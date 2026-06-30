@@ -8,8 +8,6 @@
 
 ## 목록
 
-### [linux_guide/](linux_guide/)
-
 **실습 환경:** VMware Workstation Pro 17 | Oracle Linux 7/8/9 | Oracle Database 19c
 
 1. 리눅스
