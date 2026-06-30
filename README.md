@@ -10,7 +10,14 @@
 
 ### [linux_guide/](linux_guide/)
 
-Oracle Linux 기초 입문 교안 — 챕터별 Markdown
-
 **실습 환경:** VMware Workstation Pro 17 | Oracle Linux 7/8/9 | Oracle Database 19c
 
+1. 리눅스
+2. SQL
+3. ADMIN
+4. PL/SQL
+5. BACKUP&RECOVERY
+6. TUNING
+7. ADG
+8. RAC
+9. FINAL TESTING(PATCH,RAT)
