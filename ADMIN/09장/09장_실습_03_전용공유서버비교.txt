@@ -1,0 +1,146 @@
+-- 9장 실습_03: 전용 서버(Dedicated) vs 공유 서버(Shared) 아키텍처 비교
+
+- 개념: 전용 서버 = 클라이언트 1 : 서버 프로세스 1 (전담)
+--       공유 서버 = 다수 클라이언트 : 소수 서버 프로세스 (디스패처 + 공통 큐 경유)
+- 목표: 현재 전용 서버 상태를 확인하고, 공유 서버를 활성화한 뒤 접속 방식을 비교
+
+- SQL*Plus로 CDB에 SYSDBA로 접속
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+...
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] 현재 서버 방식 확인 — 기본값은 전용 서버(DEDICATED)
+======================================================================
+
+- 세션들이 전용/공유 중 어떤 방식으로 연결되어 있는지 분포 확인
+SYS@cdb1> select server, count(*)
+  2  from v$session
+  3  where username is not null
+  4  group by server;
+
+SERVER    COUNT(*)
+--------- ----------
+DEDICATED          4
+
+- 공유 서버 관련 파라미터 확인 (SHARED_SERVERS=0 이면 공유 서버 비활성)
+SYS@cdb1> show parameter shared_servers
+
+NAME                     TYPE        VALUE
+------------------------ ----------- -----
+max_shared_servers       integer
+shared_servers           integer     0
+
+- 디스패처 뷰 조회 (공유 서버 미사용 시 행이 없음)
+SYS@cdb1> select name, status from v$dispatcher;
+
+no rows selected
+
+======================================================================
+[2단계] 공유 서버 활성화 — 디스패처와 공유 서버 프로세스 기동
+======================================================================
+
+- (실수) 디스패처 속성값에 따옴표를 빠뜨려 구문 오류 발생
+SYS@cdb1> alter system set dispatchers = (PROTOCOL=TCP)(DISPATCHERS=2);
+alter system set dispatchers = (PROTOCOL=TCP)(DISPATCHERS=2)
+                               *
+ERROR at line 1:
+ORA-00933: SQL command not properly ended
+
+- 원인: DISPATCHERS 파라미터 값은 문자열이므로 작은따옴표로 감싸야 한다. 수정 후 재실행
+SYS@cdb1> alter system set dispatchers = '(PROTOCOL=TCP)(DISPATCHERS=2)' scope=both;
+
+System altered.
+
+- 공유 서버 프로세스 최소 개수를 지정하여 공유 서버 활성화
+SYS@cdb1> alter system set shared_servers = 2 scope=both;
+
+System altered.
+
+- 활성화 결과 확인: 디스패처 2개가 기동되어 대기(accept=YES)
+SYS@cdb1> select name, status, accept, conf_indx
+  2  from v$dispatcher;
+
+NAME   STATUS       ACC  CONF_INDX
+------ ------------ ---  ----------
+D000   WAIT         YES           0
+D001   WAIT         YES           0
+
+- 공유 서버 프로세스 현황 확인
+SYS@cdb1> select name, status, messages from v$shared_server;
+
+NAME   STATUS           MESSAGES
+------ ---------------- ----------
+S000   WAIT(COMMON)              0
+S001   WAIT(COMMON)              0
+
+- 리스너에도 디스패처 핸들러가 등록되도록 즉시 등록 유도
+SYS@cdb1> alter system register;
+
+System altered.
+
+======================================================================
+[3단계] 접속 방식 비교 — SERVER=SHARED vs SERVER=DEDICATED
+======================================================================
+
+- (터미널 2) 공유 서버 방식으로 접속 (연결 기술자에 SERVER=SHARED 지정)
+[oracle@dbsvr ~]$ sqlplus hr@'(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=dbsvr.example.com)(PORT=1521))(CONNECT_DATA=(SERVER=SHARED)(SERVICE_NAME=salespdb.example.com)))'
+Enter password:
+Connected.
+HR@...> -- 접속 성공. 이 세션은 디스패처를 통해 연결됨
+
+- (터미널 3) 전용 서버 방식으로 접속 (SERVER=DEDICATED 명시)
+[oracle@dbsvr ~]$ sqlplus hr@'(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=dbsvr.example.com)(PORT=1521))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=salespdb.example.com)))'
+Enter password:
+Connected.
+
+- (SYSDBA 세션에서) 두 접속의 서버 방식을 비교 확인
+SYS@cdb1> select sid, username, server, program
+  2  from v$session
+  3  where username = 'HR' order by sid;
+
+       SID USERNAME   SERVER    PROGRAM
+---------- ---------- --------- ------------------
+       138 HR         SHARED    sqlplus@dbsvr
+       162 HR         DEDICATED sqlplus@dbsvr
+
+- SERVER 컬럼으로 방식이 갈림을 확인:
+-   SHARED 세션(SID 138)은 디스패처를 거쳐 공통 큐 -> 공유 서버 프로세스가 처리
+-   DEDICATED 세션(SID 162)은 전용 서버 프로세스가 직접 처리
+
+- 공유 세션이 어느 디스패처를 통해 연결되었는지 확인 (V$CIRCUIT)
+SYS@cdb1> select c.circuit, c.dispatcher, c.server, c.status
+  2  from v$circuit c;
+
+CIRCUIT          DISPATCHER       SERVER           STATUS
+---------------- ---------------- ---------------- --------
+000000008F...    000000008A...    000000008B...    NORMAL
+
+======================================================================
+[4단계] 실습 정리 — 공유 서버를 원래 상태(비활성)로 되돌림
+======================================================================
+
+- 학습 환경을 원복: 공유 서버 비활성화 (실습 후 원래 값으로 되돌리는 습관)
+SYS@cdb1> alter system set shared_servers = 0 scope=both;
+
+System altered.
+
+SYS@cdb1> alter system set dispatchers = '' scope=both;
+
+System altered.
+
+- [정리]
+-   전용 서버: 연결 1:1 서버 프로세스, 큐 없이 직접 처리, 배치/DBA 작업에 적합
+-   공유 서버: 리스너가 최소 부하 디스패처로 라우팅 -> SGA 공유 풀의 공통 큐 ->
+--             공유 서버 프로세스가 처리, 유휴 세션이 프로세스를 점유하지 않아 확장성↑
+-   접속 문자열의 (SERVER=DEDICATED/SHARED)로 연결마다 방식을 선택할 수 있다
+-   상세 구성(SHARED_SERVERS/DISPATCHERS/CIRCUITS 등)은 12장에서 다룸
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

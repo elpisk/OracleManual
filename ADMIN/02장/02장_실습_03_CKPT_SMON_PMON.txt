@@ -1,0 +1,116 @@
+-- 2장 실습_03: CKPT(Checkpoint)/SMON/PMON 프로세스 확인
+
+- CDB1 루트에 SYSDBA로 접속된 상태에서 시작
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] CKPT / SMON / PMON 프로세스 존재 확인
+======================================================================
+
+- 세 프로세스가 모두 필수 백그라운드 프로세스로 기동되어 있는지 확인
+SYS@cdb1> select name, description from v$bgprocess
+  2  where name in ('CKPT','SMON','PMON') and paddr <> '00'
+  3  order by name;
+
+NAME  DESCRIPTION
+----- ----------------------------------------------------------------
+CKPT  checkpoint
+PMON  process cleanup
+SMON  System Monitor Process
+
+======================================================================
+[2단계] CKPT: 체크포인트 정보 확인 (V$INSTANCE_RECOVERY)
+======================================================================
+
+- 체크포인트 SCN과 컨트롤 파일에 기록된 체크포인트 진행 상황 확인
+-   CHECKPOINT_CHANGE#(데이터베이스 체크포인트 SCN)와 컨트롤파일 SCN을 함께 조회
+SYS@cdb1> select checkpoint_change#, controlfile_change#, current_scn
+  2  from v$database;
+
+CHECKPOINT_CHANGE# CONTROLFILE_CHANGE# CURRENT_SCN
+------------------ ------------------- -----------
+           2846591             2846720     2847003
+
+- V$INSTANCE_RECOVERY로 복구 시 다시 적용할 리두의 양(복구 부하) 확인
+-   ESTIMATED_MTTR = 지금 장애 시 예상 복구 시간(초), 이 값이 체크포인트 빈도를 반영
+SYS@cdb1> select recovery_estimated_ios, estimated_mttr, target_mttr,
+  2         log_file_size_redo_blks
+  3  from v$instance_recovery;
+
+RECOVERY_ESTIMATED_IOS ESTIMATED_MTTR TARGET_MTTR LOG_FILE_SIZE_REDO_BLKS
+---------------------- -------------- ----------- -----------------------
+                   187             12           0                  368640
+
+- 강제 체크포인트 후 CHECKPOINT_CHANGE#가 전진하는지 확인 (CKPT가 SCN을 갱신함)
+SYS@cdb1> alter system checkpoint;
+
+System altered.
+
+SYS@cdb1> select checkpoint_change# from v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2847150
+
+======================================================================
+[3단계] SMON: 임시 세그먼트 정리 관점 확인
+======================================================================
+
+- SMON이 정리하는 임시 세그먼트(temporary segment)의 현재 상황 조회
+-   정렬/해시 등에 쓰인 임시 세그먼트는 SMON이 주기적으로 회수함
+SYS@cdb1> select tablespace_name, segment_type, extents, blocks
+  2  from   dba_segments
+  3  where  segment_type = 'TEMPORARY' and rownum <= 5;
+
+no rows selected
+
+- 임시 세그먼트가 없으면 위처럼 조회되지 않음. 임시 공간 사용 현황은 V$SORT_SEGMENT로 확인
+SYS@cdb1> select tablespace_name, total_blocks, used_blocks, free_blocks
+  2  from   v$sort_segment;
+
+TABLESPACE_NAME    TOTAL_BLOCKS USED_BLOCKS FREE_BLOCKS
+------------------ ------------ ----------- -----------
+TEMP                       2560           0        2560
+
+======================================================================
+[4단계] PMON: 실패한 세션 정리 실습 (ALTER SYSTEM KILL SESSION)
+======================================================================
+
+- 정리 대상이 될 사용자 세션 하나 확인 (SALESPDB 애플리케이션 세션 예시)
+SYS@cdb1> select sid, serial#, username, status, con_id
+  2  from   v$session
+  3  where  username = 'SALES_APP';
+
+       SID    SERIAL# USERNAME   STATUS   CON_ID
+---------- ---------- ---------- -------- ----------
+       142       9271 SALES_APP  INACTIVE          3
+
+- (실수) SID만 지정하고 SERIAL#를 빠뜨린 채 세션 종료 시도
+SYS@cdb1> alter system kill session '142';
+alter system kill session '142'
+*
+ERROR at line 1:
+ORA-00026: missing or invalid session ID
+
+- 원인: KILL SESSION은 'SID,SERIAL#' 형식으로 두 값을 모두 지정해야 함.
+-   SID와 SERIAL#를 함께 지정하여 재시도 (PMON이 이 세션의 롤백/락해제/자원반납을 수행)
+SYS@cdb1> alter system kill session '142,9271';
+
+System altered.
+
+- 종료된 세션의 상태 확인: PMON이 정리 중이면 KILLED로 표시됨
+SYS@cdb1> select sid, serial#, status from v$session where sid = 142;
+
+       SID    SERIAL# STATUS
+---------- ---------- --------
+       142       9271 KILLED
+
+- [정리] CKPT/SMON/PMON 확인 완료:
+-   CKPT = 더티 버퍼를 직접 쓰지 않고 체크포인트 SCN을 갱신, V$INSTANCE_RECOVERY로 복구부하 관찰
+-   SMON = 인스턴스 복구 + 임시 세그먼트 회수 등 인스턴스 전역 정리
+-   PMON = 실패한 개별 세션/프로세스 정리, ALTER SYSTEM KILL SESSION 'SID,SERIAL#'
+SYS@cdb1>

@@ -1,0 +1,124 @@
+-- 2장 실습_02: DBWn(Database Writer)/LGWR(Log Writer) 프로세스 확인
+
+- CDB1 루트에 SYSDBA로 접속된 상태에서 시작
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] V$BGPROCESS로 DBWn / LGWR 프로세스 존재 확인
+======================================================================
+
+- 데이터 라이터(DBWn)와 로그 라이터(LGWR) 계열 백그라운드 프로세스만 조회
+-   PADDR <> '00' 이면 실제로 기동된 프로세스
+SYS@cdb1> select name, description, paddr
+  2  from   v$bgprocess
+  3  where  name like 'DBW%' or name like 'LG%'
+  4  order  by name;
+
+NAME  DESCRIPTION                          PADDR
+----- ------------------------------------ ----------------
+DBW0  db writer process 0                  000000009A3F1250
+LG00  Log Writer Worker                    000000009A3F0A80
+LG01  Log Writer Worker                    00
+LGWR  Redo etc.                            000000009A3EF2B0
+
+- 해석: DBW0(데이터 라이터 0번)과 LGWR(로그 라이터)가 기동 중.
+-   LG00은 로그 쓰기를 병렬화하는 워커, LG01은 현재 미기동(PADDR=00) 상태.
+
+======================================================================
+[2단계] DB_WRITER_PROCESSES 파라미터 조회 (데이터 라이터 개수)
+======================================================================
+
+- 현재 구성된 데이터베이스 라이터 개수 확인 (기본 1개, 최대 20개까지 구성 가능)
+SYS@cdb1> show parameter db_writer_processes
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- -------
+db_writer_processes                  integer     1
+
+- 실제로 기동된 DBWn 프로세스 개수와 파라미터 값이 일치하는지 교차 확인
+SYS@cdb1> select count(*) from v$bgprocess
+  2  where name like 'DBW%' and paddr <> '00';
+
+  COUNT(*)
+----------
+         1
+
+======================================================================
+[3단계] 강제 체크포인트로 DBWn의 쓰기 유발 (ALTER SYSTEM CHECKPOINT)
+======================================================================
+
+- 체크포인트 이전 완료된 체크포인트 횟수를 확인 (V$SYSSTAT)
+SYS@cdb1> select name, value from v$sysstat
+  2  where name = 'DBWR checkpoints';
+
+NAME                                     VALUE
+---------------------------------------- ----------
+DBWR checkpoints                                 41
+
+- (실수) 체크포인트 키워드를 잘못 입력
+SYS@cdb1> alter system checkpiont;
+alter system checkpiont
+             *
+ERROR at line 1:
+ORA-00940: invalid ALTER command
+
+- 원인: CHECKPOINT 철자 오류(checkpiont). 올바른 키워드로 재시도
+-   강제 체크포인트는 CKPT가 DBWn에 신호를 보내 더티 버퍼를 데이터 파일에 기록하게 함
+SYS@cdb1> alter system checkpoint;
+
+System altered.
+
+- 체크포인트 횟수가 1 증가했는지 확인 (DBWn이 실제로 쓰기를 수행했음을 방증)
+SYS@cdb1> select name, value from v$sysstat
+  2  where name = 'DBWR checkpoints';
+
+NAME                                     VALUE
+---------------------------------------- ----------
+DBWR checkpoints                                 42
+
+======================================================================
+[4단계] 로그 스위치로 LGWR 동작 유발 (ALTER SYSTEM SWITCH LOGFILE)
+======================================================================
+
+- 스위치 전 현재(CURRENT) 리두 로그 그룹 확인
+SYS@cdb1> select group#, sequence#, status from v$log order by group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1         57 INACTIVE
+         2         58 CURRENT
+         3         56 INACTIVE
+
+- 로그 스위치 실행: LGWR가 다음 로그 그룹으로 전환 (현재 그룹을 닫고 새 그룹을 CURRENT로)
+SYS@cdb1> alter system switch logfile;
+
+System altered.
+
+- 스위치 후 CURRENT가 그룹 3으로 넘어가고 SEQUENCE#가 증가했는지 확인
+SYS@cdb1> select group#, sequence#, status from v$log order by group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1         57 INACTIVE
+         2         58 ACTIVE
+         3         59 CURRENT
+
+- LGWR가 리두 로그 파일에 실제로 기록한 통계 확인 (redo writes / redo size)
+SYS@cdb1> select name, value from v$sysstat
+  2  where name in ('redo writes','redo size')
+  3  order  by name;
+
+NAME                                     VALUE
+---------------------------------------- ----------
+redo size                             198734512
+redo writes                                 8842
+
+- [정리] DBWn/LGWR 확인 완료:
+-   DBWn = 더티 버퍼를 데이터 파일에 기록, DB_WRITER_PROCESSES(기본1/최대20)로 개수 조절
+-   ALTER SYSTEM CHECKPOINT -> CKPT가 신호, DBWn이 쓰기 -> DBWR checkpoints 증가
+-   LGWR = 리두 로그 버퍼를 리두 로그 파일에 기록, ALTER SYSTEM SWITCH LOGFILE로 로그 전환
+SYS@cdb1>

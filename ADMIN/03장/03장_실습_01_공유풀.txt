@@ -1,0 +1,134 @@
+-- 3장 실습_01: 공유 풀(Shared Pool) 구성요소 확인
+-- 목표: 공유 풀의 크기, 라이브러리 캐시/딕셔너리 캐시 사용 현황, 소프트/하드 파스를 조회로 확인
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 10:05:11 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+- 프롬프트를 사용자@인스턴스 형태로 지정 (실습 환경 glogin.sql 설정)
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] 현재 메모리 관리 방식과 공유 풀 크기 확인
+======================================================================
+
+- 세 파라미터로 메모리 관리 방식을 먼저 판별 (이 인스턴스는 ASMM: sga_target>0, memory_target=0)
+SYS@cdb1> show parameter memory_target
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------
+memory_max_target                    big integer 0
+memory_target                        big integer 0
+
+SYS@cdb1> show parameter sga_target
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------
+sga_target                           big integer 2G
+
+- 공유 풀의 현재 크기 확인 (ASMM에서 0으로 두면 자동 배분, 값이 있으면 하한)
+SYS@cdb1> show parameter shared_pool_size
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------
+shared_pool_size                     big integer 0
+
+- V$SGAINFO에서 Shared Pool Size 실제 크기 확인 (자동으로 잡힌 값)
+SYS@cdb1> select name, round(bytes/1024/1024,1) as mb, resizeable
+  2  from v$sgainfo where name like '%Shared Pool%';
+
+NAME                                     MB RES
+-------------------------------- ---------- ---
+Shared Pool Size                        640 Yes
+
+======================================================================
+[2단계] 공유 풀 내부 상위 메모리 소비 항목 확인 (V$SGASTAT)
+======================================================================
+
+- 공유 풀 안에서 메모리를 많이 쓰는 항목 상위 5개 (SQLA=SQL 영역, KGLH0=라이브러리 캐시 핸들)
+SYS@cdb1> select pool, name, round(bytes/1024/1024,2) as mb
+  2  from v$sgastat
+  3  where pool = 'shared pool'
+  4  order by bytes desc fetch first 5 rows only;
+
+POOL         NAME                        MB
+------------ ------------------- ----------
+shared pool  SQLA                     78.42
+shared pool  KGLH0                    41.20
+shared pool  free memory              33.71
+shared pool  KGLHD                    12.03
+shared pool  row cache                 9.88
+
+======================================================================
+[3단계] 라이브러리 캐시 효율 확인 (소프트 파스가 많을수록 좋음)
+======================================================================
+
+- (실수) 뷰 이름을 v$library_cache 로 잘못 입력 (실제 이름은 v$librarycache, 언더스코어 없음)
+SYS@cdb1> select namespace, gets, pins from v$library_cache
+  2  where namespace = 'SQL AREA';
+select namespace, gets, pins from v$library_cache
+                                   *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+- 원인: 동적 성능 뷰 이름 철자 오류. 올바른 이름은 V$LIBRARYCACHE (한 단어)
+SYS@cdb1> select namespace, gets, gethits,
+  2         round(gethitratio*100,2) as hit_pct
+  3  from v$librarycache
+  4  where namespace in ('SQL AREA','TABLE/PROCEDURE');
+
+NAMESPACE            GETS    GETHITS    HIT_PCT
+--------------- --------- ---------- ----------
+SQL AREA           184203     179115      97.24
+TABLE/PROCEDURE     92044      91012      98.88
+
+- 해석: HIT_PCT가 높다 = 라이브러리 캐시에서 재사용(소프트 파스)이 잘 되고 있음
+
+======================================================================
+[4단계] 데이터 딕셔너리 캐시(로우 캐시) 사용 현황
+======================================================================
+
+- 딕셔너리 캐시의 항목별 요청 수와 미스율 확인 (미스율이 낮아야 좋음)
+SYS@cdb1> select parameter, gets, getmisses
+  2  from v$rowcache
+  3  where gets > 0 and parameter in ('dc_objects','dc_users')
+  4  order by parameter;
+
+PARAMETER              GETS  GETMISSES
+--------------- ----------- ----------
+dc_objects            45120        212
+dc_users              18004         31
+
+======================================================================
+[5단계] 하드 파스 통계 확인 (전체 파스 대비 하드 파스 비율)
+======================================================================
+
+- parse count(total)와 parse count(hard) 비교 → 하드 파스 비율이 낮아야 바람직
+SYS@cdb1> select name, value from v$sysstat
+  2  where name in ('parse count (total)','parse count (hard)');
+
+NAME                             VALUE
+------------------------- ------------
+parse count (total)             205331
+parse count (hard)                4021
+
+- 해석: 하드 파스 비율 약 2% → 바인드 변수가 잘 사용되어 공유 풀 효율이 좋은 편
+
+- [정리] 공유 풀 = 라이브러리 캐시(파싱된 SQL/실행계획) + 딕셔너리 캐시(로우 캐시)
+-   소프트 파스 비율을 높이는 핵심은 바인드 변수 사용
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

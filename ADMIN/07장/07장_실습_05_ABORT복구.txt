@@ -1,0 +1,137 @@
+-- 7장 실습_05: SHUTDOWN ABORT 후 인스턴스 복구 시나리오 확인
+-- 목표: ABORT가 비일관을 남기고, 다음 기동 시 SMON이 자동으로 인스턴스 복구를 수행함을 확인한다.
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Mon Jul 27 14:41:02 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> alter session set nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+Session altered.
+
+======================================================================
+[준비] 커밋되지 않은 변경을 남긴 채 ABORT하기 위한 테스트 데이터 구성
+======================================================================
+
+- 실습용 테이블 생성 및 커밋된 초기 데이터 1건
+SYS@cdb1> create table sys.abort_demo(id number, memo varchar2(30));
+
+Table created.
+
+SYS@cdb1> insert into sys.abort_demo values (1, 'committed-row');
+
+1 row created.
+
+SYS@cdb1> commit;
+
+Commit complete.
+
+- 커밋하지 않은 변경 1건을 추가 (이 세션에서만 보이는 상태)
+SYS@cdb1> insert into sys.abort_demo values (2, 'uncommitted-row');
+
+1 row created.
+
+- 현재 이 세션에서는 2건이 보인다 (미커밋 포함)
+SYS@cdb1> select id, memo from sys.abort_demo order by id;
+
+        ID MEMO
+---------- ------------------------------
+         1 committed-row
+         2 uncommitted-row
+
+======================================================================
+[실행] 응급 상황을 가정하여 SHUTDOWN ABORT (미커밋 변경은 롤백되지 않음)
+======================================================================
+
+- ABORT는 미커밋 트랜잭션을 롤백하지 않고, 체크포인트 없이 즉시 종료한다
+SYS@cdb1> shutdown abort
+ORACLE instance shut down.
+
+- [주목] 'Database closed./dismounted.'가 없다 = 정리 없이 죽였다는 증거.
+-   이 시점의 데이터베이스는 비일관 상태이며, 백업을 뜨면 안 된다.
+
+======================================================================
+[복구] 다음 기동 시 OPEN 단계에서 SMON이 자동 인스턴스 복구 수행
+======================================================================
+
+- 재기동. 화면에는 단순히 mounted -> opened로 보이지만
+-   OPEN 직전에 롤 포워드(리두 재적용) + 롤백(언두로 미커밋 되돌림)이 자동 수행된다
+SYS@cdb1> startup
+ORACLE instance started.
+
+Total System Global Area 2046827888 bytes
+Fixed Size                  9145712 bytes
+Variable Size            1358954496 bytes
+Database Buffers          671088640 bytes
+Redo Buffers                7639040 bytes
+Database mounted.
+Database opened.
+
+- 복구 완료 후 정상 OPEN 확인
+SYS@cdb1> select status from v$instance;
+
+STATUS
+------------
+OPEN
+
+======================================================================
+[검증] 미커밋 변경은 롤백되고, 커밋된 변경만 살아남았는지 확인
+======================================================================
+
+- 커밋된 1번 행만 남고, 미커밋 2번 행은 롤백되어 사라졌다
+SYS@cdb1> select id, memo from sys.abort_demo order by id;
+
+        ID MEMO
+---------- ------------------------------
+         1 committed-row
+
+- 이것이 인스턴스 복구의 결과다: 커밋된 것은 보존(롤 포워드),
+-   커밋 안 된 것은 되돌림(롤백) -> 일관성 회복.
+
+======================================================================
+[증거 확인] 알림 로그(alert log)에서 crash recovery 흔적 확인
+======================================================================
+
+- 알림 로그가 있는 진단 디렉터리 경로 조회
+SYS@cdb1> select value from v$diag_info where name='Diag Trace';
+
+VALUE
+------------------------------------------------------------
+/u01/app/oracle/diag/rdbms/cdb1/cdb1/trace
+
+- OS 셸에서 알림 로그를 열어 복구 메시지를 확인 (별도 터미널)
+SYS@cdb1> host tail -n 12 /u01/app/oracle/diag/rdbms/cdb1/cdb1/trace/alert_cdb1.log
+Beginning crash recovery of 1 threads
+ Started redo scan
+ Completed redo scan
+  read 118 KB redo, 84 data blocks need recovery
+ Started redo application at
+  Thread 1: logseq 42, block 1523
+ Recovery of Online Redo Log: Thread 1 Group 2 Seq 42 Reading mem 0
+ Completed redo application of 0.08MB
+Completed crash recovery at
+  Thread 1: logseq 42, block 1607, scn 3956821
+  84 data blocks read, 84 data blocks written, 118 KB redo read
+Crash recovery completed successfully
+
+- [정리]
+-   ABORT/인스턴스 장애/STARTUP FORCE는 비일관을 남기지만,
+-   데이터 파일이 손상되지 않았다면 다음 기동 시 SMON이 온라인 리두+언두만으로
+-   자동 인스턴스 복구(crash recovery)를 수행한다. 관리자 수동 개입은 불필요하다.
+-   이는 백업/아카이브 리두가 필요한 '미디어 복구'와 구별된다.
+
+- 실습 정리: 테스트 테이블 삭제
+SYS@cdb1> drop table sys.abort_demo purge;
+
+Table dropped.
+
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

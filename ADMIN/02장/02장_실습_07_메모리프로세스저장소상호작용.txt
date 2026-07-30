@@ -1,0 +1,209 @@
+-- 2장 실습_07: 메모리·프로세스·저장소 상호작용 확인 (SELECT 읽기 / UPDATE·COMMIT 쓰기 흐름)
+
+- CDB1의 SALESPDB로 이동하여 실습 (실제 데이터 조작은 PDB 안에서 수행)
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+SYS@salespdb> show con_name
+
+CON_NAME
+------------------------------
+SALESPDB
+
+======================================================================
+[준비] 실습용 소규모 테이블 생성 및 데이터 적재
+======================================================================
+
+- 흐름 관찰용 테이블 생성 후 커밋
+SYS@salespdb> create table sales_app.flow_demo (id number, val varchar2(30));
+
+Table created.
+
+SYS@salespdb> insert into sales_app.flow_demo
+  2  select level, 'row_'||level from dual connect by level <= 1000;
+
+1000 rows created.
+
+SYS@salespdb> commit;
+
+Commit complete.
+
+======================================================================
+[1단계] 첫 조회: 공유 풀 파싱 + 디스크 읽기(물리 I/O) 관찰
+======================================================================
+
+- 버퍼 캐시를 비워 '디스크에서 읽어오는' 상황을 강제로 재현 (테스트 목적)
+SYS@salespdb> alter session set container = cdb$root;
+
+Session altered.
+
+SYS@cdb1> alter system flush buffer_cache;
+
+System altered.
+
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+- 통계 자동 표시 켜기 (물리 읽기/논리 읽기를 결과와 함께 보기 위함)
+SYS@salespdb> set autotrace on statistics
+
+- (실수) 테이블명을 오타로 조회
+SYS@salespdb> select count(*) from sales_app.flow_demo_x;
+select count(*) from sales_app.flow_demo_x
+                                *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+- 원인: 테이블명 오타(flow_demo_x). 올바른 이름 flow_demo로 재시도
+-   첫 조회이므로 서버 프로세스가 공유 풀에서 파싱(hard parse) 후
+-   버퍼 캐시에 블록이 없어 데이터 파일에서 읽음(physical reads 발생)
+SYS@salespdb> select count(*) from sales_app.flow_demo;
+
+  COUNT(*)
+----------
+      1000
+
+Statistics
+----------------------------------------------------------
+          6  recursive calls
+          0  db block gets
+         27  consistent gets
+         14  physical reads
+          0  redo size
+        548  bytes sent via SQL*Net to client
+        ...
+
+- 해석: physical reads=14 -> 서버 프로세스가 디스크(데이터 파일)에서 블록을 읽어
+-   버퍼 캐시에 적재했음. 이것이 '캐시 미스' 경로.
+
+======================================================================
+[2단계] 재조회: 버퍼 캐시 히트로 물리 읽기 사라짐 관찰
+======================================================================
+
+- 같은 SQL을 다시 실행: 이미 공유 풀에 파싱 결과가 있고(soft parse),
+-   블록도 버퍼 캐시에 있으므로 physical reads=0 (디스크 접근 없음)
+SYS@salespdb> select count(*) from sales_app.flow_demo;
+
+  COUNT(*)
+----------
+      1000
+
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+         27  consistent gets
+          0  physical reads
+          0  redo size
+        ...
+
+- 해석: physical reads가 14 -> 0으로 바뀜. '캐시 히트' 경로.
+-   메모리(버퍼 캐시)가 저장소(데이터 파일) 접근을 대신해 성능을 높이는 원리 확인.
+SYS@salespdb> set autotrace off
+
+======================================================================
+[3단계] 쓰기 흐름: UPDATE로 더티 버퍼 생성 + 리두 발생
+======================================================================
+
+- 세션의 redo 통계 기준값 확인
+SYS@salespdb> select n.name, s.value
+  2  from   v$mystat s join v$statname n on s.statistic# = n.statistic#
+  3  where  n.name in ('redo size','db block changes')
+  4  order  by n.name;
+
+NAME                                     VALUE
+---------------------------------------- ----------
+db block changes                              128
+redo size                                   45120
+
+- UPDATE 실행: 버퍼 캐시의 블록을 수정 -> 해당 버퍼가 '더티' 상태가 됨
+-   동시에 변경에 대한 리두 엔트리가 리두 로그 버퍼에 기록됨
+SYS@salespdb> update sales_app.flow_demo set val = upper(val) where id <= 500;
+
+500 rows updated.
+
+- redo size와 db block changes가 증가했는지 확인 (변경이 리두로 기록됨)
+SYS@salespdb> select n.name, s.value
+  2  from   v$mystat s join v$statname n on s.statistic# = n.statistic#
+  3  where  n.name in ('redo size','db block changes')
+  4  order  by n.name;
+
+NAME                                     VALUE
+---------------------------------------- ----------
+db block changes                              812
+redo size                                  118904
+
+======================================================================
+[4단계] COMMIT: LGWR가 리두를 로그 파일에 기록 (지속성 보장)
+======================================================================
+
+- 커밋 전 LGWR의 redo writes 통계 확인 (인스턴스 전역 통계, 루트에서 조회)
+SYS@salespdb> alter session set container = cdb$root;
+
+Session altered.
+
+SYS@cdb1> select value from v$sysstat where name = 'redo writes';
+
+     VALUE
+----------
+      8850
+
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+- 커밋 실행: LGWR가 리두 로그 버퍼의 내용을 리두 로그 파일에 확실히 기록해야 커밋 완료
+SYS@salespdb> commit;
+
+Commit complete.
+
+- LGWR가 리두를 기록했는지 확인 (redo writes 증가)
+SYS@salespdb> alter session set container = cdb$root;
+
+Session altered.
+
+SYS@cdb1> select value from v$sysstat where name = 'redo writes';
+
+     VALUE
+----------
+      8853
+
+- 더티 버퍼는 커밋 시점에 즉시 안 써짐 -> 강제 체크포인트로 DBWn이 데이터 파일에 반영하게 함
+SYS@cdb1> alter system checkpoint;
+
+System altered.
+
+- DBWn이 기록한 물리 쓰기 통계 확인 (physical writes 존재 -> 저장소에 반영됨)
+SYS@cdb1> select name, value from v$sysstat
+  2  where name in ('physical writes','DBWR checkpoint buffers written')
+  3  order  by name;
+
+NAME                                     VALUE
+---------------------------------------- ----------
+DBWR checkpoint buffers written               3271
+physical writes                              41988
+
+======================================================================
+[정리] 실습 계정 정리
+======================================================================
+
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+SYS@salespdb> drop table sales_app.flow_demo purge;
+
+Table dropped.
+
+SYS@salespdb> alter session set container = cdb$root;
+
+Session altered.
+
+- [정리] 메모리·프로세스·저장소 상호작용 확인 완료:
+-   읽기(SELECT) = 서버프로세스 -> 공유풀(파싱) -> 버퍼캐시(히트) or 데이터파일(미스, physical reads)
+-   쓰기(UPDATE) = 버퍼캐시 수정(더티) + 리두로그버퍼 기록(redo size 증가)
+-   커밋(COMMIT) = LGWR가 리두를 로그파일에 기록(redo writes) -> 지속성 보장
+-   이후 DBWn = 체크포인트 등 트리거에 따라 더티 버퍼를 데이터파일에 기록(physical writes)
+SYS@cdb1>

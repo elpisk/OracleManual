@@ -1,0 +1,121 @@
+-- 3장 실습_08: 오라클 메모리 관련 파라미터 비교 실습
+-- 목표: MEMORY_TARGET/SGA_TARGET/PGA_AGGREGATE_TARGET로 관리 방식을 판별하고 계층을 이해
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 13:40:10 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+- 프롬프트를 사용자@인스턴스 형태로 지정 (실습 환경 glogin.sql 설정)
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] 메모리 관리 3대 파라미터를 한 화면에 모아 보기
+======================================================================
+
+- 관리 방식 판별에 쓰는 핵심 파라미터들을 V$PARAMETER로 조회
+SYS@cdb1> select name, value from v$parameter
+  2  where name in ('memory_target','memory_max_target',
+  3    'sga_target','sga_max_size','pga_aggregate_target','pga_aggregate_limit')
+  4  order by name;
+
+NAME                       VALUE
+-------------------------- ------------
+memory_max_target          0
+memory_target              0
+pga_aggregate_limit        2147483648
+pga_aggregate_target       734003200
+sga_max_size               3221225472
+sga_target                 2147483648
+
+- 판별: memory_target=0 AND sga_target>0 → ASMM + 자동 PGA
+
+======================================================================
+[2단계] 판별 규칙을 CASE 식으로 자동 표시
+======================================================================
+
+- 세 파라미터로 관리 방식을 문자열로 판별하는 쿼리
+SYS@cdb1> select
+  2    case when m.value > 0 then 'AMM (완전 자동)'
+  3         when s.value > 0 then 'ASMM + 자동 PGA'
+  4         else '수동(Manual)'
+  5    end as mode
+  6  from (select value from v$parameter where name='memory_target') m,
+  7       (select value from v$parameter where name='sga_target') s;
+
+MODE
+------------------
+ASMM + 자동 PGA
+
+======================================================================
+[3단계] SGA/PGA 어드바이저를 함께 조회 (오류 → 수정)
+======================================================================
+
+- (실수) SGA 어드바이저 뷰 이름을 v$sga_advice 로 잘못 입력
+SYS@cdb1> select sga_size, sga_size_factor, estd_db_time
+  2  from v$sga_advice order by sga_size;
+from v$sga_advice order by sga_size
+     *
+ERROR at line 2:
+ORA-00942: table or view does not exist
+
+- 원인: 뷰 이름 오류. 올바른 이름은 V$SGA_TARGET_ADVICE
+SYS@cdb1> select sga_size as sga_mb, sga_size_factor as factor,
+  2         estd_db_time
+  3  from v$sga_target_advice
+  4  where sga_size_factor in (0.5, 1, 1.5) order by sga_size;
+
+    SGA_MB     FACTOR ESTD_DB_TIME
+---------- ---------- ------------
+      1024       0.50        13980
+      2048       1.00        12030
+      3072       1.50        11990
+
+======================================================================
+[4단계] 두 어드바이저를 비교해 SGA와 PGA 중 어디에 투자할지 판단
+======================================================================
+
+- PGA 어드바이저도 함께 확인
+SYS@cdb1> select round(pga_target_for_estimate/1024/1024) as pga_mb,
+  2         pga_target_factor as factor,
+  3         estd_pga_cache_hit_percentage as hit_pct
+  4  from v$pga_target_advice
+  5  where pga_target_factor in (1, 2) order by pga_target_factor;
+
+    PGA_MB     FACTOR    HIT_PCT
+---------- ---------- ----------
+       700        1.0         98
+      1400        2.0         99
+
+- 해석: SGA를 키워도 DB 시간이 거의 안 줄고, PGA도 이미 98% → 현재 배분이 균형적
+
+======================================================================
+[5단계] 파라미터 계층 정리 확인
+======================================================================
+
+- 우선순위 규칙을 주석으로 정리
+-   memory_target>0                  -> AMM (상위, SGA_TARGET/PGA_TARGET은 하한)
+-   memory_target=0 AND sga_target>0 -> ASMM + 자동 PGA
+-   memory_target=0 AND sga_target=0 -> 수동(개별 풀 파라미터가 직접 결정)
+SYS@cdb1> select 'memory_target > sga_target > shared_pool_size 순으로 상위가 우선' as rule from dual;
+
+RULE
+-----------------------------------------------------------------
+memory_target > sga_target > shared_pool_size 순으로 상위가 우선
+
+- [정리] 세 파라미터만 보면 관리 방식을 즉시 판별할 수 있고, 두 어드바이저로 투자 방향을 정한다.
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

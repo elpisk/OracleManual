@@ -1,0 +1,177 @@
+-- 7장 실습_01: STARTUP NOMOUNT / MOUNT / OPEN 단계별 실습
+-- 목표: 인스턴스 기동이 3단계로 누적 진행됨을 상태 조회로 직접 확인한다.
+
+- SQL*Plus로 CDB에 SYSDBA 권한으로 접속 (OS 인증)
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Mon Jul 27 09:05:31 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+- 프롬프트를 사용자@인스턴스 형태로 지정 (실습 환경 glogin.sql 설정)
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[준비] 단계별 실습을 위해 데이터베이스를 정상 종료
+======================================================================
+
+- IMMEDIATE로 정상 종료 (다음 기동 시 복구 없이 단계 실습을 진행하기 위함)
+SYS@cdb1> shutdown immediate
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+======================================================================
+[1단계] NOMOUNT: 인스턴스만 기동 (SGA 할당 + 백그라운드 프로세스)
+======================================================================
+
+- (실수) NOMOUNT 옵션 철자를 잘못 입력
+SYS@cdb1> startup nomont
+SP2-0714: invalid combination of STARTUP options
+
+- 원인: 옵션 철자 오류(nomont). 올바른 키워드로 재시도
+SYS@cdb1> startup nomount
+ORACLE instance started.
+
+Total System Global Area 2046827888 bytes
+Fixed Size                  9145712 bytes
+Variable Size            1358954496 bytes
+Database Buffers          671088640 bytes
+Redo Buffers                7639040 bytes
+
+- NOMOUNT 단계의 상태는 STARTED. 아직 데이터베이스와 연결되지 않음
+SYS@cdb1> select status from v$instance;
+
+STATUS
+------------
+STARTED
+
+- (실수) NOMOUNT 상태에서 V$DATABASE 조회 시도 -> 컨트롤 파일을 아직 안 읽어 실패
+SYS@cdb1> select name, open_mode from v$database;
+select name, open_mode from v$database
+                            *
+ERROR at line 1:
+ORA-01507: database not mounted
+
+- 원인: V$DATABASE는 '컨트롤 파일'에서 읽는 정보이므로 MOUNT 이후에만 조회 가능
+- NOMOUNT에서는 인스턴스 메모리 정보(V$SGA 등)만 조회할 수 있다
+SYS@cdb1> select name, value/1024/1024 as mb from v$sga;
+
+NAME                         MB
+-------------------- ----------
+Fixed Size            8.7220535
+Variable Size               1296
+Database Buffers             640
+Redo Buffers          7.2851562
+
+======================================================================
+[2단계] MOUNT: 컨트롤 파일을 열어 데이터베이스를 인스턴스에 연결
+======================================================================
+
+- MOUNT 단계로 진행하여 컨트롤 파일을 읽게 함
+SYS@cdb1> alter database mount;
+
+Database altered.
+
+- MOUNT 단계의 상태는 MOUNTED
+SYS@cdb1> select status from v$instance;
+
+STATUS
+------------
+MOUNTED
+
+- MOUNT 이후에는 V$DATABASE 조회가 가능해짐(단, 데이터 자체에는 아직 접근 불가)
+SYS@cdb1> select name, open_mode, log_mode, cdb from v$database;
+
+NAME      OPEN_MODE            LOG_MODE     CDB
+--------- -------------------- ------------ ---
+CDB1      MOUNTED              ARCHIVELOG   YES
+
+- 컨트롤 파일이 파악한 데이터 파일 목록도 이 단계에서 조회 가능
+-   (단, 파일의 실제 존재 여부는 아직 검사되지 않았음에 유의)
+SYS@cdb1> select file#, status, name from v$datafile where con_id=1 order by file#;
+
+     FILE# STATUS  NAME
+---------- ------- ------------------------------------------------------------
+         1 SYSTEM  /u01/app/oracle/oradata/CDB1/system01.dbf
+         3 ONLINE  /u01/app/oracle/oradata/CDB1/sysaux01.dbf
+         4 ONLINE  /u01/app/oracle/oradata/CDB1/undotbs01.dbf
+         7 ONLINE  /u01/app/oracle/oradata/CDB1/users01.dbf
+
+======================================================================
+[3단계] OPEN: 데이터 파일과 리두 로그를 실제로 열어 사용 가능하게 함
+======================================================================
+
+- OPEN 단계로 진행
+SYS@cdb1> alter database open;
+
+Database altered.
+
+- 최종 상태는 OPEN
+SYS@cdb1> select status, database_status from v$instance;
+
+STATUS       DATABASE_STATUS
+------------ -----------------
+OPEN         ACTIVE
+
+- CDB 루트는 READ WRITE로 열림
+SYS@cdb1> select name, open_mode from v$database;
+
+NAME      OPEN_MODE
+--------- --------------------
+CDB1      READ WRITE
+
+- OPEN 완료 후 실제 데이터 접근이 가능한지 확인
+SYS@cdb1> select count(*) from dba_tablespaces;
+
+  COUNT(*)
+----------
+         5
+
+- [중요] CDB가 OPEN 되어도 PDB는 자동으로 열리지 않고 MOUNTED로 남는다
+SYS@cdb1> select con_id, name, open_mode from v$pdbs order by con_id;
+
+    CON_ID NAME                           OPEN_MODE
+---------- ------------------------------ ----------
+         2 PDB$SEED                       READ ONLY
+         3 SALESPDB                       MOUNTED
+         4 HRPDB                          MOUNTED
+
+======================================================================
+[정리] 한 번에 OPEN까지 진행하려면 옵션 없이 STARTUP만 입력하면 된다
+======================================================================
+
+- 3단계를 한 번에 진행하는 것과 동일함을 확인하기 위해 정상 종료 후 재기동
+SYS@cdb1> shutdown immediate
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+- 옵션 생략 시 기본값 OPEN까지 자동 진행 (mounted -> opened 메시지 확인)
+SYS@cdb1> startup
+ORACLE instance started.
+
+Total System Global Area 2046827888 bytes
+Fixed Size                  9145712 bytes
+Variable Size            1358954496 bytes
+Database Buffers          671088640 bytes
+Redo Buffers                7639040 bytes
+Database mounted.
+Database opened.
+
+- [결론] 기동 = NOMOUNT(인스턴스) -> MOUNT(컨트롤파일) -> OPEN(데이터파일).
+-   각 단계는 이전 단계 완료가 전제이며, STARTUP 기본값은 OPEN이다.
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

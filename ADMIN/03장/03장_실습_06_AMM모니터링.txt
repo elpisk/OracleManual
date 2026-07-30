@@ -1,0 +1,116 @@
+-- 3장 실습_06: 자동 메모리 관리 모니터링 실습
+-- 목표: V$MEMORY_TARGET_ADVICE / V$MEMORY_DYNAMIC_COMPONENTS / V$MEMORY_RESIZE_OPS 활용
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 11:48:03 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+- 프롬프트를 사용자@인스턴스 형태로 지정 (실습 환경 glogin.sql 설정)
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] 총 메모리 목표를 바꾸면 성능이 어떻게 될지 조언 확인
+======================================================================
+
+- MEMORY_TARGET을 배수별로 바꿀 때 예상 DB 시간 (작을수록 좋음)
+SYS@cdb1> select round(memory_size) as mem_mb,
+  2         memory_size_factor as factor,
+  3         estd_db_time,
+  4         estd_db_time_factor as time_factor
+  5  from v$memory_target_advice order by memory_size;
+
+    MEM_MB     FACTOR ESTD_DB_TIME TIME_FACTOR
+---------- ---------- ------------ -----------
+      1024       0.50        14210       1.182
+      1536       0.75        12655       1.052
+      2048       1.00        12030       1.000
+      2560       1.25        11980       0.996
+      3072       1.50        11975       0.995
+
+- 해석: 현재(2048MB) 대비 목표를 키워도 DB 시간이 거의 안 줄어듦 → 증설 이득 미미
+
+======================================================================
+[2단계] 현재 각 메모리 컴포넌트의 크기와 조정 방식
+======================================================================
+
+- 컴포넌트별 현재/최소 크기와 마지막 조정 모드 확인
+SYS@cdb1> select component,
+  2         round(current_size/1024/1024) as cur_mb,
+  3         round(min_size/1024/1024) as min_mb,
+  4         last_oper_mode
+  5  from v$memory_dynamic_components
+  6  where current_size > 0 order by current_size desc;
+
+COMPONENT                CUR_MB     MIN_MB LAST_OPER_MODE
+-------------------- ---------- ---------- --------------
+SGA Target                 1408          0 DEFERRED
+DEFAULT buffer cache        704        512 DEFERRED
+shared pool                 512        448 IMMEDIATE
+PGA Target                  640          0 DEFERRED
+large pool                   32          0 STATIC
+
+======================================================================
+[3단계] 최근 메모리 재조정 이력 확인 (오류 → 수정)
+======================================================================
+
+- (실수) 존재하지 않는 컬럼 oper_mode 로 조회 (정확한 컬럼은 oper_type / oper_mode 둘 다 있으나 여기선 final_size 오타)
+SYS@cdb1> select component, oper_type, final_sizes, start_time
+  2  from v$memory_resize_ops order by start_time desc;
+select component, oper_type, final_sizes, start_time
+                             *
+ERROR at line 1:
+ORA-00904: "FINAL_SIZES": invalid identifier
+
+- 원인: 컬럼명 오류. 올바른 컬럼은 FINAL_SIZE (복수형 아님)
+SYS@cdb1> select component, oper_type,
+  2         round(initial_size/1024/1024) as from_mb,
+  3         round(final_size/1024/1024) as to_mb,
+  4         to_char(start_time,'HH24:MI:SS') as t
+  5  from v$memory_resize_ops
+  6  where final_size <> initial_size
+  7  order by start_time desc fetch first 8 rows only;
+
+COMPONENT            OPER_TYPE     FROM_MB      TO_MB T
+-------------------- ---------- ---------- ---------- --------
+shared pool          GROW              448        512 11:47:12
+DEFAULT buffer cache SHRINK            768        704 11:47:12
+PGA Target           GROW              576        640 11:31:05
+SGA Target           SHRINK           1472       1408 11:31:05
+
+- 해석: 11:47에 공유 풀이 부족해 버퍼 캐시에서 64MB를 떼어 공유 풀로 이동(GROW/SHRINK 쌍)
+
+======================================================================
+[4단계] 특정 풀 부족이 상한 때문인지 확인
+======================================================================
+
+- 전체 목표가 상한에 닿았는지 (memory_target 이 memory_max_target 에 근접하면 증설 필요)
+SYS@cdb1> select name, value from v$parameter
+  2  where name in ('memory_target','memory_max_target');
+
+NAME                     VALUE
+-------------------- ----------
+memory_max_target    3221225472
+memory_target        2147483648
+
+- 해석: 목표(2G)가 상한(3G)에 여유가 있음 → 필요 시 ALTER SYSTEM으로 무중단 상향 가능
+SYS@cdb1> alter system set memory_target = 2560M scope=both;
+
+System altered.
+
+- [정리] AMM도 관측이 중요. ADVICE(증설 이득)·DYNAMIC_COMPONENTS(현재 크기)·RESIZE_OPS(이력)를 함께 본다.
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

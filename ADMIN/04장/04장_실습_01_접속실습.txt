@@ -1,0 +1,173 @@
+-- 4장 실습_01: SQL*Plus로 OS 인증 및 Easy Connect 접속 실습
+-- 목표: (1) OS 인증(/ as sysdba)으로 CDB 루트 접속, (2) Easy Connect로 PDB 접속,
+--       (3) 연결/세션 확인, (4) 잘못된 서비스명/포트 오류를 재현하고 수정한다.
+
+======================================================================
+[1단계] OS 인증으로 CDB 루트(CDB$ROOT)에 SYSDBA로 접속
+======================================================================
+
+- 비밀번호 없이 운영체제 인증으로 SQL*Plus 시작 (인스턴스와 동일한 로컬 서버에서 실행)
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 10:05:41 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+- 프롬프트를 사용자@인스턴스 형태로 지정 (실습 환경 glogin.sql 설정)
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+
+- 접속한 사용자 확인: OS 인증 + as sysdba 이므로 SYS로 접속됨
+SYS@cdb1> show user
+USER is "SYS"
+
+- 접속한 컨테이너 확인: 기본적으로 루트 컨테이너(CDB$ROOT)에 접속됨
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+- 접속에 사용된 인증 방식이 OS 인증(사전 인증)임을 확인
+SYS@cdb1> select sys_context('USERENV','AUTHENTICATION_METHOD') as auth_method,
+  2         sys_context('USERENV','ISDBA') as is_dba
+  3  from dual;
+
+AUTH_METHOD          IS_DBA
+-------------------- ------
+OS_AUTHENT           TRUE
+
+======================================================================
+[2단계] 연결(connection)과 세션(session) 확인
+======================================================================
+
+- 현재 인스턴스에 열려 있는 사용자 세션 확인 (백그라운드 제외)
+SYS@cdb1> select sid, serial#, username, program, server, status
+  2  from v$session where type = 'USER' order by sid;
+
+       SID    SERIAL# USERNAME   PROGRAM            SERVER    STATUS
+---------- ---------- ---------- ------------------ --------- --------
+       142       9271 SYS        sqlplus@dbsvr      DEDICATED ACTIVE
+
+- 내 세션과 연결된 서버 프로세스(연결의 물리적 실체, OS PID) 확인
+-   V$SESSION.PADDR = V$PROCESS.ADDR 조인으로 세션과 OS 프로세스를 매칭
+SYS@cdb1> select s.sid, s.username, p.spid as os_pid, p.pname
+  2  from v$session s join v$process p on s.paddr = p.addr
+  3  where s.sid = sys_context('USERENV','SID');
+
+       SID USERNAME   OS_PID       PNAME
+---------- ---------- ------------ -----
+       142 SYS        20418
+
+- 현재 CDB에 존재하는 PDB 목록과 오픈 상태 확인 (접속 대상 후보)
+SYS@cdb1> select con_id, name, open_mode from v$pdbs order by con_id;
+
+    CON_ID NAME                           OPEN_MODE
+---------- ------------------------------ ----------
+         2 PDB$SEED                       READ ONLY
+         3 SALESPDB                       MOUNTED
+         4 HRPDB                          READ WRITE
+
+======================================================================
+[3단계] Easy Connect로 PDB(HRPDB)에 접속 - 오류 재현과 수정
+======================================================================
+
+- (실수) Easy Connect로 접속하려는데 서비스 이름을 잘못 입력(hrdb - 존재하지 않음)
+SYS@cdb1> connect hr/hr@dbsvr:1521/hrdb
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in
+connect descriptor
+
+Warning: You are no longer connected to ORACLE.
+
+- 원인: 리스너는 정상이지만 'hrdb'라는 서비스가 리스너에 등록되어 있지 않음.
+-   서버에서 실제 등록된 서비스 이름을 확인해야 함
+[oracle@dbsvr ~]$ lsnrctl status | grep -i service
+Service "hrpdb" has 1 instance(s).
+Service "salespdb" has 1 instance(s).
+Service "cdb1" has 1 instance(s).
+
+- 확인 결과 올바른 서비스 이름은 'hrpdb'. 다시 SQL*Plus로 접속하여 재시도
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SYS@cdb1> connect hr/hr@dbsvr:1521/hrpdb
+Connected.
+
+- 접속한 컨테이너가 루트가 아니라 HRPDB임을 확인
+HR@dbsvr> show con_name
+
+CON_NAME
+------------------------------
+HRPDB
+
+- 접속한 사용자 확인
+HR@dbsvr> show user
+USER is "HR"
+
+======================================================================
+[4단계] 포트 생략(기본 1521 가정)과 닫힌 PDB 접속 오류
+======================================================================
+
+- 리스너가 1521 포트를 사용하므로 포트를 생략해도 동일하게 접속됨
+HR@dbsvr> connect hr/hr@dbsvr/hrpdb
+Connected.
+
+- (실수) 아직 열리지 않은(MOUNTED) SALESPDB로 접속 시도
+HR@dbsvr> connect hr/hr@dbsvr/salespdb
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in
+connect descriptor
+
+Warning: You are no longer connected to ORACLE.
+
+- 원인: SALESPDB가 MOUNTED 상태라 해당 서비스가 리스너에 등록되지 않음.
+-   PDB를 열어야 서비스가 자동 등록됨. 먼저 SYSDBA로 접속하여 PDB를 오픈
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SYS@cdb1> alter pluggable database salespdb open;
+
+Pluggable database altered.
+
+- PDB가 열리면서 salespdb 서비스가 리스너에 자동 등록되었는지 확인
+SYS@cdb1> select con_id, name, open_mode from v$pdbs where name='SALESPDB';
+
+    CON_ID NAME                           OPEN_MODE
+---------- ------------------------------ ----------
+         3 SALESPDB                       READ WRITE
+
+- 이제 SALESPDB로 Easy Connect 접속이 정상 동작
+SYS@cdb1> connect hr/hr@dbsvr/salespdb
+Connected.
+
+HR@dbsvr> show con_name
+
+CON_NAME
+------------------------------
+SALESPDB
+
+======================================================================
+[5단계] 접속 해제(DISCONNECT vs EXIT)
+======================================================================
+
+- DISCONNECT: 세션만 끊고 SQL*Plus는 유지 -> 다른 계정으로 재접속 준비
+HR@dbsvr> disconnect
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+- 같은 SQL*Plus 안에서 관리자 세션으로 다시 접속
+SQL> connect system/oracle@dbsvr/hrpdb
+Connected.
+
+- [정리]
+-   OS 인증(/ as sysdba)   = 로컬 + dba 그룹 멤버 -> SYS로 CDB$ROOT 접속(비밀번호 불필요)
+-   Easy Connect           = user/pw@host:port/service -> PDB 접속(클라이언트 설정 불필요)
+-   ORA-12514              = 서비스 미등록(서비스명 오타 또는 PDB 미오픈)
+-   DISCONNECT=세션만 종료 / EXIT=SQL*Plus 종료+연결 해제+세션 종료
+SYSTEM@dbsvr> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

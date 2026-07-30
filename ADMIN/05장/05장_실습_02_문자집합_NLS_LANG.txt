@@ -1,0 +1,168 @@
+-- 5장 실습_02: 문자집합(Character Set) 선택 및 NLS_LANG 설정 확인 실습
+--   시나리오: 데이터베이스는 AL32UTF8(유니코드)로 생성되어 있다. 클라이언트의 NLS_LANG을
+--   실제 인코딩과 다르게(서버 문자집합에 무작정 맞춰) 설정했을 때 데이터가 조용히 손상되는 과정을
+--   재현하고, 원인을 DUMP()로 파악한 뒤, 올바른 NLS_LANG으로 재시도해 정상 저장되는 것을 확인한다.
+
+======================================================================
+[0단계] 서버(데이터베이스) 문자집합 확인
+======================================================================
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+
+- 데이터베이스 문자집합이 AL32UTF8 인지 확인
+SYS@ORCL> select value from nls_database_parameters
+  2  where parameter = 'NLS_CHARACTERSET';
+
+VALUE
+----------------
+AL32UTF8
+
+- 실습용 테이블을 PDB1 안에 준비 (컨테이너 전환)
+SYS@ORCL> alter session set container = pdb1;
+
+Session altered.
+
+- 문자열의 문자 수(LENGTH)와 바이트 수(LENGTHB)가 다른 것을 먼저 눈으로 확인
+--   AL32UTF8에서 한글 한 글자는 3바이트다
+SYS@ORCL> select length('가') as chars, lengthb('가') as bytes from dual;
+
+     CHARS      BYTES
+---------- ----------
+         1          3
+
+- 이름을 담을 실습 테이블 생성 (글자 수 기준으로 넉넉히)
+SYS@ORCL> create table t_cust (id number, nm varchar2(30 char));
+
+Table created.
+
+SYS@ORCL> exit
+Disconnected from Oracle Database 19c ...
+[oracle@dbsvr ~]$
+
+======================================================================
+[1단계] (오류 재현) NLS_LANG을 '실제 인코딩과 다르게' 설정
+======================================================================
+
+- 이 클라이언트 터미널의 실제 인코딩은 라틴1 계열(WE8ISO8859P1)이라고 가정한다.
+--   그런데 흔한 실수처럼, NLS_LANG의 문자집합을 '서버와 같은 AL32UTF8'로 잘못 지정한다.
+[oracle@dbsvr ~]$ export NLS_LANG=AMERICAN_AMERICA.AL32UTF8
+
+- 현재 NLS_LANG 확인
+[oracle@dbsvr ~]$ echo $NLS_LANG
+AMERICAN_AMERICA.AL32UTF8
+
+- 라틴1 특수문자(예: é, ü)가 들어간 값을 입력한다.
+--   클라이언트는 WE8ISO8859P1 바이트를 보내지만, NLS_LANG이 AL32UTF8이라 서버는
+--   '변환 불필요'로 가정하고 그대로 저장한다 → 잘못된 바이트 유입
+[oracle@dbsvr ~]$ sqlplus hr/hr@localhost:1521/pdb1
+
+HR@pdb1> insert into t_cust values (1, 'Renée Müller');
+
+1 row created.
+
+HR@pdb1> commit;
+
+Commit complete.
+
+- 겉보기에는 성공했다. 그러나 저장된 실제 바이트를 DUMP로 열어보면 문제가 드러난다.
+--   1016 = 16진수 표기 + 문자집합 이름 표시
+HR@pdb1> select id, dump(nm, 1016) as raw_bytes from t_cust where id = 1;
+
+        ID RAW_BYTES
+---------- ------------------------------------------------------------
+         1 Typ=1 Len=12 CharacterSet=AL32UTF8: 52,65,6e,e9,20,4d,fc,6c,6c,65,72
+-- 문제: 'é'가 UTF-8 정상값(0xC3 0xA9, 2바이트)이 아니라 라틴1 단일 바이트 0xe9 로 저장됨.
+--        'ü'도 UTF-8(0xC3 0xBC)이 아니라 0xfc 단일 바이트. 즉 UTF-8로는 깨진 바이트열이다.
+
+- 조회 시에도 깨져 보이거나, 다른 클라이언트/웹에서 물음표(?)로 표시되는 원인이 바로 이것이다.
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[2단계] 원인 파악
+======================================================================
+
+- 핵심 원리:
+--   (1) NLS_LANG의 charset 은 '클라이언트가 실제로 만들어내는 바이트의 인코딩'을 선언해야 한다.
+--   (2) 그런데 NLS_LANG=...AL32UTF8 로 서버 문자집합과 똑같이 선언해 버렸다.
+--   (3) 서버는 클라이언트도 AL32UTF8 이라고 믿고 '변환이 필요 없다'고 가정 → 변환 생략.
+--   (4) 실제로는 라틴1(WE8ISO8859P1) 바이트가 그대로 들어가 UTF-8로 유효하지 않은 데이터가 됨.
+- => 손상은 INSERT(입력) 시점에 이미 발생했다. 조회 도구를 바꿔도 복구되지 않는다.
+
+- 잘못 저장된 실습 행은 제거하고, 올바른 설정으로 재시도할 준비
+[oracle@dbsvr ~]$ sqlplus hr/hr@localhost:1521/pdb1
+HR@pdb1> delete from t_cust where id = 1;
+
+1 row deleted.
+
+HR@pdb1> commit;
+
+Commit complete.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[3단계] (수정) 올바른 NLS_LANG 설정으로 재시도
+======================================================================
+
+- 클라이언트의 실제 인코딩(WE8ISO8859P1)에 맞게 NLS_LANG을 지정한다.
+--   이제 서버는 'WE8ISO8859P1 → AL32UTF8' 변환이 필요함을 알고 자동 변환한다.
+[oracle@dbsvr ~]$ export NLS_LANG=AMERICAN_AMERICA.WE8ISO8859P1
+[oracle@dbsvr ~]$ echo $NLS_LANG
+AMERICAN_AMERICA.WE8ISO8859P1
+
+[oracle@dbsvr ~]$ sqlplus hr/hr@localhost:1521/pdb1
+
+HR@pdb1> insert into t_cust values (2, 'Renée Müller');
+
+1 row created.
+
+HR@pdb1> commit;
+
+Commit complete.
+
+- 이번에는 저장된 바이트가 올바른 UTF-8 인코딩인지 DUMP로 확인
+HR@pdb1> select id, dump(nm, 1016) as raw_bytes from t_cust where id = 2;
+
+        ID RAW_BYTES
+---------- ------------------------------------------------------------
+         2 Typ=1 Len=14 CharacterSet=AL32UTF8: 52,65,6e,c3,a9,20,4d,c3,bc,6c,6c,65,72
+-- 정상: 'é' = c3,a9 (UTF-8 2바이트), 'ü' = c3,bc (UTF-8 2바이트) 로 올바르게 변환·저장됨.
+--        Len 도 12 -> 14 로 늘었다(멀티바이트 변환의 결과).
+
+- 문자 수/바이트 수도 함께 확인
+HR@pdb1> select nm, length(nm) as chars, lengthb(nm) as bytes from t_cust where id = 2;
+
+NM                CHARS      BYTES
+--------------- ---------- ----------
+Renée Müller           12         14
+
+======================================================================
+[4단계] 세션이 인식한 NLS 설정 확인 및 정리
+======================================================================
+
+- 현재 세션이 인식하는 NLS 언어/지역 확인(클라이언트 NLS_LANG의 language_territory 부분 반영)
+HR@pdb1> select parameter, value from nls_session_parameters
+  2  where parameter in ('NLS_LANGUAGE','NLS_TERRITORY');
+
+PARAMETER            VALUE
+-------------------- --------------------
+NLS_LANGUAGE         AMERICAN
+NLS_TERRITORY        AMERICA
+
+- [정리]
+--   1) NLS_LANG=language_territory.charset 에서 손상과 직접 관련되는 것은 마지막 charset 이다.
+--   2) charset 은 반드시 '클라이언트의 실제 인코딩'을 선언해야 한다.
+--      서버 문자집합에 무작정 맞추면(=AL32UTF8) 변환이 생략되어 데이터가 조용히 손상된다.
+--   3) 손상 여부는 화면 표시가 아니라 DUMP()로 '실제 저장 바이트'를 봐야 확정할 수 있다.
+--   4) 새 데이터베이스를 AL32UTF8로 만들어 두면, 클라이언트 NLS_LANG만 정확하면 어떤 언어든 안전하다.
+HR@pdb1> exit
+Disconnected from Oracle Database 19c ...
+[oracle@dbsvr ~]$

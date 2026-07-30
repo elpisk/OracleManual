@@ -1,0 +1,171 @@
+-- 4장 실습_02: SQL*Plus에서 스크립트 호출 실습
+-- 목표: (1) 세션 내 @ 연산자, (2) 커맨드라인 인자로 스크립트 실행, (3) @@ 상대경로,
+--       (4) 쉘 스크립트(히어 도큐먼트) 연동, (5) WHENEVER SQLERROR로 오류 처리.
+--       중간에 확장자/경로 오류를 재현하고 수정한다.
+
+======================================================================
+[1단계] SQL*Plus 세션 내에서 스크립트 저장(SAVE)과 실행(@)
+======================================================================
+
+- HR 사용자로 HRPDB에 Easy Connect 접속
+[oracle@dbsvr ~]$ sqlplus hr/hr@dbsvr:1521/hrpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 11:02:10 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+
+- 부서 목록 조회 문장을 버퍼에 입력
+HR@dbsvr> select department_id, department_name from departments order by department_id;
+
+DEPARTMENT_ID DEPARTMENT_NAME
+------------- ------------------------------
+           10 Administration
+           20 Marketing
+           50 Shipping
+           60 IT
+
+- 현재 버퍼 내용을 스크립트로 저장 (SAVE는 .sql 확장자를 자동으로 붙임)
+HR@dbsvr> save list_depts
+Created file list_depts.sql
+
+- (실수) 저장한 스크립트를 확장자까지 붙여 실행하려다 파일명을 오타(list_dept)
+HR@dbsvr> @list_dept
+SP2-0310: unable to open file "list_dept.sql"
+
+- 원인: 저장된 파일명은 list_depts.sql 인데 list_dept 로 잘못 입력함.
+-   올바른 이름으로, 확장자는 생략하고 실행(@ 연산자는 .sql을 자동으로 가정)
+HR@dbsvr> @list_depts
+
+DEPARTMENT_ID DEPARTMENT_NAME
+------------- ------------------------------
+           10 Administration
+           20 Marketing
+           50 Shipping
+           60 IT
+
+======================================================================
+[2단계] 커맨드라인 인자로 스크립트 실행 + 바인드 파라미터(&1) 전달
+======================================================================
+
+- SQL*Plus를 종료하고 셸에서 스크립트 파일을 작성
+HR@dbsvr> exit
+[oracle@dbsvr ~]$ cat > emp_by_dept.sql <<'SQL'
+-- 인자 &1(부서번호)로 직원을 조회하는 스크립트
+set verify off
+select employee_id, last_name, salary
+from   employees
+where  department_id = &1
+order  by employee_id;
+SQL
+
+- SQL*Plus 최초 호출과 동시에 스크립트 실행하고 인자 60을 전달
+-   형식: sqlplus user/pw@service @스크립트 인자1 인자2 ...
+[oracle@dbsvr ~]$ sqlplus -s hr/hr@dbsvr/hrpdb @emp_by_dept.sql 60
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        103 Hunold                          9000
+        104 Ernst                           6000
+        107 Lorentz                         4200
+
+======================================================================
+[3단계] @@ (상대경로) 로 스크립트 안에서 다른 스크립트 호출
+======================================================================
+
+- 하위 디렉터리에 공통 헤더 스크립트를 만들고, 메인 스크립트에서 호출
+[oracle@dbsvr ~]$ mkdir -p scripts
+[oracle@dbsvr ~]$ cat > scripts/header.sql <<'SQL'
+prompt ===== 사원 급여 리포트 =====
+column last_name format a20
+SQL
+[oracle@dbsvr ~]$ cat > scripts/report.sql <<'SQL'
+-- @@ 는 '현재 실행 중인 스크립트가 있는 디렉터리' 기준으로 경로를 해석
+@@header
+select last_name, salary from employees where rownum <= 3;
+SQL
+
+- 메인 스크립트를 실행: @@header 덕분에 scripts/ 안의 header.sql을 정확히 찾음
+[oracle@dbsvr ~]$ sqlplus -s hr/hr@dbsvr/hrpdb @scripts/report.sql
+===== 사원 급여 리포트 =====
+
+LAST_NAME                SALARY
+-------------------- ----------
+King                      24000
+Kochhar                   17000
+De Haan                   17000
+
+- 참고: 만약 @@ 대신 @header 로 썼다면 SQL*Plus 시작 위치(홈 디렉터리) 기준으로
+-   찾기 때문에 SP2-0310(파일 열기 실패)이 발생했을 것이다. 배포 패키지에선 @@를 쓴다.
+
+======================================================================
+[4단계] 쉘 스크립트(히어 도큐먼트)에서 SQL*Plus 호출 + 오류 처리
+======================================================================
+
+- WHENEVER SQLERROR 없이 작성한 배치를 먼저 실행 -> 오류가 나도 계속 진행되는 문제 확인
+[oracle@dbsvr ~]$ cat > batch_bad.sh <<'SH'
+#!/bin/bash
+# (나쁜 예) 오류가 나도 멈추지 않고 다음 문장을 실행함
+sqlplus -s hr/hr@dbsvr/hrpdb <<EOF
+update employees set salary = salary * 1.10 where department_id = 999999;
+insert into no_such_table values (1);
+select count(*) from employees;
+commit;
+quit
+EOF
+SH
+[oracle@dbsvr ~]$ chmod +x batch_bad.sh
+[oracle@dbsvr ~]$ ./batch_bad.sh
+
+0 rows updated.
+insert into no_such_table values (1)
+            *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+  COUNT(*)
+----------
+       107
+
+- 문제: 중간에 ORA-00942가 났는데도 이후 SELECT/COMMIT이 그대로 실행됨.
+-   운영 배치라면 잘못된 상태를 커밋할 위험이 있다. WHENEVER SQLERROR로 즉시 중단하도록 수정.
+[oracle@dbsvr ~]$ cat > batch_ok.sh <<'SH'
+#!/bin/bash
+# 파일명: batch_ok.sh
+# (좋은 예) 오류 시 즉시 종료 + 실행 로그 남기기
+sqlplus -s hr/hr@dbsvr/hrpdb <<EOF
+whenever sqlerror exit sql.sqlcode
+set echo on
+spool /tmp/batch_ok.log
+select count(*) from employees;
+update employees set salary = salary * 1.10 where department_id = 60;
+commit;
+spool off
+quit
+EOF
+echo "exit code = \$?"
+SH
+[oracle@dbsvr ~]$ chmod +x batch_ok.sh
+[oracle@dbsvr ~]$ ./batch_ok.sh
+
+  COUNT(*)
+----------
+       107
+
+3 rows updated.
+
+Commit complete.
+exit code = 0
+
+- 종료 코드가 0(정상)임을 확인. 만약 SQL 오류가 났다면 WHENEVER SQLERROR가
+-   즉시 SQL*Plus를 종료하고 0이 아닌 종료 코드를 반환해 배치가 실패로 감지되었을 것이다.
+
+- [정리]
+-   @script(세션 내) / sqlplus ... @script 인자(최초 호출) / @@script(상대경로)
+-   SAVE는 .sql 자동 부여 -> 실행 시 확장자 생략
+-   쉘 연동은 히어 도큐먼트(<<EOF ... EOF)
+-   운영 배치엔 WHENEVER SQLERROR EXIT SQL.SQLCODE + SPOOL 로그 필수
+[oracle@dbsvr ~]$
