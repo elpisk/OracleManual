@@ -1,0 +1,142 @@
+-- 10장 실습_04: 데이터베이스 서비스로 워크로드 관리 개념 확인
+--   목표: V$ACTIVE_SERVICES / DBA_SERVICES / V$SERVICES로 서비스를 조회하고,
+--         PDB 기본 서비스로 접속하며, 서비스로 접속 경로를 분리하는 개념을 확인한다.
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 10:40:15 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] CDB/PDB에 등록된 활성 서비스 조회 (V$ACTIVE_SERVICES)
+======================================================================
+
+- 컨테이너별(CON_ID)로 현재 활성화된 서비스 확인. PDB를 만들면 PDB명과 같은 기본 서비스가 자동 생성됨
+SYS@cdb1> column name format a18
+SYS@cdb1> column network_name format a28
+SYS@cdb1> select name, network_name, con_id
+  2  from v$active_services
+  3  order by con_id, name;
+
+NAME               NETWORK_NAME                     CON_ID
+------------------ ---------------------------- ----------
+SYS$BACKGROUND                                          1
+SYS$USERS                                               1
+cdb1.us.oracle.com cdb1.us.oracle.com                    1
+salespdb.us.oracle salespdb.us.oracle.com                3
+hrpdb.us.oracle.co hrpdb.us.oracle.com                   4
+
+- SYS$BACKGROUND / SYS$USERS 는 내부(백그라운드/기본 사용자) 서비스로 네트워크 접속용이 아님
+
+======================================================================
+[2단계] 데이터 딕셔너리(DBA_SERVICES)로 현재 컨테이너의 서비스 확인
+======================================================================
+
+- 루트에서 본 서비스 (CDB 루트 컨테이너 소속 서비스)
+SYS@cdb1> select name, network_name, pdb from dba_services order by name;
+
+NAME               NETWORK_NAME                 PDB
+------------------ ---------------------------- ----------
+SYS$BACKGROUND                                  CDB$ROOT
+SYS$USERS                                        CDB$ROOT
+cdb1.us.oracle.com cdb1.us.oracle.com           CDB$ROOT
+
+- 특정 PDB의 서비스는 그 PDB 컨테이너에서 조회해야 한다. salespdb로 전환
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+SYS@cdb1> select name, network_name, pdb from dba_services order by name;
+
+NAME                    NETWORK_NAME                 PDB
+----------------------- ---------------------------- ----------
+salespdb.us.oracle.com  salespdb.us.oracle.com       SALESPDB
+
+- 루트로 복귀
+SYS@cdb1> alter session set container = cdb$root;
+
+Session altered.
+
+======================================================================
+[3단계] PDB 기본 서비스로 접속 (서비스가 곧 접속의 목적지)
+======================================================================
+
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+- PDB명과 동일한 기본 서비스로 해당 PDB에 바로 접속
+[oracle@dbsvr ~]$ sqlplus system@dbsvr.us.oracle.com:1521/salespdb.us.oracle.com
+Enter password:
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYSTEM@...salespdb.us.oracle.com> show con_name
+
+CON_NAME
+------------------------------
+SALESPDB
+
+======================================================================
+[4단계] (실수) 리스너에 없는 서비스로 접속 -> ORA-12514, 등록 상태 확인
+======================================================================
+
+SYSTEM@...salespdb.us.oracle.com> exit
+
+- (실수) 아직 만들지 않은 워크로드용 서비스 sales_oltp 로 접속 시도
+[oracle@dbsvr ~]$ sqlplus system@dbsvr.us.oracle.com:1521/sales_oltp.us.oracle.com
+Enter password:
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in
+connect descriptor
+
+- 원인: sales_oltp 서비스가 아직 생성/등록되지 않았음. 리스너 등록 서비스 목록으로 확인
+[oracle@dbsvr ~]$ lsnrctl status | grep "Service \""
+Service "cdb1.us.oracle.com" has 1 instance(s).
+Service "salespdb.us.oracle.com" has 1 instance(s).
+Service "hrpdb.us.oracle.com" has 1 instance(s).
+
+- sales_oltp 는 목록에 없다. 이런 워크로드 전용 서비스를 만드는 방법은 실습_05(DBMS_SERVICE)에서 다룬다.
+-   지금은 기존 기본 서비스로 접속해 서비스별 세션 분포를 확인한다.
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+
+======================================================================
+[5단계] 서비스별 세션 분포 확인 (워크로드 관리의 기초)
+======================================================================
+
+- 각 세션이 어떤 서비스로 접속했는지 집계 -> 서비스가 워크로드 그룹화의 단위가 됨을 확인
+SYS@cdb1> select service_name, count(*) as sess_cnt
+  2  from v$session
+  3  where username is not null
+  4  group by service_name
+  5  order by sess_cnt desc;
+
+SERVICE_NAME               SESS_CNT
+------------------------- ----------
+salespdb.us.oracle.com             2
+SYS$USERS                          3
+
+- [정리]
+-   데이터베이스 서비스 = 하나 이상 인스턴스가 호스팅하는 워크로드의 명명된 표현(접속의 목적지)
+-   V$ACTIVE_SERVICES / DBA_SERVICES / V$SESSION.SERVICE_NAME 로 서비스와 접속을 관찰
+-   여러 서비스를 두면 접속 경로를 나누어 식별/자원 배분/모니터링을 분리할 수 있다
+-   서비스 이름은 CDB 내 + 특정 리스너를 통해 도달하는 모든 CDB 범위에서 고유해야 한다
+-   ORA-12514 = 요청 서비스 미등록 -> 서비스 생성/등록 필요(실습_05로 연결)
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+[oracle@dbsvr ~]$

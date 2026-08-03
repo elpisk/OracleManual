@@ -1,0 +1,146 @@
+-- 10장 실습_05: DBMS_SERVICE.CREATE_SERVICE로 서비스 생성 실습
+--   목표: PDB(salespdb)에 워크로드 전용 서비스 sales_oltp를 생성/시작하고,
+--         리스너 등록과 접속을 확인한 뒤, 중지/삭제로 정리한다. 오류 -> 수정 흐름 포함.
+--   주의: 이 데이터베이스는 순수 단일 인스턴스(비 Grid) 가정. Oracle Restart/RAC면 SRVCTL 사용.
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 11:02:31 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] (실수) 루트에서 서비스 생성 시도 후, 올바른 대상 PDB로 전환
+======================================================================
+
+- 이 서비스는 salespdb 워크로드용이므로 해당 PDB 컨테이너에서 만들어야 한다.
+-   (실수) 루트(CDB$ROOT)에 붙은 채로 만들면 서비스가 엉뚱한 컨테이너에 생성된다.
+-   대상 PDB로 컨테이너를 전환한다.
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+SALESPDB
+
+- PDB가 READ WRITE 로 열려 있어야 서비스 생성/시작이 정상 반영됨
+SYS@cdb1> select open_mode from v$pdbs where name = 'SALESPDB';
+
+OPEN_MODE
+--------------------
+READ WRITE
+
+======================================================================
+[2단계] DBMS_SERVICE.CREATE_SERVICE 로 서비스 정의
+======================================================================
+
+- service_name(내부 이름)과 network_name(클라이언트가 접속에 사용하는 이름)을 지정
+SYS@cdb1> begin
+  2    dbms_service.create_service(
+  3      service_name => 'sales_oltp',
+  4      network_name => 'sales_oltp.us.oracle.com');
+  5  end;
+  6  /
+
+PL/SQL procedure successfully completed.
+
+- 생성 확인 (아직 시작 전이므로 리스너에는 등록되지 않은 상태)
+SYS@cdb1> select name, network_name from dba_services where name = 'sales_oltp';
+
+NAME         NETWORK_NAME
+------------ ----------------------------
+sales_oltp   sales_oltp.us.oracle.com
+
+======================================================================
+[3단계] (실수) 시작 전에 접속 시도 -> ORA-12514, 이후 START_SERVICE
+======================================================================
+
+- (실수) 서비스를 START 하기 전에 접속을 시도
+SYS@cdb1> host sqlplus -L system/oracle@dbsvr.us.oracle.com:1521/sales_oltp.us.oracle.com <<< "select 1 from dual;"
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in
+connect descriptor
+
+- 원인: CREATE_SERVICE로 정의만 했을 뿐 START_SERVICE를 하지 않아 리스너에 등록되지 않음.
+-   서비스를 시작한다(시작해야 LREG가 리스너에 등록하고 접속을 받는다).
+SYS@cdb1> exec dbms_service.start_service('sales_oltp');
+
+PL/SQL procedure successfully completed.
+
+- 서비스 상태가 활성인지 확인
+SYS@cdb1> select name, network_name from v$active_services where name = 'sales_oltp';
+
+NAME         NETWORK_NAME
+------------ ----------------------------
+sales_oltp   sales_oltp.us.oracle.com
+
+======================================================================
+[4단계] 리스너 등록 확인 및 새 서비스로 접속
+======================================================================
+
+- 즉시 등록을 유도(동적 등록은 주기적이므로 바로 반영하려면 REGISTER)
+SYS@cdb1> alter session set container = cdb$root;
+
+Session altered.
+
+SYS@cdb1> alter system register;
+
+System altered.
+
+- 리스너에 sales_oltp 서비스가 등록되었는지 확인
+SYS@cdb1> host lsnrctl status | grep sales_oltp
+Service "sales_oltp.us.oracle.com" has 1 instance(s).
+
+- 새 워크로드 서비스로 접속 성공
+SYS@cdb1> host sqlplus -s system/oracle@dbsvr.us.oracle.com:1521/sales_oltp.us.oracle.com <<< "select sys_context('USERENV','SERVICE_NAME') svc from dual;"
+
+SVC
+------------------------------
+sales_oltp.us.oracle.com
+
+======================================================================
+[5단계] 실습 정리: 서비스 중지 및 삭제
+======================================================================
+
+- 정리를 위해 대상 PDB로 돌아가 서비스를 중지한다
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+SYS@cdb1> exec dbms_service.stop_service('sales_oltp');
+
+PL/SQL procedure successfully completed.
+
+- (실수) 중지만 하고 삭제하지 않으면 정의가 남는다. 완전히 삭제
+SYS@cdb1> exec dbms_service.delete_service('sales_oltp');
+
+PL/SQL procedure successfully completed.
+
+- 삭제 확인 (행이 조회되지 않아야 정상)
+SYS@cdb1> select count(*) as remaining from dba_services where name = 'sales_oltp';
+
+ REMAINING
+----------
+         0
+
+- [정리]
+-   DBMS_SERVICE 흐름: CREATE_SERVICE(정의) -> START_SERVICE(시작=리스너 등록) -> 접속
+-   시작 전 접속은 ORA-12514(미등록). START 후 ALTER SYSTEM REGISTER로 즉시 등록 유도 가능
+-   정리: STOP_SERVICE -> DELETE_SERVICE
+-   중요: Oracle Restart(단일)/RAC(Clusterware) 관리 DB에서는 DBMS_SERVICE 대신 SRVCTL 사용
+-     (예: srvctl add service / start service / status service) -> 클러스터 자원과 일관성 유지
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+[oracle@dbsvr ~]$
