@@ -1,0 +1,122 @@
+-- 13장 실습_03: 클라이언트 tnsnames.ora에 Connection Manager 주소 설정
+
+- 클라이언트(app01)는 최종 데이터베이스가 아니라 CMAN 리스너(proxysvr:1521)로 접속해야 한다.
+-   ADDRESS는 CMAN을 가리키고, CONNECT_DATA에는 최종 목적지 서비스 이름(FINDB01)을 넣는다.
+[oracle@app01 ~]$ export TNS_ADMIN=$ORACLE_HOME/network/admin
+[oracle@app01 ~]$ cd $TNS_ADMIN
+[oracle@app01 admin]$ pwd
+/u01/app/oracle/product/19.0.0/client_1/network/admin
+
+======================================================================
+[1단계] finance 넷 서비스 이름 정의: ADDRESS=CMAN, SERVICE_NAME=최종 DB
+======================================================================
+
+- (실수) CONNECT_DATA의 SERVICE_NAME을 오타(FINDB0)로 입력한 채 항목을 추가한다.
+[oracle@app01 admin]$ cat >> tnsnames.ora <<'EOF'
+
+# CMAN(proxysvr) 경유로 재무 DB(FINDB01)에 접속하는 넷 서비스 이름
+finance=
+  (DESCRIPTION=
+    (ADDRESS=(PROTOCOL=tcp)(HOST=proxysvr)(PORT=1521))
+    (CONNECT_DATA=(SERVICE_NAME=FINDB0)))
+EOF
+
+- 추가한 항목을 확인 (SERVICE_NAME 이 FINDB0 로 잘못 들어감)
+[oracle@app01 admin]$ tail -6 tnsnames.ora
+finance=
+  (DESCRIPTION=
+    (ADDRESS=(PROTOCOL=tcp)(HOST=proxysvr)(PORT=1521))
+    (CONNECT_DATA=(SERVICE_NAME=FINDB0)))
+
+======================================================================
+[2단계] tnsping: 이름 해석과 CMAN 리스너 도달성 확인
+======================================================================
+
+- tnsping은 ADDRESS 까지의 도달성만 검사한다(서비스 이름 검증은 실제 접속 때 일어남).
+-   ADDRESS(proxysvr:1521)는 올바르므로 tnsping 자체는 성공한다.
+[oracle@app01 admin]$ tnsping finance
+
+TNS Ping Utility for Linux: Version 19.0.0.0.0 - Production on 22-JUL-2026 14:22:31
+
+Copyright (c) 1997, 2019, Oracle.  All rights reserved.
+
+Used parameter files:
+/u01/app/oracle/product/19.0.0/client_1/network/admin/sqlnet.ora
+
+Used TNSNAMES adapter to resolve the alias
+Attempting to contact (DESCRIPTION= (ADDRESS=(PROTOCOL=tcp)(HOST=proxysvr)(PORT=1521)) (CONNECT_DATA=(SERVICE_NAME=FINDB0)))
+OK (10 msec)
+
+======================================================================
+[3단계] 실제 접속 시도: 서비스 이름 오타로 ORA-12514 -> 수정
+======================================================================
+
+- tnsping은 OK였지만 실제 접속에서는 CMAN이 중계할 최종 서비스(FINDB0)를 찾지 못해 실패
+[oracle@app01 admin]$ sqlplus system/oracle@finance
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 14:23:07 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in connect
+descriptor
+
+- 원인: CONNECT_DATA의 SERVICE_NAME 오타(FINDB0). CMAN 뒤의 DB가 등록한 서비스는 FINDB01 이다.
+-   (참고) ORA-12514 는 '주소는 맞는데 그 뒤의 서비스 이름을 못 찾음'을 뜻하는 대표 오류.
+-   오타를 FINDB01 로 정정한다.
+[oracle@app01 admin]$ sed -i 's#SERVICE_NAME=FINDB0)#SERVICE_NAME=FINDB01)#' tnsnames.ora
+
+- 수정 결과 확인
+[oracle@app01 admin]$ tail -6 tnsnames.ora
+finance=
+  (DESCRIPTION=
+    (ADDRESS=(PROTOCOL=tcp)(HOST=proxysvr)(PORT=1521))
+    (CONNECT_DATA=(SERVICE_NAME=FINDB01)))
+
+======================================================================
+[4단계] 재접속: CMAN 경유로 최종 DB에 정상 접속되는지 검증
+======================================================================
+
+- 수정 후 다시 접속 -> CMAN(proxysvr)이 규칙 통과 후 FINDB01 로 중계하여 접속 성공
+[oracle@app01 admin]$ sqlplus system/oracle@finance
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 14:25:40 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Last Successful login time: Wed Jul 22 2026 14:16:20 +09:00
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+
+- 접속한 서비스 이름이 실제로 FINDB01 인지 확인
+SYSTEM@finance> select sys_context('userenv','service_name') svc from dual;
+
+SVC
+----------------------------------------
+FINDB01
+
+- 이 세션의 클라이언트가 CMAN 게이트웨이(proxysvr)로 보이는지 확인
+-   (클라이언트 app01 -> CMAN proxysvr -> DB dbsvr 의 프록시 경로가 성립)
+SYSTEM@finance> select machine, program from v$session
+  2  where sid = sys_context('userenv','sid');
+
+MACHINE              PROGRAM
+-------------------- ------------------------------
+proxysvr             oracle@proxysvr (TNS V1-V3)
+
+SYSTEM@finance> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+- [정리]
+-   · 클라이언트 tnsnames.ora의 ADDRESS는 CMAN 리스너를, SERVICE_NAME은 최종 DB 서비스를 가리킨다.
+-   · tnsping OK 는 'ADDRESS 도달'만 보증한다. 서비스 이름 오타는 접속 단계에서 ORA-12514로 드러난다.
+-   · 애플리케이션은 finance 라는 이름 그대로 두고 ADDRESS만 CMAN으로 바꾸면 코드 변경 없이 경로만 전환된다.
+[oracle@app01 admin]$

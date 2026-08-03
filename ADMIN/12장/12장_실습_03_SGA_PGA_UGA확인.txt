@@ -1,0 +1,171 @@
+-- 12장 실습_03: 공유 서버 환경에서 SGA/PGA(UGA) 사용 변화 확인
+
+- SQL*Plus로 CDB에 SYSDBA 권한으로 접속 (OS 인증, 전용 서버 경로)
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 13:40:22 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+- (전제) 공유 서버가 활성화되어 있고, HR 계정이 두 가지 경로로 접속해 있다고 가정
+-   · HR@shared : 공유 서버 경로(SERVER=SHARED)
+-   · HR@ded    : (SERVER=DEDICATED) 강제 경로
+SYS@cdb1> show parameter shared_servers
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+max_shared_servers                   integer     20
+shared_servers                       integer     2
+
+======================================================================
+[1단계] UGA/CGA 통계 이름 확인: 어떤 통계로 UGA를 측정하는가
+======================================================================
+
+- 세션 메모리 관련 통계 이름 확인 (UGA = session uga memory)
+SYS@cdb1> select name from v$statname
+  2  where name like 'session%memory%'
+  3  order by name;
+
+NAME
+----------------------------------------------------------------
+session pga memory
+session pga memory max
+session uga memory
+session uga memory max
+
+- 'session uga memory'가 현재 UGA 크기, '...max'가 세션 수명 중 최고치.
+-   전용 서버에서는 UGA가 PGA에 포함되고, 공유 서버에서는 UGA가 SGA(공유/라지 풀)로 이동한다.
+
+======================================================================
+[2단계] 세션별 접속 경로(SERVER) 확인: 전용 vs 공유 구분
+======================================================================
+
+- HR 세션들이 각각 전용/공유 중 무엇으로 접속했는지 SERVER 컬럼으로 구분
+SYS@cdb1> select sid, username, server, program
+  2  from v$session
+  3  where username = 'HR'
+  4  order by server;
+
+       SID USERNAME   SERVER    PROGRAM
+---------- ---------- --------- ------------------------------
+        45 HR         SHARED    sqlplus@app01 (TNS V1-V3)
+        88 HR         DEDICATED sqlplus@app01 (TNS V1-V3)
+
+======================================================================
+[3단계] UGA 크기 비교: 공유 서버 세션 vs 전용 서버 세션
+======================================================================
+
+- (실수) 통계 이름을 대략적으로(uga) 조인하려다 통계 이름을 잘못 적어 결과가 비어 나옴
+SYS@cdb1> select s.sid, s.server, round(m.value/1024) as uga_kb
+  2  from v$session s
+  3  join v$sesstat m on m.sid = s.sid
+  4  join v$statname n on n.statistic# = m.statistic#
+  5  where s.username = 'HR'
+  6    and n.name = 'uga memory';
+
+no rows selected
+
+- 원인: 통계 이름이 정확히 'session uga memory' 여야 함('uga memory'는 존재하지 않음).
+-   정확한 통계 이름으로 재작성
+SYS@cdb1> select s.sid, s.server, round(m.value/1024) as uga_kb
+  2  from v$session s
+  3  join v$sesstat m on m.sid = s.sid
+  4  join v$statname n on n.statistic# = m.statistic#
+  5  where s.username = 'HR'
+  6    and n.name = 'session uga memory'
+  7  order by s.server;
+
+       SID SERVER       UGA_KB
+---------- --------- ----------
+        45 SHARED           412
+        88 DEDICATED        118
+
+- 해석: 같은 HR 계정이라도 공유 서버 세션(SID 45)의 UGA가 SGA에 잡혀 있어 크게 나타난다.
+-   전용 서버 세션(SID 88)은 UGA가 PGA에 있으므로 이 통계 관점의 SGA 사용이 상대적으로 작다.
+
+======================================================================
+[4단계] 공유 서버 세션의 UGA가 SGA(공유 풀/라지 풀)에 있음을 확인
+======================================================================
+
+- 공유 서버 세션의 UGA 최고치와 PGA 값을 함께 조회 (UGA가 SGA로 이동했음을 이해)
+SYS@cdb1> select n.name, round(m.value/1024) as kb
+  2  from v$sesstat m
+  3  join v$statname n on n.statistic# = m.statistic#
+  4  where m.sid = 45
+  5    and n.name in ('session uga memory','session uga memory max',
+  6                   'session pga memory','session pga memory max')
+  7  order by n.name;
+
+NAME                                             KB
+---------------------------------------- ----------
+session pga memory                              896
+session pga memory max                         1024
+session uga memory                              412
+session uga memory max                          540
+
+- 공유 서버에서 UGA(session uga memory)는 공유 메모리에 놓이며, 스택 등 프로세스 로컬은 PGA에 남는다.
+-   라지 풀이 구성되어 있으면 UGA는 라지 풀에 격리된다. SGA 구성요소 크기를 확인:
+SYS@cdb1> select pool, round(sum(bytes)/1024/1024,1) as mb
+  2  from v$sgastat
+  3  where pool in ('shared pool','large pool')
+  4  group by pool;
+
+POOL                MB
+------------ ----------
+large pool         32
+shared pool       640
+
+======================================================================
+[5단계] 라지 풀 사이징 근거: 동시 공유 세션 x 세션당 UGA
+======================================================================
+
+- 현재 공유 서버 세션 수와 세션당 평균 UGA(max)로 라지 풀 소요를 대략 산정
+SYS@cdb1> select count(*) as shared_sessions,
+  2         round(avg(m.value)/1024) as avg_uga_kb
+  3  from v$session s
+  4  join v$sesstat m on m.sid = s.sid
+  5  join v$statname n on n.statistic# = m.statistic#
+  6  where s.server = 'SHARED'
+  7    and n.name = 'session uga memory max';
+
+SHARED_SESSIONS AVG_UGA_KB
+--------------- ----------
+             12        480
+
+- 대략 12 세션 x 480KB ≈ 5.6MB 의 UGA가 SGA(라지 풀)에 필요.
+-   사용자가 늘수록 이 값이 커지므로 LARGE_POOL_SIZE 를 넉넉히 잡아야 ORA-04031 을 예방한다.
+-   AMM(MEMORY_TARGET)/ASMM(SGA_TARGET) 사용 시에는 데이터베이스가 자동 조정한다.
+SYS@cdb1> show parameter large_pool_size
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+large_pool_size                      big integer 0
+
+- large_pool_size=0 이지만 sga_target 이 설정되어 있어 ASMM이 라지 풀을 자동 관리 중임을 확인
+SYS@cdb1> show parameter sga_target
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+sga_target                           big integer 2016M
+
+- [정리]
+-   · 공유 서버에서는 UGA(커서 상태·정렬/해시 영역·세션 데이터)가 PGA -> SGA(공유/라지 풀)로 이동.
+-   · 스택 공간 등 '프로세스 로컬' 데이터는 공유 서버에서도 PGA에 남는다.
+-   · 같은 계정이라도 SHARED 세션의 UGA가 SGA에 크게 잡히며, DEDICATED 세션은 PGA에 있다.
+-   · 사용자 증가에 대비해 LARGE_POOL_SIZE(또는 ASMM/AMM)로 SGA를 사이징해 ORA-04031을 예방한다.
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

@@ -1,0 +1,170 @@
+-- 13장 실습_02: CMAN_RULES(RULE_LIST)로 접근 제어 필터링 규칙(SRC/DST/SRV/ACT) 설정
+
+- (전제) 실습_01에서 cman01 이 기동되어 있고 기본 규칙 2개가 적재된 상태이다.
+-   이번 실습에서는 재무 DB(dbsvr) 접근을 특정 서브넷만 허용하도록 규칙을 세밀화한다.
+[oracle@proxysvr ~]$ export TNS_ADMIN=$ORACLE_HOME/network/admin
+[oracle@proxysvr ~]$ cd $TNS_ADMIN
+
+- 접근 통제 설계(문서로 먼저 정리):
+-   · 허용: 재무팀 서브넷 192.0.2.0/24 -> dbsvr 의 FINDB01 서비스만
+-   · 관리: proxysvr 자기 자신에 대한 cmon 관리 연결 허용
+-   · 그 외 모든 소스는 drop(응답 없이 폐기)하여 존재 자체를 숨김
+
+======================================================================
+[1단계] RULE_LIST 작성: SRC/DST/SRV/ACT 조합 + 마지막 포괄 차단(drop)
+======================================================================
+
+- (실수) 재무팀 서브넷을 192.0.20.0/24 로 잘못 입력한다(오타: 2 -> 20).
+-   또한 규칙은 위에서부터 순서대로 평가되므로, 포괄 drop 규칙을 accept 규칙보다
+-   위에 두면 허용 규칙이 영영 평가되지 않는 점도 함께 주의해야 한다(여기선 순서는 맞게 둔다).
+[oracle@proxysvr admin]$ cat > cman.ora <<'EOF'
+cman01=
+  (CONFIGURATION=
+    (ADDRESS=(PROTOCOL=tcp)(HOST=proxysvr)(PORT=1521))
+    (RULE_LIST=
+      (RULE=(SRC=192.0.20.0/24)(DST=dbsvr)(SRV=FINDB01)(ACT=accept)
+        (ACTION_LIST=(AUT=off)(MCT=120)(MIT=30)))
+      (RULE=(SRC=127.0.0.1)(DST=proxysvr)(SRV=cmon)(ACT=accept))
+      (RULE=(SRC=*)(DST=*)(SRV=*)(ACT=drop)))
+    (PARAMETER_LIST=
+      (LOG_LEVEL=SUPPORT)
+      (TRACING=on)
+      (MAX_GATEWAY_PROCESSES=8)
+      (MIN_GATEWAY_PROCESSES=3)))
+EOF
+
+- 규칙을 반영: CMCTL에 진입하여 reload (재기동 없이 규칙만 다시 읽음)
+[oracle@proxysvr admin]$ cmctl administer cman01
+
+CMCTL for Linux: Version 19.0.0.0.0 - Production on 22-JUL-2026 14:08:19
+
+Copyright (c) 1996, 2019, Oracle.  All rights reserved.
+
+Welcome to CMCTL, type "help" for information.
+
+Current instance cman01 is already started
+Connections refer to (address=(protocol=tcp)(host=proxysvr)(port=1521)).
+The command completed successfully.
+
+- reload 로 3개 규칙이 적재됨을 확인 ("in effect: 3")
+CMCTL:cman01> reload
+Reloading the configuration parameters...
+Number of filtering rules currently in effect: 3
+The command completed successfully.
+
+- 현재 적용 중인 규칙을 조회
+CMCTL:cman01> show rules
+Number of filtering rules currently in effect: 3
+Rule List
+   Source                    Destination               Service     Action
+   192.0.20.0/24             dbsvr                     FINDB01     ACCEPT
+   127.0.0.1                 proxysvr                  cmon        ACCEPT
+   *                         *                         *           DROP
+The command completed successfully.
+CMCTL:cman01> exit
+
+======================================================================
+[2단계] 접속 테스트: 재무팀 클라이언트(192.0.2.50)에서 접근 시도 -> drop
+======================================================================
+
+- (다른 터미널) 재무팀 클라이언트 app01 (IP 192.0.2.50) 에서 CMAN 경유로 접속 시도
+[oracle@app01 ~]$ hostname -I
+192.0.2.50
+[oracle@app01 ~]$ sqlplus system/oracle@finance
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 14:11:44 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+ERROR:
+ORA-12564: TNS:connection was refused
+
+- 원인 추적: CMAN 로그를 보면 이 소스가 마지막 포괄 규칙(DROP)에 걸린 것으로 기록됨
+-   즉 192.0.2.50 은 192.0.20.0/24 대역에 포함되지 않아 첫 accept 규칙과 매칭 실패
+[oracle@proxysvr admin]$ tail -3 /u01/app/oracle/network/log/cman01.log
+(SRC=192.0.2.50)(DST=dbsvr)(SERVICE=FINDB01) : Rule matched: (SRC=*)(DST=*)(SRV=*)(ACT=drop)
+Connection dropped, no matching accept rule for source 192.0.2.50
+
+======================================================================
+[3단계] SRC 대역 오타 수정 -> reload -> 재테스트
+======================================================================
+
+- 원인: SRC 서브넷 오타(192.0.20.0/24 -> 올바른 값 192.0.2.0/24). 첫 규칙만 수정한다.
+[oracle@proxysvr admin]$ sed -i 's#SRC=192.0.20.0/24#SRC=192.0.2.0/24#' cman.ora
+
+- 수정 결과 확인 (첫 accept 규칙의 SRC가 192.0.2.0/24 로 바뀜)
+[oracle@proxysvr admin]$ grep 'SRC=192' cman.ora
+      (RULE=(SRC=192.0.2.0/24)(DST=dbsvr)(SRV=FINDB01)(ACT=accept)
+      (RULE=(SRC=127.0.0.1)(DST=proxysvr)(SRV=cmon)(ACT=accept))
+
+- 규칙을 다시 적재
+[oracle@proxysvr admin]$ cmctl administer cman01
+
+CMCTL for Linux: Version 19.0.0.0.0 - Production on 22-JUL-2026 14:15:02
+
+Copyright (c) 1996, 2019, Oracle.  All rights reserved.
+
+Welcome to CMCTL, type "help" for information.
+
+Current instance cman01 is already started
+Connections refer to (address=(protocol=tcp)(host=proxysvr)(port=1521)).
+The command completed successfully.
+
+CMCTL:cman01> reload
+Reloading the configuration parameters...
+Number of filtering rules currently in effect: 3
+The command completed successfully.
+
+- 수정된 규칙 목록 확인 (SRC 대역이 192.0.2.0/24 로 정정됨)
+CMCTL:cman01> show rules
+Number of filtering rules currently in effect: 3
+Rule List
+   Source                    Destination               Service     Action
+   192.0.2.0/24              dbsvr                     FINDB01     ACCEPT
+   127.0.0.1                 proxysvr                  cmon        ACCEPT
+   *                         *                         *           DROP
+The command completed successfully.
+CMCTL:cman01> exit
+
+- (다른 터미널) 재무팀 클라이언트에서 다시 접속 시도 -> 이번엔 accept 되어 정상 접속
+[oracle@app01 ~]$ sqlplus system/oracle@finance
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 14:16:20 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Last Successful login time: Wed Jul 22 2026 14:11:12 +09:00
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+- 이 세션이 CMAN(프록시)을 경유해 들어왔음을 서버 측 관점에서 확인
+SYSTEM@finance> select sys_context('userenv','ip_address') proxy_ip from dual;
+
+PROXY_IP
+--------------------
+192.0.2.100
+
+- 참고: SERVER 측 V$SESSION 의 MACHINE/PROGRAM 은 CMAN 게이트웨이가 대리 접속하므로
+-   proxysvr(192.0.2.100)로 보인다. 즉 클라이언트-서버 사이에 프록시 계층이 놓였음을 확인.
+SYSTEM@finance> exit
+
+======================================================================
+[4단계] reject vs drop 차이 확인: 비허용 서비스 접근은 reject로 명시 거부
+======================================================================
+
+- 마지막 포괄 규칙을 잠시 reject 로 바꿔 클라이언트가 받는 응답 차이를 관찰(교육용)
+-   drop: 무응답 폐기(타임아웃/refused처럼 보임) / reject: 명시적 거부 오류 즉시 반환
+[oracle@proxysvr admin]$ grep 'ACT=drop\|ACT=reject' cman.ora
+      (RULE=(SRC=*)(DST=*)(SRV=*)(ACT=drop)))
+
+- [정리]
+-   · RULE은 SRC(소스)/DST(목적지)/SRV(서비스)/ACT(accept|reject|drop) 조합으로 구성한다.
+-   · 규칙은 위에서부터 평가되어 처음 일치한 규칙의 액션이 적용된다(구체적 규칙을 위로).
+-   · 화이트리스트(허용만 나열 + 마지막 포괄 drop) 구조가 안전하며, 로그로 반드시 검증한다.
+-   · SRC 대역 오타는 '허용해야 할 접속이 막히는' 대표 원인 -> show rules + 로그로 진단한다.
+[oracle@proxysvr admin]$

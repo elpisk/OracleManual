@@ -1,0 +1,161 @@
+-- 12장 실습_04: 공유 서버 사용이 제한되는 작업(DBA 작업/백업복구/배치) 확인
+
+- SQL*Plus로 CDB에 SYSDBA 권한으로 접속 (OS 인증, 로컬 전용 서버 경로)
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 15:02:58 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+- (전제) 공유 서버가 활성화되어 있음. 그럼에도 DBA/백업/배치는 전용 서버로 처리되어야 함.
+SYS@cdb1> show parameter shared_servers
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+max_shared_servers                   integer     20
+shared_servers                       integer     2
+
+======================================================================
+[1단계] 관리 접속은 항상 전용 서버임을 확인 (SYSDBA 로컬 접속)
+======================================================================
+
+- 현재 SYSDBA 세션의 SERVER 값 확인: 관리 접속은 공유 서버가 아니라 전용 서버 경로
+SYS@cdb1> select sid, username, server, program
+  2  from v$session
+  3  where sid = sys_context('userenv','sid');
+
+       SID USERNAME   SERVER    PROGRAM
+---------- ---------- --------- ------------------------------
+       261 SYS        DEDICATED sqlplus@dbsvr (TNS V1-V3)
+
+- 관리 작업(예: 테이블스페이스 생성)이 정상 수행되는지 확인 (전용 세션이므로 문제없음)
+SYS@cdb1> create tablespace demo_ts datafile size 10m;
+
+Tablespace created.
+
+SYS@cdb1> drop tablespace demo_ts including contents and datafiles;
+
+Tablespace dropped.
+
+======================================================================
+[2단계] STARTUP/SHUTDOWN 은 공유 서버 경로로 불가능함을 이해
+======================================================================
+
+- (실수) 원격에서 공유 서버 별칭(SERVER=SHARED)으로 SYSDBA 접속해 종료를 시도했다고 가정
+-   원격 공유 서버 별칭으로 접속을 시도하면 SYSDBA 권한 협상 단계에서 거부된다.
+SYS@cdb1> host sqlplus -S sys/oracle@cdb1_shared as sysdba <<< "shutdown immediate"
+ERROR:
+ORA-01031: insufficient privileges
+
+
+- 원인: 공유 서버 인프라(디스패처/공유 서버 프로세스)는 인스턴스가 열려 있어야 동작한다.
+-   STARTUP/SHUTDOWN 은 인스턴스가 열리기 전/닫히는 중에도 수행되어야 하므로 공유 서버로 처리 불가.
+-   해결: 관리 작업은 서버 로컬 OS 인증( / as sysdba ) 또는 전용 서버 경로로 수행한다.
+SYS@cdb1> select 'admin tasks require a dedicated/local connection' as note from dual;
+
+NOTE
+-------------------------------------------------
+admin tasks require a dedicated/local connection
+
+======================================================================
+[3단계] 백업/복구(RMAN)는 전용 서버로 접속해야 함
+======================================================================
+
+- RMAN 은 대용량 데이터를 다루므로 전용 연결이 필요하다. 전용 채널로 접속 확인
+SYS@cdb1> host rman target / <<'EOF'
+show all;
+exit;
+EOF
+
+Recovery Manager: Release 19.0.0.0.0 - Production on Wed Jul 22 15:10:14 2026
+
+connected to target database: CDB1 (DBID=1039437891)
+
+RMAN> show all;
+
+CONFIGURE DEVICE TYPE DISK PARALLELISM 1 BACKUP TYPE TO BACKUPSET;
+CONFIGURE CONTROLFILE AUTOBACKUP ON;
+
+RMAN> exit;
+
+Recovery Manager complete.
+
+- RMAN 은 'target /' (로컬 전용 접속)로 붙으므로 공유 서버 경로를 타지 않음을 확인
+-   만약 RMAN 이 공유 서버로 접속되면 대량 데이터가 응답 큐를 통해 흐르며 OLTP 를 지연시킨다.
+
+======================================================================
+[4단계] 배치/대량 작업이 공유 서버를 점유할 때의 문제 재현·진단
+======================================================================
+
+- 무거운 배치성 쿼리가 공유 서버 세션으로 실행되면 그 공유 서버 프로세스를 장기 점유한다.
+-   현재 SHARED 세션 중 오래 실행 중인(active) 세션이 있는지 진단
+SYS@cdb1> select s.sid, s.server, s.status, s.last_call_et as busy_sec, s.sql_id
+  2  from v$session s
+  3  where s.server = 'SHARED' and s.status = 'ACTIVE'
+  4  order by s.last_call_et desc;
+
+       SID SERVER    STATUS   BUSY_SEC SQL_ID
+---------- --------- -------- -------- -------------
+        45 SHARED    ACTIVE        213 8x9y2k3m4n5p6
+
+- busy_sec=213 -> 한 세션이 공유 서버 프로세스를 3분 넘게 점유 중. 큐 대기 증가 여부 확인
+SYS@cdb1> select paddr, type, queued, totalq,
+  2         round(totalq/decode(dequeued,0,1,dequeued)) as avg_wait
+  3  from v$queue
+  4  where type = 'COMMON';
+
+PADDR            TYPE         QUEUED     TOTALQ   AVG_WAIT
+---------------- ---------- -------- ---------- ----------
+00                COMMON            5        260          4
+
+- QUEUED=5 -> 공통 요청 큐에 5건이 대기. 무거운 배치가 공유 서버를 점유해 짧은 OLTP가 밀리는 상황.
+-   조치: 배치/대량 작업은 전용 서버로 분리한다(아래 5단계).
+
+======================================================================
+[5단계] (SERVER=DEDICATED)로 전용 서버 강제: 배치/백업 접속 경로 분리
+======================================================================
+
+- 배치용 tnsnames.ora 별칭에 (SERVER=DEDICATED)를 명시했는지 확인
+SYS@cdb1> host grep -A6 '^BATCH' $ORACLE_HOME/network/admin/tnsnames.ora
+BATCH =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = dbsvr)(PORT = 1521))
+    (CONNECT_DATA =
+      (SERVICE_NAME = cdb1)
+      (SERVER = DEDICATED)))
+
+- 배치 계정으로 BATCH 별칭 접속 시 전용 서버 경로가 강제되는지 검증 (다른 터미널에서 접속 가정)
+SYS@cdb1> select sid, username, server, program
+  2  from v$session
+  3  where username = 'BATCHUSR'
+  4  order by sid;
+
+       SID USERNAME   SERVER    PROGRAM
+---------- ---------- --------- ------------------------------
+       132 BATCHUSR   DEDICATED sqlplus@batch01 (TNS V1-V3)
+
+- SERVER=DEDICATED 로 표시되면 배치 세션이 공유 서버 풀을 잠식하지 않고 자기 전용 프로세스에서 실행됨.
+-   접속 문자열의 (SERVER=DEDICATED) 지정이 최우선으로 접속 경로를 결정함을 확인.
+
+- [정리]
+-   · 관리(DBA) 작업: STARTUP/SHUTDOWN 등은 인스턴스가 열리기 전에도 필요하므로 공유 서버로 불가.
+-     -> 로컬 OS 인증( / as sysdba ) 또는 전용 서버로 수행. 모든 DBA 세션은 전용 서버.
+-   · 백업/복구(RMAN): 대용량 데이터 -> 전용 연결(target /) 필요.
+-   · 배치/대량 로드/웨어하우스: 공유 서버 프로세스를 장기 점유해 큐의 OLTP 요청을 지연시킴.
+-     -> (SERVER=DEDICATED) 로 전용 경로를 강제하고, 서비스/접속 문자열을 워크로드별로 분리한다.
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

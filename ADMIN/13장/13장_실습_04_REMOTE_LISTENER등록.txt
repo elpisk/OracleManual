@@ -1,0 +1,140 @@
+-- 13장 실습_04: 데이터베이스 서버에 REMOTE_LISTENER로 Connection Manager 등록
+
+- 데이터베이스 서버(dbsvr)가 자신의 서비스를 CMAN(원격 리스너)에 동적 등록하도록 구성한다.
+-   ① tnsnames.ora에 CMAN 주소를 가리키는 별칭 정의 ② REMOTE_LISTENER에 그 별칭 지정.
+[oracle@dbsvr ~]$ export TNS_ADMIN=$ORACLE_HOME/network/admin
+[oracle@dbsvr ~]$ cd $TNS_ADMIN
+[oracle@dbsvr admin]$ pwd
+/u01/app/oracle/product/19.0.0/dbhome_1/network/admin
+
+======================================================================
+[1단계] DB 서버 tnsnames.ora에 CMAN 원격 리스너 별칭 정의
+======================================================================
+
+- CMAN(proxysvr:1521)을 가리키는 별칭 listener_cman01 을 추가 (CONNECT_DATA 없이 ADDRESS만)
+[oracle@dbsvr admin]$ cat >> tnsnames.ora <<'EOF'
+
+# 인스턴스가 서비스를 등록할 CMAN(원격 리스너) 별칭
+listener_cman01=
+  (DESCRIPTION=
+    (ADDRESS=(PROTOCOL=tcp)(HOST=proxysvr)(PORT=1521)))
+EOF
+
+- 별칭이 CMAN 리스너까지 도달하는지 tnsping 으로 확인
+[oracle@dbsvr admin]$ tnsping listener_cman01
+
+TNS Ping Utility for Linux: Version 19.0.0.0.0 - Production on 22-JUL-2026 14:31:09
+
+Copyright (c) 1997, 2019, Oracle.  All rights reserved.
+
+Used parameter files:
+/u01/app/oracle/product/19.0.0/dbhome_1/network/admin/sqlnet.ora
+
+Used TNSNAMES adapter to resolve the alias
+Attempting to contact (DESCRIPTION= (ADDRESS=(PROTOCOL=tcp)(HOST=proxysvr)(PORT=1521)))
+OK (0 msec)
+
+======================================================================
+[2단계] REMOTE_LISTENER 설정: 별칭 오타로 등록 실패 -> 수정
+======================================================================
+
+- SQL*Plus로 CDB에 SYSDBA 접속
+[oracle@dbsvr admin]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 14:32:15 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+- (실수) REMOTE_LISTENER 에 tnsnames.ora에 정의하지 않은 별칭(listener_cman1)을 지정한다.
+-   ALTER SYSTEM 자체는 값을 문자열로 받아들여 성공하지만, 실제 등록 단계에서 별칭 해석이 실패한다.
+SYS@cdb1> alter system set remote_listener='listener_cman1' scope=both;
+
+System altered.
+
+- 등록을 즉시 시도 -> LREG가 별칭을 해석하지 못해 경보 로그에 TNS-12154가 기록됨
+SYS@cdb1> alter system register;
+
+System altered.
+
+- CMAN 쪽에서 서비스가 보이는지 확인해 보면(다른 터미널) FINDB01 이 등록되지 않았음
+[oracle@proxysvr ~]$ cmctl show services -c cman01
+...
+Services Summary...
+  Service "cmon" has 1 instance(s).
+    Instance "cman01", status READY, has 1 handler(s) for this service...
+The command completed successfully.
+
+- 원인 확인: DB 경보 로그에 원격 리스너 별칭 해석 실패(TNS-12154)가 남음
+SYS@cdb1> host tail -2 /u01/app/oracle/diag/rdbms/cdb1/cdb1/trace/alert_cdb1.log
+Wed Jul 22 14:33:02 2026
+ORA-12154: TNS:could not resolve the connect identifier "listener_cman1" (remote listener registration)
+
+- 원인: 별칭 오타(listener_cman1). tnsnames.ora에 정의된 이름은 listener_cman01 이다.
+-   올바른 별칭으로 정정한다.
+SYS@cdb1> alter system set remote_listener='listener_cman01' scope=both;
+
+System altered.
+
+======================================================================
+[3단계] 재등록: 서비스가 CMAN에 동적 등록되는지 검증
+======================================================================
+
+- 별칭이 올바르므로 LREG가 CMAN(원격 리스너)에 서비스를 등록하도록 즉시 재등록
+SYS@cdb1> alter system register;
+
+System altered.
+
+- REMOTE_LISTENER 값이 올바른 별칭으로 반영되었는지 확인
+SYS@cdb1> show parameter remote_listener
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+remote_listener                      string      listener_cman01
+
+- 이번엔 CMAN 쪽에서 FINDB01 서비스가 보이는지 확인(다른 터미널) -> 등록 성공
+[oracle@proxysvr ~]$ cmctl show services -c cman01
+...
+Services Summary...
+  Service "FINDB01" has 1 instance(s).
+    Instance "cdb1", status READY, has 1 handler(s) for this service...
+      Handler(s):
+        "DEDICATED" established:0 refused:0 state:ready
+         REMOTE SERVER
+         (ADDRESS=(PROTOCOL=TCP)(HOST=dbsvr)(PORT=1521))
+  Service "cmon" has 1 instance(s).
+    Instance "cman01", status READY, has 1 handler(s) for this service...
+The command completed successfully.
+
+- DB 서버 쪽에서도 원격 리스너 등록 상태를 확인 (CMAN 주소로 등록되어 있음)
+SYS@cdb1> select name, network from v$dispatcher_config where rownum <= 1;
+
+no rows selected
+
+- (참고) 인스턴스가 어떤 리스너에 등록되어 있는지는 서비스 관점으로 확인
+SYS@cdb1> select name, network_name from v$active_services
+  2  where name = 'FINDB01';
+
+NAME       NETWORK_NAME
+---------- ------------------------------
+FINDB01    FINDB01
+
+- [정리]
+-   · REMOTE_LISTENER는 인스턴스(LREG)가 CMAN(원격 리스너)에 서비스를 동적 등록하게 하는 열쇠다.
+-   · 값에는 tnsnames.ora에 정의된 CMAN 별칭을 넣는다. 별칭 미해석 시 경보 로그에 TNS-12154.
+-   · 설정 후 ALTER SYSTEM REGISTER로 즉시 반영하고, CMAN의 show services로 서비스 등록을 검증한다.
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr admin]$

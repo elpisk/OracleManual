@@ -1,0 +1,152 @@
+-- 12장 실습_01: SHARED_SERVERS 파라미터로 공유 서버 활성화 실습
+
+- SQL*Plus로 CDB에 SYSDBA 권한으로 접속 (OS 인증, 로컬 전용 서버 경로)
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Jul 22 10:05:41 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+- 프롬프트를 사용자@인스턴스 형태로 지정 (실습 환경 glogin.sql 설정)
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] 현재 공유 서버 관련 파라미터 확인: 활성화 전 기준선 파악
+======================================================================
+
+- 공유 서버 관련 파라미터를 한 번에 조회 (활성화 전 상태 확인)
+-   shared_servers=0 이면 일반 사용자 접속은 전용 서버로만 처리됨
+SYS@cdb1> show parameter shared_server
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+max_shared_servers                   integer
+shared_server_sessions               integer
+shared_servers                       integer     0
+
+- shared_servers=0 이지만 XDB용 공유 서버/디스패처는 이미 떠 있을 수 있음(정상)
+-   Oracle XML DB(XDB)는 내부적으로 공유 서버 인프라를 사용하도록 기본 구성됨
+SYS@cdb1> select name, status from v$shared_server order by name;
+
+NAME   STATUS
+------ ----------------
+S000   WAIT(COMMON)
+
+- 디스패처도 XDB용으로 하나 떠 있는 것을 확인 (D000)
+SYS@cdb1> select name, network, status from v$dispatcher order by name;
+
+NAME   NETWORK                                            STATUS
+------ -------------------------------------------------- ----------------
+D000   (ADDRESS=(PROTOCOL=tcp)(HOST=dbsvr)(PORT=...))     WAIT
+
+======================================================================
+[2단계] 공유 서버 활성화 시도: 파라미터 이름 오류 -> 수정
+======================================================================
+
+- (실수) 파라미터 이름을 단수형(shared_server)으로 잘못 입력하여 활성화 시도
+SYS@cdb1> alter system set shared_server=2 scope=both;
+alter system set shared_server=2 scope=both
+                 *
+ERROR at line 1:
+ORA-02065: illegal option for ALTER SYSTEM
+
+- 원인: 파라미터 이름은 복수형 SHARED_SERVERS 이다(단수형 shared_server는 없음).
+-   올바른 이름으로 재시도
+SYS@cdb1> alter system set shared_servers=2 scope=both;
+
+System altered.
+
+- SHARED_SERVERS를 2로 설정하면 인스턴스가 최소 2개의 공유 서버를 유지한다.
+-   SCOPE=BOTH 이므로 실행 중 인스턴스와 SPFILE 양쪽에 반영되어 재기동 후에도 유지됨
+SYS@cdb1> show parameter shared_servers
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+max_shared_servers                   integer     40
+shared_servers                       integer     2
+
+======================================================================
+[3단계] 공유 서버 프로세스 확인: S000, S001 이 떴는가
+======================================================================
+
+- 공유 서버 프로세스별 이름/상태/처리량 확인
+-   SHARED_SERVERS=2 이므로 최소 2개(S000, S001)가 유지됨
+SYS@cdb1> select name, status, messages, bytes
+  2  from v$shared_server
+  3  order by name;
+
+NAME   STATUS             MESSAGES      BYTES
+------ ---------------- ---------- ----------
+S000   WAIT(COMMON)            18      24576
+S001   WAIT(COMMON)             0          0
+
+- 참고: 상태 WAIT(COMMON)은 공통 요청 큐에서 요청이 오기를 대기 중이라는 뜻(정상 유휴)
+-   MESSAGES/BYTES는 지금까지 이 공유 서버가 처리한 메시지 수와 바이트 수
+
+======================================================================
+[4단계] 디스패처 자동 생성 확인: SHARED_SERVERS만 켜도 TCP 디스패처가 따라온다
+======================================================================
+
+- 디스패처를 명시적으로 설정하지 않았지만 TCP용 디스패처가 자동 생성됨을 확인
+SYS@cdb1> select name, network, status, conf_indx
+  2  from v$dispatcher
+  3  order by name;
+
+NAME   NETWORK                                            STATUS      CONF_INDX
+------ -------------------------------------------------- ---------- ----------
+D000   (ADDRESS=(PROTOCOL=tcp)(HOST=dbsvr)(PORT=...))     WAIT                0
+
+- OS 레벨에서도 공유 서버(ora_s0*)와 디스패처(ora_d0*) 프로세스를 교차 확인
+-   (다른 터미널에서) ps -ef | grep -E 'ora_s0|ora_d0' | grep -v grep
+SYS@cdb1> host ps -ef | grep -E 'ora_(s|d)00[0-9]_cdb1' | grep -v grep
+oracle    4821     1  0 10:04 ?        00:00:00 ora_d000_cdb1
+oracle    4890     1  0 10:06 ?        00:00:00 ora_s000_cdb1
+oracle    4892     1  0 10:06 ?        00:00:00 ora_s001_cdb1
+
+======================================================================
+[5단계] 공유 서버 모드 동작 검증: 새 세션이 SHARED 로 접속되는지 확인
+======================================================================
+
+- 리스너에 공유 서버 핸들러(디스패처)가 등록되었는지 확인
+SYS@cdb1> host lsnrctl services | grep -i dispatcher
+      "DISPATCHER <machine: dbsvr, pid: 4821>" established:6 refused:0 current:1 max:1022 state:ready
+
+- 애플리케이션 계정으로 공유 서버 경로 접속 (다른 터미널에서 접속했다고 가정)
+-   접속 문자열에 SERVER 지정이 없으면 공유 서버가 활성화된 경우 기본적으로 SHARED 경로 사용
+SYS@cdb1> select sid, username, server, program
+  2  from v$session
+  3  where username = 'HR'
+  4  order by sid;
+
+       SID USERNAME   SERVER    PROGRAM
+---------- ---------- --------- ------------------------------
+        45 HR         SHARED    sqlplus@app01 (TNS V1-V3)
+
+- SERVER=SHARED 로 표시되면 이 세션은 디스패처+공유 서버 경로로 처리되고 있음(활성화 성공)
+- 반면 SYSDBA 로컬 접속(현재 세션)은 여전히 전용 서버 경로임을 확인
+SYS@cdb1> select sid, server from v$session
+  2  where sid = sys_context('userenv','sid');
+
+       SID SERVER
+---------- ---------
+       261 DEDICATED
+
+- [정리]
+-   · SHARED_SERVERS 를 0보다 큰 값으로 설정하면 공유 서버가 활성화된다(최소 유지 개수).
+-   · SHARED_SERVERS 만 켜도 TCP 프로토콜용 디스패처(D000) 1개가 자동 생성된다.
+-   · V$SHARED_SERVER / V$DISPATCHER / V$SESSION(SERVER 컬럼)으로 상태를 검증한다.
+-   · XDB용 공유 서버/디스패처는 기본 구성이며, 일반 사용자 접속용 설정은 별개다.
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$
