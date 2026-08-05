@@ -1,0 +1,112 @@
+-- 15장 실습_09: Near-Zero Downtime PDB 재배치(RELOCATE)
+
+======================================================================
+[사전] 전제조건 확인 - 두 CDB 모두 로컬 언두 + ARCHIVELOG
+======================================================================
+
+- 대상 CDB2 루트로 접속해 전제조건 확인
+SYS@cdb2> select property_value from database_properties
+  2  where property_name='LOCAL_UNDO_ENABLED';
+
+PROPERTY_VALUE
+--------------------
+TRUE
+
+SYS@cdb2> archive log list
+Database log mode              Archive Mode
+Automatic archival             Enabled
+
+======================================================================
+[1단계] 원격 CDB1 에 재배치용 공통 사용자 + SYSOPER 부여
+======================================================================
+
+- (원격 CDB1 세션) DB 링크가 사용할 사용자에 권한 부여
+SYS@cdb1> create user c##reloc identified by "Welcome_1234" container=all;
+User created.
+
+SYS@cdb1> grant create session, create pluggable database
+  2  to c##reloc container=all;
+Grant succeeded.
+
+- 재배치는 SYSOPER 가 추가로 필요
+SYS@cdb1> grant sysoper to c##reloc container=all;
+Grant succeeded.
+
+======================================================================
+[2단계] 대상 CDB2 에서 원격 CDB1 로의 데이터베이스 링크 생성
+======================================================================
+
+SYS@cdb2> create database link link_cdb1
+  2  connect to c##reloc identified by "Welcome_1234"
+  3  using 'cdb1';
+
+Database link created.
+
+======================================================================
+[3단계] (실수 -> 오류 -> 재시도) NOARCHIVELOG 소스에서 재배치 시도
+======================================================================
+
+- (실수) 원격 CDB1 이 NOARCHIVELOG 라고 가정하고 재배치 시도
+SYS@cdb2> create pluggable database pdb1 from pdb1@link_cdb1
+  2  relocate availability max;
+create pluggable database pdb1 from pdb1@link_cdb1
+*
+ERROR at line 1:
+ORA-65394: The PDB needs to be in local undo mode and the CDB in
+ARCHIVELOG mode to relocate.
+
+- 원인: 재배치는 소스/대상 모두 ARCHIVELOG + 로컬 언두 필요.
+-   원격 CDB1 을 ARCHIVELOG 로 전환 후 재시도 (원격 세션)
+SYS@cdb1> shutdown immediate
+SYS@cdb1> startup mount
+SYS@cdb1> alter database archivelog;
+Database altered.
+SYS@cdb1> alter database open;
+
+======================================================================
+[4단계] 단일 DDL 로 PDB1 을 CDB1 -> CDB2 로 재배치 (최대 가용성)
+======================================================================
+
+- RELOCATE + AVAILABILITY MAX: 소스 마운트 유지, 커넥션 자동 전달
+SYS@cdb2> create pluggable database pdb1 from pdb1@link_cdb1
+  2  relocate
+  3  availability max;
+
+Pluggable database created.
+
+- AVAILABILITY MAX 에서는 PDB 가 먼저 READ ONLY 로 열려 새 연결 대상이 됨
+SYS@cdb2> select name, open_mode from v$pdbs where name='PDB1';
+
+NAME       OPEN_MODE
+---------- ----------
+PDB1       READ ONLY
+
+======================================================================
+[5단계] READ WRITE 로 완전 전환 및 검증
+======================================================================
+
+SYS@cdb2> alter pluggable database pdb1 open read write force;
+
+Pluggable database altered.
+
+SYS@cdb2> select pdb_name, status from cdb_pdbs where pdb_name='PDB1';
+
+PDB_NAME   STATUS
+---------- ----------
+PDB1       NORMAL
+
+- 위반 사항 확인
+SYS@cdb2> select name, type, message from pdb_plug_in_violations
+  2  where name='PDB1';
+
+no rows selected
+
+- 모든 클라이언트가 새 호스트에 직접 연결되면 소스 PDB 는 안전하게 드롭 가능
+-   (원격 CDB1 세션에서) SYS@cdb1> drop pluggable database pdb1 including datafiles;
+
+- [정리 완료] Near-Zero Downtime 재배치:
+-   단일 DDL(RELOCATE), 언플러그/복사/플러그/드롭 불필요
+-   전제: 두 CDB 로컬 언두 + ARCHIVELOG, 원격 사용자 SYSOPER
+-   AVAILABILITY MAX: 소스 마운트 유지 + 커넥션 자동 전달(완료 후 지속)
+SYS@cdb2> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

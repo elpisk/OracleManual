@@ -1,0 +1,129 @@
+-- 17장 실습_08: 데이터베이스 블록 내용 구조 확인 (블록/행 조각/PCTFREE)
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+...
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+======================================================================
+[1단계] 표준 블록 크기 확인 (블록의 물리적 바이트 수)
+======================================================================
+
+SYS@cdb1> show parameter db_block_size
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+db_block_size                        integer     8192
+
+======================================================================
+[2단계] PCTFREE가 다른 두 테이블 생성 (여유 공간 정책 비교)
+======================================================================
+
+- PCTFREE 10(기본) : 업데이트 대비 여유를 남김
+SYS@cdb1> create table hr.blk_hi (id number, name varchar2(100))
+  2  pctfree 10 segment creation immediate tablespace users;
+
+Table created.
+
+- PCTFREE 0 : 삽입 위주, 블록을 촘촘히 채움(이력 테이블 성격)
+SYS@cdb1> create table hr.blk_lo (id number, name varchar2(100))
+  2  pctfree 0 segment creation immediate tablespace users;
+
+Table created.
+
+- 동일 데이터 삽입
+SYS@cdb1> insert into hr.blk_hi
+  2  select level, rpad('n',80,'n') from dual connect by level <= 10000;
+SYS@cdb1> insert into hr.blk_lo
+  2  select level, rpad('n',80,'n') from dual connect by level <= 10000;
+SYS@cdb1> commit;
+
+Commit complete.
+
+- 통계 수집 후 블록당 행 밀도 비교 (PCTFREE 0이 블록을 더 촘촘히 사용)
+SYS@cdb1> exec dbms_stats.gather_table_stats('HR','BLK_HI');
+SYS@cdb1> exec dbms_stats.gather_table_stats('HR','BLK_LO');
+
+SYS@cdb1> select table_name, num_rows, blocks,
+  2         round(num_rows/blocks,1) as rows_per_block, pct_free
+  3  from   dba_tables
+  4  where  owner='HR' and table_name in ('BLK_HI','BLK_LO')
+  5  order  by table_name;
+
+TABLE_NAME  NUM_ROWS  BLOCKS  ROWS_PER_BLOCK  PCT_FREE
+----------- -------- ------- --------------- ---------
+BLK_HI         10000     160            62.5        10
+BLK_LO         10000     143            69.9         0
+
+- PCTFREE 0(blk_lo)이 블록당 더 많은 행 -> 블록을 더 촘촘히 채움
+
+======================================================================
+[3단계] 행 조각/ROWID 관찰: 행의 물리적 주소
+======================================================================
+
+- ROWID를 분해해 오브젝트/파일/블록/행 번호 확인
+SYS@cdb1> select rowid,
+  2         dbms_rowid.rowid_relative_fno(rowid) as file#,
+  3         dbms_rowid.rowid_block_number(rowid) as block#,
+  4         dbms_rowid.rowid_row_number(rowid)   as row#
+  5  from   hr.blk_hi where id <= 3;
+
+ROWID              FILE#   BLOCK#   ROW#
+------------------ ----- -------- ------
+AAAS1kAAHAAAACHAAA     7      135      0
+AAAS1kAAHAAAACHAAB     7      135      1
+AAAS1kAAHAAAACHAAC     7      135      2
+
+- 같은 블록(135) 안에 여러 행이 ROW#로 구분되어 저장됨(행 디렉터리의 역할)
+
+======================================================================
+[4단계] 행 마이그레이션 유발 관찰 (PCTFREE 0 + 업데이트로 행 확장)
+======================================================================
+
+- (실수) 마이그레이션 통계를 보려고 CHAINED_ROWS를 조회했으나 컬럼이 아직 없음
+SYS@cdb1> select num_rows, chain_cnt from dba_tables
+  2  where owner='HR' and table_name='BLK_LO';
+
+  NUM_ROWS  CHAIN_CNT
+---------- ----------
+     10000
+
+- 원인: CHAIN_CNT는 ANALYZE ... LIST CHAINED ROWS 또는 통계 갱신 후에 채워짐
+-   행을 크게 업데이트해 마이그레이션을 유발한 뒤 통계를 다시 수집
+SYS@cdb1> update hr.blk_lo set name = rpad('N',100,'N');
+
+10000 rows updated.
+
+SYS@cdb1> commit;
+
+Commit complete.
+
+SYS@cdb1> exec dbms_stats.gather_table_stats('HR','BLK_LO');
+
+SYS@cdb1> select num_rows, chain_cnt from dba_tables
+  2  where owner='HR' and table_name='BLK_LO';
+
+  NUM_ROWS  CHAIN_CNT
+---------- ----------
+     10000       1877
+
+- PCTFREE 0이라 커진 행을 담을 여유가 없어 다수 행이 다른 블록으로 이동(마이그레이션)
+
+======================================================================
+[5단계] 블록 구성요소 요약 및 원복
+======================================================================
+
+- [정리] 데이터 블록 구성요소
+-   헤더(블록 유형/주소/트랜잭션) / 테이블 디렉터리 / 행 디렉터리
+-   사용 가능 공간(가운데) / 행 데이터(행 조각)
+- [정리] PCTFREE
+-   높음: 업데이트 대비 여유 -> 마이그레이션 억제
+-   0/낮음: 삽입 위주 이력 테이블에 유리(촘촘히 채움)
+SYS@cdb1> drop table hr.blk_hi purge;
+SYS@cdb1> drop table hr.blk_lo purge;
+
+Table dropped.
+
+SYS@cdb1> exit
+[oracle@dbsvr ~]$

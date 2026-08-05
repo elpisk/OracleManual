@@ -1,0 +1,150 @@
+-- 17장 실습_01: 데이터베이스 저장소 아키텍처 및 논리/물리 구조 확인
+
+- SQL*Plus로 CDB에 SYSDBA 권한으로 접속 (OS 인증)
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 5 09:10:22 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+- 프롬프트를 사용자@인스턴스 형태로 지정 (실습 환경 glogin.sql 설정)
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] 물리적 저장 구조 확인: 데이터 파일 / 컨트롤 파일 / 리두 로그
+======================================================================
+
+- 표준 블록 크기(논리 블록의 물리적 크기)를 먼저 확인 (생성 시 고정, 변경 불가)
+SYS@cdb1> show parameter db_block_size
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+db_block_size                        integer     8192
+
+- 물리적 데이터 파일 목록: OS에 실재하는 파일(경로/크기)
+SYS@cdb1> select file#, con_id,
+  2         round(bytes/1024/1024) as mb, name
+  3  from   v$datafile
+  4  where  con_id = 1 order by file#;
+
+     FILE#     CON_ID         MB NAME
+---------- ---------- ---------- ------------------------------------------
+         1          1        340 /u01/app/oracle/oradata/CDB1/system01.dbf
+         3          1        550 /u01/app/oracle/oradata/CDB1/sysaux01.dbf
+         4          1         90 /u01/app/oracle/oradata/CDB1/undotbs01.dbf
+         7          1          5 /u01/app/oracle/oradata/CDB1/users01.dbf
+
+- 컨트롤 파일: 데이터베이스의 물리 구조(파일 위치/상태)를 기록하는 메타데이터 파일
+SYS@cdb1> select name from v$controlfile;
+
+NAME
+------------------------------------------------------------
+/u01/app/oracle/oradata/CDB1/control01.ctl
+/u01/app/oracle/fast_recovery_area/CDB1/control02.ctl
+
+- 온라인 리두 로그 파일: 데이터 변경 사항을 기록해 복구에 사용
+SYS@cdb1> select group#, members, status from v$log order by group#;
+
+    GROUP#    MEMBERS STATUS
+---------- ---------- ----------------
+         1          1 INACTIVE
+         2          1 CURRENT
+         3          1 INACTIVE
+
+======================================================================
+[2단계] 논리적 저장 구조 확인: 테이블스페이스 (물리 파일 위에 얹힌 추상화)
+======================================================================
+
+- 현재 컨테이너(루트)의 테이블스페이스 목록과 유형
+SYS@cdb1> select tablespace_name, contents, status
+  2  from   dba_tablespaces order by tablespace_name;
+
+TABLESPACE_NAME  CONTENTS   STATUS
+---------------- ---------- ---------
+SYSAUX           PERMANENT  ONLINE
+SYSTEM           PERMANENT  ONLINE
+TEMP             TEMPORARY  ONLINE
+UNDOTBS1         UNDO       ONLINE
+USERS            PERMANENT  ONLINE
+
+- 논리(테이블스페이스)와 물리(데이터 파일)의 매핑을 조인으로 확인
+SYS@cdb1> select t.tablespace_name, f.file_name,
+  2         f.bytes/1024/1024 as mb
+  3  from   dba_tablespaces t
+  4  join   dba_data_files f on t.tablespace_name = f.tablespace_name
+  5  order  by t.tablespace_name;
+
+TABLESPACE_NAME  FILE_NAME                                    MB
+---------------- ------------------------------------- ---------
+SYSAUX           /u01/app/oracle/oradata/CDB1/sysaux01.dbf   550
+SYSTEM           /u01/app/oracle/oradata/CDB1/system01.dbf   340
+USERS            /u01/app/oracle/oradata/CDB1/users01.dbf      5
+
+======================================================================
+[3단계] '분리' 원칙 체험: 데이터 파일 이름 변경(물리)은 논리에 영향 없음
+======================================================================
+
+- (실수) TEMP는 임시 파일이므로 DBA_DATA_FILES에는 없다. 그런데 조인 결과에 TEMP가 빠진 것을
+-   'DBA_DATA_FILES 오류'로 오해하고, 아래처럼 임시 파일을 같은 뷰에서 찾으려다 실패
+SYS@cdb1> select file_name from dba_data_files
+  2  where tablespace_name = 'TEMP';
+
+no rows selected
+
+- 원인: 임시 테이블스페이스의 파일은 '임시 파일'이라 DBA_TEMP_FILES에서 조회해야 함
+SYS@cdb1> select file_name, bytes/1024/1024 as mb
+  2  from   dba_temp_files where tablespace_name = 'TEMP';
+
+FILE_NAME                                        MB
+----------------------------------------- ---------
+/u01/app/oracle/oradata/CDB1/temp01.dbf         60
+
+- 물리적 변경 시연을 위해 USERS 데이터 파일을 오프라인 없이 온라인 이동(이름 변경)
+-   물리 경로가 바뀌어도 테이블스페이스(USERS)라는 논리명과 사용자 접근은 그대로임
+SYS@cdb1> alter database move datafile
+  2  '/u01/app/oracle/oradata/CDB1/users01.dbf'
+  3  to '/u01/app/oracle/oradata/CDB1/users01_new.dbf';
+
+Database altered.
+
+- 물리 경로만 바뀌었을 뿐 논리 구조(테이블스페이스명)는 불변임을 확인
+SYS@cdb1> select tablespace_name, file_name from dba_data_files
+  2  where tablespace_name = 'USERS';
+
+TABLESPACE_NAME  FILE_NAME
+---------------- --------------------------------------------
+USERS            /u01/app/oracle/oradata/CDB1/users01_new.dbf
+
+======================================================================
+[4단계] 저장소 계층 요약 조회
+======================================================================
+
+- 논리 계층(테이블스페이스 > 세그먼트 > 익스텐트 > 블록)의 최상위/최하위를 한 번에 확인
+-   총 테이블스페이스 수와, 그 안에 담긴 세그먼트 수를 대비
+SYS@cdb1> select
+  2    (select count(*) from dba_tablespaces) as tablespaces,
+  3    (select count(*) from dba_segments)     as segments
+  4  from dual;
+
+TABLESPACES   SEGMENTS
+----------- ----------
+          5       4821
+
+- [정리]
+-   물리 = 데이터 파일 / 컨트롤 파일 / 리두 로그 (OS에 실재)
+-   논리 = 테이블스페이스 > 세그먼트 > 익스텐트 > 데이터 블록 (개념적)
+-   분리 원칙 = 데이터 파일 이동(물리)해도 테이블스페이스명/사용자 접근(논리)은 불변
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

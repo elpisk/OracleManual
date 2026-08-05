@@ -1,0 +1,134 @@
+-- 17장 실습_05: 세그먼트 유형별 저장 방식 확인 (데이터/인덱스/임시/언두)
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+...
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+======================================================================
+[1단계] 데이터 세그먼트 + 인덱스 세그먼트 생성
+======================================================================
+
+- 테이블(데이터 세그먼트)과 그 위의 인덱스(인덱스 세그먼트) 생성
+SYS@cdb1> create table hr.type_demo
+  2  (id number, name varchar2(50), memo clob)
+  3  segment creation immediate tablespace users;
+
+Table created.
+
+SYS@cdb1> create index hr.type_demo_ix on hr.type_demo(name)
+  2  tablespace users;
+
+Index created.
+
+SYS@cdb1> insert into hr.type_demo
+  2  select level, 'name'||level, rpad('m',4000,'m')
+  3  from dual connect by level <= 5000;
+
+5000 rows created.
+
+SYS@cdb1> commit;
+
+Commit complete.
+
+======================================================================
+[2단계] 세그먼트 유형별 조회: 하나의 테이블이 여러 세그먼트를 만든다
+======================================================================
+
+- TABLE(데이터), INDEX(인덱스), LOBSEGMENT/LOBINDEX(CLOB 저장)가 각각 생성됨
+SYS@cdb1> select segment_name, segment_type, bytes/1024 as kb
+  2  from   dba_segments
+  3  where  owner='HR'
+  4  and   (segment_name like 'TYPE_DEMO%'
+  5         or segment_name in
+  6           (select segment_name from dba_lobs
+  7            where table_name='TYPE_DEMO'))
+  8  order  by segment_type;
+
+SEGMENT_NAME               SEGMENT_TYPE        KB
+-------------------------- --------------- ------
+TYPE_DEMO                  TABLE              256
+SYS_IL0000074512C00003$$   LOBINDEX            64
+SYS_LOB0000074512C00003$$  LOBSEGMENT       20480
+TYPE_DEMO_IX               INDEX              320
+
+- CLOB 데이터(memo)는 테이블 본체가 아니라 별도 LOB 세그먼트에 저장됨(본체 블록 압박 방지)
+
+======================================================================
+[3단계] 임시 세그먼트: 대량 정렬 시 임시 테이블스페이스에 생성
+======================================================================
+
+- 큰 정렬을 유발해 임시 세그먼트 사용을 관찰(다른 세션 병행 조회 가정)
+SYS@cdb1> select count(*) from
+  2   (select id from hr.type_demo order by name, id);
+
+  COUNT(*)
+----------
+      5000
+
+- 임시 세그먼트/임시 공간 사용 현황 (작업 중에만 잡히고 끝나면 회수)
+SYS@cdb1> select tablespace_name, segtype, blocks
+  2  from   v$tempseg_usage;
+
+TABLESPACE_NAME  SEGTYPE     BLOCKS
+---------------- --------- --------
+TEMP             SORT           128
+
+======================================================================
+[4단계] 언두 세그먼트: 트랜잭션의 변경 전 이미지 저장
+======================================================================
+
+- 트랜잭션을 열어 언두 세그먼트가 할당됨을 확인
+SYS@cdb1> update hr.type_demo set name = upper(name) where id <= 3000;
+
+3000 rows updated.
+
+- 현재 트랜잭션이 사용하는 언두 세그먼트 확인 (커밋 전)
+SYS@cdb1> select s.sid, r.segment_name, t.used_ublk
+  2  from   v$transaction t
+  3  join   v$session s   on s.saddr = t.ses_addr
+  4  join   dba_rollback_segs r on r.segment_id = t.xidusn
+  5  where  s.sid = sys_context('userenv','sid');
+
+       SID SEGMENT_NAME      USED_UBLK
+---------- ----------------- ----------
+       142 _SYSSMU4_xxxxxxx$          6
+
+- (실수) 언두 세그먼트를 사용자 테이블처럼 DBA_SEGMENTS에서 이름으로 찾으려다 혼동
+SYS@cdb1> select segment_name from dba_segments
+  2  where segment_type = 'ROLLBACK';
+
+no rows selected
+
+- 원인: 자동 언두 관리에서 언두 세그먼트 유형은 'TYPE2 UNDO'로 표기됨. 조건을 정정
+SYS@cdb1> select segment_name, segment_type, tablespace_name
+  2  from   dba_segments
+  3  where  segment_type = 'TYPE2 UNDO'
+  4  fetch first 3 rows only;
+
+SEGMENT_NAME          SEGMENT_TYPE   TABLESPACE_NAME
+--------------------- -------------- ----------------
+_SYSSMU1_2932610722$  TYPE2 UNDO     UNDOTBS1
+_SYSSMU2_1875343981$  TYPE2 UNDO     UNDOTBS1
+_SYSSMU3_ ...         TYPE2 UNDO     UNDOTBS1
+
+SYS@cdb1> commit;
+
+Commit complete.
+
+======================================================================
+[5단계] 정리 및 원복
+======================================================================
+
+- [정리] 유형별 저장 위치
+-   데이터/인덱스 세그먼트 -> 영구 테이블스페이스(USERS)
+-   LOB 세그먼트         -> 대용량 값 전용(본체와 분리)
+-   임시 세그먼트         -> 임시 테이블스페이스(TEMP), 작업 후 회수
+-   언두 세그먼트         -> 언두 테이블스페이스(UNDOTBS1), 자동 관리
+SYS@cdb1> drop table hr.type_demo purge;
+
+Table dropped.
+
+SYS@cdb1> exit
+[oracle@dbsvr ~]$
