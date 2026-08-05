@@ -1,0 +1,177 @@
+-- 19장 실습_02: 익스텐트 할당 및 사용 불가능한 인덱스 처리
+-- 목표: 세그먼트의 익스텐트 구성을 확인하고, 명시적 익스텐트 할당과 UNUSABLE 인덱스 재구축을 실습한다.
+
+[oracle@dbsvr ~]$ sqlplus sys@hrpdb as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 5 10:02:44 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@hrpdb> show con_name
+
+CON_NAME
+------------------------------
+HRPDB
+
+======================================================================
+[1단계] 실습 테이블 생성 및 초기 익스텐트 확인
+======================================================================
+
+- AUTOALLOCATE 테이블스페이스(USERS)에 테이블 생성
+SYS@hrpdb> create table hr.ext_demo (id number, v varchar2(100)) tablespace users;
+
+Table created.
+
+- 데이터를 넣어 세그먼트가 익스텐트를 할당받도록 함
+SYS@hrpdb> insert into hr.ext_demo
+  2  select level, rpad('D',100,'D') from dual connect by level <= 50000;
+
+50000 rows created.
+
+SYS@hrpdb> commit;
+
+Commit complete.
+
+- 익스텐트 목록과 크기 확인: AUTOALLOCATE는 64KB->1MB->... 로 점차 커짐
+SYS@hrpdb> select extent_id, bytes/1024 as kb, blocks
+  2  from dba_extents
+  3  where owner='HR' and segment_name='EXT_DEMO'
+  4  order by extent_id
+  5  fetch first 8 rows only;
+
+ EXTENT_ID         KB     BLOCKS
+---------- ---------- ----------
+         0         64          8
+         1         64          8
+         2         64          8
+         3         64          8
+         4         64          8
+         5         64          8
+         6         64          8
+         7         64          8
+
+- 세그먼트 전체 크기와 익스텐트 개수 요약
+SYS@hrpdb> select extents, blocks, bytes/1024/1024 as mb
+  2  from dba_segments where owner='HR' and segment_name='EXT_DEMO';
+
+   EXTENTS     BLOCKS         MB
+---------- ---------- ----------
+        22        896          7
+
+======================================================================
+[2단계] 명시적 익스텐트 할당 (대량 적재 전 공간 미리 확보)
+======================================================================
+
+- (실수) 크기 단위 없이 SIZE 값을 숫자만 지정
+SYS@hrpdb> alter table hr.ext_demo allocate extent (size 1);
+alter table hr.ext_demo allocate extent (size 1)
+                                              *
+ERROR at line 1:
+ORA-02143: invalid ALTER TABLE option
+
+- 원인: SIZE 값에는 단위(K/M)를 붙여야 한다. 올바르게 1M로 명시 할당
+SYS@hrpdb> alter table hr.ext_demo allocate extent (size 1m);
+
+Table altered.
+
+- 방금 수동으로 추가된 1MB 익스텐트를 확인
+SYS@hrpdb> select extent_id, bytes/1024 as kb
+  2  from dba_extents
+  3  where owner='HR' and segment_name='EXT_DEMO'
+  4  order by extent_id desc fetch first 3 rows only;
+
+ EXTENT_ID         KB
+---------- ----------
+        22       1024
+        21       1024
+        20       1024
+
+======================================================================
+[3단계] 인덱스를 UNUSABLE로 만들고 동작 관찰
+======================================================================
+
+- 조회 성능용 인덱스 생성
+SYS@hrpdb> create index hr.ext_demo_idx on hr.ext_demo(id) tablespace users;
+
+Index created.
+
+- 테이블을 MOVE하면 ROWID가 바뀌어 인덱스가 UNUSABLE이 됨(대표적 무효화 사례)
+SYS@hrpdb> alter table hr.ext_demo move;
+
+Table altered.
+
+SYS@hrpdb> select index_name, status from dba_indexes
+  2  where owner='HR' and table_name='EXT_DEMO';
+
+INDEX_NAME       STATUS
+---------------- --------
+EXT_DEMO_IDX     UNUSABLE
+
+- SKIP_UNUSABLE_INDEXES 확인: TRUE(기본)이면 비유일 UNUSABLE 인덱스는 무시되고 DML 진행
+SYS@hrpdb> show parameter skip_unusable_indexes
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------
+skip_unusable_indexes                boolean     TRUE
+
+- 비유일 인덱스가 UNUSABLE이어도 INSERT는 오류 없이 진행됨(인덱스만 조용히 무시)
+SYS@hrpdb> insert into hr.ext_demo values (999999, 'ok');
+
+1 row created.
+
+SYS@hrpdb> commit;
+
+Commit complete.
+
+- (실수) SKIP_UNUSABLE_INDEXES를 FALSE로 바꾸면 UNUSABLE 인덱스 관련 DML이 실패함
+SYS@hrpdb> alter session set skip_unusable_indexes = false;
+
+Session altered.
+
+SYS@hrpdb> insert into hr.ext_demo values (999998, 'fail');
+insert into hr.ext_demo values (999998, 'fail')
+*
+ERROR at line 1:
+ORA-01502: index 'HR.EXT_DEMO_IDX' or partition of such index is in unusable
+state
+
+- 원인: FALSE에서는 UNUSABLE 인덱스가 있으면 DML이 실패한다. 해결은 인덱스 재구축
+SYS@hrpdb> alter index hr.ext_demo_idx rebuild;
+
+Index altered.
+
+SYS@hrpdb> select status from dba_indexes
+  2  where owner='HR' and index_name='EXT_DEMO_IDX';
+
+STATUS
+--------
+VALID
+
+- 재구축 후에는 FALSE 상태에서도 DML이 정상 진행됨
+SYS@hrpdb> insert into hr.ext_demo values (999998, 'ok now');
+
+1 row created.
+
+SYS@hrpdb> commit;
+
+Commit complete.
+
+- [정리]
+-   AUTOALLOCATE는 익스텐트를 64KB부터 점차 키우며, 필요 시 ALLOCATE EXTENT로 명시 할당 가능
+-   ALTER TABLE ... MOVE는 인덱스를 UNUSABLE로 만든다 -> 이후 REBUILD 필수
+-   SKIP_UNUSABLE_INDEXES=TRUE는 비유일 UNUSABLE 인덱스를 무시, FALSE는 관련 DML 실패
+SYS@hrpdb> alter session set skip_unusable_indexes = true;
+
+Session altered.
+
+SYS@hrpdb> drop table hr.ext_demo purge;
+
+Table dropped.
+
+SYS@hrpdb> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

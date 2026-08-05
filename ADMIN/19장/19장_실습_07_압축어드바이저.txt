@@ -1,0 +1,160 @@
+-- 19장 실습_07: 압축 어드바이저(DBMS_COMPRESSION)로 압축률 예측
+-- 목표: 원본을 변경하지 않고 GET_COMPRESSION_RATIO로 방식별 예상 압축률을 비교한다.
+
+[oracle@dbsvr ~]$ sqlplus sys@hrpdb as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 5 16:18:55 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@hrpdb> show con_name
+
+CON_NAME
+------------------------------
+HRPDB
+
+======================================================================
+[1단계] 예측 대상 테이블과 작업용 테이블스페이스 준비
+======================================================================
+
+- 반복값이 많은 테이블을 대상으로 준비(압축 어드바이저의 표본이 커야 정확)
+SYS@hrpdb> create table hr.big_sales (id number, dept varchar2(20), note varchar2(100))
+  2  tablespace users;
+
+Table created.
+
+SYS@hrpdb> insert /*+ append */ into hr.big_sales
+  2  select level,
+  3         case mod(level,4) when 0 then 'SALES' when 1 then 'HR'
+  4                           when 2 then 'IT' else 'FINANCE' end,
+  5         rpad('note',100,'x')
+  6  from dual connect by level <= 300000;
+
+300000 rows created.
+
+SYS@hrpdb> commit;
+
+Commit complete.
+
+- 어드바이저가 표본 압축을 시험할 작업(scratch) 테이블스페이스 확인
+SYS@hrpdb> select tablespace_name from dba_tablespaces where contents='PERMANENT';
+
+TABLESPACE_NAME
+------------------------------
+SYSTEM
+SYSAUX
+USERS
+
+======================================================================
+[2단계] 압축 어드바이저 실행 (Advanced Row Compression 예측)
+======================================================================
+
+SYS@hrpdb> set serveroutput on
+
+- (실수) 필수 OUT 파라미터 변수를 선언하지 않고 프로시저를 호출
+SYS@hrpdb> begin
+  2    dbms_compression.get_compression_ratio(
+  3      scratchtbsname => 'USERS',
+  4      ownname        => 'HR',
+  5      objname        => 'BIG_SALES',
+  6      subobjname     => NULL,
+  7      comptype       => dbms_compression.comp_advanced);
+  8  end;
+  9  /
+  dbms_compression.get_compression_ratio(
+  *
+ERROR at line 2:
+ORA-06550: line 2, column 3:
+PLS-00306: wrong number or types of arguments in call to 'GET_COMPRESSION_RATIO'
+
+- 원인: GET_COMPRESSION_RATIO는 압축/비압축 블록 수·행 수·압축률 등 OUT 파라미터가 필수다.
+-   OUT 변수를 모두 선언하여 올바르게 호출한다.
+SYS@hrpdb> declare
+  2    v_blk_cmp    pls_integer;
+  3    v_blk_uncmp  pls_integer;
+  4    v_row_cmp    pls_integer;
+  5    v_row_uncmp  pls_integer;
+  6    v_ratio      number;
+  7    v_ctype      varchar2(100);
+  8  begin
+  9    dbms_compression.get_compression_ratio(
+ 10      scratchtbsname => 'USERS',
+ 11      ownname        => 'HR',
+ 12      objname        => 'BIG_SALES',
+ 13      subobjname     => NULL,
+ 14      comptype       => dbms_compression.comp_advanced,
+ 15      blkcnt_cmp     => v_blk_cmp,
+ 16      blkcnt_uncmp   => v_blk_uncmp,
+ 17      row_cmp        => v_row_cmp,
+ 18      row_uncmp      => v_row_uncmp,
+ 19      cmp_ratio      => v_ratio,
+ 20      comptype_str   => v_ctype);
+ 21    dbms_output.put_line('ADVANCED 비압축 블록: '||v_blk_uncmp);
+ 22    dbms_output.put_line('ADVANCED 압축 블록  : '||v_blk_cmp);
+ 23    dbms_output.put_line('ADVANCED 예상 압축률: '||round(v_ratio,2)||' : 1');
+ 24  end;
+ 25  /
+ADVANCED 비압축 블록: 4608
+ADVANCED 압축 블록  : 1707
+ADVANCED 예상 압축률: 2.7 : 1
+
+PL/SQL procedure successfully completed.
+
+======================================================================
+[3단계] 기본 압축(BASIC)으로도 예측하여 방식 비교
+======================================================================
+
+SYS@hrpdb> declare
+  2    v_blk_cmp    pls_integer;
+  3    v_blk_uncmp  pls_integer;
+  4    v_row_cmp    pls_integer;
+  5    v_row_uncmp  pls_integer;
+  6    v_ratio      number;
+  7    v_ctype      varchar2(100);
+  8  begin
+  9    dbms_compression.get_compression_ratio(
+ 10      scratchtbsname => 'USERS',
+ 11      ownname        => 'HR',
+ 12      objname        => 'BIG_SALES',
+ 13      subobjname     => NULL,
+ 14      comptype       => dbms_compression.comp_basic,
+ 15      blkcnt_cmp     => v_blk_cmp,
+ 16      blkcnt_uncmp   => v_blk_uncmp,
+ 17      row_cmp        => v_row_cmp,
+ 18      row_uncmp      => v_row_uncmp,
+ 19      cmp_ratio      => v_ratio,
+ 20      comptype_str   => v_ctype);
+ 21    dbms_output.put_line('BASIC 예상 압축률: '||round(v_ratio,2)||' : 1');
+ 22  end;
+ 23  /
+BASIC 예상 압축률: 2.85 : 1
+
+PL/SQL procedure successfully completed.
+
+- 관찰: BASIC(2.85:1)이 ADVANCED(2.7:1)보다 약간 높은 압축률.
+-   그러나 BASIC은 다이렉트 패스에만 적용되므로, 갱신이 잦으면 ADVANCED가 실용적이다.
+-   -> 압축률만이 아니라 워크로드(적재/갱신 패턴)를 함께 고려해 방식 선택
+
+- 원본 테이블은 어드바이저 실행으로 전혀 변경되지 않았음을 확인
+SYS@hrpdb> select compression from user_tables where table_name='BIG_SALES';
+
+COMPRESSION
+-------------
+DISABLED
+
+- [정리]
+-   DBMS_COMPRESSION.GET_COMPRESSION_RATIO는 표본을 scratch 테이블스페이스에서 시험 후 결과만 반환
+-   comptype: COMP_BASIC / COMP_ADVANCED / COMP_QUERY_HIGH / COMP_ARCHIVE_HIGH 등
+-   OUT 파라미터(블록 수·행 수·압축률)가 필수 -> 변수를 반드시 선언해 전달
+-   원본 테이블은 변경되지 않음(COMPRESSION=DISABLED 유지)
+SYS@hrpdb> drop table hr.big_sales purge;
+
+Table dropped.
+
+SYS@hrpdb> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

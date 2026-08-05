@@ -1,0 +1,127 @@
+-- 20장 실습_08: 언두 사용량 초과 시나리오 및 대응 (ORA-01555 / ORA-30036)
+
+- 루트 컨테이너 확인
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] 시나리오 A: ORA-01555 (snapshot too old) 재현 조건 이해
+======================================================================
+
+- 상황: UNDO_RETENTION을 아주 짧게 설정하고, 작은 언두 TS에서 대량 DML을 반복하면
+-   장시간 실행 중인 조회가 참조할 커밋 언두가 덮어써져 ORA-01555가 발생함.
+
+- (재현용) 보존 시간을 매우 짧게 설정 (실습 목적, 운영에서는 금지)
+SYS@cdb1> alter session set container=salespdb;
+
+Session altered.
+
+SYS@salespdb> alter system set undo_retention=1 scope=memory;
+
+System altered.
+
+- 세션1: 장시간 조회 시작 (커서를 오래 열어 둔 상태를 가정)
+SYS@salespdb> -- (세션1) 아래 커서를 열고 각 행 사이에 지연이 있다고 가정
+SYS@salespdb> select /*+ no_merge */ count(*)
+  2  from   hr.big_src a, hr.big_src b where a.id=b.id;   -- 오래 걸리는 조인
+
+- 세션2: 같은 테이블에 대량 DML을 반복 커밋하여 언두를 빠르게 순환/덮어씀
+S2 SYS@salespdb> begin
+  2    for i in 1..50 loop
+  3      update hr.big_src set val=val+1; commit;
+  4    end loop;
+  5  end;
+  6  /
+
+PL/SQL procedure successfully completed.
+
+- 세션1의 장시간 조회가 실패
+SYS@salespdb> /
+ERROR:
+ORA-01555: snapshot too old: rollback segment number 7 with name
+"_SYSSMU7_...$" too small
+
+- 원인: UNDO_RETENTION=1초로 너무 짧고 언두가 빠르게 재사용되어, 조회 기준 시점의
+-   일관된 이미지를 재구성할 수 없었음.
+
+======================================================================
+[2단계] ORA-01555 대응
+======================================================================
+
+- 대응1: UNDO_RETENTION을 조회 최대 실행 시간 이상으로 상향
+SYS@salespdb> alter system set undo_retention=3600 scope=both;
+
+System altered.
+
+- 대응2: 반드시 완주해야 하는 조회라면 보존 보장(GUARANTEE) 설정 (공간 충분 전제)
+SYS@salespdb> alter tablespace undotbs1 retention guarantee;
+
+Tablespace altered.
+
+SYS@salespdb> select tablespace_name, retention from dba_tablespaces where contents='UNDO';
+
+TABLESPACE_NAME      RETENTION
+-------------------- -----------
+UNDOTBS1             GUARANTEE
+
+- 대응3: 언두 TS 크기 확대(자동확장 또는 데이터 파일 추가). 조회 튜닝으로 실행 시간 단축도 병행.
+
+======================================================================
+[3단계] 시나리오 B: ORA-30036 (unable to extend undo) 재현/대응
+======================================================================
+
+- 상황: 고정 크기(작은) 언두 TS + RETENTION GUARANTEE 상태에서 대용량 트랜잭션 실행 시
+-   활성 트랜잭션이 쓸 언두 공간이 부족하면 ORA-30036 발생.
+
+- (재현용) 대용량 단일 트랜잭션 실행
+SYS@salespdb> update hr.big_src set val = val || rpad('X',200,'X');
+update hr.big_src set val = val || rpad('X',200,'X')
+*
+ERROR at line 1:
+ORA-30036: unable to extend segment by 8 in undo tablespace 'UNDOTBS1'
+
+- 원인: GUARANTEE로 unexpired 언두를 재사용할 수 없고, 고정 크기라 확장도 불가능해
+-   활성 트랜잭션 언두 공간이 소진됨.
+
+- 대응1: (즉시) 보존 보장을 완화하여 만료 언두 재사용 허용
+SYS@salespdb> alter tablespace undotbs1 retention noguarantee;
+
+Tablespace altered.
+
+- 대응2: 언두 데이터 파일 자동확장 활성화(+상한)로 공간 확보
+SYS@salespdb> alter database datafile '/u01/app/oracle/oradata/CDB1/undotbs01.dbf'
+  2  autoextend on next 50M maxsize 2G;
+
+Database altered.
+
+- 대응3: 대용량 트랜잭션을 분할 커밋하여 언두 점유를 낮춤 (재시도 성공)
+SYS@salespdb> begin
+  2    for c in (select rowid rid from hr.big_src) loop
+  3      update hr.big_src set val=val||'X' where rowid=c.rid;
+  4      if mod(rownum,1000)=0 then commit; end if;
+  5    end loop;
+  6    commit;
+  7  end;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+======================================================================
+[정리] 설정 원복
+======================================================================
+
+SYS@salespdb> alter system set undo_retention=900 scope=both;
+
+System altered.
+
+- [정리] 핵심 확인 완료:
+-   ORA-01555 = 조회가 참조할 과거 언두가 덮어써짐 -> UNDO_RETENTION 상향/GUARANTEE/언두 TS 확대/쿼리 튜닝
+-   ORA-30036 = 활성 트랜잭션 언두 공간 부족 -> 언두 TS 확장/자동확장/NOGUARANTEE/분할 커밋
+-   GUARANTEE는 읽기 일관성을 지키지만 공간 부족 시 DML을 실패시킬 수 있음(트레이드오프)
+SYS@salespdb> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

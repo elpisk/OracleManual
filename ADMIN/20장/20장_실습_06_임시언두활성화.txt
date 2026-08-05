@@ -1,0 +1,139 @@
+-- 20장 실습_06: 임시 언두(Temporary Undo) 활성화 및 리두 감소 효과 확인
+
+- 실습 PDB로 접속
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+SYS@salespdb> show con_name
+
+CON_NAME
+------------------------------
+SALESPDB
+
+======================================================================
+[1단계] 글로벌 임시 테이블(GTT) 준비
+======================================================================
+
+SYS@salespdb> create global temporary table hr.gtt_stage
+  2  (id number, name varchar2(100)) on commit preserve rows;
+
+Table created.
+
+- 현재 임시 언두 설정 확인 (기본 FALSE)
+SYS@salespdb> show parameter temp_undo_enabled
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+temp_undo_enabled                    boolean     FALSE
+
+======================================================================
+[2단계] (실수 -> 오류 -> 재시도) 임시 테이블 사용 후 파라미터 변경 시도
+======================================================================
+
+- (실수) GTT에 먼저 DML을 한 뒤 임시 언두를 켜려고 시도
+SYS@salespdb> insert into hr.gtt_stage select object_id, object_name
+  2  from all_objects where rownum<=5000;
+
+5000 rows created.
+
+SYS@salespdb> alter session set temp_undo_enabled=true;
+alter session set temp_undo_enabled=true
+*
+ERROR at line 1:
+ORA-14453: attempt to use a temporary table whose data has already been
+created in the current session
+
+- 원인: 세션이 이미 임시 테이블을 사용 중이면 TEMP_UNDO_ENABLED를 바꿀 수 없음.
+-   현재 트랜잭션/임시 데이터를 정리하고, '임시 테이블 접근 전에' 설정해야 함
+SYS@salespdb> rollback;
+
+Rollback complete.
+
+SYS@salespdb> truncate table hr.gtt_stage;
+
+Table truncated.
+
+======================================================================
+[3단계] 올바른 순서: 임시 언두 활성화 후 임시 테이블 사용
+======================================================================
+
+- 임시 테이블에 접근하기 '전에' 세션 수준으로 임시 언두 활성화
+SYS@salespdb> alter session set temp_undo_enabled=true;
+
+Session altered.
+
+SYS@salespdb> show parameter temp_undo_enabled
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+temp_undo_enabled                    boolean     TRUE
+
+- 리두 생성량 측정: DML 전 redo size 통계 확인
+SYS@salespdb> select s.value redo_before
+  2  from   v$mystat s, v$statname n
+  3  where  s.statistic#=n.statistic# and n.name='redo size';
+
+REDO_BEFORE
+-----------
+   12345678
+
+- GTT에 대량 DML 수행 (임시 언두가 임시 TS에 저장됨, 언두 변경은 리두로 보호되지 않음)
+SYS@salespdb> insert into hr.gtt_stage select object_id, object_name
+  2  from all_objects where rownum<=5000;
+
+5000 rows created.
+
+SYS@salespdb> update hr.gtt_stage set name=lower(name);
+
+5000 rows updated.
+
+- DML 후 redo size 통계 확인
+SYS@salespdb> select s.value redo_after
+  2  from   v$mystat s, v$statname n
+  3  where  s.statistic#=n.statistic# and n.name='redo size';
+
+REDO_AFTER
+-----------
+   12360012
+
+- 해석: 임시 언두 활성화 시 GTT DML의 언두가 임시 TS로 가고 리두로 기록되지 않아
+-   redo 증가폭이 매우 작음(약 14KB). 임시 언두를 끄면 같은 작업의 redo 증가폭이 훨씬 큼.
+
+======================================================================
+[4단계] 임시 언두 사용 통계 확인
+======================================================================
+
+SYS@salespdb> select begin_time, undotsn, txncount, undoblkcnt, extcnt
+  2  from   v$temp_undo_stat order by begin_time desc fetch first 3 rows only;
+
+BEGIN_TIME          UNDOTSN   TXNCOUNT UNDOBLKCNT     EXTCNT
+------------------- -------- ---------- ---------- ----------
+2026-07-22 15:40           3          2         46          3
+
+- 해석: 임시 언두 세그먼트가 임시 TS(UNDOTSN)에서 언두 블록/익스텐트를 사용 중임을 확인.
+
+======================================================================
+[정리] 임시 객체/설정 정리
+======================================================================
+
+SYS@salespdb> truncate table hr.gtt_stage;
+
+Table truncated.
+
+SYS@salespdb> drop table hr.gtt_stage;
+
+Table dropped.
+
+SYS@salespdb> alter session set temp_undo_enabled=false;
+
+Session altered.
+
+- [정리] 핵심 확인 완료:
+-   TEMP_UNDO_ENABLED는 임시 테이블 접근 '전에' 설정(사용 후 변경 시 ORA-14453)
+-   임시 언두 활성화 시 GTT DML의 언두가 임시 TS로 이동 -> redo 생성량 급감
+-   임시 언두 사용은 V$TEMP_UNDO_STAT으로 모니터링
+SYS@salespdb> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

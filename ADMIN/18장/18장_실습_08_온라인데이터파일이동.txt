@@ -1,0 +1,152 @@
+-- 18장 실습_08: 온라인 데이터파일 이동 및 이름변경(ALTER DATABASE MOVE DATAFILE) 실습
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug  5 17:40:33 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+
+SYS@cdb1> alter session set container = pdb1;
+
+Session altered.
+
+======================================================================
+[0단계] 실습용 테이블스페이스와 데이터 준비
+======================================================================
+
+SYS@cdb1> create tablespace move_ts
+  2    datafile '/u01/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf' size 100M;
+
+Tablespace created.
+
+SYS@cdb1> create table hr.t_move (id number, txt varchar2(50))
+  2    tablespace move_ts;
+
+Table created.
+
+SYS@cdb1> insert into hr.t_move values (1, 'before move');
+
+1 row created.
+
+SYS@cdb1> commit;
+
+Commit complete.
+
+- 이동 대상 파일의 현재 경로/번호 확인
+SYS@cdb1> select file_id, file_name from dba_data_files
+  2  where tablespace_name = 'MOVE_TS';
+
+   FILE_ID FILE_NAME
+---------- ------------------------------------------------------------
+        33 /u01/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf
+
+======================================================================
+[1단계] 온라인 상태에서 데이터 파일 이동 (/u01 -> /u02)
+======================================================================
+
+- (실수) 대상 디렉터리에 이미 같은 이름의 파일이 있어 실패 (REUSE 미지정)
+SYS@cdb1> alter database move datafile
+  2    '/u01/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf'
+  3    to '/u02/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf';
+alter database move datafile
+*
+ERROR at line 1:
+ORA-01276: Cannot add file
+/u02/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf.  File has an Oracle Managed
+Files file name.
+
+- 원인: 대상 경로에 이전 실습에서 남은 동일 이름 파일이 존재.
+-   기존 파일을 재사용하도록 REUSE 절을 추가해 재시도
+SYS@cdb1> alter database move datafile
+  2    '/u01/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf'
+  3    to '/u02/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf' reuse;
+
+Database altered.
+
+- 이동 중에도 테이블은 온라인 상태로 조회/DML 가능했음을 확인
+SYS@cdb1> select * from hr.t_move;
+
+        ID TXT
+---------- --------------------------------------------------
+         1 before move
+
+- 새 경로로 바뀐 것을 확인
+SYS@cdb1> select file_id, file_name from dba_data_files
+  2  where tablespace_name = 'MOVE_TS';
+
+   FILE_ID FILE_NAME
+---------- ------------------------------------------------------------
+        33 /u02/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf
+
+======================================================================
+[2단계] 파일 번호로 지정 + KEEP(원본 보존)
+======================================================================
+
+- DML을 계속 수행하면서 이동해도 됨을 보이기 위해 행 추가
+SYS@cdb1> insert into hr.t_move values (2, 'during move test');
+
+1 row created.
+
+SYS@cdb1> commit;
+
+Commit complete.
+
+- 경로 대신 file# 33을 지정, KEEP로 원본(/u02)을 남기고 /u03으로 이동
+SYS@cdb1> alter database move datafile 33
+  2    to '/u03/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf' keep;
+
+Database altered.
+
+- 새 경로 확인
+SYS@cdb1> select file_id, file_name from dba_data_files where file_id = 33;
+
+   FILE_ID FILE_NAME
+---------- ------------------------------------------------------------
+        33 /u03/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf
+
+- KEEP 덕분에 이전 위치(/u02)의 원본 파일이 남아 있음 (롤백 대비)
+SYS@cdb1> host ls -l /u02/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf
+-rw-r----- 1 oracle oinstall 104865792 Aug  5 17:44 /u02/app/oracle/oradata/CDB1/pdb1/move_ts01.dbf
+
+======================================================================
+[3단계] 이동 진행률 모니터링 뷰
+======================================================================
+
+- 대용량 파일 이동 시 진행률은 V$SESSION_LONGOPS로 확인 (소형 파일은 즉시 완료)
+SYS@cdb1> select opname, sofar, totalwork,
+  2         round(sofar/decode(totalwork,0,1,totalwork)*100,1) as pct
+  3  from   v$session_longops
+  4  where  opname like '%Move%'
+  5  order  by start_time desc;
+
+OPNAME                    SOFAR  TOTALWORK        PCT
+------------------------- ------ ---------- ----------
+Online data file move      12800      12800        100
+
+- 데이터 정합성 최종 확인
+SYS@cdb1> select * from hr.t_move order by id;
+
+        ID TXT
+---------- --------------------------------------------------
+         1 before move
+         2 during move test
+
+- 정리
+SYS@cdb1> drop tablespace move_ts including contents and datafiles;
+
+Tablespace dropped.
+
+- [정리]
+-   1) ALTER DATABASE MOVE DATAFILE로 온라인 상태(무중단) 파일 이동/이름변경
+-   2) 이동 중에도 조회/DML 계속 가능(12c+)
+-   3) REUSE=대상 기존 파일 재사용, KEEP=원본 보존(롤백 대비)
+-   4) 경로 대신 file#로도 지정 가능, 진행률은 V$SESSION_LONGOPS
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

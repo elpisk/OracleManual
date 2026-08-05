@@ -1,0 +1,154 @@
+-- 18장 실습_07: 데이터파일 추가/자동확장으로 데이터베이스 확장 실습
+
+[oracle@dbsvr ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug  5 16:12:55 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> set sqlprompt "_user'@'_connect_identifier> "
+
+SYS@cdb1> alter session set container = pdb1;
+
+Session altered.
+
+======================================================================
+[0단계] 실습용 소형 테이블스페이스 준비 (자동확장 OFF, 50MB)
+======================================================================
+
+SYS@cdb1> create tablespace grow_ts
+  2    datafile '/u01/app/oracle/oradata/CDB1/pdb1/grow_ts01.dbf' size 50M
+  3    autoextend off;
+
+Tablespace created.
+
+- 현재 크기/자동확장 상태 확인
+SYS@cdb1> select file_name, bytes/1024/1024 as mb, autoextensible
+  2  from   dba_data_files where tablespace_name = 'GROW_TS';
+
+FILE_NAME                                                    MB  AUT
+------------------------------------------------------------ --- ---
+/u01/app/oracle/oradata/CDB1/pdb1/grow_ts01.dbf              50  NO
+
+======================================================================
+[1단계] 공간 부족 상황 재현 (ORA-01653)
+======================================================================
+
+- 50MB를 초과하는 데이터를 넣어 공간 부족을 유발
+SYS@cdb1> create table hr.big_t tablespace grow_ts
+  2    as select level id, rpad('x',2000,'x') pad
+  3    from dual connect by level <= 100000;
+create table hr.big_t tablespace grow_ts
+                *
+ERROR at line 1:
+ORA-01653: unable to extend table HR.BIG_T by 128 in tablespace GROW_TS
+
+- 원인: 테이블스페이스가 가득 찼고 자동확장이 꺼져 있어 익스텐트를 늘릴 수 없음.
+-   세 가지 확장 방법을 차례로 적용한다.
+
+======================================================================
+[2단계] (방법1) 기존 데이터 파일 리사이즈
+======================================================================
+
+SYS@cdb1> alter database datafile
+  2    '/u01/app/oracle/oradata/CDB1/pdb1/grow_ts01.dbf' resize 200M;
+
+Database altered.
+
+SYS@cdb1> select bytes/1024/1024 as mb from dba_data_files
+  2  where file_name like '%grow_ts01.dbf';
+
+        MB
+----------
+       200
+
+======================================================================
+[3단계] (방법2) 자동 확장 켜기 (상한 지정)
+======================================================================
+
+SYS@cdb1> alter database datafile
+  2    '/u01/app/oracle/oradata/CDB1/pdb1/grow_ts01.dbf'
+  3    autoextend on next 100M maxsize 2G;
+
+Database altered.
+
+SYS@cdb1> select bytes/1024/1024 as mb, autoextensible,
+  2         maxbytes/1024/1024 as max_mb
+  3  from   dba_data_files where file_name like '%grow_ts01.dbf';
+
+        MB  AUT     MAX_MB
+---------- --- ----------
+       200 YES       2048
+
+======================================================================
+[4단계] (방법3) 테이블스페이스에 데이터 파일 추가 (I/O 분산)
+======================================================================
+
+- (실수) 이미 존재하는 경로로 파일을 추가하려다 충돌
+SYS@cdb1> alter tablespace grow_ts add datafile
+  2    '/u01/app/oracle/oradata/CDB1/pdb1/grow_ts01.dbf' size 100M;
+alter tablespace grow_ts add datafile
+*
+ERROR at line 1:
+ORA-01537: cannot add file
+'/u01/app/oracle/oradata/CDB1/pdb1/grow_ts01.dbf' - file already part of
+database
+
+- 원인: 이미 사용 중인 파일 이름. 새 이름(다른 디스크 /u02)으로 추가
+SYS@cdb1> alter tablespace grow_ts add datafile
+  2    '/u02/app/oracle/oradata/CDB1/pdb1/grow_ts02.dbf' size 300M
+  3    autoextend on next 100M maxsize 4G;
+
+Tablespace altered.
+
+- 이제 테이블스페이스는 두 개의 데이터 파일로 구성됨
+SYS@cdb1> select file_name, bytes/1024/1024 as mb from dba_data_files
+  2  where tablespace_name = 'GROW_TS' order by file_id;
+
+FILE_NAME                                                    MB
+------------------------------------------------------------ ----------
+/u01/app/oracle/oradata/CDB1/pdb1/grow_ts01.dbf              200
+/u02/app/oracle/oradata/CDB1/pdb1/grow_ts02.dbf              300
+
+======================================================================
+[5단계] 확장 후 재적재 성공 및 사용률 확인
+======================================================================
+
+SYS@cdb1> create table hr.big_t tablespace grow_ts
+  2    as select level id, rpad('x',2000,'x') pad
+  3    from dual connect by level <= 100000;
+
+Table created.
+
+- 테이블스페이스 사용률 확인
+SYS@cdb1> select df.tablespace_name,
+  2         round(df.total_mb,1) total_mb,
+  3         round(df.total_mb - nvl(fs.free_mb,0),1) used_mb
+  4  from  (select tablespace_name, sum(bytes)/1048576 total_mb
+  5         from dba_data_files where tablespace_name='GROW_TS'
+  6         group by tablespace_name) df
+  7  left join (select tablespace_name, sum(bytes)/1048576 free_mb
+  8         from dba_free_space where tablespace_name='GROW_TS'
+  9         group by tablespace_name) fs
+ 10  on df.tablespace_name = fs.tablespace_name;
+
+TABLESPACE_NAME    TOTAL_MB    USED_MB
+------------------ ---------- ----------
+GROW_TS                  500      241.8
+
+- 정리
+SYS@cdb1> drop table hr.big_t purge;
+
+Table dropped.
+
+- [정리] 데이터베이스 확장 3가지:
+-   1) RESIZE로 기존 파일 확대
+-   2) AUTOEXTEND ON + MAXSIZE로 자동 확장(상한 필수)
+-   3) ADD DATAFILE로 파일 추가(여러 디스크로 I/O 분산)
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

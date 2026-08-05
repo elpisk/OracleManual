@@ -1,0 +1,138 @@
+-- 20장 실습_01: 언두 데이터 개념 및 자동 언두 관리(AUM) 확인
+
+- 루트 컨테이너로 SYSDBA 접속된 상태에서 현재 컨테이너 확인
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] 언두 관련 핵심 초기화 파라미터 확인
+======================================================================
+
+- 언두 관리 방식/보존 시간/사용 언두 TS/임시 언두 여부를 한 번에 조회
+SYS@cdb1> show parameter undo
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+temp_undo_enabled                    boolean     FALSE
+undo_management                      string      AUTO
+undo_retention                       integer     900
+undo_tablespace                      string      UNDOTBS1
+
+- 해석: UNDO_MANAGEMENT=AUTO 이므로 자동 언두 관리(AUM)가 동작 중.
+-   Oracle이 언두 세그먼트를 자동으로 생성/튜닝하며, DBA가 수동 롤백 세그먼트를 만들 필요 없음.
+
+======================================================================
+[2단계] 언두 테이블스페이스와 자동 언두 세그먼트 확인
+======================================================================
+
+- CONTENTS='UNDO' 인 테이블스페이스가 언두 전용 테이블스페이스
+SYS@cdb1> select tablespace_name, contents, status, retention
+  2  from   dba_tablespaces where contents='UNDO';
+
+TABLESPACE_NAME      CONTENTS  STATUS    RETENTION
+-------------------- --------- --------- -----------
+UNDOTBS1             UNDO      ONLINE    NOGUARANTEE
+
+- 언두 테이블스페이스 안에 Oracle이 자동으로 만든 언두(롤백) 세그먼트 목록
+SYS@cdb1> select segment_name, status
+  2  from   dba_rollback_segs
+  3  where  tablespace_name='UNDOTBS1' and rownum <= 5;
+
+SEGMENT_NAME                   STATUS
+------------------------------ ----------------
+_SYSSMU1_3448552820$           ONLINE
+_SYSSMU2_2789871456$           ONLINE
+_SYSSMU3_1017341276$           ONLINE
+_SYSSMU4_2632461099$           ONLINE
+_SYSSMU5_3491852690$           ONLINE
+
+- 해석: '_SYSSMU'로 시작하는 이름이 AUM이 자동 생성/관리하는 언두 세그먼트.
+-   개수/크기는 워크로드에 따라 Oracle이 알아서 조정함.
+
+======================================================================
+[3단계] 언두가 실제로 생성되는지 트랜잭션으로 확인
+======================================================================
+
+- 실습용 테이블 생성 후 DML로 언두 발생시키기
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+SYS@salespdb> create table hr.undo_demo as select * from all_objects where rownum<=1000;
+
+Table created.
+
+- 트랜잭션 시작(커밋 전) - 대량 UPDATE로 언두 생성
+SYS@salespdb> update hr.undo_demo set object_name = lower(object_name);
+
+1000 rows updated.
+
+- 현재 내 트랜잭션이 사용 중인 언두 블록/레코드 수 확인
+SYS@salespdb> select t.used_ublk, t.used_urec
+  2  from   v$transaction t, v$session s
+  3  where  t.addr = s.taddr and s.sid = sys_context('USERENV','SID');
+
+ USED_UBLK  USED_UREC
+---------- ----------
+        18       1000
+
+- 해석: 커밋하지 않은 활성 트랜잭션이 언두 블록 18개, 언두 레코드 1000개를 점유 중.
+-   이 언두는 롤백/읽기 일관성을 위해 사용되며, 커밋 전에는 절대 덮어써지지 않음.
+
+======================================================================
+[4단계] (실수 -> 오류 -> 재시도) 언두 테이블스페이스에 사용자 테이블 생성 시도
+======================================================================
+
+- (실수) 언두 테이블스페이스에 일반 테이블을 만들려고 시도
+SYS@salespdb> alter session set container = cdb$root;
+
+Session altered.
+
+SYS@cdb1> create table system.badtab (id number) tablespace undotbs1;
+create table system.badtab (id number) tablespace undotbs1
+                                                   *
+ERROR at line 1:
+ORA-30022: Cannot create segments in undo tablespace
+
+- 원인: 언두 테이블스페이스에는 오직 언두 세그먼트만 저장 가능. 사용자 객체 배치 불가.
+-   일반 테이블은 영구 테이블스페이스(예: USERS)에 생성해야 함
+SYS@cdb1> create table system.badtab (id number) tablespace users;
+
+Table created.
+
+======================================================================
+[정리] 실습 객체 롤백/삭제
+======================================================================
+
+- 위 UPDATE 트랜잭션은 커밋하지 않았으므로 롤백으로 원래 값 복원(언두 사용)
+SYS@cdb1> alter session set container = salespdb;
+
+Session altered.
+
+SYS@salespdb> rollback;
+
+Rollback complete.
+
+SYS@salespdb> drop table hr.undo_demo purge;
+
+Table dropped.
+
+SYS@salespdb> alter session set container = cdb$root;
+
+Session altered.
+
+SYS@cdb1> drop table system.badtab purge;
+
+Table dropped.
+
+- [정리] 핵심 확인 완료:
+-   AUM = UNDO_MANAGEMENT AUTO, 언두는 UNDOTBS1 언두 TS의 _SYSSMU 세그먼트에 자동 저장
+-   DML은 언두를 생성(V$TRANSACTION.USED_UBLK), 커밋 전 언두는 롤백/읽기 일관성용
+-   언두 TS에는 사용자 객체 생성 불가(ORA-30022)
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

@@ -1,0 +1,129 @@
+-- 19장 실습_09: Resumable Space Allocation 활성화 및 일시중단된 문장 재개
+-- 목표: 작은 할당량 테이블스페이스에서 공간 부족을 유발해 문장을 SUSPEND시키고, 공간 확보 후 재개시킨다.
+
+======================================================================
+[준비] 관리자 세션: 작은 데이터 파일의 테이블스페이스 생성
+======================================================================
+
+[oracle@dbsvr ~]$ sqlplus sys@hrpdb as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 5 20:11:09 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@hrpdb> show con_name
+
+CON_NAME
+------------------------------
+HRPDB
+
+- 자동 확장을 끈 작은(5M) 테이블스페이스를 만들어 공간 부족을 의도적으로 유발
+SYS@hrpdb> create tablespace tiny_ts
+  2  datafile '/u01/app/oracle/oradata/CDB1/hrpdb/tiny01.dbf'
+  3  size 5m autoextend off;
+
+Tablespace created.
+
+- 실습 사용자에게 RESUMABLE 권한과 해당 테이블스페이스 사용 권한 부여
+SYS@hrpdb> grant resumable to hr;
+
+Grant succeeded.
+
+SYS@hrpdb> alter user hr quota unlimited on tiny_ts;
+
+User altered.
+
+======================================================================
+[작업 세션] Resumable 활성화 후 공간 부족 유발
+======================================================================
+
+[oracle@dbsvr ~]$ sqlplus hr@hrpdb
+
+Enter password:
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+- (실수) Resumable을 켜기 전에 대량 적재부터 실행 -> 즉시 실패(롤백)
+HR@hrpdb> create table big_load (id number, v varchar2(200)) tablespace tiny_ts;
+
+Table created.
+
+HR@hrpdb> insert /*+ append */ into big_load
+  2  select level, rpad('X',200,'X') from dual connect by level <= 500000;
+insert /*+ append */ into big_load
+*
+ERROR at line 1:
+ORA-01653: unable to extend table HR.BIG_LOAD by 128 in tablespace TINY_TS
+
+- 원인: Resumable 미활성 상태라 공간 부족 즉시 실패. 이제 Resumable을 켜고 재시도한다.
+HR@hrpdb> alter session enable resumable timeout 3600 name 'big_load_demo';
+
+Session altered.
+
+- 같은 적재를 다시 실행 -> 이번엔 실패 대신 '일시 중단(SUSPEND)' 되어 프롬프트가 멈춘다
+HR@hrpdb> insert /*+ append */ into big_load
+  2  select level, rpad('X',200,'X') from dual connect by level <= 500000;
+-- (문장이 반환되지 않고 SUSPEND 상태로 대기 중...)
+
+======================================================================
+[관리자 세션] 일시 중단 감지 및 공간 확보 -> 자동 재개
+======================================================================
+
+- 관리자 세션에서 일시 중단된 문장을 확인
+SYS@hrpdb> select session_id, status, name, error_number
+  2  from dba_resumable;
+
+SESSION_ID STATUS     NAME             ERROR_NUMBER
+---------- ---------- ---------------- ------------
+       142 SUSPENDED  big_load_demo            1653
+
+- 알림 로그에도 기록됨. 어떤 오류인지 재확인 후 데이터 파일을 확장하여 공간 확보
+SYS@hrpdb> alter database datafile
+  2  '/u01/app/oracle/oradata/CDB1/hrpdb/tiny01.dbf' autoextend on next 50m maxsize 500m;
+
+Database altered.
+
+- 공간이 확보되는 순간, 작업 세션의 문장이 중단 지점부터 자동으로 이어서 완료된다
+SYS@hrpdb> select session_id, status from dba_resumable;
+
+no rows selected
+
+======================================================================
+[작업 세션] 문장이 재개되어 정상 완료됨
+======================================================================
+
+-- (앞서 멈춰 있던 작업 세션의 프롬프트가 이제 반환됨)
+HR@hrpdb> insert /*+ append */ into big_load
+  2  select level, rpad('X',200,'X') from dual connect by level <= 500000;
+
+500000 rows created.
+
+HR@hrpdb> commit;
+
+Commit complete.
+
+- 적재가 온전히 완료되었는지 확인
+HR@hrpdb> select count(*) from big_load;
+
+  COUNT(*)
+----------
+    500000
+
+- 작업 완료 후 Resumable 비활성화(권장)
+HR@hrpdb> alter session disable resumable;
+
+Session altered.
+
+- [정리]
+-   Resumable 미활성: 공간 부족 시 즉시 실패(롤백)
+-   ALTER SESSION ENABLE RESUMABLE TIMEOUT n NAME '...' 로 활성화(RESUMABLE 권한 필요)
+-   공간 부족(ORA-01653) 시 문장이 SUSPEND -> 관리자가 공간 확보하면 자동 재개
+-   TIMEOUT 안에 해결 안 되면 그때 비로소 실패 / DBA_RESUMABLE로 모니터링
+HR@hrpdb> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

@@ -1,0 +1,150 @@
+-- 19장 실습_10: 재개 가능(Resumable) 작업 대상 확인
+-- 목표: 어떤 작업이 Resumable 대상인지(쿼리/DML/DDL) 구분하고, DBMS_RESUMABLE와 AFTER SUSPEND 트리거를 살펴본다.
+
+======================================================================
+[준비] 관리자 세션
+======================================================================
+
+[oracle@dbsvr ~]$ sqlplus sys@hrpdb as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 5 21:30:44 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@hrpdb> show con_name
+
+CON_NAME
+------------------------------
+HRPDB
+
+- 시스템 수준 Resumable 기본값 확인 (0이면 세션에서 명시 활성화해야 함)
+SYS@hrpdb> show parameter resumable_timeout
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------
+resumable_timeout                    integer     0
+
+======================================================================
+[1단계] AFTER SUSPEND 트리거로 자동 대응 준비
+======================================================================
+
+- 문장이 일시 중단될 때마다 실행되어 무슨 일이 있었는지 로그를 남기는 트리거 생성
+SYS@hrpdb> create table sys.resumable_log (
+  2    log_time   timestamp,
+  3    err_type   varchar2(30),
+  4    object_owner varchar2(30),
+  5    table_space varchar2(30));
+
+Table created.
+
+SYS@hrpdb> create or replace trigger sys.trg_after_suspend
+  2  after suspend on database
+  3  declare
+  4    v_type  varchar2(30);
+  5    v_owner varchar2(30);
+  6    v_obj   varchar2(30);
+  7    v_sub   varchar2(30);
+  8    v_ts    varchar2(30);
+  9    v_ok    boolean;
+ 10  begin
+ 11    v_ok := dbms_resumable.space_error_info(
+ 12              error_type   => v_type,
+ 13              object_owner => v_owner,
+ 14              table_space_name => v_ts,
+ 15              object_name  => v_obj,
+ 16              sub_object_name => v_sub);
+ 17    insert into sys.resumable_log
+ 18      values (systimestamp, v_type, v_owner, v_ts);
+ 19  end;
+ 20  /
+
+Trigger created.
+
+======================================================================
+[2단계] Resumable '대상' 작업과 '비대상' 작업 구분
+======================================================================
+
+SYS@hrpdb> alter session enable resumable timeout 60 name 'target_test';
+
+Session altered.
+
+- (실수) 문법 오류가 있는 문장은 공간과 무관하므로 Resumable로 처리되지 않고 즉시 실패
+SYS@hrpdb> create table hr.t_bad (id number, id number);
+create table hr.t_bad (id number, id number)
+                                   *
+ERROR at line 1:
+ORA-00957: duplicate column name
+
+- 원인: 이것은 공간 오류가 아니라 정의 오류다. Resumable은 공간 관련 오류만 SUSPEND한다.
+-   -> 문법/제약 오류는 대상이 아님을 확인
+
+- Resumable '대상'이 되는 작업 유형 정리(문서적 확인):
+-   * 쿼리(SELECT): 대용량 정렬/해시 조인의 임시 공간 부족
+-   * DML: INSERT/UPDATE/DELETE, INSERT ... SELECT, 다이렉트 패스 적재
+-   * DDL: CREATE TABLE AS SELECT, CREATE INDEX, ALTER INDEX REBUILD,
+-          ALTER TABLE MOVE, ALTER TABLE ADD PARTITION 등 세그먼트를 크게 확장하는 작업
+
+======================================================================
+[3단계] DBMS_RESUMABLE로 세션의 타임아웃 조회/변경
+======================================================================
+
+- 현재 세션의 Resumable 타임아웃(초) 조회
+SYS@hrpdb> select dbms_resumable.get_timeout() as timeout_sec from dual;
+
+TIMEOUT_SEC
+-----------
+         60
+
+- 프로그래밍으로 타임아웃을 변경(예: 120초)
+SYS@hrpdb> exec dbms_resumable.set_timeout(120);
+
+PL/SQL procedure successfully completed.
+
+SYS@hrpdb> select dbms_resumable.get_timeout() as timeout_sec from dual;
+
+TIMEOUT_SEC
+-----------
+        120
+
+======================================================================
+[4단계] 일시 중단 이력 확인 뷰
+======================================================================
+
+- DBA_RESUMABLE: 현재/최근 Resumable 문장의 상태를 확인하는 뷰
+SYS@hrpdb> select session_id, status, name, error_number
+  2  from dba_resumable;
+
+no rows selected
+
+- (현재 SUSPEND된 문장이 없으므로 no rows. 실습_09에서 SUSPENDED 상태를 관찰했다.)
+- AFTER SUSPEND 트리거가 남긴 로그 테이블도 대응 자동화의 근거가 된다
+SYS@hrpdb> select count(*) from sys.resumable_log;
+
+  COUNT(*)
+----------
+         0
+
+- [정리]
+-   Resumable 대상 = 공간을 크게 쓰는 쿼리/DML/특정 DDL이 '공간 관련 오류'를 만난 경우
+-   비대상 = 문법 오류·제약 위반 등 공간과 무관한 오류 -> 즉시 실패
+-   DBMS_RESUMABLE: GET_TIMEOUT/SET_TIMEOUT/ABORT, SPACE_ERROR_INFO(트리거에서 원인 파악)
+-   DBA_RESUMABLE/USER_RESUMABLE 뷰와 AFTER SUSPEND 트리거로 모니터링·자동 대응
+SYS@hrpdb> alter session disable resumable;
+
+Session altered.
+
+SYS@hrpdb> drop trigger sys.trg_after_suspend;
+
+Trigger dropped.
+
+SYS@hrpdb> drop table sys.resumable_log purge;
+
+Table dropped.
+
+SYS@hrpdb> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

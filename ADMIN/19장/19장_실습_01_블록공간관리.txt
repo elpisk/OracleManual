@@ -1,0 +1,167 @@
+-- 19장 실습_01: 블록 공간 관리(ASSM) 및 행 체이닝/마이그레이션 확인
+-- 목표: ASSM(자동 세그먼트 공간 관리) 확인, PCTFREE와 행 마이그레이션의 관계를 직접 재현하고 해소한다.
+
+- SQL*Plus로 HR PDB에 접속 (실습용 PDB)
+[oracle@dbsvr ~]$ sqlplus sys@hrpdb as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 5 09:20:11 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@hrpdb> show con_name
+
+CON_NAME
+------------------------------
+HRPDB
+
+======================================================================
+[1단계] 테이블스페이스의 세그먼트 공간 관리 방식 확인 (ASSM 여부)
+======================================================================
+
+- USERS 테이블스페이스의 익스텐트 관리/세그먼트 공간 관리 방식 확인
+-   19c 로컬 관리 테이블스페이스는 SEGMENT_SPACE_MANAGEMENT=AUTO(ASSM)가 기본
+SYS@hrpdb> select tablespace_name, extent_management, segment_space_management
+  2  from dba_tablespaces
+  3  where tablespace_name in ('USERS','SYSTEM');
+
+TABLESPACE_NAME  EXTENT_MAN SEGMEN
+---------------- ---------- ------
+SYSTEM           LOCAL      MANUAL
+USERS            LOCAL      AUTO
+
+- 관찰: SYSTEM은 MANUAL(MSSM), USERS는 AUTO(ASSM). 실습 객체는 ASSM인 USERS에 만든다.
+
+======================================================================
+[2단계] PCTFREE를 일부러 낮게 지정한 테이블 생성 후 행 마이그레이션 유발
+======================================================================
+
+- 갱신용 여유 공간이 거의 없도록 PCTFREE 0으로 테이블 생성
+SYS@hrpdb> create table hr.rowmig_demo (
+  2    id     number,
+  3    filler varchar2(2000)
+  4  ) pctfree 0 tablespace users;
+
+Table created.
+
+- 짧은 값으로 먼저 채워 블록을 꽉 채움 (PCTFREE 0이므로 여유 공간이 거의 없음)
+SYS@hrpdb> insert into hr.rowmig_demo
+  2  select level, 'x' from dual connect by level <= 2000;
+
+2000 rows created.
+
+SYS@hrpdb> commit;
+
+Commit complete.
+
+- 통계 수집 후 체인/마이그레이션 행 수 확인 (아직 0에 가까움)
+SYS@hrpdb> analyze table hr.rowmig_demo compute statistics;
+
+Table analyzed.
+
+SYS@hrpdb> select num_rows, chain_cnt from dba_tables
+  2  where owner='HR' and table_name='ROWMIG_DEMO';
+
+  NUM_ROWS  CHAIN_CNT
+---------- ----------
+      2000          0
+
+- 이제 각 행을 크게 UPDATE하여 원래 블록에 못 들어가게 만듦 -> 행 마이그레이션 유발
+SYS@hrpdb> update hr.rowmig_demo set filler = rpad('A', 1500, 'A');
+
+2000 rows updated.
+
+SYS@hrpdb> commit;
+
+Commit complete.
+
+======================================================================
+[3단계] 마이그레이션(체인) 행 식별
+======================================================================
+
+- 체인 행 저장용 표준 테이블 생성 (utlchain.sql이 정의하는 구조)
+SYS@hrpdb> create table hr.chained_rows (
+  2    owner_name         varchar2(128),
+  3    table_name         varchar2(128),
+  4    cluster_name       varchar2(128),
+  5    partition_name     varchar2(128),
+  6    subpartition_name  varchar2(128),
+  7    head_rowid         rowid,
+  8    analyze_timestamp  date
+  9  );
+
+Table created.
+
+- (실수) 컬럼을 지정하는 INTO 절 없이 LIST CHAINED ROWS를 실행하려다 결과 저장 위치 누락
+SYS@hrpdb> analyze table hr.rowmig_demo list chained rows;
+analyze table hr.rowmig_demo list chained rows
+*
+ERROR at line 1:
+ORA-24328: illegal attribute value
+
+- 원인: LIST CHAINED ROWS는 결과를 담을 대상 테이블을 INTO 절로 지정해야 한다. 올바르게 재실행
+SYS@hrpdb> analyze table hr.rowmig_demo list chained rows into hr.chained_rows;
+
+Table analyzed.
+
+- 마이그레이션된 행의 ROWID가 chained_rows에 수집됨
+SYS@hrpdb> select count(*) as migrated_rows from hr.chained_rows;
+
+MIGRATED_ROWS
+-------------
+         1876
+
+- 통계에도 chain_cnt가 크게 증가한 것을 확인
+SYS@hrpdb> analyze table hr.rowmig_demo compute statistics;
+
+Table analyzed.
+
+SYS@hrpdb> select chain_cnt from dba_tables
+  2  where owner='HR' and table_name='ROWMIG_DEMO';
+
+ CHAIN_CNT
+----------
+      1876
+
+======================================================================
+[4단계] 마이그레이션 해소: MOVE로 세그먼트 재구성 + PCTFREE 상향
+======================================================================
+
+- 갱신 여유를 주도록 PCTFREE를 20으로 올리며 세그먼트를 재작성
+SYS@hrpdb> alter table hr.rowmig_demo move pctfree 20;
+
+Table altered.
+
+- 재구성 후 다시 분석하면 마이그레이션 행이 사라진 것을 확인
+SYS@hrpdb> analyze table hr.rowmig_demo compute statistics;
+
+Table analyzed.
+
+SYS@hrpdb> select chain_cnt from dba_tables
+  2  where owner='HR' and table_name='ROWMIG_DEMO';
+
+ CHAIN_CNT
+----------
+         0
+
+- [정리]
+-   행 마이그레이션 = UPDATE로 행이 커져 원블록을 벗어남 -> 추가 I/O로 성능 저하
+-   예방 = PCTFREE를 적절히 높여 갱신용 여유 확보
+-   해소 = ANALYZE ... LIST CHAINED ROWS INTO 로 식별 후 ALTER TABLE ... MOVE로 재구성
+-   행 체이닝(행이 블록보다 큼)은 PCTFREE로 해결 안 되며 큰 블록/컬럼 재설계가 필요(구분!)
+SYS@hrpdb> drop table hr.chained_rows purge;
+
+Table dropped.
+
+SYS@hrpdb> drop table hr.rowmig_demo purge;
+
+Table dropped.
+
+SYS@hrpdb> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

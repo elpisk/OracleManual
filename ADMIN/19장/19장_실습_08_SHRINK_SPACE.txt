@@ -1,0 +1,134 @@
+-- 19장 실습_08: 세그먼트 축소(SHRINK SPACE)로 공간 회수
+-- 목표: 대량 DELETE 후 HWM가 내려가지 않음을 확인하고, ENABLE ROW MOVEMENT + SHRINK SPACE로 회수한다.
+
+[oracle@dbsvr ~]$ sqlplus sys@hrpdb as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 5 17:03:22 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@hrpdb> show con_name
+
+CON_NAME
+------------------------------
+HRPDB
+
+======================================================================
+[1단계] 실습 테이블 생성 및 대량 적재 (ASSM 테이블스페이스 USERS)
+======================================================================
+
+SYS@hrpdb> create table hr.shrink_demo (id number, v varchar2(100)) tablespace users;
+
+Table created.
+
+SYS@hrpdb> insert /*+ append */ into hr.shrink_demo
+  2  select level, rpad('D',100,'D') from dual connect by level <= 300000;
+
+300000 rows created.
+
+SYS@hrpdb> commit;
+
+Commit complete.
+
+- 적재 직후 세그먼트 크기 확인
+SYS@hrpdb> select blocks, extents, bytes/1024/1024 as mb from user_segments
+  2  where segment_name='SHRINK_DEMO';
+
+    BLOCKS    EXTENTS         MB
+---------- ---------- ----------
+      4608         33         36
+
+======================================================================
+[2단계] 대량 DELETE 후 HWM가 그대로임을 확인
+======================================================================
+
+- 90%의 행을 삭제 (id가 10의 배수인 행만 남김)
+SYS@hrpdb> delete from hr.shrink_demo where mod(id,10) <> 0;
+
+270000 rows deleted.
+
+SYS@hrpdb> commit;
+
+Commit complete.
+
+- 행은 1/10로 줄었지만 세그먼트 블록/익스텐트는 그대로 (HWM가 내려가지 않음)
+SYS@hrpdb> select blocks, extents, bytes/1024/1024 as mb from user_segments
+  2  where segment_name='SHRINK_DEMO';
+
+    BLOCKS    EXTENTS         MB
+---------- ---------- ----------
+      4608         33         36
+
+- 전체 스캔 비용 지표(실제 사용 블록)도 여전히 높음
+SYS@hrpdb> select count(*) from hr.shrink_demo;
+
+  COUNT(*)
+----------
+     30000
+
+======================================================================
+[3단계] SHRINK SPACE 시도 -> 행 이동 미허용으로 실패
+======================================================================
+
+- (실수) 행 이동을 허용하지 않은 채 바로 SHRINK SPACE 실행
+SYS@hrpdb> alter table hr.shrink_demo shrink space;
+alter table hr.shrink_demo shrink space
+*
+ERROR at line 1:
+ORA-10636: ROW MOVEMENT is not enabled
+
+- 원인: SHRINK는 행 재배치 중 ROWID가 바뀌므로 반드시 행 이동이 허용되어야 한다.
+-   행 이동을 허용한 뒤 재시도한다.
+SYS@hrpdb> alter table hr.shrink_demo enable row movement;
+
+Table altered.
+
+======================================================================
+[4단계] 2단계 축소: COMPACT(재배치) -> 완료(HWM 조정)
+======================================================================
+
+- 1단계: 행 재배치만 수행(온라인). HWM 조정/공간 반환은 아직 하지 않음
+SYS@hrpdb> alter table hr.shrink_demo shrink space compact;
+
+Table altered.
+
+- COMPACT 단계만으로는 아직 HWM가 내려가지 않아 세그먼트 크기가 그대로
+SYS@hrpdb> select blocks, extents from user_segments
+  2  where segment_name='SHRINK_DEMO';
+
+    BLOCKS    EXTENTS
+---------- ----------
+      4608         33
+
+- 2단계: 옵션 없이 SHRINK SPACE로 HWM 조정과 공간 반환을 완료(짧은 배타적 잠금)
+SYS@hrpdb> alter table hr.shrink_demo shrink space;
+
+Table altered.
+
+- 이제 블록/익스텐트가 크게 줄고 HWM가 낮아졌다
+SYS@hrpdb> select blocks, extents, bytes/1024/1024 as mb from user_segments
+  2  where segment_name='SHRINK_DEMO';
+
+    BLOCKS    EXTENTS         MB
+---------- ---------- ----------
+       512          8          4
+
+- 종속 인덱스까지 함께 줄이려면 CASCADE 옵션을 사용할 수 있다(참고)
+SYS@hrpdb> -- alter table hr.shrink_demo shrink space cascade;
+
+- [정리]
+-   DELETE는 HWM를 낮추지 않아 공간/스캔 비용이 그대로다
+-   SHRINK SPACE 전제: ASSM 테이블스페이스 + ENABLE ROW MOVEMENT
+-   COMPACT=재배치만(온라인, 오래) / 옵션없음=HWM 조정·공간 반환 / CASCADE=종속 객체까지
+-   결과: 36MB -> 4MB, HWM 하락으로 전체 스캔 성능도 함께 개선
+SYS@hrpdb> drop table hr.shrink_demo purge;
+
+Table dropped.
+
+SYS@hrpdb> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$
