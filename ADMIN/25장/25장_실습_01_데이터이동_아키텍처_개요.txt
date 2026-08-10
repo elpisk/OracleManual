@@ -1,0 +1,126 @@
+-- 25장 실습_01: 데이터 이동(Data Movement) 아키텍처 개요 확인
+-- 목표: Oracle 데이터 이동 도구의 지형도를 딕셔너리로 확인하고, 데이터 이동의
+--       공통 기반(디렉터리 객체, DBMS_DATAPUMP/DBMS_METADATA API)을 점검한다.
+--       중간에 권한 부족 오류(ORA-01031)를 만나 원인 파악 후 해결한다.
+
+- 루트 컨테이너로 SYSDBA 접속된 상태 확인
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+======================================================================
+[1단계] 데이터 이동 API 계층이 데이터베이스에 존재하는지 확인
+======================================================================
+
+- 데이터 이동의 핵심 PL/SQL API 패키지(DBMS_DATAPUMP, DBMS_METADATA) 존재 확인
+SYS@cdb1> select object_name, object_type, status
+  2  from   dba_objects
+  3  where  object_name in ('DBMS_DATAPUMP','DBMS_METADATA')
+  4  and    object_type = 'PACKAGE'
+  5  order  by object_name;
+
+OBJECT_NAME       OBJECT_TYPE   STATUS
+----------------- ------------- -------
+DBMS_DATAPUMP     PACKAGE       VALID
+DBMS_METADATA     PACKAGE       VALID
+
+- DBMS_DATAPUMP: 데이터/메타데이터를 대량 이동하는 엔진 API
+- DBMS_METADATA: 객체 정의(DDL)를 추출·변환하는 API
+- expdp/impdp 같은 커맨드라인 유틸리티도 내부적으로 이 API를 호출한다.
+
+======================================================================
+[2단계] 서버 파일 접근의 관문 - 디렉터리 객체 확인
+======================================================================
+
+- Data Pump·외부 테이블 등은 반드시 디렉터리 객체를 통해서만 서버 파일에 접근한다.
+- 현재 정의된 디렉터리 객체 목록 조회 (설치 시 자동 생성되는 DATA_PUMP_DIR 확인)
+SYS@cdb1> select directory_name, directory_path
+  2  from   dba_directories
+  3  order  by directory_name;
+
+DIRECTORY_NAME       DIRECTORY_PATH
+-------------------- ------------------------------------------------
+DATA_PUMP_DIR        /u01/app/oracle/admin/cdb1/dpdump/
+XMLDIR               /u01/app/oracle/product/19.3.0/dbhome_1/rdbms/xml
+
+- DATA_PUMP_DIR: 오라클이 설치 시 자동 생성하는 기본 디렉터리 객체.
+- DIRECTORY 파라미터를 생략하면 이 기본 디렉터리가 사용될 수 있으나,
+  실무에서는 명시적으로 전용 디렉터리 객체를 만들어 쓰는 것이 안전하다.
+
+======================================================================
+[3단계] (오류 -> 원인 -> 수정) 일반 사용자가 디렉터리 객체 생성 시도
+======================================================================
+
+- 애플리케이션 계정 hr 로 접속해 전용 디렉터리 객체를 만들려고 시도한다.
+SYS@cdb1> connect hr/oracle@pdb1
+Connected.
+
+- (실수) 일반 사용자 hr 이 CREATE DIRECTORY 를 직접 실행.
+HR@pdb1> create directory dp_dir as '/u01/app/oracle/dpdump';
+create directory dp_dir as '/u01/app/oracle/dpdump'
+*
+ERROR at line 1:
+ORA-01031: insufficient privileges
+
+- 원인: 디렉터리 객체를 만들려면 CREATE ANY DIRECTORY 시스템 권한(또는 SYSDBA)이
+        필요하다. hr 은 그 권한이 없어 실패했다. 디렉터리 객체는 서버가 신뢰하는
+        경로에만 파일 입출력을 허용하는 보안 장치이므로 생성 권한을 아무에게나 주지 않는다.
+- 수정: 관리자(SYSDBA)가 디렉터리 객체를 생성하고, hr 에게는 READ/WRITE 권한만 부여한다.
+
+HR@pdb1> connect sys/oracle@pdb1 as sysdba
+Connected.
+
+SYS@pdb1> create or replace directory dp_dir as '/u01/app/oracle/dpdump';
+
+Directory created.
+
+SYS@pdb1> grant read, write on directory dp_dir to hr;
+
+Grant succeeded.
+
+======================================================================
+[4단계] 부여된 권한 확인 및 도구 지형도 정리
+======================================================================
+
+- hr 이 dp_dir 에 대해 어떤 권한을 받았는지 확인
+SYS@pdb1> select grantee, privilege
+  2  from   dba_tab_privs
+  3  where  table_name = 'DP_DIR'
+  4  order  by privilege;
+
+GRANTEE   PRIVILEGE
+--------- ----------
+HR        READ
+HR        WRITE
+
+- 데이터 이동 도구 지형도(개념 정리):
+--   Data Pump(expdp/impdp) : 오라클<->오라클 논리 이동, 오라클 전용 바이너리 덤프
+--   SQL*Loader(sqlldr)     : 외부 텍스트/플랫 파일 -> 오라클 테이블 적재(진입 도구)
+--   외부 테이블(External)   : 외부 파일을 테이블처럼 SQL 로 조회/적재/추출
+--   데이터베이스 링크(DB Link): 네트워크로 원격 DB 데이터 직접 조회/복사(파일 없음)
+--   트랜스포터블 TS(TTS)    : 데이터 파일 자체를 물리적으로 다른 DB 로 이동
+-- => 논리적 이동(행/정의를 읽어 옮김) vs 물리적 이동(데이터 파일 블록 복사)으로 크게 구분.
+
+======================================================================
+[정리]
+======================================================================
+- 데이터 이동은 DBMS_DATAPUMP(이동 엔진)와 DBMS_METADATA(DDL 추출/변환) API를 공통 기반으로 한다.
+- 서버 파일 접근은 반드시 디렉터리 객체를 통하며, 생성은 CREATE ANY DIRECTORY(또는 SYSDBA),
+  사용은 해당 디렉터리에 대한 READ/WRITE 권한이 필요하다.
+- 일반 사용자의 CREATE DIRECTORY 는 ORA-01031 로 거부되며, 관리자가 생성 후 권한을 부여하는 것이 정석이다.
+
+- 뒷정리
+SYS@pdb1> revoke read, write on directory dp_dir from hr;
+
+Revoke succeeded.
+
+SYS@pdb1> drop directory dp_dir;
+
+Directory dropped.
+
+SYS@pdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

@@ -1,0 +1,172 @@
+-- 26장 실습_01: SQL*Loader 컨트롤 파일 작성 실습
+-- 목표: LOAD DATA / INFILE / INTO TABLE / FIELDS TERMINATED BY / TRAILING NULLCOLS
+--       등 컨트롤 파일의 핵심 절을 직접 작성해 구분자 기반 CSV 를 적재한다.
+--       중간에 TRAILING NULLCOLS 누락으로 인한 레코드 거부를 만나 원인을 파악하고
+--       컨트롤 파일을 수정해 재적재한다.
+
+======================================================================
+[1단계] 적재 대상 테이블 준비
+======================================================================
+
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Mon Aug 10 09:40:12 2026
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+HR@pdb1> create table dept_load (
+  2    deptno  number(4),
+  3    dname   varchar2(30),
+  4    loc     varchar2(30),
+  5    note    varchar2(60)
+  6  );
+
+Table created.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[2단계] 입력 CSV 데이터 파일 작성
+======================================================================
+
+- dept.csv 작성 (쉼표 구분). 4번째 컬럼 note 가 없는 레코드가 섞여 있고,
+  값에 쉼표가 포함된 부서명은 큰따옴표로 감쌌다.
+[oracle@dbsvr ~]$ cat > dept.csv <<'EOF'
+10,ACCOUNTING,NEW YORK,main office
+20,RESEARCH,DALLAS
+30,"SALES, EMEA",CHICAGO,region hub
+40,OPERATIONS,BOSTON
+EOF
+
+- 확인
+[oracle@dbsvr ~]$ cat dept.csv
+10,ACCOUNTING,NEW YORK,main office
+20,RESEARCH,DALLAS
+30,"SALES, EMEA",CHICAGO,region hub
+40,OPERATIONS,BOSTON
+
+-- 20번, 40번 레코드는 note(4번째 필드)가 아예 없다.
+-- 30번 레코드의 부서명 'SALES, EMEA' 는 값 안에 쉼표가 있어 큰따옴표로 감쌌다.
+
+======================================================================
+[3단계] (오류 -> 원인 -> 수정) 컨트롤 파일 1차 작성 -> 필드 부족 거부
+======================================================================
+
+- dept.ctl 1차 작성 (TRAILING NULLCOLS 없음)
+[oracle@dbsvr ~]$ cat > dept.ctl <<'EOF'
+LOAD DATA
+INFILE 'dept.csv'
+BADFILE 'dept.bad'
+APPEND
+INTO TABLE dept_load
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+( deptno,
+  dname,
+  loc,
+  note )
+EOF
+
+- 실행 (전통적 경로)
+[oracle@dbsvr ~]$ sqlldr userid=hr@pdb1 control=dept.ctl log=dept.log bad=dept.bad
+
+SQL*Loader: Release 19.0.0.0.0 - Production on Mon Aug 10 09:45:03 2026
+Version 19.3.0.0.0
+
+Path used:      Conventional
+Commit point reached - logical record count 4
+
+Table DEPT_LOAD:
+  2 Rows successfully loaded.
+  2 Rows not loaded due to data errors.
+
+Check the log file:
+  dept.log
+for more information about the load.
+
+- 4건 중 2건이 거부되었다. 불량 파일을 확인한다.
+[oracle@dbsvr ~]$ cat dept.bad
+20,RESEARCH,DALLAS
+40,OPERATIONS,BOSTON
+
+- 로그에서 거부 사유를 확인한다.
+[oracle@dbsvr ~]$ grep -A1 "Record 2:" dept.log
+Record 2: Rejected - Error on table DEPT_LOAD.
+ORA-00947: not enough values
+
+- 원인: 컨트롤 파일 필드 목록에는 4개 컬럼(deptno, dname, loc, note)이 있는데
+        20번/40번 레코드는 note 필드가 없어 필드 개수가 부족하다.
+        TRAILING NULLCOLS 가 없으면 SQL*Loader 는 부족한 후행 필드를 채우지 못해
+        레코드를 거부한다(ORA-00947 계열).
+- 수정: 컨트롤 파일에 TRAILING NULLCOLS 를 추가해, 없는 후행 필드를 NULL 로 채운다.
+
+[oracle@dbsvr ~]$ cat > dept.ctl <<'EOF'
+LOAD DATA
+INFILE 'dept.csv'
+BADFILE 'dept.bad'
+APPEND
+INTO TABLE dept_load
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+TRAILING NULLCOLS
+( deptno,
+  dname,
+  loc,
+  note )
+EOF
+
+======================================================================
+[4단계] 수정된 컨트롤 파일로 재적재
+======================================================================
+
+- 앞서 2건은 이미 적재되었으므로, 거부되었던 불량 파일(dept.bad)만 재적재한다.
+[oracle@dbsvr ~]$ sqlldr userid=hr@pdb1 control=dept.ctl data=dept.bad log=dept_fix.log bad=dept_fix.bad
+
+SQL*Loader: Release 19.0.0.0.0 - Production on Mon Aug 10 09:47:20 2026
+Version 19.3.0.0.0
+
+Path used:      Conventional
+Commit point reached - logical record count 2
+
+Table DEPT_LOAD:
+  2 Rows successfully loaded.
+
+======================================================================
+[5단계] 적재 결과 확인
+======================================================================
+
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> select deptno, dname, loc, note from dept_load order by deptno;
+
+    DEPTNO DNAME           LOC        NOTE
+---------- --------------- ---------- -----------
+        10 ACCOUNTING      NEW YORK   main office
+        20 RESEARCH        DALLAS
+        30 SALES, EMEA     CHICAGO    region hub
+        40 OPERATIONS      BOSTON
+
+-- 4건 모두 적재되었다. 20/40 번은 note 가 NULL 로 채워졌고,
+-- 30번은 큰따옴표 덕분에 'SALES, EMEA' 가 하나의 값으로 정확히 들어갔다.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[정리]
+======================================================================
+- 컨트롤 파일의 핵심 절: LOAD DATA(시작), INFILE(입력), INTO TABLE(대상),
+  FIELDS TERMINATED BY(구분자), OPTIONALLY ENCLOSED BY(감싸는 문자).
+- TRAILING NULLCOLS 는 후행 필드가 없는 레코드를 NULL 로 채워 거부(ORA-00947)를 막는다.
+- OPTIONALLY ENCLOSED BY '"' 는 값 내부 쉼표를 구분자로 오인하지 않게 한다.
+- 거부 레코드는 불량 파일로 분리되므로, 원인 수정 후 그 파일만 재적재할 수 있다.
+
+- 뒷정리
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> drop table dept_load purge;
+
+Table dropped.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$ rm -f dept.csv dept.ctl dept.bad dept.log dept_fix.log dept_fix.bad
+[oracle@dbsvr ~]$

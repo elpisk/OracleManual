@@ -1,0 +1,188 @@
+-- 26장 실습_02: SQL*Loader 적재 방식(전통적/다이렉트 패스) 비교 실습
+-- 목표: 같은 데이터를 전통적 경로와 다이렉트 경로로 각각 적재하며,
+--       트리거 실행 여부·제약 처리·잠금·성능 차이를 확인한다.
+--       다이렉트 경로에서 활성 트리거로 인한 폴백(Conventional) 현상을 만나
+--       원인을 파악하고 대응한다.
+
+======================================================================
+[1단계] 대상 테이블과 트리거 준비
+======================================================================
+
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> create table sales_load (
+  2    id     number(8),
+  3    amount number(10),
+  4    loaded_by varchar2(30)
+  5  );
+
+Table created.
+
+-- INSERT 트리거: 행이 들어올 때 loaded_by 를 채운다(비즈니스 로직 예시)
+HR@pdb1> create or replace trigger trg_sales_bi
+  2  before insert on sales_load for each row
+  3  begin
+  4    :new.loaded_by := 'TRG_' || USER;
+  5  end;
+  6  /
+
+Trigger created.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[2단계] 입력 데이터·컨트롤 파일 작성
+======================================================================
+
+[oracle@dbsvr ~]$ cat > sales.csv <<'EOF'
+1,1000
+2,2000
+3,3000
+4,4000
+EOF
+
+[oracle@dbsvr ~]$ cat > sales.ctl <<'EOF'
+LOAD DATA
+INFILE 'sales.csv'
+APPEND
+INTO TABLE sales_load
+FIELDS TERMINATED BY ','
+TRAILING NULLCOLS
+( id, amount )
+EOF
+
+======================================================================
+[3단계] 전통적 경로로 적재 (트리거 동작 확인)
+======================================================================
+
+[oracle@dbsvr ~]$ sqlldr userid=hr@pdb1 control=sales.ctl log=sales_conv.log
+
+SQL*Loader: Release 19.0.0.0.0 - Production on Mon Aug 10 10:10:41 2026
+Version 19.3.0.0.0
+
+Path used:      Conventional
+Commit point reached - logical record count 4
+
+Table SALES_LOAD:
+  4 Rows successfully loaded.
+
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> select id, amount, loaded_by from sales_load order by id;
+
+        ID     AMOUNT LOADED_BY
+---------- ---------- ------------
+         1       1000 TRG_HR
+         2       2000 TRG_HR
+         3       3000 TRG_HR
+         4       4000 TRG_HR
+
+-- 전통적 경로는 일반 INSERT 와 동일하므로 BEFORE INSERT 트리거가 실행되어
+-- loaded_by 가 'TRG_HR' 로 채워졌다.
+
+HR@pdb1> truncate table sales_load;
+
+Table truncated.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[4단계] (관찰 -> 원인 -> 대응) 다이렉트 경로 시도 -> 폴백 발생
+======================================================================
+
+- 이번에는 다이렉트 경로로 적재한다.
+[oracle@dbsvr ~]$ sqlldr userid=hr@pdb1 control=sales.ctl log=sales_dir.log direct=true
+
+SQL*Loader: Release 19.0.0.0.0 - Production on Mon Aug 10 10:14:05 2026
+Version 19.3.0.0.0
+
+Table SALES_LOAD:
+  4 Rows successfully loaded.
+
+- 결과는 성공했지만, 로그에서 실제 사용된 경로를 확인한다.
+[oracle@dbsvr ~]$ grep -i "Path used" sales_dir.log
+Path used:      Conventional
+
+[oracle@dbsvr ~]$ grep -i "insert triggers" sales_dir.log
+SQL*Loader-951: Error calling once/load initialization
+-- (환경에 따라) 활성화된 INSERT 트리거가 있어 다이렉트 경로를 사용할 수 없다는
+--   취지의 경고가 로그에 남고, SQL*Loader 가 전통적 경로로 폴백한다.
+
+- 원인: DIRECT=TRUE 를 주었지만 대상 테이블에 활성 INSERT 트리거(trg_sales_bi)가
+        있어 다이렉트 경로가 거부되고 전통적 경로(Conventional)로 폴백되었다.
+        다이렉트 경로는 트리거를 실행하지 않기 때문에, 트리거가 활성 상태면
+        데이터 정합성을 위해 다이렉트 경로가 제한된다.
+- 대응: 트리거 로직을 태울 필요가 없다면 트리거를 일시 비활성화한 뒤 다이렉트 경로로
+        적재한다(적재 후 다시 활성화). 트리거를 반드시 태워야 하면 전통적 경로를 쓴다.
+
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> truncate table sales_load;
+
+Table truncated.
+
+HR@pdb1> alter trigger trg_sales_bi disable;
+
+Trigger altered.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[5단계] 트리거 비활성화 후 진짜 다이렉트 경로로 적재
+======================================================================
+
+[oracle@dbsvr ~]$ sqlldr userid=hr@pdb1 control=sales.ctl log=sales_dir2.log direct=true
+
+SQL*Loader: Release 19.0.0.0.0 - Production on Mon Aug 10 10:17:52 2026
+Version 19.3.0.0.0
+
+Table SALES_LOAD:
+  4 Rows successfully loaded.
+
+[oracle@dbsvr ~]$ grep -i "Path used" sales_dir2.log
+Path used:      Direct
+
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> select id, amount, loaded_by from sales_load order by id;
+
+        ID     AMOUNT LOADED_BY
+---------- ---------- ------------
+         1       1000
+         2       2000
+         3       3000
+         4       4000
+
+-- 이번엔 Path used: Direct 로 적재되었고, 트리거가 실행되지 않아
+-- loaded_by 가 NULL 이다(다이렉트 경로는 INSERT 트리거를 실행하지 않음).
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[정리]
+======================================================================
+- 전통적 경로: SQL/버퍼 캐시 경유, 트리거 실행·제약 즉시 검증·동시 DML 가능. 소량/안전.
+- 다이렉트 경로(DIRECT=TRUE): 버퍼 캐시 우회, HWM 위 직접 기록으로 대용량 고속.
+  단, INSERT 트리거 미실행·테이블 배타 잠금·CHECK/FK 후검증.
+- 활성 INSERT 트리거가 있으면 다이렉트 경로가 전통적 경로로 폴백될 수 있다.
+  로그의 'Path used:' 로 실제 경로를 반드시 확인한다.
+- 다이렉트 경로가 필요하면 트리거를 일시 비활성화하거나 스테이징 테이블을 활용한다.
+
+- 뒷정리
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> drop trigger trg_sales_bi;
+
+Trigger dropped.
+
+HR@pdb1> drop table sales_load purge;
+
+Table dropped.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$ rm -f sales.csv sales.ctl sales_conv.log sales_dir.log sales_dir2.log
+[oracle@dbsvr ~]$

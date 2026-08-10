@@ -1,0 +1,147 @@
+================================================================================
+ 28장 실습 04 — 외부 테이블 정보 조회(딕셔너리 뷰)
+ 목표: USER/DBA_EXTERNAL_TABLES, EXTERNAL_LOCATIONS, DBA_DIRECTORIES 로
+       외부 테이블의 정의·파일·경로를 조합해 파악하고,
+       REJECT LIMIT / PROJECT COLUMN 변경 결과를 뷰로 확인
+ 환경: CDB=cdb1, PDB=pdb1, oracle 계정
+================================================================================
+
+-- 사전 준비: 조회 실습용 외부 테이블 2개를 만든다(LOADER, DATAPUMP).
+$ sqlplus sys@pdb1 as sysdba
+SYS@pdb1> CREATE OR REPLACE DIRECTORY data_dir AS '/u01/app/oracle/extdata';
+Directory created.
+SYS@pdb1> GRANT READ, WRITE ON DIRECTORY data_dir TO hr;
+Grant succeeded.
+SYS@pdb1> EXIT
+
+$ cat > /u01/app/oracle/extdata/dept.csv <<'EOF'
+10,ACCOUNTING,NEW YORK
+20,RESEARCH,DALLAS
+EOF
+
+$ sqlplus hr@pdb1
+
+HR@pdb1> CREATE TABLE dept_ext
+  2    ( deptno NUMBER(2), dname VARCHAR2(20), loc VARCHAR2(20) )
+  3    ORGANIZATION EXTERNAL
+  4    ( TYPE ORACLE_LOADER DEFAULT DIRECTORY data_dir
+  5      ACCESS PARAMETERS ( RECORDS DELIMITED BY NEWLINE
+  6        FIELDS TERMINATED BY ',' ( deptno, dname, loc ) )
+  7      LOCATION ('dept.csv') )
+  8    REJECT LIMIT 5;
+Table created.
+
+HR@pdb1> CREATE TABLE emp_dp
+  2    ORGANIZATION EXTERNAL
+  3    ( TYPE ORACLE_DATAPUMP DEFAULT DIRECTORY data_dir
+  4      LOCATION ('emp.dmp') )
+  5    AS SELECT employee_id, last_name FROM employees WHERE rownum <= 3;
+Table created.
+
+--------------------------------------------------------------------------------
+-- [1] USER_EXTERNAL_TABLES — 외부 테이블 정의(드라이버·디렉터리·REJECT LIMIT)
+--------------------------------------------------------------------------------
+HR@pdb1> COLUMN table_name FORMAT A12
+HR@pdb1> COLUMN type_name  FORMAT A16
+HR@pdb1> COLUMN default_directory_name FORMAT A16 HEADING 'DEFAULT_DIR'
+HR@pdb1> SELECT table_name, type_name, default_directory_name, reject_limit
+  2       FROM user_external_tables ORDER BY table_name;
+
+TABLE_NAME   TYPE_NAME        DEFAULT_DIR      REJECT_LIMIT
+------------ ---------------- ---------------- ------------
+DEPT_EXT     ORACLE_LOADER    DATA_DIR         5
+EMP_DP       ORACLE_DATAPUMP  DATA_DIR         0
+
+-- 드라이버 종류(LOADER/DATAPUMP)와 기본 디렉터리, 거부 한도가 한눈에 보인다.
+
+--------------------------------------------------------------------------------
+-- [2] USER_EXTERNAL_LOCATIONS — 각 외부 테이블이 읽는 파일 목록
+--------------------------------------------------------------------------------
+HR@pdb1> COLUMN location FORMAT A16
+HR@pdb1> COLUMN directory_name FORMAT A14
+HR@pdb1> SELECT table_name, directory_name, location
+  2       FROM user_external_locations ORDER BY table_name;
+
+TABLE_NAME   DIRECTORY_NAME LOCATION
+------------ -------------- ----------------
+DEPT_EXT     DATA_DIR       dept.csv
+EMP_DP       DATA_DIR       emp.dmp
+
+--------------------------------------------------------------------------------
+-- [3] DBA_DIRECTORIES — 디렉터리 객체의 실제 OS 경로
+--------------------------------------------------------------------------------
+HR@pdb1> -- (권한상 DBA_DIRECTORIES 가 안 보일 수 있어 ALL_DIRECTORIES 로 확인)
+HR@pdb1> COLUMN directory_path FORMAT A34
+HR@pdb1> SELECT directory_name, directory_path
+  2       FROM all_directories WHERE directory_name = 'DATA_DIR';
+
+DIRECTORY_NAME   DIRECTORY_PATH
+---------------- ----------------------------------
+DATA_DIR         /u01/app/oracle/extdata
+
+-- TABLES(정의) + LOCATIONS(파일) + DIRECTORIES(경로) 를 조합하면
+-- '어디의 어떤 파일을 어떤 드라이버로 읽는지' 전체 그림이 완성된다.
+
+--------------------------------------------------------------------------------
+-- [4] (오류 → 원인 → 수정) 권한 없이 DBA_ 뷰를 조회하려다 실패
+--------------------------------------------------------------------------------
+HR@pdb1> SELECT owner, table_name, type_name FROM dba_external_tables;
+SELECT owner, table_name, type_name FROM dba_external_tables
+                                         *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+HR@pdb1> -- 원인 파악: HR 은 DBA_ 뷰 조회 권한이 없다. DBA_* 는 관리자용이다.
+HR@pdb1> -- 수정: 관리자로 접속하거나, 소유자는 USER_*/ALL_* 를 사용한다.
+HR@pdb1> EXIT
+
+$ sqlplus system@pdb1
+SYSTEM@pdb1> COLUMN owner FORMAT A8
+SYSTEM@pdb1> COLUMN table_name FORMAT A12
+SYSTEM@pdb1> SELECT owner, table_name, type_name
+  2          FROM dba_external_tables WHERE owner = 'HR' ORDER BY table_name;
+
+OWNER    TABLE_NAME   TYPE_NAME
+-------- ------------ ----------------
+HR       DEPT_EXT     ORACLE_LOADER
+HR       EMP_DP       ORACLE_DATAPUMP
+
+SYSTEM@pdb1> EXIT
+
+--------------------------------------------------------------------------------
+-- [5] REJECT LIMIT / PROJECT COLUMN 변경 후 딕셔너리에 반영됨을 확인
+--------------------------------------------------------------------------------
+$ sqlplus hr@pdb1
+
+HR@pdb1> ALTER TABLE dept_ext REJECT LIMIT UNLIMITED;
+Table altered.
+
+HR@pdb1> ALTER TABLE dept_ext PROJECT COLUMN ALL;
+Table altered.
+
+HR@pdb1> COLUMN property FORMAT A10
+HR@pdb1> SELECT table_name, reject_limit, property
+  2       FROM user_external_tables WHERE table_name = 'DEPT_EXT';
+
+TABLE_NAME   REJECT_LIMIT PROPERTY
+------------ ------------ ----------
+DEPT_EXT     UNLIMITED    ALL
+
+-- REJECT_LIMIT 이 UNLIMITED 로, PROPERTY(PROJECT COLUMN)가 ALL 로 바뀌었다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) USER/ALL/DBA_EXTERNAL_TABLES: 드라이버·기본 디렉터리·REJECT LIMIT·PROJECT COLUMN.
+-- 2) USER/ALL/DBA_EXTERNAL_LOCATIONS: 외부 테이블이 읽는 파일 목록.
+-- 3) DBA/ALL_DIRECTORIES: 디렉터리 객체의 실제 OS 경로.
+-- 4) DBA_* 뷰는 관리자 권한이 필요하다(일반 사용자는 ORA-00942).
+-- 5) ALTER TABLE 로 바꾼 REJECT LIMIT/PROJECT COLUMN 은 딕셔너리에 즉시 반영된다.
+
+HR@pdb1> DROP TABLE dept_ext;
+Table dropped.
+HR@pdb1> DROP TABLE emp_dp;
+Table dropped.
+HR@pdb1> EXIT
+$ rm -f /u01/app/oracle/extdata/dept.csv /u01/app/oracle/extdata/emp.dmp
+================================================================================

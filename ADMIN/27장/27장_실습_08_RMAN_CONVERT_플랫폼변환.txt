@@ -1,0 +1,100 @@
+================================================================================
+ 27장 실습 08 — RMAN CONVERT 로 플랫폼 간 데이터 변환
+ 목표: 빅 엔디안(Solaris SPARC) 데이터파일을 리틀 엔디안(Linux) 대상으로 변환
+ 환경: 원본 플랫폼=Solaris[tm] OE (64-bit)=Big, 대상=Linux x86 64-bit=Little
+================================================================================
+
+-- [1] 양쪽 엔디안 확인 (원본 Solaris에서)
+$ sqlplus sys@srcdb as sysdba
+SYS@srcdb> SELECT d.platform_name, tp.endian_format
+  2       FROM v$database d JOIN v$transportable_platform tp
+  3         ON d.platform_id = tp.platform_id;
+PLATFORM_NAME                        ENDIAN_FORMAT
+------------------------------------ --------------
+Solaris[tm] OE (64-bit)              Big
+
+SYS@srcdb> -- 대상(Linux)의 엔디안도 뷰에서 조회 가능
+SYS@srcdb> SELECT platform_name, endian_format
+  2       FROM v$transportable_platform
+  3       WHERE platform_name = 'Linux x86 64-bit';
+PLATFORM_NAME             ENDIAN_FORMAT
+------------------------- --------------
+Linux x86 64-bit          Little
+-- Big ≠ Little → RMAN CONVERT 필수.
+
+--------------------------------------------------------------------------------
+-- [2] 전송 대상 테이블스페이스를 READ ONLY 로 전환
+--------------------------------------------------------------------------------
+SYS@srcdb> ALTER TABLESPACE ts_sales READ ONLY;
+Tablespace altered.
+SYS@srcdb> EXIT
+
+--------------------------------------------------------------------------------
+-- [3] 첫 시도: 대상 Linux에서 변환 없이 데이터파일을 바로 plug-in → 실패
+--     (변환을 깜빡하고 원본 파일을 그대로 복사해 impdp 시도)
+--------------------------------------------------------------------------------
+$ impdp system@pdb1 DIRECTORY=dp_dir DUMPFILE=sales_meta.dmp \
+        TRANSPORT_DATAFILES='/u01/oradata/ts_sales01.dbf'
+
+Import: Release 19.0.0.0.0 - Production on Wed Aug 5 17:02:31 2026
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Processing object type TRANSPORTABLE_EXPORT/PLUGTS_BLK
+ORA-39123: Data Pump transportable tablespace job aborted
+ORA-19722: datafile /u01/oradata/ts_sales01.dbf is an incorrect version
+-- 원인 파악:
+--   원본은 빅 엔디안, 대상은 리틀 엔디안이다. 변환하지 않은 데이터파일은
+--   블록 내 다바이트 값의 순서가 대상과 반대라 대상이 올바르게 해석하지 못한다.
+--   RMAN CONVERT 로 대상 엔디안에 맞게 변환해야 한다.
+
+--------------------------------------------------------------------------------
+-- [4] 수정: RMAN CONVERT 로 데이터파일을 대상 엔디안으로 변환
+--     방식A) 원본(Solaris)에서 미리 변환: CONVERT TABLESPACE ... TO PLATFORM
+--------------------------------------------------------------------------------
+$ rman target /
+RMAN> CONVERT TABLESPACE ts_sales
+2>    TO PLATFORM 'Linux x86 64-bit'
+3>    FORMAT '/stage/conv/%U';
+
+Starting conversion at source at 05-AUG-26
+using channel ORA_DISK_1
+channel ORA_DISK_1: starting datafile conversion
+input datafile file number=00012 name=/u02/oradata/ts_sales01.dbf
+converted datafile=/stage/conv/data_D-SRCDB_I-...
+channel ORA_DISK_1: datafile conversion complete
+Finished conversion at source at 05-AUG-26
+RMAN> EXIT
+
+-- 변환된 파일을 대상 서버로 복사
+$ scp /stage/conv/data_D-SRCDB_* oracle@linuxhost:/u01/oradata/ts_sales01.dbf
+
+--------------------------------------------------------------------------------
+-- [5] 대상에서 변환된 파일로 다시 plug-in
+--------------------------------------------------------------------------------
+$ impdp system@pdb1 DIRECTORY=dp_dir DUMPFILE=sales_meta.dmp \
+        TRANSPORT_DATAFILES='/u01/oradata/ts_sales01.dbf' \
+        LOGFILE=sales_imp.log
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Processing object type TRANSPORTABLE_EXPORT/PLUGTS_BLK
+Processing object type TRANSPORTABLE_EXPORT/TABLE
+Job "SYSTEM"."SYS_IMPORT_TRANSPORTABLE_01" successfully completed ...
+
+$ sqlplus sys@pdb1 as sysdba
+SYS@pdb1> ALTER TABLESPACE ts_sales READ WRITE;
+Tablespace altered.
+SYS@pdb1> SELECT COUNT(*) FROM sh.sales;
+  COUNT(*)
+----------
+    918843
+
+-- 참고(방식B) 대상에서 받아서 변환:
+--   RMAN> CONVERT DATAFILE '/stage/ts_sales01.dbf'
+--         FROM PLATFORM 'Solaris[tm] OE (64-bit)'
+--         FORMAT '/u01/oradata/ts_sales01.dbf';
+
+-- 결론:
+--   1) 엔디안이 다르면 데이터파일을 그대로 쓰면 ORA-19722로 실패한다.
+--   2) RMAN CONVERT가 블록 내 다바이트 값을 대상 엔디안 순서로 재배열한다.
+--   3) 원본에서 TO PLATFORM 또는 대상에서 FROM PLATFORM 방식 중 선택한다.
+--   4) 플랫폼 이름은 V$TRANSPORTABLE_PLATFORM.PLATFORM_NAME 값을 그대로 쓴다.
+================================================================================

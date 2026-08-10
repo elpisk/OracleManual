@@ -1,0 +1,94 @@
+================================================================================
+ 27장 실습 09 — 이미지 카피 / 백업세트를 이용한 테이블스페이스 전송
+ 목표: 같은 엔디안(Linux→Linux) 환경에서 두 전송 매체 비교
+       (A) 이미지 카피 1:1 복사   (B) RMAN 백업세트(FOR TRANSPORT, 압축)
+ 환경: 원본 CDB=cdb1/pdb1, 대상 CDB=cdb2/pdb1 (둘 다 Linux x86-64, Little)
+================================================================================
+
+-- [1] 전송 대상 TS를 READ ONLY 전환 + 자체 포함성 점검
+$ sqlplus sys@pdb1 as sysdba
+SYS@pdb1> ALTER TABLESPACE ts_app READ ONLY;
+Tablespace altered.
+SYS@pdb1> EXEC DBMS_TTS.TRANSPORT_SET_CHECK(ts_list=>'TS_APP', incl_constraints=>TRUE);
+PL/SQL procedure successfully completed.
+SYS@pdb1> SELECT * FROM transport_set_violations;
+no rows selected      -- 자체 포함성 OK
+
+-- 메타데이터 내보내기
+$ expdp system@pdb1 TRANSPORT_TABLESPACES=ts_app DIRECTORY=dp_dir \
+        DUMPFILE=ts_app_meta.dmp LOGFILE=ts_app_meta.log
+... Datafiles required: /u01/app/oracle/oradata/CDB1/pdb1/ts_app01.dbf
+Job successfully completed.
+
+================================================================================
+-- (A) 이미지 카피 방식 — 데이터파일 1:1 복사
+================================================================================
+$ cp /u01/app/oracle/oradata/CDB1/pdb1/ts_app01.dbf /stage/img/ts_app01.dbf
+$ scp /stage/img/ts_app01.dbf oracle@dbhost2:/u01/app/oracle/oradata/CDB2/pdb1/
+$ scp /u01/app/oracle/dpdump/ts_app_meta.dmp oracle@dbhost2:/u01/app/oracle/dpdump/
+
+-- 대상에서 plug-in
+$ impdp system@pdb1_c2 DIRECTORY=dp_dir DUMPFILE=ts_app_meta.dmp \
+        TRANSPORT_DATAFILES='/u01/app/oracle/oradata/CDB2/pdb1/ts_app01.dbf' \
+        LOGFILE=ts_app_imp.log
+Job "SYSTEM"."SYS_IMPORT_TRANSPORTABLE_01" successfully completed ...
+-- 절차가 단순하지만 파일 크기 그대로(예: 200MB) 전송된다.
+
+================================================================================
+-- (B) 백업세트 방식 — RMAN BACKUP ... FOR TRANSPORT (압축)
+================================================================================
+-- [B-1] 첫 시도: TS가 READ WRITE 인 상태로 FOR TRANSPORT → 실패
+--        (앞서 READ WRITE로 잠깐 되돌려 둔 상황을 가정)
+$ sqlplus sys@pdb1 as sysdba
+SYS@pdb1> ALTER TABLESPACE ts_app READ WRITE;
+Tablespace altered.
+SYS@pdb1> EXIT
+
+$ rman target sys@pdb1
+RMAN> BACKUP FOR TRANSPORT
+2>    FORMAT '/stage/bset/ts_app_%U.bkp'
+3>    TABLESPACE ts_app;
+
+Starting backup at 05-AUG-26
+RMAN-06136: ORACLE error from auxiliary database:
+ORA-29335: tablespace 'TS_APP' is not read only
+-- 원인 파악:
+--   전송용 백업세트를 만들려면 대상 테이블스페이스가 READ ONLY 여야 한다
+--   (복사 일관성 확보). READ WRITE 상태에서는 만들 수 없다.
+
+-- [B-2] 수정: READ ONLY 로 전환 후 압축 백업세트 생성
+RMAN> EXIT
+$ sqlplus sys@pdb1 as sysdba
+SYS@pdb1> ALTER TABLESPACE ts_app READ ONLY;
+Tablespace altered.
+SYS@pdb1> EXIT
+
+$ rman target sys@pdb1
+RMAN> BACKUP AS COMPRESSED BACKUPSET FOR TRANSPORT
+2>    FORMAT '/stage/bset/ts_app_%U.bkp'
+3>    DATAPUMP FORMAT '/stage/bset/ts_app_meta.dmp'
+4>    TABLESPACE ts_app;
+
+Starting backup at 05-AUG-26
+channel ORA_DISK_1: starting compressed full datafile backup set
+channel ORA_DISK_1: including datafile 00014 in backup set
+channel ORA_DISK_1: backup set complete
+-- 압축 결과 예: 200MB → 62MB (네트워크 전송량 크게 감소)
+Finished backup at 05-AUG-26
+RMAN> EXIT
+
+$ scp /stage/bset/ts_app_*.bkp oracle@dbhost2:/stage/bset/
+
+-- 대상에서 복원(plug-in)
+$ rman target sys@pdb1_c2
+RMAN> RESTORE FOREIGN TABLESPACE ts_app
+2>    FROM BACKUPSET '/stage/bset/ts_app_0abc.bkp'
+3>    DUMP FILE FROM BACKUPSET '/stage/bset/ts_app_meta.dmp';
+Finished restore at 05-AUG-26
+
+-- 결론:
+--   1) 이미지 카피: 1:1 복사로 절차가 단순하나 원본 크기 그대로 전송.
+--   2) 백업세트: BACKUP ... FOR TRANSPORT + AS COMPRESSED BACKUPSET 로
+--      전송량을 줄이고 필요 시 변환(TO PLATFORM)까지 결합할 수 있다.
+--   3) 두 방식 모두 대상 TS는 READ ONLY 여야 한다(ORA-29335).
+================================================================================

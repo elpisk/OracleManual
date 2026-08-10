@@ -1,0 +1,124 @@
+-- 25장 실습_02: Oracle Data Pump 개요 및 이점 확인
+-- 목표: 디렉터리 객체를 만들고 expdp 로 스키마를 내보내며, Data Pump 의 이점
+--       (서버 기반·병렬·재시작·모니터링)을 확인한다. 중간에 디렉터리 권한 부족
+--       오류(ORA-39087)를 만나 원인 파악 후 해결한다.
+
+======================================================================
+[1단계] Data Pump 전용 디렉터리 객체 준비 (SYSDBA)
+======================================================================
+
+- PDB 로 접속하여 전용 덤프 디렉터리 객체를 생성
+[oracle@dbsvr ~]$ sqlplus sys/oracle@pdb1 as sysdba
+
+SYS@pdb1> create or replace directory dp_dir as '/u01/app/oracle/dpdump';
+
+Directory created.
+
+- OS 경로가 실제로 존재하고 오라클 소유자가 접근 가능한지도 함께 확인해 둔다.
+SYS@pdb1> host ls -ld /u01/app/oracle/dpdump
+drwxr-xr-x 2 oracle oinstall 4096 Aug 10 09:12 /u01/app/oracle/dpdump
+
+SYS@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[2단계] (오류 -> 원인 -> 수정) 권한 없이 expdp 실행
+======================================================================
+
+- 아직 hr 에게 디렉터리 권한을 주지 않은 상태로 스키마 내보내기를 시도한다.
+[oracle@dbsvr ~]$ expdp hr/oracle@pdb1 SCHEMAS=hr DIRECTORY=dp_dir \
+>       DUMPFILE=hr.dmp LOGFILE=hr_exp.log
+
+Export: Release 19.0.0.0.0 - Production on Mon Aug 10 09:20:33 2026
+Version 19.3.0.0.0
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+ORA-39002: invalid operation
+ORA-39070: Unable to open the log file.
+ORA-39087: directory name DP_DIR is invalid
+
+- 원인: 디렉터리 객체 DP_DIR 자체는 존재하지만, 실행 사용자 hr 에게 그 디렉터리에
+        대한 READ/WRITE 권한이 없다. Data Pump 는 로그/덤프 파일을 쓰기 위해 WRITE
+        권한이 필요하므로, 권한이 없으면 로그 파일조차 열지 못해 ORA-39087 이 난다.
+- 수정: 관리자가 hr 에게 READ, WRITE 권한을 부여한다.
+
+[oracle@dbsvr ~]$ sqlplus sys/oracle@pdb1 as sysdba
+
+SYS@pdb1> grant read, write on directory dp_dir to hr;
+
+Grant succeeded.
+
+SYS@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[3단계] 권한 부여 후 스키마 내보내기 재실행 (병렬 처리)
+======================================================================
+
+- 이번에는 PARALLEL 2 와 %U 치환 변수로 여러 덤프 파일에 나누어 병렬로 내보낸다.
+[oracle@dbsvr ~]$ expdp hr/oracle@pdb1 SCHEMAS=hr DIRECTORY=dp_dir \
+>       DUMPFILE=hr_%U.dmp PARALLEL=2 LOGFILE=hr_exp.log
+
+Export: Release 19.0.0.0.0 - Production on Mon Aug 10 09:24:10 2026
+Version 19.3.0.0.0
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Starting "HR"."SYS_EXPORT_SCHEMA_01":  hr/********@pdb1 SCHEMAS=hr DIRECTORY=dp_dir DUMPFILE=hr_%U.dmp PARALLEL=2 LOGFILE=hr_exp.log
+Processing object type SCHEMA_EXPORT/TABLE/TABLE_DATA
+Processing object type SCHEMA_EXPORT/TABLE/INDEX/INDEX
+. . exported "HR"."EMPLOYEES"        17.08 KB     107 rows
+. . exported "HR"."DEPARTMENTS"       7.09 KB      27 rows
+. . exported "HR"."JOBS"             7.28 KB      19 rows
+Master table "HR"."SYS_EXPORT_SCHEMA_01" successfully loaded/unloaded
+******************************************************************************
+Dump file set for HR.SYS_EXPORT_SCHEMA_01 is:
+  /u01/app/oracle/dpdump/hr_01.dmp
+  /u01/app/oracle/dpdump/hr_02.dmp
+Job "HR"."SYS_EXPORT_SCHEMA_01" successfully completed at Mon Aug 10 09:24:38 2026 elapsed 0 00:00:28
+
+- 관찰 포인트:
+--   * 작업은 클라이언트가 아니라 서버가 수행하며, 덤프 파일도 서버 디렉터리에 생성된다.
+--   * 마스터 테이블 "HR"."SYS_EXPORT_SCHEMA_01" 이 작업 스키마에 생성되었다(재시작의 근거).
+--   * PARALLEL=2 로 hr_01.dmp, hr_02.dmp 두 파일에 나누어 기록되었다.
+
+======================================================================
+[4단계] Data Pump 작업 모니터링 - 딕셔너리 뷰 조회
+======================================================================
+
+- 방금 작업은 완료되어 마스터 테이블이 자동 삭제되었는지 확인한다.
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> select job_name, operation, job_mode, state
+  2  from   user_datapump_jobs;
+
+no rows selected
+
+- 완료된 작업은 마스터 테이블이 자동 삭제되어 조회되지 않는다.
+- (참고) 실행 중인 작업이라면 다음 뷰로 상태를 조회할 수 있다:
+--   DBA_DATAPUMP_JOBS      : 활성 작업의 이름/소유자/유형/상태
+--   DBA_DATAPUMP_SESSIONS  : 작업에 연결된 세션
+--   V$SESSION_LONGOPS      : 장시간 작업의 진행률
+-- 클라이언트를 종료해도 서버 작업은 계속되며, expdp ... ATTACH=작업이름 으로 재접속해
+-- STATUS 조회, STOP_JOB/START_JOB, PARALLEL 변경 등 대화형 제어가 가능하다.
+
+======================================================================
+[정리]
+======================================================================
+- 디렉터리 객체는 존재해도 사용자에게 READ/WRITE 권한이 없으면 ORA-39002/39070/39087 이 발생한다.
+- Data Pump 는 서버 기반으로 동작하여 병렬 처리(PARALLEL/%U), 재시작(마스터 테이블),
+  모니터링/제어(딕셔너리 뷰·ATTACH)를 지원하며 이것이 전통적 exp/imp 대비 핵심 이점이다.
+
+- 뒷정리
+[oracle@dbsvr ~]$ rm -f /u01/app/oracle/dpdump/hr_01.dmp /u01/app/oracle/dpdump/hr_02.dmp /u01/app/oracle/dpdump/hr_exp.log
+[oracle@dbsvr ~]$ sqlplus sys/oracle@pdb1 as sysdba
+
+SYS@pdb1> revoke read, write on directory dp_dir from hr;
+
+Revoke succeeded.
+
+SYS@pdb1> drop directory dp_dir;
+
+Directory dropped.
+
+SYS@pdb1> exit
+[oracle@dbsvr ~]$

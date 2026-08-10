@@ -1,0 +1,86 @@
+================================================================================
+ 27장 실습 04 — non-CDB에서 내보내 PDB로 가져오기
+ 목표: non-CDB(orcl)의 HR 스키마를 CDB의 PDB1로 논리 이동
+ 환경: 원본 non-CDB=orcl, 대상 CDB=cdb1 / PDB=pdb1
+================================================================================
+
+-- [1] 원본 non-CDB(orcl)에서 HR 스키마 내보내기
+$ sqlplus sys@orcl as sysdba
+SYS@orcl> SELECT cdb FROM v$database;   -- non-CDB 확인
+CDB
+---
+NO
+SYS@orcl> CREATE DIRECTORY mig_dir AS '/u01/mig';
+Directory created.
+SYS@orcl> GRANT READ, WRITE ON DIRECTORY mig_dir TO system;
+Grant succeeded.
+SYS@orcl> EXIT
+
+$ mkdir -p /u01/mig
+$ expdp system@orcl SCHEMAS=hr DIRECTORY=mig_dir DUMPFILE=hr_ncdb.dmp \
+        LOGFILE=hr_ncdb_exp.log
+
+Export: Release 19.0.0.0.0 - Production on Wed Aug 5 13:30:12 2026
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Starting "SYSTEM"."SYS_EXPORT_SCHEMA_01": ... SCHEMAS=hr
+. . exported "HR"."EMPLOYEES"          17.08 KB     107 rows
+. . exported "HR"."DEPARTMENTS"        7.125 KB      27 rows
+Job successfully completed. Dump file: /u01/mig/hr_ncdb.dmp
+
+--------------------------------------------------------------------------------
+-- [2] 덤프파일을 대상 서버(PDB용 디렉터리)로 이동
+--------------------------------------------------------------------------------
+$ scp /u01/mig/hr_ncdb.dmp oracle@dbhost2:/u01/app/oracle/dpdump/
+hr_ncdb.dmp                              100%   96KB  12.1MB/s   00:00
+
+--------------------------------------------------------------------------------
+-- [3] 첫 시도: PDB1로 가져오기 → 대상 테이블스페이스가 없어 실패
+--------------------------------------------------------------------------------
+$ impdp system@pdb1 SCHEMAS=hr DIRECTORY=dp_dir DUMPFILE=hr_ncdb.dmp \
+        LOGFILE=hr_ncdb_imp.log
+
+Import: Release 19.0.0.0.0 - Production on Wed Aug 5 13:40:55 2026
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+ORA-39083: Object type TABLE:"HR"."EMPLOYEES" failed to create with error:
+ORA-00959: tablespace 'HR_DATA' does not exist
+Failing sql is:
+CREATE TABLE "HR"."EMPLOYEES" ( ... ) TABLESPACE "HR_DATA" ...
+
+-- 원인 파악:
+--   원본 non-CDB에서 HR 객체는 HR_DATA 테이블스페이스에 있었으나,
+--   대상 PDB1에는 HR_DATA 라는 테이블스페이스가 없다.
+--   테이블스페이스 레이아웃이 다르므로 REMAP_TABLESPACE가 필요하다.
+
+--------------------------------------------------------------------------------
+-- [4] 수정: REMAP_TABLESPACE로 대상 USERS에 맞춰 재실행
+--------------------------------------------------------------------------------
+$ impdp system@pdb1 SCHEMAS=hr DIRECTORY=dp_dir DUMPFILE=hr_ncdb.dmp \
+        LOGFILE=hr_ncdb_imp2.log \
+        REMAP_TABLESPACE=hr_data:users \
+        TABLE_EXISTS_ACTION=REPLACE
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+. . imported "HR"."EMPLOYEES"          17.08 KB     107 rows
+. . imported "HR"."DEPARTMENTS"        7.125 KB      27 rows
+Job "SYSTEM"."SYS_IMPORT_SCHEMA_01" successfully completed ...
+
+--------------------------------------------------------------------------------
+-- [5] 검증: PDB1에서 HR 데이터 확인
+--------------------------------------------------------------------------------
+$ sqlplus hr@pdb1
+HR@pdb1> SELECT COUNT(*) FROM employees;
+  COUNT(*)
+----------
+       107
+HR@pdb1> SELECT DISTINCT tablespace_name FROM user_tables;
+TABLESPACE_NAME
+--------------------
+USERS
+
+-- 결론:
+--   1) non-CDB는 컨테이너 개념이 없어 서비스명으로 평범하게 expdp 한다.
+--   2) 대상 PDB의 테이블스페이스 레이아웃이 다르면 REMAP_TABLESPACE가 필요하다.
+--   3) 논리 이동이므로 플랫폼/버전이 달라도 대체로 호환된다(문자집합만 유의).
+================================================================================

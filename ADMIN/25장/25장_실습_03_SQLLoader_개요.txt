@@ -1,0 +1,150 @@
+-- 25장 실습_03: SQL*Loader 개요 확인
+-- 목표: 컨트롤 파일을 작성해 외부 CSV 를 테이블에 적재하고, 전통적 경로와
+--       다이렉트 경로를 비교한다. 중간에 데이터 타입 오류로 레코드가 불량 파일로
+--       빠지는 상황을 만나 원인 파악 후 데이터를 보정해 재적재한다.
+
+======================================================================
+[1단계] 적재 대상 테이블 준비
+======================================================================
+
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> create table emp_stage (
+  2    emp_id    number(6),
+  3    ename     varchar2(30),
+  4    hire_date date,
+  5    salary    number(8)
+  6  );
+
+Table created.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[2단계] 입력 CSV 데이터 파일과 컨트롤 파일 작성
+======================================================================
+
+- 입력 데이터 파일 emp.csv 작성 (쉼표 구분). 3번째 레코드의 salary 가 잘못된 값이다.
+[oracle@dbsvr ~]$ cat > emp.csv <<'EOF'
+1001,KIM,2026-01-15,5000
+1002,LEE,2026-02-01,6200
+1003,PARK,2026-03-10,ABChundred
+1004,CHOI,2026-04-05,7100
+EOF
+
+- 컨트롤 파일 emp.ctl 작성
+[oracle@dbsvr ~]$ cat > emp.ctl <<'EOF'
+LOAD DATA
+INFILE 'emp.csv'
+BADFILE 'emp.bad'
+DISCARDFILE 'emp.dsc'
+APPEND
+INTO TABLE emp_stage
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
+( emp_id,
+  ename,
+  hire_date DATE "YYYY-MM-DD",
+  salary )
+EOF
+
+- 컨트롤 파일 요약:
+--   INFILE      : 어느 파일을 읽을지
+--   INTO TABLE  : 어느 테이블에 넣을지
+--   APPEND      : 기존 데이터에 이어 넣기(비우고 넣으려면 REPLACE/TRUNCATE)
+--   FIELDS TERMINATED BY ',' : 쉼표 구분자
+--   hire_date DATE "..."     : 날짜 형식 변환 규칙
+
+======================================================================
+[3단계] (오류 -> 원인 -> 수정) 전통적 경로로 적재 -> 불량 레코드 발생
+======================================================================
+
+- 기본(전통적 경로)으로 sqlldr 실행
+[oracle@dbsvr ~]$ sqlldr hr/oracle@pdb1 CONTROL=emp.ctl LOG=emp.log BAD=emp.bad
+
+SQL*Loader: Release 19.0.0.0.0 - Production on Mon Aug 10 10:05:12 2026
+Version 19.3.0.0.0
+
+Path used:      Conventional
+Commit point reached - logical record count 4
+
+Table EMP_STAGE:
+  3 Rows successfully loaded.
+  1 Row not loaded due to data errors.
+
+Check the log file:
+  emp.log
+for more information about the load.
+
+- 4건 중 1건이 적재되지 않았다(Row not loaded due to data errors). 불량 파일을 확인한다.
+[oracle@dbsvr ~]$ cat emp.bad
+1003,PARK,2026-03-10,ABChundred
+
+- 로그에서 거부 사유를 확인한다.
+[oracle@dbsvr ~]$ grep -A1 "Record 3" emp.log
+Record 3: Rejected - Error on table EMP_STAGE, column SALARY.
+ORA-01722: invalid number
+
+- 원인: salary 컬럼은 NUMBER 인데 3번째 레코드의 값이 'ABChundred' 라는 문자열이라
+        숫자로 변환할 수 없어 ORA-01722 로 거부되었다. 거부된 레코드는 불량 파일(emp.bad)에
+        원본 형태로 보관되므로, 정상 3건은 그대로 적재되고 문제 레코드만 따로 분리된다.
+- 수정: 불량 파일의 레코드를 올바른 숫자 값으로 보정한 뒤, 그 파일만 다시 적재한다.
+
+[oracle@dbsvr ~]$ sed -i 's/ABChundred/6800/' emp.bad
+[oracle@dbsvr ~]$ cat emp.bad
+1003,PARK,2026-03-10,6800
+
+- 보정된 불량 파일(emp.bad)을 입력으로 삼아 재적재 (INFILE 을 커맨드라인에서 덮어씀)
+[oracle@dbsvr ~]$ sqlldr hr/oracle@pdb1 CONTROL=emp.ctl DATA=emp.bad LOG=emp_fix.log BAD=emp_fix.bad
+
+SQL*Loader: Release 19.0.0.0.0 - Production on Mon Aug 10 10:07:40 2026
+Version 19.3.0.0.0
+
+Path used:      Conventional
+Commit point reached - logical record count 1
+
+Table EMP_STAGE:
+  1 Row successfully loaded.
+
+======================================================================
+[4단계] 적재 결과 확인 및 다이렉트 경로 비교
+======================================================================
+
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> select count(*) as cnt from emp_stage;
+
+       CNT
+----------
+         4
+
+- 이제 4건 모두 적재되었다(정상 3건 + 보정 1건).
+
+- (참고) 대용량 초기 적재에서는 다이렉트 경로가 훨씬 빠르다.
+--   sqlldr hr/oracle@pdb1 CONTROL=emp.ctl LOG=emp.log DIRECT=TRUE
+--   * 다이렉트 경로: SQL/버퍼 캐시를 우회해 HWM 위에 블록을 직접 기록 -> 빠름.
+--   * 단, 적재 중 테이블 잠금, INSERT 트리거 미실행, 일부 제약 비활성화 후 재검증,
+--     NOLOGGING 결합 시 적재 직후 백업 필요 등의 주의점이 있다.
+--   * 소량이거나 트리거/제약을 반드시 태워야 하면 전통적 경로가 적합하다.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[정리]
+======================================================================
+- SQL*Loader 는 컨트롤 파일 정의(INFILE/INTO TABLE/FIELDS/적재옵션)에 따라 외부 텍스트를 적재한다.
+- 데이터 타입 오류(예: ORA-01722) 레코드는 불량 파일(BAD)로 분리되어 정상 데이터 적재를 막지 않는다.
+- 거부 레코드는 원인 확인 후 보정하여 재적재할 수 있다.
+- 전통적 경로는 안전(트리거/제약 적용)·동시성, 다이렉트 경로(DIRECT=TRUE)는 속도가 강점이다.
+
+- 뒷정리
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> drop table emp_stage purge;
+
+Table dropped.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$ rm -f emp.csv emp.ctl emp.bad emp.dsc emp.log emp_fix.log emp_fix.bad
+[oracle@dbsvr ~]$

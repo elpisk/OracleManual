@@ -1,0 +1,99 @@
+================================================================================
+ 27장 실습 02 — Data Pump Import 변환(Transformation) 옵션
+ 목표: REMAP_SCHEMA / REMAP_TABLESPACE / TRANSFORM 으로 구조를 바꿔 가져오기
+ 환경: PDB=pdb1, 원본 덤프=hr.dmp (실습01에서 생성)
+================================================================================
+
+-- [1] 대상 테이블스페이스와 스테이징 스키마 준비
+$ sqlplus system@pdb1
+
+SYSTEM@pdb1> CREATE TABLESPACE ts_stg
+  2          DATAFILE '/u01/app/oracle/oradata/CDB1/pdb1/ts_stg01.dbf'
+  3          SIZE 50M AUTOEXTEND ON;
+Tablespace created.
+
+SYSTEM@pdb1> -- 스테이징 스키마는 일부러 아직 만들지 않는다(뒤에서 오류 재현).
+SYSTEM@pdb1> EXIT
+
+--------------------------------------------------------------------------------
+-- [2] 첫 시도: REMAP_SCHEMA 대상(HR_STG)이 없는 상태에서 impdp
+--------------------------------------------------------------------------------
+$ impdp system@pdb1 DIRECTORY=dp_dir DUMPFILE=hr.dmp LOGFILE=stg_imp.log \
+         REMAP_SCHEMA=hr:hr_stg \
+         REMAP_TABLESPACE=users:ts_stg \
+         TRANSFORM=SEGMENT_ATTRIBUTES:N
+
+Import: Release 19.0.0.0.0 - Production on Wed Aug 5 10:02:11 2026
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Master table "SYSTEM"."SYS_IMPORT_FULL_01" successfully loaded/unloaded
+Processing object type SCHEMA_EXPORT/USER
+ORA-31684: Object type USER:"HR_STG" already exists
+ORA-39083: Object type OBJECT_GRANT failed to create with error:
+ORA-01917: user or role 'HR_STG' does not exist
+...
+ORA-39165: Schema HR_STG was not found.
+
+-- 원인 파악:
+--   REMAP_SCHEMA=hr:hr_stg 의 대상 HR_STG 사용자가 존재하지 않는다.
+--   impdp가 자동 생성을 시도하지만 쿼터/권한이 없어 후속 객체 생성이 실패한다.
+--   운영에서는 대상 스키마를 미리 만들어 두는 것이 안전하다.
+
+--------------------------------------------------------------------------------
+-- [3] 수정: 대상 스키마를 명시적으로 생성하고 쿼터 부여 후 재실행
+--------------------------------------------------------------------------------
+$ sqlplus system@pdb1
+SYSTEM@pdb1> CREATE USER hr_stg IDENTIFIED BY oracle
+  2          DEFAULT TABLESPACE ts_stg QUOTA UNLIMITED ON ts_stg;
+User created.
+SYSTEM@pdb1> GRANT CREATE SESSION, CREATE TABLE, CREATE SEQUENCE TO hr_stg;
+Grant succeeded.
+SYSTEM@pdb1> EXIT
+
+$ impdp system@pdb1 DIRECTORY=dp_dir DUMPFILE=hr.dmp LOGFILE=stg_imp.log \
+         REMAP_SCHEMA=hr:hr_stg \
+         REMAP_TABLESPACE=users:ts_stg \
+         TRANSFORM=SEGMENT_ATTRIBUTES:N \
+         TABLE_EXISTS_ACTION=REPLACE
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+Processing object type SCHEMA_EXPORT/TABLE/TABLE_DATA
+. . imported "HR_STG"."EMPLOYEES"      17.08 KB     107 rows
+. . imported "HR_STG"."DEPARTMENTS"    7.125 KB      27 rows
+. . imported "HR_STG"."JOBS"           7.375 KB      19 rows
+. . imported "HR_STG"."LOCATIONS"      8.437 KB      23 rows
+Job "SYSTEM"."SYS_IMPORT_FULL_01" successfully completed ... elapsed 0 00:00:35
+
+--------------------------------------------------------------------------------
+-- [4] 검증: 객체가 TS_STG 테이블스페이스에 저장되었는지 확인
+--------------------------------------------------------------------------------
+$ sqlplus system@pdb1
+SYSTEM@pdb1> SELECT table_name, tablespace_name
+  2          FROM dba_tables WHERE owner = 'HR_STG' ORDER BY table_name;
+
+TABLE_NAME      TABLESPACE_NAME
+--------------- --------------------
+DEPARTMENTS     TS_STG
+EMPLOYEES       TS_STG
+JOBS            TS_STG
+LOCATIONS       TS_STG
+
+-- REMAP_TABLESPACE=users:ts_stg 덕분에 원본 USERS 대신 TS_STG에 저장됨.
+-- TRANSFORM=SEGMENT_ATTRIBUTES:N 으로 원본 저장 절을 제거해 대상 기본값을 따름.
+
+--------------------------------------------------------------------------------
+-- [5] 추가 실험: TRANSFORM으로 리두 최소화하며 재적재
+--------------------------------------------------------------------------------
+$ impdp system@pdb1 DIRECTORY=dp_dir DUMPFILE=hr.dmp LOGFILE=stg_imp2.log \
+         REMAP_SCHEMA=hr:hr_stg REMAP_TABLESPACE=users:ts_stg \
+         TABLE_EXISTS_ACTION=TRUNCATE \
+         TRANSFORM=DISABLE_ARCHIVE_LOGGING:Y
+
+... imported "HR_STG"."EMPLOYEES"     107 rows
+Job successfully completed.
+
+-- 결론:
+--   1) REMAP_SCHEMA 대상 스키마는 미리 만들어 두는 것이 안전(ORA-39165 방지).
+--   2) REMAP_TABLESPACE로 저장 위치를, TRANSFORM으로 DDL 속성을 바꿔 가져온다.
+--   3) DISABLE_ARCHIVE_LOGGING:Y 는 대량 적재 시 리두를 줄여 속도를 높인다.
+================================================================================

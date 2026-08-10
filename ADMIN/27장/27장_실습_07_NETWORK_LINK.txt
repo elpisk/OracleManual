@@ -1,0 +1,85 @@
+================================================================================
+ 27장 실습 07 — 네트워크를 통한 전송 (NETWORK_LINK)
+ 목표: 덤프파일 없이 대상 PDB2가 원본 PDB1의 HR 스키마를 직접 당겨오기(pull)
+ 환경: 원본 PDB=pdb1(srchost), 대상 PDB=pdb2
+================================================================================
+
+-- [1] 대상 PDB2에서 원본 PDB1을 가리키는 데이터베이스 링크 생성
+--     ★ 링크는 '대상'에 만들어 '원본'을 가리킨다(방향에 주의).
+$ sqlplus system@pdb2
+SYSTEM@pdb2> CREATE DATABASE LINK src_link
+  2          CONNECT TO hr IDENTIFIED BY oracle
+  3          USING '//srchost:1521/pdb1';
+Database link created.
+
+-- 링크 동작 확인
+SYSTEM@pdb2> SELECT COUNT(*) FROM employees@src_link;
+  COUNT(*)
+----------
+       107
+
+--------------------------------------------------------------------------------
+-- [2] 첫 시도: impdp NETWORK_LINK → 대상 스키마 권한 부족으로 실패
+--------------------------------------------------------------------------------
+$ impdp system@pdb2 NETWORK_LINK=src_link SCHEMAS=hr \
+        REMAP_SCHEMA=hr:hr_net LOGFILE=dp_dir:net_imp.log
+
+Import: Release 19.0.0.0.0 - Production on Wed Aug 5 16:05:44 2026
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Estimate in progress using BLOCKS method...
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+ORA-31631: privileges are required
+ORA-39149: cannot link privileged user to non-privileged user
+
+-- 원인 파악:
+--   NETWORK_LINK 임포트에서 링크 계정(hr)은 원본에서 DATAPUMP_EXP_FULL_DATABASE
+--   같은 권한이 없어, 다른 스키마를 REMAP하는 특권 작업을 수행할 수 없다.
+--   링크 계정에 적절한 내보내기 권한을 부여해야 한다.
+
+--------------------------------------------------------------------------------
+-- [3] 수정: 원본에서 링크 계정에 DATAPUMP_EXP_FULL_DATABASE 부여
+--------------------------------------------------------------------------------
+$ sqlplus sys@pdb1 as sysdba
+SYS@pdb1> GRANT DATAPUMP_EXP_FULL_DATABASE TO hr;
+Grant succeeded.
+SYS@pdb1> EXIT
+
+-- 대상 PDB2에는 매핑 대상 스키마를 준비
+$ sqlplus system@pdb2
+SYSTEM@pdb2> CREATE USER hr_net IDENTIFIED BY oracle
+  2          DEFAULT TABLESPACE users QUOTA UNLIMITED ON users;
+User created.
+SYSTEM@pdb2> GRANT CREATE SESSION, CREATE TABLE TO hr_net;
+Grant succeeded.
+SYSTEM@pdb2> EXIT
+
+$ impdp system@pdb2 NETWORK_LINK=src_link SCHEMAS=hr \
+        REMAP_SCHEMA=hr:hr_net LOGFILE=dp_dir:net_imp.log \
+        TABLE_EXISTS_ACTION=REPLACE
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Estimate in progress using BLOCKS method...
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+. . imported "HR_NET"."EMPLOYEES"                     107 rows
+. . imported "HR_NET"."DEPARTMENTS"                    27 rows
+Job "SYSTEM"."SYS_IMPORT_SCHEMA_01" successfully completed ...
+-- ★ DUMPFILE 파라미터가 없다 — 중간 덤프파일 없이 링크로 직접 전송되었다.
+
+--------------------------------------------------------------------------------
+-- [4] 검증
+--------------------------------------------------------------------------------
+$ sqlplus hr_net@pdb2
+HR_NET@pdb2> SELECT COUNT(*) FROM employees;
+  COUNT(*)
+----------
+       107
+
+-- 참고: 원본 테이블의 일관 읽기가 필요하면 아래처럼 FLASHBACK_TIME 병행
+-- $ impdp system@pdb2 NETWORK_LINK=src_link SCHEMAS=hr \
+--        FLASHBACK_TIME=\"TO_TIMESTAMP(SYSTIMESTAMP)\"
+
+-- 결론:
+--   1) NETWORK_LINK는 impdp 전용 — 대상이 링크로 원본 데이터를 당겨온다.
+--   2) 링크는 대상에 만들어 원본을 가리키고, 덤프파일을 만들지 않는다.
+--   3) 다른 스키마 REMAP 등 특권 작업은 링크 계정에 EXP_FULL 권한이 필요하다.
+================================================================================

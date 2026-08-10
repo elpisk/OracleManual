@@ -1,0 +1,169 @@
+-- 26장 실습_05: PDB 내 테이블에 SQL*Loader 로 데이터 적재 실습
+-- 목표: 멀티테넌트 환경에서 대상 PDB(pdb1)의 테이블에 적재한다.
+--       접속 문자열(@서비스명)과 TWO_TASK 환경변수 두 가지 방식을 사용하고,
+--       루트(CDB$ROOT) 접속이나 PDB 미개방으로 인한 실패를 만나 원인을 파악·수정한다.
+
+======================================================================
+[1단계] 대상 PDB 상태와 대상 테이블 확인
+======================================================================
+
+[oracle@dbsvr ~]$ sqlplus sys/oracle@cdb1 as sysdba
+
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+SYS@cdb1> select name, open_mode from v$pdbs;
+
+NAME         OPEN_MODE
+------------ ----------
+PDB$SEED     READ ONLY
+PDB1         MOUNTED         -- 아직 열리지 않았다!
+
+-- pdb1 이 MOUNTED 상태다. 적재하려면 READ WRITE 로 열어야 한다.
+SYS@cdb1> alter pluggable database pdb1 open;
+
+Pluggable database altered.
+
+SYS@cdb1> alter session set container=pdb1;
+
+Session altered.
+
+SYS@cdb1> create table hr.emp_pdb ( id number(6), ename varchar2(30) );
+
+Table created.
+
+SYS@cdb1> grant insert on hr.emp_pdb to hr;
+
+Grant succeeded.
+
+SYS@cdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[2단계] 입력 데이터·컨트롤 파일 작성
+======================================================================
+
+[oracle@dbsvr ~]$ cat > emp_pdb.csv <<'EOF'
+1,KIM
+2,LEE
+3,PARK
+EOF
+
+[oracle@dbsvr ~]$ cat > emp_pdb.ctl <<'EOF'
+LOAD DATA
+INFILE 'emp_pdb.csv'
+APPEND
+INTO TABLE emp_pdb
+FIELDS TERMINATED BY ','
+TRAILING NULLCOLS
+( id, ename )
+EOF
+
+======================================================================
+[3단계] (오류 -> 원인 -> 수정) 루트(CDB$ROOT)로 접속해 적재 시도 -> 실패
+======================================================================
+
+- 실수로 CDB 루트 서비스(cdb1)로 접속해 적재를 시도한다.
+[oracle@dbsvr ~]$ sqlldr userid=hr@cdb1 control=emp_pdb.ctl log=emp_pdb.log
+
+SQL*Loader: Release 19.0.0.0.0 - Production on Mon Aug 10 14:20:03 2026
+Version 19.3.0.0.0
+
+SQL*Loader-704: Internal error: ulconnect: OCIServerAttach [0]
+ORA-01017: invalid username/password; logon denied
+
+- 원인: HR 은 pdb1 안의 로컬 사용자이므로 CDB$ROOT(서비스 cdb1)에는 존재하지 않는다.
+        루트 서비스로 접속하면 인증에 실패하고(ORA-01017), 설령 공통 사용자라 해도
+        대상 테이블은 PDB 안에 있으므로 루트에 적재할 수 없다.
+- 수정: 대상 PDB 의 서비스명(pdb1)으로 접속하도록 접속 문자열을 바꾼다.
+
+======================================================================
+[4단계] 접속 문자열(@서비스명)로 PDB 지정 후 적재
+======================================================================
+
+[oracle@dbsvr ~]$ sqlldr userid=hr@pdb1 control=emp_pdb.ctl log=emp_pdb.log
+
+SQL*Loader: Release 19.0.0.0.0 - Production on Mon Aug 10 14:22:15 2026
+Version 19.3.0.0.0
+
+Path used:      Conventional
+Commit point reached - logical record count 3
+
+Table EMP_PDB:
+  3 Rows successfully loaded.
+
+- 접속이 올바른 PDB 로 갔는지 확인한다.
+[oracle@dbsvr ~]$ sqlplus hr/oracle@pdb1
+
+HR@pdb1> show con_name
+
+CON_NAME
+------------------------------
+PDB1
+
+HR@pdb1> select id, ename from emp_pdb order by id;
+
+        ID ENAME
+---------- ------
+         1 KIM
+         2 LEE
+         3 PARK
+
+HR@pdb1> truncate table emp_pdb;
+
+Table truncated.
+
+HR@pdb1> exit
+[oracle@dbsvr ~]$
+
+======================================================================
+[5단계] TWO_TASK 환경변수로 기본 접속 대상 PDB 지정
+======================================================================
+
+- TWO_TASK 에 서비스명을 설정하면 userid 에 @접속식별자를 생략할 수 있다.
+[oracle@dbsvr ~]$ export TWO_TASK=pdb1
+[oracle@dbsvr ~]$ sqlldr userid=hr control=emp_pdb.ctl log=emp_pdb2.log
+
+SQL*Loader: Release 19.0.0.0.0 - Production on Mon Aug 10 14:26:40 2026
+Version 19.3.0.0.0
+
+Path used:      Conventional
+Commit point reached - logical record count 3
+
+Table EMP_PDB:
+  3 Rows successfully loaded.
+
+- 어느 컨테이너로 접속했는지 검증(TWO_TASK 가 여전히 pdb1 을 가리킴).
+[oracle@dbsvr ~]$ sqlplus hr/oracle
+SQL> select sys_context('USERENV','CON_NAME') from dual;
+
+SYS_CONTEXT('USERENV','CON_NAME')
+------------------------------------
+PDB1
+
+SQL> exit
+[oracle@dbsvr ~]$ unset TWO_TASK
+
+======================================================================
+[정리]
+======================================================================
+- 멀티테넌트 환경에서 사용자 데이터는 PDB 에 있으므로, 반드시 대상 PDB 서비스로 접속한다.
+- 방법1: userid=hr@pdb1 (네트 서비스명) 또는 Easy Connect(@//host:1521/pdb1...).
+- 방법2: export TWO_TASK=pdb1 후 userid=hr (접속식별자 생략).
+- 루트(CDB$ROOT) 서비스로 접속하면 로컬 사용자 인증 실패(ORA-01017) 또는 대상 부재.
+- 적재 전 점검: 대상 PDB 가 READ WRITE 인가(MOUNTED/READ ONLY 면 실패),
+  사용자 INSERT 권한·테이블스페이스 할당량, SHOW CON_NAME 으로 컨테이너 확인.
+
+- 뒷정리
+[oracle@dbsvr ~]$ sqlplus sys/oracle@pdb1 as sysdba
+
+SYS@pdb1> drop table hr.emp_pdb purge;
+
+Table dropped.
+
+SYS@pdb1> exit
+[oracle@dbsvr ~]$ rm -f emp_pdb.csv emp_pdb.ctl emp_pdb.log emp_pdb2.log
+[oracle@dbsvr ~]$

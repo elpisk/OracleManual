@@ -1,0 +1,152 @@
+================================================================================
+ 28장 실습 03 — ORACLE_DATAPUMP 액세스 드라이버로 외부 테이블 생성/전송
+ 목표: CTAS 로 데이터를 이진 덤프로 언로드(unload) → 파일 이동 →
+       대상에서 외부 테이블로 재적재(load) 하는 플랫폼 독립 전송을 실습
+ 환경: 원본 PDB=pdb1, 대상 PDB=pdb2 (같은 서버로 단순화), oracle 계정
+================================================================================
+
+-- 사전 준비: 원본/대상 각각의 디렉터리 객체가 필요하다.
+$ sqlplus sys@pdb1 as sysdba
+SYS@pdb1> CREATE OR REPLACE DIRECTORY data_dir AS '/u01/app/oracle/extdata';
+Directory created.
+SYS@pdb1> GRANT READ, WRITE ON DIRECTORY data_dir TO hr;
+Grant succeeded.
+SYS@pdb1> EXIT
+
+$ sqlplus sys@pdb2 as sysdba
+SYS@pdb2> CREATE OR REPLACE DIRECTORY data_dir AS '/u01/app/oracle/xfer';
+Directory created.
+SYS@pdb2> GRANT READ, WRITE ON DIRECTORY data_dir TO hr;
+Grant succeeded.
+SYS@pdb2> EXIT
+
+$ mkdir -p /u01/app/oracle/extdata /u01/app/oracle/xfer
+
+--------------------------------------------------------------------------------
+-- [1] 원본(pdb1)에서 부서 20 직원을 이진 덤프로 언로드한다.
+--------------------------------------------------------------------------------
+$ sqlplus hr@pdb1
+
+HR@pdb1> -- ORGANIZATION EXTERNAL + TYPE ORACLE_DATAPUMP + AS SELECT = 언로드
+HR@pdb1> CREATE TABLE emp_dp
+  2    ORGANIZATION EXTERNAL
+  3    ( TYPE ORACLE_DATAPUMP
+  4      DEFAULT DIRECTORY data_dir
+  5      LOCATION ('emp_dept20.dmp') )
+  6    AS
+  7    SELECT employee_id, last_name, salary, department_id
+  8    FROM   employees
+  9    WHERE  department_id = 20;
+
+Table created.
+
+HR@pdb1> SELECT COUNT(*) FROM emp_dp;
+
+  COUNT(*)
+----------
+         2
+
+HR@pdb1> EXIT
+$ ls -l /u01/app/oracle/extdata/emp_dept20.dmp
+-rw-r-----. 1 oracle oinstall 16384 Aug 10 10:20 /u01/app/oracle/extdata/emp_dept20.dmp
+
+-- 이진 덤프 파일이 생성되었다. 텍스트로는 열어볼 수 없다.
+$ head -c 40 /u01/app/oracle/extdata/emp_dept20.dmp | cat -v
+^@^@^@^@^A^H^@^@... (이진 데이터)
+
+--------------------------------------------------------------------------------
+-- [2] (오류 → 원인 → 수정) 언로드한 외부 테이블에 다시 언로드를 시도
+--------------------------------------------------------------------------------
+$ sqlplus hr@pdb1
+
+HR@pdb1> -- '데이터가 늘었으니 같은 외부 테이블에 다시 채우자'는 실수를 해 본다.
+HR@pdb1> INSERT INTO emp_dp
+  2    SELECT employee_id, last_name, salary, department_id
+  3    FROM   employees WHERE department_id = 20;
+INSERT INTO emp_dp
+            *
+ERROR at line 1:
+ORA-30657: operation not supported on external organized table
+
+HR@pdb1> -- 원인 파악:
+HR@pdb1> --   ORACLE_DATAPUMP 외부 테이블은 CREATE TABLE ... AS SELECT 시점에
+HR@pdb1> --   단 한 번만 채워지고, 그 후에는 다른 외부 테이블처럼 읽기 전용이 된다.
+HR@pdb1> --   기존 덤프에 행을 추가하거나 덮어쓸 수 없다.
+HR@pdb1> -- 수정: 새 조건을 담은 SELECT 로 '새 덤프 파일'을 만드는 외부 테이블을 다시 만든다.
+HR@pdb1> CREATE TABLE emp_dp_all
+  2    ORGANIZATION EXTERNAL
+  3    ( TYPE ORACLE_DATAPUMP
+  4      DEFAULT DIRECTORY data_dir
+  5      LOCATION ('emp_all.dmp') )
+  6    AS SELECT employee_id, last_name, salary, department_id FROM employees;
+
+Table created.
+
+HR@pdb1> EXIT
+
+--------------------------------------------------------------------------------
+-- [3] 덤프 파일을 대상 디렉터리로 이동(전송)한다.
+--------------------------------------------------------------------------------
+$ cp /u01/app/oracle/extdata/emp_dept20.dmp /u01/app/oracle/xfer/
+$ ls -l /u01/app/oracle/xfer/emp_dept20.dmp
+-rw-r-----. 1 oracle oinstall 16384 Aug 10 10:23 /u01/app/oracle/xfer/emp_dept20.dmp
+
+--------------------------------------------------------------------------------
+-- [4] 대상(pdb2)에서 같은 구조의 외부 테이블로 재적재한다 (AS SELECT 없이).
+--------------------------------------------------------------------------------
+$ sqlplus hr@pdb2
+
+HR@pdb2> CREATE TABLE emp_dp_in
+  2    ( employee_id NUMBER(6), last_name VARCHAR2(25),
+  3      salary NUMBER(8,2), department_id NUMBER(4) )
+  4    ORGANIZATION EXTERNAL
+  5    ( TYPE ORACLE_DATAPUMP
+  6      DEFAULT DIRECTORY data_dir
+  7      LOCATION ('emp_dept20.dmp') );
+
+Table created.
+
+HR@pdb2> SELECT employee_id, last_name, salary FROM emp_dp_in ORDER BY employee_id;
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        201 Hartstein                      13000
+        202 Fay                             6000
+
+-- 원본 pdb1 에서 언로드한 데이터가 대상 pdb2 에서 그대로 읽힌다.
+
+HR@pdb2> -- 실제 내부 테이블로 적재하여 전송을 완료한다.
+HR@pdb2> CREATE TABLE emp_marketing AS SELECT * FROM emp_dp_in;
+
+Table created.
+
+HR@pdb2> SELECT COUNT(*) FROM emp_marketing;
+
+  COUNT(*)
+----------
+         2
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 언로드: CREATE TABLE ... ORGANIZATION EXTERNAL TYPE ORACLE_DATAPUMP ... AS SELECT
+-- 2) 언로드된 외부 테이블은 이후 읽기 전용 — 추가 INSERT 시 ORA-30657.
+-- 3) 전송: 덤프 파일을 대상 서버 디렉터리로 복사한다(이진, 플랫폼 독립적).
+-- 4) 재적재: 대상에서 같은 컬럼 구조로 외부 테이블 정의(AS SELECT 없이, LOCATION=덤프).
+-- 5) 그 외부 테이블을 SELECT/CTAS 하면 원본 데이터가 복원된다.
+
+HR@pdb2> DROP TABLE emp_marketing PURGE;
+Table dropped.
+HR@pdb2> DROP TABLE emp_dp_in;
+Table dropped.
+HR@pdb2> EXIT
+
+$ sqlplus hr@pdb1
+HR@pdb1> DROP TABLE emp_dp;
+Table dropped.
+HR@pdb1> DROP TABLE emp_dp_all;
+Table dropped.
+HR@pdb1> EXIT
+$ rm -f /u01/app/oracle/extdata/emp_dept20.dmp /u01/app/oracle/extdata/emp_all.dmp
+$ rm -f /u01/app/oracle/xfer/emp_dept20.dmp
+================================================================================

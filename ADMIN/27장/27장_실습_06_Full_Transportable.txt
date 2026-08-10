@@ -1,0 +1,93 @@
+================================================================================
+ 27장 실습 06 — Full Transportable Export/Import (TRANSPORTABLE=ALWAYS)
+ 목표: non-CDB(orcl)를 PDB1으로 고속 이관(데이터파일 복사 + 메타데이터 Data Pump)
+ 환경: 원본 non-CDB=orcl, 대상 PDB=pdb1 (동일 엔디안: 둘 다 Linux x86-64 Little)
+================================================================================
+
+-- [1] 원본에서 사용자 테이블스페이스 및 엔디안 확인
+$ sqlplus sys@orcl as sysdba
+SYS@orcl> SELECT tablespace_name FROM dba_tablespaces
+  2       WHERE tablespace_name NOT IN ('SYSTEM','SYSAUX','TEMP','UNDOTBS1');
+TABLESPACE_NAME
+--------------------
+TS_APP
+
+SYS@orcl> SELECT d.platform_name, tp.endian_format
+  2       FROM v$database d JOIN v$transportable_platform tp
+  3         ON d.platform_id = tp.platform_id;
+PLATFORM_NAME                        ENDIAN_FORMAT
+------------------------------------ --------------
+Linux x86 64-bit                     Little
+-- 대상도 Linux x86-64(Little) → 엔디안 동일, RMAN CONVERT 불필요.
+
+--------------------------------------------------------------------------------
+-- [2] 첫 시도: 테이블스페이스를 READ WRITE 상태로 두고 expdp → 실패
+--------------------------------------------------------------------------------
+$ expdp system@orcl FULL=Y TRANSPORTABLE=ALWAYS VERSION=12 \
+        DIRECTORY=mig_dir DUMPFILE=ft_meta.dmp LOGFILE=ft_meta.log
+
+Export: Release 19.0.0.0.0 - Production on Wed Aug 5 15:10:22 2026
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+
+ORA-39123: Data Pump transportable tablespace job aborted
+ORA-29335: tablespace 'TS_APP' is not read only
+-- 원인 파악:
+--   Full Transportable은 사용자 테이블스페이스의 데이터파일을 물리 복사한다.
+--   복사 시점 일관성을 위해 대상 테이블스페이스가 READ ONLY 여야 한다.
+
+--------------------------------------------------------------------------------
+-- [3] 수정: 사용자 테이블스페이스를 READ ONLY 로 전환 후 재실행
+--------------------------------------------------------------------------------
+$ sqlplus sys@orcl as sysdba
+SYS@orcl> ALTER TABLESPACE ts_app READ ONLY;
+Tablespace altered.
+SYS@orcl> EXIT
+
+$ expdp system@orcl FULL=Y TRANSPORTABLE=ALWAYS VERSION=12 \
+        DIRECTORY=mig_dir DUMPFILE=ft_meta.dmp LOGFILE=ft_meta.log
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Starting "SYSTEM"."SYS_EXPORT_FULL_01": ... FULL=Y TRANSPORTABLE=ALWAYS
+Processing object type DATABASE_EXPORT/PLUGTS_FULL/FULL/PLUGTS_TABLESPACE
+Processing object type DATABASE_EXPORT/SCHEMA/TABLE/TABLE  -- (메타데이터만)
+Master table "SYSTEM"."SYS_EXPORT_FULL_01" successfully loaded/unloaded
+Dump file: /u01/mig/ft_meta.dmp
+Datafiles required for transportable tablespace TS_APP:
+  /u01/app/oracle/oradata/ORCL/ts_app01.dbf
+Job successfully completed.
+
+-- 메타데이터 덤프는 매우 작다(행 데이터가 없음). 데이터는 아래 파일 복사로 옮긴다.
+
+--------------------------------------------------------------------------------
+-- [4] 데이터파일과 메타데이터 덤프를 대상 서버로 복사
+--------------------------------------------------------------------------------
+$ scp /u01/app/oracle/oradata/ORCL/ts_app01.dbf \
+      oracle@dbhost2:/u01/app/oracle/oradata/CDB1/pdb1/
+$ scp /u01/mig/ft_meta.dmp oracle@dbhost2:/u01/app/oracle/dpdump/
+
+--------------------------------------------------------------------------------
+-- [5] 대상 PDB1에서 impdp (TRANSPORT_DATAFILES + REMAP_DATAFILE)
+--------------------------------------------------------------------------------
+$ impdp system@pdb1 DIRECTORY=dp_dir DUMPFILE=ft_meta.dmp LOGFILE=ft_imp.log \
+        TRANSPORT_DATAFILES='/u01/app/oracle/oradata/CDB1/pdb1/ts_app01.dbf'
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Processing object type DATABASE_EXPORT/PLUGTS_FULL/PLUGTS_TABLESPACE
+Processing object type DATABASE_EXPORT/SCHEMA/TABLE/TABLE
+Job "SYSTEM"."SYS_IMPORT_TRANSPORTABLE_01" successfully completed ...
+
+-- [6] 원본/대상 테이블스페이스를 READ WRITE로 되돌린다.
+$ sqlplus sys@orcl as sysdba
+SYS@orcl> ALTER TABLESPACE ts_app READ WRITE;
+Tablespace altered.
+
+$ sqlplus sys@pdb1 as sysdba
+SYS@pdb1> ALTER TABLESPACE ts_app READ WRITE;
+Tablespace altered.
+
+-- 결론:
+--   1) Full Transportable = 데이터파일 물리 복사 + 메타데이터 Data Pump.
+--   2) 활성화는 expdp에 FULL=Y + TRANSPORTABLE=ALWAYS (원본 12.1 미만이면 VERSION=12).
+--   3) 사용자 TS는 복사 전 READ ONLY 필수(ORA-29335), 완료 후 READ WRITE 복귀.
+--   4) 엔디안이 같으면 CONVERT 없이 데이터파일을 그대로 복사한다.
+================================================================================

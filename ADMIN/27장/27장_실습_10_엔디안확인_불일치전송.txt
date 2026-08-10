@@ -1,0 +1,127 @@
+================================================================================
+ 27장 실습 10 — 엔디안 포맷 확인 및 불일치 테이블스페이스 전송
+ 목표: V$TRANSPORTABLE_PLATFORM/V$DATABASE로 엔디안 판정 후 8단계 전체 흐름 수행
+ 시나리오: 원본=AIX-Based Systems(64-bit)=Big → 대상=Linux x86 64-bit=Little
+================================================================================
+
+--------------------------------------------------------------------------------
+-- [1] 엔디안 확인 (원본 AIX)
+--------------------------------------------------------------------------------
+$ sqlplus sys@aixdb as sysdba
+SYS@aixdb> SELECT platform_name FROM v$database;
+PLATFORM_NAME
+------------------------------
+AIX-Based Systems (64-bit)
+
+SYS@aixdb> SELECT d.platform_name, tp.endian_format
+  2       FROM v$database d JOIN v$transportable_platform tp
+  3         ON d.platform_id = tp.platform_id;
+PLATFORM_NAME                        ENDIAN_FORMAT
+------------------------------------ --------------
+AIX-Based Systems (64-bit)           Big
+
+SYS@aixdb> SELECT endian_format FROM v$transportable_platform
+  2       WHERE platform_name = 'Linux x86 64-bit';
+ENDIAN_FORMAT
+--------------
+Little
+-- 판정: Big ≠ Little → 불일치. RMAN CONVERT 필요.
+
+--------------------------------------------------------------------------------
+-- [2] 원본 테이블스페이스 READ ONLY 전환
+--------------------------------------------------------------------------------
+SYS@aixdb> ALTER TABLESPACE ts_hr READ ONLY;
+Tablespace altered.
+
+--------------------------------------------------------------------------------
+-- [3] 첫 시도: 자체 포함성 점검 생략하고 바로 expdp → 위반으로 실패
+--------------------------------------------------------------------------------
+$ expdp system@aixdb TRANSPORT_TABLESPACES=ts_hr DIRECTORY=mig_dir \
+        DUMPFILE=ts_hr_meta.dmp LOGFILE=ts_hr_meta.log
+
+Export: Release 19.0.0.0.0 - Production on Wed Aug 5 18:20:10 2026
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+ORA-39123: Data Pump transportable tablespace job aborted
+ORA-39907: Index HR.EMP_DEPT_IX in tablespace TS_IDX points to
+           table HR.EMPLOYEES in tablespace TS_HR.
+-- 원인 파악:
+--   전송 집합(TS_HR)에 있는 EMPLOYEES 테이블의 인덱스가 집합 밖 TS_IDX에 있다.
+--   외부 의존성 → 자체 포함성(Self-Contained) 위반. 사전 점검을 건너뛴 탓이다.
+
+--------------------------------------------------------------------------------
+-- [4] 수정: 자체 포함성 점검 → 인덱스 재배치 → 전송 집합 확정
+--------------------------------------------------------------------------------
+SYS@aixdb> ALTER TABLESPACE ts_hr READ WRITE;   -- 재배치 위해 잠시 해제
+Tablespace altered.
+SYS@aixdb> EXEC DBMS_TTS.TRANSPORT_SET_CHECK(ts_list=>'TS_HR', incl_constraints=>TRUE);
+PL/SQL procedure successfully completed.
+SYS@aixdb> SELECT violations FROM transport_set_violations;
+VIOLATIONS
+--------------------------------------------------------------------
+Index HR.EMP_DEPT_IX in tablespace TS_IDX points to table HR.EMPLOYEES ...
+
+-- 해결책1: 인덱스를 전송 집합(TS_HR)으로 재배치
+SYS@aixdb> ALTER INDEX hr.emp_dept_ix REBUILD TABLESPACE ts_hr;
+Index altered.
+
+-- 재점검: 위반 없음 확인
+SYS@aixdb> EXEC DBMS_TTS.TRANSPORT_SET_CHECK(ts_list=>'TS_HR', incl_constraints=>TRUE);
+SYS@aixdb> SELECT * FROM transport_set_violations;
+no rows selected
+
+SYS@aixdb> ALTER TABLESPACE ts_hr READ ONLY;
+Tablespace altered.
+
+-- 이제 메타데이터 내보내기 성공
+$ expdp system@aixdb TRANSPORT_TABLESPACES=ts_hr DIRECTORY=mig_dir \
+        DUMPFILE=ts_hr_meta.dmp LOGFILE=ts_hr_meta.log
+... Datafiles required for transportable tablespace TS_HR:
+    /oradata/AIXDB/ts_hr01.dbf
+Job successfully completed.
+
+--------------------------------------------------------------------------------
+-- [5] RMAN CONVERT 로 데이터파일을 대상 엔디안(Little)으로 변환
+--------------------------------------------------------------------------------
+$ rman target /
+RMAN> CONVERT TABLESPACE ts_hr
+2>    TO PLATFORM 'Linux x86 64-bit'
+3>    FORMAT '/stage/conv/ts_hr01_lin.dbf';
+channel ORA_DISK_1: datafile conversion complete
+Finished conversion at source.
+RMAN> EXIT
+
+--------------------------------------------------------------------------------
+-- [6] 변환된 파일 + 메타데이터 덤프를 대상 Linux 서버로 복사
+--------------------------------------------------------------------------------
+$ scp /stage/conv/ts_hr01_lin.dbf oracle@linuxhost:/u01/app/oracle/oradata/CDB1/pdb1/ts_hr01.dbf
+$ scp /mig/ts_hr_meta.dmp oracle@linuxhost:/u01/app/oracle/dpdump/
+
+--------------------------------------------------------------------------------
+-- [7] 대상에서 impdp (TRANSPORT_DATAFILES)
+--------------------------------------------------------------------------------
+$ impdp system@pdb1 DIRECTORY=dp_dir DUMPFILE=ts_hr_meta.dmp \
+        TRANSPORT_DATAFILES='/u01/app/oracle/oradata/CDB1/pdb1/ts_hr01.dbf' \
+        REMAP_SCHEMA=hr:hr LOGFILE=ts_hr_imp.log
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+Processing object type TRANSPORTABLE_EXPORT/PLUGTS_BLK
+Processing object type TRANSPORTABLE_EXPORT/TABLE
+Job "SYSTEM"."SYS_IMPORT_TRANSPORTABLE_01" successfully completed ...
+
+--------------------------------------------------------------------------------
+-- [8] 양쪽 테이블스페이스를 READ WRITE 로 복귀 + 검증
+--------------------------------------------------------------------------------
+$ sqlplus sys@pdb1 as sysdba
+SYS@pdb1> ALTER TABLESPACE ts_hr READ WRITE;
+Tablespace altered.
+SYS@pdb1> SELECT COUNT(*) FROM hr.employees;
+  COUNT(*)
+----------
+       107
+
+-- 결론(불일치 시 8단계):
+--   ① 엔디안 확인(V$TRANSPORTABLE_PLATFORM) → ② READ ONLY →
+--   ③ TRANSPORT_SET_CHECK 자체 포함성 → ④ expdp 메타데이터 →
+--   ⑤ RMAN CONVERT → ⑥ 파일·덤프 복사 → ⑦ impdp TRANSPORT_DATAFILES →
+--   ⑧ READ WRITE 복귀. 어느 단계라도 빠지면 전송 실패/데이터 손상.
+================================================================================
