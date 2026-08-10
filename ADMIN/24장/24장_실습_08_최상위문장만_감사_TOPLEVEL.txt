@@ -1,0 +1,154 @@
+-- 24장 실습_08: 최상위 문장만 감사 (ONLY TOPLEVEL) - 중첩 호출 중복 감사 방지
+-- 목표: PL/SQL 내부 중첩 문장이 감사되어 레코드가 팽창하는 현상을 재현하고,
+--       ONLY TOPLEVEL 로 최상위 문장만 감사되도록 개선한다.
+
+SYS@cdb1> alter session set container = pdb1;
+
+Session altered.
+
+- 내부에서 EMPLOYEES 를 조회하는 프로시저를 준비한다.
+SYS@cdb1> connect hr/Oracle_123@pdb1
+Connected.
+HR@cdb1> create or replace procedure get_emp_cnt is
+  2    n number;
+  3  begin
+  4    select count(*) into n from employees;
+  5  end;
+  6  /
+
+Procedure created.
+
+======================================================================
+[1단계] ONLY TOPLEVEL 없이 감사 (중복 감사 관찰)
+======================================================================
+
+HR@cdb1> connect sys/Oracle_123@pdb1 as sysdba
+Connected.
+SYS@cdb1> create audit policy sel_all_pol
+  2    actions select on hr.employees, execute on hr.get_emp_cnt;
+
+Audit policy created.
+
+SYS@cdb1> audit policy sel_all_pol;
+
+Audit succeeded.
+
+- 사용자가 프로시저를 호출한다(내부에서 EMPLOYEES SELECT 발생).
+SYS@cdb1> connect hr/Oracle_123@pdb1
+Connected.
+HR@cdb1> exec get_emp_cnt
+
+PL/SQL procedure successfully completed.
+
+- 감사 결과 확인: 프로시저 EXECUTE 와 내부 SELECT 가 모두 감사됨.
+HR@cdb1> connect sys/Oracle_123@pdb1 as sysdba
+Connected.
+SYS@cdb1> select action_name, object_name
+  2  from   unified_audit_trail
+  3  where  unified_audit_policies = 'SEL_ALL_POL'
+  4  order  by event_timestamp desc
+  5  fetch first 4 rows only;
+
+ACTION_NAME  OBJECT_NAME
+------------ -------------
+SELECT       EMPLOYEES
+EXECUTE      GET_EMP_CNT
+
+- 관찰: 한 번의 프로시저 호출에 대해 EXECUTE + 내부 SELECT 두 레코드가 남았다.
+-   배치가 대량 호출하면 감사 추적이 급격히 팽창한다.
+
+======================================================================
+[2단계] (오류 -> 원인 -> 수정) ALTER 로 ONLY TOPLEVEL 추가 시도
+======================================================================
+
+- (실수) 기존 정책에 ALTER 로 ONLY TOPLEVEL 속성만 추가하려 한다.
+SYS@cdb1> alter audit policy sel_all_pol add only toplevel;
+alter audit policy sel_all_pol add only toplevel
+                                   *
+ERROR at line 1:
+ORA-46372: audit condition syntax error at 'ONLY' near position 34
+
+- 원인: ONLY TOPLEVEL 은 정책 생성 시점 속성이며 ALTER 의 ADD 로 변경할 수 없다.
+- 수정: 정책을 비활성화/삭제 후 ONLY TOPLEVEL 을 지정해 재생성한다.
+SYS@cdb1> noaudit policy sel_all_pol;
+
+Noaudit succeeded.
+
+SYS@cdb1> drop audit policy sel_all_pol;
+
+Audit policy dropped.
+
+======================================================================
+[3단계] ONLY TOPLEVEL 로 재생성
+======================================================================
+
+SYS@cdb1> create audit policy sel_top_pol
+  2    actions select on hr.employees, execute on hr.get_emp_cnt
+  3    only toplevel;
+
+Audit policy created.
+
+- (오류 -> 원인 -> 수정) 같은 이름으로 실수로 다시 생성
+SYS@cdb1> create audit policy sel_top_pol
+  2    actions select on hr.employees only toplevel;
+create audit policy sel_top_pol
+*
+ERROR at line 1:
+ORA-46358: Unified audit policy sel_top_pol already exists.
+
+- 원인: 방금 만든 정책이 이미 존재한다.
+- 수정: 그대로 활성화 단계로 진행한다.
+SYS@cdb1> audit policy sel_top_pol;
+
+Audit succeeded.
+
+======================================================================
+[4단계] 개선 효과 확인
+======================================================================
+
+SYS@cdb1> connect hr/Oracle_123@pdb1
+Connected.
+HR@cdb1> exec get_emp_cnt
+
+PL/SQL procedure successfully completed.
+
+HR@cdb1> connect sys/Oracle_123@pdb1 as sysdba
+Connected.
+SYS@cdb1> select action_name, object_name
+  2  from   unified_audit_trail
+  3  where  unified_audit_policies = 'SEL_TOP_POL'
+  4  order  by event_timestamp desc
+  5  fetch first 4 rows only;
+
+ACTION_NAME  OBJECT_NAME
+------------ -------------
+EXECUTE      GET_EMP_CNT
+
+- 관찰: 최상위 문장(EXECUTE)만 감사되고, 내부 SELECT 는 제외되었다.
+-   업무 행위 1건 = 레코드 1건으로, 감사 추적이 간결해졌다.
+
+======================================================================
+[정리]
+======================================================================
+- ONLY TOPLEVEL 은 생성 시 지정 속성 -> ALTER 로 추가 불가(재생성 필요).
+- 재생성 시 동일 이름은 ORA-46358 -> 이미 존재하므로 활성화로 진행.
+- 최상위 문장만 감사해 중첩 호출로 인한 중복 감사를 방지한다.
+- 정리
+SYS@cdb1> noaudit policy sel_top_pol;
+
+Noaudit succeeded.
+
+SYS@cdb1> drop audit policy sel_top_pol;
+
+Audit policy dropped.
+
+SYS@cdb1> connect hr/Oracle_123@pdb1
+Connected.
+HR@cdb1> drop procedure get_emp_cnt;
+
+Procedure dropped.
+
+HR@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$

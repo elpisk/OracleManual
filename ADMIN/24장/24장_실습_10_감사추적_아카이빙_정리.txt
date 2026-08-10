@@ -1,0 +1,147 @@
+-- 24장 실습_10: 감사 추적 아카이빙 및 정리 (DBMS_AUDIT_MGMT)
+-- 목표: 아카이브 기준선을 설정하고 기준선 이전만 정리한 뒤, 자동 정리 작업을 만든다.
+
+SYS@cdb1> show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+- 현재 통합 감사 추적 레코드 수 확인
+SYS@cdb1> select count(*) from unified_audit_trail;
+
+  COUNT(*)
+----------
+     18452
+
+======================================================================
+[1단계] (오류 -> 원인 -> 수정) 권한 없는 사용자가 정리 시도
+======================================================================
+
+- (실수) AUDIT_ADMIN 롤이 없는 계정으로 정리 프로시저 호출.
+SYS@cdb1> connect appadmin/Oracle_123@cdb1
+Connected.
+APPADMIN@cdb1> begin
+  2    dbms_audit_mgmt.clean_audit_trail(
+  3      audit_trail_type => dbms_audit_mgmt.audit_trail_unified,
+  4      use_last_arch_timestamp => false);
+  5  end;
+  6  /
+begin
+*
+ERROR at line 1:
+ORA-01031: insufficient privileges
+ORA-06512: at "SYS.DBMS_AUDIT_MGMT", line 271
+ORA-06512: at line 2
+
+- 원인: 감사 추적 관리에는 AUDIT_ADMIN 롤(또는 EXECUTE 권한)이 필요하다.
+- 수정: 감사 관리자(SYS 또는 AUDIT_ADMIN 보유 계정)로 다시 접속한다.
+APPADMIN@cdb1> connect sys/Oracle_123@cdb1 as sysdba
+Connected.
+
+======================================================================
+[2단계] 아카이브 기준선(Last Archive Timestamp) 설정
+======================================================================
+
+- '이 시점 이전 데이터는 이미 외부로 아카이브했다'는 기준선을 설정한다.
+- 여기서는 30일 이전을 기준선으로 지정.
+SYS@cdb1> begin
+  2    dbms_audit_mgmt.set_last_archive_timestamp(
+  3      audit_trail_type  => dbms_audit_mgmt.audit_trail_unified,
+  4      last_archive_time => systimestamp - interval '30' day);
+  5  end;
+  6  /
+
+PL/SQL procedure successfully completed.
+
+- 설정된 기준선 확인
+SYS@cdb1> select audit_trail, last_archive_ts
+  2  from   dba_audit_mgmt_last_arch_ts;
+
+AUDIT_TRAIL         LAST_ARCHIVE_TS
+------------------- ---------------------------------
+UNIFIED AUDIT TRAIL 12-JUL-26 03.00.00.000000 AM +00:00
+
+======================================================================
+[3단계] 기준선 이전 레코드만 정리 (안전한 Purge)
+======================================================================
+
+- use_last_arch_timestamp => TRUE 이면 기준선 이전 레코드만 삭제된다.
+SYS@cdb1> begin
+  2    dbms_audit_mgmt.clean_audit_trail(
+  3      audit_trail_type        => dbms_audit_mgmt.audit_trail_unified,
+  4      use_last_arch_timestamp => true);
+  5  end;
+  6  /
+
+PL/SQL procedure successfully completed.
+
+- 정리 후 레코드 수 확인 (30일 이전 데이터가 삭제되어 감소)
+SYS@cdb1> select count(*) from unified_audit_trail;
+
+  COUNT(*)
+----------
+      6231
+
+======================================================================
+[4단계] 자동 정리 작업(Purge Job) 생성
+======================================================================
+
+- (오류 -> 원인 -> 수정) 이미 있는 이름으로 작업 생성 시도
+SYS@cdb1> begin
+  2    dbms_audit_mgmt.create_purge_job(
+  3      audit_trail_type           => dbms_audit_mgmt.audit_trail_unified,
+  4      audit_trail_purge_interval => 24,
+  5      audit_trail_purge_name     => 'UNIFIED_PURGE_JOB',
+  6      use_last_arch_timestamp    => true);
+  7  end;
+  8  /
+begin
+*
+ERROR at line 1:
+ORA-46255: The audit trail purge job UNIFIED_PURGE_JOB already exists.
+ORA-06512: at "SYS.DBMS_AUDIT_MGMT", line 1653
+ORA-06512: at line 2
+
+- 원인: 동일 이름의 정리 작업이 이미 존재한다(이전에 만들어 둠).
+- 수정: 기존 작업을 제거한 뒤 다시 생성하거나, 주기만 변경한다. 여기서는 재생성.
+SYS@cdb1> exec dbms_audit_mgmt.drop_purge_job('UNIFIED_PURGE_JOB');
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> begin
+  2    dbms_audit_mgmt.create_purge_job(
+  3      audit_trail_type           => dbms_audit_mgmt.audit_trail_unified,
+  4      audit_trail_purge_interval => 24,
+  5      audit_trail_purge_name     => 'UNIFIED_PURGE_JOB',
+  6      use_last_arch_timestamp    => true);
+  7  end;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+- 생성된 정리 작업 확인
+SYS@cdb1> select job_name, job_status, job_frequency
+  2  from   dba_audit_mgmt_cleanup_jobs
+  3  where  job_name = 'UNIFIED_PURGE_JOB';
+
+JOB_NAME           JOB_STATUS  JOB_FREQUENCY
+------------------ ----------- -------------
+UNIFIED_PURGE_JOB  ENABLED     24
+
+======================================================================
+[정리]
+======================================================================
+- 정리 순서: SET_LAST_ARCHIVE_TIMESTAMP(기준선) -> CLEAN_AUDIT_TRAIL(use_last_arch_timestamp=TRUE).
+- 권한 부족은 ORA-01031 -> AUDIT_ADMIN 롤 필요.
+- 동일 이름 정리 작업 재생성은 ORA-46255 -> DROP_PURGE_JOB 후 재생성.
+- 보존 기간/정리 주기는 규정에 맞춰 문서화하고 CREATE_PURGE_JOB 으로 자동화한다.
+- 정리(실습 작업 제거)
+SYS@cdb1> exec dbms_audit_mgmt.drop_purge_job('UNIFIED_PURGE_JOB');
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> exit
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+[oracle@dbsvr ~]$
