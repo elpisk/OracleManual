@@ -1,0 +1,188 @@
+================================================================================
+ 32장 실습 07 — 서비스(Services) 모니터링
+ 목표: 서비스를 워크로드 관리 단위로 이해한다. V$SERVICES 로 서비스를 확인하고,
+       V$SERVICEMETRIC 로 서비스별 성능 메트릭을, V$SERV_MOD_ACT_STATS 로
+       서비스·모듈·액션별 통계를 조회한다. 서비스별 성능 임계값도 설정한다.
+ 환경: CDB=cdb1 (루트 컨테이너에서 SYS로 수행)
+================================================================================
+
+-- [1] 현재 데이터베이스에 정의된 서비스를 V$SERVICES 로 확인한다.
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> COLUMN name         FORMAT A16
+SYS@cdb1> COLUMN network_name FORMAT A16
+SYS@cdb1> SELECT name, network_name, creation_date
+  2       FROM  v$services
+  3      ORDER BY name;
+
+NAME             NETWORK_NAME     CREATION_
+---------------- ---------------- ---------
+SYS$BACKGROUND                    01-JAN-19
+SYS$USERS                         01-JAN-19
+cdb1             cdb1             15-MAR-24
+cdb1XDB          cdb1XDB          15-MAR-24
+
+-- 기본 서비스 외에, 애플리케이션 워크로드용 서비스를 하나 만들어 실습한다.
+
+--------------------------------------------------------------------------------
+-- [2] 테스트용 서비스(sales_svc)를 생성·시작한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_SERVICE.CREATE_SERVICE(
+  3           service_name => 'sales_svc',
+  4           network_name => 'sales_svc');
+  5       END;
+  6       /
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> EXEC DBMS_SERVICE.START_SERVICE('sales_svc');
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> SELECT name, network_name FROM v$services WHERE name = 'sales_svc';
+
+NAME             NETWORK_NAME
+---------------- ----------------
+sales_svc        sales_svc
+
+--------------------------------------------------------------------------------
+-- [3] 서비스별 성능 메트릭을 V$SERVICEMETRIC 로 조회한다.
+--     서비스별 CPU 시간·DB 시간·호출 수 등을 최근 구간 단위로 보여 준다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN service_name FORMAT A14
+SYS@cdb1> SELECT service_name, intsize_csec, callspersec, dbtimepercall, cpupercall
+  2       FROM  v$servicemetric
+  3      WHERE  service_name IN ('cdb1','sales_svc')
+  4      ORDER BY service_name, intsize_csec;
+
+SERVICE_NAME   INTSIZE_CSEC CALLSPERSEC DBTIMEPERCALL CPUPERCALL
+-------------- ------------ ----------- ------------- ----------
+cdb1                   1500        12.4        8234.5     3120.0
+cdb1                   6000        10.1        7980.2     3005.4
+sales_svc              1500         0.0           0.0        0.0
+sales_svc              6000         0.0           0.0        0.0
+
+-- DBTIMEPERCALL/CPUPERCALL 은 마이크로초 단위. sales_svc 는 아직 부하가 없어 0 이다.
+
+--------------------------------------------------------------------------------
+-- [4] 서비스·모듈·액션 조합별 통계는 V$SERV_MOD_ACT_STATS 로 본다.
+--     애플리케이션이 DBMS_APPLICATION_INFO 로 MODULE/ACTION 을 설정해야 분해된다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN module FORMAT A14
+SYS@cdb1> COLUMN stat_name FORMAT A24
+SYS@cdb1> SELECT service_name, module, stat_name, value
+  2       FROM  v$serv_mod_act_stats
+  3      WHERE  service_name = 'cdb1'
+  4        AND  stat_name IN ('DB time','user calls')
+  5      FETCH FIRST 5 ROWS ONLY;
+
+SERVICE_NAME   MODULE         STAT_NAME                     VALUE
+-------------- -------------- ------------------------ ----------
+cdb1           SQL*Plus       DB time                     882301
+cdb1           SQL*Plus       user calls                    9820
+
+-- 같은 서비스 안에서도 모듈 단위로 성능을 추적할 수 있다.
+
+--------------------------------------------------------------------------------
+-- [5] 서비스별 성능 임계값을 설정한다: 호출당 경과 시간(ELAPSED_TIME_PER_CALL).
+--     object_type 을 서비스로, object_name 을 서비스 이름으로 지정한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_SERVER_ALERT.SET_THRESHOLD(
+  3           metrics_id        => DBMS_SERVER_ALERT.ELAPSED_TIME_PER_CALL,
+  4           warning_operator  => DBMS_SERVER_ALERT.OPERATOR_GE,
+  5           warning_value     => '500000',      -- 0.5초(마이크로초 단위)
+  6           critical_operator => DBMS_SERVER_ALERT.OPERATOR_GE,
+  7           critical_value    => '1000000',     -- 1초
+  8           observation_period      => 1,
+  9           consecutive_occurrences => 2,
+ 10           instance_name     => NULL,
+ 11           object_type       => DBMS_SERVER_ALERT.OBJECT_TYPE_SERVICE,
+ 12           object_name       => 'sales_svc');
+ 13       END;
+ 14       /
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> -- 설정을 DBA_THRESHOLDS 로 확인한다.
+SYS@cdb1> COLUMN metrics_name FORMAT A28
+SYS@cdb1> SELECT metrics_name, warning_value, critical_value, object_name
+  2       FROM  dba_thresholds
+  3      WHERE  object_name = 'sales_svc';
+
+METRICS_NAME                 WARNING_VALUE CRITICAL_VALUE OBJECT_NAME
+---------------------------- ------------- -------------- -----------
+Service Response Time Per Call 500000        1000000        sales_svc
+
+--------------------------------------------------------------------------------
+-- [6] (오류 → 원인 → 수정)
+--     object_type 을 서비스가 아니라 테이블스페이스로 잘못 지정해
+--     서비스 이름을 넘기면 대상 불일치로 ORA-13859 가 발생한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_SERVER_ALERT.SET_THRESHOLD(
+  3           metrics_id        => DBMS_SERVER_ALERT.ELAPSED_TIME_PER_CALL,
+  4           warning_operator  => DBMS_SERVER_ALERT.OPERATOR_GE,
+  5           warning_value     => '500000',
+  6           critical_operator => DBMS_SERVER_ALERT.OPERATOR_GE,
+  7           critical_value    => '1000000',
+  8           observation_period=>1, consecutive_occurrences=>2,
+  9           instance_name=>NULL,
+ 10           object_type=>DBMS_SERVER_ALERT.OBJECT_TYPE_TABLESPACE,  -- 잘못된 대상
+ 11           object_name=>'sales_svc');
+ 12       END;
+ 13       /
+BEGIN
+*
+ERROR at line 1:
+ORA-13859: Action cannot be specified with warning or critical values
+ORA-06512: at "SYS.DBMS_SERVER_ALERT", line ...
+
+SYS@cdb1> -- 원인 파악: ELAPSED_TIME_PER_CALL 메트릭은 서비스(OBJECT_TYPE_SERVICE)에만
+SYS@cdb1> -- 적용 가능한데, 대상 유형을 테이블스페이스로 지정해 메트릭-대상이 어긋났다.
+SYS@cdb1> -- 수정: object_type 을 OBJECT_TYPE_SERVICE 로 지정한다([5]가 올바른 형태).
+SYS@cdb1> -- ([5]에서 이미 정상 설정을 마쳤으므로 여기서는 재확인만 한다)
+SYS@cdb1> SELECT COUNT(*) FROM dba_thresholds WHERE object_name = 'sales_svc';
+
+  COUNT(*)
+----------
+         1
+
+--------------------------------------------------------------------------------
+-- [7] 정리: 임계값과 테스트 서비스를 제거한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_SERVER_ALERT.SET_THRESHOLD(
+  3           metrics_id        => DBMS_SERVER_ALERT.ELAPSED_TIME_PER_CALL,
+  4           warning_operator  => DBMS_SERVER_ALERT.OPERATOR_GE,
+  5           warning_value     => NULL,
+  6           critical_operator => DBMS_SERVER_ALERT.OPERATOR_GE,
+  7           critical_value    => NULL,
+  8           observation_period=>1, consecutive_occurrences=>2,
+  9           instance_name=>NULL,
+ 10           object_type=>DBMS_SERVER_ALERT.OBJECT_TYPE_SERVICE,
+ 11           object_name=>'sales_svc');
+ 12       END;
+ 13       /
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> EXEC DBMS_SERVICE.STOP_SERVICE('sales_svc');
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> EXEC DBMS_SERVICE.DELETE_SERVICE('sales_svc');
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 서비스는 워크로드 관리 단위 — V$SERVICES 로 정의·상태를 확인한다.
+-- 2) 서비스별 성능은 V$SERVICEMETRIC, 모듈·액션 분해는 V$SERV_MOD_ACT_STATS.
+-- 3) 서비스별 임계값은 SET_THRESHOLD 에 OBJECT_TYPE_SERVICE 로 설정한다.
+-- 4) 메트릭과 대상 유형이 맞아야 한다 — ELAPSED_TIME_PER_CALL 은 서비스 전용이다.
+
+SYS@cdb1> EXIT
+================================================================================

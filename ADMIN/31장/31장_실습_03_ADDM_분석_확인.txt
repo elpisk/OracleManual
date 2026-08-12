@@ -1,0 +1,132 @@
+================================================================================
+ 31장 실습 03 — ADDM 분석 확인
+ 목표: DBMS_ADDM.ANALYZE_DB 로 두 스냅샷 구간의 ADDM 태스크를 실행하고,
+       GET_REPORT 와 DBA_ADDM_FINDINGS 로 발견 사항을 조회한다.
+ 환경: CDB=cdb1 (루트 컨테이너에서 수행)
+================================================================================
+
+-- [1] 분석 대상으로 삼을 스냅샷 범위를 먼저 확인한다.
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> SET LINESIZE 200
+SYS@cdb1> ALTER SESSION SET nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+Session altered.
+
+SYS@cdb1> SELECT snap_id, end_interval_time
+  2       FROM  dba_hist_snapshot
+  3      ORDER BY snap_id DESC FETCH FIRST 4 ROWS ONLY;
+
+   SNAP_ID END_INTERVAL_TIME
+---------- --------------------
+       121 2026-07-22 15:00:00
+       120 2026-07-22 14:00:00
+       119 2026-07-22 13:00:00
+       118 2026-07-22 12:00:00
+
+--------------------------------------------------------------------------------
+-- [2] (오류 → 원인 → 수정)
+--     존재하지 않는 스냅샷 ID(999~1000)를 지정해 ADDM 태스크를 실행한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> VAR tname VARCHAR2(60)
+SYS@cdb1> BEGIN
+  2         :tname := 'ADDM_BAD';
+  3         DBMS_ADDM.ANALYZE_DB(
+  4           task_name      => :tname,
+  5           begin_snapshot => 999,
+  6           end_snapshot   => 1000);
+  7       END;
+  8       /
+BEGIN
+*
+ERROR at line 1:
+ORA-13509: error encountered during updates to a AWR table
+ORA-13519: invalid value for begin snapshot id: "999"
+ORA-06512: at "SYS.PRVT_ADVISOR", line 3195
+ORA-06512: at "SYS.DBMS_ADDM", line 176
+ORA-06512: at line 4
+
+SYS@cdb1> -- 원인 파악: begin_snapshot=999 는 실제 존재하지 않는 SNAP_ID 다.
+SYS@cdb1> --   ADDM 은 두 SNAP_ID 사이의 AWR 데이터를 입력으로 삼는데 그 데이터가 없다.
+SYS@cdb1> SELECT MIN(snap_id) min_id, MAX(snap_id) max_id FROM dba_hist_snapshot;
+
+    MIN_ID     MAX_ID
+---------- ----------
+        98        121
+
+SYS@cdb1> -- 수정: 실제 존재하는 연속 구간(120~121)을 지정한다. begin < end 여야 한다.
+SYS@cdb1> BEGIN
+  2         :tname := 'ADDM_120_121';
+  3         DBMS_ADDM.ANALYZE_DB(
+  4           task_name      => :tname,
+  5           begin_snapshot => 120,
+  6           end_snapshot   => 121);
+  7       END;
+  8       /
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [3] ADDM 결과 리포트를 텍스트로 조회한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> SET LONG 1000000 PAGESIZE 0 LONGCHUNKSIZE 1000
+SYS@cdb1> SELECT DBMS_ADDM.GET_REPORT(:tname) FROM dual;
+
+          ADDM Report for Task 'ADDM_120_121'
+          -------------------------------------
+
+Analysis Period
+---------------
+AWR snapshot range from 120 to 121.
+Time period starts at 22-JUL-26 02.00.00 PM
+Time period ends   at 22-JUL-26 03.00.00 PM
+
+Analysis Target
+---------------
+Database 'CDB1' with DB ID 1523497011.
+Database version 19.0.0.0.0.
+
+Activity During the Analysis Period
+-----------------------------------
+Total database time was 1284 seconds.
+The average number of active sessions was .36.
+
+Summary of Findings
+-------------------
+   Description                        Active Sessions      Recommendations
+                                      Percent of Activity
+   ---------------------------------  -------------------  ---------------
+1  Top SQL Statements                 62.4 | .22           1
+2  "User I/O" wait Class              18.1 | .06           1
+3  Undersized Buffer Cache            10.7 | .04           2
+...
+   (리포트 하단에 각 Finding 의 Recommendation·Rationale 이 이어짐)
+
+--------------------------------------------------------------------------------
+-- [4] 발견 사항을 딕셔너리 뷰로 영향도(impact) 순 조회한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN message FORMAT A54
+SYS@cdb1> SELECT type, ROUND(impact,1) AS impact, message
+  2       FROM  dba_addm_findings
+  3      WHERE task_name = 'ADDM_120_121'
+  4      ORDER BY impact DESC;
+
+TYPE            IMPACT MESSAGE
+------------ --------- ------------------------------------------------------
+PROBLEM         62.4   SQL statements consuming significant database time.
+PROBLEM         18.1   Wait class "User I/O" is consuming significant DB time.
+PROBLEM         10.7   The buffer cache was undersized.
+
+-- 영향도가 가장 큰 'Top SQL'(62.4%)부터 조치하는 것이 우선순위 원칙이다.
+-- ADDM 은 대개 이 SQL 에 대해 SQL Tuning Advisor 실행을 권고한다(→ 실습 05 연결).
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) ADDM 은 AWR 스냅샷 두 개를 입력으로 DB Time 을 가장 많이 소비한 원인을 진단한다.
+-- 2) 실행: DBMS_ADDM.ANALYZE_DB(task_name, begin_snapshot, end_snapshot).
+-- 3) 조회: DBMS_ADDM.GET_REPORT(텍스트) 또는 DBA_ADDM_FINDINGS(뷰, impact 순).
+-- 4) 존재하지 않는 SNAP_ID 를 지정하면 ORA-13519/13509 → 실제 범위를 먼저 확인한다.
+
+SYS@cdb1> EXIT
+================================================================================

@@ -1,0 +1,145 @@
+================================================================================
+ 32장 실습 08 — 세션·시스템 통계 정보 조회(V$SESSTAT / V$STATNAME / V$SYSSTAT)
+ 목표: V$SESSTAT(세션별 값) + V$STATNAME(이름) + V$SESSION(세션 정보)의
+       3자 조인으로 "어떤 세션이 논리적 읽기·하드 파싱을 가장 많이 유발하는가"를
+       특정한다. V$SYSSTAT 와의 관계도 확인한다.
+ 환경: CDB=cdb1 (루트 컨테이너에서 SYS로 수행)
+================================================================================
+
+-- [1] V$SESSTAT 은 세션별 통계를 담되 이름 대신 통계 번호(STATISTIC#)만 갖는다.
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> SELECT sid, statistic#, value
+  2       FROM  v$sesstat
+  3      WHERE  sid = 142
+  4      FETCH FIRST 3 ROWS ONLY;
+
+       SID STATISTIC#      VALUE
+---------- ---------- ----------
+       142          0          0
+       142          1          5
+       142          2      33221
+
+-- 번호만으로는 의미를 알 수 없다. 사람이 읽을 이름은 V$STATNAME 에서 얻는다.
+
+--------------------------------------------------------------------------------
+-- [2] V$STATNAME 은 통계 번호와 이름을 매핑하는 사전이다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN name FORMAT A26
+SYS@cdb1> SELECT statistic#, name
+  2       FROM  v$statname
+  3      WHERE  name IN ('session logical reads','physical reads',
+  4                      'parse count (hard)')
+  5      ORDER BY statistic#;
+
+STATISTIC# NAME
+---------- --------------------------
+        12 session logical reads
+        18 physical reads
+       334 parse count (hard)
+
+--------------------------------------------------------------------------------
+-- [3] (오류 → 원인 → 수정)
+--     통계 이름과 값을 한 번에 보려고 V$SESSTAT 에서 바로 name 을 참조한다.
+--     그러나 V$SESSTAT 에는 NAME 컬럼이 없다(STATISTIC# 만 있다).
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT sid, name, value
+  2       FROM  v$sesstat
+  3      WHERE  sid = 142
+  4        AND  name = 'session logical reads';
+       SELECT sid, name, value
+                   *
+ERROR at line 1:
+ORA-00904: "NAME": invalid identifier
+
+SYS@cdb1> -- 원인 파악: V$SESSTAT 은 값만, 이름은 V$STATNAME 에 있다.
+SYS@cdb1> -- 두 뷰를 STATISTIC# 로 조인해야 이름으로 필터링할 수 있다.
+SYS@cdb1> -- 수정: V$SESSTAT 와 V$STATNAME 을 STATISTIC# 로 조인한다.
+SYS@cdb1> SELECT st.sid, n.name, st.value
+  2       FROM  v$sesstat st
+  3       JOIN  v$statname n ON n.statistic# = st.statistic#
+  4      WHERE  st.sid = 142
+  5        AND  n.name = 'session logical reads';
+
+       SID NAME                        VALUE
+---------- -------------------------- ----------
+       142 session logical reads          33221
+
+--------------------------------------------------------------------------------
+-- [4] 3자 조인의 정석: V$SESSTAT + V$STATNAME + V$SESSION 으로
+--     "논리적 읽기를 가장 많이 유발한 세션 TOP 5"를 찾는다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN username FORMAT A10
+SYS@cdb1> COLUMN name     FORMAT A22
+SYS@cdb1> SELECT s.sid, s.username, st.value AS logical_reads
+  2       FROM  v$sesstat st
+  3       JOIN  v$statname n ON n.statistic# = st.statistic#
+  4       JOIN  v$session  s ON s.sid = st.sid
+  5      WHERE  n.name = 'session logical reads'
+  6        AND  s.type = 'USER'
+  7      ORDER BY st.value DESC
+  8      FETCH FIRST 5 ROWS ONLY;
+
+       SID USERNAME   LOGICAL_READS
+---------- ---------- -------------
+       142 SCOTT             33221
+        87 HR                18740
+        55 APPUSER            9210
+       201 BATCH              4102
+        33 WEB                1880
+
+-- 세션 단위로 작업량(논리적 읽기)이 큰 세션을 즉시 특정할 수 있다.
+
+--------------------------------------------------------------------------------
+-- [5] 하드 파싱을 많이 일으키는 세션도 같은 패턴으로 찾는다(공유 풀 효율 진단).
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT s.sid, s.username, st.value AS hard_parses
+  2       FROM  v$sesstat st
+  3       JOIN  v$statname n ON n.statistic# = st.statistic#
+  4       JOIN  v$session  s ON s.sid = st.sid
+  5      WHERE  n.name = 'parse count (hard)'
+  6        AND  s.type = 'USER'
+  7        AND  st.value > 0
+  8      ORDER BY st.value DESC
+  9      FETCH FIRST 5 ROWS ONLY;
+
+       SID USERNAME   HARD_PARSES
+---------- ---------- -----------
+       201 BATCH             4820
+       142 SCOTT              310
+        87 HR                  95
+
+-- BATCH 세션의 하드 파싱이 유독 많다 → 바인드 변수 미사용 가능성을 의심한다.
+
+--------------------------------------------------------------------------------
+-- [6] 세션별 값의 합은 시스템 전체 값(V$SYSSTAT)과 개념적으로 대응한다.
+--     같은 통계를 두 층위에서 비교해 본다.
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT 'V$SYSSTAT' AS src, value
+  2       FROM  v$sysstat
+  3      WHERE  name = 'session logical reads'
+  4      UNION ALL
+  5      SELECT 'SUM(V$SESSTAT)',
+  6             SUM(st.value)
+  7       FROM  v$sesstat st
+  8       JOIN  v$statname n ON n.statistic# = st.statistic#
+  9      WHERE  n.name = 'session logical reads';
+
+SRC                 VALUE
+-------------- ----------
+V$SYSSTAT        12904812
+SUM(V$SESSTAT)   12903990
+
+-- 두 값이 근접한다(종료된 세션의 몫 등으로 미세 차이는 있을 수 있다).
+-- V$SESSTAT 은 V$SYSSTAT 을 세션 단위로 분해한 것임을 확인한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) V$SESSTAT 은 세션별 값(STATISTIC# 기준), V$STATNAME 은 번호→이름 사전이다.
+-- 2) V$SESSTAT 에는 NAME 컬럼이 없다 — 이름 필터는 V$STATNAME 조인이 필요하다.
+-- 3) V$SESSTAT + V$STATNAME + V$SESSION 3자 조인이 세션별 통계 분석의 정석이다.
+-- 4) 세션별 값의 합은 V$SYSSTAT(시스템 전체)과 대응한다.
+
+SYS@cdb1> EXIT
+================================================================================

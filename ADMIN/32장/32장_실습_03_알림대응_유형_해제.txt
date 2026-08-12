@@ -1,0 +1,185 @@
+================================================================================
+ 32장 실습 03 — 알림 발생 시 대응 및 알림 유형/해제
+ 목표: 상태 기반(stateful)·상태 없는(stateless) 알림을 구분하고,
+       DBA_OUTSTANDING_ALERTS(미해결)와 DBA_ALERT_HISTORY(이력)로
+       알림을 조회한다. 임계값을 낮춰 테이블스페이스 알림을 인위적으로
+       발생시키고, 원인을 해소해 자동 해제(self-clearing)되는 과정을 확인한다.
+ 환경: CDB=cdb1 (루트 컨테이너에서 SYS로 수행)
+================================================================================
+
+-- [1] 현재 미해결 상태로 남아 있는 알림을 먼저 조회한다.
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> COLUMN reason        FORMAT A38
+SYS@cdb1> COLUMN object_name   FORMAT A12
+SYS@cdb1> COLUMN object_type   FORMAT A10
+SYS@cdb1> SELECT object_type, object_name, reason, message_level
+  2       FROM  dba_outstanding_alerts
+  3      ORDER BY object_type;
+
+no rows selected
+
+-- 현재 미해결 알림이 없다. 이제 알림을 하나 인위적으로 발생시켜 본다.
+
+--------------------------------------------------------------------------------
+-- [2] 테스트용 테이블스페이스(SMALLTBS)를 작게 만들고 데이터를 채워
+--     사용률이 높아지도록 준비한다. (사전 정의 알림 = 테이블스페이스 사용률)
+--------------------------------------------------------------------------------
+SYS@cdb1> CREATE TABLESPACE smalltbs
+  2         DATAFILE '/u01/app/oracle/oradata/CDB1/smalltbs01.dbf'
+  3         SIZE 10M AUTOEXTEND OFF;
+
+Tablespace created.
+
+--------------------------------------------------------------------------------
+-- [3] 이 테이블스페이스만 경고 60%, 위험 80% 로 낮춰 감시하도록 임계값을 지정한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_SERVER_ALERT.SET_THRESHOLD(
+  3           metrics_id        => DBMS_SERVER_ALERT.TABLESPACE_PCT_FULL,
+  4           warning_operator  => DBMS_SERVER_ALERT.OPERATOR_GE,
+  5           warning_value     => '60',
+  6           critical_operator => DBMS_SERVER_ALERT.OPERATOR_GE,
+  7           critical_value    => '80',
+  8           observation_period      => 1,
+  9           consecutive_occurrences => 1,
+ 10           instance_name     => NULL,
+ 11           object_type       => DBMS_SERVER_ALERT.OBJECT_TYPE_TABLESPACE,
+ 12           object_name       => 'SMALLTBS');
+ 13       END;
+ 14       /
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [4] 데이터를 넣어 사용률을 임계값 위로 끌어올린다.
+--------------------------------------------------------------------------------
+SYS@cdb1> CREATE TABLE system.fill_t (c CHAR(2000)) TABLESPACE smalltbs;
+
+Table created.
+
+SYS@cdb1> BEGIN
+  2         FOR i IN 1..4000 LOOP
+  3           INSERT INTO system.fill_t VALUES ('x');
+  4         END LOOP;
+  5         COMMIT;
+  6       END;
+  7       /
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> -- 사용률을 직접 확인한다.
+SYS@cdb1> SELECT ROUND((used.bytes/tot.bytes)*100) AS pct_used
+  2       FROM  (SELECT SUM(bytes) bytes FROM dba_data_files
+  3               WHERE tablespace_name='SMALLTBS') tot,
+  4             (SELECT SUM(bytes) bytes FROM dba_segments
+  5               WHERE tablespace_name='SMALLTBS') used;
+
+  PCT_USED
+----------
+        86
+
+-- 사용률이 86% 이므로 경고(60%)와 위험(80%)을 모두 넘겼다.
+
+--------------------------------------------------------------------------------
+-- [5] MMON이 메트릭을 평가하고 알림을 큐에 등록할 시간을 준 뒤 미해결 알림을 조회한다.
+--     (MMON은 보통 수십 초~1분 주기로 사용률을 평가한다)
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT object_name, reason, message_level
+  2       FROM  dba_outstanding_alerts
+  3      WHERE  object_name = 'SMALLTBS';
+
+OBJECT_NAME  REASON                                 MESSAGE_LEVEL
+------------ -------------------------------------- -------------
+SMALLTBS     Tablespace [SMALLTBS] is [86 percent]           1
+                                                    full
+
+-- MESSAGE_LEVEL=1 은 위험(Critical) 수준을 뜻한다(값이 작을수록 심각).
+
+--------------------------------------------------------------------------------
+-- [6] (오류 → 원인 → 수정)
+--     "해제되었을 이력을 보겠다"며 뷰 이름을 착각해 DBA_ALERT_HISTORY 를
+--     DBA_ALERTS_HISTORY 로 잘못 입력한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT object_name, reason, resolution
+  2       FROM  dba_alerts_history
+  3      WHERE  object_name = 'SMALLTBS';
+       FROM  dba_alerts_history
+             *
+ERROR at line 2:
+ORA-00942: table or view does not exist
+
+SYS@cdb1> -- 원인 파악: 뷰 이름 오타다. 올바른 이름은 DBA_ALERT_HISTORY(ALERT 단수)다.
+SYS@cdb1> -- 수정: 정확한 뷰 이름으로 다시 조회한다.
+SYS@cdb1> COLUMN resolution FORMAT A22
+SYS@cdb1> SELECT object_name, reason, resolution
+  2       FROM  dba_alert_history
+  3      WHERE  object_name = 'SMALLTBS';
+
+no rows selected
+
+-- 아직 알림이 해제되지 않았으므로 이력에는 나타나지 않는다(미해결은 OUTSTANDING 에만 존재).
+
+--------------------------------------------------------------------------------
+-- [7] 원인을 해소한다: 데이터를 삭제해 사용률을 임계값 아래로 낮춘다.
+--     상태 기반 알림이므로 조건이 풀리면 데이터베이스가 스스로 알림을 해제한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> DROP TABLE system.fill_t PURGE;
+
+Table dropped.
+
+SYS@cdb1> -- MMON이 다시 평가할 때까지 잠시 기다린 뒤 미해결 알림을 확인한다.
+SYS@cdb1> SELECT object_name, reason
+  2       FROM  dba_outstanding_alerts
+  3      WHERE  object_name = 'SMALLTBS';
+
+no rows selected
+
+-- 미해결 목록에서 사라졌다. 자동 해제(self-clearing)가 일어난 것이다.
+
+SYS@cdb1> -- 해제된 알림은 이력(DBA_ALERT_HISTORY)으로 옮겨진다.
+SYS@cdb1> SELECT object_name, reason, resolution
+  2       FROM  dba_alert_history
+  3      WHERE  object_name = 'SMALLTBS';
+
+OBJECT_NAME  REASON                                 RESOLUTION
+------------ -------------------------------------- ----------------------
+SMALLTBS     Tablespace [SMALLTBS] is [86 percent]  cleared
+             full
+
+-- RESOLUTION=cleared: 조건이 해소되어 알림이 자동으로 정리되었음을 보여 준다.
+
+--------------------------------------------------------------------------------
+-- [8] 정리: 테스트용 임계값과 테이블스페이스를 제거한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_SERVER_ALERT.SET_THRESHOLD(
+  3           metrics_id        => DBMS_SERVER_ALERT.TABLESPACE_PCT_FULL,
+  4           warning_operator  => DBMS_SERVER_ALERT.OPERATOR_GE,
+  5           warning_value     => NULL,
+  6           critical_operator => DBMS_SERVER_ALERT.OPERATOR_GE,
+  7           critical_value    => NULL,
+  8           observation_period=>1, consecutive_occurrences=>1,
+  9           instance_name=>NULL,
+ 10           object_type=>DBMS_SERVER_ALERT.OBJECT_TYPE_TABLESPACE,
+ 11           object_name=>'SMALLTBS');
+ 12       END;
+ 13       /
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> DROP TABLESPACE smalltbs INCLUDING CONTENTS AND DATAFILES;
+
+Tablespace dropped.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 미해결(살아 있는) 알림은 DBA_OUTSTANDING_ALERTS, 이력은 DBA_ALERT_HISTORY.
+--    (뷰 이름은 ALERT 단수 — DBA_ALERTS_HISTORY 는 존재하지 않는다: ORA-00942)
+-- 2) 테이블스페이스 사용률은 상태 기반(stateful) 알림이라 원인 해소 시 자동 해제된다.
+-- 3) MESSAGE_LEVEL 은 값이 작을수록 심각하다(위험=1 부근, 경고는 더 큰 값).
+-- 4) 해제된 알림은 RESOLUTION='cleared' 로 이력에 남는다.
+
+SYS@cdb1> EXIT
+================================================================================

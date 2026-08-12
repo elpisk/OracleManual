@@ -1,0 +1,162 @@
+================================================================================
+ 32장 실습 05 — 대기 이벤트(Wait Events) 모니터링
+ 목표: 대기 이벤트와 대기 클래스의 관계를 이해한다.
+       V$EVENT_NAME(카탈로그), V$SYSTEM_EVENT(인스턴스 누적),
+       V$SESSION_WAIT/V$SESSION(실시간), V$SYSTEM_WAIT_CLASS(클래스 집계)로
+       "무엇을 기다리는가"를 층위별로 조회한다. Idle 클래스는 제외한다.
+ 환경: CDB=cdb1 (루트 컨테이너에서 SYS로 수행)
+================================================================================
+
+-- [1] 대기 이벤트 카탈로그(V$EVENT_NAME)에서 대표 이벤트의 소속 클래스를 확인한다.
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> COLUMN name       FORMAT A28
+SYS@cdb1> COLUMN wait_class FORMAT A14
+SYS@cdb1> SELECT name, wait_class
+  2       FROM  v$event_name
+  3      WHERE  name IN ('db file sequential read',
+  4                      'db file scattered read',
+  5                      'log file sync',
+  6                      'enq: TX - row lock contention',
+  7                      'SQL*Net message from client')
+  8      ORDER BY wait_class, name;
+
+NAME                         WAIT_CLASS
+---------------------------- --------------
+enq: TX - row lock contention Application
+log file sync                Commit
+db file scattered read       User I/O
+db file sequential read      User I/O
+SQL*Net message from client  Idle
+
+-- 'SQL*Net message from client' 는 Idle 클래스임에 주목한다(병목 아님).
+
+--------------------------------------------------------------------------------
+-- [2] db file sequential read 의 대기 파라미터(P1/P2/P3) 의미를 확인한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN parameter1 FORMAT A10
+SYS@cdb1> COLUMN parameter2 FORMAT A10
+SYS@cdb1> COLUMN parameter3 FORMAT A10
+SYS@cdb1> SELECT parameter1, parameter2, parameter3
+  2       FROM  v$event_name
+  3      WHERE  name = 'db file sequential read';
+
+PARAMETER1 PARAMETER2 PARAMETER3
+---------- ---------- ----------
+file#      block#     blocks
+
+-- P1=파일 번호, P2=블록 번호. 이 값을 역추적하면 어떤 세그먼트의 I/O인지 특정된다.
+
+--------------------------------------------------------------------------------
+-- [3] 인스턴스 전체 관점: V$SYSTEM_EVENT 로 누적 대기가 큰 이벤트를 본다.
+--     반드시 Idle 클래스를 제외하고 실제 자원 대기만 본다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN event      FORMAT A30
+SYS@cdb1> COLUMN wait_class FORMAT A12
+SYS@cdb1> SELECT event, wait_class, total_waits, time_waited
+  2       FROM  v$system_event
+  3      WHERE  wait_class <> 'Idle'
+  4      ORDER BY time_waited DESC
+  5      FETCH FIRST 5 ROWS ONLY;
+
+EVENT                          WAIT_CLASS   TOTAL_WAITS TIME_WAITED
+------------------------------ ------------ ----------- -----------
+db file sequential read        User I/O          884213      412770
+log file parallel write        System I/O        152004       98330
+db file scattered read         User I/O          201553       76540
+log file sync                  Commit             34980       41220
+control file sequential read   System I/O        512044       18110
+
+-- TIME_WAITED 는 1/100초 단위. User I/O(단일 블록 읽기)가 대기 시간을 지배한다.
+
+--------------------------------------------------------------------------------
+-- [4] 큰 그림은 대기 클래스 집계로 잡는다: V$SYSTEM_WAIT_CLASS.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN wait_class FORMAT A16
+SYS@cdb1> SELECT wait_class, total_waits, time_waited
+  2       FROM  v$system_wait_class
+  3      WHERE  wait_class <> 'Idle'
+  4      ORDER BY time_waited DESC;
+
+WAIT_CLASS       TOTAL_WAITS TIME_WAITED
+---------------- ----------- -----------
+User I/O             1093881      493400
+System I/O            701260      121870
+Commit                 34980       41220
+Concurrency            12044        9330
+Application             3210        5120
+
+-- User I/O 가 전체 대기의 대부분 → 스토리지/캐시 관점의 진단으로 좁혀 간다.
+
+--------------------------------------------------------------------------------
+-- [5] 실시간 관점: 지금 대기 중인 세션을 V$SESSION 으로 본다(19c는 대기 정보 통합).
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN username FORMAT A10
+SYS@cdb1> COLUMN event    FORMAT A28
+SYS@cdb1> SELECT sid, username, event, wait_class, seconds_in_wait, state
+  2       FROM  v$session
+  3      WHERE  wait_class <> 'Idle'
+  4        AND  type = 'USER';
+
+       SID USERNAME   EVENT                        WAIT_CLASS   SECONDS_IN_WAIT STATE
+---------- ---------- ---------------------------- ------------ --------------- -------------------
+       142 SCOTT      db file sequential read      User I/O                   0 WAITED KNOWN TIME
+        87 HR         enq: TX - row lock contention Application               12 WAITING
+
+-- STATE=WAITING 이면 현재 대기 중, WAITED KNOWN TIME 이면 직전 대기가 끝난 상태.
+
+--------------------------------------------------------------------------------
+-- [6] (오류 → 원인 → 수정)
+--     V$SESSION_WAIT 에서 '대기 시간' 컬럼을 TIME_WAITED 로 착각해 조회한다.
+--     V$SESSION_WAIT 에는 그 컬럼이 없다(SECONDS_IN_WAIT/WAIT_TIME 을 쓴다).
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT sid, event, time_waited
+  2       FROM  v$session_wait
+  3      WHERE  wait_class <> 'Idle';
+       SELECT sid, event, time_waited
+                          *
+ERROR at line 1:
+ORA-00904: "TIME_WAITED": invalid identifier
+
+SYS@cdb1> -- 원인 파악: TIME_WAITED 는 누적 집계 뷰(V$SYSTEM_EVENT)의 컬럼이다.
+SYS@cdb1> -- 실시간 뷰 V$SESSION_WAIT 는 SECONDS_IN_WAIT/WAIT_TIME 을 제공한다.
+SYS@cdb1> -- 컬럼명을 확인한다.
+SYS@cdb1> SELECT column_name FROM v$session_wait_columns_check
+  2       WHERE 1=0;
+SELECT column_name FROM v$session_wait_columns_check
+                        *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+SYS@cdb1> -- (해당 확인 뷰는 없다) DESC 로 실제 컬럼을 확인한다.
+SYS@cdb1> DESC v$session_wait
+ Name                          Null?    Type
+ ----------------------------- -------- --------------
+ SID                                    NUMBER
+ EVENT                                  VARCHAR2(64)
+ WAIT_CLASS                             VARCHAR2(64)
+ SECONDS_IN_WAIT                        NUMBER
+ WAIT_TIME                              NUMBER
+ STATE                                  VARCHAR2(19)
+ ...
+
+SYS@cdb1> -- 수정: SECONDS_IN_WAIT 로 조회한다.
+SYS@cdb1> SELECT sid, event, seconds_in_wait, state
+  2       FROM  v$session_wait
+  3      WHERE  wait_class <> 'Idle'
+  4        AND  state = 'WAITING';
+
+       SID EVENT                        SECONDS_IN_WAIT STATE
+---------- ---------------------------- --------------- -------
+        87 enq: TX - row lock contention              12 WAITING
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 대기 이벤트 카탈로그는 V$EVENT_NAME(이름·클래스·P1/P2/P3).
+-- 2) 인스턴스 누적은 V$SYSTEM_EVENT, 클래스 집계는 V$SYSTEM_WAIT_CLASS.
+-- 3) 실시간 대기는 V$SESSION_WAIT / V$SESSION(19c 통합) — Idle 클래스는 제외한다.
+-- 4) 누적 뷰의 TIME_WAITED 와 실시간 뷰의 SECONDS_IN_WAIT 를 혼동하지 않는다.
+
+SYS@cdb1> EXIT
+================================================================================

@@ -1,0 +1,119 @@
+================================================================================
+ 32장 실습 06 — 세션 모니터링(V$SESSION / 블로킹 세션 / 세션 종료)
+ 목표: V$SESSION 으로 세션 상태(ACTIVE/INACTIVE)와 실행 SQL·대기를 조회한다.
+       BLOCKING_SESSION 으로 블로커를 찾고, ALTER SYSTEM KILL SESSION 으로
+       세션을 종료한다. 잘못된 SID/SERIAL# 지정 시 발생하는 ORA-00030 을 다룬다.
+ 환경: CDB=cdb1 (루트 컨테이너에서 SYS로 수행)
+================================================================================
+
+-- [1] 접속한 사용자 세션의 기본 정보를 조회한다.
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> COLUMN username FORMAT A10
+SYS@cdb1> COLUMN program  FORMAT A16
+SYS@cdb1> COLUMN status   FORMAT A8
+SYS@cdb1> SELECT sid, serial#, username, status, program
+  2       FROM  v$session
+  3      WHERE  type = 'USER'
+  4        AND  username IS NOT NULL
+  5      ORDER BY sid;
+
+       SID    SERIAL# USERNAME   STATUS   PROGRAM
+---------- ---------- ---------- -------- ----------------
+        87       6021 HR         INACTIVE sqlplus.exe
+       142       3390 SCOTT      ACTIVE   sqlplus.exe
+
+-- ACTIVE=현재 SQL 실행 중, INACTIVE=서버 프로세스는 잡고 있으나 문장 미실행.
+
+--------------------------------------------------------------------------------
+-- [2] 특정 세션이 실행 중인 SQL 을 SQL_ID 로 연결해 확인한다(진단의 관문).
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN sql_text FORMAT A46
+SYS@cdb1> SELECT s.sid, s.sql_id, q.sql_text
+  2       FROM  v$session s
+  3       JOIN  v$sql q ON q.sql_id = s.sql_id
+  4      WHERE  s.sid = 142;
+
+       SID SQL_ID        SQL_TEXT
+---------- ------------- ----------------------------------------------
+       142 8x9c2mabcd1ef UPDATE emp SET sal = sal*1.1 WHERE deptno = 10
+
+--------------------------------------------------------------------------------
+-- [3] 블로킹 상황을 재현한다: HR(SID 87)이 한 행을 잠근 뒤 커밋하지 않고,
+--     SCOTT(SID 142)이 같은 행을 UPDATE 하려다 막힌다(다른 두 세션에서 수행).
+--     여기서는 SYS 세션에서 그 결과를 관찰한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN event FORMAT A30
+SYS@cdb1> SELECT sid, blocking_session, blocking_session_status, event
+  2       FROM  v$session
+  3      WHERE  blocking_session IS NOT NULL;
+
+       SID BLOCKING_SESSION BLOCKING_SESSION_STATUS EVENT
+---------- ---------------- ----------------------- ------------------------------
+       142               87 VALID                   enq: TX - row lock contention
+
+-- SID 142 는 SID 87 에 막혀 있다. BLOCKING_SESSION 으로 근본 원인(블로커)을 즉시 특정.
+
+--------------------------------------------------------------------------------
+-- [4] 블로커(SID 87)의 SERIAL# 를 확보한다(종료에 SID+SERIAL# 조합이 필요).
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT sid, serial#, username, status
+  2       FROM  v$session
+  3      WHERE  sid = 87;
+
+       SID    SERIAL# USERNAME   STATUS
+---------- ---------- ---------- --------
+        87       6021 HR         INACTIVE
+
+--------------------------------------------------------------------------------
+-- [5] (오류 → 원인 → 수정)
+--     SERIAL# 를 확인하지 않고 예전 값(9999)으로 KILL SESSION 을 시도한다.
+--     SID 는 재사용되므로 SID+SERIAL# 조합이 맞지 않으면 ORA-00030 이 난다.
+--------------------------------------------------------------------------------
+SYS@cdb1> ALTER SYSTEM KILL SESSION '87, 9999';
+ALTER SYSTEM KILL SESSION '87, 9999'
+*
+ERROR at line 1:
+ORA-00030: User session ID does not exist.
+
+SYS@cdb1> -- 원인 파악: SID 87 은 존재하지만 SERIAL# 9999 와의 조합이 없다.
+SYS@cdb1> -- SID 는 재사용되므로 반드시 현재 SERIAL# 와 함께 지정해야 한다.
+SYS@cdb1> -- 수정: 방금 조회한 정확한 SERIAL#(6021)로 다시 시도한다.
+SYS@cdb1> ALTER SYSTEM KILL SESSION '87, 6021' IMMEDIATE;
+
+System altered.
+
+-- IMMEDIATE 로 트랜잭션 롤백과 자원 회수를 즉시 시도한다.
+
+--------------------------------------------------------------------------------
+-- [6] 종료 결과를 확인한다. 블로커가 사라지면 막혔던 세션은 진행을 재개한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT sid, serial#, status
+  2       FROM  v$session
+  3      WHERE  sid = 87;
+
+no rows selected
+
+-- 블로커(87)가 정리되었다. (즉시 정리가 어려우면 STATUS='KILLED'로 잠시 남기도 한다)
+
+SYS@cdb1> -- 이제 SID 142 는 락을 얻어 대기에서 벗어난다.
+SYS@cdb1> SELECT sid, blocking_session, status, event
+  2       FROM  v$session
+  3      WHERE  sid = 142;
+
+       SID BLOCKING_SESSION STATUS   EVENT
+---------- ---------------- -------- ------------------------------
+       142                           ACTIVE   SQL*Net message from client
+
+-- BLOCKING_SESSION 이 사라지고 정상 상태로 돌아왔다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) V$SESSION 이 실시간 모니터링의 중심 — 상태·SQL·대기·블로커를 한 행에서 본다.
+-- 2) STATUS 는 ACTIVE(실행 중)/INACTIVE(문장 미실행)를 구분한다.
+-- 3) BLOCKING_SESSION 으로 대기 사슬 최상단의 근본 원인 세션을 찾는다.
+-- 4) 종료는 ALTER SYSTEM KILL SESSION 'sid, serial#' — 조합이 틀리면 ORA-00030.
+
+SYS@cdb1> EXIT
+================================================================================

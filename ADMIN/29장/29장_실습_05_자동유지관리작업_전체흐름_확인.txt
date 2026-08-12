@@ -1,0 +1,106 @@
+================================================================================
+ 29장 실습 05 — 자동 유지관리 작업 전체 흐름 확인
+ 목표: 윈도우별 실행 이력과 작업 실행 이력으로 큐잉→실행→중단→이월 흐름을 관측
+       ('STOPPED' 는 실패가 아니라 윈도우 종료로 인한 정상 중단임을 확인)
+ 환경: CDB=cdb1
+================================================================================
+
+-- [1] 윈도우 단위 실행 이력: 각 윈도우에서 생성/시작/완료된 작업 수를 본다.
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> SET LINESIZE 160
+SYS@cdb1> COLUMN window_name FORMAT A16
+SYS@cdb1> SELECT window_name,
+  2              TO_CHAR(window_start_time,'MM-DD HH24:MI') AS win_start,
+  3              jobs_created, jobs_started, jobs_completed
+  4       FROM  dba_autotask_window_history
+  5      ORDER BY window_start_time DESC FETCH FIRST 5 ROWS ONLY;
+
+WINDOW_NAME      WIN_START    JOBS_CREATED JOBS_STARTED JOBS_COMPLETED
+---------------- ------------ ------------ ------------ --------------
+MONDAY_WINDOW    08-10 22:00             3            3              2
+SUNDAY_WINDOW    08-09 06:00             3            3              3
+SATURDAY_WINDOW  08-08 06:00             3            3              3
+FRIDAY_WINDOW    08-08 22:00             3            3              2
+THURSDAY_WINDOW  08-07 22:00             3            3              3
+
+-- 08-10 월요일: 3개 생성/시작, 2개 완료 → 1개는 윈도우 안에 못 끝내고 이월되었음을 짐작.
+
+--------------------------------------------------------------------------------
+-- [2] 작업(job) 단위 실행 이력으로 어떤 작업이 STOPPED 되었는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN client_name FORMAT A34
+SYS@cdb1> COLUMN job_status  FORMAT A10
+SYS@cdb1> SELECT client_name, job_status,
+  2              TO_CHAR(job_start_time,'MM-DD HH24:MI') AS started, job_duration
+  3       FROM  dba_autotask_job_history
+  4      WHERE window_name = 'MONDAY_WINDOW'
+  5        AND job_start_time > TO_DATE('2026-08-10','YYYY-MM-DD')
+  6      ORDER BY job_start_time;
+
+CLIENT_NAME                        JOB_STATUS STARTED      JOB_DURATION
+---------------------------------- ---------- ------------ ---------------
+auto optimizer stats collection    SUCCEEDED  08-10 22:00  +000 00:52:11
+auto space advisor                 SUCCEEDED  08-10 22:55  +000 00:20:03
+sql tuning advisor                 STOPPED    08-10 23:20  +000 02:39:58
+
+-- 통계 수집→세그먼트 어드바이저는 성공. SQL 튜닝은 새벽 2시 윈도우 종료로 STOPPED.
+
+--------------------------------------------------------------------------------
+-- [3] (오류 → 원인 → 수정) 존재하지 않는 job_status 값으로 필터해 결과가 없다.
+--------------------------------------------------------------------------------
+SYS@cdb1> -- 중단된 작업만 보려는데 상태 값을 'STOP' 으로 잘못 입력했다.
+SYS@cdb1> SELECT client_name, job_status FROM dba_autotask_job_history
+  2       WHERE job_status = 'STOP';
+
+no rows selected
+
+SYS@cdb1> -- 원인 파악: 상태 값은 'STOP' 이 아니라 'STOPPED' 이다.
+SYS@cdb1> --   실제 어떤 값들이 있는지 DISTINCT 로 확인한다.
+SYS@cdb1> SELECT DISTINCT job_status FROM dba_autotask_job_history;
+
+JOB_STATUS
+----------
+SUCCEEDED
+STOPPED
+
+SYS@cdb1> -- 수정: 올바른 값 'STOPPED' 로 조회한다.
+SYS@cdb1> SELECT client_name, TO_CHAR(job_start_time,'MM-DD HH24:MI') AS started
+  2       FROM  dba_autotask_job_history
+  3      WHERE job_status = 'STOPPED'
+  4      ORDER BY job_start_time DESC FETCH FIRST 3 ROWS ONLY;
+
+CLIENT_NAME                        STARTED
+---------------------------------- ------------
+sql tuning advisor                 08-10 23:20
+sql tuning advisor                 08-08 23:40
+auto optimizer stats collection    08-03 23:05
+
+--------------------------------------------------------------------------------
+-- [4] 이월 확인: STOPPED 된 작업이 다음 윈도우에서 이어져 성공했는지 본다.
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT client_name, window_name, job_status,
+  2              TO_CHAR(job_start_time,'MM-DD HH24:MI') AS started
+  3       FROM  dba_autotask_job_history
+  4      WHERE client_name = 'sql tuning advisor'
+  5      ORDER BY job_start_time DESC FETCH FIRST 3 ROWS ONLY;
+
+CLIENT_NAME          WINDOW_NAME       JOB_STATUS STARTED
+-------------------- ----------------- ---------- ------------
+sql tuning advisor   TUESDAY_WINDOW    SUCCEEDED  08-11 22:10
+sql tuning advisor   MONDAY_WINDOW     STOPPED    08-10 23:20
+sql tuning advisor   SUNDAY_WINDOW     SUCCEEDED  08-09 07:00
+
+-- 월요일 STOPPED → 화요일 윈도우에서 SUCCEEDED. 이월 메커니즘이 정상 동작했다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 전체 흐름: 윈도우 시작 → 큐잉 → 실행 → (윈도우 종료 시)중단 → 다음 윈도우 이월.
+-- 2) 윈도우 단위 이력: DBA_AUTOTASK_WINDOW_HISTORY (jobs_created/started/completed).
+-- 3) 작업 단위 이력: DBA_AUTOTASK_JOB_HISTORY (job_status = SUCCEEDED/STOPPED).
+-- 4) STOPPED 는 실패가 아니라 윈도우 종료로 인한 정상 중단이며, 다음 윈도우로 이월된다.
+-- 5) 상태 값 오타(STOP vs STOPPED)에 주의한다. DISTINCT 로 실제 값을 확인하면 안전하다.
+
+SYS@cdb1> EXIT
+================================================================================

@@ -1,0 +1,80 @@
+================================================================================
+ 34장 실습 10 — RMAN 을 이용한 non-ASM → ASM 데이터 마이그레이션
+ 목표: 파일 시스템의 데이터베이스를 RMAN 으로 +DATA 디스크 그룹으로 이관한다.
+       (오류→원인→수정) 임시 파일 미이관으로 정렬 쿼리 실패(ORA-25153) → 임시파일 추가.
+ 환경: DB 인스턴스 orcl(비-ASM), ASM 디스크 그룹 +DATA/+FRA
+================================================================================
+
+-- [1] 이관 대상 파일이 파일 시스템에 있는지 확인한다.
+$ sqlplus / as sysdba
+SQL> SELECT name FROM v$datafile WHERE rownum<=2;
+NAME
+--------------------------------------
+/u01/oradata/orcl/system01.dbf
+/u01/oradata/orcl/users01.dbf
+
+-- [2] 생성 위치 파라미터를 ASM 경로로 변경한다(SPFILE).
+SQL> ALTER SYSTEM SET db_create_file_dest='+DATA' SCOPE=SPFILE;
+System altered.
+SQL> ALTER SYSTEM SET db_recovery_file_dest_size=20G SCOPE=SPFILE;
+SQL> ALTER SYSTEM SET db_recovery_file_dest='+FRA' SCOPE=SPFILE;
+System altered.
+
+-- [3] MOUNT 상태에서 RMAN 으로 데이터파일을 ASM 으로 복사 후 스위치한다.
+SQL> SHUTDOWN IMMEDIATE
+SQL> EXIT
+$ rman target /
+RMAN> STARTUP MOUNT;
+RMAN> BACKUP AS COPY DATABASE FORMAT '+DATA';
+Starting backup ...
+output file name=+DATA/orcl/datafile/system.257.1049 ...
+Finished backup
+
+RMAN> SWITCH DATABASE TO COPY;
+datafile 1 switched to datafile copy "+DATA/orcl/datafile/system.257.1049"
+datafile 4 switched to datafile copy "+DATA/orcl/datafile/users.259.1049"
+
+-- [4] 리두로그를 ASM 으로 이동(멤버 추가 → 로그 스위치 → 구멤버 삭제, 요약)
+RMAN> SQL "ALTER DATABASE ADD LOGFILE '+DATA' SIZE 200M";
+RMAN> ALTER DATABASE OPEN;
+database opened
+
+--------------------------------------------------------------------------------
+-- [5] (오류 → 원인 → 수정) 정렬을 유발하는 쿼리에서 오류가 발생한다.
+--------------------------------------------------------------------------------
+$ sqlplus / as sysdba
+SQL> SELECT * FROM all_objects ORDER BY object_name;
+SELECT * FROM all_objects ORDER BY object_name
+*
+ERROR at line 1:
+ORA-25153: Temporary Tablespace is Empty
+
+-- 원인 파악: 데이터파일은 ASM 으로 옮겼지만 임시 테이블스페이스의 TEMP 파일을
+--            ASM 에 재생성하지 않아 임시 공간이 비어 있다.
+-- 수정: +DATA 에 임시 파일을 추가하고 파일 시스템의 구 임시파일을 제거한다.
+SQL> ALTER TABLESPACE temp ADD TEMPFILE '+DATA' SIZE 1G;
+Tablespace altered.
+SQL> ALTER DATABASE TEMPFILE '/u01/oradata/orcl/temp01.dbf' DROP INCLUDING DATAFILES;
+Database altered.
+
+-- 다시 정렬 쿼리 수행 → 정상
+SQL> SELECT count(*) FROM (SELECT * FROM all_objects ORDER BY object_name);
+  COUNT(*)
+----------
+     73512
+
+-- [6] 모든 파일이 ASM(+DATA)으로 이동했는지 최종 확인한다.
+SQL> SELECT name FROM v$datafile
+  2  UNION ALL SELECT member FROM v$logfile
+  3  UNION ALL SELECT name FROM v$tempfile;
+NAME
+--------------------------------------
++DATA/orcl/datafile/system.257.1049
++DATA/orcl/datafile/users.259.1049
++DATA/orcl/onlinelog/group_1.261.1049
++DATA/orcl/tempfile/temp.262.1049
+...
+
+-- 정리: BACKUP AS COPY + SWITCH 로 데이터파일을 이관하고, 누락된 임시파일(ORA-25153)을
+-- ASM 에 추가하여 이관을 완결했다. 데이터파일·리두·임시파일·컨트롤파일을 모두 옮겨야 한다.
+SQL> EXIT

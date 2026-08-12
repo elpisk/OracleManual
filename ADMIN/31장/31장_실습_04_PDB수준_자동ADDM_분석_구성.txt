@@ -1,0 +1,150 @@
+================================================================================
+ 31장 실습 04 — PDB 수준 자동 ADDM 분석 구성 (19c 신기능)
+ 목표: PDB 에서 AWR_PDB_AUTOFLUSH_ENABLED 로 PDB 수준 AWR 수집을 켜고,
+       DBMS_ADDM.ANALYZE_INST 로 그 PDB 워크로드만 진단한다.
+ 환경: CDB=cdb1, PDB=pdb1
+================================================================================
+
+-- [1] 현재 접속 컨테이너를 확인한다(루트에서 시작).
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> SET LINESIZE 180
+SYS@cdb1> SHOW CON_NAME
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+--------------------------------------------------------------------------------
+-- [2] (오류 → 원인 → 수정)
+--     CDB 루트에서 PDB 전용 파라미터를 켠 뒤, PDB 뷰(AWR_PDB_*)를 루트에서
+--     조회하려다 데이터가 없어 당황하는 상황을 재현하고 바로잡는다.
+--------------------------------------------------------------------------------
+SYS@cdb1> -- 루트에서 파라미터부터 켜 본다.
+SYS@cdb1> ALTER SYSTEM SET awr_pdb_autoflush_enabled = TRUE;
+
+System altered.
+
+SYS@cdb1> -- 루트에서 PDB 스냅샷을 조회하려 한다.
+SYS@cdb1> SELECT snap_id FROM awr_pdb_snapshot ORDER BY snap_id;
+
+no rows selected
+
+SYS@cdb1> -- 원인 파악: PDB 수준 AWR 자동 수집과 AWR_PDB_* 조회는 그 PDB 컨테이너
+SYS@cdb1> --   안에서 이루어져야 한다. 루트에서는 PDB 의 autoflush 가 적용되지 않고,
+SYS@cdb1> --   PDB 스냅샷도 쌓이지 않는다.
+SYS@cdb1> -- 수정: 대상 PDB 로 컨테이너를 전환한 뒤 설정한다.
+SYS@cdb1> ALTER SESSION SET CONTAINER = pdb1;
+
+Session altered.
+
+SYS@cdb1> SHOW CON_NAME
+
+CON_NAME
+------------------------------
+PDB1
+
+--------------------------------------------------------------------------------
+-- [3] PDB 안에서 전제 조건과 파라미터를 확인/설정한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> SHOW PARAMETER statistics_level
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+statistics_level                     string      TYPICAL
+
+SYS@cdb1> -- PDB 수준 AWR 자동 수집 활성화(이 컨테이너에 적용).
+SYS@cdb1> ALTER SYSTEM SET awr_pdb_autoflush_enabled = TRUE;
+
+System altered.
+
+SYS@cdb1> SHOW PARAMETER awr_pdb_autoflush_enabled
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+awr_pdb_autoflush_enabled            boolean     TRUE
+
+--------------------------------------------------------------------------------
+-- [4] PDB 자체 스냅샷을 수동 생성하고 AWR_PDB_* 뷰로 확인한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> ALTER SESSION SET nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+Session altered.
+
+SYS@cdb1> SELECT snap_id, begin_interval_time
+  2       FROM  awr_pdb_snapshot
+  3      ORDER BY snap_id;
+
+   SNAP_ID BEGIN_INTERVAL_TIME
+---------- --------------------
+        10 2026-07-22 15:30:00
+        11 2026-07-22 16:00:00
+
+-- 이제 PDB1 자체의 스냅샷이 쌓인다(AWR_PDB_* 뷰로 조회).
+
+--------------------------------------------------------------------------------
+-- [5] 이 PDB 의 두 스냅샷 구간에 대해 ADDM 분석을 실행한다.
+--     ANALYZE_INST 는 특정 인스턴스(여기서는 이 PDB) 워크로드만 진단한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> -- (오류 → 원인 → 수정) 아직 존재하지 않는 PDB 스냅샷 99 를 지정한다.
+SYS@cdb1> VAR t VARCHAR2(60)
+SYS@cdb1> BEGIN
+  2         :t := 'ADDM_PDB1_BAD';
+  3         DBMS_ADDM.ANALYZE_INST(
+  4           task_name      => :t,
+  5           begin_snapshot => 99,
+  6           end_snapshot   => 100);
+  7       END;
+  8       /
+BEGIN
+*
+ERROR at line 1:
+ORA-13519: invalid value for begin snapshot id: "99"
+ORA-06512: at "SYS.PRVT_ADVISOR", line 3195
+ORA-06512: at "SYS.DBMS_ADDM", line 210
+ORA-06512: at line 4
+
+SYS@cdb1> -- 원인 파악: 이 PDB 에는 SNAP_ID 99 가 없다. PDB 수준 ADDM 은 AWR_PDB_*
+SYS@cdb1> --   에 실제 존재하는 그 PDB 의 스냅샷만 입력으로 삼을 수 있다.
+SYS@cdb1> SELECT MIN(snap_id) min_id, MAX(snap_id) max_id FROM awr_pdb_snapshot;
+
+    MIN_ID     MAX_ID
+---------- ----------
+        10         11
+
+SYS@cdb1> -- 수정: 실제 존재하는 PDB 스냅샷 구간(10~11)을 지정한다.
+SYS@cdb1> BEGIN
+  2         :t := 'ADDM_PDB1_10_11';
+  3         DBMS_ADDM.ANALYZE_INST(
+  4           task_name      => :t,
+  5           begin_snapshot => 10,
+  6           end_snapshot   => 11);
+  7       END;
+  8       /
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> SET LONG 1000000 PAGESIZE 0 LONGCHUNKSIZE 1000
+SYS@cdb1> SELECT DBMS_ADDM.GET_REPORT(:t) FROM dual;
+
+          ADDM Report for Task 'ADDM_PDB1_10_11'
+          ---------------------------------------
+Analysis Period: PDB 'PDB1' snapshot range 10 to 11.
+...
+   (해당 PDB 워크로드에 국한된 Finding·Recommendation 이 출력됨)
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) PDB 수준 AWR/ADDM 은 반드시 그 PDB 컨테이너 안에서 구성·수행한다.
+-- 2) 활성화: (PDB 내) ALTER SYSTEM SET awr_pdb_autoflush_enabled = TRUE.
+-- 3) 조회: AWR_PDB_* 뷰(예: AWR_PDB_SNAPSHOT). 루트는 DBA_HIST_*/AWR_ROOT_*.
+-- 4) ANALYZE_DB(루트 전체) vs ANALYZE_INST(인스턴스/PDB) vs ANALYZE_PARTIAL(PDB 집합).
+-- 5) SGA·I/O 같은 CDB 공용 자원 권고는 여전히 루트 관점에서 검토해야 한다.
+
+SYS@cdb1> EXIT
+================================================================================

@@ -1,0 +1,149 @@
+================================================================================
+ 32장 실습 04 — 데이터베이스 서버 통계/메트릭 조회
+ 목표: 원시 통계(V$SYSSTAT)와 가공된 메트릭(V$SYSMETRIC)의 차이를 이해한다.
+       V$METRICNAME 으로 메트릭 정의를, V$SYSMETRIC/V$SYSMETRIC_HISTORY 로
+       현재 값과 추세를, V$SYSSTAT 델타로 구간 활동량을 조회한다.
+ 환경: CDB=cdb1 (루트 컨테이너에서 SYS로 수행)
+================================================================================
+
+-- [1] 시스템 통계는 NAME/VALUE 누적 카운터다. 핵심 통계 몇 가지를 조회한다.
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> COLUMN name FORMAT A28
+SYS@cdb1> SELECT name, value
+  2       FROM  v$sysstat
+  3      WHERE  name IN ('user commits','user calls',
+  4                      'session logical reads','physical reads',
+  5                      'parse count (total)','parse count (hard)')
+  6      ORDER BY name;
+
+NAME                              VALUE
+---------------------------- ----------
+parse count (hard)                 8123
+parse count (total)              152344
+physical reads                    43120
+session logical reads          12904557
+user calls                       201338
+user commits                      35102
+
+-- 모두 인스턴스 기동 이후 누적값이다. "지금 얼마나 바쁜가"는 이 값만으로 알 수 없다.
+
+--------------------------------------------------------------------------------
+-- [2] 구간 활동량은 델타로 본다. 시작값을 저장하고 잠깐 뒤 다시 읽어 뺀다.
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT value FROM v$sysstat WHERE name = 'user commits';
+
+     VALUE
+----------
+     35102
+
+SYS@cdb1> -- (이 사이에 워크로드가 진행된다고 가정) 잠시 후 다시 조회한다.
+SYS@cdb1> SELECT value FROM v$sysstat WHERE name = 'user commits';
+
+     VALUE
+----------
+     35119
+
+-- 델타 = 35119 - 35102 = 17 커밋. 구간 활동량은 이렇게 두 시점의 차이로 해석한다.
+
+--------------------------------------------------------------------------------
+-- [3] 메트릭은 통계를 단위 시간·작업당으로 정규화한 값이다.
+--     먼저 어떤 메트릭이 있는지 V$METRICNAME 으로 정의를 확인한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN metric_name  FORMAT A34
+SYS@cdb1> COLUMN metric_unit  FORMAT A24
+SYS@cdb1> SELECT metric_name, metric_unit
+  2       FROM  v$metricname
+  3      WHERE  metric_group = 'System Metrics Long Duration'
+  4        AND  metric_name IN ('Database CPU Time Ratio',
+  5                             'Average Active Sessions',
+  6                             'Host CPU Utilization (%)',
+  7                             'Physical Reads Per Sec')
+  8      ORDER BY metric_name;
+
+METRIC_NAME                        METRIC_UNIT
+---------------------------------- ------------------------
+Average Active Sessions            Active Sessions
+Database CPU Time Ratio            % Cpu/Db_Time
+Host CPU Utilization (%)           % Busy/(Idle+Busy)
+Physical Reads Per Sec             Reads Per Second
+
+--------------------------------------------------------------------------------
+-- [4] 현재 시스템 메트릭 값을 V$SYSMETRIC 으로 조회한다.
+--     각 메트릭은 60초·15초 두 구간(INTERVAL_SIZE)으로 계산된다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN value FORMAT 999999.99
+SYS@cdb1> SELECT metric_name, ROUND(value,2) AS value, metric_unit, intsize_csec
+  2       FROM  v$sysmetric
+  3      WHERE  metric_name IN ('Average Active Sessions',
+  4                             'Host CPU Utilization (%)')
+  5      ORDER BY metric_name, intsize_csec;
+
+METRIC_NAME                     VALUE  METRIC_UNIT              INTSIZE_CSEC
+------------------------------ ------ ------------------------ ------------
+Average Active Sessions          0.34 Active Sessions                  1500
+Average Active Sessions          0.29 Active Sessions                  6000
+Host CPU Utilization (%)         6.10 % Busy/(Idle+Busy)               1500
+Host CPU Utilization (%)         5.80 % Busy/(Idle+Busy)               6000
+-- INTSIZE_CSEC 는 1/100초 단위: 1500=15초 구간, 6000=60초 구간.
+
+--------------------------------------------------------------------------------
+-- [5] (오류 → 원인 → 수정)
+--     통계 이름을 대소문자/표기를 착각해 조회하면 결과가 나오지 않는다.
+--     V$SYSSTAT 의 NAME 은 모두 소문자다("Session Logical Reads" 아님).
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT name, value
+  2       FROM  v$sysstat
+  3      WHERE  name = 'Session Logical Reads';
+
+no rows selected
+
+SYS@cdb1> -- 오류는 아니지만 "결과 없음"이다. 원인: 통계 이름 표기가 실제와 다르다.
+SYS@cdb1> -- 원인 파악: 실제 저장된 이름을 부분 일치로 확인한다.
+SYS@cdb1> SELECT name FROM v$sysstat WHERE LOWER(name) LIKE '%logical reads%';
+
+NAME
+----------------------------
+session logical reads
+session logical reads in local numa group
+session logical reads in remote numa group
+
+SYS@cdb1> -- 수정: 정확한 소문자 이름 'session logical reads' 로 조회한다.
+SYS@cdb1> SELECT name, value FROM v$sysstat WHERE name = 'session logical reads';
+
+NAME                              VALUE
+---------------------------- ----------
+session logical reads          12904812
+
+--------------------------------------------------------------------------------
+-- [6] 메트릭의 추세는 V$SYSMETRIC_HISTORY 로 시계열로 본다(최근 약 1시간).
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN begin_time FORMAT A20
+SYS@cdb1> SELECT TO_CHAR(begin_time,'HH24:MI:SS') AS begin_time,
+  2             ROUND(value,2) AS value
+  3       FROM  v$sysmetric_history
+  4      WHERE  metric_name = 'Host CPU Utilization (%)'
+  5        AND  intsize_csec = 6000
+  6      ORDER BY begin_time DESC
+  7      FETCH FIRST 5 ROWS ONLY;
+
+BEGIN_TIME               VALUE
+-------------------- ---------
+14:32:00                  5.80
+14:31:00                  6.40
+14:30:00                  9.10
+14:29:00                  7.25
+14:28:00                  6.02
+
+-- 실시간 대시보드의 그래프는 대부분 이런 이력 뷰에서 값을 읽어 온다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) V$SYSSTAT 은 기동 이후 누적 원시 통계 — 구간 활동량은 델타로 해석한다.
+-- 2) V$SYSMETRIC 은 60초·15초 구간의 정규화된 메트릭(현재 값)이다.
+-- 3) 메트릭 이름·단위·그룹은 V$METRICNAME, 이력은 V$SYSMETRIC_HISTORY.
+-- 4) V$SYSSTAT.NAME 은 모두 소문자다 — 표기가 다르면 결과가 없다(오류 아님).
+
+SYS@cdb1> EXIT
+================================================================================

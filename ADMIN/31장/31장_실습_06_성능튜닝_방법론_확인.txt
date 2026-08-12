@@ -1,0 +1,114 @@
+================================================================================
+ 31장 실습 06 — 성능 튜닝 방법론 확인 (Top-Down 접근)
+ 목표: 사용자 체감 응답시간(DB Time)에서 출발해 시간 모델·대기 클래스로
+       하향식 분해하는 Top-Down 진단을 시간 기반 통계로 확인한다.
+       비율(ratio) 기반 Bottom-Up 진단의 함정도 함께 짚는다.
+ 환경: CDB=cdb1 (루트 컨테이너에서 수행)
+================================================================================
+
+-- [1] 최상위 지표: DB Time 을 시간 모델(V$SYS_TIME_MODEL)에서 확인한다.
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> SET LINESIZE 160
+SYS@cdb1> COLUMN stat_name FORMAT A34
+SYS@cdb1> SELECT stat_name, ROUND(value/1000000,1) AS seconds
+  2       FROM  v$sys_time_model
+  3      WHERE stat_name IN ('DB time','DB CPU','sql execute elapsed time',
+  4                          'parse time elapsed')
+  5      ORDER BY value DESC;
+
+STAT_NAME                             SECONDS
+---------------------------------- ----------
+DB time                              12840.5
+sql execute elapsed time             11002.3
+DB CPU                                4820.7
+parse time elapsed                     318.4
+
+-- 1단계: DB time 이 소비의 총량. 이것을 CPU 와 대기로 분해하는 것이 Top-Down 의 시작.
+
+--------------------------------------------------------------------------------
+-- [2] DB Time 을 CPU 시간과 대기 클래스로 분해한다(V$SYSTEM_WAIT_CLASS).
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN wait_class FORMAT A20
+SYS@cdb1> SELECT wait_class,
+  2              ROUND(time_waited/100,1) AS wait_secs
+  3       FROM  v$system_wait_class
+  4      WHERE  wait_class <> 'Idle'
+  5      ORDER BY time_waited DESC FETCH FIRST 5 ROWS ONLY;
+
+WAIT_CLASS            WAIT_SECS
+-------------------- ----------
+User I/O                 5231.6
+Concurrency               842.0
+Commit                    410.3
+Configuration             150.2
+Network                    38.9
+
+-- 2단계: 대기 시간의 가장 큰 조각이 'User I/O'. 여기서부터 파고들면 효과가 크다.
+-- (전체 시간의 1%밖에 안 되는 Network 를 아무리 최적화해도 체감 개선은 없다.)
+
+--------------------------------------------------------------------------------
+-- [3] (오류 → 원인 → 수정)
+--     흔한 함정: 버퍼 캐시 '적중률'이라는 비율(ratio) 하나만 보고 판단하려 한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> -- Bottom-Up 접근: 적중률만 계산해 '좋다/나쁘다'를 판정하려는 시도.
+SYS@cdb1> SELECT ROUND(
+  2           (1 - (SELECT value FROM v$sysstat WHERE name='physical reads')
+  3               / (SELECT value FROM v$sysstat WHERE name='sessin logical reads')  -- 오타
+  4           ) * 100, 2) AS hit_ratio
+  5       FROM dual;
+              / (SELECT value FROM v$sysstat WHERE name='sessin logical reads')
+                                                            *
+ERROR at line 3:
+ORA-01427: single-row subquery returns more than one row
+
+SYS@cdb1> -- 원인 파악(1): 통계 이름 오타('sessin' → 'session')로 WHERE 조건이
+SYS@cdb1> --   아무 행도 특정하지 못해 서브쿼리 결과가 어긋났다.
+SYS@cdb1> -- 수정: 정확한 통계 이름 'session logical reads' 를 사용한다.
+SYS@cdb1> SELECT ROUND(
+  2           (1 - (SELECT value FROM v$sysstat WHERE name='physical reads')
+  3               / (SELECT value FROM v$sysstat WHERE name='session logical reads')
+  4           ) * 100, 2) AS hit_ratio
+  5       FROM dual;
+
+ HIT_RATIO
+----------
+     99.02
+
+SYS@cdb1> -- 원인 파악(2)/방법론 교정: 적중률 99%는 '좋아 보이지만' 그 1% 미스가
+SYS@cdb1> --   User I/O 대기(위 5231초)의 대부분을 만들 수 있다. 비율 지표만으로는
+SYS@cdb1> --   사용자 체감을 설명하지 못한다 → Top-Down 시간 기반 진단으로 돌아간다.
+
+--------------------------------------------------------------------------------
+-- [4] Top-Down 결론: 가장 큰 시간 조각(Top SQL)을 시간 기준으로 확인한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN sql_id FORMAT A15
+SYS@cdb1> SELECT sql_id,
+  2              ROUND(elapsed_time/1000000,1) AS elapsed_secs,
+  2              executions
+  3       FROM  v$sql
+  4      ORDER BY elapsed_time DESC FETCH FIRST 3 ROWS ONLY;
+
+SQL_ID          ELAPSED_SECS EXECUTIONS
+--------------- ------------ ----------
+g4pkm814ac8n2         4820.5      15230
+7hy2m0abcd12f          932.1       2044
+c1n8s5qwe33az          210.7        512
+
+-- 상위 SQL(g4pkm814ac8n2)이 DB Time 을 압도적으로 소비한다. 이 SQL 을
+-- SQL Tuning Advisor 로 넘기는 것이 '가장 큰 조각부터, 한 번에 하나씩' 원칙이다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 방법론 5단계: 문제 정의 → 데이터 수집 → 병목 식별 → 해결책 적용 → 검증(반복).
+-- 2) Top-Down: 사용자 체감 응답시간(DB Time)에서 출발 → CPU/대기 → 대기 클래스
+--    → 가장 큰 조각(Top SQL) 순으로 좁혀 간다.
+-- 3) Bottom-Up(적중률 등 비율 지표)만 보는 것은 함정: 99% 적중률도 1% 미스가
+--    응답시간을 지배할 수 있다. 비율은 워크로드 맥락 안에서만 보조로 해석한다.
+-- 4) 한 번에 하나만 변경하고 새 스냅샷 구간의 ADDM 으로 검증한다. SLA 충족 시 멈춘다.
+-- 5) 인프라 대응: AWR=수집(2단계), ADDM=병목 식별(3단계),
+--    Advisory Framework=해결책(4단계), 재분석=검증(5단계).
+
+SYS@cdb1> EXIT
+================================================================================

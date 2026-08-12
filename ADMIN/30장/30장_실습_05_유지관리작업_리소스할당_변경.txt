@@ -1,0 +1,139 @@
+================================================================================
+ 30장 실습 05 — 유지관리 작업 리소스 할당 변경 실습
+ 목표: DBMS_RESOURCE_MANAGER 의 Pending Area 워크플로우로 ORA$AUTOTASK 의
+       CPU 상한을 변경하고, 검증 실패/대기영역 누락 오류를 다뤄 본다.
+ 환경: CDB=cdb1
+================================================================================
+
+-- [1] 변경 전 현재 배분 값을 기록한다(롤백 근거).
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> COLUMN plan             FORMAT A26
+SYS@cdb1> COLUMN group_or_subplan FORMAT A22
+SYS@cdb1> SELECT plan, group_or_subplan, mgmt_p1
+  2       FROM  dba_rsrc_plan_directives
+  3      WHERE plan = 'DEFAULT_MAINTENANCE_PLAN'
+  4      ORDER BY group_or_subplan;
+
+PLAN                       GROUP_OR_SUBPLAN       MGMT_P1
+-------------------------- ---------------------- -------
+DEFAULT_MAINTENANCE_PLAN   ORA$AUTOTASK                25
+DEFAULT_MAINTENANCE_PLAN   ORA$DIAGNOSTICS              5
+DEFAULT_MAINTENANCE_PLAN   OTHER_GROUPS                70
+
+-- 변경 전: ORA$AUTOTASK=25, ORA$DIAGNOSTICS=5, OTHER_GROUPS=70 (합 100).
+
+--------------------------------------------------------------------------------
+-- [2] (오류 → 원인 → 수정) 대기 영역 없이 곧바로 변경을 시도한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  3           plan             => 'DEFAULT_MAINTENANCE_PLAN',
+  4           group_or_subplan => 'ORA$AUTOTASK',
+  5           new_mgmt_p1      => 40);
+  6       END;
+  7       /
+BEGIN
+*
+ERROR at line 1:
+ORA-29371: pending area is not active
+ORA-06512: at "SYS.DBMS_RMIN", line 444
+ORA-06512: at "SYS.DBMS_RESOURCE_MANAGER", line 108
+ORA-06512: at line 2
+
+SYS@cdb1> -- 원인 파악: 변경은 반드시 CREATE_PENDING_AREA 로 대기 영역을 연 뒤에만 가능하다.
+SYS@cdb1> --   대기 영역이 없어서 ORA-29371 이 발생했다.
+
+--------------------------------------------------------------------------------
+-- [3] 수정: 올바른 4단계 워크플로우로 변경한다.
+--     ORA$AUTOTASK 25→40, OTHER_GROUPS 70→55 로 합계 100 을 유지한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+  3
+  4         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  5           plan             => 'DEFAULT_MAINTENANCE_PLAN',
+  6           group_or_subplan => 'ORA$AUTOTASK',
+  7           new_mgmt_p1      => 40);
+  8
+  9         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+ 10           plan             => 'DEFAULT_MAINTENANCE_PLAN',
+ 11           group_or_subplan => 'OTHER_GROUPS',
+ 12           new_mgmt_p1      => 55);
+ 13
+ 14         DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+ 15         DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+ 16       END;
+ 17       /
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> -- 변경 결과 확인
+SYS@cdb1> SELECT plan, group_or_subplan, mgmt_p1
+  2       FROM  dba_rsrc_plan_directives
+  3      WHERE plan = 'DEFAULT_MAINTENANCE_PLAN'
+  4      ORDER BY group_or_subplan;
+
+PLAN                       GROUP_OR_SUBPLAN       MGMT_P1
+-------------------------- ---------------------- -------
+DEFAULT_MAINTENANCE_PLAN   ORA$AUTOTASK                40
+DEFAULT_MAINTENANCE_PLAN   ORA$DIAGNOSTICS              5
+DEFAULT_MAINTENANCE_PLAN   OTHER_GROUPS                55
+
+-- ORA$AUTOTASK 상한이 40% 로 올라갔다(유지관리 작업에 자원을 더 배정).
+
+--------------------------------------------------------------------------------
+-- [4] (오류 → 원인 → 수정) 합계가 100 을 넘도록 잘못 변경 후 VALIDATE 로 잡아낸다.
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+  3         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  4           plan=>'DEFAULT_MAINTENANCE_PLAN', group_or_subplan=>'ORA$AUTOTASK',
+  5           new_mgmt_p1=>60);            -- 60 + 5 + 55 = 120 (초과)
+  6         DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+  7       END;
+  8       /
+BEGIN
+*
+ERROR at line 1:
+ORA-29382: validation of pending area failed
+ORA-29377: consumer group OTHER_GROUPS is not part of top-plan ...
+ORA-29383: all leaves of top-plan ... must have positive CPU allocation
+ORA-06512: at "SYS.DBMS_RMIN", line 645
+
+SYS@cdb1> -- 원인 파악: 레벨 1 배분 합계가 100 을 초과해 정합성 검증에 실패했다.
+SYS@cdb1> -- 수정: SUBMIT 하지 말고 대기 영역을 폐기(CLEAR)한 뒤 올바른 값으로 다시 한다.
+SYS@cdb1> EXEC DBMS_RESOURCE_MANAGER.CLEAR_PENDING_AREA();
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [5] 원상 복구: [1]의 원래 값(25/5/70)으로 되돌린다.
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+  3         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  4           plan=>'DEFAULT_MAINTENANCE_PLAN', group_or_subplan=>'ORA$AUTOTASK',
+  5           new_mgmt_p1=>25);
+  6         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  7           plan=>'DEFAULT_MAINTENANCE_PLAN', group_or_subplan=>'OTHER_GROUPS',
+  8           new_mgmt_p1=>70);
+  9         DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+ 10         DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+ 11       END;
+ 12       /
+
+PL/SQL procedure successfully completed.
+
+-- 원래 배분(25/5/70)으로 복구 완료.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 리소스 관리자 변경은 CREATE→UPDATE→VALIDATE→SUBMIT 순서를 반드시 지킨다.
+-- 2) 대기 영역 없이 UPDATE/SUBMIT 시 ORA-29371 발생.
+-- 3) 배분 합계 초과 등은 VALIDATE 에서 ORA-29382 로 잡히므로 SUBMIT 전에 확인한다.
+-- 4) 잘못된 변경은 CLEAR_PENDING_AREA 로 폐기하고, 변경 전 값 기록이 롤백 근거가 된다.
+
+SYS@cdb1> EXIT
+================================================================================

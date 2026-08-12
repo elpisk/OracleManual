@@ -1,0 +1,120 @@
+================================================================================
+ 31장 실습 02 — AWR 스냅샷 개념 확인
+ 목표: 수동 스냅샷 생성(CREATE_SNAPSHOT), 설정 변경(MODIFY_SNAPSHOT_SETTINGS),
+       구간 삭제(DROP_SNAPSHOT_RANGE)를 직접 수행하며 스냅샷의 개념을 익힌다.
+ 환경: CDB=cdb1 (루트 컨테이너에서 수행)
+================================================================================
+
+-- [1] 현재 보관 중인 스냅샷 목록을 확인한다. 각 스냅샷은 고유한 SNAP_ID 를 갖는다.
+$ sqlplus sys@cdb1 as sysdba
+
+SYS@cdb1> SET LINESIZE 180
+SYS@cdb1> ALTER SESSION SET nls_date_format='YYYY-MM-DD HH24:MI:SS';
+
+Session altered.
+
+SYS@cdb1> SELECT snap_id, begin_interval_time, end_interval_time
+  2       FROM  dba_hist_snapshot
+  3      ORDER BY snap_id DESC FETCH FIRST 5 ROWS ONLY;
+
+   SNAP_ID BEGIN_INTERVAL_TIME  END_INTERVAL_TIME
+---------- -------------------- --------------------
+        52 2026-07-22 12:00:00  2026-07-22 12:30:11
+        51 2026-07-22 11:00:00  2026-07-22 12:00:00
+        50 2026-07-22 10:00:00  2026-07-22 11:00:00
+        49 2026-07-22 09:31:44  2026-07-22 10:00:00
+        48 2026-07-22 09:00:00  2026-07-22 09:31:44
+
+--------------------------------------------------------------------------------
+-- [2] 대형 배치 직전/직후를 정밀 포착하기 위해 수동 스냅샷을 두 번 생성한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> -- 배치 시작 직전: 함수 형태로 SNAP_ID 를 직접 받는다.
+SYS@cdb1> VARIABLE sid_begin NUMBER
+SYS@cdb1> EXEC :sid_begin := DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT();
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> PRINT sid_begin
+
+ SID_BEGIN
+----------
+        53
+
+SYS@cdb1> -- (여기서 대형 배치를 수행했다고 가정)
+SYS@cdb1> -- 배치 종료 직후: 두 번째 스냅샷.
+SYS@cdb1> VARIABLE sid_end NUMBER
+SYS@cdb1> EXEC :sid_end := DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT();
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> PRINT sid_end
+
+   SID_END
+----------
+        54
+
+-- 이제 SNAP_ID 53~54 구간이 '배치 구간'만 정확히 담은 분석 대상이 된다.
+
+--------------------------------------------------------------------------------
+-- [3] 스냅샷 간격/보존 기간을 변경한다(분 단위).
+--------------------------------------------------------------------------------
+SYS@cdb1> BEGIN
+  2         DBMS_WORKLOAD_REPOSITORY.MODIFY_SNAPSHOT_SETTINGS(
+  3           interval  => 30,       -- 30분 간격
+  4           retention => 21600);   -- 21600분 = 15일 보존
+  5       END;
+  6       /
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> SELECT snap_interval, retention FROM dba_hist_wr_control;
+
+SNAP_INTERVAL        RETENTION
+-------------------- --------------------
++00000 00:30:00.0    +00015 00:00:00.0
+
+-- 간격 30분, 보존 15일로 반영되었다.
+
+--------------------------------------------------------------------------------
+-- [4] (오류 → 원인 → 수정)
+--     아직 존재하지 않는(미래) SNAP_ID 구간을 삭제하려다 오류를 만난다.
+--------------------------------------------------------------------------------
+SYS@cdb1> -- 실수로 990~999 라는 존재하지 않는 구간을 삭제하려 한다.
+SYS@cdb1> EXEC DBMS_WORKLOAD_REPOSITORY.DROP_SNAPSHOT_RANGE(low_snap_id=>990, high_snap_id=>999);
+BEGIN DBMS_WORKLOAD_REPOSITORY.DROP_SNAPSHOT_RANGE(low_snap_id=>990, high_snap_id=>999); END;
+
+*
+ERROR at line 1:
+ORA-13514: Snapshot ID range is invalid
+ORA-06512: at "SYS.DBMS_WORKLOAD_REPOSITORY", line 1103
+ORA-06512: at line 1
+
+SYS@cdb1> -- 원인 파악: 지정한 low/high SNAP_ID 가 실제 존재하는 범위를 벗어났다.
+SYS@cdb1> -- 실제 존재하는 SNAP_ID 범위를 먼저 확인한다.
+SYS@cdb1> SELECT MIN(snap_id) AS min_id, MAX(snap_id) AS max_id FROM dba_hist_snapshot;
+
+    MIN_ID     MAX_ID
+---------- ----------
+        48         54
+
+SYS@cdb1> -- 수정: 실제 존재하는 구간(테스트로 만든 53~54)만 안전하게 삭제한다.
+SYS@cdb1> EXEC DBMS_WORKLOAD_REPOSITORY.DROP_SNAPSHOT_RANGE(low_snap_id=>53, high_snap_id=>54);
+
+PL/SQL procedure successfully completed.
+
+SYS@cdb1> SELECT snap_id FROM dba_hist_snapshot WHERE snap_id IN (53,54);
+
+no rows selected
+
+-- 지정한 구간이 정상적으로 제거되었다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 스냅샷은 특정 시점의 누적 통계를 떠 놓은 것이며 고유 SNAP_ID 를 갖는다.
+-- 2) 성능 분석은 두 스냅샷 사이 구간(interval)의 변화량을 보는 작업이다.
+-- 3) CREATE_SNAPSHOT(수동), MODIFY_SNAPSHOT_SETTINGS(간격/보존), DROP_SNAPSHOT_RANGE(삭제).
+-- 4) DROP/분석 시 반드시 실제 존재하는 SNAP_ID 범위를 먼저 확인한다(ORA-13514 방지).
+
+SYS@cdb1> EXIT
+================================================================================

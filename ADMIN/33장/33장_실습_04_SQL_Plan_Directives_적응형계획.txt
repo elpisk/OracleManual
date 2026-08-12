@@ -1,0 +1,123 @@
+================================================================================
+ 33장 실습 04 — SQL Plan Directives 및 Adaptive Execution Plans 확인
+ 목표: 카디널리티 오추정으로 생성되는 SQL Plan Directive를 조회하고,
+       컬럼 그룹 확장 통계로 문제를 해소해 디렉티브 상태 변화를 관찰한다.
+       또한 적응형 실행 계획 파라미터와 계획 표시(FORMAT 'adaptive')를 확인한다.
+ 환경: CDB=cdb1, PDB=orclpdb1 (SH 스키마, 실습 01의 상관관계 문제 후속)
+================================================================================
+
+$ sqlplus sys@orclpdb1 as sysdba
+
+-- [1] 적응형 최적화 관련 파라미터의 19c 기본값을 확인한다.
+SYS@cdb1> SHOW PARAMETER optimizer_adaptive
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- -------
+optimizer_adaptive_plans             boolean     TRUE
+optimizer_adaptive_statistics        boolean     FALSE
+
+-- 19c 기본: 실행 계획 적응(PLANS)은 ON, 통계 적응(STATISTICS)은 OFF.
+
+--------------------------------------------------------------------------------
+-- [2] 상관관계가 있는 두 컬럼 조건으로 여러 번 질의해 오추정을 유발한다.
+--     (자동 재최적화가 오차를 감지하면 SQL Plan Directive가 생성된다.)
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT COUNT(*) FROM sh.customers
+  2   WHERE cust_state_province='CA' AND country_id=52790;
+  COUNT(*)
+----------
+      9800
+
+SYS@cdb1> -- 같은 술어 패턴의 질의를 반복 실행(생략) 후 디렉티브를 디스크로 flush.
+SYS@cdb1> EXEC DBMS_SPD.FLUSH_SQL_PLAN_DIRECTIVE;
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [3] 생성된 SQL Plan Directive를 조회한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> COLUMN reason FORMAT A34
+SYS@cdb1> SELECT directive_id, type, state, reason
+  2    FROM dba_sql_plan_directives
+  3   WHERE directive_id IN
+  4         (SELECT directive_id FROM dba_sql_plan_dir_objects
+  5           WHERE owner='SH' AND object_name='CUSTOMERS');
+
+       DIRECTIVE_ID TYPE             STATE    REASON
+------------------- ---------------- -------- ----------------------------------
+8912345678901234567 DYNAMIC_SAMPLING USABLE   SINGLE TABLE CARDINALITY MISESTIMATE
+
+-- STATE=USABLE, TYPE=DYNAMIC_SAMPLING: 이후 최적화 시 동적 통계를 수행하라는 지시.
+
+--------------------------------------------------------------------------------
+-- [4] (오류 → 원인 → 수정)
+--     디렉티브를 삭제하려고 잘못된(존재하지 않는) ID를 넘겨 오류가 난다.
+--------------------------------------------------------------------------------
+SYS@cdb1> EXEC DBMS_SPD.DROP_SQL_PLAN_DIRECTIVE(directive_id => 999999999);
+BEGIN DBMS_SPD.DROP_SQL_PLAN_DIRECTIVE(directive_id => 999999999); END;
+
+*
+ERROR at line 1:
+ORA-13773: insufficient privileges to access SQL Plan Directive "999999999"
+ORA-06512: at "SYS.DBMS_SPD", line 128
+ORA-06512: at line 1
+
+SYS@cdb1> -- 원인 파악: 존재하지 않는(또는 접근 불가) 디렉티브 ID를 넘겼다.
+SYS@cdb1> -- 수정: DBA_SQL_PLAN_DIRECTIVES에서 실제 ID를 확인해 사용한다.
+SYS@cdb1> -- (여기서는 디렉티브를 지우지 않고, 근본 원인을 확장 통계로 해소한다.)
+
+--------------------------------------------------------------------------------
+-- [5] 근본 해소: 상관관계 컬럼에 컬럼 그룹 확장 통계를 만들고 재수집한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT DBMS_STATS.CREATE_EXTENDED_STATS(
+  2           'SH','CUSTOMERS','(cust_state_province,country_id)') FROM dual;
+
+DBMS_STATS.CREATE_EXTENDED_STATS('SH','CUSTOMERS','(CUST_STATE...
+----------------------------------------------------------------
+SYS_STUKWU5#87SQUFUXHUKULXWLM
+
+SYS@cdb1> EXEC DBMS_STATS.GATHER_TABLE_STATS('SH','CUSTOMERS', -
+>   method_opt => 'FOR ALL COLUMNS SIZE AUTO');
+
+PL/SQL procedure successfully completed.
+
+-- 이제 옵티마이저는 두 컬럼 조합의 실제 NDV를 알아 정확히 추정한다.
+
+--------------------------------------------------------------------------------
+-- [6] 확장 통계가 반영되었는지, 디렉티브 상태가 바뀌었는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT extension_name, extension
+  2    FROM dba_stat_extensions
+  3   WHERE owner='SH' AND table_name='CUSTOMERS';
+
+EXTENSION_NAME                 EXTENSION
+------------------------------ ------------------------------------
+SYS_STUKWU5#87SQUFUXHUKULXWLM  ("CUST_STATE_PROVINCE","COUNTRY_ID")
+
+SYS@cdb1> -- 이후 같은 질의를 최적화하면 정적(확장) 통계로 정확 추정 → 동적 통계 불필요.
+SYS@cdb1> -- 디렉티브 상태는 이후 SUPERSEDED로 전이된다(더 이상 필요 없어짐).
+SYS@cdb1> SELECT state, notes FROM dba_sql_plan_directives
+  2   WHERE directive_id = 8912345678901234567;
+
+STATE      NOTES
+---------- ------------------------------------
+SUPERSEDED <internal_state>HAS_STATS</internal_state>
+
+--------------------------------------------------------------------------------
+-- [7] 적응형 실행 계획의 대안 라인을 확인한다(FORMAT 'adaptive').
+--------------------------------------------------------------------------------
+SYS@cdb1> SELECT * FROM TABLE(
+  2    DBMS_XPLAN.DISPLAY_CURSOR(FORMAT=>'+adaptive'));
+
+-- Note: '- this is an adaptive plan' 주석과 함께, 채택되지 않은 조인 대안(-)이 표시됨.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 카디널리티 오추정이 반복되면 SQL Plan Directive(컬럼 조합 단위)가 생성된다.
+-- 2) 디렉티브는 이후 최적화에 동적 통계/확장 통계 필요를 알려 준다.
+-- 3) 권고대로 컬럼 그룹 확장 통계를 만들면 디렉티브가 SUPERSEDED로 전이된다.
+-- 4) 19c 기본: ADAPTIVE_PLANS=TRUE, ADAPTIVE_STATISTICS=FALSE.
+-- 5) 잘못된 디렉티브 ID 조작은 ORA-13773. 실제 ID를 뷰에서 확인해 사용한다.
+
+SYS@cdb1> EXIT
+================================================================================
