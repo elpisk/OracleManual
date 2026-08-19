@@ -1,0 +1,542 @@
+================================================================================
+ 제4장 실습 06 — Procedure / Function 재컴파일 및 삭제
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) USER_DEPENDENCIES 로 의존 관계와 영향 범위를 확인한다
+               2) 테이블 구조 변경으로 의존 객체가 INVALID 가 되는 것을 재현한다
+               3) ALTER ... COMPILE 로 재컴파일하고 상태를 재검증한다
+               4) DROP 이후의 PLS-00201 · ORA-04043 · PLS-00905 를 확인한다
+               5) 재실행 가능한 배포 스크립트 패턴과 권한 유지 원칙을 익힌다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 접속과 현재 상태 확인
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Tue Aug 19 16:10:47 2025
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 130
+
+SQL> SELECT object_name, object_type, status,
+  2         TO_CHAR(last_ddl_time, 'YYYY-MM-DD HH24:MI') AS last_ddl
+  3    FROM user_objects
+  4   WHERE object_type IN ('PROCEDURE', 'FUNCTION')
+  5   ORDER BY status, object_type, object_name;
+
+OBJECT_NAME               OBJECT_TYPE  STATUS  LAST_DDL
+------------------------- ------------ ------- ----------------
+DEL_EMP                   PROCEDURE    INVALID 2025-08-19 11:52
+GET_ANNUAL_SALARY         FUNCTION     VALID   2025-08-19 10:28
+GET_DEPT_NAME             FUNCTION     VALID   2025-08-19 14:12
+GET_FULL_NAME             FUNCTION     VALID   2025-08-19 10:20
+GRADE_OF                  FUNCTION     VALID   2025-08-19 10:41
+TAX                       FUNCTION     VALID   2025-08-19 14:08
+CALC_PAY                  PROCEDURE    VALID   2025-08-19 09:31
+DEPT_REPORT               PROCEDURE    VALID   2025-08-19 15:22
+GET_DEPT_STAT             PROCEDURE    VALID   2025-08-19 09:38
+SHOW_EMP                  PROCEDURE    VALID   2025-08-19 15:04
+
+
+--------------------------------------------------------------------------------
+[2] (오류 상황 1) 참조 테이블이 사라진 프로시저 — 실습 03 의 잔재
+--------------------------------------------------------------------------------
+
+SQL> EXEC del_emp('King');
+BEGIN del_emp('King'); END;
+
+*
+ERROR at line 1:
+ORA-06550: line 1, column 7:
+PLS-00905: object HR.DEL_EMP is invalid
+ORA-06550: line 1, column 7:
+PL/SQL: Statement ignored
+
+-- [원인 파악] 재컴파일을 시도해 원인을 확인한다.
+SQL> ALTER PROCEDURE del_emp COMPILE;
+
+Warning: Procedure altered with compilation errors.
+
+SQL> SHOW ERRORS PROCEDURE del_emp
+Errors for PROCEDURE DEL_EMP:
+
+LINE/COL ERROR
+-------- -----------------------------------------------------------------
+4/4      PL/SQL: SQL Statement ignored
+4/17     PL/SQL: ORA-00942: table or view does not exist
+
+--   실습 03 에서 EMP_COPY 테이블을 DROP 했기 때문에 참조 대상이 사라졌다.
+--   ALTER ... COMPILE 이 'altered' 가 아니라 경고를 낸 점에 주목한다.
+
+-- [수정] 테이블을 다시 만들면 재컴파일에 성공한다.
+SQL> CREATE TABLE emp_copy AS SELECT * FROM employees;
+
+Table created.
+
+SQL> ALTER PROCEDURE del_emp COMPILE;
+
+Procedure altered.
+
+SQL> SELECT object_name, status FROM user_objects WHERE object_name='DEL_EMP';
+
+OBJECT_NAME       STATUS
+----------------- -------
+DEL_EMP           VALID
+
+SQL> EXEC del_emp('King');
+2 건 삭제
+
+PL/SQL procedure successfully completed.
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+
+--------------------------------------------------------------------------------
+[3] 의존 관계 확인 — USER_DEPENDENCIES
+--------------------------------------------------------------------------------
+
+SQL> SELECT name, type, referenced_name, referenced_type
+  2    FROM user_dependencies
+  3   WHERE referenced_name = 'EMPLOYEES'
+  4     AND type IN ('PROCEDURE', 'FUNCTION')
+  5   ORDER BY type, name;
+
+NAME                 TYPE       REFERENCED_NAME  REFERENCED_TYPE
+-------------------- ---------- ---------------- ----------------
+GET_ANNUAL_SALARY    FUNCTION   EMPLOYEES        TABLE
+GET_FULL_NAME        FUNCTION   EMPLOYEES        TABLE
+IS_MANAGER_YN        FUNCTION   EMPLOYEES        TABLE
+CALC_PAY             PROCEDURE  EMPLOYEES        TABLE
+DEPT_REPORT          PROCEDURE  EMPLOYEES        TABLE
+GET_DEPT_STAT        PROCEDURE  EMPLOYEES        TABLE
+SHOW_EMP             PROCEDURE  EMPLOYEES        TABLE
+
+-- 서브프로그램끼리의 의존 관계도 확인할 수 있다.
+SQL> SELECT name, type, referenced_name, referenced_type
+  2    FROM user_dependencies
+  3   WHERE referenced_name = 'GET_FULL_NAME';
+
+NAME                 TYPE       REFERENCED_NAME  REFERENCED_TYPE
+-------------------- ---------- ---------------- ----------------
+CHECK_EMP            PROCEDURE  GET_FULL_NAME    FUNCTION
+
+-- CHECK_EMP 프로시저가 GET_FULL_NAME 함수를 호출하고 있다.
+-- 함수를 건드리면 프로시저가 영향을 받는다는 뜻이다.
+
+
+--------------------------------------------------------------------------------
+[4] 테이블 구조 변경으로 의존 객체가 INVALID 가 되는 것을 재현한다
+--------------------------------------------------------------------------------
+
+SQL> ALTER TABLE employees MODIFY (last_name VARCHAR2(30));
+
+Table altered.
+
+SQL> SELECT object_name, object_type, status
+  2    FROM user_objects
+  3   WHERE status = 'INVALID'
+  4   ORDER BY object_type, object_name;
+
+OBJECT_NAME               OBJECT_TYPE  STATUS
+------------------------- ------------ -------
+GET_ANNUAL_SALARY         FUNCTION     INVALID
+GET_FULL_NAME             FUNCTION     INVALID
+IS_MANAGER_YN             FUNCTION     INVALID
+CALC_PAY                  PROCEDURE    INVALID
+CHECK_EMP                 PROCEDURE    INVALID
+DEPT_REPORT               PROCEDURE    INVALID
+GET_DEPT_STAT             PROCEDURE    INVALID
+SHOW_EMP                  PROCEDURE    INVALID
+
+-- [확인]
+--   EMPLOYEES 를 참조하는 객체들이 한꺼번에 INVALID 가 되었다.
+--   CHECK_EMP 는 EMPLOYEES 를 직접 참조하지 않지만 GET_FULL_NAME 을
+--   호출하므로 간접 의존으로 함께 무효화되었다(연쇄 무효화).
+--   11g 이후의 세밀한 의존성 추적 덕분에 사용하지 않는 컬럼만 바뀌면
+--   무효화되지 않는 경우도 있으나, 자료형 변경은 여전히 무효화를 일으킨다.
+
+-- 자동 재컴파일 : 호출하면 오라클이 먼저 재컴파일을 시도한다.
+SQL> EXEC show_emp(100);
+Steven King
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT object_name, status FROM user_objects WHERE object_name='SHOW_EMP';
+
+OBJECT_NAME       STATUS
+----------------- -------
+SHOW_EMP          VALID
+
+-- 성공적으로 재컴파일되어 VALID 로 돌아왔다.
+-- 그러나 이 방식은 두 가지 문제가 있다.
+--   (1) 재컴파일이 실패하면 운영 중에 오류가 그대로 터진다.
+--   (2) 첫 호출자가 컴파일 비용을 부담하므로 응답 시간이 튄다.
+
+
+--------------------------------------------------------------------------------
+[5] 명시적 재컴파일 — ALTER ... COMPILE
+--------------------------------------------------------------------------------
+
+SQL> ALTER FUNCTION get_full_name COMPILE;
+
+Function altered.
+
+SQL> ALTER FUNCTION get_annual_salary COMPILE;
+
+Function altered.
+
+SQL> ALTER PROCEDURE calc_pay COMPILE;
+
+Procedure altered.
+
+-- [주의] 'altered' 는 컴파일을 시도했다는 뜻일 뿐이다.
+--        반드시 STATUS 를 다시 조회해 검증해야 한다.
+SQL> SELECT object_name, object_type, status
+  2    FROM user_objects
+  3   WHERE status = 'INVALID'
+  4   ORDER BY object_type, object_name;
+
+OBJECT_NAME               OBJECT_TYPE  STATUS
+------------------------- ------------ -------
+IS_MANAGER_YN             FUNCTION     INVALID
+CHECK_EMP                 PROCEDURE    INVALID
+DEPT_REPORT               PROCEDURE    INVALID
+GET_DEPT_STAT             PROCEDURE    INVALID
+
+-- 남은 객체가 있으면 반복하거나 일괄 처리한다.
+SQL> BEGIN
+  2     FOR r IN (SELECT object_name, object_type
+  3                 FROM user_objects
+  4                WHERE status = 'INVALID'
+  5                  AND object_type IN ('PROCEDURE', 'FUNCTION')) LOOP
+  6        BEGIN
+  7           EXECUTE IMMEDIATE 'ALTER ' || r.object_type || ' ' ||
+  8                             r.object_name || ' COMPILE';
+  9           DBMS_OUTPUT.PUT_LINE('재컴파일 : ' || r.object_name);
+ 10        EXCEPTION
+ 11           WHEN OTHERS THEN                    -- 한 건 실패가 전체를 멈추지 않게
+ 12              DBMS_OUTPUT.PUT_LINE('실패 : ' || r.object_name ||
+ 13                                   ' - ' || SQLERRM);
+ 14        END;
+ 15     END LOOP;
+ 16  END;
+ 17  /
+재컴파일 : IS_MANAGER_YN
+재컴파일 : CHECK_EMP
+재컴파일 : DEPT_REPORT
+재컴파일 : GET_DEPT_STAT
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT COUNT(*) AS invalid_cnt FROM user_objects WHERE status = 'INVALID';
+
+INVALID_CNT
+-----------
+          0
+
+-- 스키마 전체를 일괄 처리하는 표준 방법도 있다(권한 필요).
+SQL> EXEC DBMS_UTILITY.COMPILE_SCHEMA(schema => 'HR', compile_all => FALSE);
+
+PL/SQL procedure successfully completed.
+
+-- DBA 권한이 있으면 UTL_RECOMP 패키지를 쓸 수도 있다.
+--   EXEC UTL_RECOMP.RECOMP_SERIAL('HR');
+--   EXEC UTL_RECOMP.RECOMP_PARALLEL(4, 'HR');
+
+
+--------------------------------------------------------------------------------
+[6] (오류 상황 2) 하위 객체를 DROP 하면 상위 객체가 INVALID 가 된다
+--------------------------------------------------------------------------------
+
+SQL> EXEC check_emp(100);
+처리 계속 : Steven King
+
+PL/SQL procedure successfully completed.
+
+SQL> DROP FUNCTION get_full_name;
+
+Function dropped.
+
+SQL> SELECT object_name, status FROM user_objects
+  2   WHERE object_name IN ('CHECK_EMP', 'GET_FULL_NAME');
+
+OBJECT_NAME       STATUS
+----------------- -------
+CHECK_EMP         INVALID
+
+-- GET_FULL_NAME 은 아예 사라졌고 CHECK_EMP 는 INVALID 가 되었다.
+SQL> EXEC check_emp(100);
+BEGIN check_emp(100); END;
+
+*
+ERROR at line 1:
+ORA-06550: line 1, column 7:
+PLS-00905: object HR.CHECK_EMP is invalid
+ORA-06550: line 1, column 7:
+PL/SQL: Statement ignored
+
+SQL> ALTER PROCEDURE check_emp COMPILE;
+
+Warning: Procedure altered with compilation errors.
+
+SQL> SHOW ERRORS PROCEDURE check_emp
+Errors for PROCEDURE CHECK_EMP:
+
+LINE/COL ERROR
+-------- -----------------------------------------------------------------
+11/4     PL/SQL: Statement ignored
+11/45    PLS-00201: identifier 'GET_FULL_NAME' must be declared
+
+-- [원인 파악]
+--   삭제된 함수를 참조하고 있으므로 재컴파일이 실패한다.
+--   PLS-00201 은 오타뿐 아니라 '객체가 존재하지 않는다'는 의미도 갖는다.
+
+-- [수정] 함수를 다시 만들면 상위 객체도 정상으로 돌아온다.
+SQL> CREATE OR REPLACE FUNCTION get_full_name (p_emp_id IN NUMBER)
+  2     RETURN VARCHAR2
+  3  IS
+  4     v_name   VARCHAR2(60);
+  5  BEGIN
+  6     SELECT first_name || ' ' || last_name INTO v_name
+  7       FROM employees WHERE employee_id = p_emp_id;
+  8     RETURN v_name;
+  9  EXCEPTION
+ 10     WHEN NO_DATA_FOUND THEN
+ 11        RETURN NULL;
+ 12  END get_full_name;
+ 13  /
+
+Function created.
+
+SQL> ALTER PROCEDURE check_emp COMPILE;
+
+Procedure altered.
+
+SQL> EXEC check_emp(100);
+처리 계속 : Steven King
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[7] (오류 상황 3) 삭제된 객체를 호출하거나 다시 삭제한다
+--------------------------------------------------------------------------------
+
+SQL> DROP PROCEDURE calc_pay;
+
+Procedure dropped.
+
+-- PL/SQL 에서 호출하면 식별자를 찾을 수 없다.
+SQL> EXEC calc_pay(100, 0.1);
+BEGIN calc_pay(100, 0.1); END;
+
+*
+ERROR at line 1:
+ORA-06550: line 1, column 7:
+PLS-00201: identifier 'CALC_PAY' must be declared
+ORA-06550: line 1, column 7:
+PL/SQL: Statement ignored
+
+-- SQL 에서 삭제된 함수를 참조하면 다른 오류가 나온다.
+SQL> DROP FUNCTION tax;
+
+Function dropped.
+
+SQL> SELECT last_name, tax(salary) FROM employees WHERE rownum = 1;
+SELECT last_name, tax(salary) FROM employees WHERE rownum = 1
+                  *
+ERROR at line 1:
+ORA-00904: "TAX": invalid identifier
+
+-- 존재하지 않는 객체를 다시 DROP 하면 ORA-04043 이다.
+SQL> DROP PROCEDURE calc_pay;
+DROP PROCEDURE calc_pay
+*
+ERROR at line 1:
+ORA-04043: object CALC_PAY does not exist
+
+-- [수정] 재실행 가능한 배포 스크립트는 DROP 을 예외로 감싼다.
+SQL> BEGIN
+  2     EXECUTE IMMEDIATE 'DROP PROCEDURE calc_pay';
+  3  EXCEPTION
+  4     WHEN OTHERS THEN
+  5        IF SQLCODE != -4043 THEN RAISE; END IF;   -- 없으면 무시
+  6  END;
+  7  /
+
+PL/SQL procedure successfully completed.
+
+-- 또는 존재 여부를 먼저 확인한다.
+SQL> DECLARE
+  2     v_cnt   PLS_INTEGER;
+  3  BEGIN
+  4     SELECT COUNT(*) INTO v_cnt FROM user_objects
+  5      WHERE object_name = 'CALC_PAY' AND object_type = 'PROCEDURE';
+  6     IF v_cnt > 0 THEN
+  7        EXECUTE IMMEDIATE 'DROP PROCEDURE calc_pay';
+  8        DBMS_OUTPUT.PUT_LINE('삭제 완료');
+  9     ELSE
+ 10        DBMS_OUTPUT.PUT_LINE('대상 없음 — 건너뜀');
+ 11     END IF;
+ 12  END;
+ 13  /
+대상 없음 — 건너뜀
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[8] DROP + CREATE 와 CREATE OR REPLACE 의 결정적 차이 — 권한
+--------------------------------------------------------------------------------
+
+SQL> GRANT EXECUTE ON get_dept_stat TO scott;
+
+Grant succeeded.
+
+SQL> SELECT grantee, table_name, privilege
+  2    FROM user_tab_privs_made
+  3   WHERE table_name = 'GET_DEPT_STAT';
+
+GRANTEE    TABLE_NAME        PRIVILEGE
+---------- ----------------- ----------
+SCOTT      GET_DEPT_STAT     EXECUTE
+
+-- CREATE OR REPLACE 로 재배포하면 권한이 유지된다.
+SQL> CREATE OR REPLACE PROCEDURE get_dept_stat
+  2     (p_dept_id  IN  NUMBER,
+  3      p_cnt      OUT NUMBER,
+  4      p_sum      OUT NUMBER,
+  5      p_avg      OUT NUMBER)
+  6  IS
+  7  BEGIN
+  8     SELECT COUNT(*), NVL(SUM(salary), 0), NVL(ROUND(AVG(salary)), 0)
+  9       INTO p_cnt, p_sum, p_avg
+ 10       FROM employees WHERE department_id = p_dept_id;
+ 11  END get_dept_stat;
+ 12  /
+
+Procedure created.
+
+SQL> SELECT grantee, privilege FROM user_tab_privs_made
+  2   WHERE table_name = 'GET_DEPT_STAT';
+
+GRANTEE    PRIVILEGE
+---------- ----------
+SCOTT      EXECUTE
+
+-- 그러나 DROP 후 CREATE 하면 권한이 사라진다.
+SQL> DROP PROCEDURE get_dept_stat;
+
+Procedure dropped.
+
+SQL> CREATE OR REPLACE PROCEDURE get_dept_stat
+  2     (p_dept_id  IN  NUMBER,
+  3      p_cnt      OUT NUMBER,
+  4      p_sum      OUT NUMBER,
+  5      p_avg      OUT NUMBER)
+  6  IS
+  7  BEGIN
+  8     SELECT COUNT(*), NVL(SUM(salary), 0), NVL(ROUND(AVG(salary)), 0)
+  9       INTO p_cnt, p_sum, p_avg
+ 10       FROM employees WHERE department_id = p_dept_id;
+ 11  END get_dept_stat;
+ 12  /
+
+Procedure created.
+
+SQL> SELECT COUNT(*) AS grant_cnt FROM user_tab_privs_made
+  2   WHERE table_name = 'GET_DEPT_STAT';
+
+ GRANT_CNT
+----------
+         0
+
+-- [확인]
+--   권한이 모두 사라졌다. SCOTT 세션에서 호출하면 ORA-00904 또는
+--   PLS-00201 로 실패한다. 운영 환경에서 DROP 후 CREATE 로 배포하면
+--   다른 스키마의 호출이 전부 깨지는 사고가 발생하는 이유다.
+--   반드시 CREATE OR REPLACE 를 사용한다.
+
+SQL> GRANT EXECUTE ON get_dept_stat TO scott;
+
+Grant succeeded.
+
+
+--------------------------------------------------------------------------------
+[9] 실습 환경 정리
+--------------------------------------------------------------------------------
+
+SQL> ALTER TABLE employees MODIFY (last_name VARCHAR2(25));
+
+Table altered.
+
+SQL> DROP TABLE emp_copy PURGE;
+
+Table dropped.
+
+SQL> BEGIN
+  2     FOR r IN (SELECT object_name, object_type
+  3                 FROM user_objects
+  4                WHERE status = 'INVALID'
+  5                  AND object_type IN ('PROCEDURE', 'FUNCTION')) LOOP
+  6        BEGIN
+  7           EXECUTE IMMEDIATE 'ALTER ' || r.object_type || ' ' ||
+  8                             r.object_name || ' COMPILE';
+  9        EXCEPTION
+ 10           WHEN OTHERS THEN NULL;
+ 11        END;
+ 12     END LOOP;
+ 13  END;
+ 14  /
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT object_name, object_type, status
+  2    FROM user_objects
+  3   WHERE status = 'INVALID';
+
+OBJECT_NAME       OBJECT_TYPE  STATUS
+----------------- ------------ -------
+DEL_EMP           PROCEDURE    INVALID
+
+-- DEL_EMP 는 삭제된 EMP_COPY 를 참조하므로 재컴파일할 수 없다. 삭제한다.
+SQL> DROP PROCEDURE del_emp;
+
+Procedure dropped.
+
+SQL> SELECT COUNT(*) AS invalid_cnt FROM user_objects WHERE status = 'INVALID';
+
+INVALID_CNT
+----------
+         0
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
+
+================================================================================
+ 실습 06 정리
+--------------------------------------------------------------------------------
+ · USER_DEPENDENCIES 로 어떤 객체가 무엇을 참조하는지 확인해
+   스키마 변경의 영향 범위를 사전에 계산한다.
+ · 참조 테이블의 자료형이 바뀌면 의존 객체가 INVALID 가 되며,
+   간접 의존 객체까지 연쇄적으로 무효화된다.
+ · INVALID 객체는 호출 시 자동 재컴파일되지만, 실패하면 PLS-00905 가 나고
+   성공해도 첫 호출자가 컴파일 비용을 부담한다.
+   따라서 배포 절차에 ALTER ... COMPILE 을 명시적으로 넣는다.
+ · 'Procedure altered' 는 컴파일 시도를 뜻할 뿐이므로 STATUS 를 재검증한다.
+ · 삭제된 객체를 PL/SQL 에서 호출하면 PLS-00201, SQL 에서 참조하면
+   ORA-00904, 존재하지 않는 객체를 DROP 하면 ORA-04043 이 발생한다.
+ · DROP 후 CREATE 는 부여된 EXECUTE 권한을 모두 잃는다.
+   운영 환경에서는 반드시 CREATE OR REPLACE 를 사용한다.
+================================================================================

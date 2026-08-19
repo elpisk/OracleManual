@@ -1,0 +1,283 @@
+================================================================================
+ 제3장 실습 04 — OTHERS 예외 처리와 예외 전파
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) OTHERS 의 위치 규칙과 PLS-00370 을 확인한다
+               2) 중첩 블록에서 예외가 전파되는 경로를 추적한다
+               3) 예외를 잡고도 RAISE 하지 않아 실패가 감춰지는 논리 오류를 재현한다
+               4) RAISE 로 재발생시켜 호출자가 실패를 인지하도록 수정한다
+               5) EXCEPTION 절 내부에서 발생한 예외의 동작을 확인한다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 접속 및 준비
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 10:05:11 2025
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+
+SQL> SELECT COUNT(*) FROM plsql_job_log;
+
+  COUNT(*)
+----------
+         2
+
+-- 실습 03 에서 만든 로그 테이블을 계속 사용한다.
+
+
+--------------------------------------------------------------------------------
+[2] 오류 → 원인 → 수정 : OTHERS 를 앞에 두면 PLS-00370
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     v_name   employees.last_name%TYPE;
+  3  BEGIN
+  4     SELECT last_name INTO v_name FROM employees WHERE employee_id = 9999;
+  5  EXCEPTION
+  6     WHEN OTHERS THEN                       -- 앞에 두었다
+  7        DBMS_OUTPUT.PUT_LINE('기타 오류');
+  8     WHEN NO_DATA_FOUND THEN
+  9        DBMS_OUTPUT.PUT_LINE('데이터 없음');
+ 10  END;
+ 11  /
+   WHEN OTHERS THEN
+        *
+ERROR at line 6:
+ORA-06550: line 6, column 9:
+PLS-00370: OTHERS handler must be last among the exception handlers of a block
+
+-- [오류 발생]
+--   PLS-00370. 컴파일 자체가 되지 않는다.
+-- [원인 파악]
+--   OTHERS 는 앞에서 잡히지 않은 모든 예외를 포착하므로
+--   반드시 마지막 핸들러여야 한다. 앞에 두면 뒤의 핸들러가 도달 불가능해진다.
+-- [수정]
+--   구체적인 예외를 먼저 쓰고 OTHERS 를 마지막에 한 번만 둔다.
+
+SQL> DECLARE
+  2     v_name   employees.last_name%TYPE;
+  3  BEGIN
+  4     SELECT last_name INTO v_name FROM employees WHERE employee_id = 9999;
+  5  EXCEPTION
+  6     WHEN NO_DATA_FOUND THEN
+  7        DBMS_OUTPUT.PUT_LINE('데이터 없음');
+  8     WHEN OTHERS THEN                       -- 마지막에 한 번만
+  9        DBMS_OUTPUT.PUT_LINE('기타 오류 : ' || SQLERRM);
+ 10  END;
+ 11  /
+데이터 없음
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[3] 예외 전파 경로 추적
+--------------------------------------------------------------------------------
+
+SQL> BEGIN
+  2     DBMS_OUTPUT.PUT_LINE('바깥 블록 시작');
+  3     BEGIN
+  4        DBMS_OUTPUT.PUT_LINE('안쪽 블록 시작');
+  5        RAISE ZERO_DIVIDE;
+  6        DBMS_OUTPUT.PUT_LINE('안쪽 : 이 줄은 실행되지 않는다');
+  7     EXCEPTION
+  8        WHEN NO_DATA_FOUND THEN            -- 일치하는 핸들러가 없다
+  9           DBMS_OUTPUT.PUT_LINE('안쪽에서 처리');
+ 10     END;
+ 11     DBMS_OUTPUT.PUT_LINE('바깥 : 이 줄도 실행되지 않는다');
+ 12  EXCEPTION
+ 13     WHEN ZERO_DIVIDE THEN
+ 14        DBMS_OUTPUT.PUT_LINE('바깥 블록에서 처리');
+ 15  END;
+ 16  /
+바깥 블록 시작
+안쪽 블록 시작
+바깥 블록에서 처리
+
+PL/SQL procedure successfully completed.
+
+-- [관찰 포인트]
+--   1) 안쪽 블록에 ZERO_DIVIDE 핸들러가 없으므로 예외가 바깥으로 전파되었다.
+--   2) 전파되면 안쪽 블록은 이미 종료된 상태다(6행 미실행).
+--   3) 바깥 블록의 남은 실행부(11행)도 건너뛰고 바로 EXCEPTION 절로 갔다.
+--   4) 핸들러 실행 후 예외 발생 지점으로 되돌아가지 않는다.
+
+
+--------------------------------------------------------------------------------
+[4] 오류 → 원인 → 수정 : 예외를 잡고도 RAISE 하지 않아 실패가 감춰진다
+--------------------------------------------------------------------------------
+
+-- 하위 처리 블록이 예외를 잡고 출력만 하는 상황을 재현한다.
+
+SQL> BEGIN
+  2     -- 하위 처리 (실무에서는 프로시저 호출에 해당)
+  3     BEGIN
+  4        UPDATE employees SET salary = salary / 0 WHERE department_id = 60;
+  5     EXCEPTION
+  6        WHEN OTHERS THEN
+  7           DBMS_OUTPUT.PUT_LINE('[하위] 오류 : ' || SQLERRM);
+  8           -- RAISE 가 없다!
+  9     END;
+ 10
+ 11     -- 상위는 하위가 성공했다고 믿는다
+ 12     DBMS_OUTPUT.PUT_LINE('[상위] 처리 완료. 후속 작업을 진행한다.');
+ 13     COMMIT;
+ 14  EXCEPTION
+ 15     WHEN OTHERS THEN
+ 16        DBMS_OUTPUT.PUT_LINE('[상위] 실패 감지 : ' || SQLCODE);
+ 17        ROLLBACK;
+ 18  END;
+ 19  /
+[하위] 오류 : ORA-01476: divisor is equal to zero
+[상위] 처리 완료. 후속 작업을 진행한다.
+
+PL/SQL procedure successfully completed.
+
+-- [문제 상황]
+--   하위 처리는 분명히 실패했는데 상위는 '처리 완료' 를 출력하고 COMMIT 까지 했다.
+--   스케줄러 관점에서는 이 배치가 성공한 것으로 기록된다.
+-- [원인 파악]
+--   하위 블록이 예외를 잡아 처리했으므로 블록이 정상 종료되었고,
+--   상위 블록은 예외를 전혀 받지 못했다.
+-- [수정]
+--   하위에서는 로컬 로깅만 하고 인자 없는 RAISE 로 예외를 그대로 전파한다.
+
+SQL> DECLARE
+  2     v_code   NUMBER;
+  3     v_msg    VARCHAR2(400);
+  4  BEGIN
+  5     BEGIN
+  6        UPDATE employees SET salary = salary / 0 WHERE department_id = 60;
+  7     EXCEPTION
+  8        WHEN OTHERS THEN
+  9           v_code := SQLCODE;
+ 10           v_msg  := SUBSTR(SQLERRM, 1, 400);
+ 11           DBMS_OUTPUT.PUT_LINE('[하위] 로그 기록 : ' || v_msg);
+ 12           RAISE;                          -- 원래 예외를 그대로 재발생
+ 13     END;
+ 14
+ 15     DBMS_OUTPUT.PUT_LINE('[상위] 처리 완료');
+ 16     COMMIT;
+ 17  EXCEPTION
+ 18     WHEN OTHERS THEN
+ 19        DBMS_OUTPUT.PUT_LINE('[상위] 실패 감지 : ' || SQLCODE);
+ 20        ROLLBACK;
+ 21        INSERT INTO plsql_job_log(job_name, log_time, err_code, err_msg)
+ 22        VALUES ('SALARY_BATCH', SYSTIMESTAMP, v_code, v_msg);
+ 23        COMMIT;
+ 24  END;
+ 25  /
+[하위] 로그 기록 : ORA-01476: divisor is equal to zero
+[상위] 실패 감지 : -1476
+
+PL/SQL procedure successfully completed.
+
+-- 이번에는 상위가 실패를 인지했고 '처리 완료' 는 출력되지 않았다.
+-- 잘못된 COMMIT 대신 ROLLBACK 이 수행되었고 로그도 남았다.
+
+
+--------------------------------------------------------------------------------
+[5] 호출 환경까지 실패를 알리려면 RAISE_APPLICATION_ERROR 를 사용한다
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     v_code   NUMBER;
+  3     v_msg    VARCHAR2(400);
+  4  BEGIN
+  5     UPDATE employees SET salary = salary / 0 WHERE department_id = 60;
+  6     COMMIT;
+  7  EXCEPTION
+  8     WHEN OTHERS THEN
+  9        v_code := SQLCODE;
+ 10        v_msg  := SUBSTR(SQLERRM, 1, 400);
+ 11        ROLLBACK;
+ 12        RAISE_APPLICATION_ERROR(-20900, '급여 배치 실패: ' || v_msg, TRUE);
+ 13  END;
+ 14  /
+DECLARE
+*
+ERROR at line 1:
+ORA-20900: 급여 배치 실패: ORA-01476: divisor is equal to zero
+ORA-06512: at line 12
+ORA-01476: divisor is equal to zero
+
+-- keep_errors 를 TRUE 로 주었으므로 원인 오류(ORA-01476)까지 스택에 남았다.
+-- 스케줄러는 이 블록을 '실패' 로 기록한다.
+
+
+--------------------------------------------------------------------------------
+[6] 오류 → 원인 → 수정 : EXCEPTION 절 내부에서 발생한 예외
+--------------------------------------------------------------------------------
+
+SQL> BEGIN
+  2     RAISE ZERO_DIVIDE;
+  3  EXCEPTION
+  4     WHEN ZERO_DIVIDE THEN
+  5        -- 로그 컬럼 길이를 초과하는 값을 넣어 본다
+  6        INSERT INTO plsql_job_log(job_name, log_time, err_code, err_msg)
+  7        VALUES (RPAD('X', 100, 'X'), SYSTIMESTAMP, -1476, 'test');
+  8        COMMIT;
+  9  END;
+ 10  /
+BEGIN
+*
+ERROR at line 1:
+ORA-12899: value too large for column "HR"."PLSQL_JOB_LOG"."JOB_NAME"
+(actual: 100, maximum: 60)
+ORA-06512: at line 6
+
+-- [오류 발생]
+--   원래 오류(ORA-01476)가 아니라 로깅 오류(ORA-12899)가 보고되었다.
+-- [원인 파악]
+--   EXCEPTION 절 안에서 발생한 예외는 같은 블록이 잡을 수 없고
+--   즉시 바깥으로 전파된다. 그 결과 원래 오류가 가려졌다.
+-- [수정]
+--   핸들러 내부의 위험한 작업은 다시 중첩 블록으로 감싸 방어한다.
+
+SQL> BEGIN
+  2     RAISE ZERO_DIVIDE;
+  3  EXCEPTION
+  4     WHEN ZERO_DIVIDE THEN
+  5        BEGIN
+  6           INSERT INTO plsql_job_log(job_name, log_time, err_code, err_msg)
+  7           VALUES (RPAD('X', 100, 'X'), SYSTIMESTAMP, -1476, 'test');
+  8           COMMIT;
+  9        EXCEPTION
+ 10           WHEN OTHERS THEN NULL;          -- 로깅 실패가 본 오류를 가리지 않도록
+ 11        END;
+ 12        DBMS_OUTPUT.PUT_LINE('원래 오류 처리 완료 : ' || SQLERRM);
+ 13  END;
+ 14  /
+원래 오류 처리 완료 : ORA-01476: divisor is equal to zero
+
+PL/SQL procedure successfully completed.
+
+-- 로깅은 실패했지만 원래 오류 처리는 정상적으로 끝났다.
+
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+-- 1) OTHERS 는 마지막에 한 번만. 앞에 두면 PLS-00370.
+-- 2) 처리되지 않은 예외는 바깥 블록으로 전파되고, 안쪽으로 되돌아가지 않는다.
+-- 3) 예외를 잡고 RAISE 하지 않으면 호출자는 실패를 알 수 없다.
+-- 4) 로컬 로깅 후 RAISE 또는 RAISE_APPLICATION_ERROR 로 실패를 전달한다.
+-- 5) EXCEPTION 절 내부의 위험한 작업은 중첩 블록으로 감싸 방어한다.
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

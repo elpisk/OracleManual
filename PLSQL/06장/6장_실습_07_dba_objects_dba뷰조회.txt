@@ -1,0 +1,385 @@
+================================================================================
+ 제6장 실습 07 — DBA_OBJECTS / DBA_USERS / DBA_TABLESPACES 조회 (DBA 권한 필요)
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (일반 계정) / SYSTEM (관리 계정)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) 권한 없는 계정이 DBA_ 뷰를 조회할 때의 ORA-00942 를 재현한다
+               2) "권한 없음"과 "객체 없음"이 구분되지 않는 이유를 이해한다
+               3) SYSTEM 계정으로 전환해 DBA_OBJECTS 를 조회한다
+               4) DBA_USERS 로 계정 상태와 만료 예정 계정을 점검한다
+               5) DBA_TABLESPACES / DBA_DATA_FILES / DBA_FREE_SPACE 로 공간을 점검한다
+               6) 필요한 뷰만 직접 GRANT 해 최소 권한 원칙을 적용한다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] HR 계정으로 DBA_ 뷰 조회를 시도한다
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 13:05:41 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 130
+SQL> SET PAGESIZE 60
+
+SQL> SHOW USER
+USER is "HR"
+
+SQL> SELECT COUNT(*) FROM dba_objects;
+SELECT COUNT(*) FROM dba_objects
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+
+--------------------------------------------------------------------------------
+[2] (함정) 이 오류는 "객체 없음"이 아니라 "권한 없음"이다
+--------------------------------------------------------------------------------
+
+-- 원인 파악
+--   DBA_OBJECTS 는 데이터베이스에 분명히 존재하는 뷰다. 그런데도 HR 에게는
+--   ORA-01031(insufficient privileges)이 아니라 ORA-00942 가 반환된다.
+--   오라클은 보안상 "존재하지만 권한이 없다"와 "존재하지 않는다"를 구분해
+--   알려 주지 않는다. 객체의 존재 여부 자체가 정보가 되기 때문이다.
+
+-- 확인 1 : 현재 세션이 조회할 수 있는 딕셔너리 뷰 목록에 있는지 본다.
+
+SQL> SELECT table_name FROM dict WHERE table_name = 'DBA_OBJECTS';
+
+no rows selected
+
+SQL> SELECT table_name FROM dict WHERE table_name = 'USER_OBJECTS';
+
+TABLE_NAME
+--------------------------------
+USER_OBJECTS
+
+-- 확인 2 : 현재 계정이 가진 롤과 시스템 권한을 확인한다.
+
+SQL> SELECT granted_role FROM user_role_privs ORDER BY granted_role;
+
+GRANTED_ROLE
+------------------------------
+CONNECT
+RESOURCE
+
+SQL> SELECT privilege FROM user_sys_privs
+  2   WHERE privilege LIKE '%DICTIONARY%';
+
+no rows selected
+
+-- SELECT ANY DICTIONARY 권한도 SELECT_CATALOG_ROLE 롤도 없다.
+-- 이것이 ORA-00942 의 진짜 원인이다.
+
+-- 확인 3 : ALL_ 계열은 조회할 수 있다.
+
+SQL> SELECT owner, COUNT(*) AS cnt FROM all_objects
+  2   WHERE owner IN ('HR', 'SYS') GROUP BY owner ORDER BY owner;
+
+OWNER            CNT
+---------- ---------
+HR                40
+SYS             9832
+
+-- ALL_ 계열은 "접근 권한이 있는 객체"만 보여 주므로 별도 권한이 필요 없다.
+
+
+--------------------------------------------------------------------------------
+[3] SYSTEM 계정으로 전환한다
+--------------------------------------------------------------------------------
+
+SQL> CONNECT system/oracle@localhost:1521/orclpdb
+Connected.
+
+SQL> SHOW USER
+USER is "SYSTEM"
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 130
+
+SQL> SELECT COUNT(*) FROM dba_objects;
+
+  COUNT(*)
+----------
+     73418
+
+
+--------------------------------------------------------------------------------
+[4] DBA_OBJECTS 로 전체 스키마를 점검한다
+--------------------------------------------------------------------------------
+
+SQL> SELECT owner, object_type, COUNT(*) AS cnt
+  2    FROM dba_objects
+  3   WHERE owner = 'HR'
+  4   GROUP BY owner, object_type ORDER BY cnt DESC;
+
+OWNER   OBJECT_TYPE                 CNT
+------- --------------------- ----------
+HR      INDEX                        20
+HR      TABLE                         9
+HR      PROCEDURE                     4
+HR      SEQUENCE                      3
+HR      TRIGGER                       2
+HR      VIEW                          1
+
+6 rows selected.
+
+-- 데이터베이스 전체의 INVALID 객체를 점검한다(오라클 내장 스키마는 제외).
+
+SQL> SELECT owner, object_name, object_type,
+  2         TO_CHAR(last_ddl_time, 'YYYY-MM-DD HH24:MI') AS last_ddl
+  3    FROM dba_objects
+  4   WHERE status = 'INVALID'
+  5     AND owner NOT IN ('SYS','SYSTEM','XDB','MDSYS','CTXSYS','ORDSYS')
+  6   ORDER BY owner, object_type, object_name;
+
+OWNER   OBJECT_NAME       OBJECT_TYPE   LAST_DDL
+------- ----------------- ------------- ----------------
+SCOTT   CALC_BONUS        FUNCTION      2026-08-14 17:22
+
+-- 소유자별 객체 수 상위 목록
+
+SQL> SELECT owner, COUNT(*) AS cnt FROM dba_objects
+  2   WHERE owner NOT LIKE 'SYS%'
+  3   GROUP BY owner ORDER BY cnt DESC FETCH FIRST 5 ROWS ONLY;
+
+OWNER            CNT
+---------- ---------
+XDB              874
+MDSYS            532
+CTXSYS           394
+HR                40
+SCOTT             13
+
+
+--------------------------------------------------------------------------------
+[5] DBA_USERS 로 계정 상태를 점검한다
+--------------------------------------------------------------------------------
+
+SQL> SELECT username, account_status,
+  2         TO_CHAR(expiry_date, 'YYYY-MM-DD') AS expiry,
+  3         default_tablespace, profile
+  4    FROM dba_users
+  5   WHERE username IN ('HR','SCOTT','SYSTEM','BATCH_USER')
+  6   ORDER BY username;
+
+USERNAME   ACCOUNT_STATUS      EXPIRY     DEFAULT_TABLESPACE PROFILE
+---------- ------------------- ---------- ------------------ --------
+HR         OPEN                2026-11-15 USERS              DEFAULT
+SCOTT      EXPIRED & LOCKED    2025-03-02 USERS              DEFAULT
+SYSTEM     OPEN                           SYSTEM             DEFAULT
+
+-- BATCH_USER 는 아직 없다. 조회 결과에 나오지 않을 뿐 오류는 아니다.
+
+-- 30일 이내에 만료되는 계정 점검 (배치 계정 만료는 흔한 장애 원인이다)
+
+SQL> SELECT username, account_status, expiry_date
+  2    FROM dba_users
+  3   WHERE expiry_date IS NOT NULL
+  4     AND expiry_date BETWEEN SYSDATE AND SYSDATE + 30
+  5   ORDER BY expiry_date;
+
+no rows selected
+
+-- 잠기거나 만료된 계정 전체 목록
+
+SQL> SELECT account_status, COUNT(*) AS cnt
+  2    FROM dba_users GROUP BY account_status ORDER BY cnt DESC;
+
+ACCOUNT_STATUS             CNT
+-------------------- ---------
+EXPIRED & LOCKED            32
+OPEN                         5
+LOCKED                       2
+
+
+--------------------------------------------------------------------------------
+[6] DBA_TABLESPACES 와 공간 점검
+--------------------------------------------------------------------------------
+
+SQL> SELECT tablespace_name, status, contents,
+  2         extent_management, segment_space_management
+  3    FROM dba_tablespaces ORDER BY tablespace_name;
+
+TABLESPACE_NAME STATUS   CONTENTS  EXTENT_MAN SEGMENT_SPACE_MAN
+--------------- -------- --------- ---------- -----------------
+SYSAUX          ONLINE   PERMANENT LOCAL      AUTO
+SYSTEM          ONLINE   PERMANENT LOCAL      MANUAL
+TEMP            ONLINE   TEMPORARY LOCAL      MANUAL
+UNDOTBS1        ONLINE   UNDO      LOCAL      MANUAL
+USERS           ONLINE   PERMANENT LOCAL      AUTO
+
+SQL> SELECT tablespace_name, file_name,
+  2         ROUND(bytes/1024/1024) AS size_mb, autoextensible
+  3    FROM dba_data_files ORDER BY tablespace_name;
+
+TABLESPACE_NAME FILE_NAME                                 SIZE_MB AUT
+--------------- ---------------------------------------- -------- ---
+SYSAUX          /u01/oradata/ORCL/orclpdb/sysaux01.dbf        650 YES
+SYSTEM          /u01/oradata/ORCL/orclpdb/system01.dbf        900 YES
+UNDOTBS1        /u01/oradata/ORCL/orclpdb/undotbs01.dbf       325 YES
+USERS           /u01/oradata/ORCL/orclpdb/users01.dbf           5 YES
+
+-- 사용률 계산 : DBA_DATA_FILES 와 DBA_FREE_SPACE 를 조인한다.
+
+SQL> SELECT d.tablespace_name,
+  2         ROUND(d.bytes/1024/1024) AS total_mb,
+  3         ROUND(NVL(f.bytes,0)/1024/1024) AS free_mb,
+  4         ROUND((d.bytes - NVL(f.bytes,0)) / d.bytes * 100, 1) AS used_pct
+  5    FROM (SELECT tablespace_name, SUM(bytes) bytes
+  6            FROM dba_data_files GROUP BY tablespace_name) d
+  7    LEFT JOIN (SELECT tablespace_name, SUM(bytes) bytes
+  8            FROM dba_free_space GROUP BY tablespace_name) f
+  9      ON d.tablespace_name = f.tablespace_name
+ 10   ORDER BY used_pct DESC;
+
+TABLESPACE_NAME  TOTAL_MB   FREE_MB  USED_PCT
+--------------- --------- --------- ---------
+SYSTEM                900        28      96.9
+SYSAUX                650        74      88.6
+USERS                   5         3      40.0
+UNDOTBS1              325       231      28.9
+
+-- 사용률이 90% 를 넘는 테이블스페이스는 경고 대상이다.
+-- 공간이 부족하면 ORA-01653(unable to extend)로 배치가 통째로 중단된다.
+
+
+--------------------------------------------------------------------------------
+[7] (오류 상황) DBA_ 뷰 이름을 잘못 입력했다
+--------------------------------------------------------------------------------
+
+SQL> SELECT COUNT(*) FROM dba_object;
+SELECT COUNT(*) FROM dba_object
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- 원인 파악
+--   이번에는 SYSTEM 계정인데도 같은 ORA-00942 가 나왔다.
+--   정확한 뷰 이름은 DBA_OBJECTS(복수형)이며 DBA_OBJECT 는 존재하지 않는다.
+--   즉 같은 오류 번호가 "권한 없음"과 "이름 오타" 두 경우에 모두 나온다.
+--   그래서 진단할 때는 다음 순서로 확인하는 것이 좋다.
+--     1) DICT 에서 뷰 이름이 실제로 있는지 확인한다
+--     2) 있다면 현재 계정의 권한을 확인한다
+
+SQL> SELECT table_name FROM dict
+  2   WHERE table_name LIKE 'DBA_OBJECT%' ORDER BY table_name;
+
+TABLE_NAME
+--------------------------------
+DBA_OBJECTS
+DBA_OBJECT_SIZE
+DBA_OBJECT_TABLES
+DBA_OBJECT_USAGE
+
+-- 수정 : 올바른 이름으로 조회한다.
+
+SQL> SELECT COUNT(*) FROM dba_objects WHERE owner = 'HR';
+
+  COUNT(*)
+----------
+        40
+
+
+--------------------------------------------------------------------------------
+[8] 최소 권한으로 자동화 계정을 만든다
+--------------------------------------------------------------------------------
+
+SQL> CREATE USER batch_user IDENTIFIED BY batch_pw
+  2     DEFAULT TABLESPACE users QUOTA 5M ON users;
+
+User created.
+
+SQL> GRANT CREATE SESSION, CREATE PROCEDURE TO batch_user;
+
+Grant succeeded.
+
+-- 롤이 아니라 필요한 뷰에만 직접 SELECT 권한을 부여한다.
+-- 롤로 주면 정의자 권한 프로그램의 정적 SQL 에서는 여전히 보이지 않는다.
+
+SQL> GRANT SELECT ON sys.dba_objects TO batch_user;
+
+Grant succeeded.
+
+SQL> GRANT SELECT ON sys.dba_users TO batch_user;
+
+Grant succeeded.
+
+SQL> CONNECT batch_user/batch_pw@localhost:1521/orclpdb
+Connected.
+
+SQL> SET SERVEROUTPUT ON
+
+SQL> SELECT COUNT(*) FROM dba_objects WHERE status = 'INVALID';
+
+  COUNT(*)
+----------
+         1
+
+-- 정의자 권한 프로시저 안의 정적 SQL 로도 정상 동작하는지 확인한다.
+
+SQL> CREATE OR REPLACE PROCEDURE check_invalid IS
+  2     v_cnt   NUMBER;
+  3  BEGIN
+  4     SELECT COUNT(*) INTO v_cnt FROM sys.dba_objects WHERE status = 'INVALID';
+  5     DBMS_OUTPUT.PUT_LINE('INVALID 객체 : ' || v_cnt);
+  6  END check_invalid;
+  7  /
+
+Procedure created.
+
+SQL> EXEC check_invalid
+INVALID 객체 : 1
+
+PL/SQL procedure successfully completed.
+
+-- 부여하지 않은 뷰는 여전히 보이지 않는다.
+
+SQL> SELECT COUNT(*) FROM dba_tablespaces;
+SELECT COUNT(*) FROM dba_tablespaces
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- 최소 권한 원칙이 그대로 동작하고 있음을 확인할 수 있다.
+
+
+--------------------------------------------------------------------------------
+[9] 실습 정리
+--------------------------------------------------------------------------------
+
+SQL> CONNECT system/oracle@localhost:1521/orclpdb
+Connected.
+
+SQL> DROP USER batch_user CASCADE;
+
+User dropped.
+
+SQL> SELECT username FROM dba_users WHERE username = 'BATCH_USER';
+
+no rows selected
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. 권한 없는 계정이 DBA_ 뷰를 조회하면 ORA-01031 이 아니라 ORA-00942 가 난다.
+    오라클은 "존재하지만 권한 없음"과 "존재하지 않음"을 구분해 알려 주지 않는다.
+ 2. 같은 ORA-00942 가 이름 오타에도 발생하므로, 진단은 DICT 에서 뷰 이름을
+    확인한 뒤 권한을 확인하는 순서로 진행한다.
+ 3. DBA_OBJECTS 는 전체 스키마의 객체와 INVALID 상태를 한 번에 보여 준다.
+ 4. DBA_USERS 의 ACCOUNT_STATUS 와 EXPIRY_DATE 로 만료 예정 계정을 미리 찾는다.
+ 5. DBA_TABLESPACES / DBA_DATA_FILES / DBA_FREE_SPACE 로 사용률을 계산한다.
+    90% 이상이면 경고 대상이며 방치하면 ORA-01653 이 발생한다.
+ 6. 자동화 계정에는 SELECT_CATALOG_ROLE 같은 롤 대신 필요한 뷰만 직접 GRANT 한다.
+    롤 권한은 정의자 권한 프로그램의 정적 SQL 에서 동작하지 않기 때문이다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

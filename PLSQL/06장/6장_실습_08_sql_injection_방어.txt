@@ -1,0 +1,505 @@
+================================================================================
+ 제6장 실습 08 — Dynamic SQL Injection 위험성 확인 및 Bind Variable 방어
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 주의        : 이 실습은 데이터를 변경하는 시나리오를 포함한다.
+               반드시 복사본 테이블(EMP_COPY)에서만 수행하고 확인 즉시 ROLLBACK 한다.
+ 학습 목표   : 1) 문자열 결합 동적 SQL 의 SQL Injection 을 안전하게 재현한다
+               2) 조회 유출과 데이터 변경 두 가지 피해 유형을 확인한다
+               3) Bind Variable 로 값 자리를 방어한다
+               4) DBMS_ASSERT 로 식별자 자리를 검증한다
+               5) 딕셔너리 대조 화이트리스트로 최종 방어선을 만든다
+               6) 방어 결과를 plsql_job_log 에 기록한다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 접속과 실습 환경 확인
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 14:02:10 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 130
+
+SQL> SELECT COUNT(*) AS total FROM emp_copy;
+
+     TOTAL
+----------
+       107
+
+SQL> SELECT COUNT(*) AS king_cnt FROM emp_copy WHERE last_name = 'King';
+
+  KING_CNT
+----------
+         2
+
+-- 원본 EMPLOYEES 는 절대 대상으로 삼지 않는다.
+SQL> SHOW AUTOCOMMIT
+autocommit OFF
+
+-- AUTOCOMMIT 이 OFF 인지 반드시 확인한다. ON 이면 ROLLBACK 이 불가능하다.
+
+
+--------------------------------------------------------------------------------
+[2] 취약한 조회 프로시저를 만든다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE find_emp_bad(p_name IN VARCHAR2) IS
+  2     TYPE t_tab IS TABLE OF VARCHAR2(120);
+  3     v_rows   t_tab;
+  4     v_sql    VARCHAR2(1000);
+  5  BEGIN
+  6     v_sql := 'SELECT last_name || '' / '' || salary
+  7                 FROM emp_copy
+  8                WHERE last_name = ''' || p_name || '''';
+  9     DBMS_OUTPUT.PUT_LINE('실행 문장 : ' || v_sql);
+ 10     EXECUTE IMMEDIATE v_sql BULK COLLECT INTO v_rows;
+ 11     DBMS_OUTPUT.PUT_LINE('조회 건수 : ' || v_rows.COUNT);
+ 12     FOR i IN 1 .. LEAST(v_rows.COUNT, 3) LOOP
+ 13        DBMS_OUTPUT.PUT_LINE('   ' || v_rows(i));
+ 14     END LOOP;
+ 15  END find_emp_bad;
+ 16  /
+
+Procedure created.
+
+-- 정상 입력
+
+SQL> EXEC find_emp_bad('King')
+실행 문장 : SELECT last_name || ' / ' || salary
+                 FROM emp_copy
+                WHERE last_name = 'King'
+조회 건수 : 2
+   King / 24000
+   King / 10000
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[3] (공격 재현 1) 조회 조건을 무력화해 전체 데이터를 노출시킨다
+--------------------------------------------------------------------------------
+
+SQL> EXEC find_emp_bad('x'' OR ''1''=''1')
+실행 문장 : SELECT last_name || ' / ' || salary
+                 FROM emp_copy
+                WHERE last_name = 'x' OR '1'='1'
+조회 건수 : 107
+   King / 24000
+   Kochhar / 17000
+   De Haan / 17000
+
+PL/SQL procedure successfully completed.
+
+-- 원인 파악
+--   입력값의 작은따옴표가 WHERE 절의 문자열을 닫아 버렸다.
+--   그 뒤의 OR '1'='1' 이 조건절의 일부로 해석되어 WHERE 절이 항상 참이 되었다.
+--   그 결과 특정 사원 한 명을 조회하려던 문장이 테이블 전체를 반환했다.
+--   출력된 "실행 문장"을 보면 조립 결과가 어떻게 바뀌었는지 한눈에 확인할 수 있다.
+
+-- 더 진행된 공격 : UNION 으로 다른 테이블의 데이터를 끌어온다.
+
+SQL> EXEC find_emp_bad('x'' UNION SELECT department_name || '' / '' || department_id FROM departments WHERE ''1''=''1')
+실행 문장 : SELECT last_name || ' / ' || salary
+                 FROM emp_copy
+                WHERE last_name = 'x' UNION SELECT department_name || ' / ' ||
+department_id FROM departments WHERE '1'='1'
+조회 건수 : 27
+   Accounting / 110
+   Administration / 10
+   Benefits / 160
+
+PL/SQL procedure successfully completed.
+
+-- SELECT 목록의 개수와 자료형만 맞추면 전혀 다른 테이블을 조회할 수 있다.
+
+
+--------------------------------------------------------------------------------
+[4] (공격 재현 2) 데이터 변경 — 반드시 즉시 ROLLBACK 한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE del_emp_bad(p_job IN VARCHAR2) IS
+  2     v_sql   VARCHAR2(1000);
+  3  BEGIN
+  4     v_sql := 'DELETE FROM emp_copy WHERE job_id = ''' || p_job || '''';
+  5     DBMS_OUTPUT.PUT_LINE('실행 문장 : ' || v_sql);
+  6     EXECUTE IMMEDIATE v_sql;
+  7     DBMS_OUTPUT.PUT_LINE('삭제 건수 : ' || SQL%ROWCOUNT);
+  8  END del_emp_bad;
+  9  /
+
+Procedure created.
+
+-- 정상 입력
+
+SQL> EXEC del_emp_bad('IT_PROG')
+실행 문장 : DELETE FROM emp_copy WHERE job_id = 'IT_PROG'
+삭제 건수 : 5
+
+PL/SQL procedure successfully completed.
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+-- 공격 입력 : 두 개의 하이픈(--)은 SQL 주석 시작 기호로,
+--             뒤에 남은 따옴표를 무력화하는 데 쓰인다.
+
+SQL> EXEC del_emp_bad('X'' OR 1=1 --')
+실행 문장 : DELETE FROM emp_copy WHERE job_id = 'X' OR 1=1 --'
+삭제 건수 : 107
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT COUNT(*) FROM emp_copy;
+
+  COUNT(*)
+----------
+         0
+
+-- 테이블이 통째로 비었다. 즉시 되돌린다.
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+SQL> SELECT COUNT(*) FROM emp_copy;
+
+  COUNT(*)
+----------
+       107
+
+-- 원인 파악
+--   조회 취약점은 정보 유출로 끝나지만, 같은 취약점이 DELETE 나 UPDATE 에 있으면
+--   데이터가 통째로 사라지거나 바뀐다. 운영 환경이었다면 커밋된 뒤에는
+--   플래시백이나 백업 복구 외에는 방법이 없다.
+
+
+--------------------------------------------------------------------------------
+[5] (방어 1) 값은 예외 없이 바인딩한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE find_emp_safe(p_name IN VARCHAR2) IS
+  2     TYPE t_tab IS TABLE OF VARCHAR2(120);
+  3     v_rows   t_tab;
+  4  BEGIN
+  5     EXECUTE IMMEDIATE
+  6        'SELECT last_name || '' / '' || salary FROM emp_copy
+  7          WHERE last_name = :name'
+  8        BULK COLLECT INTO v_rows USING p_name;
+  9     DBMS_OUTPUT.PUT_LINE('조회 건수 : ' || v_rows.COUNT);
+ 10     FOR i IN 1 .. LEAST(v_rows.COUNT, 3) LOOP
+ 11        DBMS_OUTPUT.PUT_LINE('   ' || v_rows(i));
+ 12     END LOOP;
+ 13  END find_emp_safe;
+ 14  /
+
+Procedure created.
+
+SQL> EXEC find_emp_safe('King')
+조회 건수 : 2
+   King / 24000
+   King / 10000
+
+PL/SQL procedure successfully completed.
+
+-- 같은 공격 문자열을 넣어 본다.
+
+SQL> EXEC find_emp_safe('x'' OR ''1''=''1')
+조회 건수 : 0
+
+PL/SQL procedure successfully completed.
+
+SQL> EXEC find_emp_safe('X'' OR 1=1 --')
+조회 건수 : 0
+
+PL/SQL procedure successfully completed.
+
+-- 원리
+--   바인드 변수로 넘긴 값은 문장이 파싱된 뒤에 전달된다.
+--   따라서 그 안에 어떤 문자가 들어 있어도 문장의 구조를 바꿀 수 없고
+--   입력 전체가 "이름이 이상한 검색어" 하나로 취급된다.
+--   문장 텍스트가 항상 동일해지므로 하드 파스도 사라진다. 보안과 성능을 함께 얻는다.
+
+-- 삭제 프로시저도 같은 방식으로 고친다.
+
+SQL> CREATE OR REPLACE PROCEDURE del_emp_safe(p_job IN VARCHAR2) IS
+  2  BEGIN
+  3     EXECUTE IMMEDIATE 'DELETE FROM emp_copy WHERE job_id = :j'
+  4        USING p_job;
+  5     DBMS_OUTPUT.PUT_LINE('삭제 건수 : ' || SQL%ROWCOUNT);
+  6  END del_emp_safe;
+  7  /
+
+Procedure created.
+
+SQL> EXEC del_emp_safe('X'' OR 1=1 --')
+삭제 건수 : 0
+
+PL/SQL procedure successfully completed.
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+
+--------------------------------------------------------------------------------
+[6] (방어 2) 바인딩할 수 없는 식별자는 DBMS_ASSERT 로 검증한다
+--------------------------------------------------------------------------------
+
+-- 테이블 이름은 값이 아니라 식별자이므로 바인딩할 수 없다.
+
+SQL> DECLARE
+  2     v_cnt   NUMBER;
+  3  BEGIN
+  4     EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM :t' INTO v_cnt USING 'EMP_COPY';
+  5  END;
+  6  /
+DECLARE
+
+*
+ERROR at line 1:
+ORA-00903: invalid table name
+ORA-06512: at line 4
+
+-- 원인 : 바인드 변수는 리터럴이 올 수 있는 자리에만 놓을 수 있다.
+--        테이블 이름 자리에는 플레이스홀더를 쓸 수 없다.
+
+-- 따라서 문자열 결합이 불가피하다. 대신 DBMS_ASSERT 로 검증한다.
+
+SQL> CREATE OR REPLACE FUNCTION count_rows_assert(p_table IN VARCHAR2)
+  2     RETURN NUMBER IS
+  3     v_cnt   NUMBER;
+  4  BEGIN
+  5     EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM '
+  6                       || DBMS_ASSERT.SIMPLE_SQL_NAME(p_table)
+  7        INTO v_cnt;
+  8     RETURN v_cnt;
+  9  END count_rows_assert;
+ 10  /
+
+Function created.
+
+SQL> SELECT count_rows_assert('EMP_COPY') AS cnt FROM dual;
+
+       CNT
+----------
+       107
+
+-- 주입을 시도하면 실행 전에 차단된다.
+
+SQL> SELECT count_rows_assert('emp_copy WHERE 1=1 UNION SELECT 1 FROM dual')
+  2    FROM dual;
+SELECT count_rows_assert('emp_copy WHERE 1=1 UNION SELECT 1 FROM dual')
+       *
+ERROR at line 1:
+ORA-44003: invalid SQL name
+ORA-06512: at "SYS.DBMS_ASSERT", line 200
+ORA-06512: at "HR.COUNT_ROWS_ASSERT", line 5
+
+
+--------------------------------------------------------------------------------
+[7] (방어 3) DBMS_ASSERT 만으로는 부족하다 — 화이트리스트를 더한다
+--------------------------------------------------------------------------------
+
+-- DBMS_ASSERT 는 "문법적으로 올바른 이름인가"만 검사한다.
+-- 아래 이름은 문법적으로 올바르므로 그대로 통과한다.
+
+SQL> SELECT DBMS_ASSERT.SIMPLE_SQL_NAME('PLSQL_JOB_LOG') AS ok FROM dual;
+
+OK
+--------------------
+PLSQL_JOB_LOG
+
+-- 즉 사용자가 의도하지 않은 테이블을 지정해도 막지 못한다.
+
+SQL> SELECT count_rows_assert('PLSQL_JOB_LOG') AS cnt FROM dual;
+
+       CNT
+----------
+         2
+
+-- 최종 방어선 : 딕셔너리를 조회해 허용된 대상인지 대조한다.
+
+SQL> CREATE OR REPLACE FUNCTION count_rows_safe(p_table IN VARCHAR2)
+  2     RETURN NUMBER IS
+  3     v_name   VARCHAR2(128);
+  4     v_cnt    NUMBER;
+  5  BEGIN
+  6     -- 1) 딕셔너리 대조(화이트리스트) : 존재하고 내가 소유한 테이블인가
+  7     SELECT table_name INTO v_name
+  8       FROM user_tables
+  9      WHERE table_name = UPPER(TRIM(p_table))
+ 10        AND table_name IN ('EMP_COPY', 'EMPLOYEES', 'DEPARTMENTS');
+ 11
+ 12     -- 2) 확인된 이름만 문장에 결합한다
+ 13     EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM "' || v_name || '"' INTO v_cnt;
+ 14     RETURN v_cnt;
+ 15  EXCEPTION
+ 16     WHEN NO_DATA_FOUND THEN
+ 17        RAISE_APPLICATION_ERROR(-20010, '허용되지 않은 테이블: ' || p_table);
+ 18  END count_rows_safe;
+ 19  /
+
+Function created.
+
+SQL> SELECT count_rows_safe('emp_copy') AS cnt FROM dual;
+
+       CNT
+----------
+       107
+
+SQL> SELECT count_rows_safe('PLSQL_JOB_LOG') AS cnt FROM dual;
+SELECT count_rows_safe('PLSQL_JOB_LOG') AS cnt FROM dual
+       *
+ERROR at line 1:
+ORA-20010: 허용되지 않은 테이블: PLSQL_JOB_LOG
+ORA-06512: at "HR.COUNT_ROWS_SAFE", line 17
+
+-- 이제 문장에 들어가는 것은 사용자 입력이 아니라 딕셔너리에서 읽어 온 값이다.
+
+
+--------------------------------------------------------------------------------
+[8] 정렬 컬럼처럼 바인딩할 수 없는 자리의 방어
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE FUNCTION get_emp_sorted(p_order IN VARCHAR2)
+  2     RETURN SYS_REFCURSOR IS
+  3     c_out   SYS_REFCURSOR;
+  4  BEGIN
+  5     IF UPPER(TRIM(p_order)) NOT IN ('LAST_NAME', 'SALARY DESC', 'HIRE_DATE') THEN
+  6        RAISE_APPLICATION_ERROR(-20012, '허용되지 않은 정렬: ' || p_order);
+  7     END IF;
+  8     OPEN c_out FOR
+  9        'SELECT employee_id, last_name, salary FROM emp_copy
+ 10          WHERE department_id = :d ORDER BY ' || UPPER(TRIM(p_order))
+ 11        USING 20;
+ 12     RETURN c_out;
+ 13  END get_emp_sorted;
+ 14  /
+
+Function created.
+
+SQL> VARIABLE rc REFCURSOR
+SQL> EXEC :rc := get_emp_sorted('SALARY DESC')
+
+PL/SQL procedure successfully completed.
+
+SQL> PRINT rc
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        201 Hartstein                      13000
+        202 Fay                             6000
+
+SQL> EXEC :rc := get_emp_sorted('1, (SELECT 1 FROM dual)')
+BEGIN :rc := get_emp_sorted('1, (SELECT 1 FROM dual)'); END;
+
+*
+ERROR at line 1:
+ORA-20012: 허용되지 않은 정렬: 1, (SELECT 1 FROM dual)
+ORA-06512: at "HR.GET_EMP_SORTED", line 6
+ORA-06512: at line 1
+
+
+--------------------------------------------------------------------------------
+[9] 방어 점검 결과를 plsql_job_log 에 기록한다
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     v_start   TIMESTAMP := SYSTIMESTAMP;
+  3     v_bad     NUMBER;
+  4  BEGIN
+  5     -- 소스에서 문자열 결합 패턴이 남아 있는 프로그램을 찾는다
+  6     SELECT COUNT(DISTINCT name) INTO v_bad
+  7       FROM user_source
+  8      WHERE UPPER(text) LIKE '%EXECUTE IMMEDIATE%'
+  9         OR UPPER(text) LIKE '%|| P_%';
+ 10
+ 11     INSERT INTO plsql_job_log(job_name, start_time, end_time, status,
+ 12                               processed_cnt, error_message, created_by)
+ 13     VALUES ('INJECTION_SCAN', v_start, SYSTIMESTAMP,
+ 14             CASE WHEN v_bad = 0 THEN 'SUCCESS' ELSE 'WARN' END,
+ 15             v_bad,
+ 16             '문자열 결합 의심 프로그램 ' || v_bad || '건 - 코드 리뷰 필요',
+ 17             USER);
+ 18     COMMIT;
+ 19     DBMS_OUTPUT.PUT_LINE('점검 완료 : 의심 프로그램 ' || v_bad || '건');
+ 20  END;
+ 21  /
+점검 완료 : 의심 프로그램 5건
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT log_id, job_name, status, processed_cnt,
+  2         SUBSTR(error_message, 1, 40) AS msg
+  3    FROM plsql_job_log ORDER BY log_id;
+
+LOG_ID JOB_NAME       STATUS   PROCESSED_CNT MSG
+------ -------------- -------- ------------- ----------------------------------
+     1 DDL_TEST       SUCCESS              0
+     2 SCHEMA_CHECK   SUCCESS              1 INVALID=0, STALE_STATS=1
+     3 INJECTION_SCAN WARN                 5 문자열 결합 의심 프로그램 5건 - 코드
+
+
+--------------------------------------------------------------------------------
+[10] 취약한 실습 객체를 반드시 제거한다
+--------------------------------------------------------------------------------
+
+SQL> DROP PROCEDURE find_emp_bad;
+
+Procedure dropped.
+
+SQL> DROP PROCEDURE del_emp_bad;
+
+Procedure dropped.
+
+SQL> DROP FUNCTION count_rows_assert;
+
+Function dropped.
+
+SQL> SELECT COUNT(*) AS total FROM emp_copy;
+
+     TOTAL
+----------
+       107
+
+-- 데이터가 원래대로 복구되었는지 마지막으로 확인한다.
+
+SQL> SELECT COUNT(*) AS diff
+  2    FROM (SELECT employee_id FROM employees
+  3          MINUS
+  4          SELECT employee_id FROM emp_copy);
+
+      DIFF
+----------
+         0
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. 문자열 결합으로 만든 동적 SQL 은 입력값이 코드로 해석될 수 있다.
+    ' OR '1'='1 같은 입력 하나로 WHERE 절이 항상 참이 되어 전체가 노출된다.
+ 2. 같은 취약점이 DELETE·UPDATE 에 있으면 데이터가 통째로 사라진다.
+    실습은 반드시 복사본에서 수행하고 확인 즉시 ROLLBACK 한다.
+ 3. 값은 예외 없이 바인딩한다. 바인드 값은 파싱 이후에 전달되므로
+    문장의 구조를 바꿀 수 없고, 덤으로 하드 파스도 사라진다.
+ 4. 테이블·컬럼·정렬 컬럼은 식별자라 바인딩할 수 없다(ORA-00903).
+    DBMS_ASSERT.SIMPLE_SQL_NAME 으로 문법을 검증한다(위반 시 ORA-44003).
+ 5. DBMS_ASSERT 는 문법만 검사하므로 허용 대상까지 막지는 못한다.
+    딕셔너리 대조 화이트리스트를 더해 확인된 이름만 문장에 결합한다.
+ 6. 조립한 문장을 로그로 남기면 공격 시도와 조립 오류를 사후에 추적할 수 있다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

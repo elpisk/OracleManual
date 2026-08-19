@@ -1,0 +1,268 @@
+================================================================================
+ 제3장 실습 03 — SQLCODE / SQLERRM 으로 오류 정보 조회
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) SQLCODE / SQLERRM 의 반환값과 유효 구간을 확인한다
+               2) NO_DATA_FOUND 의 SQLCODE 가 +100 인 것을 직접 확인한다
+               3) SQL 문장에 직접 사용했을 때의 PLS-00204 를 재현·수정한다
+               4) OTHERS 로 삼켜서 원인 추적이 불가능해지는 안티패턴을 개선한다
+               5) DBMS_UTILITY.FORMAT_ERROR_BACKTRACE 로 발생 위치를 기록한다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 접속 및 실습용 로그 테이블 준비
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 09:48:20 2025
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+
+SQL> CREATE TABLE plsql_job_log (
+  2     job_name    VARCHAR2(60),
+  3     log_time    TIMESTAMP,
+  4     err_code    NUMBER,
+  5     err_msg     VARCHAR2(400)
+  6  );
+
+Table created.
+
+-- 교육용 로그 테이블이다. 이후 실습에서도 계속 사용한다.
+
+
+--------------------------------------------------------------------------------
+[2] 정상 실행부에서의 SQLCODE / SQLERRM
+--------------------------------------------------------------------------------
+
+SQL> BEGIN
+  2     DBMS_OUTPUT.PUT_LINE('SQLCODE = ' || SQLCODE);
+  3     DBMS_OUTPUT.PUT_LINE('SQLERRM = ' || SQLERRM);
+  4  END;
+  5  /
+SQLCODE = 0
+SQLERRM = ORA-0000: normal, successful completion
+
+PL/SQL procedure successfully completed.
+
+-- 두 함수는 EXCEPTION 절 안에서만 의미 있는 값을 가진다.
+-- 정상 실행부에서는 0 과 'normal, successful completion' 을 반환한다.
+
+
+--------------------------------------------------------------------------------
+[3] NO_DATA_FOUND 의 SQLCODE 는 +100 이다
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     v_name   employees.last_name%TYPE;
+  3  BEGIN
+  4     SELECT last_name INTO v_name
+  5       FROM employees WHERE employee_id = 9999;
+  6  EXCEPTION
+  7     WHEN OTHERS THEN
+  8        DBMS_OUTPUT.PUT_LINE('SQLCODE = ' || SQLCODE);
+  9        DBMS_OUTPUT.PUT_LINE('SQLERRM = ' || SQLERRM);
+ 10  END;
+ 11  /
+SQLCODE = 100
+SQLERRM = ORA-01403: no data found
+
+PL/SQL procedure successfully completed.
+
+-- 오류 번호는 ORA-01403 이지만 SQLCODE 는 -1403 이 아니라 +100 이다.
+-- ANSI SQL 의 SQLSTATE 규약에서 '데이터 없음'을 100 으로 정의한 것을 따랐다.
+
+-- 다른 예외들은 음수를 반환한다.
+SQL> BEGIN
+  2     DBMS_OUTPUT.PUT_LINE('TOO_MANY_ROWS  : ' || SQLERRM(-1422));
+  3     DBMS_OUTPUT.PUT_LINE('ZERO_DIVIDE    : ' || SQLERRM(-1476));
+  4     DBMS_OUTPUT.PUT_LINE('VALUE_ERROR    : ' || SQLERRM(-6502));
+  5     DBMS_OUTPUT.PUT_LINE('DUP_VAL_ON_IDX : ' || SQLERRM(-1));
+  6  END;
+  7  /
+TOO_MANY_ROWS  : ORA-01422: exact fetch returns more than requested number of rows
+ZERO_DIVIDE    : ORA-01476: divisor is equal to zero
+VALUE_ERROR    : ORA-06502: PL/SQL: numeric or value error
+DUP_VAL_ON_IDX : ORA-00001: unique constraint (.) violated
+
+PL/SQL procedure successfully completed.
+
+-- SQLERRM 에 오류 번호를 인자로 주면 임의 오류의 메시지를 조회할 수 있다.
+
+
+--------------------------------------------------------------------------------
+[4] 오류 → 원인 → 수정 : SQL 문장에 SQLCODE/SQLERRM 직접 사용 (PLS-00204)
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     v_name   employees.last_name%TYPE;
+  3  BEGIN
+  4     SELECT last_name INTO v_name
+  5       FROM employees WHERE employee_id = 9999;
+  6  EXCEPTION
+  7     WHEN OTHERS THEN
+  8        INSERT INTO plsql_job_log(job_name, log_time, err_code, err_msg)
+  9        VALUES ('EMP_LOOKUP', SYSTIMESTAMP, SQLCODE, SQLERRM);
+ 10        COMMIT;
+ 11  END;
+ 12  /
+      VALUES ('EMP_LOOKUP', SYSTIMESTAMP, SQLCODE, SQLERRM);
+                                          *
+ERROR at line 9:
+ORA-06550: line 9, column 43:
+PLS-00204: function or pseudo-column 'SQLCODE' may be used inside a SQL
+statement only if the owner is SYS
+ORA-06550: line 8, column 7:
+PL/SQL: SQL Statement ignored
+
+-- [오류 발생]
+--   PLS-00204. 로그를 남기려던 코드가 아예 컴파일되지 않는다.
+-- [원인 파악]
+--   SQLCODE 와 SQLERRM 은 PL/SQL 내장 함수이지 SQL 함수가 아니다.
+--   따라서 SQL 문장(INSERT/UPDATE/SELECT) 안에서 직접 호출할 수 없다.
+-- [수정]
+--   지역 변수에 먼저 대입한 뒤 그 변수를 SQL 문장에 사용한다.
+
+SQL> DECLARE
+  2     v_name   employees.last_name%TYPE;
+  3     v_code   NUMBER;
+  4     v_msg    VARCHAR2(400);
+  5  BEGIN
+  6     SELECT last_name INTO v_name
+  7       FROM employees WHERE employee_id = 9999;
+  8  EXCEPTION
+  9     WHEN OTHERS THEN
+ 10        v_code := SQLCODE;                        -- 먼저 변수에 담는다
+ 11        v_msg  := SUBSTR(SQLERRM, 1, 400);        -- 길이도 잘라 둔다
+ 12        INSERT INTO plsql_job_log(job_name, log_time, err_code, err_msg)
+ 13        VALUES ('EMP_LOOKUP', SYSTIMESTAMP, v_code, v_msg);
+ 14        COMMIT;
+ 15        DBMS_OUTPUT.PUT_LINE('로그 기록 완료 : ' || v_code);
+ 16  END;
+ 17  /
+로그 기록 완료 : 100
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, err_code, err_msg FROM plsql_job_log;
+
+JOB_NAME     ERR_CODE ERR_MSG
+---------- ---------- ----------------------------------------
+EMP_LOOKUP        100 ORA-01403: no data found
+
+1 row selected.
+
+-- SUBSTR 로 길이를 자른 이유는 메시지가 컬럼 길이를 넘겨
+-- 로깅 코드가 다시 ORA-06502 를 일으키는 것을 막기 위해서다.
+
+
+--------------------------------------------------------------------------------
+[5] 오류 → 원인 → 수정 : OTHERS 로 삼켜서 원인 추적이 불가능한 코드
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     v_result   NUMBER;
+  3  BEGIN
+  4     v_result := 100 / 0;
+  5     DBMS_OUTPUT.PUT_LINE('결과 : ' || v_result);
+  6  EXCEPTION
+  7     WHEN OTHERS THEN
+  8        NULL;                                     -- 아무 것도 남기지 않는다
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+-- [문제 상황]
+--   화면에는 'successfully completed' 만 나온다.
+--   실제로는 ZERO_DIVIDE 가 발생했지만 어디에도 흔적이 없다.
+-- [원인 파악]
+--   WHEN OTHERS THEN NULL; 은 예외를 처리한 것으로 간주되어
+--   블록이 정상 종료된다. 호출자와 스케줄러는 성공으로 판정한다.
+-- [수정]
+--   최소한 SQLCODE / SQLERRM 을 남기고, 발생 위치까지 기록한다.
+
+SQL> DECLARE
+  2     v_result   NUMBER;
+  3     v_code     NUMBER;
+  4     v_msg      VARCHAR2(400);
+  5  BEGIN
+  6     v_result := 100 / 0;
+  7  EXCEPTION
+  8     WHEN OTHERS THEN
+  9        v_code := SQLCODE;
+ 10        v_msg  := SUBSTR(SQLERRM, 1, 400);
+ 11        DBMS_OUTPUT.PUT_LINE('CODE  : ' || v_code);
+ 12        DBMS_OUTPUT.PUT_LINE('MSG   : ' || v_msg);
+ 13        DBMS_OUTPUT.PUT_LINE('TRACE : ' ||
+ 14                             DBMS_UTILITY.FORMAT_ERROR_BACKTRACE);
+ 15        INSERT INTO plsql_job_log(job_name, log_time, err_code, err_msg)
+ 16        VALUES ('DIV_CALC', SYSTIMESTAMP, v_code, v_msg);
+ 17        COMMIT;
+ 18  END;
+ 19  /
+CODE  : -1476
+MSG   : ORA-01476: divisor is equal to zero
+TRACE : ORA-06512: at line 6
+
+PL/SQL procedure successfully completed.
+
+-- FORMAT_ERROR_BACKTRACE 가 오류가 실제로 발생한 줄 번호(6행)를 알려 준다.
+-- SQLERRM 만으로는 "무슨 오류인지"만 알 수 있고 "어디에서 났는지"는 알 수 없다.
+
+
+--------------------------------------------------------------------------------
+[6] 오류 스택 전체 확인 — FORMAT_ERROR_STACK
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     v_x   NUMBER;
+  3  BEGIN
+  4     BEGIN
+  5        v_x := TO_NUMBER('ABC');
+  6     EXCEPTION
+  7        WHEN OTHERS THEN
+  8           RAISE_APPLICATION_ERROR(-20500, '숫자 변환 실패', TRUE);
+  9     END;
+ 10  EXCEPTION
+ 11     WHEN OTHERS THEN
+ 12        DBMS_OUTPUT.PUT_LINE(DBMS_UTILITY.FORMAT_ERROR_STACK);
+ 13  END;
+ 14  /
+ORA-20500: 숫자 변환 실패
+ORA-06502: PL/SQL: numeric or value error: character to number conversion error
+
+PL/SQL procedure successfully completed.
+
+-- keep_errors 를 TRUE 로 주었기 때문에 원인 오류(ORA-06502)까지 스택에 남았다.
+
+
+--------------------------------------------------------------------------------
+[7] 로그 확인 및 정리
+--------------------------------------------------------------------------------
+
+SQL> SELECT job_name, err_code, SUBSTR(err_msg, 1, 45) AS msg
+  2    FROM plsql_job_log ORDER BY log_time;
+
+JOB_NAME     ERR_CODE MSG
+---------- ---------- ---------------------------------------------
+EMP_LOOKUP        100 ORA-01403: no data found
+DIV_CALC        -1476 ORA-01476: divisor is equal to zero
+
+2 rows selected.
+
+-- 1) SQLCODE 는 오류 번호, SQLERRM 은 메시지. EXCEPTION 절 안에서만 유효하다.
+-- 2) NO_DATA_FOUND 만 SQLCODE 가 +100 이다.
+-- 3) SQL 문장에 직접 쓰면 PLS-00204 — 반드시 변수에 담아 사용한다.
+-- 4) OTHERS 에서는 최소한 SQLCODE/SQLERRM 을 남긴다.
+-- 5) FORMAT_ERROR_BACKTRACE 로 발생 줄 번호까지 남기면 추적 시간이 크게 준다.
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

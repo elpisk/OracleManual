@@ -1,0 +1,478 @@
+================================================================================
+ 제6장 실습 06 — USER_OBJECTS / USER_TABLES / USER_PROCEDURES 스키마 객체 점검
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) USER_OBJECTS 로 소유 객체의 종류와 상태를 파악한다
+               2) 없는 객체명으로 조회하면 오류가 아니라 빈 결과임을 확인한다
+               3) 대소문자 함정을 재현하고 UPPER 로 해결한다
+               4) INVALID 객체를 탐지하고 동적 SQL 로 일괄 재컴파일한다
+               5) USER_TABLES / USER_INDEXES 로 통계와 인덱스 상태를 점검한다
+               6) USER_PROCEDURES / USER_SOURCE / USER_ERRORS 로 프로그램을 진단한다
+               7) 점검 결과를 plsql_job_log 에 기록한다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 접속과 소유 객체 개요 확인
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 11:48:52 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 120
+SQL> SET PAGESIZE 60
+
+SQL> SELECT object_type, COUNT(*) AS cnt
+  2    FROM user_objects
+  3   GROUP BY object_type ORDER BY cnt DESC, object_type;
+
+OBJECT_TYPE                CNT
+-------------------- ----------
+INDEX                        20
+TABLE                         9
+PROCEDURE                     4
+SEQUENCE                      3
+TRIGGER                       2
+VIEW                          1
+
+-- TABLE 이 9개인 이유는 HR 기본 7개에 실습에서 만든 EMP_COPY 와
+-- PLSQL_JOB_LOG 가 추가되었기 때문이다.
+
+SQL> SELECT object_name, object_type, status,
+  2         TO_CHAR(created, 'YYYY-MM-DD') AS created,
+  3         TO_CHAR(last_ddl_time, 'YYYY-MM-DD HH24:MI') AS last_ddl
+  4    FROM user_objects
+  5   WHERE object_type = 'TABLE' ORDER BY object_name;
+
+OBJECT_NAME          OBJECT_TYPE STATUS  CREATED    LAST_DDL
+-------------------- ----------- ------- ---------- ----------------
+COUNTRIES            TABLE       VALID   2026-07-01 2026-07-01 09:12
+DEPARTMENTS          TABLE       VALID   2026-07-01 2026-07-01 09:12
+EMPLOYEES            TABLE       VALID   2026-07-01 2026-07-01 09:12
+EMP_COPY             TABLE       VALID   2026-08-19 2026-08-19 10:35
+JOBS                 TABLE       VALID   2026-07-01 2026-07-01 09:12
+JOB_HISTORY          TABLE       VALID   2026-07-01 2026-07-01 09:12
+LOCATIONS            TABLE       VALID   2026-07-01 2026-07-01 09:12
+PLSQL_JOB_LOG        TABLE       VALID   2026-08-19 2026-08-19 10:38
+REGIONS              TABLE       VALID   2026-07-01 2026-07-01 09:12
+
+9 rows selected.
+
+
+--------------------------------------------------------------------------------
+[2] (오해하기 쉬운 상황) 없는 객체를 조회하면 오류가 아니다
+--------------------------------------------------------------------------------
+
+SQL> SELECT object_name, object_type, status FROM user_objects
+  2   WHERE object_name = 'NO_SUCH_OBJECT';
+
+no rows selected
+
+-- 이것은 오류가 아니다. 딕셔너리 뷰 USER_OBJECTS 자체는 존재하므로
+-- 질의는 정상적으로 수행되었고 조건에 맞는 행이 없을 뿐이다.
+
+-- 반면 존재하지 않는 테이블을 직접 조회하면 오류가 난다.
+
+SQL> SELECT COUNT(*) FROM no_such_object;
+SELECT COUNT(*) FROM no_such_object
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- 두 상황의 차이를 자동화 코드에 적용하면 다음과 같다.
+
+SQL> CREATE OR REPLACE FUNCTION object_exists(p_name IN VARCHAR2)
+  2     RETURN VARCHAR2 IS
+  3     v_cnt   NUMBER;
+  4  BEGIN
+  5     SELECT COUNT(*) INTO v_cnt FROM user_objects
+  6      WHERE object_name = UPPER(TRIM(p_name));
+  7     RETURN CASE WHEN v_cnt > 0 THEN 'YES' ELSE 'NO' END;
+  8  END object_exists;
+  9  /
+
+Function created.
+
+SQL> SELECT object_exists('EMP_COPY')       AS a,
+  2         object_exists('NO_SUCH_OBJECT') AS b FROM dual;
+
+A   B
+--- ---
+YES NO
+
+-- 존재 여부는 예외가 아니라 COUNT(*) = 0 으로 판정해야 한다.
+
+
+--------------------------------------------------------------------------------
+[3] (함정) 대소문자를 맞추지 않으면 항상 0건이다
+--------------------------------------------------------------------------------
+
+SQL> SELECT object_name, object_type FROM user_objects
+  2   WHERE object_name = 'emp_copy';
+
+no rows selected
+
+-- 원인 파악
+--   오라클은 큰따옴표 없이 만든 객체 이름을 대문자로 저장한다.
+--   따라서 소문자 조건은 언제나 일치하지 않는다. 오류가 나지 않으므로
+--   "객체가 없다"고 잘못 판단하기 쉬운 대표적 함정이다.
+
+-- 수정 : 조건 값을 UPPER 로 변환한다.
+
+SQL> SELECT object_name, object_type FROM user_objects
+  2   WHERE object_name = UPPER('emp_copy');
+
+OBJECT_NAME          OBJECT_TYPE
+-------------------- -----------
+EMP_COPY             TABLE
+
+
+--------------------------------------------------------------------------------
+[4] INVALID 객체를 만들고 탐지한다
+--------------------------------------------------------------------------------
+
+-- 컴파일 오류가 있는 프로시저를 일부러 만든다.
+
+SQL> CREATE OR REPLACE PROCEDURE broken_proc IS
+  2  BEGIN
+  3     SELECT last_name INTO v_name FROM employees WHERE rownum = 1;
+  4  END;
+  5  /
+
+Warning: Procedure created with compilation errors.
+
+SQL> SHOW ERRORS
+Errors for PROCEDURE BROKEN_PROC:
+
+LINE/COL ERROR
+-------- ---------------------------------------------------------------
+3/26     PLS-00201: identifier 'V_NAME' must be declared
+3/4      PL/SQL: SQL Statement ignored
+
+-- 참조하는 테이블이 바뀌어 INVALID 가 되는 상황도 만들어 본다.
+
+SQL> CREATE OR REPLACE PROCEDURE use_emp_copy IS
+  2     v_cnt NUMBER;
+  3  BEGIN
+  4     SELECT COUNT(*) INTO v_cnt FROM emp_copy;
+  5     DBMS_OUTPUT.PUT_LINE(v_cnt);
+  6  END;
+  7  /
+
+Procedure created.
+
+SQL> ALTER TABLE emp_copy ADD (tmp_col NUMBER);
+
+Table altered.
+
+SQL> SELECT object_name, object_type, status FROM user_objects
+  2   WHERE status <> 'VALID' ORDER BY object_type, object_name;
+
+OBJECT_NAME          OBJECT_TYPE STATUS
+-------------------- ----------- -------
+BROKEN_PROC          PROCEDURE   INVALID
+USE_EMP_COPY         PROCEDURE   INVALID
+
+-- INVALID 객체는 다음 호출 때 자동 재컴파일을 시도한다.
+-- 성공하면 조용히 지나가지만 실패하면 ORA-04063 으로 애플리케이션이 멈춘다.
+
+SQL> EXEC broken_proc
+BEGIN broken_proc; END;
+
+*
+ERROR at line 1:
+ORA-06550: line 1, column 7:
+PLS-00905: object HR.BROKEN_PROC is invalid
+ORA-06550: line 1, column 7:
+PL/SQL: Statement ignored
+
+
+--------------------------------------------------------------------------------
+[5] 동적 SQL 로 INVALID 객체를 일괄 재컴파일한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE recompile_invalid IS
+  2     v_stmt   VARCHAR2(400);
+  3     v_ok     NUMBER := 0;
+  4     v_fail   NUMBER := 0;
+  5  BEGIN
+  6     FOR r IN (SELECT object_name, object_type
+  7                 FROM user_objects
+  8                WHERE status = 'INVALID'
+  9                  AND object_type IN ('PROCEDURE','FUNCTION','VIEW',
+ 10                                      'PACKAGE','PACKAGE BODY','TRIGGER')) LOOP
+ 11        BEGIN
+ 12           IF r.object_type = 'PACKAGE BODY' THEN
+ 13              v_stmt := 'ALTER PACKAGE "' || r.object_name || '" COMPILE BODY';
+ 14           ELSE
+ 15              v_stmt := 'ALTER ' || r.object_type || ' "'
+ 16                        || r.object_name || '" COMPILE';
+ 17           END IF;
+ 18           EXECUTE IMMEDIATE v_stmt;
+ 19           v_ok := v_ok + 1;
+ 20           DBMS_OUTPUT.PUT_LINE('OK   : ' || r.object_name);
+ 21        EXCEPTION
+ 22           WHEN OTHERS THEN
+ 23              v_fail := v_fail + 1;
+ 24              DBMS_OUTPUT.PUT_LINE('FAIL : ' || r.object_name
+ 25                                   || ' - ' || SQLERRM);
+ 26        END;
+ 27     END LOOP;
+ 28     DBMS_OUTPUT.PUT_LINE('성공 ' || v_ok || ' / 실패 ' || v_fail);
+ 29  END recompile_invalid;
+ 30  /
+
+Procedure created.
+
+SQL> EXEC recompile_invalid
+OK   : BROKEN_PROC
+OK   : USE_EMP_COPY
+성공 2 / 실패 0
+
+PL/SQL procedure successfully completed.
+
+-- ALTER ... COMPILE 자체는 성공했지만 소스에 오류가 있는 BROKEN_PROC 은
+-- 여전히 INVALID 로 남는다. 재컴파일 성공과 유효성은 다른 문제다.
+
+SQL> SELECT object_name, status FROM user_objects
+  2   WHERE object_name IN ('BROKEN_PROC', 'USE_EMP_COPY') ORDER BY object_name;
+
+OBJECT_NAME          STATUS
+-------------------- -------
+BROKEN_PROC          INVALID
+USE_EMP_COPY         VALID
+
+-- 주의 : PACKAGE BODY 를 ALTER PACKAGE BODY x COMPILE 로 쓰면 ORA-00922 가 난다.
+--        위 코드처럼 ALTER PACKAGE x COMPILE BODY 로 변환해야 한다.
+
+
+--------------------------------------------------------------------------------
+[6] 남은 INVALID 의 원인을 USER_ERRORS 로 확인한다
+--------------------------------------------------------------------------------
+
+SQL> SELECT name, type, line, position, text
+  2    FROM user_errors ORDER BY name, sequence;
+
+NAME          TYPE      LINE POSITION TEXT
+------------- --------- ---- -------- ---------------------------------------
+BROKEN_PROC   PROCEDURE    3       26 PLS-00201: identifier 'V_NAME' must be
+                                      declared
+BROKEN_PROC   PROCEDURE    3        4 PL/SQL: SQL Statement ignored
+
+-- 자동화 스크립트에서는 SHOW ERRORS 를 쓸 수 없으므로 이 뷰를 직접 조회한다.
+
+SQL> SELECT name, type, COUNT(*) AS err_cnt
+  2    FROM user_errors GROUP BY name, type ORDER BY name;
+
+NAME          TYPE       ERR_CNT
+------------- --------- --------
+BROKEN_PROC   PROCEDURE        2
+
+-- 수정 : 변수를 선언해 다시 컴파일한다.
+
+SQL> CREATE OR REPLACE PROCEDURE broken_proc IS
+  2     v_name   employees.last_name%TYPE;
+  3  BEGIN
+  4     SELECT last_name INTO v_name FROM employees WHERE rownum = 1;
+  5     DBMS_OUTPUT.PUT_LINE('첫 사원 : ' || v_name);
+  6  END;
+  7  /
+
+Procedure created.
+
+SQL> EXEC broken_proc
+첫 사원 : Abel
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT COUNT(*) AS remaining_errors FROM user_errors;
+
+REMAINING_ERRORS
+----------------
+               0
+
+
+--------------------------------------------------------------------------------
+[7] USER_TABLES / USER_INDEXES 로 물리 상태를 점검한다
+--------------------------------------------------------------------------------
+
+SQL> SELECT table_name, num_rows, blocks, avg_row_len,
+  2         TO_CHAR(last_analyzed, 'YYYY-MM-DD') AS analyzed
+  3    FROM user_tables ORDER BY table_name;
+
+TABLE_NAME       NUM_ROWS  BLOCKS AVG_ROW_LEN ANALYZED
+--------------- --------- ------- ----------- ----------
+COUNTRIES              25       0          15 2026-08-18
+DEPARTMENTS            27       5          21 2026-08-18
+EMPLOYEES             107       5          69 2026-08-18
+EMP_COPY
+JOBS                   19       5          33 2026-08-18
+JOB_HISTORY            10       5          30 2026-08-18
+LOCATIONS              23       5          49 2026-08-18
+PLSQL_JOB_LOG
+REGIONS                 4       5          15 2026-08-18
+
+9 rows selected.
+
+-- 방금 만든 EMP_COPY 와 PLSQL_JOB_LOG 는 통계가 없어 NUM_ROWS 가 비어 있다.
+-- NUM_ROWS 는 통계 수집 시점의 값이며 실시간 값이 아니다.
+
+SQL> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, 'EMP_COPY')
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT table_name, num_rows, TO_CHAR(last_analyzed, 'YYYY-MM-DD HH24:MI')
+  2    FROM user_tables WHERE table_name = 'EMP_COPY';
+
+TABLE_NAME       NUM_ROWS TO_CHAR(LAST_ANA
+--------------- --------- ----------------
+EMP_COPY              107 2026-08-19 11:56
+
+-- 통계가 오래된 테이블 점검
+
+SQL> SELECT table_name, last_analyzed FROM user_tables
+  2   WHERE last_analyzed IS NULL OR last_analyzed < SYSDATE - 30;
+
+TABLE_NAME       LAST_ANALYZED
+--------------- -------------
+PLSQL_JOB_LOG
+
+SQL> SELECT index_name, table_name, uniqueness, status
+  2    FROM user_indexes WHERE table_name = 'EMPLOYEES' ORDER BY index_name;
+
+INDEX_NAME               TABLE_NAME  UNIQUENESS STATUS
+------------------------ ----------- ---------- -------
+EMP_DEPARTMENT_IX        EMPLOYEES   NONUNIQUE  VALID
+EMP_EMAIL_UK             EMPLOYEES   UNIQUE     VALID
+EMP_EMP_ID_PK            EMPLOYEES   UNIQUE     VALID
+EMP_JOB_IX               EMPLOYEES   NONUNIQUE  VALID
+EMP_MANAGER_IX           EMPLOYEES   NONUNIQUE  VALID
+EMP_NAME_IX              EMPLOYEES   NONUNIQUE  VALID
+
+6 rows selected.
+
+-- STATUS 가 UNUSABLE 인 인덱스는 사용되지 않으며,
+-- 유니크 제약을 지원하던 인덱스라면 DML 자체가 실패한다.
+
+
+--------------------------------------------------------------------------------
+[8] USER_PROCEDURES 와 USER_SOURCE 로 프로그램을 점검한다
+--------------------------------------------------------------------------------
+
+SQL> SELECT object_name, procedure_name, object_type, authid, deterministic
+  2    FROM user_procedures ORDER BY object_name, procedure_name;
+
+OBJECT_NAME        PROCEDURE_NAME  OBJECT_TYPE AUTHID   DET
+------------------ --------------- ----------- -------- ---
+ADD_JOB_HISTORY                    PROCEDURE   DEFINER  NO
+BROKEN_PROC                        PROCEDURE   DEFINER  NO
+DROP_IF_EXISTS                     PROCEDURE   DEFINER  NO
+OBJECT_EXISTS                      FUNCTION    DEFINER  NO
+RECOMPILE_INVALID                  PROCEDURE   DEFINER  NO
+SECURE_DML                         PROCEDURE   DEFINER  NO
+USE_EMP_COPY                       PROCEDURE   DEFINER  NO
+
+7 rows selected.
+
+-- 독립 프로시저는 PROCEDURE_NAME 이 NULL 이고,
+-- 패키지 서브프로그램은 OBJECT_NAME 에 패키지 이름이 들어간다.
+-- AUTHID 로 정의자 권한인지 호출자 권한인지 확인할 수 있다.
+
+SQL> SELECT name, type, line, TRIM(text) AS src
+  2    FROM user_source
+  3   WHERE UPPER(text) LIKE '%EXECUTE IMMEDIATE%'
+  4   ORDER BY name, line;
+
+NAME              TYPE       LINE SRC
+----------------- --------- ----- ------------------------------------------
+DROP_IF_EXISTS    PROCEDURE     3 EXECUTE IMMEDIATE 'DROP TABLE '
+RECOMPILE_INVALID PROCEDURE    18 EXECUTE IMMEDIATE v_stmt;
+
+-- 코드 표준 점검에 활용할 수 있다.
+-- 예) 하드코딩된 비밀번호, 금지된 힌트, WHEN OTHERS THEN NULL 패턴 검색
+
+
+--------------------------------------------------------------------------------
+[9] 점검 결과를 plsql_job_log 에 기록한다
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     v_start    TIMESTAMP := SYSTIMESTAMP;
+  3     v_invalid  NUMBER;
+  4     v_stale    NUMBER;
+  5  BEGIN
+  6     SELECT COUNT(*) INTO v_invalid FROM user_objects WHERE status = 'INVALID';
+  7     SELECT COUNT(*) INTO v_stale   FROM user_tables
+  8      WHERE last_analyzed IS NULL OR last_analyzed < SYSDATE - 30;
+  9
+ 10     INSERT INTO plsql_job_log(job_name, start_time, end_time, status,
+ 11                               processed_cnt, error_message, created_by)
+ 12     VALUES ('SCHEMA_CHECK', v_start, SYSTIMESTAMP,
+ 13             CASE WHEN v_invalid = 0 THEN 'SUCCESS' ELSE 'WARN' END,
+ 14             v_invalid + v_stale,
+ 15             'INVALID=' || v_invalid || ', STALE_STATS=' || v_stale, USER);
+ 16     COMMIT;
+ 17     DBMS_OUTPUT.PUT_LINE('점검 완료 : INVALID ' || v_invalid
+ 18                          || ' / 통계 미수집 ' || v_stale);
+ 19  END;
+ 20  /
+점검 완료 : INVALID 0 / 통계 미수집 1
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT log_id, job_name, status, processed_cnt, error_message
+  2    FROM plsql_job_log ORDER BY log_id;
+
+LOG_ID JOB_NAME     STATUS   PROCESSED_CNT ERROR_MESSAGE
+------ ------------ -------- ------------- -----------------------------
+     1 DDL_TEST     SUCCESS              0
+     2 SCHEMA_CHECK SUCCESS              1 INVALID=0, STALE_STATS=1
+
+
+--------------------------------------------------------------------------------
+[10] 정리
+--------------------------------------------------------------------------------
+
+SQL> ALTER TABLE emp_copy DROP COLUMN tmp_col;
+
+Table altered.
+
+SQL> DROP PROCEDURE broken_proc;
+
+Procedure dropped.
+
+SQL> DROP PROCEDURE use_emp_copy;
+
+Procedure dropped.
+
+SQL> DROP FUNCTION object_exists;
+
+Function dropped.
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. USER_OBJECTS 는 소유 객체의 이름·종류·상태·생성일·최종 DDL 시각을 보여 준다.
+ 2. 없는 객체명으로 조회하면 오류가 아니라 빈 결과다. 존재 여부는 COUNT(*)=0 으로
+    판정하며, 조건 값은 반드시 UPPER 로 변환해야 한다.
+ 3. INVALID 객체는 USER_OBJECTS 로 찾고 동적 SQL 로 일괄 재컴파일한다.
+    PACKAGE BODY 는 ALTER PACKAGE x COMPILE BODY 형태여야 한다.
+ 4. 재컴파일에 실패해 남는 INVALID 는 USER_ERRORS 로 원인을 확인한다.
+ 5. USER_TABLES 의 NUM_ROWS 는 통계 수집 시점의 값이며 실시간 값이 아니다.
+    USER_INDEXES 의 STATUS 가 UNUSABLE 이면 인덱스가 사용되지 않는다.
+ 6. USER_PROCEDURES 의 AUTHID 로 정의자·호출자 권한을 확인할 수 있고,
+    USER_SOURCE 로 코드 표준 점검을 자동화할 수 있다.
+ 7. 점검 결과는 화면 출력이 아니라 plsql_job_log 같은 로그 테이블에 남긴다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

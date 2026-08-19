@@ -1,0 +1,445 @@
+================================================================================
+ 제5장 실습 06 — INSTEAD OF Trigger 개념 확인
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) 조인 뷰에 DML 을 시도해 ORA-01779 를 재현한다
+               2) INSTEAD OF 트리거를 테이블에 만들려다 나는 ORA-25002 를 본다
+               3) 뷰에 INSTEAD OF UPDATE / INSERT / DELETE 트리거를 작성한다
+               4) USER_UPDATABLE_COLUMNS 로 갱신 가능 여부 변화를 확인한다
+               5) 행 트리거에서 뮤테이팅 테이블 오류(ORA-04091)를 재현하고
+                  복합 트리거로 회피한다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 접속과 조인 뷰 생성
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 13:10:52 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 130
+
+SQL> CREATE OR REPLACE VIEW emp_dept_v AS
+  2  SELECT e.employee_id, e.last_name, e.email, e.salary,
+  3         d.department_id, d.department_name
+  4    FROM employees e
+  5    JOIN departments d ON e.department_id = d.department_id;
+
+View EMP_DEPT_V created.
+
+SQL> SELECT employee_id, last_name, salary, department_id, department_name
+  2    FROM emp_dept_v WHERE employee_id IN (103, 200) ORDER BY employee_id;
+
+EMPLOYEE_ID LAST_NAME        SALARY DEPARTMENT_ID DEPARTMENT_NAME
+----------- ------------ ---------- ------------- ------------------
+        103 Hunold             9000            60 IT
+        200 Whalen             4400            10 Administration
+
+
+--------------------------------------------------------------------------------
+[2] 갱신 가능 여부를 딕셔너리로 확인한다
+--------------------------------------------------------------------------------
+
+SQL> SELECT column_name, updatable, insertable, deletable
+  2    FROM user_updatable_columns
+  3   WHERE table_name = 'EMP_DEPT_V'
+  4   ORDER BY column_name;
+
+COLUMN_NAME          UPD INS DEL
+-------------------- --- --- ---
+DEPARTMENT_ID        NO  NO  NO
+DEPARTMENT_NAME      NO  NO  NO
+EMAIL                YES YES YES
+EMPLOYEE_ID          YES YES YES
+LAST_NAME            YES YES YES
+SALARY               YES YES YES
+
+6 rows selected.
+
+-- 확인) EMPLOYEES 쪽 컬럼은 갱신 가능하지만 DEPARTMENTS 쪽 컬럼은 아니다.
+--       조인에서 DEPARTMENTS 는 키 보존 테이블(key-preserved table)이 아니기
+--       때문이다. 한 부서의 행이 여러 사원 행에 대응되므로 뷰의 한 행을
+--       바꾼다고 해서 DEPARTMENTS 의 어느 행을 바꿔야 할지 확정되지 않는다.
+
+
+--------------------------------------------------------------------------------
+[3] (오류 상황) 조인 뷰에 부서 이름을 갱신해 본다 — ORA-01779
+--------------------------------------------------------------------------------
+
+SQL> UPDATE emp_dept_v
+  2     SET department_name = '연구소'
+  3   WHERE employee_id = 103;
+   SET department_name = '연구소'
+       *
+ERROR at line 2:
+ORA-01779: cannot modify a column which maps to a non key-preserved table
+
+-- 원인) DEPARTMENT_NAME 은 키 보존되지 않은 DEPARTMENTS 에 매핑된다.
+-- 조치) INSTEAD OF 트리거로 어느 기저 테이블을 어떻게 바꿀지 직접 정의한다.
+
+-- 삭제도 마찬가지다.
+SQL> DELETE FROM emp_dept_v WHERE employee_id = 103;
+DELETE FROM emp_dept_v WHERE employee_id = 103
+            *
+ERROR at line 1:
+ORA-01752: cannot delete from view without exactly one key-preserved table
+
+
+--------------------------------------------------------------------------------
+[4] (오류 상황) 테이블에 INSTEAD OF 트리거를 만들어 본다 — ORA-25002
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE TRIGGER trg_emp_io_bad
+  2     INSTEAD OF INSERT ON employees
+  3     FOR EACH ROW
+  4  BEGIN
+  5     NULL;
+  6  END;
+  7  /
+   INSTEAD OF INSERT ON employees
+   *
+ERROR at line 2:
+ORA-25002: cannot create INSTEAD OF triggers on tables
+
+-- 원인) INSTEAD OF 트리거는 갱신 불가능한 뷰에 대한 DML 을 대신 처리하기 위한
+--       장치다. 테이블은 이미 DML 이 가능하므로 대상이 될 수 없다.
+-- 조치) 대상이 테이블이라면 BEFORE 또는 AFTER 시점의 일반 DML 트리거를 쓴다.
+--       뷰에 대한 DML 이 목적이라면 뷰에 INSTEAD OF 트리거를 만든다.
+
+
+--------------------------------------------------------------------------------
+[5] 뷰에 INSTEAD OF UPDATE 트리거를 작성한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE TRIGGER trg_emp_dept_v_iou
+  2     INSTEAD OF UPDATE ON emp_dept_v
+  3     FOR EACH ROW
+  4  BEGIN
+  5     -- 사원 정보는 EMPLOYEES 로
+  6     UPDATE employees
+  7        SET last_name     = :NEW.last_name,
+  8            email         = UPPER(:NEW.email),
+  9            salary        = :NEW.salary,
+ 10            department_id = :NEW.department_id
+ 11      WHERE employee_id = :OLD.employee_id;
+ 12
+ 13     IF SQL%ROWCOUNT = 0 THEN
+ 14        RAISE_APPLICATION_ERROR(-20601, '사원을 찾을 수 없습니다');
+ 15     END IF;
+ 16
+ 17     -- 부서 이름이 실제로 바뀐 경우에만 DEPARTMENTS 로
+ 18     IF NVL(:OLD.department_name, '~') <> NVL(:NEW.department_name, '~') THEN
+ 19        UPDATE departments
+ 20           SET department_name = :NEW.department_name
+ 21         WHERE department_id = :NEW.department_id;
+ 22     END IF;
+ 23  END trg_emp_dept_v_iou;
+ 24  /
+
+Trigger TRG_EMP_DEPT_V_IOU compiled
+
+SQL> UPDATE emp_dept_v
+  2     SET department_name = '연구소'
+  3   WHERE employee_id = 103;
+
+1 row updated.
+
+SQL> SELECT department_id, department_name FROM departments
+  2   WHERE department_id = 60;
+
+DEPARTMENT_ID DEPARTMENT_NAME
+------------- ------------------------------
+           60 연구소
+
+-- 확인) 이제 갱신이 성공한다. 오라클이 UPDATE 를 수행하는 대신
+--       우리가 쓴 트리거 본문을 실행했기 때문이다.
+
+-- 사원 정보와 부서 이름을 함께 바꿔 본다.
+SQL> UPDATE emp_dept_v
+  2     SET salary = 9500, department_name = 'IT'
+  3   WHERE employee_id = 103;
+
+1 row updated.
+
+SQL> SELECT e.employee_id, e.salary, d.department_name
+  2    FROM employees e JOIN departments d
+  3      ON e.department_id = d.department_id
+  4   WHERE e.employee_id = 103;
+
+EMPLOYEE_ID     SALARY DEPARTMENT_NAME
+----------- ---------- ------------------------------
+        103       9500 IT
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+
+--------------------------------------------------------------------------------
+[6] INSTEAD OF INSERT / DELETE 트리거도 작성한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE TRIGGER trg_emp_dept_v_ioi
+  2     INSTEAD OF INSERT ON emp_dept_v
+  3     FOR EACH ROW
+  4  DECLARE
+  5     v_cnt NUMBER;
+  6  BEGIN
+  7     SELECT COUNT(*) INTO v_cnt
+  8       FROM departments WHERE department_id = :NEW.department_id;
+  9     IF v_cnt = 0 THEN
+ 10        RAISE_APPLICATION_ERROR(-20602, '존재하지 않는 부서입니다');
+ 11     END IF;
+ 12
+ 13     INSERT INTO employees(employee_id, last_name, email, hire_date,
+ 14                           job_id, salary, department_id)
+ 15     VALUES (:NEW.employee_id, :NEW.last_name, UPPER(:NEW.email), SYSDATE,
+ 16             'IT_PROG', :NEW.salary, :NEW.department_id);
+ 17  END trg_emp_dept_v_ioi;
+ 18  /
+
+Trigger TRG_EMP_DEPT_V_IOI compiled
+
+SQL> CREATE OR REPLACE TRIGGER trg_emp_dept_v_iod
+  2     INSTEAD OF DELETE ON emp_dept_v
+  3     FOR EACH ROW
+  4  BEGIN
+  5     -- 사원만 삭제한다. 부서는 다른 사원이 참조하므로 남긴다.
+  6     DELETE FROM employees WHERE employee_id = :OLD.employee_id;
+  7  END trg_emp_dept_v_iod;
+  8  /
+
+Trigger TRG_EMP_DEPT_V_IOD compiled
+
+SQL> INSERT INTO emp_dept_v(employee_id, last_name, email, salary,
+  2                         department_id, department_name)
+  3  VALUES (905, 'Nam', 'jnam', 5300, 60, 'IT');
+
+1 row created.
+
+SQL> SELECT employee_id, last_name, email, salary, department_id
+  2    FROM employees WHERE employee_id = 905;
+
+EMPLOYEE_ID LAST_NAME    EMAIL          SALARY DEPARTMENT_ID
+----------- ------------ ---------- ---------- -------------
+        905 Nam          JNAM             5300            60
+
+-- 없는 부서를 주면 트리거가 막는다.
+SQL> INSERT INTO emp_dept_v(employee_id, last_name, email, salary,
+  2                         department_id, department_name)
+  3  VALUES (906, 'Oh', 'joh', 5000, 9999, 'None');
+INSERT INTO emp_dept_v(employee_id, last_name, email, salary,
+*
+ERROR at line 1:
+ORA-20602: 존재하지 않는 부서입니다
+ORA-06512: at "HR.TRG_EMP_DEPT_V_IOI", line 8
+ORA-04088: error during execution of trigger 'HR.TRG_EMP_DEPT_V_IOI'
+
+SQL> DELETE FROM emp_dept_v WHERE employee_id = 905;
+
+1 row deleted.
+
+SQL> SELECT COUNT(*) AS emp_cnt FROM employees WHERE employee_id = 905;
+
+   EMP_CNT
+----------
+         0
+
+SQL> SELECT COUNT(*) AS dept_cnt FROM departments WHERE department_id = 60;
+
+  DEPT_CNT
+----------
+         1
+
+-- 확인) 사원은 지워졌지만 부서는 그대로 남았다.
+
+SQL> COMMIT;
+
+Commit complete.
+
+
+--------------------------------------------------------------------------------
+[7] INSTEAD OF 트리거가 생기면 갱신 가능 여부가 바뀐다
+--------------------------------------------------------------------------------
+
+SQL> SELECT column_name, updatable, insertable, deletable
+  2    FROM user_updatable_columns
+  3   WHERE table_name = 'EMP_DEPT_V'
+  4   ORDER BY column_name;
+
+COLUMN_NAME          UPD INS DEL
+-------------------- --- --- ---
+DEPARTMENT_ID        YES YES YES
+DEPARTMENT_NAME      YES YES YES
+EMAIL                YES YES YES
+EMPLOYEE_ID          YES YES YES
+LAST_NAME            YES YES YES
+SALARY               YES YES YES
+
+6 rows selected.
+
+-- 확인) INSTEAD OF 트리거가 존재하면 오라클은 모든 컬럼을 갱신 가능한 것으로
+--       간주한다. 실제 동작의 책임은 트리거를 작성한 개발자에게 있다.
+
+SQL> SELECT trigger_name, trigger_type, triggering_event, base_object_type
+  2    FROM user_triggers WHERE table_name = 'EMP_DEPT_V' ORDER BY 1;
+
+TRIGGER_NAME          TRIGGER_TYPE     TRIGGERING_EVENT BASE_OBJECT_TYPE
+--------------------- ---------------- ---------------- ----------------
+TRG_EMP_DEPT_V_IOD    INSTEAD OF       DELETE           VIEW
+TRG_EMP_DEPT_V_IOI    INSTEAD OF       INSERT           VIEW
+TRG_EMP_DEPT_V_IOU    INSTEAD OF       UPDATE           VIEW
+
+-- TRIGGER_TYPE 이 INSTEAD OF 이고 BASE_OBJECT_TYPE 이 VIEW 인 것을 확인한다.
+
+
+--------------------------------------------------------------------------------
+[8] (오류 상황) 뮤테이팅 테이블 오류 재현과 복합 트리거 회피
+--------------------------------------------------------------------------------
+
+-- 부서 평균 급여의 2배를 넘지 못하게 하려는 행 트리거를 만들어 본다.
+SQL> CREATE OR REPLACE TRIGGER trg_emp_br_avg
+  2     BEFORE INSERT OR UPDATE OF salary ON employees
+  3     FOR EACH ROW
+  4  DECLARE
+  5     v_avg NUMBER;
+  6  BEGIN
+  7     SELECT AVG(salary) INTO v_avg          -- 자기 테이블을 읽는다
+  8       FROM employees WHERE department_id = :NEW.department_id;
+  9     IF :NEW.salary > v_avg * 2 THEN
+ 10        RAISE_APPLICATION_ERROR(-20701, '부서 평균의 2배를 초과할 수 없습니다');
+ 11     END IF;
+ 12  END trg_emp_br_avg;
+ 13  /
+
+Trigger TRG_EMP_BR_AVG compiled
+
+-- 컴파일은 통과했다. 실행해 보자.
+SQL> UPDATE employees SET salary = salary * 1.1 WHERE department_id = 60;
+UPDATE employees SET salary = salary * 1.1 WHERE department_id = 60
+       *
+ERROR at line 1:
+ORA-04091: table HR.EMPLOYEES is mutating, trigger/function may not see it
+ORA-06512: at "HR.TRG_EMP_BR_AVG", line 4
+ORA-04088: error during execution of trigger 'HR.TRG_EMP_BR_AVG'
+
+-- 원인) 행 트리거는 문장이 진행되는 도중에 실행된다. 그 시점의 EMPLOYEES 는
+--       일부 행만 바뀐 중간 상태(mutating)이므로 일관된 읽기를 보장할 수 없다.
+--       그래서 오라클은 자기 테이블 조회를 금지한다.
+-- 조치) 복합 트리거로 옮긴다. 행 시점에는 대상만 수집하고, 문장이 끝난 뒤
+--       테이블이 안정된 AFTER STATEMENT 시점에서 조회와 검증을 수행한다.
+
+SQL> DROP TRIGGER trg_emp_br_avg;
+
+Trigger dropped.
+
+SQL> CREATE OR REPLACE TRIGGER trg_emp_comp
+  2     FOR INSERT OR UPDATE OF salary ON employees
+  3     COMPOUND TRIGGER
+  4
+  5     TYPE t_dept_set IS TABLE OF PLS_INTEGER INDEX BY PLS_INTEGER;
+  6     g_depts t_dept_set;              -- 인덱스를 부서번호로 써서 중복 제거
+  7
+  8     BEFORE STATEMENT IS
+  9     BEGIN
+ 10        g_depts.DELETE;
+ 11     END BEFORE STATEMENT;
+ 12
+ 13     AFTER EACH ROW IS
+ 14     BEGIN
+ 15        IF :NEW.department_id IS NOT NULL THEN
+ 16           g_depts(:NEW.department_id) := 1;   -- 조회하지 않고 수집만 한다
+ 17        END IF;
+ 18     END AFTER EACH ROW;
+ 19
+ 20     AFTER STATEMENT IS
+ 21        v_avg NUMBER;
+ 22        v_max NUMBER;
+ 23        v_idx PLS_INTEGER;
+ 24     BEGIN
+ 25        v_idx := g_depts.FIRST;
+ 26        WHILE v_idx IS NOT NULL LOOP
+ 27           SELECT AVG(salary), MAX(salary) INTO v_avg, v_max
+ 28             FROM employees WHERE department_id = v_idx;
+ 29           IF v_max > v_avg * 2 THEN
+ 30              RAISE_APPLICATION_ERROR(-20701,
+ 31                 v_idx || '번 부서에 평균의 2배를 넘는 급여가 있습니다');
+ 32           END IF;
+ 33           v_idx := g_depts.NEXT(v_idx);
+ 34        END LOOP;
+ 35     END AFTER STATEMENT;
+ 36
+ 37  END trg_emp_comp;
+ 38  /
+
+Trigger TRG_EMP_COMP compiled
+
+SQL> UPDATE employees SET salary = salary * 1.1 WHERE department_id = 60;
+
+5 rows updated.
+
+-- 확인) 같은 UPDATE 가 이제 정상 수행된다.
+--       행 시점에는 자기 테이블을 읽지 않았기 때문이다.
+
+-- 검증이 실제로 동작하는지 확인한다. 한 사람만 크게 올려 본다.
+SQL> UPDATE employees SET salary = 100000 WHERE employee_id = 107;
+UPDATE employees SET salary = 100000 WHERE employee_id = 107
+       *
+ERROR at line 1:
+ORA-20701: 60번 부서에 평균의 2배를 넘는 급여가 있습니다
+ORA-06512: at "HR.TRG_EMP_COMP", line 27
+ORA-04088: error during execution of trigger 'HR.TRG_EMP_COMP'
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+
+--------------------------------------------------------------------------------
+[9] 뒷정리
+--------------------------------------------------------------------------------
+
+SQL> DROP TRIGGER trg_emp_comp;
+
+Trigger dropped.
+
+SQL> DROP TRIGGER trg_emp_dept_v_ioi;
+SQL> DROP TRIGGER trg_emp_dept_v_iod;
+
+Trigger dropped.
+
+-- trg_emp_dept_v_iou 와 emp_dept_v 는 실습 07 에서 계속 사용한다.
+SQL> UPDATE departments SET department_name = 'IT' WHERE department_id = 60;
+
+1 row updated.
+
+SQL> COMMIT;
+
+Commit complete.
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. 조인 뷰에서 키 보존되지 않은 테이블의 컬럼은 갱신할 수 없다(ORA-01779).
+    삭제도 정확히 하나의 키 보존 테이블이 없으면 ORA-01752 로 거부된다.
+ 2. INSTEAD OF 트리거는 뷰 전용이다. 테이블에 만들면 ORA-25002 가 발생한다.
+ 3. INSTEAD OF 트리거는 항상 행 수준이며 BEFORE/AFTER 를 지정할 수 없다.
+ 4. INSTEAD OF 트리거가 생기면 USER_UPDATABLE_COLUMNS 가 모두 YES 로 바뀐다.
+    실제 동작의 책임은 트리거를 작성한 개발자에게 있다.
+ 5. 행 트리거에서 자기 테이블을 조회하면 ORA-04091 이 발생한다.
+    복합 트리거에서 행 시점에는 수집만 하고 AFTER STATEMENT 에서 검증하면
+    같은 로직을 안전하게 구현할 수 있다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

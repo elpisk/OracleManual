@@ -1,0 +1,615 @@
+================================================================================
+ 제7장 실습 07 — CHECK_INVALID_OBJECT / CHECK_USER_STATUS 자동화 프로시저
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS) / SYSTEM (관리 계정)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) CHECK_INVALID_OBJECT 를 만들고 INVALID 객체를 탐지한다
+               2) owner 조건을 빠뜨려 결과가 폭증하는 범위 오류를 재현하고 고친다
+               3) DBA_USERS 접근 권한이 없을 때의 컴파일 ORA-00942 를 재현한다
+               4) 롤 권한이 정적 SQL 에서 무시되는 것을 확인하고 직접 GRANT 로 고친다
+               5) CHECK_USER_STATUS 로 잠긴 계정·만료 임박 계정을 찾는다
+               6) 두 점검을 스케줄러 Job 으로 등록해 자동 실행한다
+ 사전 준비   : 실습 01 에서 만든 dba_check_result 테이블과 실습 06 에서 만든
+               write_operation_log 프로시저가 필요합니다.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+[1] 접속하고 사전 준비 상태를 확인한다
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 16:05:03 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 150
+SQL> SET PAGESIZE 60
+
+SQL> SELECT object_name, object_type FROM user_objects
+  2   WHERE object_name IN ('WRITE_OPERATION_LOG','DBA_CHECK_RESULT')
+  3   ORDER BY object_name;
+
+OBJECT_NAME             OBJECT_TYPE
+----------------------- -----------
+DBA_CHECK_RESULT        TABLE
+WRITE_OPERATION_LOG     PROCEDURE
+
+SQL> DELETE FROM dba_check_result;
+
+1 row deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+
+--------------------------------------------------------------------------------
+[2] 점검 대상을 만든다 — 일부러 INVALID 객체를 발생시킨다
+--------------------------------------------------------------------------------
+
+SQL> CREATE TABLE tmp_src (id NUMBER, name VARCHAR2(30));
+
+Table created.
+
+SQL> CREATE OR REPLACE PROCEDURE pr_uses_tmp IS
+  2     v_name tmp_src.name%TYPE;
+  3  BEGIN
+  4     SELECT name INTO v_name FROM tmp_src WHERE id = 1;
+  5     DBMS_OUTPUT.PUT_LINE(v_name);
+  6  END;
+  7  /
+
+Procedure created.
+
+SQL> CREATE OR REPLACE VIEW v_uses_tmp AS SELECT id, name FROM tmp_src;
+
+View created.
+
+-- 참조 테이블을 지우면 두 객체가 INVALID 가 된다.
+
+SQL> DROP TABLE tmp_src PURGE;
+
+Table dropped.
+
+SQL> SELECT object_name, object_type, status FROM user_objects
+  2   WHERE status = 'INVALID' ORDER BY object_type, object_name;
+
+OBJECT_NAME     OBJECT_TYPE STATUS
+--------------- ----------- -------
+PR_USES_TMP     PROCEDURE   INVALID
+V_USES_TMP      VIEW        INVALID
+
+
+--------------------------------------------------------------------------------
+[3] (오류 재현 1) owner 조건을 빠뜨린다 — 결과가 폭증한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE check_invalid_object (
+  2     p_owner IN  VARCHAR2 DEFAULT USER,
+  3     p_cnt   OUT NUMBER)
+  4  IS
+  5  BEGIN
+  6     p_cnt := 0;
+  7     FOR r IN (SELECT owner, object_type, object_name
+  8                 FROM all_objects
+  9                WHERE status = 'INVALID')      -- owner 조건이 없다
+ 10     LOOP
+ 11        INSERT INTO dba_check_result
+ 12           (check_name, check_time, target_object, status, result_message)
+ 13        VALUES
+ 14           ('CHECK_INVALID_OBJECT', SYSTIMESTAMP,
+ 15            r.owner || '.' || r.object_name, 'WARN',
+ 16            r.object_type || ' 이 INVALID 상태입니다');
+ 17        p_cnt := p_cnt + 1;
+ 18     END LOOP;
+ 19     COMMIT;
+ 20  END;
+ 21  /
+
+Procedure created.
+
+SQL> DECLARE
+  2     v_cnt NUMBER;
+  3  BEGIN
+  4     check_invalid_object('HR', v_cnt);
+  5     DBMS_OUTPUT.PUT_LINE('탐지 건수 : ' || v_cnt);
+  6  END;
+  7  /
+탐지 건수 : 87
+
+PL/SQL procedure successfully completed.
+
+-- 87건? HR 스키마에는 두 개뿐인데 이상하다.
+
+SQL> SELECT SUBSTR(target_object, 1, INSTR(target_object,'.')-1) AS owner,
+  2         COUNT(*) AS cnt
+  3    FROM dba_check_result WHERE check_name = 'CHECK_INVALID_OBJECT'
+  4   GROUP BY SUBSTR(target_object, 1, INSTR(target_object,'.')-1)
+  5   ORDER BY cnt DESC;
+
+OWNER           CNT
+--------- ---------
+PUBLIC           74
+SYS              11
+HR                2
+
+-- 원인 파악
+--   p_owner 인자를 받아 놓고 WHERE 절에서 쓰지 않았다.
+--   ALL_OBJECTS 는 접근 가능한 모든 스키마의 객체를 보여 주므로
+--   PUBLIC 시노님과 SYS 객체까지 전부 잡혔다.
+--   점검 프로시저는 대상 범위를 명시적으로 좁히는 것이 첫 번째 규칙이다.
+
+-- 수정 : owner 조건을 추가한다.
+
+SQL> DELETE FROM dba_check_result;
+
+87 rows deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> CREATE OR REPLACE PROCEDURE check_invalid_object (
+  2     p_owner IN  VARCHAR2 DEFAULT USER,
+  3     p_cnt   OUT NUMBER)
+  4  IS
+  5  BEGIN
+  6     p_cnt := 0;
+  7     FOR r IN (SELECT owner, object_type, object_name
+  8                 FROM all_objects
+  9                WHERE owner  = UPPER(p_owner)      -- 범위를 좁힌다
+ 10                  AND status = 'INVALID'
+ 11                ORDER BY object_type, object_name)
+ 12     LOOP
+ 13        INSERT INTO dba_check_result
+ 14           (check_name, check_time, target_object, status, result_message)
+ 15        VALUES
+ 16           ('CHECK_INVALID_OBJECT', SYSTIMESTAMP,
+ 17            r.owner || '.' || r.object_name, 'WARN',
+ 18            r.object_type || ' 이 INVALID 상태입니다');
+ 19        p_cnt := p_cnt + 1;
+ 20     END LOOP;
+ 21     COMMIT;
+ 22  END;
+ 23  /
+
+Procedure created.
+
+SQL> DECLARE
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3     v_cnt   NUMBER;
+  4  BEGIN
+  5     check_invalid_object('HR', v_cnt);
+  6     write_operation_log('CHECK_INVALID_OBJECT', v_start, 'SUCCESS', v_cnt);
+  7     DBMS_OUTPUT.PUT_LINE('HR INVALID 객체 : ' || v_cnt || ' 건');
+  8  END;
+  9  /
+HR INVALID 객체 : 2 건
+
+PL/SQL procedure successfully completed.
+
+SQL> COLUMN result_message FORMAT A40
+
+SQL> SELECT target_object, status, result_message FROM dba_check_result;
+
+TARGET_OBJECT        STATUS RESULT_MESSAGE
+-------------------- ------ ----------------------------------------
+HR.PR_USES_TMP       WARN   PROCEDURE 이 INVALID 상태입니다
+HR.V_USES_TMP        WARN   VIEW 이 INVALID 상태입니다
+
+
+--------------------------------------------------------------------------------
+[4] (오류 재현 2) CHECK_USER_STATUS 컴파일 실패 — ORA-00942
+--------------------------------------------------------------------------------
+
+-- 우선 권한을 회수해 권한 없는 상태를 만든다.
+
+SQL> CONNECT system/oracle@localhost:1521/orclpdb
+Connected.
+
+SQL> REVOKE SELECT ON dba_users FROM hr;
+
+Revoke succeeded.
+
+SQL> CONNECT hr/hr@localhost:1521/orclpdb
+Connected.
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 150
+
+SQL> CREATE OR REPLACE PROCEDURE check_user_status (p_cnt OUT NUMBER)
+  2  IS
+  3  BEGIN
+  4     p_cnt := 0;
+  5     FOR r IN (SELECT username, account_status, expiry_date
+  6                 FROM dba_users
+  7                WHERE account_status <> 'OPEN'
+  8                   OR expiry_date < SYSDATE + 14)
+  9     LOOP
+ 10        INSERT INTO dba_check_result
+ 11           (check_name, check_time, target_object, status, result_message)
+ 12        VALUES
+ 13           ('CHECK_USER_STATUS', SYSTIMESTAMP, r.username,
+ 14            CASE WHEN r.account_status LIKE '%LOCKED%' THEN 'ERROR'
+ 15                 ELSE 'WARN' END,
+ 16            r.account_status || ' / 만료 ' ||
+ 17            NVL(TO_CHAR(r.expiry_date,'YYYY-MM-DD'), '-'));
+ 18        p_cnt := p_cnt + 1;
+ 19     END LOOP;
+ 20     COMMIT;
+ 21  END;
+ 22  /
+
+Warning: Procedure created with compilation errors.
+
+SQL> SHOW ERRORS
+Errors for PROCEDURE CHECK_USER_STATUS:
+
+LINE/COL ERROR
+-------- ---------------------------------------------------------------
+5/13     PL/SQL: SQL Statement ignored
+6/17     PL/SQL: ORA-00942: table or view does not exist
+
+-- 원인 파악
+--   런타임 오류가 아니라 컴파일 오류다.
+--   정적 SQL 은 컴파일 시점에 객체 존재와 권한을 함께 검사하기 때문이다.
+--   프로시저는 만들어졌지만 INVALID 상태로 남는다.
+
+SQL> SELECT object_name, status FROM user_objects
+  2   WHERE object_name = 'CHECK_USER_STATUS';
+
+OBJECT_NAME          STATUS
+-------------------- -------
+CHECK_USER_STATUS    INVALID
+
+-- 아이러니하게도 CHECK_INVALID_OBJECT 가 잡아내야 할 대상이 자기 자신이 됐다.
+
+SQL> DECLARE
+  2     v_cnt NUMBER;
+  3  BEGIN
+  4     check_invalid_object('HR', v_cnt);
+  5     DBMS_OUTPUT.PUT_LINE('HR INVALID 객체 : ' || v_cnt || ' 건');
+  6  END;
+  7  /
+HR INVALID 객체 : 3 건
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[5] 롤로 권한을 줘도 해결되지 않는다는 것을 확인한다
+--------------------------------------------------------------------------------
+
+SQL> CONNECT system/oracle@localhost:1521/orclpdb
+Connected.
+
+SQL> GRANT select_catalog_role TO hr;
+
+Grant succeeded.
+
+SQL> CONNECT hr/hr@localhost:1521/orclpdb
+Connected.
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+
+SQL> SELECT granted_role FROM user_role_privs ORDER BY granted_role;
+
+GRANTED_ROLE
+------------------------------
+CONNECT
+RESOURCE
+SELECT_CATALOG_ROLE
+
+-- 대화식 SQL 에서는 이제 조회된다.
+
+SQL> SELECT COUNT(*) FROM dba_users;
+
+  COUNT(*)
+----------
+        38
+
+-- 그러나 프로시저는 여전히 컴파일되지 않는다.
+
+SQL> ALTER PROCEDURE check_user_status COMPILE;
+
+Warning: Procedure altered with compilation errors.
+
+SQL> SHOW ERRORS
+Errors for PROCEDURE CHECK_USER_STATUS:
+
+LINE/COL ERROR
+-------- ---------------------------------------------------------------
+5/13     PL/SQL: SQL Statement ignored
+6/17     PL/SQL: ORA-00942: table or view does not exist
+
+-- 원인 파악
+--   기본값인 정의자 권한(DEFINER RIGHTS) 프로그램의 정적 SQL 은
+--   롤로 받은 권한을 무시한다. 직접 부여된 권한만 인정한다.
+--   6장에서 배운 규칙이 그대로 적용된다.
+
+
+--------------------------------------------------------------------------------
+[6] 수정 — 필요한 뷰만 직접 GRANT 한다
+--------------------------------------------------------------------------------
+
+SQL> CONNECT system/oracle@localhost:1521/orclpdb
+Connected.
+
+SQL> REVOKE select_catalog_role FROM hr;
+
+Revoke succeeded.
+
+SQL> GRANT SELECT ON dba_users TO hr;
+
+Grant succeeded.
+
+SQL> CONNECT hr/hr@localhost:1521/orclpdb
+Connected.
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 150
+
+SQL> ALTER PROCEDURE check_user_status COMPILE;
+
+Procedure altered.
+
+SQL> SELECT object_name, status FROM user_objects
+  2   WHERE object_name = 'CHECK_USER_STATUS';
+
+OBJECT_NAME          STATUS
+-------------------- -------
+CHECK_USER_STATUS    VALID
+
+-- 최소 권한 원칙 : 롤 전체가 아니라 필요한 뷰 하나만 직접 부여한다.
+
+
+--------------------------------------------------------------------------------
+[7] CHECK_USER_STATUS 를 실행한다
+--------------------------------------------------------------------------------
+
+SQL> DELETE FROM dba_check_result;
+
+3 rows deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> DECLARE
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3     v_cnt   NUMBER;
+  4  BEGIN
+  5     check_user_status(v_cnt);
+  6     write_operation_log('CHECK_USER_STATUS', v_start, 'SUCCESS', v_cnt);
+  7     DBMS_OUTPUT.PUT_LINE('점검 대상 계정 : ' || v_cnt || ' 건');
+  8  END;
+  9  /
+점검 대상 계정 : 31 건
+
+PL/SQL procedure successfully completed.
+
+SQL> COLUMN result_message FORMAT A40
+
+SQL> SELECT status, COUNT(*) AS cnt FROM dba_check_result
+  2   WHERE check_name = 'CHECK_USER_STATUS' GROUP BY status;
+
+STATUS       CNT
+------ ---------
+ERROR         28
+WARN           3
+
+SQL> SELECT target_object, status, result_message
+  2    FROM dba_check_result
+  3   WHERE check_name = 'CHECK_USER_STATUS' AND status = 'WARN'
+  4   ORDER BY target_object;
+
+TARGET_OBJECT   STATUS RESULT_MESSAGE
+--------------- ------ ----------------------------------------
+DBSNMP          WARN   EXPIRED / 만료 2026-08-25
+GSMCATUSER      WARN   EXPIRED / 만료 2026-08-22
+XS$NULL         WARN   EXPIRED & LOCKED / 만료 2026-08-28
+
+-- 잠긴 계정 28개는 오라클 기본 계정이라 정상이다.
+-- 실무에서는 점검 대상 계정 목록을 화이트리스트로 관리해 잡음을 줄인다.
+
+SQL> CREATE OR REPLACE PROCEDURE check_user_status (p_cnt OUT NUMBER)
+  2  IS
+  3  BEGIN
+  4     p_cnt := 0;
+  5     FOR r IN (SELECT username, account_status, expiry_date
+  6                 FROM dba_users
+  7                WHERE oracle_maintained = 'N'        -- 사용자 계정만
+  8                  AND (account_status <> 'OPEN'
+  9                       OR expiry_date < SYSDATE + 14))
+ 10     LOOP
+ 11        INSERT INTO dba_check_result
+ 12           (check_name, check_time, target_object, status, result_message)
+ 13        VALUES
+ 14           ('CHECK_USER_STATUS', SYSTIMESTAMP, r.username,
+ 15            CASE WHEN r.account_status LIKE '%LOCKED%' THEN 'ERROR'
+ 16                 ELSE 'WARN' END,
+ 17            r.account_status || ' / 만료 ' ||
+ 18            NVL(TO_CHAR(r.expiry_date,'YYYY-MM-DD'), '-'));
+ 19        p_cnt := p_cnt + 1;
+ 20     END LOOP;
+ 21     COMMIT;
+ 22  END;
+ 23  /
+
+Procedure created.
+
+SQL> DELETE FROM dba_check_result;
+
+31 rows deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> DECLARE
+  2     v_cnt NUMBER;
+  3  BEGIN
+  4     check_user_status(v_cnt);
+  5     DBMS_OUTPUT.PUT_LINE('사용자 계정 중 점검 대상 : ' || v_cnt || ' 건');
+  6  END;
+  7  /
+사용자 계정 중 점검 대상 : 1 건
+
+SQL> SELECT target_object, status, result_message FROM dba_check_result;
+
+TARGET_OBJECT   STATUS RESULT_MESSAGE
+--------------- ------ ----------------------------------------
+BATCH_USER      ERROR  LOCKED(TIMED) / 만료 2026-09-30
+
+-- ORACLE_MAINTAINED 컬럼으로 오라클 기본 계정을 걸러 내니 신호가 뚜렷해졌다.
+
+
+--------------------------------------------------------------------------------
+[8] INVALID 객체를 실제로 복구한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE TABLE tmp_src (id NUMBER, name VARCHAR2(30));
+
+Table created.
+
+SQL> ALTER PROCEDURE pr_uses_tmp COMPILE;
+
+Procedure altered.
+
+SQL> ALTER VIEW v_uses_tmp COMPILE;
+
+View altered.
+
+SQL> SELECT object_name, object_type, status FROM user_objects
+  2   WHERE status = 'INVALID';
+
+no rows selected
+
+SQL> DECLARE
+  2     v_cnt NUMBER;
+  3  BEGIN
+  4     check_invalid_object('HR', v_cnt);
+  5     DBMS_OUTPUT.PUT_LINE('HR INVALID 객체 : ' || v_cnt || ' 건');
+  6  END;
+  7  /
+HR INVALID 객체 : 0 건
+
+PL/SQL procedure successfully completed.
+
+-- 0건이 정상이다. 어제 0건이었는데 오늘 12건이면 누군가 배포하고
+-- 재컴파일하지 않은 것이므로 즉시 확인해야 한다.
+
+
+--------------------------------------------------------------------------------
+[9] 두 점검을 스케줄러 Job 으로 등록한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE pr_run_two_checks IS
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3     v_cnt   NUMBER;
+  4  BEGIN
+  5     check_invalid_object(USER, v_cnt);
+  6     write_operation_log('CHECK_INVALID_OBJECT', v_start, 'SUCCESS', v_cnt);
+  7
+  8     check_user_status(v_cnt);
+  9     write_operation_log('CHECK_USER_STATUS', v_start, 'SUCCESS', v_cnt);
+ 10  END;
+ 11  /
+
+Procedure created.
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.CREATE_JOB (
+  3        job_name        => 'J_DAILY_CHECK',
+  4        job_type        => 'STORED_PROCEDURE',
+  5        job_action      => 'PR_RUN_TWO_CHECKS',
+  6        start_date      => SYSTIMESTAMP,
+  7        repeat_interval => 'FREQ=DAILY; BYHOUR=2; BYMINUTE=0; BYSECOND=0',
+  8        enabled         => TRUE,
+  9        auto_drop       => FALSE,
+ 10        comments        => '일일 운영 점검');
+ 11     DBMS_SCHEDULER.SET_ATTRIBUTE('J_DAILY_CHECK', 'max_failures', 3);
+ 12  END;
+ 13  /
+
+PL/SQL procedure successfully completed.
+
+-- 배포 전 반드시 수동으로 한 번 돌려 검증한다.
+
+SQL> EXEC DBMS_SCHEDULER.RUN_JOB('J_DAILY_CHECK');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, status, processed_cnt,
+  2         TO_CHAR(start_time,'HH24:MI:SS') AS ts
+  3    FROM plsql_job_log ORDER BY log_id DESC FETCH FIRST 2 ROWS ONLY;
+
+JOB_NAME               STATUS     PROCESSED_CNT TS
+---------------------- ---------- ------------- --------
+CHECK_USER_STATUS      SUCCESS                1 16:41:02
+CHECK_INVALID_OBJECT   SUCCESS                0 16:41:02
+
+SQL> SELECT job_name, state, enabled,
+  2         TO_CHAR(next_run_date,'MM-DD HH24:MI') AS next_run
+  3    FROM user_scheduler_jobs WHERE job_name = 'J_DAILY_CHECK';
+
+JOB_NAME         STATE       ENABLED  NEXT_RUN
+---------------- ----------- -------- ----------
+J_DAILY_CHECK    SCHEDULED   TRUE     08-20 02:00
+
+-- 주의 : PR_RUN_TWO_CHECKS 는 두 점검을 예외 처리 없이 순차 호출한다.
+--        첫 점검이 실패하면 두 번째가 실행되지 않는 구조적 문제가 있다.
+--        이 문제는 실습 08 에서 패키지로 통합하며 해결한다.
+
+
+--------------------------------------------------------------------------------
+[10] 실습 정리
+--------------------------------------------------------------------------------
+
+SQL> EXEC DBMS_SCHEDULER.DISABLE('J_DAILY_CHECK');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT object_name, object_type, status FROM user_objects
+  2   WHERE object_name IN ('CHECK_INVALID_OBJECT','CHECK_USER_STATUS',
+  3                         'WRITE_OPERATION_LOG','WRITE_ERROR_LOG')
+  4   ORDER BY object_name;
+
+OBJECT_NAME             OBJECT_TYPE STATUS
+----------------------- ----------- -------
+CHECK_INVALID_OBJECT    PROCEDURE   VALID
+CHECK_USER_STATUS       PROCEDURE   VALID
+WRITE_ERROR_LOG         PROCEDURE   VALID
+WRITE_OPERATION_LOG     PROCEDURE   VALID
+
+-- 네 프로시저의 로직을 실습 08 에서 패키지로 옮긴다.
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. 점검 프로시저의 첫 번째 규칙은 대상 범위를 명시적으로 좁히는 것이다.
+    owner 조건을 빠뜨리면 PUBLIC·SYS 객체까지 잡혀 결과가 폭증한다.
+ 2. ALL_OBJECTS 는 접근 가능한 객체만 보여 주므로 추가 권한 없이 동작한다.
+    관리자 권한이 있다면 그때 DBA_OBJECTS 로 바꾼다.
+ 3. 정적 SQL 은 컴파일 시점에 객체 존재와 권한을 검사한다.
+    권한이 없으면 "Warning: Procedure created with compilation errors" 가 뜨고
+    SHOW ERRORS 에 PL/SQL: ORA-00942 가 나오며 객체는 INVALID 로 남는다.
+ 4. 정의자 권한 프로그램의 정적 SQL 은 롤로 받은 권한을 무시한다.
+    SELECT_CATALOG_ROLE 을 줘도 컴파일되지 않으며, 직접 GRANT 해야 한다.
+ 5. 최소 권한 원칙에 따라 롤 전체가 아니라 필요한 뷰만 직접 부여한다.
+ 6. DBA_USERS 의 ORACLE_MAINTAINED = 'N' 조건으로 오라클 기본 계정을 걸러 내면
+    점검 결과의 잡음이 크게 줄어든다.
+ 7. 점검 프로시저를 순차 호출하기만 하면 첫 실패가 나머지를 막는다.
+    이 문제는 실습 08 의 패키지에서 개별 예외 블록으로 해결한다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

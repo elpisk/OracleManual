@@ -1,0 +1,885 @@
+================================================================================
+ 제7장 실습 08 — PKG_DBA_AUTOMATION 패키지 기반 통합 자동화 실행
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) 패키지 스펙과 바디를 나눠 작성하고 PLS-00323 을 재현·수정한다
+               2) CHECK_INVALID_OBJECT / CHECK_USER_STATUS / CHECK_HR_DATA 를
+                  패키지 안에 최소 형태로 구현한다
+               3) WRITE_LOG / WRITE_ERROR_LOG 를 자율 트랜잭션으로 구현한다
+               4) RUN_ALL_CHECK 에서 첫 점검 실패가 나머지를 막는 문제를 재현한다
+               5) 개별 예외 블록으로 부분 실패를 흡수하고 마지막에 재전파한다
+               6) 스케줄러 Job 으로 등록해 자동 실행하고 모니터링 질의를 만든다
+ 사전 준비   : 실습 01 에서 만든 plsql_job_log · dba_check_result 테이블,
+               실습 07 에서 HR 에 직접 부여한 DBA_USERS 조회 권한이 필요합니다.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+[1] 접속하고 사전 준비 상태를 확인한다
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 17:10:44 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 150
+SQL> SET PAGESIZE 60
+
+SQL> SELECT table_name FROM user_tables
+  2   WHERE table_name IN ('PLSQL_JOB_LOG','DBA_CHECK_RESULT') ORDER BY 1;
+
+TABLE_NAME
+--------------------
+DBA_CHECK_RESULT
+PLSQL_JOB_LOG
+
+SQL> SELECT COUNT(*) FROM dba_users;
+
+  COUNT(*)
+----------
+        38
+
+-- DBA_USERS 조회 권한이 직접 부여된 상태다(실습 07).
+
+SQL> DELETE FROM dba_check_result;
+
+1 row deleted.
+
+SQL> DELETE FROM plsql_job_log;
+
+6 rows deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+
+--------------------------------------------------------------------------------
+[2] 패키지 스펙을 작성한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PACKAGE pkg_dba_automation AS
+  2
+  3     -- 개별 점검 : 각각 처리 건수를 OUT 으로 돌려준다
+  4     PROCEDURE check_invalid_object (p_owner IN VARCHAR2 DEFAULT USER,
+  5                                     p_cnt   OUT NUMBER);
+  6     PROCEDURE check_user_status (p_cnt OUT NUMBER);
+  7     PROCEDURE check_hr_data     (p_cnt OUT NUMBER);
+  8
+  9     -- 로그 : 자율 트랜잭션으로 즉시 확정한다
+ 10     PROCEDURE write_log       (p_job_name IN VARCHAR2,
+ 11                                p_start    IN TIMESTAMP,
+ 12                                p_status   IN VARCHAR2,
+ 13                                p_cnt      IN NUMBER DEFAULT NULL);
+ 14     PROCEDURE write_error_log (p_job_name IN VARCHAR2,
+ 15                                p_start    IN TIMESTAMP,
+ 16                                p_code     IN NUMBER,
+ 17                                p_msg      IN VARCHAR2);
+ 18
+ 19     -- 통합 진입점 : 스케줄러는 이것만 알면 된다
+ 20     PROCEDURE run_all_check;
+ 21
+ 22  END pkg_dba_automation;
+ 23  /
+
+Package created.
+
+
+--------------------------------------------------------------------------------
+[3] (오류 재현 1) 바디에 프로시저 하나를 빠뜨린다 — PLS-00323
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PACKAGE BODY pkg_dba_automation AS
+  2
+  3     PROCEDURE write_log (p_job_name IN VARCHAR2,
+  4                          p_start    IN TIMESTAMP,
+  5                          p_status   IN VARCHAR2,
+  6                          p_cnt      IN NUMBER DEFAULT NULL)
+  7     IS
+  8        PRAGMA AUTONOMOUS_TRANSACTION;
+  9     BEGIN
+ 10        INSERT INTO plsql_job_log
+ 11           (job_name, start_time, end_time, status, processed_cnt, created_by)
+ 12        VALUES
+ 13           (p_job_name, p_start, SYSTIMESTAMP, p_status, p_cnt, USER);
+ 14        COMMIT;
+ 15     END write_log;
+ 16
+ 17     PROCEDURE write_error_log (p_job_name IN VARCHAR2,
+ 18                                p_start    IN TIMESTAMP,
+ 19                                p_code     IN NUMBER,
+ 20                                p_msg      IN VARCHAR2)
+ 21     IS
+ 22        PRAGMA AUTONOMOUS_TRANSACTION;
+ 23     BEGIN
+ 24        INSERT INTO plsql_job_log
+ 25           (job_name, start_time, end_time, status,
+ 26            error_code, error_message, created_by)
+ 27        VALUES
+ 28           (p_job_name, p_start, SYSTIMESTAMP, 'ERROR',
+ 29            p_code, SUBSTR(p_msg, 1, 4000), USER);
+ 30        COMMIT;
+ 31     END write_error_log;
+ 32
+ 33     PROCEDURE check_invalid_object (p_owner IN VARCHAR2 DEFAULT USER,
+ 34                                     p_cnt   OUT NUMBER)
+ 35     IS
+ 36     BEGIN
+ 37        p_cnt := 0;
+ 38        FOR r IN (SELECT owner, object_type, object_name FROM all_objects
+ 39                   WHERE owner = UPPER(p_owner) AND status = 'INVALID')
+ 40        LOOP
+ 41           INSERT INTO dba_check_result
+ 42              (check_name, check_time, target_object, status, result_message)
+ 43           VALUES ('CHECK_INVALID_OBJECT', SYSTIMESTAMP,
+ 44                   r.owner || '.' || r.object_name, 'WARN',
+ 45                   r.object_type || ' 이 INVALID 상태입니다');
+ 46           p_cnt := p_cnt + 1;
+ 47        END LOOP;
+ 48        COMMIT;
+ 49     END check_invalid_object;
+ 50
+ 51     PROCEDURE check_user_status (p_cnt OUT NUMBER)
+ 52     IS
+ 53     BEGIN
+ 54        p_cnt := 0;
+ 55        FOR r IN (SELECT username, account_status, expiry_date FROM dba_users
+ 56                   WHERE oracle_maintained = 'N'
+ 57                     AND (account_status <> 'OPEN'
+ 58                          OR expiry_date < SYSDATE + 14))
+ 59        LOOP
+ 60           INSERT INTO dba_check_result
+ 61              (check_name, check_time, target_object, status, result_message)
+ 62           VALUES ('CHECK_USER_STATUS', SYSTIMESTAMP, r.username,
+ 63                   CASE WHEN r.account_status LIKE '%LOCKED%' THEN 'ERROR'
+ 64                        ELSE 'WARN' END,
+ 65                   r.account_status || ' / 만료 ' ||
+ 66                   NVL(TO_CHAR(r.expiry_date,'YYYY-MM-DD'), '-'));
+ 67           p_cnt := p_cnt + 1;
+ 68        END LOOP;
+ 69        COMMIT;
+ 70     END check_user_status;
+ 71
+ 72     -- CHECK_HR_DATA 를 깜빡 잊고 넣지 않았다
+ 73
+ 74     PROCEDURE run_all_check IS
+ 75        v_start TIMESTAMP := SYSTIMESTAMP;
+ 76        v_cnt   NUMBER;
+ 77     BEGIN
+ 78        check_invalid_object(USER, v_cnt);
+ 79        write_log('CHECK_INVALID_OBJECT', v_start, 'SUCCESS', v_cnt);
+ 80        check_user_status(v_cnt);
+ 81        write_log('CHECK_USER_STATUS', v_start, 'SUCCESS', v_cnt);
+ 82     END run_all_check;
+ 83
+ 84  END pkg_dba_automation;
+ 85  /
+
+Warning: Package Body created with compilation errors.
+
+SQL> SHOW ERRORS
+Errors for PACKAGE BODY PKG_DBA_AUTOMATION:
+
+LINE/COL ERROR
+-------- -----------------------------------------------------------------
+84/4     PLS-00323: subprogram or cursor 'CHECK_HR_DATA' is declared in a
+         package specification and must be defined in the package body
+
+
+-- 원인 파악
+--   스펙에 선언한 서브프로그램은 바디에 반드시 정의해야 한다.
+--   오류 위치가 바디의 마지막 줄(END)로 표시되는 점에 주의한다.
+--   컴파일러는 바디를 끝까지 읽고 나서야 "없다"는 것을 알기 때문이다.
+
+SQL> SELECT object_name, object_type, status FROM user_objects
+  2   WHERE object_name = 'PKG_DBA_AUTOMATION' ORDER BY object_type;
+
+OBJECT_NAME          OBJECT_TYPE    STATUS
+-------------------- -------------- -------
+PKG_DBA_AUTOMATION   PACKAGE        VALID
+PKG_DBA_AUTOMATION   PACKAGE BODY   INVALID
+
+-- 스펙은 VALID 지만 바디가 INVALID 이므로 호출하면 실패한다.
+
+SQL> DECLARE
+  2     v_cnt NUMBER;
+  3  BEGIN
+  4     pkg_dba_automation.check_user_status(v_cnt);
+  5  END;
+  6  /
+DECLARE
+*
+ERROR at line 1:
+ORA-04063: package body "HR.PKG_DBA_AUTOMATION" has errors
+ORA-06508: PL/SQL: could not find program unit being called:
+"HR.PKG_DBA_AUTOMATION"
+ORA-06512: at line 4
+
+
+
+--------------------------------------------------------------------------------
+[4] 수정 — CHECK_HR_DATA 를 추가하고 RUN_ALL_CHECK 를 예외 안전하게 만든다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PACKAGE BODY pkg_dba_automation AS
+  2
+  3     ---------------------------------------------------------------- 로그
+  4     PROCEDURE write_log (p_job_name IN VARCHAR2,
+  5                          p_start    IN TIMESTAMP,
+  6                          p_status   IN VARCHAR2,
+  7                          p_cnt      IN NUMBER DEFAULT NULL)
+  8     IS
+  9        PRAGMA AUTONOMOUS_TRANSACTION;
+ 10     BEGIN
+ 11        INSERT INTO plsql_job_log
+ 12           (job_name, start_time, end_time, status, processed_cnt, created_by)
+ 13        VALUES
+ 14           (p_job_name, p_start, SYSTIMESTAMP, p_status, p_cnt, USER);
+ 15        COMMIT;
+ 16     EXCEPTION
+ 17        WHEN OTHERS THEN ROLLBACK; RAISE;
+ 18     END write_log;
+ 19
+ 20     PROCEDURE write_error_log (p_job_name IN VARCHAR2,
+ 21                                p_start    IN TIMESTAMP,
+ 22                                p_code     IN NUMBER,
+ 23                                p_msg      IN VARCHAR2)
+ 24     IS
+ 25        PRAGMA AUTONOMOUS_TRANSACTION;
+ 26     BEGIN
+ 27        INSERT INTO plsql_job_log
+ 28           (job_name, start_time, end_time, status,
+ 29            error_code, error_message, created_by)
+ 30        VALUES
+ 31           (p_job_name, p_start, SYSTIMESTAMP, 'ERROR',
+ 32            p_code, SUBSTR(p_msg, 1, 4000), USER);
+ 33        COMMIT;
+ 34     EXCEPTION
+ 35        WHEN OTHERS THEN ROLLBACK; RAISE;
+ 36     END write_error_log;
+ 37
+ 38     ------------------------------------------------------------ 개별 점검
+ 39     PROCEDURE check_invalid_object (p_owner IN VARCHAR2 DEFAULT USER,
+ 40                                     p_cnt   OUT NUMBER)
+ 41     IS
+ 42     BEGIN
+ 43        p_cnt := 0;
+ 44        FOR r IN (SELECT owner, object_type, object_name FROM all_objects
+ 45                   WHERE owner = UPPER(p_owner) AND status = 'INVALID')
+ 46        LOOP
+ 47           INSERT INTO dba_check_result
+ 48              (check_name, check_time, target_object, status, result_message)
+ 49           VALUES ('CHECK_INVALID_OBJECT', SYSTIMESTAMP,
+ 50                   r.owner || '.' || r.object_name, 'WARN',
+ 51                   r.object_type || ' 이 INVALID 상태입니다');
+ 52           p_cnt := p_cnt + 1;
+ 53        END LOOP;
+ 54        COMMIT;
+ 55     END check_invalid_object;
+ 56
+ 57     PROCEDURE check_user_status (p_cnt OUT NUMBER)
+ 58     IS
+ 59     BEGIN
+ 60        p_cnt := 0;
+ 61        FOR r IN (SELECT username, account_status, expiry_date FROM dba_users
+ 62                   WHERE oracle_maintained = 'N'
+ 63                     AND (account_status <> 'OPEN'
+ 64                          OR expiry_date < SYSDATE + 14))
+ 65        LOOP
+ 66           INSERT INTO dba_check_result
+ 67              (check_name, check_time, target_object, status, result_message)
+ 68           VALUES ('CHECK_USER_STATUS', SYSTIMESTAMP, r.username,
+ 69                   CASE WHEN r.account_status LIKE '%LOCKED%' THEN 'ERROR'
+ 70                        ELSE 'WARN' END,
+ 71                   r.account_status || ' / 만료 ' ||
+ 72                   NVL(TO_CHAR(r.expiry_date,'YYYY-MM-DD'), '-'));
+ 73           p_cnt := p_cnt + 1;
+ 74        END LOOP;
+ 75        COMMIT;
+ 76     END check_user_status;
+ 77
+ 78     PROCEDURE check_hr_data (p_cnt OUT NUMBER)
+ 79     IS
+ 80     BEGIN
+ 81        p_cnt := 0;
+ 82
+ 83        -- (1) 직무 급여 범위를 벗어난 사원
+ 84        FOR r IN (SELECT e.employee_id, e.last_name, e.salary,
+ 85                         j.min_salary, j.max_salary
+ 86                    FROM employees e JOIN jobs j ON e.job_id = j.job_id
+ 87                   WHERE e.salary < j.min_salary OR e.salary > j.max_salary)
+ 88        LOOP
+ 89           INSERT INTO dba_check_result
+ 90              (check_name, check_time, target_object, status, result_message)
+ 91           VALUES ('CHECK_HR_DATA', SYSTIMESTAMP,
+ 92                   'HR.EMPLOYEES#' || r.employee_id, 'WARN',
+ 93                   r.last_name || ' 급여 ' || r.salary ||
+ 94                   ' (허용 ' || r.min_salary || '~' || r.max_salary || ')');
+ 95           p_cnt := p_cnt + 1;
+ 96        END LOOP;
+ 97
+ 98        -- (2) 존재하지 않는 부서를 참조하는 사원
+ 99        FOR r IN (SELECT e.employee_id, e.department_id
+ 100                   FROM employees e
+ 101                  WHERE e.department_id IS NOT NULL
+ 102                    AND NOT EXISTS (SELECT 1 FROM departments d
+ 103                                     WHERE d.department_id = e.department_id))
+ 104       LOOP
+ 105          INSERT INTO dba_check_result
+ 106             (check_name, check_time, target_object, status, result_message)
+ 107          VALUES ('CHECK_HR_DATA', SYSTIMESTAMP,
+ 108                  'HR.EMPLOYEES#' || r.employee_id, 'ERROR',
+ 109                  '존재하지 않는 부서 ' || r.department_id || ' 참조');
+ 110          p_cnt := p_cnt + 1;
+ 111       END LOOP;
+ 112
+ 113       COMMIT;
+ 114    END check_hr_data;
+ 115
+ 116    ------------------------------------------------------------ 통합 실행
+ 117    PROCEDURE run_all_check IS
+ 118       v_start TIMESTAMP   := SYSTIMESTAMP;
+ 119       v_cnt   NUMBER;
+ 120       v_fail  PLS_INTEGER := 0;
+ 121    BEGIN
+ 122       BEGIN
+ 123          check_invalid_object(USER, v_cnt);
+ 124          write_log('CHECK_INVALID_OBJECT', v_start, 'SUCCESS', v_cnt);
+ 125       EXCEPTION WHEN OTHERS THEN
+ 126          v_fail := v_fail + 1;
+ 127          write_error_log('CHECK_INVALID_OBJECT', v_start, SQLCODE, SQLERRM);
+ 128       END;
+ 129
+ 130       BEGIN
+ 131          check_user_status(v_cnt);
+ 132          write_log('CHECK_USER_STATUS', v_start, 'SUCCESS', v_cnt);
+ 133       EXCEPTION WHEN OTHERS THEN
+ 134          v_fail := v_fail + 1;
+ 135          write_error_log('CHECK_USER_STATUS', v_start, SQLCODE, SQLERRM);
+ 136       END;
+ 137
+ 138       BEGIN
+ 139          check_hr_data(v_cnt);
+ 140          write_log('CHECK_HR_DATA', v_start, 'SUCCESS', v_cnt);
+ 141       EXCEPTION WHEN OTHERS THEN
+ 142          v_fail := v_fail + 1;
+ 143          write_error_log('CHECK_HR_DATA', v_start, SQLCODE, SQLERRM);
+ 144       END;
+ 145
+ 146       write_log('RUN_ALL_CHECK', v_start,
+ 147                 CASE WHEN v_fail = 0 THEN 'SUCCESS' ELSE 'PARTIAL' END, v_fail);
+ 148
+ 149       IF v_fail > 0 THEN
+ 150          RAISE_APPLICATION_ERROR(-20001,
+ 151             v_fail || '개 점검이 실패했습니다. plsql_job_log 를 확인하세요.');
+ 152       END IF;
+ 153    END run_all_check;
+ 154
+ 155 END pkg_dba_automation;
+ 156 /
+
+Package body created.
+
+SQL> SELECT object_name, object_type, status FROM user_objects
+  2   WHERE object_name = 'PKG_DBA_AUTOMATION' ORDER BY object_type;
+
+OBJECT_NAME          OBJECT_TYPE    STATUS
+-------------------- -------------- -------
+PKG_DBA_AUTOMATION   PACKAGE        VALID
+PKG_DBA_AUTOMATION   PACKAGE BODY   VALID
+
+
+--------------------------------------------------------------------------------
+[5] 정상 실행 — 세 점검이 모두 성공한다
+--------------------------------------------------------------------------------
+
+SQL> EXEC pkg_dba_automation.run_all_check;
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, status, processed_cnt, error_code,
+  2         TO_CHAR(start_time,'HH24:MI:SS') AS ts
+  3    FROM plsql_job_log ORDER BY log_id;
+
+JOB_NAME               STATUS     PROCESSED_CNT ERROR_CODE TS
+---------------------- ---------- ------------- ---------- --------
+CHECK_INVALID_OBJECT   SUCCESS                0            17:22:31
+CHECK_USER_STATUS      SUCCESS                1            17:22:31
+CHECK_HR_DATA          SUCCESS                1            17:22:31
+RUN_ALL_CHECK          SUCCESS                0            17:22:31
+
+SQL> COLUMN result_message FORMAT A45
+
+SQL> SELECT check_name, target_object, status, result_message
+  2    FROM dba_check_result ORDER BY check_id;
+
+CHECK_NAME             TARGET_OBJECT      STATUS RESULT_MESSAGE
+---------------------- ------------------ ------ ---------------------------------
+CHECK_USER_STATUS      BATCH_USER         ERROR  LOCKED(TIMED) / 만료 2026-09-30
+CHECK_HR_DATA          HR.EMPLOYEES#178   WARN   Grant 급여 7000 (허용 6000~12008)
+
+-- RUN_ALL_CHECK 의 processed_cnt 는 "실패한 점검의 개수"다.
+-- 0 이면 전부 성공했다는 뜻이다.
+
+
+--------------------------------------------------------------------------------
+[6] (오류 재현 2) 첫 점검이 실패하면 어떻게 되는가 — 예외 블록이 없다면
+--------------------------------------------------------------------------------
+
+-- 비교를 위해 예외 블록이 없는 버전을 별도 프로시저로 만든다.
+
+SQL> CREATE OR REPLACE PROCEDURE pr_run_all_naive IS
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3     v_cnt   NUMBER;
+  4  BEGIN
+  5     pkg_dba_automation.check_invalid_object(USER, v_cnt);
+  6     pkg_dba_automation.write_log('NAIVE_INVALID', v_start, 'SUCCESS', v_cnt);
+  7
+  8     pkg_dba_automation.check_user_status(v_cnt);
+  9     pkg_dba_automation.write_log('NAIVE_USER', v_start, 'SUCCESS', v_cnt);
+ 10
+ 11     pkg_dba_automation.check_hr_data(v_cnt);
+ 12     pkg_dba_automation.write_log('NAIVE_HRDATA', v_start, 'SUCCESS', v_cnt);
+ 13  END;
+ 14  /
+
+Procedure created.
+
+-- 두 번째 점검이 실패하도록 DBA_USERS 권한을 회수한다.
+
+SQL> CONNECT system/oracle@localhost:1521/orclpdb
+Connected.
+
+SQL> REVOKE SELECT ON dba_users FROM hr;
+
+Revoke succeeded.
+
+SQL> CONNECT hr/hr@localhost:1521/orclpdb
+Connected.
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 150
+
+SQL> SELECT object_name, object_type, status FROM user_objects
+  2   WHERE object_name = 'PKG_DBA_AUTOMATION';
+
+OBJECT_NAME          OBJECT_TYPE    STATUS
+-------------------- -------------- -------
+PKG_DBA_AUTOMATION   PACKAGE        VALID
+PKG_DBA_AUTOMATION   PACKAGE BODY   INVALID
+
+-- 권한이 사라지자 패키지 바디가 INVALID 로 바뀌었다.
+-- 정적 SQL 의 의존성이 딕셔너리에 기록되어 있기 때문이다.
+
+SQL> DELETE FROM plsql_job_log;
+
+4 rows deleted.
+
+SQL> DELETE FROM dba_check_result;
+
+2 rows deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> EXEC pr_run_all_naive;
+BEGIN pr_run_all_naive; END;
+
+*
+ERROR at line 1:
+ORA-04063: package body "HR.PKG_DBA_AUTOMATION" has errors
+ORA-06508: PL/SQL: could not find program unit being called:
+"HR.PKG_DBA_AUTOMATION"
+ORA-06512: at "HR.PR_RUN_ALL_NAIVE", line 5
+ORA-06512: at line 1
+
+
+SQL> SELECT job_name, status FROM plsql_job_log;
+
+no rows selected
+
+-- 원인 파악
+--   패키지 전체가 컴파일되지 않으므로 첫 호출부터 실패했다.
+--   예외 처리가 없어 아무 로그도 남지 않았고 나머지 점검도 실행되지 않았다.
+--   운영에서 이 상태는 "아무 일도 일어나지 않은 것"과 구분되지 않는다.
+
+
+--------------------------------------------------------------------------------
+[7] 부분 실패를 흡수하도록 구조를 바꾼다
+--------------------------------------------------------------------------------
+
+-- 실무에서는 점검마다 권한 요건이 다르므로, 하나가 못 돌아도 나머지는 돌아야 한다.
+-- 문제가 되는 정적 SQL 을 동적 SQL 로 바꿔 컴파일 의존성을 끊는다.
+
+SQL> CREATE OR REPLACE PACKAGE BODY pkg_dba_automation AS
+  2
+  3     PROCEDURE write_log (p_job_name IN VARCHAR2, p_start IN TIMESTAMP,
+  4                          p_status IN VARCHAR2, p_cnt IN NUMBER DEFAULT NULL)
+  5     IS
+  6        PRAGMA AUTONOMOUS_TRANSACTION;
+  7     BEGIN
+  8        INSERT INTO plsql_job_log
+  9           (job_name, start_time, end_time, status, processed_cnt, created_by)
+ 10        VALUES (p_job_name, p_start, SYSTIMESTAMP, p_status, p_cnt, USER);
+ 11        COMMIT;
+ 12     EXCEPTION
+ 13        WHEN OTHERS THEN ROLLBACK; RAISE;
+ 14     END write_log;
+ 15
+ 16     PROCEDURE write_error_log (p_job_name IN VARCHAR2, p_start IN TIMESTAMP,
+ 17                                p_code IN NUMBER, p_msg IN VARCHAR2)
+ 18     IS
+ 19        PRAGMA AUTONOMOUS_TRANSACTION;
+ 20     BEGIN
+ 21        INSERT INTO plsql_job_log
+ 22           (job_name, start_time, end_time, status,
+ 23            error_code, error_message, created_by)
+ 24        VALUES (p_job_name, p_start, SYSTIMESTAMP, 'ERROR',
+ 25                p_code, SUBSTR(p_msg, 1, 4000), USER);
+ 26        COMMIT;
+ 27     EXCEPTION
+ 28        WHEN OTHERS THEN ROLLBACK; RAISE;
+ 29     END write_error_log;
+ 30
+ 31     PROCEDURE check_invalid_object (p_owner IN VARCHAR2 DEFAULT USER,
+ 32                                     p_cnt OUT NUMBER)
+ 33     IS
+ 34     BEGIN
+ 35        p_cnt := 0;
+ 36        FOR r IN (SELECT owner, object_type, object_name FROM all_objects
+ 37                   WHERE owner = UPPER(p_owner) AND status = 'INVALID')
+ 38        LOOP
+ 39           INSERT INTO dba_check_result
+ 40              (check_name, check_time, target_object, status, result_message)
+ 41           VALUES ('CHECK_INVALID_OBJECT', SYSTIMESTAMP,
+ 42                   r.owner || '.' || r.object_name, 'WARN',
+ 43                   r.object_type || ' 이 INVALID 상태입니다');
+ 44           p_cnt := p_cnt + 1;
+ 45        END LOOP;
+ 46        COMMIT;
+ 47     END check_invalid_object;
+ 48
+ 49     PROCEDURE check_user_status (p_cnt OUT NUMBER)
+ 50     IS
+ 51        TYPE t_cur IS REF CURSOR;
+ 52        c        t_cur;
+ 53        v_user   VARCHAR2(128);
+ 54        v_status VARCHAR2(32);
+ 55        v_expiry DATE;
+ 56     BEGIN
+ 57        p_cnt := 0;
+ 58        -- 동적 SQL 로 컴파일 의존성을 끊는다.
+ 59        -- 권한이 없으면 이 프로시저만 런타임 ORA-00942 로 실패한다.
+ 60        OPEN c FOR
+ 61           'SELECT username, account_status, expiry_date FROM dba_users
+ 62             WHERE oracle_maintained = ''N''
+ 63               AND (account_status <> ''OPEN''
+ 64                    OR expiry_date < SYSDATE + 14)';
+ 65        LOOP
+ 66           FETCH c INTO v_user, v_status, v_expiry;
+ 67           EXIT WHEN c%NOTFOUND;
+ 68           INSERT INTO dba_check_result
+ 69              (check_name, check_time, target_object, status, result_message)
+ 70           VALUES ('CHECK_USER_STATUS', SYSTIMESTAMP, v_user,
+ 71                   CASE WHEN v_status LIKE '%LOCKED%' THEN 'ERROR'
+ 72                        ELSE 'WARN' END,
+ 73                   v_status || ' / 만료 ' ||
+ 74                   NVL(TO_CHAR(v_expiry,'YYYY-MM-DD'), '-'));
+ 75           p_cnt := p_cnt + 1;
+ 76        END LOOP;
+ 77        CLOSE c;
+ 78        COMMIT;
+ 79     END check_user_status;
+ 80
+ 81     PROCEDURE check_hr_data (p_cnt OUT NUMBER)
+ 82     IS
+ 83     BEGIN
+ 84        p_cnt := 0;
+ 85        FOR r IN (SELECT e.employee_id, e.last_name, e.salary,
+ 86                         j.min_salary, j.max_salary
+ 87                    FROM employees e JOIN jobs j ON e.job_id = j.job_id
+ 88                   WHERE e.salary < j.min_salary OR e.salary > j.max_salary)
+ 89        LOOP
+ 90           INSERT INTO dba_check_result
+ 91              (check_name, check_time, target_object, status, result_message)
+ 92           VALUES ('CHECK_HR_DATA', SYSTIMESTAMP,
+ 93                   'HR.EMPLOYEES#' || r.employee_id, 'WARN',
+ 94                   r.last_name || ' 급여 ' || r.salary ||
+ 95                   ' (허용 ' || r.min_salary || '~' || r.max_salary || ')');
+ 96           p_cnt := p_cnt + 1;
+ 97        END LOOP;
+ 98        COMMIT;
+ 99     END check_hr_data;
+ 100
+ 101    PROCEDURE run_all_check IS
+ 102       v_start TIMESTAMP   := SYSTIMESTAMP;
+ 103       v_cnt   NUMBER;
+ 104       v_fail  PLS_INTEGER := 0;
+ 105    BEGIN
+ 106       BEGIN
+ 107          check_invalid_object(USER, v_cnt);
+ 108          write_log('CHECK_INVALID_OBJECT', v_start, 'SUCCESS', v_cnt);
+ 109       EXCEPTION WHEN OTHERS THEN
+ 110          v_fail := v_fail + 1;
+ 111          write_error_log('CHECK_INVALID_OBJECT', v_start, SQLCODE, SQLERRM);
+ 112       END;
+ 113
+ 114       BEGIN
+ 115          check_user_status(v_cnt);
+ 116          write_log('CHECK_USER_STATUS', v_start, 'SUCCESS', v_cnt);
+ 117       EXCEPTION WHEN OTHERS THEN
+ 118          v_fail := v_fail + 1;
+ 119          write_error_log('CHECK_USER_STATUS', v_start, SQLCODE, SQLERRM);
+ 120       END;
+ 121
+ 122       BEGIN
+ 123          check_hr_data(v_cnt);
+ 124          write_log('CHECK_HR_DATA', v_start, 'SUCCESS', v_cnt);
+ 125       EXCEPTION WHEN OTHERS THEN
+ 126          v_fail := v_fail + 1;
+ 127          write_error_log('CHECK_HR_DATA', v_start, SQLCODE, SQLERRM);
+ 128       END;
+ 129
+ 130       write_log('RUN_ALL_CHECK', v_start,
+ 131                 CASE WHEN v_fail = 0 THEN 'SUCCESS' ELSE 'PARTIAL' END, v_fail);
+ 132
+ 133       IF v_fail > 0 THEN
+ 134          RAISE_APPLICATION_ERROR(-20001,
+ 135             v_fail || '개 점검이 실패했습니다. plsql_job_log 를 확인하세요.');
+ 136       END IF;
+ 137    END run_all_check;
+ 138
+ 139 END pkg_dba_automation;
+ 140 /
+
+Package body created.
+
+SQL> EXEC pkg_dba_automation.run_all_check;
+BEGIN pkg_dba_automation.run_all_check; END;
+
+*
+ERROR at line 1:
+ORA-20001: 1개 점검이 실패했습니다. plsql_job_log 를 확인하세요.
+ORA-06512: at "HR.PKG_DBA_AUTOMATION", line 134
+ORA-06512: at line 1
+
+
+SQL> SELECT job_name, status, processed_cnt, error_code,
+  2         SUBSTR(error_message,1,38) AS msg
+  3    FROM plsql_job_log ORDER BY log_id;
+
+JOB_NAME               STATUS     PROCESSED_CNT ERROR_CODE MSG
+---------------------- ---------- ------------- ---------- --------------------------------------
+CHECK_INVALID_OBJECT   SUCCESS                0
+CHECK_USER_STATUS      ERROR                        -942   ORA-00942: table or view does not exi
+CHECK_HR_DATA          SUCCESS                1
+RUN_ALL_CHECK          PARTIAL                1
+
+-- 두 번째 점검만 실패하고 세 번째 점검은 정상적으로 실행됐다.
+-- 그리고 마지막에 예외를 재전파했으므로 호출자도 실패를 인지한다.
+-- "멈추지 않되 숨기지도 않는다"가 구현된 모습이다.
+
+
+--------------------------------------------------------------------------------
+[8] 권한을 복구하고 전체가 성공하는지 확인한다
+--------------------------------------------------------------------------------
+
+SQL> CONNECT system/oracle@localhost:1521/orclpdb
+Connected.
+
+SQL> GRANT SELECT ON dba_users TO hr;
+
+Grant succeeded.
+
+SQL> CONNECT hr/hr@localhost:1521/orclpdb
+Connected.
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 150
+
+SQL> DELETE FROM plsql_job_log;
+
+4 rows deleted.
+
+SQL> DELETE FROM dba_check_result;
+
+1 row deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> EXEC pkg_dba_automation.run_all_check;
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, status, processed_cnt FROM plsql_job_log ORDER BY log_id;
+
+JOB_NAME               STATUS     PROCESSED_CNT
+---------------------- ---------- -------------
+CHECK_INVALID_OBJECT   SUCCESS                0
+CHECK_USER_STATUS      SUCCESS                1
+CHECK_HR_DATA          SUCCESS                1
+RUN_ALL_CHECK          SUCCESS                0
+
+
+--------------------------------------------------------------------------------
+[9] 스케줄러 Job 으로 등록한다 — 진입점은 하나면 된다
+--------------------------------------------------------------------------------
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.CREATE_JOB (
+  3        job_name        => 'J_DBA_AUTOMATION',
+  4        job_type        => 'STORED_PROCEDURE',
+  5        job_action      => 'PKG_DBA_AUTOMATION.RUN_ALL_CHECK',
+  6        start_date      => SYSTIMESTAMP,
+  7        repeat_interval => 'FREQ=DAILY; BYHOUR=2; BYMINUTE=0; BYSECOND=0',
+  8        enabled         => FALSE,
+  9        auto_drop       => FALSE,
+ 10        comments        => 'HR DBA 자동화 일일 점검');
+ 11
+ 12     DBMS_SCHEDULER.SET_ATTRIBUTE('J_DBA_AUTOMATION', 'max_failures', 3);
+ 13     DBMS_SCHEDULER.SET_ATTRIBUTE('J_DBA_AUTOMATION', 'schedule_limit',
+ 14                                  INTERVAL '30' MINUTE);
+ 15     DBMS_SCHEDULER.ENABLE('J_DBA_AUTOMATION');
+ 16  END;
+ 17  /
+
+PL/SQL procedure successfully completed.
+
+-- 배포 전 수동 검증(비동기 실행으로 실제 슬레이브 환경을 확인한다)
+
+SQL> EXEC DBMS_SCHEDULER.RUN_JOB('J_DBA_AUTOMATION', use_current_session => FALSE);
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, status, error# AS err,
+  2         TO_CHAR(log_date,'HH24:MI:SS') AS log_date, run_duration
+  3    FROM user_scheduler_job_run_details
+  4   WHERE job_name = 'J_DBA_AUTOMATION';
+
+JOB_NAME            STATUS            ERR LOG_DATE RUN_DURATION
+------------------- ----------- --------- -------- ---------------
+J_DBA_AUTOMATION    SUCCEEDED           0 17:41:52 +000 00:00:01
+
+SQL> SELECT job_name, enabled, state, max_failures,
+  2         TO_CHAR(next_run_date,'MM-DD HH24:MI') AS next_run
+  3    FROM user_scheduler_jobs WHERE job_name = 'J_DBA_AUTOMATION';
+
+JOB_NAME            ENABLED  STATE       MAX_FAILURES NEXT_RUN
+------------------- -------- ----------- ------------ ----------
+J_DBA_AUTOMATION    TRUE     SCHEDULED              3 08-20 02:00
+
+
+--------------------------------------------------------------------------------
+[10] 모니터링 질의 — 다섯 축
+--------------------------------------------------------------------------------
+
+SQL> SELECT job_name, COUNT(*) AS total_runs,
+  2         SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END) AS ok_cnt,
+  3         ROUND(100 * SUM(CASE WHEN status = 'SUCCESS' THEN 1 ELSE 0 END)
+  4               / COUNT(*), 1) AS success_rate
+  5    FROM plsql_job_log
+  6   WHERE start_time > SYSTIMESTAMP - INTERVAL '7' DAY
+  7   GROUP BY job_name ORDER BY success_rate, job_name;
+
+JOB_NAME               TOTAL_RUNS    OK_CNT SUCCESS_RATE
+---------------------- ---------- --------- ------------
+CHECK_HR_DATA                   2         2          100
+CHECK_INVALID_OBJECT            2         2          100
+CHECK_USER_STATUS               2         2          100
+RUN_ALL_CHECK                   2         2          100
+
+SQL> SELECT error_code, COUNT(*) AS cnt,
+  2         MAX(SUBSTR(error_message,1,40)) AS sample
+  3    FROM plsql_job_log
+  4   WHERE status <> 'SUCCESS' AND error_code IS NOT NULL
+  5   GROUP BY error_code ORDER BY cnt DESC;
+
+no rows selected
+
+SQL> SELECT job_name, status, processed_cnt,
+  2         TO_CHAR(start_time,'MM-DD HH24:MI') AS last_run
+  3    FROM (SELECT t.*, ROW_NUMBER() OVER
+  4                 (PARTITION BY job_name ORDER BY start_time DESC) AS rn
+  5            FROM plsql_job_log t)
+  6   WHERE rn = 1 ORDER BY job_name;
+
+JOB_NAME               STATUS     PROCESSED_CNT LAST_RUN
+---------------------- ---------- ------------- ----------
+CHECK_HR_DATA          SUCCESS                1 08-19 17:41
+CHECK_INVALID_OBJECT   SUCCESS                0 08-19 17:41
+CHECK_USER_STATUS      SUCCESS                1 08-19 17:41
+RUN_ALL_CHECK          SUCCESS                0 08-19 17:41
+
+-- 처리 건수가 어제와 크게 달라지면 성공했더라도 확인해야 한다.
+-- INVALID 객체가 0건에서 12건이 되었다면 배포 후 재컴파일 누락이다.
+
+
+--------------------------------------------------------------------------------
+[11] 실습 정리 — 이 장에서 만든 자산
+--------------------------------------------------------------------------------
+
+SQL> SELECT object_name, object_type, status FROM user_objects
+  2   WHERE object_type IN ('PACKAGE','PACKAGE BODY','JOB','PROGRAM','SCHEDULE')
+  3   ORDER BY object_type, object_name;
+
+OBJECT_NAME             OBJECT_TYPE    STATUS
+----------------------- -------------- -------
+J_DAILY_CHECK           JOB            VALID
+J_DBA_AUTOMATION        JOB            VALID
+J_DEMO_HOURLY           JOB            VALID
+J_DEPT_REPORT           JOB            VALID
+J_DEPT_REPORT_NIGHT     JOB            VALID
+PKG_DBA_AUTOMATION      PACKAGE        VALID
+PKG_DBA_AUTOMATION      PACKAGE BODY   VALID
+PRG_DEPT_REPORT         PROGRAM        VALID
+SCH_EVERY_2MIN          SCHEDULE       VALID
+SCH_NIGHTLY_02          SCHEDULE       VALID
+
+SQL> DROP PROCEDURE pr_run_all_naive;
+
+Procedure dropped.
+
+-- 실습 환경을 완전히 정리하려면 아래를 실행한다(로그 테이블은 남긴다).
+--   BEGIN
+--      FOR r IN (SELECT job_name FROM user_scheduler_jobs) LOOP
+--         DBMS_SCHEDULER.DROP_JOB(r.job_name, force => TRUE);
+--      END LOOP;
+--   END;
+--   /
+--
+-- PKG_DBA_AUTOMATION 은 최종 프로젝트
+-- "HR Database DBA Automation Framework" 에서 확장하므로 남겨 둔다.
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. 패키지 스펙에 선언한 서브프로그램을 바디에 정의하지 않으면 PLS-00323 이다.
+    오류 위치가 바디의 마지막 END 로 표시되는 점에 주의한다.
+ 2. 바디가 INVALID 이면 어떤 프로시저를 호출해도 ORA-04063 / ORA-06508 이 난다.
+    패키지는 스펙과 바디가 별개의 객체이므로 각각 상태를 확인한다.
+ 3. 개별 점검을 예외 처리 없이 순차 호출하면 첫 실패가 나머지 전부를 막는다.
+    로그조차 남지 않아 "아무 일도 없었던 것"과 구분되지 않는다.
+ 4. 각 호출을 개별 BEGIN … EXCEPTION … END 로 감싸면 부분 실패를 흡수한다.
+    실패한 점검만 ERROR 로 기록되고 나머지는 정상 수행된다.
+ 5. 마지막에 RAISE_APPLICATION_ERROR 로 재전파해야 스케줄러가 FAILED 로 인지한다.
+    삼키기만 하면 이력이 SUCCEEDED 가 되어 알림도 울리지 않는다.
+ 6. 권한 요건이 다른 점검은 동적 SQL 로 컴파일 의존성을 끊으면
+    권한 회수 시에도 패키지 전체가 INVALID 가 되지 않는다.
+ 7. 스케줄러에 노출하는 진입점은 RUN_ALL_CHECK 하나면 충분하다.
+    job_action 은 'PKG_DBA_AUTOMATION.RUN_ALL_CHECK' 한 줄이다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

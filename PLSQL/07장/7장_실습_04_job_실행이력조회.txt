@@ -1,0 +1,430 @@
+================================================================================
+ 제7장 실습 04 — Job 실행 이력 조회 (*_SCHEDULER_JOB_RUN_DETAILS)
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS) / SYSTEM (관리 계정)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) 잘못된 컬럼명을 조회해 ORA-00904 를 재현하고 고친다
+               2) 비동기 실행 직후 이력이 보이지 않는 상황을 오해 없이 진단한다
+               3) USER_SCHEDULER_JOB_LOG 와 JOB_RUN_DETAILS 의 차이를 확인한다
+               4) RUN_DURATION 을 초 단위로 환산해 실행 시간 추세를 본다
+               5) SYSTEM 으로 DBA_SCHEDULER_JOB_RUN_DETAILS 를 조회한다
+               6) 로그 보존 기간(LOG_HISTORY)과 PURGE_LOG 를 확인한다
+ 사전 준비   : 실습 01~03 에서 만든 J_DEMO_HOURLY · J_DEPT_REPORT ·
+               J_DEPT_REPORT_NIGHT Job 과 그 실행 이력이 필요합니다.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+[1] 접속하고 이력이 쌓여 있는지 확인한다
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 13:14:05 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 150
+SQL> SET PAGESIZE 60
+
+SQL> SELECT job_name, COUNT(*) AS runs
+  2    FROM user_scheduler_job_run_details
+  3   GROUP BY job_name ORDER BY job_name;
+
+JOB_NAME                   RUNS
+--------------------- ---------
+J_DEMO_HOURLY                 4
+J_DEPT_REPORT                 2
+J_NOISY                       2
+
+
+--------------------------------------------------------------------------------
+[2] (오류 재현 1) 컬럼명을 잘못 적는다 — ORA-00904
+--------------------------------------------------------------------------------
+
+-- "작업 상태"를 보고 싶어서 job_status 라는 컬럼을 상상해 조회한다.
+
+SQL> SELECT job_name, job_status, run_date
+  2    FROM user_scheduler_job_run_details;
+SELECT job_name, job_status, run_date
+                 *
+ERROR at line 1:
+ORA-00904: "JOB_STATUS": invalid identifier
+
+
+-- 원인 파악
+--   이 뷰에는 job_status 도 run_date 도 없다.
+--   상태 컬럼 이름은 status 이고 날짜 컬럼은 log_date 다.
+--   추측하지 말고 딕셔너리에서 컬럼 목록을 먼저 확인한다.
+
+SQL> SELECT column_name, data_type
+  2    FROM user_tab_columns
+  3   WHERE table_name = 'USER_SCHEDULER_JOB_RUN_DETAILS'
+  4   ORDER BY column_id;
+
+COLUMN_NAME                DATA_TYPE
+-------------------------- --------------------------
+LOG_ID                     NUMBER
+LOG_DATE                   TIMESTAMP(6) WITH TIME ZONE
+OWNER                      VARCHAR2
+JOB_NAME                   VARCHAR2
+JOB_SUBNAME                VARCHAR2
+STATUS                     VARCHAR2
+ERROR#                     NUMBER
+REQ_START_DATE             TIMESTAMP(6) WITH TIME ZONE
+ACTUAL_START_DATE          TIMESTAMP(6) WITH TIME ZONE
+RUN_DURATION               INTERVAL DAY(9) TO SECOND(6)
+INSTANCE_ID                NUMBER
+SESSION_ID                 VARCHAR2
+SLAVE_PID                  VARCHAR2
+CPU_USED                   INTERVAL DAY(9) TO SECOND(6)
+CREDENTIAL_OWNER           VARCHAR2
+CREDENTIAL_NAME            VARCHAR2
+DESTINATION_OWNER          VARCHAR2
+DESTINATION                VARCHAR2
+ADDITIONAL_INFO            VARCHAR2
+ERRORS                     CLOB
+OUTPUT                     CLOB
+BINARY_ERROR               RAW
+
+22 rows selected.
+
+-- 수정 : 실제 컬럼명으로 다시 조회한다.
+
+SQL> SELECT job_name, status, TO_CHAR(log_date,'MM-DD HH24:MI:SS') AS log_date
+  2    FROM user_scheduler_job_run_details
+  3   ORDER BY log_date DESC FETCH FIRST 5 ROWS ONLY;
+
+JOB_NAME        STATUS      LOG_DATE
+--------------- ----------- --------------
+J_NOISY         SUCCEEDED   08-19 11:05:42
+J_NOISY         SUCCEEDED   08-19 11:05:12
+J_DEMO_HOURLY   SUCCEEDED   08-19 11:14:03
+J_DEPT_REPORT   SUCCEEDED   08-19 10:36:01
+J_DEPT_REPORT   SUCCEEDED   08-19 10:34:01
+
+-- 참고 : ERROR# 컬럼은 이름에 # 가 들어가므로 별칭을 붙여 쓰는 편이 편하다.
+--        SELECT error# AS err FROM ...
+
+
+--------------------------------------------------------------------------------
+[3] (오류 재현 2) 비동기 실행 직후 이력이 보이지 않는다
+--------------------------------------------------------------------------------
+
+-- 일부러 몇 초 걸리는 작업을 만든다.
+
+SQL> CREATE OR REPLACE PROCEDURE pr_slow_demo IS
+  2  BEGIN
+  3     DBMS_SESSION.SLEEP(8);
+  4     INSERT INTO plsql_job_log
+  5        (job_name, start_time, end_time, status, processed_cnt, created_by)
+  6     VALUES ('PR_SLOW_DEMO', SYSTIMESTAMP, SYSTIMESTAMP, 'SUCCESS', 1, USER);
+  7     COMMIT;
+  8  END;
+  9  /
+
+Procedure created.
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.CREATE_JOB (
+  3        job_name   => 'J_SLOW',
+  4        job_type   => 'STORED_PROCEDURE',
+  5        job_action => 'PR_SLOW_DEMO',
+  6        enabled    => TRUE,
+  7        auto_drop  => FALSE);
+  8  END;
+  9  /
+
+PL/SQL procedure successfully completed.
+
+SQL> EXEC DBMS_SCHEDULER.RUN_JOB('J_SLOW', use_current_session => FALSE);
+
+PL/SQL procedure successfully completed.
+
+-- 곧바로 이력을 조회한다.
+
+SQL> SELECT job_name, status FROM user_scheduler_job_run_details
+  2   WHERE job_name = 'J_SLOW';
+
+no rows selected
+
+-- 여기서 "실패했다"고 판단하면 안 된다.
+--
+-- 원인 파악
+--   use_current_session => FALSE 는 비동기 실행이다.
+--   슬레이브가 작업을 끝내고 로그를 확정한 뒤에야 이력 행이 나타난다.
+--   조회 결과가 비었다는 사실은 실패의 증거가 아니다.
+
+-- 확인 : 아직 돌고 있는지 본다.
+
+SQL> SELECT job_name, session_id, elapsed_time
+  2    FROM user_scheduler_running_jobs;
+
+JOB_NAME   SESSION_ID ELAPSED_TIME
+---------- ---------- ---------------
+J_SLOW            301 +000 00:00:03
+
+-- 실행 중이다. 몇 초 기다렸다가 다시 조회한다.
+
+SQL> SELECT job_name, status, error# AS err, run_duration
+  2    FROM user_scheduler_job_run_details WHERE job_name = 'J_SLOW';
+
+JOB_NAME   STATUS            ERR RUN_DURATION
+---------- ----------- --------- ---------------
+J_SLOW     SUCCEEDED           0 +000 00:00:08
+
+-- 정상 실행됐다.
+-- 즉각적인 피드백이 필요하다면 동기 실행을 쓰면 된다.
+
+SQL> EXEC DBMS_SCHEDULER.RUN_JOB('J_SLOW');
+
+PL/SQL procedure successfully completed.
+
+-- 이번에는 8초 뒤에 프롬프트가 돌아왔고, 끝나자마자 이력이 보인다.
+
+SQL> SELECT COUNT(*) FROM user_scheduler_job_run_details WHERE job_name = 'J_SLOW';
+
+  COUNT(*)
+----------
+         2
+
+
+--------------------------------------------------------------------------------
+[4] JOB_LOG 와 JOB_RUN_DETAILS 의 차이
+--------------------------------------------------------------------------------
+
+SQL> SELECT TO_CHAR(log_date,'HH24:MI:SS') AS log_date,
+  2         job_name, operation, status
+  3    FROM user_scheduler_job_log
+  4   WHERE job_name = 'J_SLOW' ORDER BY log_date;
+
+LOG_DATE JOB_NAME   OPERATION   STATUS
+-------- ---------- ----------- -----------
+13:21:44 J_SLOW     RUN         SUCCEEDED
+13:22:19 J_SLOW     RUN         SUCCEEDED
+
+-- JOB_LOG 는 Job 에 일어난 "사건"을 기록한다.
+-- logging_level 을 높이면 CREATE · ENABLE · DISABLE · DROP 도 남는다.
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.SET_ATTRIBUTE('J_SLOW', 'logging_level',
+  3                                  DBMS_SCHEDULER.LOGGING_FULL);
+  4  END;
+  5  /
+
+PL/SQL procedure successfully completed.
+
+SQL> EXEC DBMS_SCHEDULER.DISABLE('J_SLOW');
+
+PL/SQL procedure successfully completed.
+
+SQL> EXEC DBMS_SCHEDULER.ENABLE('J_SLOW');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT TO_CHAR(log_date,'HH24:MI:SS') AS log_date, operation, status
+  2    FROM user_scheduler_job_log
+  3   WHERE job_name = 'J_SLOW' ORDER BY log_date;
+
+LOG_DATE OPERATION   STATUS
+-------- ----------- -----------
+13:21:44 RUN         SUCCEEDED
+13:22:19 RUN         SUCCEEDED
+13:23:51 UPDATE
+13:23:58 DISABLE
+13:24:02 ENABLE
+
+-- "누가 언제 이 Job 을 껐나" 같은 질문은 JOB_LOG 가 답한다.
+-- "왜 실패했나" 는 JOB_RUN_DETAILS 가 답한다.
+
+
+--------------------------------------------------------------------------------
+[5] 실행 시간 추세를 초 단위로 본다
+--------------------------------------------------------------------------------
+
+SQL> SELECT job_name,
+  2         TO_CHAR(actual_start_date,'MM-DD HH24:MI:SS') AS started,
+  3         run_duration,
+  4         EXTRACT(HOUR   FROM run_duration) * 3600
+  5       + EXTRACT(MINUTE FROM run_duration) * 60
+  6       + EXTRACT(SECOND FROM run_duration) AS sec
+  7    FROM user_scheduler_job_run_details
+  8   ORDER BY log_date DESC FETCH FIRST 8 ROWS ONLY;
+
+JOB_NAME        STARTED        RUN_DURATION           SEC
+--------------- -------------- --------------- ----------
+J_SLOW          08-19 13:22:11 +000 00:00:08             8
+J_SLOW          08-19 13:21:36 +000 00:00:08             8
+J_DEMO_HOURLY   08-19 13:14:03 +000 00:00:00             0
+J_NOISY         08-19 11:05:41 +000 00:00:01             1
+J_NOISY         08-19 11:05:12 +000 00:00:00             0
+J_DEMO_HOURLY   08-19 11:14:03 +000 00:00:00             0
+J_DEPT_REPORT   08-19 10:36:01 +000 00:00:00             0
+J_DEPT_REPORT   08-19 10:34:01 +000 00:00:00             0
+
+-- RUN_DURATION 은 INTERVAL DAY TO SECOND 타입이라 정렬·비교가 번거롭다.
+-- EXTRACT 로 초 단위 숫자로 바꿔 두면 리포트 작성이 쉬워진다.
+
+-- 지연도 함께 본다. 예정 시각과 실제 시각의 차이가 지연이다.
+
+SQL> SELECT job_name,
+  2         TO_CHAR(req_start_date,'HH24:MI:SS')    AS req_start,
+  3         TO_CHAR(actual_start_date,'HH24:MI:SS') AS act_start,
+  4         EXTRACT(SECOND FROM (actual_start_date - req_start_date)) AS delay_sec
+  5    FROM user_scheduler_job_run_details
+  6   WHERE req_start_date IS NOT NULL
+  7   ORDER BY log_date DESC FETCH FIRST 3 ROWS ONLY;
+
+JOB_NAME        REQ_START ACT_START  DELAY_SEC
+--------------- --------- --------- ----------
+J_DEMO_HOURLY   13:14:03  13:14:03           0
+J_DEMO_HOURLY   12:14:03  12:14:04           1
+J_DEMO_HOURLY   11:14:03  11:14:03           0
+
+-- 지연이 계속 커진다면 슬레이브 부족이나 자원 경합을 의심한다.
+
+
+--------------------------------------------------------------------------------
+[6] SYSTEM 계정으로 전체 스키마 이력을 본다
+--------------------------------------------------------------------------------
+
+SQL> CONNECT system/oracle@localhost:1521/orclpdb
+Connected.
+
+SQL> SET LINESIZE 150
+
+SQL> SELECT owner, job_name, status, COUNT(*) AS cnt
+  2    FROM dba_scheduler_job_run_details
+  3   WHERE log_date > SYSTIMESTAMP - INTERVAL '1' DAY
+  4   GROUP BY owner, job_name, status
+  5   ORDER BY owner, job_name;
+
+OWNER    JOB_NAME              STATUS            CNT
+-------- --------------------- ----------- ---------
+HR       J_DEMO_HOURLY         SUCCEEDED           4
+HR       J_DEPT_REPORT         SUCCEEDED           2
+HR       J_NOISY               SUCCEEDED           2
+HR       J_SLOW                SUCCEEDED           2
+SYS      CLEANUP_ONLINE_PMO    SUCCEEDED           1
+SYS      PURGE_LOG             SUCCEEDED           1
+
+-- SYS 소유의 유지관리 작업도 함께 보인다.
+-- PURGE_LOG 가 매일 오래된 스케줄러 로그를 정리하는 작업이다.
+
+
+--------------------------------------------------------------------------------
+[7] 로그 보존 기간과 수동 정리
+--------------------------------------------------------------------------------
+
+SQL> SELECT attribute_name, value
+  2    FROM dba_scheduler_global_attribute
+  3   WHERE attribute_name IN ('LOG_HISTORY','DEFAULT_TIMEZONE','CURRENT_OPEN_WINDOW')
+  4   ORDER BY attribute_name;
+
+ATTRIBUTE_NAME            VALUE
+------------------------- ------------------------------
+CURRENT_OPEN_WINDOW
+DEFAULT_TIMEZONE          Asia/Seoul
+LOG_HISTORY               30
+
+-- 기본값 30일. 두 달 전 장애를 조사하려면 이미 로그가 없다.
+
+SQL> EXEC DBMS_SCHEDULER.SET_SCHEDULER_ATTRIBUTE('log_history','90');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT value FROM dba_scheduler_global_attribute
+  2   WHERE attribute_name = 'LOG_HISTORY';
+
+VALUE
+------------------------------
+90
+
+-- 특정 Job 의 로그만 즉시 정리할 수도 있다.
+
+SQL> EXEC DBMS_SCHEDULER.PURGE_LOG(log_history => 0, job_name => 'HR.J_NOISY');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT COUNT(*) FROM dba_scheduler_job_run_details
+  2   WHERE owner = 'HR' AND job_name = 'J_NOISY';
+
+  COUNT(*)
+----------
+         0
+
+-- 원래 값으로 되돌린다.
+
+SQL> EXEC DBMS_SCHEDULER.SET_SCHEDULER_ATTRIBUTE('log_history','30');
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[8] 운영 점검 질의 — 최근 24시간 요약
+--------------------------------------------------------------------------------
+
+SQL> SELECT owner, job_name,
+  2         COUNT(*)                                                AS runs,
+  3         SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END)   AS ok,
+  4         SUM(CASE WHEN status = 'FAILED'    THEN 1 ELSE 0 END)   AS ng,
+  5         MAX(TO_CHAR(log_date,'MM-DD HH24:MI'))                  AS last_run
+  6    FROM dba_scheduler_job_run_details
+  7   WHERE owner = 'HR'
+  8     AND log_date > SYSTIMESTAMP - INTERVAL '1' DAY
+  9   GROUP BY owner, job_name ORDER BY ng DESC, job_name;
+
+OWNER    JOB_NAME              RUNS        OK        NG LAST_RUN
+-------- --------------------- ----- --------- --------- ----------
+HR       J_DEMO_HOURLY             4         4         0 08-19 13:14
+HR       J_DEPT_REPORT             2         2         0 08-19 10:36
+HR       J_SLOW                    2         2         0 08-19 13:22
+
+-- 이 질의를 하루 한 번 도는 Job 으로 등록하면 그것이 CHECK_JOB_STATUS 다.
+-- 실습 07·08 에서 점검 프로시저 형태로 다시 만난다.
+
+
+--------------------------------------------------------------------------------
+[9] 실습 정리
+--------------------------------------------------------------------------------
+
+SQL> CONNECT hr/hr@localhost:1521/orclpdb
+Connected.
+
+SQL> EXEC DBMS_SCHEDULER.DROP_JOB('J_SLOW');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, enabled, state FROM user_scheduler_jobs ORDER BY job_name;
+
+JOB_NAME              ENABLED  STATE
+--------------------- -------- -----------
+J_DEMO_HOURLY         TRUE     SCHEDULED
+J_DEPT_REPORT         FALSE    DISABLED
+J_DEPT_REPORT_NIGHT   TRUE     SCHEDULED
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. 컬럼명을 추측하면 ORA-00904 가 난다. USER_TAB_COLUMNS 로 목록을 먼저 본다.
+    상태는 STATUS, 시각은 LOG_DATE, 오류 번호는 ERROR# 다.
+ 2. 비동기 실행 직후 이력이 비어 있는 것은 실패가 아니라 진행 중이라는 뜻이다.
+    USER_SCHEDULER_RUNNING_JOBS 를 먼저 확인하고 몇 초 뒤 재조회한다.
+ 3. JOB_LOG 는 사건(RUN·ENABLE·DISABLE·UPDATE)을, JOB_RUN_DETAILS 는
+    실행 결과(STATUS·ERROR#·RUN_DURATION)를 기록한다.
+ 4. logging_level 을 LOGGING_FULL 로 두면 상태 변경까지 JOB_LOG 에 남는다.
+ 5. RUN_DURATION 은 INTERVAL 타입이므로 EXTRACT 로 초 단위로 환산해 쓴다.
+    REQ_START_DATE 와 ACTUAL_START_DATE 의 차이가 지연이다.
+ 6. 로그 보존 기본값은 30일이며 LOG_HISTORY 전역 속성으로 조정한다.
+    PURGE_LOG 로 특정 Job 의 로그만 즉시 지울 수도 있다.
+ 7. DBA_ 계열 뷰는 관리 계정에서 조회하거나 필요한 뷰만 직접 GRANT 받는다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

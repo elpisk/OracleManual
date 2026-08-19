@@ -1,0 +1,521 @@
+================================================================================
+ 제7장 실습 06 — plsql_job_log / dba_check_result 를 이용한 운영 로그 기록
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus  (세션 2개 사용)
+ 학습 목표   : 1) COMMIT 을 빠뜨려 다른 세션에서 로그가 보이지 않는 상황을 재현한다
+               2) PRAGMA AUTONOMOUS_TRANSACTION 으로 문제를 해결한다
+               3) COMMIT 없이 자율 트랜잭션을 끝내 ORA-06519 를 재현하고 고친다
+               4) 본 작업이 ROLLBACK 되어도 로그가 남는 것을 확인한다
+               5) 로그 테이블이 없을 때의 ORA-00942 와 사전 확인 로직을 만든다
+               6) plsql_job_log 요약과 dba_check_result 상세의 역할을 구분한다
+ 사전 준비   : 실습 01 에서 만든 plsql_job_log · dba_check_result 테이블과
+               실습 05 에서 만든 write_error_log 프로시저가 필요합니다.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+[1] 세션 A 로 접속하고 로그를 초기화한다
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb          -- 세션 A
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 15:01:12 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 150
+SQL> SET PAGESIZE 60
+
+SQL> DELETE FROM plsql_job_log;
+
+8 rows deleted.
+
+SQL> DELETE FROM dba_check_result;
+
+2 rows deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> SELECT COUNT(*) AS job_log, (SELECT COUNT(*) FROM dba_check_result) AS chk
+  2    FROM plsql_job_log;
+
+   JOB_LOG        CHK
+---------- ----------
+         0          0
+
+
+--------------------------------------------------------------------------------
+[2] (오류 재현 1) 일반 프로시저로 로그를 남긴다 — 다른 세션에서 안 보인다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE write_log_plain (
+  2     p_job_name IN VARCHAR2,
+  3     p_start    IN TIMESTAMP,
+  4     p_status   IN VARCHAR2,
+  5     p_cnt      IN NUMBER DEFAULT NULL)
+  6  IS
+  7  BEGIN
+  8     INSERT INTO plsql_job_log
+  9        (job_name, start_time, end_time, status, processed_cnt, created_by)
+ 10     VALUES
+ 11        (p_job_name, p_start, SYSTIMESTAMP, p_status, p_cnt, USER);
+ 12     -- COMMIT 이 없다. 호출자의 트랜잭션에 그대로 매달린다.
+ 13  END;
+ 14  /
+
+Procedure created.
+
+SQL> DECLARE
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3     v_cnt   NUMBER;
+  4  BEGIN
+  5     SELECT COUNT(*) INTO v_cnt FROM employees WHERE department_id = 50;
+  6     write_log_plain('CHECK_DEPT50', v_start, 'SUCCESS', v_cnt);
+  7     DBMS_OUTPUT.PUT_LINE('세션 A 에서 기록함 : ' || v_cnt || ' 건');
+  8  END;
+  9  /
+세션 A 에서 기록함 : 45 건
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, status, processed_cnt FROM plsql_job_log;
+
+JOB_NAME       STATUS     PROCESSED_CNT
+-------------- ---------- -------------
+CHECK_DEPT50   SUCCESS               45
+
+-- 세션 A 에서는 잘 보인다. 이제 다른 세션에서 확인해 본다.
+
+
+--------------------------------------------------------------------------------
+[3] 세션 B 에서 조회한다 — 아무것도 없다
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb          -- 세션 B (모니터링 담당)
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 15:04:30 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SELECT job_name, status, processed_cnt FROM plsql_job_log;
+
+no rows selected
+
+-- 원인 파악
+--   세션 A 가 INSERT 만 하고 COMMIT 하지 않았다.
+--   오라클의 읽기 일관성 때문에 다른 세션은 미확정 데이터를 볼 수 없다.
+--   모니터링 화면은 배치가 끝날 때까지 아무것도 보지 못한다.
+--
+--   더 심각한 문제는 그다음이다.
+--   본 작업이 실패해 ROLLBACK 되면 로그까지 함께 사라진다.
+--   실패한 작업의 흔적이 지워지면 로그의 존재 의의가 없다.
+
+-- 세션 A 로 돌아가 그 상황을 직접 확인한다.
+
+
+--------------------------------------------------------------------------------
+[4] 세션 A — ROLLBACK 하면 로그도 함께 사라진다
+--------------------------------------------------------------------------------
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+SQL> SELECT COUNT(*) FROM plsql_job_log;
+
+  COUNT(*)
+----------
+         0
+
+-- 로그가 통째로 사라졌다.
+-- 배치가 실패해 ROLLBACK 되는 상황이 정확히 이렇다.
+
+
+--------------------------------------------------------------------------------
+[5] 수정 — PRAGMA AUTONOMOUS_TRANSACTION 을 선언한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE write_operation_log (
+  2     p_job_name IN VARCHAR2,
+  3     p_start    IN TIMESTAMP,
+  4     p_status   IN VARCHAR2,
+  5     p_cnt      IN NUMBER   DEFAULT NULL,
+  6     p_err_code IN NUMBER   DEFAULT NULL,
+  7     p_err_msg  IN VARCHAR2 DEFAULT NULL)
+  8  IS
+  9     PRAGMA AUTONOMOUS_TRANSACTION;
+ 10  BEGIN
+ 11     INSERT INTO plsql_job_log
+ 12        (job_name, start_time, end_time, status,
+ 13         processed_cnt, error_code, error_message, created_by)
+ 14     VALUES
+ 15        (p_job_name, p_start, SYSTIMESTAMP, p_status,
+ 16         p_cnt, p_err_code, SUBSTR(p_err_msg, 1, 4000), USER);
+ 17     COMMIT;
+ 18  EXCEPTION
+ 19     WHEN OTHERS THEN
+ 20        ROLLBACK;
+ 21        RAISE;
+ 22  END;
+ 23  /
+
+Procedure created.
+
+SQL> DECLARE
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3     v_cnt   NUMBER;
+  4  BEGIN
+  5     SELECT COUNT(*) INTO v_cnt FROM employees WHERE department_id = 50;
+  6     write_operation_log('CHECK_DEPT50', v_start, 'SUCCESS', v_cnt);
+  7     DBMS_OUTPUT.PUT_LINE('자율 트랜잭션으로 기록함 : ' || v_cnt || ' 건');
+  8  END;
+  9  /
+자율 트랜잭션으로 기록함 : 45 건
+
+PL/SQL procedure successfully completed.
+
+-- 세션 A 는 아직 COMMIT 하지 않았다.
+
+SQL> SELECT job_name, status, processed_cnt FROM plsql_job_log;
+
+JOB_NAME       STATUS     PROCESSED_CNT
+-------------- ---------- -------------
+CHECK_DEPT50   SUCCESS               45
+
+
+--------------------------------------------------------------------------------
+[6] 세션 B — 이번에는 즉시 보인다
+--------------------------------------------------------------------------------
+
+SQL> SELECT job_name, status, processed_cnt, created_by FROM plsql_job_log;
+
+JOB_NAME       STATUS     PROCESSED_CNT CREATED_BY
+-------------- ---------- ------------- ----------
+CHECK_DEPT50   SUCCESS               45 HR
+
+-- 자율 트랜잭션이 본 트랜잭션과 분리되어 독립적으로 커밋됐기 때문이다.
+-- 모니터링 세션이 배치 진행 상황을 실시간으로 볼 수 있다.
+
+
+--------------------------------------------------------------------------------
+[7] 세션 A — ROLLBACK 해도 로그는 남는다
+--------------------------------------------------------------------------------
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+SQL> SELECT job_name, status, processed_cnt FROM plsql_job_log;
+
+JOB_NAME       STATUS     PROCESSED_CNT
+-------------- ---------- -------------
+CHECK_DEPT50   SUCCESS               45
+
+-- 본 트랜잭션을 되돌려도 로그는 그대로다. 이것이 자율 트랜잭션의 목적이다.
+
+-- 실제 배치 시나리오로 확인한다.
+
+SQL> DECLARE
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3  BEGIN
+  4     UPDATE employees SET salary = salary * 1.1 WHERE department_id = 60;
+  5     write_operation_log('SALARY_RAISE', v_start, 'SUCCESS', SQL%ROWCOUNT);
+  6
+  7     -- 검증 실패로 업무 트랜잭션을 되돌린다
+  8     RAISE_APPLICATION_ERROR(-20010, '급여 인상률 검증 실패');
+  9  EXCEPTION
+ 10     WHEN OTHERS THEN
+ 11        ROLLBACK;
+ 12        write_operation_log('SALARY_RAISE', v_start, 'ERROR',
+ 13                            NULL, SQLCODE, SQLERRM);
+ 14  END;
+ 15  /
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, status, processed_cnt, error_code,
+  2         SUBSTR(error_message,1,40) AS msg
+  3    FROM plsql_job_log ORDER BY log_id;
+
+JOB_NAME       STATUS     PROCESSED_CNT ERROR_CODE MSG
+-------------- ---------- ------------- ---------- ----------------------------------
+CHECK_DEPT50   SUCCESS               45
+SALARY_RAISE   SUCCESS                5
+SALARY_RAISE   ERROR                       -20010 ORA-20010: 급여 인상률 검증 실패
+
+SQL> SELECT COUNT(*) FROM employees WHERE salary > 10000 AND department_id = 60;
+
+  COUNT(*)
+----------
+         0
+
+-- 업무 데이터는 롤백됐지만 시도한 흔적과 실패 사유는 모두 남았다.
+
+
+--------------------------------------------------------------------------------
+[8] (오류 재현 2) 자율 트랜잭션을 COMMIT 없이 끝낸다 — ORA-06519
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE write_log_bad (p_job_name IN VARCHAR2) IS
+  2     PRAGMA AUTONOMOUS_TRANSACTION;
+  3  BEGIN
+  4     INSERT INTO plsql_job_log (job_name, start_time, status, created_by)
+  5     VALUES (p_job_name, SYSTIMESTAMP, 'SUCCESS', USER);
+  6     -- COMMIT 을 빠뜨렸다
+  7  END;
+  8  /
+
+Procedure created.
+
+SQL> EXEC write_log_bad('BAD_LOG');
+BEGIN write_log_bad('BAD_LOG'); END;
+
+*
+ERROR at line 1:
+ORA-06519: active autonomous transaction detected and rolled back
+ORA-06512: at "HR.WRITE_LOG_BAD", line 7
+ORA-06512: at line 1
+
+
+-- 원인 파악
+--   자율 트랜잭션은 반드시 COMMIT 또는 ROLLBACK 으로 명시적으로 끝내야 한다.
+--   끝내지 않은 채 프로시저가 반환되면 오라클이 강제로 롤백하고 ORA-06519 를 던진다.
+
+SQL> SELECT COUNT(*) FROM plsql_job_log WHERE job_name = 'BAD_LOG';
+
+  COUNT(*)
+----------
+         0
+
+-- 기록도 남지 않았다.
+
+-- 수정 : COMMIT 을 추가한다.
+
+SQL> CREATE OR REPLACE PROCEDURE write_log_bad (p_job_name IN VARCHAR2) IS
+  2     PRAGMA AUTONOMOUS_TRANSACTION;
+  3  BEGIN
+  4     INSERT INTO plsql_job_log (job_name, start_time, status, created_by)
+  5     VALUES (p_job_name, SYSTIMESTAMP, 'SUCCESS', USER);
+  6     COMMIT;
+  7  END;
+  8  /
+
+Procedure created.
+
+SQL> EXEC write_log_bad('BAD_LOG');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, status FROM plsql_job_log WHERE job_name = 'BAD_LOG';
+
+JOB_NAME  STATUS
+--------- ----------
+BAD_LOG   SUCCESS
+
+SQL> DELETE FROM plsql_job_log WHERE job_name = 'BAD_LOG';
+
+1 row deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+
+--------------------------------------------------------------------------------
+[9] (오류 재현 3) 로그 테이블이 없는 환경 — ORA-00942 와 사전 확인
+--------------------------------------------------------------------------------
+
+-- 다른 환경에 배포했더니 로그 테이블이 없는 상황을 재현한다.
+
+SQL> BEGIN
+  2     EXECUTE IMMEDIATE
+  3        'INSERT INTO plsql_job_log_v2 (job_name) VALUES (''X'')';
+  4  END;
+  5  /
+BEGIN
+*
+ERROR at line 1:
+ORA-00942: table or view does not exist
+ORA-06512: at line 2
+
+
+-- 원인 파악
+--   로그를 남기려다 오히려 프로그램이 죽는 상황이다.
+--   자동화 스크립트는 로그 인프라의 존재 여부를 먼저 확인해야 한다.
+
+-- 수정 : 존재 여부를 확인한 뒤 없으면 만드는 안전한 초기화 루틴을 만든다.
+
+SQL> CREATE OR REPLACE PROCEDURE pr_ensure_log_tables IS
+  2     v_cnt PLS_INTEGER;
+  3  BEGIN
+  4     SELECT COUNT(*) INTO v_cnt FROM user_tables
+  5      WHERE table_name = 'PLSQL_JOB_LOG';
+  6     IF v_cnt = 0 THEN
+  7        EXECUTE IMMEDIATE '
+  8           CREATE TABLE plsql_job_log (
+  9              log_id        NUMBER GENERATED BY DEFAULT AS IDENTITY,
+ 10              job_name      VARCHAR2(100),
+ 11              start_time    TIMESTAMP,
+ 12              end_time      TIMESTAMP,
+ 13              status        VARCHAR2(20),
+ 14              processed_cnt NUMBER,
+ 15              error_code    NUMBER,
+ 16              error_message VARCHAR2(4000),
+ 17              created_by    VARCHAR2(100),
+ 18              created_at    TIMESTAMP DEFAULT SYSTIMESTAMP)';
+ 19        DBMS_OUTPUT.PUT_LINE('PLSQL_JOB_LOG 생성함');
+ 20     ELSE
+ 21        DBMS_OUTPUT.PUT_LINE('PLSQL_JOB_LOG 이미 있음');
+ 22     END IF;
+ 23
+ 24     SELECT COUNT(*) INTO v_cnt FROM user_tables
+ 25      WHERE table_name = 'DBA_CHECK_RESULT';
+ 26     IF v_cnt = 0 THEN
+ 27        EXECUTE IMMEDIATE '
+ 28           CREATE TABLE dba_check_result (
+ 29              check_id       NUMBER GENERATED BY DEFAULT AS IDENTITY,
+ 30              check_name     VARCHAR2(100),
+ 31              check_time     TIMESTAMP,
+ 32              target_object  VARCHAR2(200),
+ 33              status         VARCHAR2(20),
+ 34              result_message VARCHAR2(4000))';
+ 35        DBMS_OUTPUT.PUT_LINE('DBA_CHECK_RESULT 생성함');
+ 36     ELSE
+ 37        DBMS_OUTPUT.PUT_LINE('DBA_CHECK_RESULT 이미 있음');
+ 38     END IF;
+ 39  END;
+ 40  /
+
+Procedure created.
+
+SQL> EXEC pr_ensure_log_tables;
+PLSQL_JOB_LOG 이미 있음
+DBA_CHECK_RESULT 이미 있음
+
+PL/SQL procedure successfully completed.
+
+-- 중요 : DDL 은 암묵적 COMMIT 을 유발하므로 테이블을 만든 직후에는
+--        이미 확정된 상태다. 그러나 INSERT 로 초기 데이터를 넣었다면
+--        반드시 COMMIT 해야 스케줄러 슬레이브 세션에서 보인다.
+
+
+--------------------------------------------------------------------------------
+[10] 요약(plsql_job_log)과 상세(dba_check_result)를 함께 쓴다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE pr_check_salary_range (p_cnt OUT NUMBER) IS
+  2  BEGIN
+  3     p_cnt := 0;
+  4     FOR r IN (SELECT e.employee_id, e.last_name, e.salary,
+  5                      j.min_salary, j.max_salary
+  6                 FROM employees e JOIN jobs j ON e.job_id = j.job_id
+  7                WHERE e.salary < j.min_salary OR e.salary > j.max_salary)
+  8     LOOP
+  9        INSERT INTO dba_check_result
+ 10           (check_name, check_time, target_object, status, result_message)
+ 11        VALUES
+ 12           ('CHECK_SALARY_RANGE', SYSTIMESTAMP,
+ 13            'HR.EMPLOYEES#' || r.employee_id, 'WARN',
+ 14            r.last_name || ' 급여 ' || r.salary ||
+ 15            ' (허용 ' || r.min_salary || '~' || r.max_salary || ')');
+ 16        p_cnt := p_cnt + 1;
+ 17     END LOOP;
+ 18     COMMIT;
+ 19  END;
+ 20  /
+
+Procedure created.
+
+SQL> DECLARE
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3     v_cnt   NUMBER;
+  4  BEGIN
+  5     pr_check_salary_range(v_cnt);
+  6     write_operation_log('CHECK_SALARY_RANGE', v_start, 'SUCCESS', v_cnt);
+  7     DBMS_OUTPUT.PUT_LINE('급여 범위 이상 : ' || v_cnt || ' 건');
+  8  EXCEPTION
+  9     WHEN OTHERS THEN
+ 10        write_operation_log('CHECK_SALARY_RANGE', v_start, 'ERROR',
+ 11                            NULL, SQLCODE, SQLERRM);
+ 12        RAISE;
+ 13  END;
+ 14  /
+급여 범위 이상 : 1 건
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, status, processed_cnt FROM plsql_job_log
+  2   WHERE job_name = 'CHECK_SALARY_RANGE';
+
+JOB_NAME             STATUS     PROCESSED_CNT
+-------------------- ---------- -------------
+CHECK_SALARY_RANGE   SUCCESS                1
+
+SQL> COLUMN result_message FORMAT A55
+
+SQL> SELECT check_name, target_object, status, result_message
+  2    FROM dba_check_result WHERE check_name = 'CHECK_SALARY_RANGE';
+
+CHECK_NAME           TARGET_OBJECT      STATUS RESULT_MESSAGE
+-------------------- ------------------ ------ -------------------------------------
+CHECK_SALARY_RANGE   HR.EMPLOYEES#178   WARN   Grant 급여 7000 (허용 6000~12008)
+
+-- 요약은 plsql_job_log 한 행, 상세는 dba_check_result 한 행이다.
+-- 모니터링 화면은 요약만 읽어 빠르게 그리고, 원인 분석은 상세를 파고든다.
+
+
+--------------------------------------------------------------------------------
+[11] 실습 정리
+--------------------------------------------------------------------------------
+
+SQL> DROP PROCEDURE write_log_plain;
+
+Procedure dropped.
+
+SQL> DROP PROCEDURE write_log_bad;
+
+Procedure dropped.
+
+SQL> SELECT job_name, status, processed_cnt, error_code
+  2    FROM plsql_job_log ORDER BY log_id;
+
+JOB_NAME             STATUS     PROCESSED_CNT ERROR_CODE
+-------------------- ---------- ------------- ----------
+CHECK_DEPT50         SUCCESS               45
+SALARY_RAISE         SUCCESS                5
+SALARY_RAISE         ERROR                       -20010
+CHECK_SALARY_RANGE   SUCCESS                1
+
+-- write_operation_log 와 로그 데이터는 실습 07·08 에서 계속 사용한다.
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. 일반 프로시저로 로그를 남기면 호출자 트랜잭션에 매달린다.
+    COMMIT 전까지 다른 세션이 볼 수 없고, ROLLBACK 되면 함께 사라진다.
+ 2. PRAGMA AUTONOMOUS_TRANSACTION 을 선언하면 로그가 본 트랜잭션과 분리된다.
+    다른 세션이 즉시 볼 수 있고 본 작업의 ROLLBACK 에도 영향받지 않는다.
+ 3. 자율 트랜잭션은 반드시 COMMIT 또는 ROLLBACK 으로 끝내야 한다.
+    빠뜨리면 ORA-06519 가 발생하고 자율 트랜잭션이 통째로 롤백된다.
+ 4. 예외 처리부에서도 ROLLBACK 후 RAISE 하는 형태로 마무리한다.
+ 5. 로그 테이블이 없으면 ORA-00942 로 프로그램이 죽는다. 자동화 스크립트는
+    USER_TABLES 로 존재를 먼저 확인하고 없으면 동적 DDL 로 만든다.
+ 6. error_message 는 VARCHAR2(4000)이므로 SQLERRM 을 SUBSTR 로 잘라 넣는다.
+ 7. plsql_job_log 는 작업 단위 요약, dba_check_result 는 점검 대상 단위 상세다.
+    둘을 함께 쓰면 빠른 조회와 정밀한 원인 분석을 모두 얻는다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

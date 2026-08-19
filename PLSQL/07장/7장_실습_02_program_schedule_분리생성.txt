@@ -1,0 +1,466 @@
+================================================================================
+ 제7장 실습 02 — Program 과 Schedule 분리 생성 및 Job 연결
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) CREATE_PROGRAM 과 DEFINE_PROGRAM_ARGUMENT 로 Program 을 만든다
+               2) 존재하지 않는 Program 을 참조해 ORA-27476 을 재현하고 고친다
+               3) ENABLE 하지 않은 Program 을 참조해 ORA-27367 을 재현하고 고친다
+               4) CREATE_SCHEDULE 로 Schedule 을 만들고 캘린더 표현식을 검증한다
+               5) Program 과 Schedule 을 조합해 Job 을 만들고 인자를 전달한다
+               6) Schedule 하나를 고쳐 여러 Job 의 실행 시각을 한꺼번에 바꾼다
+ 사전 준비   : 실습 01 에서 만든 plsql_job_log · dba_check_result 테이블과
+               HR 계정의 CREATE JOB 권한이 필요합니다.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+[1] 접속하고 실습 01 의 산출물이 남아 있는지 확인한다
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 10:21:38 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 140
+SQL> SET PAGESIZE 60
+
+SQL> SELECT table_name FROM user_tables
+  2   WHERE table_name IN ('PLSQL_JOB_LOG','DBA_CHECK_RESULT') ORDER BY 1;
+
+TABLE_NAME
+--------------------
+DBA_CHECK_RESULT
+PLSQL_JOB_LOG
+
+SQL> SELECT privilege FROM user_sys_privs WHERE privilege = 'CREATE JOB';
+
+PRIVILEGE
+----------------------------------------
+CREATE JOB
+
+-- 사전 준비 완료.
+
+
+--------------------------------------------------------------------------------
+[2] Program 이 실행할 프로시저를 만든다 (인자 1개)
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE pr_dept_report (p_dept_id IN VARCHAR2) IS
+  2     v_cnt NUMBER;
+  3     v_avg NUMBER;
+  4  BEGIN
+  5     SELECT COUNT(*), ROUND(AVG(salary))
+  6       INTO v_cnt, v_avg
+  7       FROM employees
+  8      WHERE department_id = TO_NUMBER(p_dept_id);
+  9
+ 10     INSERT INTO dba_check_result
+ 11        (check_name, check_time, target_object, status, result_message)
+ 12     VALUES
+ 13        ('DEPT_REPORT', SYSTIMESTAMP, 'HR.EMPLOYEES#' || p_dept_id, 'INFO',
+ 14         '사원 ' || v_cnt || '명 / 평균급여 ' || NVL(TO_CHAR(v_avg),'-'));
+ 15
+ 16     COMMIT;
+ 17  END;
+ 18  /
+
+Procedure created.
+
+-- 인자를 VARCHAR2 로 받는 이유
+--   스케줄러의 SET_JOB_ARGUMENT_VALUE 는 값을 문자열로 넘긴다.
+--   숫자 인자를 쓰려면 DEFINE_PROGRAM_ARGUMENT 에서 타입을 맞춰야 하는데
+--   실습에서는 단순하게 문자열로 받아 프로시저 안에서 변환한다.
+
+SQL> EXEC pr_dept_report('50');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT check_name, target_object, result_message FROM dba_check_result;
+
+CHECK_NAME    TARGET_OBJECT        RESULT_MESSAGE
+------------- -------------------- ----------------------------------
+DEPT_REPORT   HR.EMPLOYEES#50      사원 45명 / 평균급여 3476
+
+SQL> DELETE FROM dba_check_result;
+
+1 row deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+
+--------------------------------------------------------------------------------
+[3] (오류 재현 1) 없는 Program 을 참조하는 Job 을 만든다 — ORA-27476
+--------------------------------------------------------------------------------
+
+-- 아직 Program 을 만들지 않았는데 Job 부터 만들어 본다.
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.CREATE_JOB (
+  3        job_name      => 'J_DEPT_REPORT',
+  4        program_name  => 'PRG_DEPT_REPORT',
+  5        schedule_name => 'SCH_EVERY_2MIN',
+  6        enabled       => FALSE);
+  7  END;
+  8  /
+BEGIN
+*
+ERROR at line 1:
+ORA-27476: "HR.PRG_DEPT_REPORT" does not exist
+ORA-06512: at "SYS.DBMS_ISCHED", line 9807
+ORA-06512: at "SYS.DBMS_SCHEDULER", line 322
+ORA-06512: at line 2
+
+
+-- 원인 파악
+--   ORA-27476 은 "이름을 찾지 못했다"는 뜻이다.
+--   오타이거나, 아직 만들지 않았거나, 다른 스키마 소유인데 수식하지 않은 경우다.
+
+SQL> SELECT program_name FROM user_scheduler_programs;
+
+no rows selected
+
+SQL> SELECT schedule_name FROM user_scheduler_schedules;
+
+no rows selected
+
+-- 둘 다 아직 없다. 순서를 지켜 Program → Schedule → Job 으로 만든다.
+
+
+--------------------------------------------------------------------------------
+[4] Program 을 만든다 — 생성 · 인자 정의 · 활성화 순서
+--------------------------------------------------------------------------------
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.CREATE_PROGRAM (
+  3        program_name        => 'PRG_DEPT_REPORT',
+  4        program_type        => 'STORED_PROCEDURE',
+  5        program_action      => 'PR_DEPT_REPORT',
+  6        number_of_arguments => 1,
+  7        enabled             => FALSE,
+  8        comments            => '부서별 사원 수·평균 급여 리포트');
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT program_name, program_type, program_action,
+  2         number_of_arguments AS args, enabled
+  3    FROM user_scheduler_programs;
+
+PROGRAM_NAME       PROGRAM_TYPE       PROGRAM_ACTION     ARGS ENABLED
+------------------ ------------------ --------------- ------- --------
+PRG_DEPT_REPORT    STORED_PROCEDURE   PR_DEPT_REPORT        1 FALSE
+
+-- 인자를 아직 정의하지 않았으므로 ENABLE 하면 안 된다.
+-- 먼저 인자를 정의한다.
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.DEFINE_PROGRAM_ARGUMENT (
+  3        program_name      => 'PRG_DEPT_REPORT',
+  4        argument_position => 1,
+  5        argument_name     => 'P_DEPT_ID',
+  6        argument_type     => 'VARCHAR2',
+  7        default_value     => '50');
+  8  END;
+  9  /
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT argument_position AS pos, argument_name, argument_type, default_value
+  2    FROM user_scheduler_program_args WHERE program_name = 'PRG_DEPT_REPORT';
+
+       POS ARGUMENT_NAME   ARGUMENT_TYPE   DEFAULT_VALUE
+---------- --------------- --------------- -------------
+         1 P_DEPT_ID       VARCHAR2        50
+
+
+--------------------------------------------------------------------------------
+[5] Schedule 을 만들고 캘린더 표현식을 검증한다
+--------------------------------------------------------------------------------
+
+-- 실습 중 결과를 빨리 보기 위해 2분마다 도는 스케줄을 만든다.
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.CREATE_SCHEDULE (
+  3        schedule_name   => 'SCH_EVERY_2MIN',
+  4        start_date      => SYSTIMESTAMP,
+  5        repeat_interval => 'FREQ=MINUTELY; INTERVAL=2',
+  6        comments        => '실습용 2분 주기');
+  7  END;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+-- 운영에서 쓸 야간 배치 스케줄도 함께 만든다.
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.CREATE_SCHEDULE (
+  3        schedule_name   => 'SCH_NIGHTLY_02',
+  4        start_date      => SYSTIMESTAMP,
+  5        repeat_interval => 'FREQ=DAILY; BYHOUR=2; BYMINUTE=0; BYSECOND=0',
+  6        comments        => '야간 배치 표준 시각 02:00');
+  7  END;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT schedule_name, repeat_interval FROM user_scheduler_schedules
+  2   ORDER BY schedule_name;
+
+SCHEDULE_NAME       REPEAT_INTERVAL
+------------------- ------------------------------------------
+SCH_EVERY_2MIN      FREQ=MINUTELY; INTERVAL=2
+SCH_NIGHTLY_02      FREQ=DAILY; BYHOUR=2; BYMINUTE=0; BYSECOND=0
+
+-- 표현식이 의도한 시각을 만드는지 미리 검증한다.
+
+SQL> DECLARE
+  2     v_next TIMESTAMP;
+  3     v_ref  TIMESTAMP := SYSTIMESTAMP;
+  4  BEGIN
+  5     FOR i IN 1 .. 3 LOOP
+  6        DBMS_SCHEDULER.EVALUATE_CALENDAR_STRING (
+  7           'FREQ=DAILY; BYHOUR=2; BYMINUTE=0; BYSECOND=0',
+  8           SYSTIMESTAMP, v_ref, v_next);
+  9        DBMS_OUTPUT.PUT_LINE(i || ' 회차 : ' ||
+ 10           TO_CHAR(v_next, 'YYYY-MM-DD DY HH24:MI:SS'));
+ 11        v_ref := v_next;
+ 12     END LOOP;
+ 13  END;
+ 14  /
+1 회차 : 2026-08-20 THU 02:00:00
+2 회차 : 2026-08-21 FRI 02:00:00
+3 회차 : 2026-08-22 SAT 02:00:00
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[6] Program 과 Schedule 을 조합한 Job 을 만든다
+--------------------------------------------------------------------------------
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.CREATE_JOB (
+  3        job_name      => 'J_DEPT_REPORT',
+  4        program_name  => 'PRG_DEPT_REPORT',
+  5        schedule_name => 'SCH_EVERY_2MIN',
+  6        enabled       => FALSE,
+  7        auto_drop     => FALSE,
+  8        comments      => '부서 리포트 2분 주기');
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+-- 이제 활성화한다.
+
+SQL> EXEC DBMS_SCHEDULER.ENABLE('J_DEPT_REPORT');
+BEGIN DBMS_SCHEDULER.ENABLE('J_DEPT_REPORT'); END;
+
+*
+ERROR at line 1:
+ORA-27367: program "HR.PRG_DEPT_REPORT" associated with this job is disabled
+ORA-06512: at "SYS.DBMS_ISCHED", line 6656
+ORA-06512: at "SYS.DBMS_SCHEDULER", line 2853
+ORA-06512: at line 1
+
+
+--------------------------------------------------------------------------------
+[7] (오류 재현 2) ORA-27367 — Program 을 활성화하지 않았다
+--------------------------------------------------------------------------------
+
+-- 원인 파악
+--   ORA-27476 과 헷갈리기 쉽지만 의미가 다르다.
+--     ORA-27476 : 그 이름을 찾을 수 없다 (오타 · 미생성)
+--     ORA-27367 : 이름은 찾았으나 그 Program 이 비활성 상태다
+--   Program 의 enabled 기본값도 FALSE 이므로 별도로 켜야 한다.
+
+SQL> SELECT program_name, enabled FROM user_scheduler_programs;
+
+PROGRAM_NAME       ENABLED
+------------------ --------
+PRG_DEPT_REPORT    FALSE
+
+-- 수정 : Program 을 ENABLE 한다.
+--        인자가 이미 정의되어 있으므로 지금은 켤 수 있다.
+
+SQL> EXEC DBMS_SCHEDULER.ENABLE('PRG_DEPT_REPORT');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT program_name, enabled FROM user_scheduler_programs;
+
+PROGRAM_NAME       ENABLED
+------------------ --------
+PRG_DEPT_REPORT    TRUE
+
+-- Job 의 인자 값을 지정한 뒤 활성화한다.
+-- 지정하지 않으면 Program 의 default_value 가 쓰이지만,
+-- 이 Job 은 부서 60을 대상으로 하려 하므로 명시한다.
+
+SQL> EXEC DBMS_SCHEDULER.SET_JOB_ARGUMENT_VALUE('J_DEPT_REPORT', 1, '60');
+
+PL/SQL procedure successfully completed.
+
+SQL> EXEC DBMS_SCHEDULER.ENABLE('J_DEPT_REPORT');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, program_name, schedule_name, enabled, state
+  2    FROM user_scheduler_jobs WHERE job_name = 'J_DEPT_REPORT';
+
+JOB_NAME        PROGRAM_NAME       SCHEDULE_NAME     ENABLED  STATE
+--------------- ------------------ ----------------- -------- ----------
+J_DEPT_REPORT   PRG_DEPT_REPORT    SCH_EVERY_2MIN    TRUE     SCHEDULED
+
+SQL> SELECT argument_position AS pos, value FROM user_scheduler_job_args
+  2   WHERE job_name = 'J_DEPT_REPORT';
+
+       POS VALUE
+---------- ----------
+         1 60
+
+
+--------------------------------------------------------------------------------
+[8] 실행 결과를 확인한다
+--------------------------------------------------------------------------------
+
+-- 2분 정도 기다린 뒤 조회한다.
+
+SQL> SELECT TO_CHAR(check_time,'HH24:MI:SS') AS check_time,
+  2         target_object, result_message
+  3    FROM dba_check_result ORDER BY check_time;
+
+CHECK_TIME TARGET_OBJECT        RESULT_MESSAGE
+---------- -------------------- ----------------------------------
+10:34:00   HR.EMPLOYEES#60      사원 5명 / 평균급여 5760
+10:36:00   HR.EMPLOYEES#60      사원 5명 / 평균급여 5760
+
+-- 인자 60이 정확히 전달되어 IT 부서(60) 기준으로 집계됐다.
+
+SQL> SELECT job_name, status, error#,
+  2         TO_CHAR(log_date,'HH24:MI:SS') AS log_date, run_duration
+  3    FROM user_scheduler_job_run_details
+  4   WHERE job_name = 'J_DEPT_REPORT' ORDER BY log_date;
+
+JOB_NAME        STATUS         ERROR# LOG_DATE RUN_DURATION
+--------------- ----------- --------- -------- ---------------
+J_DEPT_REPORT   SUCCEEDED           0 10:34:01 +000 00:00:01
+J_DEPT_REPORT   SUCCEEDED           0 10:36:01 +000 00:00:00
+
+
+--------------------------------------------------------------------------------
+[9] Program 재사용 — 같은 Program 을 다른 스케줄로 한 번 더 등록한다
+--------------------------------------------------------------------------------
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.CREATE_JOB (
+  3        job_name      => 'J_DEPT_REPORT_NIGHT',
+  4        program_name  => 'PRG_DEPT_REPORT',
+  5        schedule_name => 'SCH_NIGHTLY_02',
+  6        enabled       => FALSE,
+  7        auto_drop     => FALSE,
+  8        comments      => '부서 리포트 야간 1회');
+  9
+ 10     DBMS_SCHEDULER.SET_JOB_ARGUMENT_VALUE('J_DEPT_REPORT_NIGHT', 1, '90');
+ 11     DBMS_SCHEDULER.ENABLE('J_DEPT_REPORT_NIGHT');
+ 12  END;
+ 13  /
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, program_name, schedule_name, state,
+  2         TO_CHAR(next_run_date,'MM-DD HH24:MI') AS next_run
+  3    FROM user_scheduler_jobs
+  4   WHERE program_name = 'PRG_DEPT_REPORT' ORDER BY job_name;
+
+JOB_NAME              PROGRAM_NAME       SCHEDULE_NAME     STATE       NEXT_RUN
+--------------------- ------------------ ----------------- ----------- ----------
+J_DEPT_REPORT         PRG_DEPT_REPORT    SCH_EVERY_2MIN    SCHEDULED   08-19 10:38
+J_DEPT_REPORT_NIGHT   PRG_DEPT_REPORT    SCH_NIGHTLY_02    SCHEDULED   08-20 02:00
+
+-- 하나의 Program 을 두 개의 Job 이 서로 다른 스케줄과 인자로 재사용한다.
+-- 프로시저 로직이 바뀌어도 고칠 곳은 PR_DEPT_REPORT 하나뿐이다.
+
+
+--------------------------------------------------------------------------------
+[10] Schedule 하나를 고쳐 여러 Job 의 시각을 한꺼번에 바꾼다
+--------------------------------------------------------------------------------
+
+-- "야간 백업이 길어져 02:00 배치를 02:30 으로 옮겨 달라"는 요청 상황.
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.SET_ATTRIBUTE (
+  3        name      => 'SCH_NIGHTLY_02',
+  4        attribute => 'repeat_interval',
+  5        value     => 'FREQ=DAILY; BYHOUR=2; BYMINUTE=30; BYSECOND=0');
+  6  END;
+  7  /
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, TO_CHAR(next_run_date,'MM-DD HH24:MI') AS next_run
+  2    FROM user_scheduler_jobs
+  3   WHERE schedule_name = 'SCH_NIGHTLY_02';
+
+JOB_NAME              NEXT_RUN
+--------------------- ----------
+J_DEPT_REPORT_NIGHT   08-20 02:30
+
+-- 스케줄 하나만 고쳤는데 이를 참조하는 Job 의 NEXT_RUN_DATE 가 재계산됐다.
+-- 인라인 방식이었다면 Job 마다 repeat_interval 을 따로 고쳐야 했다.
+
+
+--------------------------------------------------------------------------------
+[11] 실습 정리 — 2분 주기 Job 만 비활성화한다
+--------------------------------------------------------------------------------
+
+-- 계속 돌면 로그가 쌓이므로 실습용 Job 은 잠시 꺼 둔다.
+-- 실습 03·04 에서 다시 사용하므로 삭제하지는 않는다.
+
+SQL> EXEC DBMS_SCHEDULER.DISABLE('J_DEPT_REPORT');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, enabled, state FROM user_scheduler_jobs ORDER BY job_name;
+
+JOB_NAME              ENABLED  STATE
+--------------------- -------- -----------
+J_DEMO_HOURLY         TRUE     SCHEDULED
+J_DEPT_REPORT         FALSE    DISABLED
+J_DEPT_REPORT_NIGHT   TRUE     SCHEDULED
+
+-- DISABLE 은 객체를 지우지 않고 잠시 멈추는 수단이다.
+-- 점검 기간 동안 특정 배치만 쉬게 할 때 유용하다.
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. Program 은 "무엇을 실행할 것인가", Schedule 은 "언제 실행할 것인가"를
+    담은 독립 객체다. Job 은 둘을 이름으로 엮기만 한다.
+ 2. 없는 Program·Schedule 을 참조하면 ORA-27476 does not exist 가 발생한다.
+    이름 오타 · 미생성 · 스키마 수식 누락 셋을 순서대로 확인한다.
+ 3. 비활성 Program 을 참조하는 Job 을 ENABLE 하면 ORA-27367 이 발생한다.
+    ORA-27476 과 달리 "이름은 찾았지만 꺼져 있다"는 뜻이다.
+ 4. Program 의 enabled 기본값도 FALSE 다. 인자를 정의한 뒤 ENABLE 한다.
+    순서는 CREATE_PROGRAM → DEFINE_PROGRAM_ARGUMENT → ENABLE 이다.
+ 5. Job 의 인자는 SET_JOB_ARGUMENT_VALUE 로 지정하며 Program 의 기본값을
+    Job 단위로 덮어쓴다. 이것이 재사용성의 핵심이다.
+ 6. 캘린더 표현식은 EVALUATE_CALENDAR_STRING 으로 반드시 사전 검증한다.
+ 7. Schedule 객체를 고치면 이를 참조하는 모든 Job 의 다음 실행 시각이
+    함께 재계산된다. 두 개 이상의 Job 이 시각을 공유하면 분리가 이득이다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

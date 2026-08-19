@@ -1,0 +1,367 @@
+================================================================================
+ 제3장 실습 08 — BULK COLLECT 로 대량 데이터 수집
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) BULK COLLECT INTO 로 결과 집합 전체를 컬렉션에 담는다
+               2) 0건일 때 NO_DATA_FOUND 가 발생하지 않음을 확인한다
+               3) 이를 모르고 첫 원소에 접근해 ORA-06533 을 재현·수정한다
+               4) LIMIT 사용 시 %NOTFOUND 종료 조건의 함정을 재현·수정한다
+               5) FORALL 로 벌크 DML 을 수행하고 SAVE EXCEPTIONS 를 확인한다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 접속 및 대상 데이터 확인
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 11:24:03 2025
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+
+SQL> SELECT COUNT(*) AS total_emp FROM employees;
+
+ TOTAL_EMP
+----------
+       107
+
+SQL> SELECT COUNT(*) AS dept50 FROM employees WHERE department_id = 50;
+
+    DEPT50
+----------
+        45
+
+1 row selected.
+
+
+--------------------------------------------------------------------------------
+[2] BULK COLLECT INTO 기본 사용
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     TYPE t_emp IS TABLE OF employees%ROWTYPE;
+  3     v_emp   t_emp;
+  4  BEGIN
+  5     SELECT * BULK COLLECT INTO v_emp
+  6       FROM employees
+  7      WHERE department_id = 50;
+  8
+  9     DBMS_OUTPUT.PUT_LINE('수집 건수 : ' || v_emp.COUNT);
+ 10     FOR i IN 1 .. 3 LOOP
+ 11        DBMS_OUTPUT.PUT_LINE(v_emp(i).employee_id || ' ' || v_emp(i).last_name);
+ 12     END LOOP;
+ 13  END;
+ 14  /
+수집 건수 : 45
+120 Weiss
+121 Fripp
+122 Kaufling
+
+PL/SQL procedure successfully completed.
+
+-- 45행을 한 번의 컨텍스트 스위치로 가져왔다.
+-- BULK COLLECT 결과는 항상 1부터 시작하는 조밀한(dense) 컬렉션이다.
+
+
+--------------------------------------------------------------------------------
+[3] 오류 → 원인 → 수정 : 0건일 때 ORA-06533
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     TYPE t_id IS TABLE OF employees.employee_id%TYPE;
+  3     v_ids   t_id;
+  4  BEGIN
+  5     SELECT employee_id BULK COLLECT INTO v_ids
+  6       FROM employees
+  7      WHERE department_id = 999;            -- 존재하지 않는 부서
+  8
+  9     DBMS_OUTPUT.PUT_LINE('대표 사번 : ' || v_ids(1));
+ 10  EXCEPTION
+ 11     WHEN NO_DATA_FOUND THEN
+ 12        DBMS_OUTPUT.PUT_LINE('데이터 없음');
+ 13  END;
+ 14  /
+DECLARE
+*
+ERROR at line 1:
+ORA-06533: Subscript beyond count
+ORA-06512: at line 9
+
+-- [오류 발생]
+--   NO_DATA_FOUND 핸들러를 작성해 두었는데도 처리되지 않고 ORA-06533 이 났다.
+-- [원인 파악]
+--   BULK COLLECT INTO 는 SELECT INTO 와 다르다.
+--   조회 결과가 0건이어도 NO_DATA_FOUND 를 발생시키지 않고
+--   원소가 0개인 '빈 컬렉션' 을 반환한다.
+--   따라서 NO_DATA_FOUND 핸들러는 결코 실행되지 않으며,
+--   v_ids(1) 에 접근하는 순간 SUBSCRIPT_BEYOND_COUNT(ORA-06533)가 발생한다.
+-- [확인]
+
+SQL> DECLARE
+  2     TYPE t_id IS TABLE OF employees.employee_id%TYPE;
+  3     v_ids   t_id;
+  4  BEGIN
+  5     SELECT employee_id BULK COLLECT INTO v_ids
+  6       FROM employees WHERE department_id = 999;
+  7     DBMS_OUTPUT.PUT_LINE('COUNT = ' || v_ids.COUNT);
+  8     DBMS_OUTPUT.PUT_LINE('컬렉션이 NULL 인가? ' ||
+  9        CASE WHEN v_ids IS NULL THEN 'YES' ELSE 'NO' END);
+ 10  END;
+ 11  /
+COUNT = 0
+컬렉션이 NULL 인가? NO
+
+PL/SQL procedure successfully completed.
+
+-- 컬렉션 자체는 초기화되어 있고(NULL 아님) 원소만 0개다.
+-- [수정]
+--   예외 처리에 기대지 말고 COUNT 를 검사한다.
+
+SQL> DECLARE
+  2     TYPE t_id IS TABLE OF employees.employee_id%TYPE;
+  3     v_ids   t_id;
+  4  BEGIN
+  5     SELECT employee_id BULK COLLECT INTO v_ids
+  6       FROM employees WHERE department_id = 999;
+  7
+  8     IF v_ids.COUNT = 0 THEN
+  9        DBMS_OUTPUT.PUT_LINE('대상 데이터가 없어 처리를 건너뛴다.');
+ 10     ELSE
+ 11        DBMS_OUTPUT.PUT_LINE('대표 사번 : ' || v_ids(1));
+ 12     END IF;
+ 13  END;
+ 14  /
+대상 데이터가 없어 처리를 건너뛴다.
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[4] 오류 → 원인 → 수정 : LIMIT 루프에서 %NOTFOUND 종료 조건의 함정
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     CURSOR c_emp IS SELECT employee_id FROM employees;
+  3     TYPE t_id IS TABLE OF employees.employee_id%TYPE;
+  4     v_ids    t_id;
+  5     v_total  PLS_INTEGER := 0;
+  6     v_round  PLS_INTEGER := 0;
+  7  BEGIN
+  8     OPEN c_emp;
+  9     LOOP
+ 10        FETCH c_emp BULK COLLECT INTO v_ids LIMIT 20;
+ 11        EXIT WHEN c_emp%NOTFOUND;           -- 잘못된 종료 조건
+ 12        v_round := v_round + 1;
+ 13        v_total := v_total + v_ids.COUNT;
+ 14     END LOOP;
+ 15     CLOSE c_emp;
+ 16     DBMS_OUTPUT.PUT_LINE('반복 횟수 : ' || v_round);
+ 17     DBMS_OUTPUT.PUT_LINE('처리 건수 : ' || v_total);
+ 18  END;
+ 19  /
+반복 횟수 : 5
+처리 건수 : 100
+
+PL/SQL procedure successfully completed.
+
+-- [문제 상황]
+--   전체 107건인데 100건만 처리되었다. 7건이 누락되었다.
+-- [원인 파악]
+--   LIMIT 20 으로 6번째 FETCH 를 하면 남은 7건만 반환된다.
+--   요청한 20건보다 적게 가져왔으므로 %NOTFOUND 가 TRUE 가 되고,
+--   그 시점에 EXIT 하면 이미 컬렉션에 담긴 7건이 처리되지 않은 채 빠져나간다.
+-- [수정]
+--   종료 조건을 컬렉션의 COUNT = 0 으로 바꾼다.
+
+SQL> DECLARE
+  2     CURSOR c_emp IS SELECT employee_id FROM employees;
+  3     TYPE t_id IS TABLE OF employees.employee_id%TYPE;
+  4     v_ids    t_id;
+  5     v_total  PLS_INTEGER := 0;
+  6     v_round  PLS_INTEGER := 0;
+  7  BEGIN
+  8     OPEN c_emp;
+  9     LOOP
+ 10        FETCH c_emp BULK COLLECT INTO v_ids LIMIT 20;
+ 11        EXIT WHEN v_ids.COUNT = 0;          -- COUNT 로 판단
+ 12        v_round := v_round + 1;
+ 13        v_total := v_total + v_ids.COUNT;
+ 14        DBMS_OUTPUT.PUT_LINE('  ' || v_round || '회차 : ' || v_ids.COUNT || '건');
+ 15     END LOOP;
+ 16     CLOSE c_emp;
+ 17     DBMS_OUTPUT.PUT_LINE('처리 건수 : ' || v_total);
+ 18  END;
+ 19  /
+  1회차 : 20건
+  2회차 : 20건
+  3회차 : 20건
+  4회차 : 20건
+  5회차 : 20건
+  6회차 : 7건
+처리 건수 : 107
+
+PL/SQL procedure successfully completed.
+
+-- 이번에는 마지막 7건까지 정확히 처리되었다.
+
+
+--------------------------------------------------------------------------------
+[5] FORALL 로 벌크 DML 수행
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     CURSOR c_emp IS SELECT employee_id, salary FROM employees;
+  3     TYPE t_rec IS TABLE OF c_emp%ROWTYPE;
+  4     v_rec    t_rec;
+  5     v_total  PLS_INTEGER := 0;
+  6  BEGIN
+  7     OPEN c_emp;
+  8     LOOP
+  9        FETCH c_emp BULK COLLECT INTO v_rec LIMIT 50;
+ 10        EXIT WHEN v_rec.COUNT = 0;
+ 11
+ 12        FORALL i IN 1 .. v_rec.COUNT
+ 13           UPDATE employees
+ 14              SET salary = v_rec(i).salary        -- 값은 그대로 (실습용)
+ 15            WHERE employee_id = v_rec(i).employee_id;
+ 16
+ 17        DBMS_OUTPUT.PUT_LINE('묶음 처리 행수 : ' || SQL%ROWCOUNT);
+ 18        v_total := v_total + v_rec.COUNT;
+ 19     END LOOP;
+ 20     CLOSE c_emp;
+ 21     DBMS_OUTPUT.PUT_LINE('총 처리 건수 : ' || v_total);
+ 22     ROLLBACK;
+ 23  END;
+ 24  /
+묶음 처리 행수 : 50
+묶음 처리 행수 : 50
+묶음 처리 행수 : 7
+총 처리 건수 : 107
+
+PL/SQL procedure successfully completed.
+
+-- FORALL 뒤에는 단 하나의 DML 문장만 온다. END LOOP 도 없다.
+-- SQL%ROWCOUNT 는 그 FORALL 이 처리한 전체 행 수를 알려 준다.
+
+
+--------------------------------------------------------------------------------
+[6] 오류 → 원인 → 수정 : FORALL 을 반복문으로 착각한 경우
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     TYPE t_id IS TABLE OF NUMBER;
+  3     v_ids   t_id := t_id(100, 101);
+  4  BEGIN
+  5     FORALL i IN 1 .. v_ids.COUNT LOOP           -- LOOP 를 붙였다
+  6        UPDATE employees SET salary = salary WHERE employee_id = v_ids(i);
+  7        DBMS_OUTPUT.PUT_LINE(v_ids(i));
+  8     END LOOP;
+  9  END;
+ 10  /
+   FORALL i IN 1 .. v_ids.COUNT LOOP
+                                *
+ERROR at line 5:
+ORA-06550: line 5, column 33:
+PLS-00103: Encountered the symbol "LOOP" when expecting one of the following:
+. ( * @ % & = - + ; < / > at in is mod remainder not rem ...
+
+-- [오류 발생]
+--   PLS-00103 구문 오류.
+-- [원인 파악]
+--   FORALL 은 반복문이 아니다. LOOP/END LOOP 를 붙일 수 없고
+--   뒤에는 단 하나의 DML 문장만 올 수 있다.
+--   여러 문장을 반복해야 한다면 일반 FOR LOOP 를 사용해야 한다.
+-- [수정]
+
+SQL> DECLARE
+  2     TYPE t_id IS TABLE OF NUMBER;
+  3     v_ids   t_id := t_id(100, 101);
+  4  BEGIN
+  5     FORALL i IN 1 .. v_ids.COUNT
+  6        UPDATE employees SET salary = salary WHERE employee_id = v_ids(i);
+  7
+  8     FOR i IN 1 .. v_ids.COUNT LOOP               -- 출력은 별도 루프에서
+  9        DBMS_OUTPUT.PUT_LINE(v_ids(i) || ' : ' || SQL%BULK_ROWCOUNT(i) || '행');
+ 10     END LOOP;
+ 11     ROLLBACK;
+ 12  END;
+ 13  /
+100 : 1행
+101 : 1행
+
+PL/SQL procedure successfully completed.
+
+-- SQL%BULK_ROWCOUNT(i) 로 i번째 원소가 처리한 행 수를 개별 확인할 수 있다.
+
+
+--------------------------------------------------------------------------------
+[7] SAVE EXCEPTIONS — 실패한 원소가 있어도 끝까지 수행
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     TYPE t_id IS TABLE OF NUMBER;
+  3     v_ids    t_id := t_id(100, 101, 102);
+  4     v_errs   PLS_INTEGER;
+  5  BEGIN
+  6     FORALL i IN 1 .. v_ids.COUNT SAVE EXCEPTIONS
+  7        UPDATE employees
+  8           SET commission_pct = 1 / (v_ids(i) - 101)   -- i=2 에서 0으로 나눔
+  9         WHERE employee_id = v_ids(i);
+ 10     ROLLBACK;
+ 11  EXCEPTION
+ 12     WHEN OTHERS THEN
+ 13        v_errs := SQL%BULK_EXCEPTIONS.COUNT;
+ 14        DBMS_OUTPUT.PUT_LINE('SQLCODE     : ' || SQLCODE);
+ 15        DBMS_OUTPUT.PUT_LINE('실패 원소 수 : ' || v_errs);
+ 16        FOR i IN 1 .. v_errs LOOP
+ 17           DBMS_OUTPUT.PUT_LINE('  인덱스 ' ||
+ 18              SQL%BULK_EXCEPTIONS(i).ERROR_INDEX || ' : ' ||
+ 19              SQLERRM(-SQL%BULK_EXCEPTIONS(i).ERROR_CODE));
+ 20        END LOOP;
+ 21        ROLLBACK;
+ 22  END;
+ 23  /
+SQLCODE     : -24381
+실패 원소 수 : 1
+  인덱스 2 : ORA-01476: divisor is equal to zero
+
+PL/SQL procedure successfully completed.
+
+-- SAVE EXCEPTIONS 를 붙이면 중간에 실패해도 나머지 원소를 계속 처리한 뒤
+-- ORA-24381 을 발생시키고 SQL%BULK_EXCEPTIONS 로 실패 목록을 확인할 수 있다.
+
+
+--------------------------------------------------------------------------------
+[8] 정리
+--------------------------------------------------------------------------------
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+SQL> SELECT COUNT(*) FROM employees WHERE commission_pct = 1;
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+-- 실습 데이터는 변경되지 않았다.
+
+-- 1) BULK COLLECT 는 여러 행을 한 번에 컬렉션으로 가져와 성능을 개선한다.
+-- 2) 0건이어도 NO_DATA_FOUND 가 아니라 빈 컬렉션이 반환된다 → COUNT 검사 필수.
+-- 3) 빈 컬렉션의 첫 원소에 접근하면 ORA-06533 이 발생한다.
+-- 4) LIMIT 루프의 종료 조건은 %NOTFOUND 가 아니라 COUNT = 0 이어야 한다.
+-- 5) FORALL 은 반복문이 아니며 단 하나의 DML 문장만 올 수 있다.
+-- 6) SAVE EXCEPTIONS + SQL%BULK_EXCEPTIONS 로 실패 원소를 개별 확인할 수 있다.
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

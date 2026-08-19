@@ -1,0 +1,452 @@
+================================================================================
+ 제7장 실습 05 — 실패 Job 확인 및 오류 로그 기록
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) 의도적으로 실패하는 Job 을 만들어 FAILED 상태를 재현한다
+               2) ERROR# 와 ADDITIONAL_INFO 로 실패 원인을 규명한다
+               3) max_failures 에 도달해 BROKEN 이 되는 과정을 확인한다
+               4) BROKEN 을 해제하고 실패 카운터가 초기화되는 것을 확인한다
+               5) WRITE_ERROR_LOG 로 예외를 plsql_job_log 에 남긴다
+               6) 예외를 삼키면 스케줄러가 SUCCEEDED 로 기록하는 문제를 확인한다
+ 사전 준비   : 실습 01 에서 만든 plsql_job_log 테이블과 HR 계정의 CREATE JOB
+               권한이 필요합니다.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+[1] 접속하고 사전 준비 상태를 확인한다
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 14:02:41 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 150
+SQL> SET PAGESIZE 60
+
+SQL> SELECT table_name FROM user_tables WHERE table_name = 'PLSQL_JOB_LOG';
+
+TABLE_NAME
+--------------------
+PLSQL_JOB_LOG
+
+
+--------------------------------------------------------------------------------
+[2] 의도적으로 실패하는 Job 을 만든다
+--------------------------------------------------------------------------------
+
+-- 존재하지 않는 테이블에 INSERT 하는 프로시저를 동적 SQL 로 만든다.
+-- (정적 SQL 로 쓰면 컴파일 단계에서 막히므로 동적 SQL 을 쓴다 — 6장 참고)
+
+SQL> CREATE OR REPLACE PROCEDURE pr_will_fail IS
+  2  BEGIN
+  3     EXECUTE IMMEDIATE
+  4        'INSERT INTO no_such_table (id) VALUES (1)';
+  5  END;
+  6  /
+
+Procedure created.
+
+SQL> BEGIN
+  2     DBMS_SCHEDULER.CREATE_JOB (
+  3        job_name        => 'J_FAIL_DEMO',
+  4        job_type        => 'STORED_PROCEDURE',
+  5        job_action      => 'PR_WILL_FAIL',
+  6        start_date      => SYSTIMESTAMP,
+  7        repeat_interval => 'FREQ=MINUTELY; INTERVAL=1',
+  8        enabled         => FALSE,
+  9        auto_drop       => FALSE,
+ 10        comments        => '실패 진단 실습용');
+ 11
+ 12     DBMS_SCHEDULER.SET_ATTRIBUTE('J_FAIL_DEMO', 'max_failures', 3);
+ 13     DBMS_SCHEDULER.ENABLE('J_FAIL_DEMO');
+ 14  END;
+ 15  /
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, enabled, state, max_failures, failure_count AS fails
+  2    FROM user_scheduler_jobs WHERE job_name = 'J_FAIL_DEMO';
+
+JOB_NAME       ENABLED  STATE       MAX_FAILURES     FAILS
+-------------- -------- ----------- ------------ ---------
+J_FAIL_DEMO    TRUE     SCHEDULED              3         0
+
+
+--------------------------------------------------------------------------------
+[3] 동기 실행으로 실패를 즉시 확인한다
+--------------------------------------------------------------------------------
+
+SQL> EXEC DBMS_SCHEDULER.RUN_JOB('J_FAIL_DEMO');
+BEGIN DBMS_SCHEDULER.RUN_JOB('J_FAIL_DEMO'); END;
+
+*
+ERROR at line 1:
+ORA-00942: table or view does not exist
+ORA-06512: at "HR.PR_WILL_FAIL", line 3
+ORA-06512: at "SYS.DBMS_ISCHED", line 245
+ORA-06512: at "SYS.DBMS_SCHEDULER", line 566
+ORA-06512: at line 1
+
+
+-- 동기 실행이라 오류가 화면에 그대로 나왔다.
+-- 그러나 운영 배치는 비동기로 돌기 때문에 화면이 없다.
+-- 그때는 이력 뷰에서 같은 정보를 읽어야 한다.
+
+
+--------------------------------------------------------------------------------
+[4] 실패 이력을 읽어 원인을 규명한다
+--------------------------------------------------------------------------------
+
+SQL> SELECT log_id, TO_CHAR(log_date,'HH24:MI:SS') AS log_date,
+  2         status, error# AS err, run_duration
+  3    FROM user_scheduler_job_run_details
+  4   WHERE job_name = 'J_FAIL_DEMO' ORDER BY log_date;
+
+    LOG_ID LOG_DATE STATUS            ERR RUN_DURATION
+---------- -------- ----------- --------- ---------------
+       841 14:06:18 FAILED            942 +000 00:00:00
+
+-- ERROR# 가 942 다. ORA-00942 를 뜻한다.
+-- 그런데 942 만으로는 "테이블이 없는 것"과 "권한이 없는 것"을 구분할 수 없다.
+-- 진짜 원인은 ADDITIONAL_INFO 에 있다.
+
+SQL> SET LONG 4000
+SQL> COLUMN additional_info FORMAT A100
+
+SQL> SELECT additional_info
+  2    FROM user_scheduler_job_run_details
+  3   WHERE job_name = 'J_FAIL_DEMO' AND status = 'FAILED'
+  4   ORDER BY log_date DESC FETCH FIRST 1 ROWS ONLY;
+
+ADDITIONAL_INFO
+----------------------------------------------------------------------------------
+ORA-12012: error on auto execute of job "HR"."J_FAIL_DEMO"
+ORA-00942: table or view does not exist
+ORA-06512: at "HR.PR_WILL_FAIL", line 3
+ORA-06512: at line 1
+
+-- 원인 파악
+--   ORA-06512 줄이 정확한 위치를 알려 준다.
+--   HR.PR_WILL_FAIL 의 3번째 줄, 즉 EXECUTE IMMEDIATE 문장이다.
+--   그 문장이 참조하는 NO_SUCH_TABLE 이 존재하지 않는다.
+
+SQL> SELECT table_name FROM user_tables WHERE table_name = 'NO_SUCH_TABLE';
+
+no rows selected
+
+-- 확인 완료. 객체 자체가 없다.
+-- (권한 문제였다면 DICT 나 ALL_TABLES 에는 보이지만 접근이 안 되는 형태로 나타난다)
+
+
+--------------------------------------------------------------------------------
+[5] max_failures 에 도달해 BROKEN 이 되는 과정
+--------------------------------------------------------------------------------
+
+-- 1분 주기이므로 그대로 두면 계속 실패한다. 3분 정도 기다린다.
+
+SQL> SELECT job_name, state, failure_count AS fails, run_count AS runs,
+  2         TO_CHAR(next_run_date,'HH24:MI:SS') AS next_run
+  3    FROM user_scheduler_jobs WHERE job_name = 'J_FAIL_DEMO';
+
+JOB_NAME       STATE           FAILS      RUNS NEXT_RUN
+-------------- ----------- --------- --------- --------
+J_FAIL_DEMO    SCHEDULED           1         0 14:08:00
+
+-- 실패해도 RUN_COUNT 는 늘지 않고 FAILURE_COUNT 만 증가한다.
+
+SQL> SELECT job_name, state, enabled, failure_count AS fails
+  2    FROM user_scheduler_jobs WHERE job_name = 'J_FAIL_DEMO';
+
+JOB_NAME       STATE       ENABLED       FAILS
+-------------- ----------- -------- ---------
+J_FAIL_DEMO    BROKEN      FALSE            3
+
+-- 세 번 연속 실패하자 STATE 가 BROKEN 이 되고 ENABLED 가 FALSE 로 바뀌었다.
+-- 스케줄러가 더 이상 시도하지 않는다.
+
+SQL> SELECT TO_CHAR(log_date,'HH24:MI:SS') AS log_date, operation, status
+  2    FROM user_scheduler_job_log
+  3   WHERE job_name = 'J_FAIL_DEMO' ORDER BY log_date;
+
+LOG_DATE OPERATION   STATUS
+-------- ----------- -----------
+14:06:18 RUN         FAILED
+14:08:00 RUN         FAILED
+14:09:00 RUN         FAILED
+14:09:00 BROKEN
+
+-- JOB_LOG 에 BROKEN 사건이 별도로 남는다.
+
+
+--------------------------------------------------------------------------------
+[6] 원인을 고치고 BROKEN 을 해제한다
+--------------------------------------------------------------------------------
+
+-- 조치 없이 ENABLE 만 하면 같은 실패가 세 번 더 쌓일 뿐이다.
+-- 먼저 원인을 없앤다.
+
+SQL> CREATE TABLE no_such_table (id NUMBER);
+
+Table created.
+
+SQL> EXEC DBMS_SCHEDULER.ENABLE('J_FAIL_DEMO');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT job_name, enabled, state, failure_count AS fails
+  2    FROM user_scheduler_jobs WHERE job_name = 'J_FAIL_DEMO';
+
+JOB_NAME       ENABLED  STATE           FAILS
+-------------- -------- ----------- ---------
+J_FAIL_DEMO    TRUE     SCHEDULED           0
+
+-- ENABLE 시 BROKEN 이 해제되고 FAILURE_COUNT 도 0 으로 초기화됐다.
+
+SQL> EXEC DBMS_SCHEDULER.RUN_JOB('J_FAIL_DEMO');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT status, error# AS err FROM user_scheduler_job_run_details
+  2   WHERE job_name = 'J_FAIL_DEMO' ORDER BY log_date DESC FETCH FIRST 1 ROWS ONLY;
+
+STATUS            ERR
+----------- ---------
+SUCCEEDED           0
+
+-- 운영 절차서에는 반드시 세 단계를 명시한다.
+--   BROKEN 발견 → 원인 조치 → ENABLE
+
+-- 더 이상 반복 실행하지 않도록 잠시 끈다.
+
+SQL> EXEC DBMS_SCHEDULER.DISABLE('J_FAIL_DEMO');
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[7] WRITE_ERROR_LOG — 예외를 업무 로그에 남긴다
+--------------------------------------------------------------------------------
+
+-- 스케줄러 이력만으로는 "무엇을 하다 실패했는가"를 알기 어렵다.
+-- 프로그램이 스스로 맥락을 남기게 만든다.
+
+SQL> CREATE OR REPLACE PROCEDURE write_error_log (
+  2     p_job_name IN VARCHAR2,
+  3     p_start    IN TIMESTAMP,
+  4     p_code     IN NUMBER,
+  5     p_msg      IN VARCHAR2)
+  6  IS
+  7     PRAGMA AUTONOMOUS_TRANSACTION;
+  8  BEGIN
+  9     INSERT INTO plsql_job_log
+ 10        (job_name, start_time, end_time, status,
+ 11         error_code, error_message, created_by)
+ 12     VALUES
+ 13        (p_job_name, p_start, SYSTIMESTAMP, 'ERROR',
+ 14         p_code, SUBSTR(p_msg, 1, 4000), USER);
+ 15     COMMIT;
+ 16  END;
+ 17  /
+
+Procedure created.
+
+-- 이제 프로시저가 실패해도 맥락을 남기고 예외를 다시 던지게 만든다.
+
+SQL> CREATE OR REPLACE PROCEDURE pr_will_fail IS
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3  BEGIN
+  4     EXECUTE IMMEDIATE 'INSERT INTO no_such_table2 (id) VALUES (1)';
+  5     COMMIT;
+  6  EXCEPTION
+  7     WHEN OTHERS THEN
+  8        write_error_log('PR_WILL_FAIL', v_start, SQLCODE, SQLERRM);
+  9        RAISE;                       -- 반드시 다시 던진다
+ 10  END;
+ 11  /
+
+Procedure created.
+
+SQL> EXEC DBMS_SCHEDULER.ENABLE('J_FAIL_DEMO');
+
+PL/SQL procedure successfully completed.
+
+SQL> EXEC DBMS_SCHEDULER.RUN_JOB('J_FAIL_DEMO');
+BEGIN DBMS_SCHEDULER.RUN_JOB('J_FAIL_DEMO'); END;
+
+*
+ERROR at line 1:
+ORA-00942: table or view does not exist
+ORA-06512: at "HR.PR_WILL_FAIL", line 9
+ORA-06512: at "SYS.DBMS_ISCHED", line 245
+ORA-06512: at "SYS.DBMS_SCHEDULER", line 566
+ORA-06512: at line 1
+
+
+SQL> COLUMN error_message FORMAT A50
+
+SQL> SELECT job_name, status, error_code,
+  2         SUBSTR(error_message,1,45) AS error_message
+  3    FROM plsql_job_log WHERE status = 'ERROR' ORDER BY log_id DESC
+  4   FETCH FIRST 1 ROWS ONLY;
+
+JOB_NAME       STATUS  ERROR_CODE ERROR_MESSAGE
+-------------- ------- ---------- ---------------------------------------------
+PR_WILL_FAIL   ERROR         -942 ORA-00942: table or view does not exist
+
+-- 업무 로그에 오류 코드와 메시지가 남았다.
+-- 그리고 RAISE 로 다시 던졌기 때문에 스케줄러도 FAILED 로 인지한다.
+
+SQL> SELECT status, error# AS err FROM user_scheduler_job_run_details
+  2   WHERE job_name = 'J_FAIL_DEMO' ORDER BY log_date DESC FETCH FIRST 1 ROWS ONLY;
+
+STATUS            ERR
+----------- ---------
+FAILED            942
+
+-- SQLCODE 는 -942, 스케줄러 ERROR# 는 942 다. 부호 표기가 다르니 주의한다.
+
+
+--------------------------------------------------------------------------------
+[8] (안티패턴 확인) 예외를 삼키면 무슨 일이 벌어지는가
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE pr_will_fail IS
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3  BEGIN
+  4     EXECUTE IMMEDIATE 'INSERT INTO no_such_table2 (id) VALUES (1)';
+  5     COMMIT;
+  6  EXCEPTION
+  7     WHEN OTHERS THEN
+  8        write_error_log('PR_WILL_FAIL', v_start, SQLCODE, SQLERRM);
+  9        NULL;                        -- 안티패턴 : 삼켜 버린다
+ 10  END;
+ 11  /
+
+Procedure created.
+
+SQL> EXEC DBMS_SCHEDULER.RUN_JOB('J_FAIL_DEMO');
+
+PL/SQL procedure successfully completed.
+
+-- 오류가 화면에 나오지 않았다. 성공한 것처럼 보인다.
+
+SQL> SELECT status, error# AS err,
+  2         TO_CHAR(log_date,'HH24:MI:SS') AS log_date
+  3    FROM user_scheduler_job_run_details
+  4   WHERE job_name = 'J_FAIL_DEMO' ORDER BY log_date DESC FETCH FIRST 2 ROWS ONLY;
+
+STATUS            ERR LOG_DATE
+----------- --------- --------
+SUCCEEDED           0 14:21:07
+FAILED            942 14:18:55
+
+-- 원인 파악
+--   실제로는 실패했는데 스케줄러 이력에는 SUCCEEDED 로 남았다.
+--   이 상태에서는 실패 알림도 울리지 않고 대시보드도 정상으로 보인다.
+--   FAILURE_COUNT 도 증가하지 않아 BROKEN 으로 넘어가지도 않는다.
+--   즉 영원히 조용히 실패하는 배치가 된다.
+
+-- 수정 : 로그는 남기되 반드시 RAISE 로 다시 던진다.
+
+SQL> CREATE OR REPLACE PROCEDURE pr_will_fail IS
+  2     v_start TIMESTAMP := SYSTIMESTAMP;
+  3  BEGIN
+  4     EXECUTE IMMEDIATE 'INSERT INTO no_such_table2 (id) VALUES (1)';
+  5     COMMIT;
+  6  EXCEPTION
+  7     WHEN OTHERS THEN
+  8        write_error_log('PR_WILL_FAIL', v_start, SQLCODE, SQLERRM);
+  9        RAISE;
+ 10  END;
+ 11  /
+
+Procedure created.
+
+-- 원칙 : "멈추지 않되 숨기지도 않는다."
+
+
+--------------------------------------------------------------------------------
+[9] 최근 24시간 실패 목록 — 운영 점검 질의
+--------------------------------------------------------------------------------
+
+SQL> SELECT job_name,
+  2         TO_CHAR(log_date,'MM-DD HH24:MI') AS failed_at,
+  3         error# AS err,
+  4         SUBSTR(additional_info, 1, 60) AS reason
+  5    FROM user_scheduler_job_run_details
+  6   WHERE status = 'FAILED'
+  7     AND log_date > SYSTIMESTAMP - INTERVAL '1' DAY
+  8   ORDER BY log_date DESC;
+
+JOB_NAME       FAILED_AT        ERR REASON
+-------------- ------------ ------- ------------------------------------------
+J_FAIL_DEMO    08-19 14:18      942 ORA-12012: error on auto execute of job "HR
+J_FAIL_DEMO    08-19 14:09      942 ORA-12012: error on auto execute of job "HR
+J_FAIL_DEMO    08-19 14:08      942 ORA-12012: error on auto execute of job "HR
+J_FAIL_DEMO    08-19 14:06      942 ORA-12012: error on auto execute of job "HR
+
+SQL> SELECT error#, COUNT(*) AS cnt
+  2    FROM user_scheduler_job_run_details
+  3   WHERE status = 'FAILED' GROUP BY error# ORDER BY cnt DESC;
+
+    ERROR#       CNT
+---------- ---------
+       942         4
+      6550         1
+
+-- 반복되는 오류 코드가 보이면 개별 회차가 아니라 구조적 문제를 의심한다.
+
+
+--------------------------------------------------------------------------------
+[10] 실습 정리
+--------------------------------------------------------------------------------
+
+SQL> EXEC DBMS_SCHEDULER.DROP_JOB('J_FAIL_DEMO', force => TRUE);
+
+PL/SQL procedure successfully completed.
+
+SQL> DROP TABLE no_such_table PURGE;
+
+Table dropped.
+
+-- WRITE_ERROR_LOG 프로시저와 plsql_job_log 데이터는
+-- 실습 06·08 에서 계속 사용하므로 남겨 둔다.
+
+SQL> SELECT status, COUNT(*) FROM plsql_job_log GROUP BY status;
+
+STATUS       COUNT(*)
+---------- ----------
+SUCCESS             4
+ERROR               3
+RUNNING             1
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. 실패한 Job 은 JOB_RUN_DETAILS 에 STATUS='FAILED' 로 남는다.
+    ERROR# 는 번호만 알려 주므로 진짜 원인은 ADDITIONAL_INFO 에서 읽는다.
+ 2. ADDITIONAL_INFO 의 ORA-06512 줄이 실패한 프로그램과 줄 번호를 알려 준다.
+    ORA-12012 는 "자동 실행 중 오류"라는 스케줄러의 포장 오류다.
+ 3. 실패해도 RUN_COUNT 는 늘지 않고 FAILURE_COUNT 만 증가한다.
+    max_failures 에 도달하면 STATE 가 BROKEN 이 되고 ENABLED 가 FALSE 가 된다.
+ 4. BROKEN 은 자동으로 풀리지 않는다. 원인 조치 후 ENABLE 을 호출해야 하며
+    이때 실패 카운터도 함께 초기화된다.
+ 5. 업무 맥락은 스케줄러가 대신 남겨 주지 않는다. WRITE_ERROR_LOG 로
+    SQLCODE·SQLERRM 을 plsql_job_log 에 직접 기록한다.
+ 6. SQLCODE 는 -942, 스케줄러 ERROR# 는 942 로 부호 표기가 다르다.
+ 7. 예외를 잡아 로그만 남기고 삼키면 스케줄러 이력에 SUCCEEDED 로 남아
+    알림도 울리지 않는다. 반드시 RAISE 로 다시 던져야 한다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

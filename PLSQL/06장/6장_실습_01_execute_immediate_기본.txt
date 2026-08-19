@@ -1,0 +1,358 @@
+================================================================================
+ 제6장 실습 01 — EXECUTE IMMEDIATE 로 정적 SQL과 동적 SQL 비교
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) 정적 SQL과 동적 SQL의 오류 발견 시점 차이를 확인한다
+               2) EXECUTE IMMEDIATE 로 문장을 실행하는 기본 형태를 익힌다
+               3) 문자열 끝의 세미콜론 때문에 나는 ORA-00911 을 재현하고 고친다
+               4) SELECT 를 INTO 없이 실행할 때의 ORA-24374 를 재현하고 고친다
+               5) USER_DEPENDENCIES 로 의존성 기록 차이를 눈으로 확인한다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] HR 계정으로 접속하고 실습 환경을 준비한다
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 09:05:12 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 120
+SQL> SET PAGESIZE 50
+
+SQL> SHOW USER
+USER is "HR"
+
+-- 이 장의 실습은 원본 EMPLOYEES 를 건드리지 않기 위해 복사본을 사용한다.
+SQL> CREATE TABLE emp_copy AS SELECT * FROM employees;
+
+Table created.
+
+SQL> SELECT COUNT(*) AS cnt FROM emp_copy;
+
+       CNT
+----------
+       107
+
+
+--------------------------------------------------------------------------------
+[2] 정적 SQL — 오류는 컴파일 시점에 잡힌다
+--------------------------------------------------------------------------------
+
+-- 존재하지 않는 테이블 NO_SUCH_TABLE 을 정적 SQL 로 참조해 본다.
+
+SQL> CREATE OR REPLACE PROCEDURE static_bad IS
+  2     v_cnt NUMBER;
+  3  BEGIN
+  4     SELECT COUNT(*) INTO v_cnt FROM no_such_table;
+  5     DBMS_OUTPUT.PUT_LINE(v_cnt);
+  6  END;
+  7  /
+
+Warning: Procedure created with compilation errors.
+
+SQL> SHOW ERRORS
+Errors for PROCEDURE STATIC_BAD:
+
+LINE/COL ERROR
+-------- -----------------------------------------------------------------
+4/4      PL/SQL: SQL Statement ignored
+4/34     PL/SQL: ORA-00942: table or view does not exist
+
+-- 원인 : 정적 SQL 은 CREATE 하는 순간 파싱되어 객체 존재와 권한이 검사된다.
+--        그래서 실행해 보기도 전에 컴파일 오류로 잡힌다.
+
+SQL> SELECT object_name, status FROM user_objects
+  2   WHERE object_name = 'STATIC_BAD';
+
+OBJECT_NAME          STATUS
+-------------------- -------
+STATIC_BAD           INVALID
+
+
+--------------------------------------------------------------------------------
+[3] 동적 SQL — 같은 문장이 컴파일을 통과한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE PROCEDURE dynamic_bad IS
+  2     v_cnt NUMBER;
+  3  BEGIN
+  4     EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM no_such_table' INTO v_cnt;
+  5     DBMS_OUTPUT.PUT_LINE(v_cnt);
+  6  END;
+  7  /
+
+Procedure created.
+
+SQL> SELECT object_name, status FROM user_objects
+  2   WHERE object_name = 'DYNAMIC_BAD';
+
+OBJECT_NAME          STATUS
+-------------------- -------
+DYNAMIC_BAD          VALID
+
+-- 컴파일러는 문자열의 내용을 보지 못하므로 아무 문제가 없다고 판단한다.
+-- 그러나 실행하면 그때서야 실패한다.
+
+SQL> EXEC dynamic_bad
+BEGIN dynamic_bad; END;
+
+*
+ERROR at line 1:
+ORA-00942: table or view does not exist
+ORA-06512: at "HR.DYNAMIC_BAD", line 4
+ORA-06512: at line 1
+
+-- 정리 : 같은 실수라도 정적 SQL 은 배포 전에, 동적 SQL 은 운영 중에 드러난다.
+
+
+--------------------------------------------------------------------------------
+[4] 의존성 기록의 차이를 확인한다
+--------------------------------------------------------------------------------
+
+-- 정상 동작하는 두 프로시저를 만들어 비교한다.
+
+SQL> CREATE OR REPLACE PROCEDURE static_ok IS
+  2     v_cnt NUMBER;
+  3  BEGIN
+  4     SELECT COUNT(*) INTO v_cnt FROM emp_copy;
+  5     DBMS_OUTPUT.PUT_LINE('static_ok  : ' || v_cnt);
+  6  END;
+  7  /
+
+Procedure created.
+
+SQL> CREATE OR REPLACE PROCEDURE dynamic_ok IS
+  2     v_cnt NUMBER;
+  3  BEGIN
+  4     EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM emp_copy' INTO v_cnt;
+  5     DBMS_OUTPUT.PUT_LINE('dynamic_ok : ' || v_cnt);
+  6  END;
+  7  /
+
+Procedure created.
+
+SQL> EXEC static_ok
+static_ok  : 107
+
+PL/SQL procedure successfully completed.
+
+SQL> EXEC dynamic_ok
+dynamic_ok : 107
+
+PL/SQL procedure successfully completed.
+
+-- 두 프로시저의 의존성을 딕셔너리에서 확인한다.
+
+SQL> SELECT name, referenced_name, referenced_type
+  2    FROM user_dependencies
+  3   WHERE name IN ('STATIC_OK', 'DYNAMIC_OK')
+  4     AND referenced_name = 'EMP_COPY';
+
+NAME            REFERENCED_NAME      REFERENCED_TYPE
+--------------- -------------------- ---------------
+STATIC_OK       EMP_COPY             TABLE
+
+-- 동적 SQL 로만 참조하는 DYNAMIC_OK 는 의존성이 기록되지 않는다.
+-- 실제로 테이블을 바꾸면 어떤 차이가 나는지 확인해 보자.
+
+SQL> ALTER TABLE emp_copy ADD (memo VARCHAR2(100));
+
+Table altered.
+
+SQL> SELECT object_name, status FROM user_objects
+  2   WHERE object_name IN ('STATIC_OK', 'DYNAMIC_OK') ORDER BY object_name;
+
+OBJECT_NAME          STATUS
+-------------------- -------
+DYNAMIC_OK           VALID
+STATIC_OK            INVALID
+
+-- STATIC_OK 만 INVALID 가 되었다. 다음 호출 때 자동 재컴파일된다.
+-- DYNAMIC_OK 는 아무 일도 없었던 것처럼 VALID 로 남는다.
+
+
+--------------------------------------------------------------------------------
+[5] (오류 상황) 동적 SQL 문자열 끝에 세미콜론을 넣었다
+--------------------------------------------------------------------------------
+
+SQL> BEGIN
+  2     EXECUTE IMMEDIATE 'CREATE TABLE t_demo (id NUMBER);';
+  3  END;
+  4  /
+BEGIN
+
+*
+ERROR at line 1:
+ORA-00911: invalid character
+ORA-06512: at line 2
+
+-- 원인 파악
+--   SQL*Plus 에서 우리가 치는 세미콜론은 "문장을 서버로 보내라"는
+--   SQL*Plus 의 명령 종결 기호이지 SQL 문법의 일부가 아니다.
+--   문자열 안에 들어가면 오라클은 문장 뒤에 붙은 정체불명의 문자로 본다.
+
+-- 수정 : 문자열 안의 세미콜론을 제거한다.
+
+SQL> BEGIN
+  2     EXECUTE IMMEDIATE 'CREATE TABLE t_demo (id NUMBER)';
+  3  END;
+  4  /
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT table_name FROM user_tables WHERE table_name = 'T_DEMO';
+
+TABLE_NAME
+--------------------
+T_DEMO
+
+-- 반대로 문자열이 PL/SQL 블록이면 END 뒤의 세미콜론이 문법의 일부다.
+
+SQL> BEGIN
+  2     EXECUTE IMMEDIATE 'BEGIN DBMS_OUTPUT.PUT_LINE(''동적 블록 실행''); END;';
+  3  END;
+  4  /
+동적 블록 실행
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[6] (오류 상황) SELECT 를 INTO 없이 EXECUTE IMMEDIATE 로 실행했다
+--------------------------------------------------------------------------------
+
+SQL> BEGIN
+  2     EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM employees';
+  3  END;
+  4  /
+BEGIN
+
+*
+ERROR at line 1:
+ORA-24374: define not done before fetch or execute and fetch
+ORA-06512: at line 2
+
+-- 원인 파악
+--   SELECT 문은 결과를 어딘가에 담아야 한다. 결과를 받을 자리를 지정하는
+--   단계를 define 이라 하며, INTO 절이 그 역할을 한다.
+--   INTO 를 빠뜨리면 담을 곳이 없으므로 ORA-24374 가 발생한다.
+--   정적 SQL 이었다면 PLS-00428 컴파일 오류로 미리 잡혔을 실수다.
+
+-- 수정 : INTO 절을 붙인다.
+
+SQL> DECLARE
+  2     v_cnt   NUMBER;
+  3  BEGIN
+  4     EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM employees' INTO v_cnt;
+  5     DBMS_OUTPUT.PUT_LINE('사원 수 : ' || v_cnt);
+  6  END;
+  7  /
+사원 수 : 107
+
+PL/SQL procedure successfully completed.
+
+-- 레코드로 한 행 전체를 받을 수도 있다.
+
+SQL> DECLARE
+  2     v_emp   employees%ROWTYPE;
+  3  BEGIN
+  4     EXECUTE IMMEDIATE 'SELECT * FROM employees WHERE employee_id = :id'
+  5        INTO v_emp USING 100;
+  6     DBMS_OUTPUT.PUT_LINE(v_emp.last_name || ' / ' || v_emp.job_id
+  7                          || ' / ' || v_emp.salary);
+  8  END;
+  9  /
+King / AD_PRES / 24000
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[7] 결과 행 수에 따른 동작을 확인한다
+--------------------------------------------------------------------------------
+
+-- INTO 절은 정확히 한 행을 요구한다. 0건이면 NO_DATA_FOUND.
+
+SQL> DECLARE
+  2     v_name   employees.last_name%TYPE;
+  3  BEGIN
+  4     EXECUTE IMMEDIATE 'SELECT last_name FROM employees
+  5                         WHERE employee_id = :id'
+  6        INTO v_name USING 9999;
+  7     DBMS_OUTPUT.PUT_LINE(v_name);
+  8  EXCEPTION
+  9     WHEN NO_DATA_FOUND THEN
+ 10        DBMS_OUTPUT.PUT_LINE('해당 사원이 없습니다.');
+ 11  END;
+ 12  /
+해당 사원이 없습니다.
+
+PL/SQL procedure successfully completed.
+
+-- 2건 이상이면 TOO_MANY_ROWS.
+
+SQL> DECLARE
+  2     v_name   employees.last_name%TYPE;
+  3  BEGIN
+  4     EXECUTE IMMEDIATE 'SELECT last_name FROM employees
+  5                         WHERE department_id = :d'
+  6        INTO v_name USING 60;
+  7  EXCEPTION
+  8     WHEN TOO_MANY_ROWS THEN
+  9        DBMS_OUTPUT.PUT_LINE('여러 행이 조회되었습니다. BULK COLLECT 를 쓰세요.');
+ 10  END;
+ 11  /
+여러 행이 조회되었습니다. BULK COLLECT 를 쓰세요.
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[8] 실습 정리 및 객체 삭제
+--------------------------------------------------------------------------------
+
+SQL> DROP TABLE t_demo PURGE;
+
+Table dropped.
+
+SQL> DROP PROCEDURE static_bad;
+
+Procedure dropped.
+
+SQL> DROP PROCEDURE dynamic_bad;
+
+Procedure dropped.
+
+-- emp_copy 와 static_ok / dynamic_ok 는 이후 실습에서 계속 사용하므로 남겨 둔다.
+
+SQL> ALTER TABLE emp_copy DROP COLUMN memo;
+
+Table altered.
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. 정적 SQL 은 컴파일 시점에, 동적 SQL 은 실행 시점에 파싱된다.
+    같은 실수라도 발견 시점이 배포 전과 운영 중으로 갈린다.
+ 2. 동적 SQL 은 USER_DEPENDENCIES 에 의존성을 남기지 않는다.
+    참조 테이블이 바뀌어도 프로그램은 VALID 를 유지한다.
+ 3. 문자열이 SQL 문장이면 세미콜론을 붙이지 않는다. 붙이면 ORA-00911.
+    문자열이 PL/SQL 블록이면 END; 까지 온전히 넣어야 한다.
+ 4. SELECT 를 INTO 없이 실행하면 ORA-24374 가 발생한다.
+ 5. INTO 절은 한 행을 요구한다. 0건은 NO_DATA_FOUND, 2건 이상은 TOO_MANY_ROWS.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

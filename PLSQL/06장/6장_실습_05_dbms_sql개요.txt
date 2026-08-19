@@ -1,0 +1,426 @@
+================================================================================
+ 제6장 실습 05 — DBMS_SQL 개요 확인
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) DBMS_SQL 의 처리 절차(OPEN_CURSOR→PARSE→BIND→EXECUTE→CLOSE)를 익힌다
+               2) 호출 순서를 어겼을 때의 ORA-01001 을 재현하고 고친다
+               3) CLOSE_CURSOR 누락으로 인한 커서 누수와 ORA-01000 을 확인한다
+               4) DESCRIBE_COLUMNS 로 결과 구조를 실행 시점에 조사한다
+               5) TO_REFCURSOR 로 DBMS_SQL 커서를 NDS 방식으로 넘긴다
+               6) EXECUTE IMMEDIATE 와 DBMS_SQL 의 사용 시점 차이를 정리한다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 접속과 준비
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 11:12:35 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 120
+
+-- DBMS_SQL 은 SYS 소유의 공개 패키지로 PUBLIC 에 실행 권한이 부여되어 있다.
+SQL> SELECT grantee, privilege FROM all_tab_privs
+  2   WHERE table_name = 'DBMS_SQL' AND grantee = 'PUBLIC';
+
+GRANTEE    PRIVILEGE
+---------- ----------
+PUBLIC     EXECUTE
+
+SQL> SELECT COUNT(*) FROM emp_copy;
+
+  COUNT(*)
+----------
+       107
+
+
+--------------------------------------------------------------------------------
+[2] (오류 상황) PARSE 전에 BIND_VARIABLE 을 호출했다
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     v_cur   INTEGER;
+  3     v_n     NUMBER;
+  4  BEGIN
+  5     v_cur := DBMS_SQL.OPEN_CURSOR;
+  6     DBMS_SQL.BIND_VARIABLE(v_cur, ':d', 60);
+  7     DBMS_SQL.PARSE(v_cur, 'DELETE FROM emp_copy WHERE department_id = :d',
+  8                    DBMS_SQL.NATIVE);
+  9     v_n := DBMS_SQL.EXECUTE(v_cur);
+ 10     DBMS_SQL.CLOSE_CURSOR(v_cur);
+ 11  END;
+ 12  /
+DECLARE
+
+*
+ERROR at line 1:
+ORA-01001: invalid cursor
+ORA-06512: at "SYS.DBMS_SYS_SQL", line 1616
+ORA-06512: at "SYS.DBMS_SQL", line 1199
+ORA-06512: at line 6
+
+-- 원인 파악
+--   OPEN_CURSOR 는 빈 커서 하나를 확보했을 뿐이다. 아직 문장이 등록되지 않았으므로
+--   그 커서에는 묶을 바인드 자리가 존재하지 않는다.
+--   DBMS_SQL 은 반드시 다음 순서를 지켜야 한다.
+--     1) OPEN_CURSOR   커서 ID 확보
+--     2) PARSE         문장 등록(문법·객체·권한 검사)
+--     3) BIND_VARIABLE 값 연결
+--     4) EXECUTE       실행
+--     5) CLOSE_CURSOR  커서 반납
+
+-- 수정 : 순서를 바로잡는다.
+
+SQL> DECLARE
+  2     v_cur   INTEGER;
+  3     v_n     NUMBER;
+  4  BEGIN
+  5     v_cur := DBMS_SQL.OPEN_CURSOR;
+  6     DBMS_SQL.PARSE(v_cur, 'DELETE FROM emp_copy WHERE department_id = :d',
+  7                    DBMS_SQL.NATIVE);
+  8     DBMS_SQL.BIND_VARIABLE(v_cur, ':d', 60);
+  9     v_n := DBMS_SQL.EXECUTE(v_cur);
+ 10     DBMS_SQL.CLOSE_CURSOR(v_cur);
+ 11     DBMS_OUTPUT.PUT_LINE('삭제 건수 : ' || v_n);
+ 12  END;
+ 13  /
+삭제 건수 : 5
+
+PL/SQL procedure successfully completed.
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+
+--------------------------------------------------------------------------------
+[3] 커서 누수와 ORA-01000
+--------------------------------------------------------------------------------
+
+SQL> SHOW PARAMETER open_cursors
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------
+open_cursors                         integer     300
+
+-- CLOSE_CURSOR 를 빠뜨린 함수를 만들어 반복 호출해 본다.
+
+SQL> CREATE OR REPLACE FUNCTION leak_cursor RETURN NUMBER IS
+  2     v_cur   INTEGER;
+  3     v_cnt   NUMBER;
+  4  BEGIN
+  5     v_cur := DBMS_SQL.OPEN_CURSOR;
+  6     DBMS_SQL.PARSE(v_cur, 'SELECT COUNT(*) FROM employees', DBMS_SQL.NATIVE);
+  7     v_cnt := DBMS_SQL.EXECUTE(v_cur);
+  8     -- DBMS_SQL.CLOSE_CURSOR(v_cur);   <-- 일부러 빠뜨렸다
+  9     RETURN v_cur;
+ 10  END leak_cursor;
+ 11  /
+
+Function created.
+
+SQL> DECLARE
+  2     v_id   NUMBER;
+  3  BEGIN
+  4     FOR i IN 1 .. 400 LOOP
+  5        v_id := leak_cursor;
+  6     END LOOP;
+  7  END;
+  8  /
+DECLARE
+
+*
+ERROR at line 1:
+ORA-01000: maximum open cursors exceeded
+ORA-06512: at "SYS.DBMS_SQL", line 1113
+ORA-06512: at "HR.LEAK_CURSOR", line 5
+ORA-06512: at line 5
+
+-- 원인 파악
+--   커서를 닫지 않아 세션의 열린 커서 수가 OPEN_CURSORS(300)를 넘었다.
+--   DBMS_SQL 은 NDS 와 달리 커서를 자동으로 반납하지 않는다.
+
+-- 수정 : 예외가 나도 반드시 닫히도록 EXCEPTION 절을 둔다.
+
+SQL> CREATE OR REPLACE FUNCTION safe_count RETURN NUMBER IS
+  2     v_cur   INTEGER;
+  3     v_dummy NUMBER;
+  4     v_cnt   NUMBER;
+  5  BEGIN
+  6     v_cur := DBMS_SQL.OPEN_CURSOR;
+  7     DBMS_SQL.PARSE(v_cur, 'SELECT COUNT(*) FROM employees', DBMS_SQL.NATIVE);
+  8     DBMS_SQL.DEFINE_COLUMN(v_cur, 1, v_cnt);
+  9     v_dummy := DBMS_SQL.EXECUTE(v_cur);
+ 10     IF DBMS_SQL.FETCH_ROWS(v_cur) > 0 THEN
+ 11        DBMS_SQL.COLUMN_VALUE(v_cur, 1, v_cnt);
+ 12     END IF;
+ 13     DBMS_SQL.CLOSE_CURSOR(v_cur);
+ 14     RETURN v_cnt;
+ 15  EXCEPTION
+ 16     WHEN OTHERS THEN
+ 17        IF DBMS_SQL.IS_OPEN(v_cur) THEN
+ 18           DBMS_SQL.CLOSE_CURSOR(v_cur);
+ 19        END IF;
+ 20        RAISE;
+ 21  END safe_count;
+ 22  /
+
+Function created.
+
+SQL> DECLARE
+  2     v_n   NUMBER;
+  3  BEGIN
+  4     FOR i IN 1 .. 400 LOOP
+  5        v_n := safe_count;
+  6     END LOOP;
+  7     DBMS_OUTPUT.PUT_LINE('400회 반복 완료. 마지막 결과 : ' || v_n);
+  8  END;
+  9  /
+400회 반복 완료. 마지막 결과 : 107
+
+PL/SQL procedure successfully completed.
+
+-- 질의를 처리하려면 DEFINE_COLUMN → EXECUTE → FETCH_ROWS → COLUMN_VALUE 단계가
+-- 추가된다. NDS 라면 EXECUTE IMMEDIATE ... INTO 한 줄로 끝나는 일이다.
+
+
+--------------------------------------------------------------------------------
+[4] 파라미터가 있는 DML — BIND_VARIABLE 활용
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE FUNCTION del_rows_sql(p_table IN VARCHAR2,
+  2                                           p_dept  IN NUMBER)
+  3     RETURN NUMBER IS
+  4     v_cur    INTEGER;
+  5     v_rows   NUMBER;
+  6  BEGIN
+  7     v_cur := DBMS_SQL.OPEN_CURSOR;
+  8     DBMS_SQL.PARSE(v_cur,
+  9        'DELETE FROM ' || DBMS_ASSERT.SIMPLE_SQL_NAME(p_table)
+ 10        || ' WHERE department_id = :d', DBMS_SQL.NATIVE);
+ 11     DBMS_SQL.BIND_VARIABLE(v_cur, ':d', p_dept);
+ 12     v_rows := DBMS_SQL.EXECUTE(v_cur);
+ 13     DBMS_SQL.CLOSE_CURSOR(v_cur);
+ 14     RETURN v_rows;
+ 15  EXCEPTION
+ 16     WHEN OTHERS THEN
+ 17        IF DBMS_SQL.IS_OPEN(v_cur) THEN DBMS_SQL.CLOSE_CURSOR(v_cur); END IF;
+ 18        RAISE;
+ 19  END del_rows_sql;
+ 20  /
+
+Function created.
+
+SQL> DECLARE
+  2     v_n   NUMBER;
+  3  BEGIN
+  4     v_n := del_rows_sql('EMP_COPY', 60);
+  5     DBMS_OUTPUT.PUT_LINE(v_n || ' rows deleted.');
+  6  END;
+  7  /
+5 rows deleted.
+
+PL/SQL procedure successfully completed.
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+-- 객체 이름은 바인딩할 수 없으므로 DBMS_ASSERT 로 검증한 뒤 결합했다.
+
+SQL> DECLARE
+  2     v_n   NUMBER;
+  3  BEGIN
+  4     v_n := del_rows_sql('emp_copy WHERE 1=1 OR ''a''=''a', 60);
+  5  END;
+  6  /
+DECLARE
+
+*
+ERROR at line 1:
+ORA-44003: invalid SQL name
+ORA-06512: at "SYS.DBMS_ASSERT", line 200
+ORA-06512: at "HR.DEL_ROWS_SQL", line 9
+ORA-06512: at line 4
+
+-- 주입 시도가 실행 전에 차단되었다.
+
+
+--------------------------------------------------------------------------------
+[5] DESCRIBE_COLUMNS 로 결과 구조를 실행 시점에 조사한다
+--------------------------------------------------------------------------------
+
+-- 이것이 NDS 로는 할 수 없는 Method 4 의 영역이다.
+
+SQL> DECLARE
+  2     v_cur     INTEGER;
+  3     v_cnt     INTEGER;
+  4     v_desc    DBMS_SQL.DESC_TAB;
+  5     v_dummy   INTEGER;
+  6  BEGIN
+  7     v_cur := DBMS_SQL.OPEN_CURSOR;
+  8     DBMS_SQL.PARSE(v_cur,
+  9        'SELECT employee_id, last_name, salary, hire_date FROM employees',
+ 10        DBMS_SQL.NATIVE);
+ 11     DBMS_SQL.DESCRIBE_COLUMNS(v_cur, v_cnt, v_desc);
+ 12     DBMS_OUTPUT.PUT_LINE('컬럼 개수 : ' || v_cnt);
+ 13     FOR i IN 1 .. v_cnt LOOP
+ 14        DBMS_OUTPUT.PUT_LINE('  ' || i || ' : '
+ 15                             || RPAD(v_desc(i).col_name, 14)
+ 16                             || ' type=' || v_desc(i).col_type
+ 17                             || ' len=' || v_desc(i).col_max_len);
+ 18     END LOOP;
+ 19     DBMS_SQL.CLOSE_CURSOR(v_cur);
+ 20  END;
+ 21  /
+컬럼 개수 : 4
+  1 : EMPLOYEE_ID    type=2 len=22
+  2 : LAST_NAME      type=1 len=25
+  3 : SALARY         type=2 len=22
+  4 : HIRE_DATE      type=12 len=7
+
+PL/SQL procedure successfully completed.
+
+-- col_type 값 : 1=VARCHAR2, 2=NUMBER, 12=DATE, 112=CLOB 등
+-- 이 정보를 이용하면 컬럼 개수와 자료형을 모르는 상태에서도 결과를 처리할 수 있다.
+
+
+--------------------------------------------------------------------------------
+[6] TO_REFCURSOR 로 NDS 방식으로 넘긴다
+--------------------------------------------------------------------------------
+
+SQL> DECLARE
+  2     v_cur     INTEGER;
+  3     v_rc      SYS_REFCURSOR;
+  4     v_dummy   INTEGER;
+  5     v_id      employees.employee_id%TYPE;
+  6     v_name    employees.last_name%TYPE;
+  7  BEGIN
+  8     v_cur := DBMS_SQL.OPEN_CURSOR;
+  9     DBMS_SQL.PARSE(v_cur,
+ 10        'SELECT employee_id, last_name FROM employees
+ 11          WHERE department_id = :d ORDER BY employee_id', DBMS_SQL.NATIVE);
+ 12     DBMS_SQL.BIND_VARIABLE(v_cur, ':d', 20);
+ 13     v_dummy := DBMS_SQL.EXECUTE(v_cur);
+ 14
+ 15     -- 여기서부터는 NDS 방식으로 다룬다
+ 16     v_rc := DBMS_SQL.TO_REFCURSOR(v_cur);
+ 17     LOOP
+ 18        FETCH v_rc INTO v_id, v_name;
+ 19        EXIT WHEN v_rc%NOTFOUND;
+ 20        DBMS_OUTPUT.PUT_LINE(v_id || ' / ' || v_name);
+ 21     END LOOP;
+ 22     CLOSE v_rc;
+ 23  END;
+ 24  /
+201 / Hartstein
+202 / Fay
+
+PL/SQL procedure successfully completed.
+
+-- TO_REFCURSOR 를 호출한 뒤에는 원래의 커서 번호로 DBMS_SQL 호출을 할 수 없다.
+-- 소유권이 REF CURSOR 로 넘어간 것으로 보고 CLOSE 문으로 닫아야 한다.
+
+SQL> DECLARE
+  2     v_cur     INTEGER;
+  3     v_rc      SYS_REFCURSOR;
+  4     v_dummy   INTEGER;
+  5  BEGIN
+  6     v_cur := DBMS_SQL.OPEN_CURSOR;
+  7     DBMS_SQL.PARSE(v_cur, 'SELECT 1 FROM dual', DBMS_SQL.NATIVE);
+  8     v_dummy := DBMS_SQL.EXECUTE(v_cur);
+  9     v_rc := DBMS_SQL.TO_REFCURSOR(v_cur);
+ 10     DBMS_SQL.CLOSE_CURSOR(v_cur);       -- 이미 넘어간 커서를 닫으려 한다
+ 11  END;
+ 12  /
+DECLARE
+
+*
+ERROR at line 1:
+ORA-29471: DBMS_SQL access denied
+ORA-06512: at "SYS.DBMS_SQL", line 1721
+ORA-06512: at line 10
+
+-- 원인 : 변환된 커서는 더 이상 DBMS_SQL 이 관리하지 않는다.
+-- 수정 : CLOSE v_rc; 로 닫는다.
+
+
+--------------------------------------------------------------------------------
+[7] DDL 처리 방식의 차이
+--------------------------------------------------------------------------------
+
+-- DBMS_SQL 은 DDL 을 PARSE 하는 순간 곧바로 실행한다.
+
+SQL> DECLARE
+  2     v_cur   INTEGER;
+  3  BEGIN
+  4     v_cur := DBMS_SQL.OPEN_CURSOR;
+  5     DBMS_SQL.PARSE(v_cur, 'CREATE TABLE t_sql_demo (id NUMBER)',
+  6                    DBMS_SQL.NATIVE);
+  7     -- EXECUTE 를 호출하지 않았다
+  8     DBMS_SQL.CLOSE_CURSOR(v_cur);
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT table_name FROM user_tables WHERE table_name = 'T_SQL_DEMO';
+
+TABLE_NAME
+--------------------
+T_SQL_DEMO
+
+-- EXECUTE 없이도 테이블이 만들어졌다.
+-- NDS 의 EXECUTE IMMEDIATE 와 동작이 다르므로 혼동하지 않도록 한다.
+
+SQL> BEGIN
+  2     EXECUTE IMMEDIATE 'DROP TABLE t_sql_demo PURGE';
+  3  END;
+  4  /
+
+PL/SQL procedure successfully completed.
+
+
+--------------------------------------------------------------------------------
+[8] 정리
+--------------------------------------------------------------------------------
+
+SQL> DROP FUNCTION leak_cursor;
+
+Function dropped.
+
+SQL> DROP FUNCTION safe_count;
+
+Function dropped.
+
+SQL> DROP FUNCTION del_rows_sql;
+
+Function dropped.
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. DBMS_SQL 의 순서는 OPEN_CURSOR → PARSE → BIND_VARIABLE → EXECUTE →
+    CLOSE_CURSOR 이며, 질의라면 DEFINE_COLUMN 과 FETCH_ROWS/COLUMN_VALUE 가 추가된다.
+ 2. PARSE 전에 BIND_VARIABLE 을 호출하면 ORA-01001 이 발생한다.
+ 3. CLOSE_CURSOR 를 빠뜨리면 커서가 누수되어 ORA-01000 이 발생한다.
+    예외 절에 IS_OPEN 검사와 CLOSE_CURSOR 를 반드시 둔다.
+ 4. DESCRIBE_COLUMNS 는 결과 구조를 실행 시점에 조사한다. NDS 로는 불가능한
+    Method 4 의 영역이며 이때만 DBMS_SQL 이 필요하다.
+ 5. TO_REFCURSOR 로 변환하면 이후에는 NDS 방식으로 다루며, 원래 커서 번호로
+    DBMS_SQL 을 호출하면 ORA-29471 이 발생한다.
+ 6. DBMS_SQL 은 DDL 을 PARSE 시점에 곧바로 실행한다. EXECUTE 호출이 불필요하다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0

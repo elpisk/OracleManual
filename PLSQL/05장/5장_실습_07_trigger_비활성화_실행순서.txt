@@ -1,0 +1,499 @@
+================================================================================
+ 제5장 실습 07 — Trigger 비활성화 / 활성화 및 실행 순서 확인
+--------------------------------------------------------------------------------
+ 대상 스키마 : HR (EMPLOYEES / DEPARTMENTS / JOBS / JOB_HISTORY /
+                   LOCATIONS / COUNTRIES / REGIONS)
+ 실행 환경   : Oracle Database 19c (19.3) / SQL*Plus
+ 학습 목표   : 1) 네 종류의 트리거를 만들어 발화 순서를 눈으로 확인한다
+               2) FOLLOWS 절로 같은 시점 트리거의 순서를 고정한다
+               3) ALTER TRIGGER / ALTER TABLE 로 상태를 바꾸고 조회한다
+               4) 이름 오타로 나는 ORA-04080 을 재현하고 수정한다
+               5) 트리거를 다시 켜지 않아 데이터 정합성이 깨지는 상황을 재현하고
+                  안전한 작업 패턴을 만든다
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 접속과 준비
+--------------------------------------------------------------------------------
+
+$ sqlplus hr/hr@localhost:1521/orclpdb
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Wed Aug 19 14:02:19 2026
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SQL> SET SERVEROUTPUT ON SIZE UNLIMITED
+SQL> SET LINESIZE 130
+
+-- 실습 04 에서 만든 감사 테이블이 있는지 확인한다.
+SQL> SELECT COUNT(*) AS audit_rows FROM emp_audit_detail;
+
+AUDIT_ROWS
+----------
+         0
+
+-- 현재 EMPLOYEES 에 걸려 있는 트리거를 확인한다.
+SQL> SELECT trigger_name, trigger_type, triggering_event, status
+  2    FROM user_triggers WHERE table_name = 'EMPLOYEES' ORDER BY 1;
+
+TRIGGER_NAME           TRIGGER_TYPE      TRIGGERING_EVENT           STATUS
+---------------------- ----------------- -------------------------- --------
+TRG_EMP_AR_SALARY      AFTER EACH ROW    UPDATE                     ENABLED
+TRG_EMP_BIU_NORMALIZE  BEFORE EACH ROW   INSERT OR UPDATE           ENABLED
+TRG_EMP_SECURE         BEFORE STATEMENT  INSERT OR UPDATE OR DELETE DISABLED
+
+-- 실습 05 마지막에 꺼 둔 TRG_EMP_SECURE 가 DISABLED 로 남아 있다.
+
+
+--------------------------------------------------------------------------------
+[2] 네 종류의 트리거를 만들어 실행 순서를 확인한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE TRIGGER trg_ord_bs
+  2     BEFORE UPDATE ON employees
+  3  BEGIN
+  4     DBMS_OUTPUT.PUT_LINE('1. BEFORE 문장');
+  5  END trg_ord_bs;
+  6  /
+
+Trigger TRG_ORD_BS compiled
+
+SQL> CREATE OR REPLACE TRIGGER trg_ord_br
+  2     BEFORE UPDATE ON employees
+  3     FOR EACH ROW
+  4  BEGIN
+  5     DBMS_OUTPUT.PUT_LINE('   2. BEFORE 행 - 사번 ' || :OLD.employee_id);
+  6  END trg_ord_br;
+  7  /
+
+Trigger TRG_ORD_BR compiled
+
+SQL> CREATE OR REPLACE TRIGGER trg_ord_ar
+  2     AFTER UPDATE ON employees
+  3     FOR EACH ROW
+  4  BEGIN
+  5     DBMS_OUTPUT.PUT_LINE('   3. AFTER 행  - 사번 ' || :NEW.employee_id);
+  6  END trg_ord_ar;
+  7  /
+
+Trigger TRG_ORD_AR compiled
+
+SQL> CREATE OR REPLACE TRIGGER trg_ord_as
+  2     AFTER UPDATE ON employees
+  3  BEGIN
+  4     DBMS_OUTPUT.PUT_LINE('4. AFTER 문장');
+  5  END trg_ord_as;
+  6  /
+
+Trigger TRG_ORD_AS compiled
+
+-- 단일 행 UPDATE : 네 단계가 한 번씩 나타난다.
+SQL> UPDATE employees SET salary = salary + 100 WHERE employee_id = 200;
+1. BEFORE 문장
+   2. BEFORE 행 - 사번 200
+   3. AFTER 행  - 사번 200
+4. AFTER 문장
+
+1 row updated.
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+-- 다중 행 UPDATE : 행 단위 쌍이 행 수만큼 반복된다.
+SQL> UPDATE employees SET salary = salary + 100 WHERE department_id = 60;
+1. BEFORE 문장
+   2. BEFORE 행 - 사번 103
+   3. AFTER 행  - 사번 103
+   2. BEFORE 행 - 사번 104
+   3. AFTER 행  - 사번 104
+   2. BEFORE 행 - 사번 105
+   3. AFTER 행  - 사번 105
+   2. BEFORE 행 - 사번 106
+   3. AFTER 행  - 사번 106
+   2. BEFORE 행 - 사번 107
+   3. AFTER 행  - 사번 107
+4. AFTER 문장
+
+5 rows updated.
+
+-- 확인) BEFORE 문장 1회 → (BEFORE 행 → 변경 → AFTER 행) × 행 수 → AFTER 문장 1회
+--       문장 트리거가 앞뒤를 감싸는 구조다.
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+-- 조건에 맞는 행이 없는 UPDATE
+SQL> UPDATE employees SET salary = salary + 100 WHERE department_id = 9999;
+1. BEFORE 문장
+4. AFTER 문장
+
+0 rows updated.
+
+-- 확인) 문장 트리거만 발화하고 행 트리거는 한 번도 실행되지 않았다.
+
+
+--------------------------------------------------------------------------------
+[3] 같은 시점 트리거의 순서를 FOLLOWS 로 고정한다
+--------------------------------------------------------------------------------
+
+SQL> CREATE OR REPLACE TRIGGER trg_emp_br_validate
+  2     BEFORE INSERT ON employees
+  3     FOR EACH ROW
+  4  BEGIN
+  5     IF :NEW.salary IS NULL THEN
+  6        RAISE_APPLICATION_ERROR(-20801, '급여는 필수입니다');
+  7     END IF;
+  8     DBMS_OUTPUT.PUT_LINE('   [검증] 급여 확인 완료');
+  9  END trg_emp_br_validate;
+ 10  /
+
+Trigger TRG_EMP_BR_VALIDATE compiled
+
+SQL> CREATE OR REPLACE TRIGGER trg_emp_br_default
+  2     BEFORE INSERT ON employees
+  3     FOR EACH ROW
+  4     FOLLOWS trg_emp_br_validate        -- 검증 트리거 이후에 실행
+  5  BEGIN
+  6     :NEW.email := UPPER(:NEW.email);
+  7     DBMS_OUTPUT.PUT_LINE('   [보정] 이메일 대문자 변환');
+  8  END trg_emp_br_default;
+  9  /
+
+Trigger TRG_EMP_BR_DEFAULT compiled
+
+SQL> INSERT INTO employees(employee_id, last_name, email, hire_date,
+  2                        job_id, salary, department_id)
+  3  VALUES (910, 'Jang', 'jjang', SYSDATE, 'IT_PROG', 5100, 60);
+   [검증] 급여 확인 완료
+   [보정] 이메일 대문자 변환
+
+1 row created.
+
+-- 확인) FOLLOWS 로 지정한 순서대로 검증이 먼저, 보정이 나중에 실행되었다.
+--       FOLLOWS 가 없으면 순서가 정의되지 않아 실행할 때마다 달라질 수 있다.
+
+-- (오류 상황) 존재하지 않는 트리거를 FOLLOWS 대상으로 지정하면?
+SQL> CREATE OR REPLACE TRIGGER trg_emp_br_x
+  2     BEFORE INSERT ON employees
+  3     FOR EACH ROW
+  4     FOLLOWS trg_emp_br_valid          -- 이름 오타
+  5  BEGIN
+  6     NULL;
+  7  END;
+  8  /
+   FOLLOWS trg_emp_br_valid
+           *
+ERROR at line 4:
+ORA-25021: cannot reference a trigger of a different table
+
+-- 원인) 오라클은 지정한 이름의 트리거를 같은 테이블에서 찾지 못했다.
+--       존재하지 않는 이름이므로 참조가 불가능하다는 오류로 보고한다.
+-- 조치) USER_TRIGGERS 에서 정확한 이름을 확인하고 다시 작성한다.
+
+SQL> SELECT trigger_name FROM user_triggers
+  2   WHERE table_name = 'EMPLOYEES' AND trigger_name LIKE 'TRG_EMP_BR%';
+
+TRIGGER_NAME
+------------------------------
+TRG_EMP_BR_DEFAULT
+TRG_EMP_BR_VALIDATE
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+
+--------------------------------------------------------------------------------
+[4] (오류 상황) 트리거 이름 오타로 ALTER 를 실행한다 — ORA-04080
+--------------------------------------------------------------------------------
+
+SQL> ALTER TRIGGER trg_emp_audit DISABLE;
+ALTER TRIGGER trg_emp_audit DISABLE
+*
+ERROR at line 1:
+ORA-04080: trigger 'TRG_EMP_AUDIT' does not exist
+
+-- 원인) 실제 이름은 TRG_EMP_AR_SALARY 다. 스크립트에 적은 이름이 틀렸다.
+-- 조치) USER_TRIGGERS 에서 정확한 이름을 확인한 뒤 다시 실행한다.
+
+SQL> SELECT trigger_name FROM user_triggers
+  2   WHERE table_name = 'EMPLOYEES' AND trigger_name LIKE '%AUDIT%'
+  3      OR trigger_name LIKE '%SALARY%';
+
+TRIGGER_NAME
+------------------------------
+TRG_EMP_AR_SALARY
+
+SQL> ALTER TRIGGER trg_emp_ar_salary DISABLE;
+
+Trigger altered.
+
+SQL> SELECT trigger_name, status FROM user_triggers
+  2   WHERE trigger_name = 'TRG_EMP_AR_SALARY';
+
+TRIGGER_NAME           STATUS
+---------------------- --------
+TRG_EMP_AR_SALARY      DISABLED
+
+
+--------------------------------------------------------------------------------
+[5] 감사 트리거를 꺼 둔 채 작업하면 어떻게 되는가
+--------------------------------------------------------------------------------
+
+SQL> SELECT COUNT(*) AS audit_rows FROM emp_audit_detail;
+
+AUDIT_ROWS
+----------
+         0
+
+SQL> UPDATE employees SET salary = salary * 1.05 WHERE department_id = 60;
+1. BEFORE 문장
+   2. BEFORE 행 - 사번 103
+   3. AFTER 행  - 사번 103
+   2. BEFORE 행 - 사번 104
+   3. AFTER 행  - 사번 104
+   2. BEFORE 행 - 사번 105
+   3. AFTER 행  - 사번 105
+   2. BEFORE 행 - 사번 106
+   3. AFTER 행  - 사번 106
+   2. BEFORE 행 - 사번 107
+   3. AFTER 행  - 사번 107
+4. AFTER 문장
+
+5 rows updated.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> SELECT COUNT(*) AS audit_rows FROM emp_audit_detail;
+
+AUDIT_ROWS
+----------
+         0
+
+-- 확인) 급여가 5% 올랐지만 감사 이력은 한 줄도 남지 않았다.
+--       트리거가 DISABLED 였기 때문이다. 커밋까지 끝났으므로 되돌릴 수도 없다.
+--       이것이 트리거를 끄고 다시 켜지 않았을 때 벌어지는 전형적인 사고다.
+
+-- 감사 트리거를 다시 켠다.
+SQL> ALTER TRIGGER trg_emp_ar_salary ENABLE;
+
+Trigger altered.
+
+SQL> UPDATE employees SET salary = salary * 1.02 WHERE department_id = 60;
+1. BEFORE 문장
+   2. BEFORE 행 - 사번 103
+   3. AFTER 행  - 사번 103
+   2. BEFORE 행 - 사번 104
+   3. AFTER 행  - 사번 104
+   2. BEFORE 행 - 사번 105
+   3. AFTER 행  - 사번 105
+   2. BEFORE 행 - 사번 106
+   3. AFTER 행  - 사번 106
+   2. BEFORE 행 - 사번 107
+   3. AFTER 행  - 사번 107
+4. AFTER 문장
+
+5 rows updated.
+
+SQL> SELECT COUNT(*) AS audit_rows FROM emp_audit_detail;
+
+AUDIT_ROWS
+----------
+         5
+
+SQL> ROLLBACK;
+
+Rollback complete.
+
+
+--------------------------------------------------------------------------------
+[6] 안전한 작업 패턴 — 실패해도 반드시 다시 켜지도록 감싼다
+--------------------------------------------------------------------------------
+
+-- 대량 적재 작업을 흉내 내되, 실패해도 트리거가 켜지도록 익명 블록으로 감싼다.
+SQL> DECLARE
+  2     PROCEDURE set_trg(p_name IN VARCHAR2, p_state IN VARCHAR2) IS
+  3     BEGIN
+  4        EXECUTE IMMEDIATE 'ALTER TRIGGER ' || p_name || ' ' || p_state;
+  5     END set_trg;
+  6  BEGIN
+  7     set_trg('trg_emp_ar_salary', 'DISABLE');
+  8     DBMS_OUTPUT.PUT_LINE('트리거 비활성화, 적재 시작');
+  9
+ 10     BEGIN
+ 11        -- 여기서 일부러 오류를 낸다(적재 중 실패 상황 재현)
+ 12        UPDATE employees SET salary = 'ABC' WHERE department_id = 60;
+ 13     EXCEPTION
+ 14        WHEN OTHERS THEN
+ 15           DBMS_OUTPUT.PUT_LINE('적재 실패 : ' || SQLERRM);
+ 16     END;
+ 17
+ 18     set_trg('trg_emp_ar_salary', 'ENABLE');
+ 19     DBMS_OUTPUT.PUT_LINE('트리거 재활성화 완료');
+ 20  EXCEPTION
+ 21     WHEN OTHERS THEN
+ 22        set_trg('trg_emp_ar_salary', 'ENABLE');   -- 어떤 경우에도 다시 켠다
+ 23        RAISE;
+ 24  END;
+ 25  /
+트리거 비활성화, 적재 시작
+적재 실패 : ORA-01722: invalid number
+트리거 재활성화 완료
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT trigger_name, status FROM user_triggers
+  2   WHERE trigger_name = 'TRG_EMP_AR_SALARY';
+
+TRIGGER_NAME           STATUS
+---------------------- --------
+TRG_EMP_AR_SALARY      ENABLED
+
+-- 확인) 적재가 실패했는데도 트리거는 정상적으로 다시 켜졌다.
+
+
+--------------------------------------------------------------------------------
+[7] 테이블 단위 일괄 처리와 운영 점검 쿼리
+--------------------------------------------------------------------------------
+
+SQL> ALTER TABLE employees DISABLE ALL TRIGGERS;
+
+Table altered.
+
+SQL> SELECT trigger_name, status FROM user_triggers
+  2   WHERE table_name = 'EMPLOYEES' ORDER BY 1;
+
+TRIGGER_NAME           STATUS
+---------------------- --------
+TRG_EMP_AR_SALARY      DISABLED
+TRG_EMP_BIU_NORMALIZE  DISABLED
+TRG_EMP_BR_DEFAULT     DISABLED
+TRG_EMP_BR_VALIDATE    DISABLED
+TRG_EMP_SECURE         DISABLED
+TRG_ORD_AR             DISABLED
+TRG_ORD_AS             DISABLED
+TRG_ORD_BR             DISABLED
+TRG_ORD_BS             DISABLED
+
+9 rows selected.
+
+SQL> ALTER TABLE employees ENABLE ALL TRIGGERS;
+
+Table altered.
+
+-- 운영에서 매일 돌려야 할 점검 쿼리 1 : 꺼져 있는 트리거
+SQL> SELECT trigger_name, table_name FROM user_triggers
+  2   WHERE status = 'DISABLED' ORDER BY table_name, trigger_name;
+
+no rows selected
+
+-- 운영에서 매일 돌려야 할 점검 쿼리 2 : 컴파일 오류가 있는 트리거
+SQL> SELECT object_name, status FROM user_objects
+  2   WHERE object_type = 'TRIGGER' AND status = 'INVALID';
+
+no rows selected
+
+-- 처음부터 꺼진 상태로 트리거를 만드는 방법도 확인한다.
+SQL> CREATE OR REPLACE TRIGGER trg_emp_future
+  2     BEFORE INSERT ON employees
+  3     FOR EACH ROW
+  4     DISABLE
+  5  BEGIN
+  6     NULL;
+  7  END trg_emp_future;
+  8  /
+
+Trigger TRG_EMP_FUTURE compiled
+
+SQL> SELECT trigger_name, status FROM user_triggers
+  2   WHERE trigger_name = 'TRG_EMP_FUTURE';
+
+TRIGGER_NAME           STATUS
+---------------------- --------
+TRG_EMP_FUTURE         DISABLED
+
+-- 아직 검증되지 않은 트리거를 미리 배포해 두고 나중에 켜는 용도로 유용하다.
+
+
+--------------------------------------------------------------------------------
+[8] 뒷정리
+--------------------------------------------------------------------------------
+
+SQL> DROP TRIGGER trg_ord_bs;
+SQL> DROP TRIGGER trg_ord_br;
+SQL> DROP TRIGGER trg_ord_ar;
+SQL> DROP TRIGGER trg_ord_as;
+SQL> DROP TRIGGER trg_emp_br_validate;
+SQL> DROP TRIGGER trg_emp_br_default;
+SQL> DROP TRIGGER trg_emp_future;
+SQL> DROP TRIGGER trg_emp_secure;
+SQL> DROP TRIGGER trg_emp_ar_salary;
+SQL> DROP TRIGGER trg_emp_biu_normalize;
+
+Trigger dropped.
+
+SQL> DROP TRIGGER trg_emp_dept_v_iou;
+
+Trigger dropped.
+
+SQL> DROP VIEW emp_dept_v;
+
+View dropped.
+
+-- 실습으로 바뀐 급여를 원래 값으로 되돌린다.
+SQL> UPDATE employees SET salary = 9000 WHERE employee_id = 103;
+SQL> UPDATE employees SET salary = 6000 WHERE employee_id = 104;
+SQL> UPDATE employees SET salary = 4800 WHERE employee_id IN (105, 106);
+SQL> UPDATE employees SET salary = 4200 WHERE employee_id = 107;
+SQL> DELETE FROM employees WHERE employee_id >= 900;
+
+1 row deleted.
+
+SQL> DROP TABLE emp_audit_detail PURGE;
+SQL> DROP TABLE emp_stmt_log PURGE;
+
+Table dropped.
+
+SQL> DROP PACKAGE emp_pkg;
+SQL> DROP PACKAGE sal_pkg;
+SQL> DROP PACKAGE hr_pkg;
+SQL> DROP PROCEDURE call_emp_pkg;
+
+Procedure dropped.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> SELECT COUNT(*) AS trg_cnt FROM user_triggers;
+
+   TRG_CNT
+----------
+         0
+
+
+================================================================================
+ 정리
+--------------------------------------------------------------------------------
+ 1. 실행 순서는 BEFORE 문장 1회 → (BEFORE 행 → 변경 → AFTER 행) 반복 →
+    AFTER 문장 1회다. 변경된 행이 없으면 문장 트리거만 발화한다.
+ 2. 같은 시점·같은 이벤트의 트리거는 순서가 정의되지 않으므로 FOLLOWS 또는
+    PRECEDES 로 명시해야 한다.
+ 3. ALTER TRIGGER ... DISABLE / ENABLE 로 개별 트리거를,
+    ALTER TABLE ... DISABLE ALL TRIGGERS 로 테이블 단위 일괄 처리를 한다.
+ 4. 이름을 잘못 적으면 ORA-04080 이 발생한다. USER_TRIGGERS 로 확인한다.
+ 5. 트리거를 끈 채 작업하고 다시 켜지 않으면 감사 이력이 누락되고 되돌릴 수
+    없다. 작업을 익명 블록으로 감싸 EXCEPTION 절에서도 반드시 ENABLE 하고,
+    STATUS = 'DISABLED' 인 트리거를 매일 점검해야 한다.
+ 6. CREATE TRIGGER ... DISABLE 로 처음부터 꺼진 트리거를 만들 수 있다.
+================================================================================
+
+SQL> EXIT
+Disconnected from Oracle Database 19c Enterprise Edition Release 19.0.0.0.0
