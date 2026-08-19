@@ -1,0 +1,297 @@
+================================================================================
+ 실습 6-6 : 데이터파일과 컨트롤파일 동시 손상
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 데이터파일 하나와 컨트롤파일 전체가 동시에 유실되었다.
+-- 컨트롤파일을 먼저 세워야 데이터파일 상태를 판정할 수 있다.
+-- 순서를 뒤집었을 때 무슨 일이 생기는지 먼저 확인한 뒤 올바른 순서로 처리한다.
+-- 리두 유무에 따라 부분 복원과 전체 복원으로 갈린다.
+-- 복구 유형 : 완전 복구(RESETLOGS 강제)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 6-5 직후의 백업본(/home/oracle/backup/ch06)이 있어야 한다.
+-- trace 백업이 현재 구조를 반영하고 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ ls /home/oracle/backup/ch06/ | wc -l
+14
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_66.sql';
+Database altered.
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2386020
+
+-- 백업본이 담고 있는 SCN이다.
+
+SYS@orcl> SELECT file#, name FROM v$datafile WHERE file# = 7;
+
+     FILE# NAME
+---------- ------------------------------------------------
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf
+
+SYS@orcl> CREATE TABLE hr.emp66(id NUMBER) TABLESPACE users;
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp66 VALUES (100);
+SYS@orcl> INSERT INTO hr.emp66 VALUES (200);
+SYS@orcl> COMMIT;
+Commit complete.
+
+-- 백업 이후 커밋한 데이터다. 완전 복구되면 살아 있어야 한다.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2385641
+
+-- 백업본 SCN(2386020) >= 최소 리두 SCN(2385641) → 리두 생존
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 데이터파일과 컨트롤파일 동시 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/users01.dbf
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/
+sysaux01.dbf  system01.dbf  temp01.dbf  undotbs01.dbf  users02.dbf
+redo01.log    redo03.log    redo04.log
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+ORA-00205: error in identifying control file, check alert log for more info
+
+-- 컨트롤파일 오류만 보인다.
+-- 데이터파일이 없다는 사실은 아직 드러나지 않는다.
+
+SYS@orcl> SELECT * FROM v$recover_file;
+SELECT * FROM v$recover_file
+              *
+ERROR at line 1:
+ORA-01507: database not mounted
+
+-- 진단 뷰를 쓸 수 없다. 어느 데이터파일이 문제인지 알 방법이 없다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- 판정
+--   0단계 : 컨트롤파일부터 세운다. MOUNT가 되어야 나머지를 판정할 수 있다.
+--   ① 손상 파일 : MOUNT 후 v$recover_file 로 확인
+--   ② 백업본 보유 : /home/oracle/backup/ch06 확인
+--   ③ 리두 생존 : v$log의 MIN(first_change#) 와 비교
+--   ④ 떼어 낼 수 있는가 : 대상이 USERS이므로 가능하나 필요 없을 것으로 예상
+
+SYS@orcl> !ls /home/oracle/backup/ch06/*.dbf
+/home/oracle/backup/ch06/sysaux01.dbf
+/home/oracle/backup/ch06/system01.dbf
+/home/oracle/backup/ch06/undotbs01.dbf
+/home/oracle/backup/ch06/users01.dbf
+/home/oracle/backup/ch06/users02.dbf
+
+-- 백업본에 users01.dbf 가 있다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_66
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.log /home/oracle/before_recover_66/
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.log /home/oracle/before_recover_66/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 순서를 뒤집어 데이터파일부터 복원해 본다.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch06/users01.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> SELECT file#, error FROM v$recover_file;
+SELECT file#, error FROM v$recover_file
+                         *
+ERROR at line 1:
+ORA-01507: database not mounted
+
+SYS@orcl> RECOVER DATAFILE 7;
+ORA-01507: database not mounted
+
+-- << 원인 파악 >>
+-- 복원은 했지만 그것이 맞는 판단이었는지 확인할 방법이 없다.
+-- 복구 명령도 실행되지 않는다. MOUNT 상태가 아니기 때문이다.
+-- 진단 뷰와 복구 명령은 모두 컨트롤파일을 읽어야 동작한다.
+-- 따라서 데이터파일이 아니라 컨트롤파일이 언제나 먼저다.
+
+-- << 수정 >>
+-- 컨트롤파일부터 세운다. 정상 종료였으므로 NORESETLOGS 형식을 쓸 수 있다.
+
+SYS@orcl> !grep -n 'CLOSE NORMAL' \
+        /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -1
+18904:Completed: ALTER DATABASE CLOSE NORMAL
+
+SYS@orcl> @/home/oracle/backup/cf_66_noresetlogs.sql
+
+Control file created.
+
+SYS@orcl> SELECT name, open_mode FROM v$database;
+
+NAME      OPEN_MODE
+--------- ----------
+ORCL      MOUNTED
+
+-- 이제 진단이 가능하다.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         7                          2386020
+
+-- 복원한 users01.dbf 가 백업 시점 상태라 복구가 필요하다.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2385641
+
+-- 백업본 SCN(2386020) >= 최소 리두 SCN(2385641) → 리두 생존, 완전 복구 가능
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01113: file 7 needs media recovery
+ORA-01110: data file 7: '/u01/app/oracle/oradata/ORCL/users01.dbf'
+
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE;
+ORA-00279: change 2386020 generated at 05/10/2025 17:12:08 needed for thread 1
+ORA-00289: suggestion : /u01/app/oracle/product/19.3.0/dbhome_1/dbs/arch1_1_1200525254.dbf
+ORA-00280: change 2386020 for thread 1 is in sequence #1
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+/u01/app/oracle/oradata/ORCL/redo01.log
+Log applied.
+
+ORA-00279: change 2386480 generated at 05/10/2025 17:14:31 needed for thread 1
+ORA-00280: change 2386480 for thread 1 is in sequence #2
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+CANCEL
+Media recovery cancelled.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT * FROM hr.emp66 ORDER BY id;
+
+        ID
+----------
+       100
+       200
+
+-- 백업 이후 커밋한 데이터가 살아 있다. 완전 복구가 성공했다.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile ORDER BY file#;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf     SYSTEM
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf     ONLINE
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf    ONLINE
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf      ONLINE
+         8 /u01/app/oracle/oradata/ORCL/users02.dbf      ONLINE
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation;
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           1                 1 PARENT
+           2           2382140 PARENT
+           3           2385641 PARENT
+           4           2386721 CURRENT
+
+-- NORESETLOGS 형식으로 컨트롤파일을 만들었어도 RESETLOGS가 강제되었다.
+-- USING BACKUP CONTROLFILE 로 복구했기 때문이다.
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u01/app/oracle/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM (SELECT object_name FROM dba_objects
+  2    UNION SELECT object_name FROM dba_objects);
+
+  COUNT(*)
+----------
+     73210
+
+-- 인카네이션이 달라졌으므로 전체 백업을 새로 받는다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch06 && mkdir -p /home/oracle/backup/ch06
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /u01/app/oracle/oradata/ORCL/*.ctl \
+                 /u01/app/oracle/oradata/ORCL/*.log /home/oracle/backup/ch06/
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.log /home/oracle/backup/ch06/
+SYS@orcl> !rm -f /home/oracle/backup/ch06/temp01.dbf
+SYS@orcl> STARTUP
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_after_66.sql';
+Database altered.
+
+-- 실무 포인트
+-- 1) 컨트롤파일이 언제나 먼저다.
+--    진단 뷰와 복구 명령이 모두 MOUNT 이후에만 동작하기 때문이다.
+--    순서를 뒤집으면 복원이 맞았는지 확인할 방법조차 없다.
+--
+-- 2) 컨트롤파일을 세운 뒤에는 4장의 네 단계 판정을 그대로 적용한다.
+--    손상 파일 확인 → 백업본 보유 → 리두 생존 → 떼어 낼 수 있는가 순이다.
+--    장애 유형이 달라져도 판정 흐름은 하나다.
+--
+-- 3) NORESETLOGS 형식으로 만들었어도 RESETLOGS가 강제될 수 있다.
+--    USING BACKUP CONTROLFILE 로 복구하면 그 자체가 RESETLOGS를 요구한다.
+--    형식 선택과 최종 오픈 방식은 별개의 문제다.
+--
+-- 4) 리두가 없었다면 이 실습은 전체 복원으로 끝났을 것이다.
+--    복원한 파일과 나머지 파일의 SCN 간격을 메울 수단이 없기 때문이다.
+--    판정 3단계에서 리두 부족이 확인되면 그 시점에 전체 복원으로 방향을 정한다.
+--
+-- 5) 복구 시도 전 리두 로그를 별도 위치로 복사해 둔다.
+--    이 실습에서도 before_recover_66 에 사본을 만들어 두었다.
+--    시도가 실패해도 원상 복귀할 수 있어야 여러 방법을 시험할 수 있다.
+--
+-- 6) 마무리는 TEMP 추가와 전체 백업이다.
+--    데이터베이스가 열렸다는 사실만으로 복구가 끝났다고 보고하지 않는다.
+
+SYS@orcl> EXIT

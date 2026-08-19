@@ -1,0 +1,307 @@
+================================================================================
+ 실습 18-4 : Flashback Transaction Query와 UNDO_SQL
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 실습 18-3에서 특정한 트랜잭션의 전체 영향을 조회한다.
+-- flashback_transaction_query 뷰를 사용한다.
+-- UNDO_SQL로 그 트랜잭션만 정밀하게 되돌린다.
+-- 보충 로깅과 권한 요건을 확인한다.
+-- 복구 유형 : 트랜잭션 단위 되돌리기, 무중단
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 18-3에서 xid 09001C00C8010000 을 특정했다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT supplemental_log_data_min FROM v$database;
+
+SUPPLEME
+--------
+NO
+
+-- 보충 로깅이 꺼져 있다.
+
+SYS@orcl> SELECT salary FROM hr.emp180 WHERE employee_id = 100;
+
+    SALARY
+----------
+     26400
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT employee_id, salary FROM hr.emp180
+  2  WHERE  department_id IN (60, 90) ORDER BY employee_id;
+
+EMPLOYEE_ID     SALARY
+----------- ----------
+        100      26400
+        101      25500
+        102      25500
+        103      13500
+        104       9000
+        105       7200
+        106       7200
+        107       6300
+
+-- 8건 중 100번은 이후에 다시 수정되었다.
+-- 나머지 7건은 잘못된 값 그대로다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : Transaction Query 시도
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT xid, operation, table_name, undo_sql
+  2  FROM   flashback_transaction_query
+  3  WHERE  xid = HEXTORAW('09001C00C8010000');
+
+SELECT xid, operation, table_name, undo_sql
+                                   *
+ERROR at line 1:
+ORA-01031: insufficient privileges
+
+-- << 원인 파악 >>
+-- flashback_transaction_query 조회에는 SELECT ANY TRANSACTION 권한이 필요하다.
+-- SYS는 기본적으로 가지고 있으나 일반 사용자는 별도 부여가 필요하다.
+-- 이 실습에서는 hr 사용자로 접속한 상태였다.
+
+SYS@orcl> SHOW USER
+
+USER is "HR"
+
+-- << 수정 >>
+
+SYS@orcl> CONNECT / AS SYSDBA
+
+Connected.
+
+SYS@orcl> SELECT xid, operation, table_name, table_owner
+  2  FROM   flashback_transaction_query
+  3  WHERE  xid = HEXTORAW('09001C00C8010000');
+
+XID              OPERATION TABLE_NAME TABLE_OWNER
+---------------- --------- ---------- -----------
+09001C00C8010000 UPDATE    EMP180     HR
+09001C00C8010000 UPDATE    EMP180     HR
+09001C00C8010000 UPDATE    EMP180     HR
+09001C00C8010000 UPDATE    EMP180     HR
+09001C00C8010000 UPDATE    EMP180     HR
+09001C00C8010000 UPDATE    EMP180     HR
+09001C00C8010000 UPDATE    EMP180     HR
+09001C00C8010000 UPDATE    EMP180     HR
+
+8 rows selected.
+
+-- 8건이 나온다. Version Query로 확인한 것과 일치한다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : UNDO_SQL 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL undo_sql FOR a100
+
+SYS@orcl> SELECT undo_sql FROM flashback_transaction_query
+  2  WHERE  xid = HEXTORAW('09001C00C8010000') AND undo_sql IS NOT NULL;
+
+UNDO_SQL
+--------------------------------------------------------------------------
+update "HR"."EMP180" set "SALARY" = '24000' where ROWID = 'AAAS3lAAMAAAACHAAA';
+update "HR"."EMP180" set "SALARY" = '17000' where ROWID = 'AAAS3lAAMAAAACHAAB';
+update "HR"."EMP180" set "SALARY" = '17000' where ROWID = 'AAAS3lAAMAAAACHAAC';
+update "HR"."EMP180" set "SALARY" = '9000'  where ROWID = 'AAAS3lAAMAAAACHAAD';
+update "HR"."EMP180" set "SALARY" = '6000'  where ROWID = 'AAAS3lAAMAAAACHAAE';
+update "HR"."EMP180" set "SALARY" = '4800'  where ROWID = 'AAAS3lAAMAAAACHAAF';
+update "HR"."EMP180" set "SALARY" = '4800'  where ROWID = 'AAAS3lAAMAAAACHAAG';
+update "HR"."EMP180" set "SALARY" = '4200'  where ROWID = 'AAAS3lAAMAAAACHAAH';
+
+8 rows selected.
+
+-- ROWID 기준으로 되돌리는 문이 만들어졌다.
+-- 보충 로깅이 없으면 이 문이 부정확할 수 있다.
+
+SYS@orcl> SELECT start_scn, commit_scn,
+  2         TO_CHAR(start_timestamp,'HH24:MI:SS') AS start_t,
+  3         TO_CHAR(commit_timestamp,'HH24:MI:SS') AS commit_t,
+  4         logon_user
+  5  FROM   flashback_transaction_query
+  6  WHERE  xid = HEXTORAW('09001C00C8010000') AND ROWNUM = 1;
+
+ START_SCN COMMIT_SCN START_T  COMMIT_T LOGON_USER
+---------- ---------- -------- -------- ----------
+   2813880    2813900 10:14:20 10:14:22 SYS
+
+-- 누가 언제 수행했는지도 알 수 있다.
+
+--------------------------------------------------------------------------------
+[6] 진단 : 되돌릴 범위 판단
+--------------------------------------------------------------------------------
+-- 100번은 이후에 다시 수정되었다는 점에 주의한다.
+
+SYS@orcl> SELECT versions_startscn, versions_xid, salary FROM hr.emp180
+  2  VERSIONS BETWEEN SCN 2813200 AND 2814500
+  3  WHERE  employee_id = 100 ORDER BY versions_startscn;
+
+VERSIONS_STARTSCN VERSIONS_XID         SALARY
+----------------- ---------------- ----------
+                                        24000
+          2813400 08001A00C1020000      25000
+          2813900 09001C00C8010000      37500
+          2814400 0A001200D3020000      26400
+
+-- 100번은 그 뒤에 26400으로 다시 바뀌었다.
+-- UNDO_SQL을 그대로 실행하면 24000이 되어 마지막 정상 변경이 사라진다.
+
+-- 판정
+--   ① 잘못된 트랜잭션이 8건을 수정했다
+--   ② 그중 100번은 이후 정상 변경이 있었다
+--   ③ 100번을 제외한 7건만 되돌리는 것이 맞다
+--   → UNDO_SQL 중 해당 문을 골라 실행한다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 먼저 전체를 그대로 실행해 본다.
+
+SYS@orcl> SPOOL /tmp/undo_all.sql
+SYS@orcl> SELECT undo_sql FROM flashback_transaction_query
+  2  WHERE  xid = HEXTORAW('09001C00C8010000') AND undo_sql IS NOT NULL;
+SYS@orcl> SPOOL OFF
+
+SYS@orcl> @/tmp/undo_all.sql
+
+1 row updated.
+1 row updated.
+...
+
+SYS@orcl> SELECT salary FROM hr.emp180 WHERE employee_id = 100;
+
+    SALARY
+----------
+     24000
+
+-- << 원인 파악 >>
+-- 100번이 24000이 되었다. 마지막 정상 변경(26400)이 사라졌다.
+-- UNDO_SQL은 그 트랜잭션 시점의 이전 값으로 되돌리므로
+-- 이후의 정상 변경까지 함께 없앤다.
+-- 이후 변경이 있었던 행은 제외해야 한다.
+
+-- << 수정 >>
+
+SYS@orcl> ROLLBACK;
+
+Rollback complete.
+
+SYS@orcl> SELECT salary FROM hr.emp180 WHERE employee_id = 100;
+
+    SALARY
+----------
+     26400
+
+-- 커밋하지 않았으므로 되돌릴 수 있었다.
+-- UNDO_SQL 실행 후 확인 전에는 COMMIT하지 않는 것이 중요하다.
+
+-- 100번을 제외하고 실행한다.
+
+SYS@orcl> SPOOL /tmp/undo_sel.sql
+SYS@orcl> SELECT undo_sql FROM flashback_transaction_query q
+  2  WHERE  q.xid = HEXTORAW('09001C00C8010000')
+  3  AND    q.undo_sql IS NOT NULL
+  4  AND    q.row_id NOT IN (SELECT ROWIDTOCHAR(ROWID) FROM hr.emp180
+  5                          WHERE employee_id = 100);
+SYS@orcl> SPOOL OFF
+
+SYS@orcl> @/tmp/undo_sel.sql
+
+1 row updated.
+1 row updated.
+1 row updated.
+1 row updated.
+1 row updated.
+1 row updated.
+1 row updated.
+
+SYS@orcl> SELECT employee_id, salary FROM hr.emp180
+  2  WHERE  department_id IN (60, 90) ORDER BY employee_id;
+
+EMPLOYEE_ID     SALARY
+----------- ----------
+        100      26400
+        101      17000
+        102      17000
+        103       9000
+        104       6000
+        105       4800
+        106       4800
+        107       4200
+
+-- 7건이 원래 값으로 돌아왔고 100번은 정상 변경이 유지되었다.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+-- 보충 로깅을 켜고 차이를 확인한다.
+
+SYS@orcl> ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
+
+Database altered.
+
+SYS@orcl> SELECT supplemental_log_data_min FROM v$database;
+
+SUPPLEME
+--------
+YES
+
+SYS@orcl> UPDATE hr.emp180 SET salary = salary + 100 WHERE employee_id = 103;
+SYS@orcl> COMMIT;
+
+SYS@orcl> SELECT xid, undo_sql FROM flashback_transaction_query
+  2  WHERE  table_name = 'EMP180' AND operation = 'UPDATE'
+  3  AND    commit_timestamp > SYSTIMESTAMP - INTERVAL '5' MINUTE;
+
+XID              UNDO_SQL
+---------------- --------------------------------------------------------
+0B001500E1030000 update "HR"."EMP180" set "SALARY" = '9000' where
+                  ROWID = 'AAAS3lAAMAAAACHAAD';
+
+-- 보충 로깅이 켜져 있으면 UNDO_SQL이 더 안정적으로 만들어진다.
+
+SYS@orcl> SELECT COUNT(*) FROM flashback_transaction_query
+  2  WHERE  commit_timestamp > SYSTIMESTAMP - INTERVAL '1' HOUR;
+
+  COUNT(*)
+----------
+        24
+
+-- 실무 포인트
+-- 1) flashback_transaction_query 조회에는 SELECT ANY TRANSACTION 권한이 필요하다.
+--    일반 사용자에게는 별도 부여해야 하며 없으면 ORA-01031이 나온다.
+--
+-- 2) UNDO_SQL은 그 트랜잭션 시점의 이전 값으로 되돌린다.
+--    이후에 정상 변경이 있었던 행은 그 변경까지 사라진다.
+--    Version Query로 이후 변경 여부를 확인한 뒤 대상을 골라야 한다.
+--
+-- 3) UNDO_SQL 실행 후 확인 전에는 COMMIT하지 않는다.
+--    결과가 기대와 다르면 ROLLBACK으로 되돌릴 수 있다.
+--    이 실습에서도 그 덕분에 잘못된 실행을 취소할 수 있었다.
+--
+-- 4) row_id 컬럼으로 대상을 걸러낼 수 있다.
+--    특정 행만 제외하거나 포함하는 조건을 붙여 정밀하게 고른다.
+--
+-- 5) 보충 로깅을 켜면 UNDO_SQL이 더 안정적으로 만들어진다.
+--    Transaction Query를 쓸 계획이라면 미리 켜 두는 편이 좋다.
+--    다만 리두량이 늘어나므로 영향을 확인한다.
+--
+-- 6) 이 방법의 가치는 정밀함이다.
+--    전체 복구나 테이블 되돌리기 없이 문제가 된 변경만 취소할 수 있다.
+--    영향 범위가 좁을수록 업무 중단도 없다.

@@ -1,0 +1,304 @@
+================================================================================
+ 실습 11-6 : 정상 종료 후 컨트롤파일 손상 — trace 재생성
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 20분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 정상 종료 후 컨트롤파일이 전손되었고 trace 백업이 있다.
+-- NORESETLOGS 형식으로 재생성하면 복구 없이 열린다.
+-- 인카네이션이 올라가지 않아 기존 백업본이 계속 유효하다.
+-- 실습 11-5의 Binary 경로와 결과를 비교한다.
+-- 복구 유형 : 복구 불필요(NORESETLOGS 재생성)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 11-5를 마친 상태에서 이어서 진행한다.
+-- trace 백업이 현재 구조를 반영하고 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_116.sql';
+Database altered.
+
+SYS@orcl> !grep -n 'CREATE CONTROLFILE' /home/oracle/backup/cf_116.sql
+34:CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS ARCHIVELOG
+82:CREATE CONTROLFILE REUSE DATABASE "ORCL" RESETLOGS ARCHIVELOG
+
+-- ARCHIVELOG 모드가 문에 반영되어 있다.
+
+SYS@orcl> !sed -n '34,44p' /home/oracle/backup/cf_116.sql
+CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS ARCHIVELOG
+    MAXLOGFILES 16
+    MAXLOGMEMBERS 3
+    MAXDATAFILES 100
+    MAXINSTANCES 8
+    MAXLOGHISTORY 292
+LOGFILE
+  GROUP 1 (
+    '/u01/app/oracle/oradata/ORCL/redo01.log',
+    '/u02/oradata/ORCL/redo01b.log'
+  ) SIZE 200M BLOCKSIZE 512,
+
+SYS@orcl> SELECT incarnation#, resetlogs_change# FROM v$database_incarnation
+  2  WHERE  status = 'CURRENT';
+
+INCARNATION# RESETLOGS_CHANGE#
+------------ -----------------
+          11           2433420
+
+SYS@orcl> INSERT INTO hr.emp115 VALUES (3, 'before trace test');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 정상 종료 후 컨트롤파일 전손
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+STARTED
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> !grep -n 'CLOSE NORMAL' \
+        /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -1
+21040:Completed: ALTER DATABASE CLOSE NORMAL
+
+-- 정상 종료였다.
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log
+/u01/app/oracle/oradata/ORCL/redo01.log
+/u01/app/oracle/oradata/ORCL/redo03.log
+/u01/app/oracle/oradata/ORCL/redo04.log
+/u02/oradata/ORCL/redo01b.log
+/u02/oradata/ORCL/redo03b.log
+/u02/oradata/ORCL/redo04b.log
+
+-- 리두 로그 여섯 멤버가 모두 있다. NORESETLOGS 형식의 조건이다.
+
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf | grep -v temp | wc -l
+7
+
+SYS@orcl> !sed -n '/NORESETLOGS ARCHIVELOG/,/^;/p' /home/oracle/backup/cf_116.sql \
+        | grep -c 'dbf'
+7
+
+-- 문의 DATAFILE 항목 수와 실제 파일 수가 일치한다.
+
+-- 판정
+--   ① 사본 : 전손
+--   ② 백업 : trace 보유, 구조 일치
+--   ③ 종료 : 정상, 리두 온전
+--   → NORESETLOGS 형식 재생성. 복구도 RESETLOGS도 불필요.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_116
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.log /home/oracle/before_recover_116/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- MOUNT 상태에서 실행해 본다.
+
+SYS@orcl> ALTER DATABASE MOUNT;
+ALTER DATABASE MOUNT
+*
+ERROR at line 1:
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> @/home/oracle/backup/cf_116_noresetlogs.sql
+CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS ARCHIVELOG
+*
+ERROR at line 1:
+ORA-01503: CREATE CONTROLFILE failed
+ORA-01565: error in identifying file '/u02/oradata/ORCL/tbs11.dbf'
+ORA-27037: unable to obtain file status
+
+-- << 원인 파악 >>
+-- ORA-01503 뒤의 ORA-01565가 실제 원인이다.
+-- 나열한 파일 중 tbs11.dbf 를 열 수 없다.
+-- 이전 실습에서 만들었다가 정리한 테이블스페이스의 파일이 문에 남아 있었다.
+-- trace 백업을 그 사이에 다시 받지 않아 문과 현재 구조가 어긋난 것이다.
+-- DATAFILE 절은 실제 파일 목록과 정확히 일치해야 한다.
+
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf
+/u02/oradata/ORCL/hist01.dbf
+/u02/oradata/ORCL/sysaux01.dbf
+/u02/oradata/ORCL/system01.dbf
+/u02/oradata/ORCL/tbs01.dbf
+/u02/oradata/ORCL/tbs02.dbf
+/u02/oradata/ORCL/temp01.dbf
+/u02/oradata/ORCL/undotbs01.dbf
+/u02/oradata/ORCL/users01.dbf
+
+-- tbs11.dbf 가 없다.
+
+-- << 수정 >>
+-- 문에서 그 줄을 제거한다.
+
+SYS@orcl> !sed -i "/tbs11.dbf/d" /home/oracle/backup/cf_116_noresetlogs.sql
+SYS@orcl> !grep -c 'dbf' /home/oracle/backup/cf_116_noresetlogs.sql
+7
+
+-- 마지막 파일 뒤의 쉼표도 확인해 문법을 맞춘다.
+
+SYS@orcl> !tail -6 /home/oracle/backup/cf_116_noresetlogs.sql
+  '/u02/oradata/ORCL/tbs01.dbf',
+  '/u02/oradata/ORCL/tbs02.dbf',
+  '/u02/oradata/ORCL/hist01.dbf'
+CHARACTER SET AL32UTF8
+;
+
+SYS@orcl> @/home/oracle/backup/cf_116_noresetlogs.sql
+
+Control file created.
+
+SYS@orcl> SELECT name, open_mode FROM v$database;
+
+NAME      OPEN_MODE
+--------- ----------
+ORCL      MOUNTED
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2433900 NO
+         3            2433900 NO
+         4            2433900 NO
+         7            2433900 NO
+
+-- 모두 같은 SCN이고 FUZZY가 NO다.
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- 복구 없이 열렸다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT id, memo FROM hr.emp115 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 after cf backup
+         2 in current redo
+         3 before trace test
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  WHERE  status = 'CURRENT';
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+          11           2433420 CURRENT
+
+-- 인카네이션이 그대로다. 실습 11-5와 결정적으로 다른 점이다.
+-- 기존 백업본이 계속 유효하다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         0
+
+-- trace 재생성은 TEMP 정보를 남기지 않는다. Binary 복원과 다르다.
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM (SELECT object_name FROM dba_objects
+  2    UNION SELECT object_name FROM dba_objects);
+
+  COUNT(*)
+----------
+     73260
+
+SYS@orcl> SELECT COUNT(*) FROM v$controlfile;
+
+  COUNT(*)
+----------
+         3
+
+SYS@orcl> SELECT group#, COUNT(*) AS members FROM v$logfile GROUP BY group# ORDER BY group#;
+
+    GROUP#    MEMBERS
+---------- ----------
+         1          2
+         3          2
+         4          2
+
+-- 다중화 구성이 그대로 재현되었다. trace에 적혀 있었기 때문이다.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+-- 현재 구조를 반영한 trace 백업을 다시 받는다.
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_after_116.sql';
+Database altered.
+
+SYS@orcl> !sed -n '/NORESETLOGS ARCHIVELOG/,/^;/p' /home/oracle/backup/cf_after_116.sql \
+        | grep -c 'dbf'
+7
+
+-- 실무 포인트
+-- 1) NORESETLOGS 형식은 인카네이션을 올리지 않는다.
+--    실습 11-5의 Binary 복원은 RESETLOGS가 강제되어 인카네이션이 올라갔다.
+--    같은 장애에서 trace가 있으면 명확히 유리한 선택이다.
+--
+-- 2) 성립 조건은 두 가지다. 정상 종료였고 리두 로그가 온전해야 한다.
+--    alert log의 CLOSE NORMAL 기록과 리두 파일 존재로 확인한다.
+--
+-- 3) trace 백업도 구조 변경 후에는 다시 받아야 한다.
+--    이 실습에서 이미 정리한 테이블스페이스가 문에 남아 ORA-01565가 발생했다.
+--    Binary 백업과 달리 편집으로 해결할 수 있다는 점이 trace의 장점이다.
+--
+-- 4) 실행 전 DATAFILE 절의 항목 수와 실제 파일 수를 대조한다.
+--    이 절차가 있었다면 오류를 만나기 전에 발견했을 것이다.
+--
+-- 5) trace 재생성은 TEMP 정보를 남기지 않는다.
+--    Binary 복원과 달리 ADD TEMPFILE 이 필요하다.
+--    빠뜨리면 큰 정렬에서 ORA-01652가 발생한다.
+--
+-- 6) 다중화 구성은 trace에 적혀 있어 그대로 재현된다.
+--    컨트롤파일 경로와 리두 그룹·멤버가 모두 복원되므로
+--    구성 문서 역할도 겸한다.
+
+SYS@orcl> EXIT

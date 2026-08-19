@@ -1,0 +1,285 @@
+================================================================================
+ 실습 13-7 : RESYNC CATALOG와 Stored Script 등록·실행
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL + RCAT
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 데이터파일을 추가해 구조를 바꾼 뒤 카탈로그 반영 시점을 확인한다.
+-- RESYNC CATALOG로 수동 동기화를 수행한다.
+-- Stored Script를 등록하고 실행한다.
+-- 크론 연계용 셸 스크립트까지 만들어 본다.
+-- 작업 유형 : 운영 관리(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 13-6까지 완료되어 카탈로그가 정상 동작해야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s rcatowner/oracle_4U@rcat <<< \
+> "SELECT COUNT(*) FROM rc_datafile;"
+
+  COUNT(*)
+----------
+         4
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: ORCL (DBID=1200530011)
+connected to recovery catalog database
+
+RMAN> REPORT SCHEMA;
+
+List of Permanent Datafiles
+===========================
+File Size(MB) Tablespace           RB segs Datafile Name
+---- -------- -------------------- ------- ------------------------------
+1    890      SYSTEM               YES     /u02/oradata/ORCL/system01.dbf
+3    550      SYSAUX               NO      /u02/oradata/ORCL/sysaux01.dbf
+4    320      UNDOTBS1             YES     /u02/oradata/ORCL/undotbs01.dbf
+7    10       USERS                NO      /u02/oradata/ORCL/users01.dbf
+
+RMAN> EXIT
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 구조 변경
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> CREATE TABLESPACE tbs13
+  2    DATAFILE '/u02/oradata/ORCL/tbs13_01.dbf' SIZE 20M;
+
+Tablespace created.
+
+SYS@orcl> SELECT file#, name FROM v$datafile ORDER BY file#;
+
+     FILE# NAME
+---------- ------------------------------------------
+         1 /u02/oradata/ORCL/system01.dbf
+         3 /u02/oradata/ORCL/sysaux01.dbf
+         4 /u02/oradata/ORCL/undotbs01.dbf
+         7 /u02/oradata/ORCL/users01.dbf
+         8 /u02/oradata/ORCL/tbs13_01.dbf
+
+SYS@orcl> EXIT
+
+-- 자동 백업이 켜져 있으므로 구조 변경 시 컨트롤파일 자동 백업이 만들어진다.
+
+[oracle@oel7v9r1 ~]$ ls -lt /home/oracle/rmanbk/cf_* | head -2
+-rw-r-----. 1 oracle oinstall 18939904 May 14 14:02 cf_c-1200530011-20250514-02
+-rw-r-----. 1 oracle oinstall 18939904 May 14 11:12 cf_c-1200530011-20250514-00
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 카탈로그 반영 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus -s rcatowner/oracle_4U@rcat <<< \
+> "SELECT COUNT(*) FROM rc_datafile;"
+
+  COUNT(*)
+----------
+         4
+
+-- 아직 4개다. 카탈로그에는 반영되지 않았다.
+-- 백업이나 복구 명령을 수행하지 않았기 때문이다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RESYNC CATALOG;
+
+starting full resync of recovery catalog
+full resync complete
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus -s rcatowner/oracle_4U@rcat <<< \
+> "SELECT file#, tablespace_name FROM rc_datafile ORDER BY file#;"
+
+     FILE# TABLESPACE_NAME
+---------- ------------------------------
+         1 SYSTEM
+         3 SYSAUX
+         4 UNDOTBS1
+         7 USERS
+         8 TBS13
+
+-- 5개가 되었다. 수동 RESYNC로 반영되었다.
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : Stored Script 등록
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> CREATE SCRIPT full_backup COMMENT '전체 백업 + 아카이브 + 정리' {
+  2>   BACKUP AS COMPRESSED BACKUPSET DATABASE
+  3>     FORMAT '/home/oracle/rmanbk/full_%d_%T_%U'
+  4>     TAG 'FULL_DAILY';
+  5>   BACKUP ARCHIVELOG ALL DELETE INPUT;
+  6>   DELETE NOPROMPT OBSOLETE;
+  7> }
+
+created script full_backup
+
+RMAN> LIST SCRIPT NAMES;
+
+List of Stored Scripts in Recovery Catalog
+
+    Script Name
+    Description
+-----------------------------------------------------------------
+    full_backup
+    전체 백업 + 아카이브 + 정리
+
+RMAN> PRINT SCRIPT full_backup;
+
+printing stored script: full_backup
+{
+  BACKUP AS COMPRESSED BACKUPSET DATABASE
+    FORMAT '/home/oracle/rmanbk/full_%d_%T_%U'
+    TAG 'FULL_DAILY';
+  BACKUP ARCHIVELOG ALL DELETE INPUT;
+  DELETE NOPROMPT OBSOLETE;
+}
+
+--------------------------------------------------------------------------------
+[7] 진행 로그 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 스크립트를 RUN 블록 없이 실행해 본다.
+
+RMAN> EXECUTE SCRIPT full_backup;
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-00558: error encountered while parsing input commands
+RMAN-01009: syntax error: found "identifier": expecting one of:
+"allocate, alter, backup, beginline, blockrecover, ..."
+RMAN-01007: at line 1 column 1 file: standard input
+
+-- << 원인 파악 >>
+-- EXECUTE SCRIPT는 RUN 블록 안에서만 쓸 수 있는 명령이다.
+-- 프롬프트에서 직접 실행할 수 있는 명령 목록에 들어 있지 않다.
+
+-- << 수정 >>
+
+RMAN> RUN { EXECUTE SCRIPT full_backup; }
+
+executing script: full_backup
+
+Starting backup at 14-MAY-25
+allocated channel: ORA_DISK_1
+allocated channel: ORA_DISK_2
+channel ORA_DISK_1: starting compressed full datafile backup set
+channel ORA_DISK_2: starting compressed full datafile backup set
+piece handle=/home/oracle/rmanbk/full_ORCL_20250514_18ttq8kf_1_1
+Finished backup at 14-MAY-25
+
+Starting backup at 14-MAY-25
+channel ORA_DISK_1: starting archived log backup set
+channel ORA_DISK_1: deleting archived log(s)
+archived log file name=/u02/arch1/1_5_1190530011.dbf RECID=30
+Finished backup at 14-MAY-25
+
+Starting Control File and SPFILE Autobackup at 14-MAY-25
+Finished Control File and SPFILE Autobackup at 14-MAY-25
+
+RMAN retention policy will be applied to the command
+no obsolete backups found
+
+-- 세 명령이 순서대로 수행되었다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+RMAN> LIST BACKUP SUMMARY;
+
+Key     TY LV S Device Type Completion Time #Pieces Tag
+------- -- -- - ----------- --------------- ------- -----------
+9       B  F  A DISK        14-MAY-25       1       RUN3
+11      B  F  A DISK        14-MAY-25       1       FULL1
+14      B  F  A DISK        14-MAY-25       1       RUN2
+17      B  F  A DISK        14-MAY-25       1       FULL_DAILY
+18      B  F  A DISK        14-MAY-25       1       FULL_DAILY
+19      B  A  A DISK        14-MAY-25       1       TAG2025...
+
+-- TY 컬럼의 A는 아카이브 로그 백업을 뜻한다.
+
+RMAN> REPORT SCHEMA;
+
+File Size(MB) Tablespace           RB segs Datafile Name
+---- -------- -------------------- ------- ------------------------------
+1    890      SYSTEM               YES     /u02/oradata/ORCL/system01.dbf
+3    550      SYSAUX               NO      /u02/oradata/ORCL/sysaux01.dbf
+4    320      UNDOTBS1             YES     /u02/oradata/ORCL/undotbs01.dbf
+7    10       USERS                NO      /u02/oradata/ORCL/users01.dbf
+8    20       TBS13                NO      /u02/oradata/ORCL/tbs13_01.dbf
+
+-- 새 데이터파일도 백업에 포함되었다.
+
+RMAN> PRINT SCRIPT full_backup TO FILE '/home/oracle/rman/full_backup.rmn';
+
+script full_backup written to file /home/oracle/rman/full_backup.rmn
+
+RMAN> EXIT
+
+-- 크론 연계용 셸 스크립트를 만든다.
+
+[oracle@oel7v9r1 ~]$ cat > /home/oracle/rman/full_backup.sh <<'EOS'
+#!/bin/bash
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export ORACLE_SID=orcl
+export PATH=$ORACLE_HOME/bin:$PATH
+LOG=/home/oracle/rman/log/full_$(date +%Y%m%d_%H%M).log
+
+rman target / catalog rcatowner/oracle_4U@rcat log=$LOG <<EOF
+RUN { EXECUTE SCRIPT full_backup; }
+EXIT;
+EOF
+
+if grep -q 'RMAN-' $LOG; then
+  echo "[ORCL] RMAN backup FAILED - see $LOG"
+  exit 1
+fi
+echo "[ORCL] RMAN backup OK - $LOG"
+EOS
+
+[oracle@oel7v9r1 ~]$ chmod 700 /home/oracle/rman/full_backup.sh
+[oracle@oel7v9r1 ~]$ /home/oracle/rman/full_backup.sh
+[ORCL] RMAN backup OK - /home/oracle/rman/log/full_20250514_1428.log
+
+[oracle@oel7v9r1 ~]$ crontab -l
+0 2 * * * /home/oracle/rman/full_backup.sh >> /home/oracle/rman/log/cron.log 2>&1
+
+[oracle@oel7v9r1 ~]$ sqlplus -s rcatowner/oracle_4U@rcat <<< \
+> "SELECT COUNT(*) FROM rc_backup_piece;"
+
+  COUNT(*)
+----------
+        12
+
+-- 실무 포인트
+-- 1) 구조 변경만 있고 백업이 없으면 카탈로그에 반영되지 않는다.
+--    RESYNC CATALOG를 수동으로 수행해야 최신 상태가 된다.
+--    백업이나 복구 명령을 수행하면 자동으로 일어난다.
+--
+-- 2) 자동 백업이 켜져 있으면 구조 변경 시에도 컨트롤파일 백업이 만들어진다.
+--    파일 목록의 시각으로 확인할 수 있다.
+--
+-- 3) EXECUTE SCRIPT는 RUN 블록 안에서만 쓸 수 있다.
+--    프롬프트에서 직접 실행하면 RMAN-01009 구문 오류가 난다.
+--
+-- 4) Stored Script는 절차를 문서가 아니라 시스템에 고정한다.
+--    담당자가 바뀌어도 같은 절차가 실행되며 실수 여지가 줄어든다.
+--    PRINT SCRIPT ... TO FILE 로 내보내 형상 관리에 포함할 수 있다.
+--
+-- 5) 크론에서는 프로필이 읽히지 않는다.
+--    ORACLE_HOME, ORACLE_SID, PATH를 스크립트 안에서 반드시 설정한다.
+--
+-- 6) 로그에서 RMAN- 문자열을 찾는 것이 가장 단순한 실패 판정이다.
+--    종료 코드만으로는 부분 실패를 놓칠 수 있다.
+--    로그를 날짜별로 남기고 실패 시 알림이 가도록 연결한다.

@@ -1,0 +1,292 @@
+================================================================================
+ 실습 18-1 : UNDO_RETENTION / RETENTION GUARANTEE 설정과 가용 시간 확인
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- Flashback 가용 시간을 결정하는 세 요소를 확인한다.
+-- UNDO_RETENTION과 실제 적용 값의 차이를 본다.
+-- RETENTION GUARANTEE의 효과와 대가를 확인한다.
+-- ORA-01555 발생 이력을 조회해 설정의 적정성을 판단한다.
+-- 작업 유형 : 환경 설정(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- ORCL이 OPEN 상태여야 한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT name, log_mode, open_mode FROM v$database;
+
+NAME      LOG_MODE     OPEN_MODE
+--------- ------------ --------------------
+ORCL      ARCHIVELOG   READ WRITE
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SHOW PARAMETER undo
+
+NAME                             TYPE        VALUE
+-------------------------------- ----------- ---------
+temp_undo_enabled                boolean     FALSE
+undo_management                  string      AUTO
+undo_retention                   integer     900
+undo_tablespace                  string      UNDOTBS1
+
+-- 목표 보존 시간이 900초, 즉 15분이다.
+
+SYS@orcl> SELECT tablespace_name, retention FROM dba_tablespaces
+  2  WHERE  contents = 'UNDO';
+
+TABLESPACE_NAME                RETENTION
+------------------------------ -----------
+UNDOTBS1                       NOGUARANTEE
+
+SYS@orcl> SELECT file_name, ROUND(bytes/1024/1024) AS mb, autoextensible
+  2  FROM   dba_data_files WHERE tablespace_name = 'UNDOTBS1';
+
+FILE_NAME                                  MB  AUT
+---------------------------------- ---------- ---
+/u03/oradata/ORCL/undotbs01.dbf           320  YES
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 실제 적용 값 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT TO_CHAR(begin_time,'MM-DD HH24:MI') AS begin_t,
+  2         undoblks, txncount, maxquerylen, tuned_undoretention, ssolderrcnt
+  3  FROM   v$undostat ORDER BY begin_time DESC FETCH FIRST 6 ROWS ONLY;
+
+BEGIN_T       UNDOBLKS   TXNCOUNT MAXQUERYLEN TUNED_UNDORETENTION SSOLDERRCNT
+------------ --------- ---------- ----------- ------------------- -----------
+05-20 10:50        842        124         412                1240           0
+05-20 10:40       1102        188         308                1240           0
+05-20 10:30        744         96         210                 900           0
+05-20 10:20        612         88         180                 900           0
+
+-- tuned_undoretention 이 실제 적용되는 값이다.
+-- 공간에 여유가 있어 목표(900)보다 큰 1240초로 조정되었다.
+-- ssolderrcnt 는 ORA-01555 발생 횟수이며 0이면 정상이다.
+
+SYS@orcl> SELECT MAX(tuned_undoretention) AS max_tuned,
+  2         MIN(tuned_undoretention) AS min_tuned,
+  3         SUM(ssolderrcnt) AS total_ora1555
+  4  FROM   v$undostat;
+
+ MAX_TUNED  MIN_TUNED TOTAL_ORA1555
+---------- ---------- -------------
+      1240        620             3
+
+-- 지난 기간에 세 번의 ORA-01555가 있었다.
+-- 보존 설정을 재검토할 근거가 된다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 보존 시간 조정
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET undo_retention = 3600 SCOPE = BOTH;
+
+System altered.
+
+-- 1시간으로 늘렸다. 실수를 발견하는 데 걸리는 시간을 고려한 값이다.
+
+SYS@orcl> SHOW PARAMETER undo_retention
+
+NAME                 TYPE        VALUE
+-------------------- ----------- ------
+undo_retention       integer     3600
+
+-- 공간이 그 값을 감당하는지 확인한다.
+
+SYS@orcl> SELECT ROUND(SUM(undoblks) / SUM(
+  2    (end_time - begin_time) * 86400) * 3600 * 8192 / 1024 / 1024) AS need_mb
+  3  FROM   v$undostat;
+
+   NEED_MB
+----------
+       780
+
+-- 시간당 UNDO 생성량으로 계산하면 3600초를 보존하려면 약 780MB가 필요하다.
+-- 현재 320MB이므로 늘려야 한다.
+
+SYS@orcl> ALTER DATABASE DATAFILE '/u03/oradata/ORCL/undotbs01.dbf' RESIZE 1G;
+
+Database altered.
+
+SYS@orcl> SELECT ROUND(bytes/1024/1024) AS mb FROM dba_data_files
+  2  WHERE  tablespace_name = 'UNDOTBS1';
+
+        MB
+----------
+      1024
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : RETENTION GUARANTEE
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLESPACE undotbs1 RETENTION GUARANTEE;
+
+Tablespace altered.
+
+SYS@orcl> SELECT tablespace_name, retention FROM dba_tablespaces
+  2  WHERE  contents = 'UNDO';
+
+TABLESPACE_NAME                RETENTION
+------------------------------ -----------
+UNDOTBS1                       GUARANTEE
+
+-- 이제 보존 기간 안의 UNDO는 덮이지 않는다.
+-- Flashback 가용 시간이 보장되지만 대가가 있다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- GUARANTEE 상태에서 UNDO를 소진시켜 본다.
+
+SYS@orcl> ALTER SYSTEM SET undo_retention = 86400 SCOPE = MEMORY;
+
+System altered.
+
+-- 보존 목표를 24시간으로 극단적으로 늘렸다.
+
+SYS@orcl> ALTER DATABASE DATAFILE '/u03/oradata/ORCL/undotbs01.dbf'
+  2    AUTOEXTEND OFF;
+
+Database altered.
+
+SYS@orcl> CREATE TABLE hr.undo_test(id NUMBER, pad VARCHAR2(2000))
+  2    TABLESPACE users;
+
+Table created.
+
+SYS@orcl> BEGIN
+  2    FOR i IN 1..20 LOOP
+  3      INSERT INTO hr.undo_test
+  4      SELECT LEVEL, RPAD('x',2000,'x') FROM dual CONNECT BY LEVEL <= 5000;
+  5      COMMIT;
+  6      UPDATE hr.undo_test SET pad = RPAD('y',2000,'y');
+  7      COMMIT;
+  8    END LOOP;
+  9  END;
+ 10  /
+
+BEGIN
+*
+ERROR at line 1:
+ORA-30036: unable to extend segment by 8 in undo tablespace 'UNDOTBS1'
+ORA-06512: at line 6
+
+-- << 원인 파악 >>
+-- ORA-30036은 UNDO 테이블스페이스를 확장할 수 없다는 뜻이다.
+-- RETENTION GUARANTEE가 설정되어 있으면 보존 기간 안의 UNDO를 재사용하지 못한다.
+-- 보존 목표가 24시간이라 거의 모든 UNDO가 보존 대상이 되었다.
+-- 자동 확장도 꺼져 있어 공간을 늘릴 수도 없다.
+-- 결과적으로 DML이 실패한다. GUARANTEE의 대가가 이것이다.
+
+SYS@orcl> SELECT status, SUM(bytes)/1024/1024 AS mb FROM dba_undo_extents
+  2  GROUP BY status;
+
+STATUS            MB
+--------- ----------
+UNEXPIRED      982.5
+ACTIVE          12.0
+EXPIRED          0.0
+
+-- UNEXPIRED가 대부분이다. 보존 기간 안이라 재사용할 수 없는 상태다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER SYSTEM SET undo_retention = 3600 SCOPE = MEMORY;
+SYS@orcl> ALTER DATABASE DATAFILE '/u03/oradata/ORCL/undotbs01.dbf'
+  2    AUTOEXTEND ON NEXT 100M MAXSIZE 4G;
+
+Database altered.
+
+SYS@orcl> SELECT status, ROUND(SUM(bytes)/1024/1024) AS mb
+  2  FROM dba_undo_extents GROUP BY status;
+
+STATUS            MB
+--------- ----------
+UNEXPIRED        620
+EXPIRED          390
+ACTIVE             8
+
+-- 보존 목표를 되돌리자 EXPIRED가 생겨 재사용할 수 있게 되었다.
+
+SYS@orcl> BEGIN
+  2    FOR i IN 1..5 LOOP
+  3      UPDATE hr.undo_test SET pad = RPAD('z',2000,'z') WHERE ROWNUM <= 1000;
+  4      COMMIT;
+  5    END LOOP;
+  6  END;
+  7  /
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT tuned_undoretention, ssolderrcnt FROM v$undostat
+  2  ORDER BY begin_time DESC FETCH FIRST 1 ROWS ONLY;
+
+TUNED_UNDORETENTION SSOLDERRCNT
+------------------- -----------
+               3600           0
+
+-- 목표만큼 보존되고 있으며 오류도 없다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.undo_test
+  2  AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '5' MINUTE;
+
+  COUNT(*)
+----------
+      5000
+
+-- 5분 전 데이터를 조회할 수 있다. Flashback이 동작한다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.undo_test
+  2  AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '90' MINUTE;
+
+ERROR at line 1:
+ORA-01555: snapshot too old: rollback segment number 3 with name
+"_SYSSMU3_1930754532$" too small
+
+-- 90분 전은 보존 목표(60분)를 넘어 조회할 수 없다.
+-- 가용 시간의 경계를 실제로 확인한 셈이다.
+
+SYS@orcl> ALTER TABLESPACE undotbs1 RETENTION NOGUARANTEE;
+
+Tablespace altered.
+
+SYS@orcl> DROP TABLE hr.undo_test PURGE;
+
+Table dropped.
+
+-- 실무 포인트
+-- 1) UNDO_RETENTION은 목표일 뿐이다.
+--    실제 적용 값은 v$undostat 의 tuned_undoretention 이며
+--    공간에 따라 목표보다 크거나 작아진다.
+--
+-- 2) 보존 시간을 늘리려면 공간도 함께 늘려야 한다.
+--    v$undostat 의 undoblks 로 시간당 생성량을 계산해 필요량을 추정한다.
+--    공간 없이 값만 올리면 목표가 지켜지지 않는다.
+--
+-- 3) ssolderrcnt 가 ORA-01555 발생 횟수다.
+--    이 값이 늘어나면 보존 설정이 부족하다는 신호다.
+--    정기 점검 항목으로 넣어 두면 문제를 조기에 발견한다.
+--
+-- 4) RETENTION GUARANTEE는 양날의 검이다.
+--    Flashback 가용 시간을 보장하지만 공간이 부족하면 DML이 실패한다.
+--    ORA-30036이 그 상황이며 운영 중단으로 이어질 수 있다.
+--
+-- 5) dba_undo_extents 의 STATUS로 상태를 확인한다.
+--    UNEXPIRED는 보존 기간 안이라 재사용할 수 없는 영역이다.
+--    이 값이 대부분이면 공간 부족 위험이 있다.
+--
+-- 6) 보존 시간은 요건에서 역산해 정한다.
+--    실수를 발견하는 데 보통 걸리는 시간에 여유를 더한 값이 출발점이다.
+--    그 값을 감당할 공간이 있는지 확인한 뒤 적용한다.

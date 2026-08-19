@@ -1,0 +1,348 @@
+================================================================================
+ 실습 10-1 : 아카이브 손상 — Cancel-based 불완전 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 데이터파일이 손상되었고 복구에 필요한 아카이브 하나가 함께 손상되었다.
+-- 연속되지 않은 리두는 적용할 수 없으므로 완전 복구가 불가능하다.
+-- 적용 가능한 마지막 지점까지 넣고 CANCEL로 멈춘 뒤 RESETLOGS로 연다.
+-- 불완전 복구의 기본 절차를 익히는 실습이다.
+-- 복구 유형 : 불완전 복구(Cancel-based)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- ARCHIVELOG 모드이며 실습 직전에 전체 백업을 새로 받는다.
+-- 데이터파일은 /u02/oradata/ORCL 에 있다(9장 실습에서 이전됨).
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a44
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : 백업과 실습 데이터
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch10 && mkdir -p /home/oracle/backup/ch10
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch10/
+SYS@orcl> !rm -f /home/oracle/backup/ch10/temp01.dbf
+SYS@orcl> STARTUP
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2419200
+
+SYS@orcl> CREATE TABLE hr.insa_2025(id NUMBER, order_date DATE) TABLESPACE users;
+Table created.
+
+SYS@orcl> INSERT INTO hr.insa_2025 VALUES (1, SYSDATE);
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+SYS@orcl> INSERT INTO hr.insa_2025 VALUES (2, SYSDATE);
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+SYS@orcl> INSERT INTO hr.insa_2025 VALUES (3, SYSDATE);
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SELECT id, TO_CHAR(order_date, 'HH24:MI:SS') AS t FROM hr.insa_2025 ORDER BY id;
+
+        ID T
+---------- --------
+         1 09:04:11
+         2 09:08:30
+         3 09:12:44
+
+SYS@orcl> SELECT sequence#, first_change#, next_change#,
+  2         TO_CHAR(first_time, 'HH24:MI:SS') AS first_time
+  3  FROM   v$log_history WHERE sequence# BETWEEN 60 AND 63 ORDER BY sequence#;
+
+ SEQUENCE# FIRST_CHANGE# NEXT_CHANGE# FIRST_TIME
+---------- ------------- ------------ ----------
+        60       2419200      2419840 09:02:11
+        61       2419840      2420100 09:08:22
+        62       2420100      2420480 09:12:40
+        63       2420480      2420900 09:16:05
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 데이터파일 + 아카이브 손상
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u02/oradata/ORCL/users01.dbf
+
+-- 시퀀스 62의 아카이브도 함께 손상되었다고 가정한다.
+
+SYS@orcl> !dd if=/dev/zero of=/u02/arch1/1_62_1200530011.dbf bs=1024 count=8 conv=notrunc
+8+0 records in
+8+0 records out
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.insa_2025;
+SELECT COUNT(*) FROM hr.insa_2025
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 7
+ORA-01110: data file 7: '/u02/oradata/ORCL/users01.dbf'
+ORA-27041: unable to open file
+
+SYS@orcl> ALTER TABLESPACE users OFFLINE IMMEDIATE;
+Tablespace altered.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch10/users01.dbf /u02/oradata/ORCL/
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER TABLESPACE users;
+ORA-00279: change 2419200 generated at 12/05/2025 09:02:11 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_60_1200530011.dbf
+ORA-00280: change 2419200 for thread 1 is in sequence #60
+
+Log applied.
+Log applied.
+
+ORA-00283: recovery session canceled due to errors
+ORA-00368: checksum error in redo log block
+ORA-00353: log corruption near block 512 change 2420100 time 12/05/2025 09:12:40
+ORA-00334: archived log: '/u02/arch1/1_62_1200530011.dbf'
+
+-- 시퀀스 62의 아카이브가 손상되었다. 완전 복구가 불가능하다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         7                          2420100
+
+-- 시퀀스 61까지는 적용되었고 62에서 막혔다.
+
+SYS@orcl> SELECT sequence#, status FROM v$archived_log
+  2  WHERE  sequence# BETWEEN 60 AND 64 ORDER BY sequence#;
+
+ SEQUENCE# S
+---------- -
+        60 A
+        61 A
+        62 A
+        63 A
+        64 A
+
+-- 컨트롤파일에는 있는 것으로 되어 있지만 파일 내용이 깨졌다.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_online FROM v$log;
+
+OLDEST_ONLINE
+-------------
+      2420900
+
+-- 온라인 리두의 최소 SCN(2420900) > 복구 시작 SCN(2420100)
+-- 온라인 리두로도 대체할 수 없다.
+
+SYS@orcl> SELECT SCN_TO_TIMESTAMP(2420099) AS max_recover_point FROM dual;
+
+MAX_RECOVER_POINT
+---------------------------------------------------------
+12-MAY-25 09.12.40.000000000 AM
+
+-- 판정
+--   ① 완전 복구 : 불가능(시퀀스 62 손상, 온라인 리두 대체 불가)
+--   ② 최대 복구 지점 : 09:12:40 (시퀀스 61까지)
+--   ③ 손실 : 09:12:40 이후의 모든 변경
+--   → Cancel-based 불완전 복구, 전체 데이터파일 복원 필요
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_101
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/before_recover_101/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 손상된 파일만 복원한 채 불완전 복구를 시도한다.
+
+SYS@orcl> SHUTDOWN ABORT
+SYS@orcl> STARTUP MOUNT
+
+SYS@orcl> SET AUTORECOVERY OFF
+SYS@orcl> RECOVER DATABASE UNTIL CANCEL;
+ORA-00283: recovery session canceled due to errors
+ORA-01152: file 1 was not restored from a sufficiently old backup
+ORA-01110: data file 1: '/u02/oradata/ORCL/system01.dbf'
+
+-- << 원인 파악 >>
+-- 파일 1은 현재 상태 그대로다. 목표 시점보다 미래에 있다.
+-- 불완전 복구는 데이터베이스 전체를 과거의 한 시점으로 되돌리는 작업이다.
+-- 모든 데이터파일이 그 시점보다 이전 백업본에서 출발해야 한다.
+-- 리두는 앞으로만 적용되고 뒤로 되돌릴 수 없기 때문이다.
+-- 완전 복구에서 손상된 파일만 복원하던 습관이 여기서 문제가 된다.
+
+SYS@orcl> SELECT file#, checkpoint_change#,
+  2         TO_CHAR(checkpoint_time, 'HH24:MI:SS') AS ckpt_time
+  3  FROM   v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# CKPT_TIME
+---------- ------------------ ----------
+         1            2420900 09:16:05
+         3            2420900 09:16:05
+         4            2420900 09:16:05
+         7            2419200 09:02:11
+
+-- 파일 7만 백업 시점이고 나머지는 현재 상태다.
+
+-- << 수정 >>
+
+SYS@orcl> !cp -p /home/oracle/backup/ch10/*.dbf /u02/oradata/ORCL/
+
+SYS@orcl> SELECT file#, checkpoint_change# FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE#
+---------- ------------------
+         1            2419200
+         3            2419200
+         4            2419200
+         7            2419200
+
+-- 모든 파일이 같은 시점이다.
+
+SYS@orcl> RECOVER DATABASE UNTIL CANCEL;
+ORA-00279: change 2419200 generated at 12/05/2025 09:02:11 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_60_1200530011.dbf
+ORA-00280: change 2419200 for thread 1 is in sequence #60
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+
+Log applied.
+
+ORA-00279: change 2419840 generated at 12/05/2025 09:08:22 needed for thread 1
+ORA-00280: change 2419840 for thread 1 is in sequence #61
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+
+Log applied.
+
+ORA-00279: change 2420100 generated at 12/05/2025 09:12:40 needed for thread 1
+ORA-00280: change 2420100 for thread 1 is in sequence #62
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+CANCEL
+Media recovery cancelled.
+
+-- 손상된 시퀀스 62 직전에서 멈췄다.
+
+SYS@orcl> ALTER DATABASE OPEN READ ONLY;
+
+Database altered.
+
+SYS@orcl> SELECT id, TO_CHAR(order_date, 'HH24:MI:SS') AS t FROM hr.insa_2025 ORDER BY id;
+
+        ID T
+---------- --------
+         1 09:04:11
+         2 09:08:30
+
+-- 09:12:44에 넣은 3번이 없다. 예상한 복구 지점이 맞다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT id, TO_CHAR(order_date, 'HH24:MI:SS') AS t FROM hr.insa_2025 ORDER BY id;
+
+        ID T
+---------- --------
+         1 09:04:11
+         2 09:08:30
+
+SYS@orcl> SELECT checkpoint_change# AS recovered_scn,
+  2         TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS recovered_time
+  3  FROM   v$database;
+
+RECOVERED_SCN RECOVERED_TIME
+------------- --------------
+      2420100 09:12:40
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  ORDER BY incarnation#;
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           1                 1 PARENT
+           2           2420100 CURRENT
+
+-- 인카네이션이 올라갔다.
+
+SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1          1 CURRENT
+         3          0 UNUSED
+         4          0 UNUSED
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         1
+
+-- 손실 구간을 정리한다.
+--   복구 지점 : SCN 2420100 / 09:12:40
+--   손실 구간 : 09:12:40 이후 ~ 장애 시각
+--   영향 : hr.insa_2025 의 3번 이후 데이터
+
+-- 즉시 전체 백업을 받는다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch10 && mkdir -p /home/oracle/backup/ch10
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch10/
+SYS@orcl> !rm -f /home/oracle/backup/ch10/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) 불완전 복구는 모든 데이터파일을 복원해야 한다.
+--    손상된 파일만 복원하면 ORA-01152가 발생한다.
+--    데이터베이스 전체를 과거의 한 시점으로 되돌리는 작업이기 때문이다.
+--
+-- 2) 리두는 앞으로만 적용되고 뒤로 되돌릴 수 없다.
+--    그래서 모든 파일이 목표 시점보다 이전 상태에서 출발해야 한다.
+--    v$datafile_header 의 체크포인트 시각을 비교하면 어긋난 파일을 찾을 수 있다.
+--
+-- 3) 아카이브 손상은 파일 존재 여부로는 알 수 없다.
+--    v$archived_log 에는 STATUS가 A로 남아 있어도 내용이 깨져 있을 수 있다.
+--    적용 시점에 ORA-00368이나 ORA-00353으로 드러난다.
+--
+-- 4) 온라인 리두로 대체 가능한지 먼저 확인한다.
+--    이 실습에서는 최소 온라인 리두 SCN이 복구 시작 SCN보다 커서 대체할 수 없었다.
+--    가능했다면 완전 복구로 끝났을 것이다.
+--
+-- 5) RESETLOGS 전에 READ ONLY로 확인한다.
+--    복구 지점이 예상과 맞는지 데이터로 검증할 수 있다.
+--    부족하면 다시 MOUNT로 내려 이어서 적용할 수 있다.
+--
+-- 6) RESETLOGS 이후 즉시 전체 백업을 받는다.
+--    인카네이션이 달라져 이전 백업본과 아카이브를 그대로 쓸 수 없다.
+
+SYS@orcl> EXIT

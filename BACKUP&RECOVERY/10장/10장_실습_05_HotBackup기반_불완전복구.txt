@@ -1,0 +1,309 @@
+================================================================================
+ 실습 10-5 : Hot Backup 기반 불완전 복구 — 최소 복구 지점
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- Hot Backup으로 받은 백업본을 기반으로 시점 복구를 수행한다.
+-- 백업 중에는 파일마다 SCN이 다르고 fuzzy 블록이 섞여 있다.
+-- 따라서 END BACKUP 시점 이전으로는 복구 지점을 잡을 수 없다.
+-- 최소 복구 지점의 개념을 오류로 직접 확인한다.
+-- 복구 유형 : 불완전 복구(Hot Backup 기반)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 10-4를 마친 상태에서 이어서 진행한다.
+-- Cold Backup이 아닌 Hot Backup으로 백업을 받는다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> ALTER SESSION SET nls_date_format = 'YYYY-MM-DD HH24:MI:SS';
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : Hot Backup 수행
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS backup_start FROM dual;
+
+BACKUP_START
+------------
+13:02:10
+
+SYS@orcl> !rm -rf /home/oracle/backup/hot10 && mkdir -p /home/oracle/backup/hot10
+
+SYS@orcl> ALTER DATABASE BEGIN BACKUP;
+Database altered.
+
+SYS@orcl> SELECT file#, status, change#,
+  2         TO_CHAR(time, 'HH24:MI:SS') AS t FROM v$backup WHERE status = 'ACTIVE';
+
+     FILE# STATUS     CHANGE# T
+---------- ------- ---------- --------
+         1 ACTIVE     2425600 13:02:12
+         3 ACTIVE     2425600 13:02:12
+         4 ACTIVE     2425600 13:02:12
+         7 ACTIVE     2425600 13:02:12
+
+-- 백업 중 변경이 계속 일어나도록 DML을 수행한다.
+
+SYS@orcl> INSERT INTO hr.emp104 VALUES (11, 'during backup');
+SYS@orcl> COMMIT;
+
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/hot10/
+SYS@orcl> !rm -f /home/oracle/backup/hot10/temp01.dbf
+
+SYS@orcl> INSERT INTO hr.emp104 VALUES (12, 'during backup 2');
+SYS@orcl> COMMIT;
+
+SYS@orcl> ALTER DATABASE END BACKUP;
+Database altered.
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS backup_end FROM dual;
+
+BACKUP_END
+------------
+13:08:44
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+-- 백업 구간 : 13:02:12 ~ 13:08:44
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 백업 이후 업무와 사고
+--------------------------------------------------------------------------------
+SYS@orcl> INSERT INTO hr.emp104 VALUES (13, 'after backup');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS now FROM dual;
+
+NOW
+--------
+13:14:20
+
+SYS@orcl> DELETE FROM hr.emp104 WHERE id <= 2;
+2 rows deleted.
+SYS@orcl> COMMIT;
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS accident FROM dual;
+
+ACCIDENT
+------------
+13:18:05
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 상황 정리
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT id, memo FROM hr.emp104 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+        11 during backup
+        12 during backup 2
+        13 after backup
+
+-- 1번과 2번이 잘못 삭제되었다. 13:18:05 직전으로 되돌려야 한다.
+
+SYS@orcl> SELECT sequence#, first_change#, next_change#,
+  2         TO_CHAR(first_time, 'HH24:MI:SS') AS first_time
+  3  FROM   v$log_history ORDER BY sequence# DESC FETCH FIRST 4 ROWS ONLY;
+
+ SEQUENCE# FIRST_CHANGE# NEXT_CHANGE# FIRST_TIME
+---------- ------------- ------------ ----------
+         4       2426400      2426800 13:14:18
+         3       2426000      2426400 13:08:40
+         2       2425600      2426000 13:02:08
+         1       2424560      2425600 12:55:02
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> !ls -l /home/oracle/backup/hot10/*.dbf | wc -l
+7
+
+SYS@orcl> SELECT MIN(sequence#), MAX(sequence#), COUNT(*),
+  2         MAX(sequence#) - MIN(sequence#) + 1 AS expected
+  3  FROM   v$archived_log WHERE status = 'A';
+
+MIN(SEQUENCE#) MAX(SEQUENCE#)   COUNT(*)   EXPECTED
+-------------- -------------- ---------- ----------
+             1              4          4          4
+
+-- 아카이브는 연속이다.
+
+-- 판정
+--   ① 백업 종류 : Hot Backup (BEGIN/END 사이에 복사)
+--   ② 백업 구간 : 13:02:12 ~ 13:08:44
+--   ③ 최소 복구 지점 : END BACKUP 시점(13:08:44) 이후
+--   ④ 목표 지점 : 13:18:00 (사고 직전)
+--   → 목표가 최소 지점보다 뒤이므로 이 백업 세트로 가능하다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_105
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/before_recover_105/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 최소 복구 지점의 개념을 확인하려고 일부러 백업 구간 안의 시각을 지정한다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> !cp -p /home/oracle/backup/hot10/*.dbf /u02/oradata/ORCL/
+
+SYS@orcl> SELECT file#, checkpoint_change#,
+  2         TO_CHAR(checkpoint_time, 'HH24:MI:SS') AS ckpt_time, fuzzy
+  3  FROM   v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# CKPT_TIME FUZ
+---------- ------------------ --------- ---
+         1            2425600 13:02:12  YES
+         3            2425600 13:02:12  YES
+         4            2425600 13:02:12  YES
+         7            2425600 13:02:12  YES
+
+-- FUZZY가 YES다. 백업 중 복사되어 일관성이 없다.
+
+SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 13:05:00';
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+ALTER DATABASE OPEN RESETLOGS
+*
+ERROR at line 1:
+ORA-01195: online backup of file 1 needs more recovery to be consistent
+ORA-01110: data file 1: '/u02/oradata/ORCL/system01.dbf'
+
+-- << 원인 파악 >>
+-- Media recovery complete. 가 나왔는데도 오픈이 거부되었다.
+-- 지정한 13:05:00은 백업 구간(13:02:12~13:08:44) 안이다.
+-- 그 시점의 데이터파일은 fuzzy 상태이며 일관성이 없다.
+-- 백업 중 갱신된 블록을 정리하려면 END BACKUP 시점까지의 리두를 모두 적용해야 한다.
+-- 따라서 Hot Backup 기반의 최소 복구 지점은 END BACKUP 시점이다.
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2425820 YES
+         3            2425820 YES
+         4            2425820 YES
+         7            2425820 YES
+
+-- 여전히 FUZZY가 YES다.
+
+-- << 수정 >>
+-- 목표 지점인 13:18:00 까지 이어서 적용한다.
+
+SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 13:18:00';
+Media recovery complete.
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2426740 NO
+         3            2426740 NO
+         4            2426740 NO
+         7            2426740 NO
+
+-- FUZZY가 NO로 바뀌었다. 일관성이 맞았다.
+
+SYS@orcl> ALTER DATABASE OPEN READ ONLY;
+
+SYS@orcl> SELECT id, memo FROM hr.emp104 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 seq 1
+         2 seq 2
+        11 during backup
+        12 during backup 2
+        13 after backup
+
+-- 삭제된 1번과 2번이 살아났고 정상 데이터도 모두 남아 있다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp104;
+
+  COUNT(*)
+----------
+         5
+
+SYS@orcl> SELECT checkpoint_change# AS recovered_scn,
+  2         TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS recovered_time
+  3  FROM   v$database;
+
+RECOVERED_SCN RECOVERED_TIME
+------------- --------------
+      2426740 13:17:58
+
+SYS@orcl> SELECT COUNT(*) FROM v$backup WHERE status = 'ACTIVE';
+
+  COUNT(*)
+----------
+         0
+
+-- 백업 모드 잔재가 없다. 3장에서 다룬 확인 항목이다.
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  WHERE  status = 'CURRENT';
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           6           2426740 CURRENT
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+Tablespace altered.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch10 && mkdir -p /home/oracle/backup/ch10
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch10/
+SYS@orcl> !rm -f /home/oracle/backup/ch10/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) Hot Backup 기반에는 최소 복구 지점이 있다.
+--    END BACKUP 시점 이전으로는 복구 지점을 잡을 수 없다.
+--    백업 중 fuzzy 상태로 복사된 블록을 리두로 정리해야 하기 때문이다.
+--
+-- 2) Media recovery complete. 가 나와도 오픈이 거부될 수 있다.
+--    ORA-01195는 온라인 백업이 아직 일관성에 도달하지 못했다는 뜻이다.
+--    복구가 끝났다는 메시지와 열 수 있다는 것은 다른 문제다.
+--
+-- 3) v$datafile_header 의 FUZZY 컬럼이 판정 기준이다.
+--    YES이면 아직 적용할 리두가 남아 있고 NO가 되어야 열 수 있다.
+--    1장에서 배운 FUZZY 개념이 여기서 실제 판정 도구로 쓰인다.
+--
+-- 4) 복구 계획 시 백업 세트의 BEGIN·END 시각을 먼저 확인한다.
+--    목표 시각이 END BACKUP 보다 이르면 그 세트로는 불가능하다.
+--    더 오래된 세트를 찾아야 하며 적용할 아카이브가 늘어난다.
+--
+-- 5) 이어서 적용할 수 있으므로 복원을 다시 하지 않았다.
+--    첫 시도가 실패한 뒤 목표 시각만 바꿔 다시 수행했다.
+--
+-- 6) 복구 후 백업 모드 잔재를 확인한다.
+--    v$backup 에 ACTIVE가 남아 있으면 3장에서 다룬 문제가 재현된다.
+
+SYS@orcl> EXIT

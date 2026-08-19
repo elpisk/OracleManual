@@ -1,0 +1,250 @@
+================================================================================
+ 실습 7-2 : 비정상 종료 후 리두 로그와 컨트롤파일 동시 손상
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- SHUTDOWN ABORT 뒤 리두 로그 전부와 컨트롤파일 전부가 유실되었다.
+-- 데이터파일에 반영되지 않은 커밋 변경이 있는데 그 리두가 사라졌다.
+-- 불완전 복구를 시도하고 실패하면 전체 복원으로 전환한다.
+-- 실습 7-1과 같은 장애이지만 종료 방식 하나로 결과가 달라진다.
+-- 복구 유형 : 불완전 복구 또는 전체 복원
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 7-1을 마친 상태에서 이어서 진행한다.
+-- /home/oracle/backup/ch07 백업본이 온전해야 한다.
+
+[oracle@oel7v9r1 ~]$ ls /home/oracle/backup/ch07/ | wc -l
+14
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_72.sql';
+Database altered.
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2392180
+
+-- 백업본이 담고 있는 SCN이다.
+
+SYS@orcl> INSERT INTO hr.emp71 VALUES (2, 'after backup');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT * FROM hr.emp71 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 before shutdown
+         2 after backup
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : ABORT 후 리두·컨트롤파일 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> INSERT INTO hr.emp71 VALUES (3, 'in redo only');
+SYS@orcl> COMMIT;
+Commit complete.
+
+-- 커밋되었으나 데이터파일에는 아직 반영되지 않았다.
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> !grep -n 'CLOSE NORMAL\|Shutting down instance (abort)' \
+        /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -2
+19188:Completed: ALTER DATABASE CLOSE NORMAL
+19240:Shutting down instance (abort) (OS id: 17422)
+
+-- 마지막 기록이 abort다. 비정상 종료였다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- 판정
+--   ① 컨트롤파일 : trace 있음
+--   ② 리두 로그 : 전부 없음 → RESETLOGS 형식 필수
+--   ③ 종료 : abort → 적용해야 할 리두가 있는데 그 리두가 사라짐
+--   → 불완전 복구 시도, 실패 시 전체 복원
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.dbf | grep -v temp | wc -l
+5
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_72
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /home/oracle/before_recover_72/
+
+-- 시도가 실패하면 이 사본으로 되돌린다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP NOMOUNT
+ORACLE instance started.
+
+SYS@orcl> @/home/oracle/backup/cf_72_resetlogs.sql
+
+Control file created.
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2392640 YES
+         3            2392640 YES
+         4            2392640 YES
+         7            2392580 YES
+         8            2392580 YES
+
+-- FUZZY가 YES다. 실습 7-1과 정반대 상태다.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+ALTER DATABASE OPEN RESETLOGS
+*
+ERROR at line 1:
+ORA-01113: file 1 needs media recovery
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+
+-- << 원인 파악 >>
+-- 적용되지 않은 리두가 있는데 그 리두가 사라졌다.
+-- 새로 만든 리두 로그는 비어 있으므로 적용할 내용이 없다.
+-- 데이터파일은 일관성 없는 상태로 남아 있어 그대로 열 수 없다.
+-- 실습 7-1에서는 FUZZY가 NO였기에 이 오류가 나오지 않았다.
+
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE UNTIL CANCEL;
+ORA-00279: change 2392580 generated at 05/10/2025 19:20:04 needed for thread 1
+ORA-00289: suggestion : /u01/app/oracle/product/19.3.0/dbhome_1/dbs/arch1_1_1200530011.dbf
+ORA-00280: change 2392580 for thread 1 is in sequence #1
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+CANCEL
+ORA-01547: warning: RECOVER succeeded but OPEN RESETLOGS would get error below
+ORA-01194: file 1 needs more recovery to be consistent
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+ALTER DATABASE OPEN RESETLOGS
+*
+ERROR at line 1:
+ORA-01113: file 1 needs media recovery
+
+-- 적용할 리두가 하나도 없어 불완전 복구조차 성립하지 않는다.
+-- ORA-01547의 "RECOVER succeeded"에 속으면 안 된다.
+
+-- << 수정 >>
+-- 전체 복원으로 전환한다.
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch07/*.dbf /u01/app/oracle/oradata/ORCL/
+SYS@orcl> !cp -p /home/oracle/backup/ch07/control01.ctl \
+                 /home/oracle/backup/ch07/control02.ctl /u01/app/oracle/oradata/ORCL/
+SYS@orcl> !cp -p /home/oracle/backup/ch07/control03.ctl /u02/oradata/ORCL/
+SYS@orcl> !cp -p /home/oracle/backup/ch07/redo01.log /home/oracle/backup/ch07/redo03.log \
+                 /home/oracle/backup/ch07/redo04.log /u01/app/oracle/oradata/ORCL/
+SYS@orcl> !cp -p /home/oracle/backup/ch07/redo01b.log /home/oracle/backup/ch07/redo03b.log \
+                 /home/oracle/backup/ch07/redo04b.log /u02/oradata/ORCL/
+
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+Database opened.
+
+-- 복구 명령 없이 열렸다. 일관성 있는 상태 전체를 되돌렸기 때문이다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT * FROM hr.emp71 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 before shutdown
+
+-- 2번과 3번 행이 사라졌다. 백업 이후의 작업이 전량 손실되었다.
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2392180
+
+SYS@orcl> SELECT SCN_TO_TIMESTAMP(2392180) AS recovered_to FROM dual;
+
+RECOVERED_TO
+---------------------------------------------------------
+10-MAY-25 07.16.52.000000000 PM
+
+-- 이 시각 이후의 업무를 재처리해야 한다. 현업에 통보할 정보다.
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation;
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           1                 1 PARENT
+           2           2382140 PARENT
+           3           2385641 PARENT
+           4           2386721 PARENT
+           5           2391041 CURRENT
+
+-- 전체 복원은 백업 시점의 컨트롤파일을 되돌렸으므로 인카네이션이 늘지 않았다.
+
+SYS@orcl> UPDATE hr.employees SET salary = salary WHERE ROWNUM = 1;
+1 row updated.
+SYS@orcl> ROLLBACK;
+Rollback complete.
+
+-- DML이 정상 동작한다.
+
+-- 실무 포인트
+-- 1) 같은 장애라도 종료 방식 하나로 결과가 완전히 달라진다.
+--    실습 7-1은 손실이 없었고 이 실습은 백업 이후 전량을 잃었다.
+--    차이는 FUZZY 컬럼에서 그대로 드러난다.
+--
+-- 2) 리두가 하나도 없으면 불완전 복구조차 성립하지 않는다.
+--    적용할 리두가 없어 데이터파일의 일관성을 맞출 수 없기 때문이다.
+--    ORA-01194가 그 상태를 알려 준다.
+--
+-- 3) ORA-01547의 "RECOVER succeeded" 문구에 속지 않는다.
+--    이어지는 ORA-01194가 미완료를 알리고 OPEN에서 ORA-01113이 다시 나온다.
+--
+-- 4) 전환 시점을 미리 정해 둔다.
+--    이 상황에서 여러 조합을 반복 시도해도 결과는 같다.
+--    판정에서 리두 부족이 확인되면 즉시 전체 복원으로 방향을 정하는 편이 낫다.
+--
+-- 5) 시도 전 사본을 확보했기 때문에 여러 방법을 시험할 수 있었다.
+--    before_recover_72 디렉터리가 없었다면 첫 시도의 결과가 그대로 최종 상태가 된다.
+--
+-- 6) 근본 원인은 배치다. 리두 로그와 컨트롤파일이 같은 디스크에 있었다.
+--    2장의 배치 원칙을 지켰다면 사본이 남아 이 상황 자체가 발생하지 않았다.
+
+SYS@orcl> EXIT

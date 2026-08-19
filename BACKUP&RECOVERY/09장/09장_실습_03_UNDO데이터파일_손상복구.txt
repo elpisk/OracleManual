@@ -1,0 +1,266 @@
+================================================================================
+ 실습 9-3 : UNDO 데이터파일 손상 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 20분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- UNDO 데이터파일이 유실되었다.
+-- 떼어 낸 상태로는 데이터베이스를 열 수 없어 무중단 복구가 불가능하다.
+-- 아카이브가 있으므로 복원 후 완전 복구가 성립한다.
+-- 5장의 NOARCHIVELOG 경우와 결말이 어떻게 달라지는지 확인한다.
+-- 복구 유형 : 완전 복구(전면 중단)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 9-2를 마친 상태에서 이어서 진행한다. 데이터파일은 /u02에 있다.
+-- 실습 직전에 백업을 새로 받는다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a44
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 4;
+
+     FILE# NAME                                  STATUS
+---------- ------------------------------------- -------
+         4 /u02/oradata/ORCL/undotbs01.dbf       ONLINE
+
+SYS@orcl> SHOW PARAMETER undo
+
+NAME              TYPE      VALUE
+----------------- --------- ----------
+undo_management   string    AUTO
+undo_retention    integer   900
+undo_tablespace   string    UNDOTBS1
+
+SYS@orcl> ALTER TABLESPACE undotbs1 BEGIN BACKUP;
+SYS@orcl> !cp -p /u02/oradata/ORCL/undotbs01.dbf /home/oracle/backup/ch09/
+SYS@orcl> ALTER TABLESPACE undotbs1 END BACKUP;
+Tablespace altered.
+
+SYS@orcl> INSERT INTO hr.emp91 VALUES (4, 'after undo backup');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp91;
+
+  COUNT(*)
+----------
+         4
+
+--------------------------------------------------------------------------------
+[4] 장애 유발
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u02/oradata/ORCL/undotbs01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+-- 읽기는 성공한다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+-- 변경은 실패한다.
+
+SYS@orcl> UPDATE hr.employees SET salary = salary + 1 WHERE ROWNUM <= 10;
+UPDATE hr.employees SET salary = salary + 1 WHERE ROWNUM <= 10
+       *
+ERROR at line 1:
+ORA-01116: error in opening database file 4
+ORA-01110: data file 4: '/u02/oradata/ORCL/undotbs01.dbf'
+ORA-27041: unable to open file
+
+-- SELECT는 되고 DML만 실패한다. 5장에서 익힌 UNDO 손상의 신호다.
+
+SYS@orcl> !tail -4 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Errors in file .../orcl_ora_21044.trc:
+ORA-01116: error in opening database file 4
+ORA-01110: data file 4: '/u02/oradata/ORCL/undotbs01.dbf'
+ORA-27041: unable to open file
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 4;
+
+     FILE# NAME                                  STATUS
+---------- ------------------------------------- -------
+         4 /u02/oradata/ORCL/undotbs01.dbf       RECOVER
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         4 FILE NOT FOUND                 0
+
+SYS@orcl> SELECT MIN(sequence#), MAX(sequence#), COUNT(*),
+  2         MAX(sequence#) - MIN(sequence#) + 1 AS expected
+  3  FROM   v$archived_log WHERE status = 'A';
+
+MIN(SEQUENCE#) MAX(SEQUENCE#)   COUNT(*)   EXPECTED
+-------------- -------------- ---------- ----------
+            20             42         23         23
+
+-- 아카이브가 연속이다.
+
+-- 판정
+--   ① 손상 파일 : UNDO → 무중단 복구 불가
+--   ② 백업본 : 있음
+--   ③ 아카이브 : 연속 보유 → 완전 복구 가능
+--   → 데이터베이스를 내리고 MOUNT 상태에서 복원·복구
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 무중단으로 처리해 본다.
+
+SYS@orcl> ALTER TABLESPACE undotbs1 OFFLINE IMMEDIATE;
+ALTER TABLESPACE undotbs1 OFFLINE IMMEDIATE
+*
+ERROR at line 1:
+ORA-30042: Cannot offline the undo tablespace
+
+-- << 원인 파악 >>
+-- 현재 사용 중인 UNDO 테이블스페이스는 OFFLINE 할 수 없다.
+-- 떼어 내면 새 트랜잭션이 언두를 확보할 수 없어 서비스가 성립하지 않는다.
+-- 8장의 무중단 복구 절차를 UNDO에는 그대로 적용할 수 없다는 뜻이다.
+-- 데이터베이스를 내리고 MOUNT 상태에서 처리하거나, 다른 UNDO로 전환해야 한다.
+-- 전환은 실습 9-4에서 다루고 여기서는 정식 복구로 진행한다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SHUTDOWN IMMEDIATE
+ORA-01116: error in opening database file 4
+ORA-01110: data file 4: '/u02/oradata/ORCL/undotbs01.dbf'
+ORA-01275: Operation SHUTDOWN is not allowed
+
+-- IMMEDIATE는 종료 과정에서 UNDO를 읽어야 해서 실패한다.
+
+-- << 수정 >>
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch09/undotbs01.dbf /u02/oradata/ORCL/
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         4                          2412400
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE;
+Media recovery complete.
+
+-- ABORT로 내렸으므로 다른 파일도 인스턴스 복구가 필요하다.
+-- RECOVER DATAFILE 4 보다 RECOVER DATABASE 가 안전하다.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+SYS@orcl> !tail -5 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Completed redo application of 0.31MB
+Completed crash recovery at
+SMON: enabling tx recovery
+Undo initialization finished serial:0 start:... end:...
+Completed: ALTER DATABASE OPEN
+
+-- 롤포워드로 언두 블록이 복구된 뒤 SMON이 트랜잭션 복구를 수행했다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 4;
+
+     FILE# NAME                                  STATUS
+---------- ------------------------------------- -------
+         4 /u02/oradata/ORCL/undotbs01.dbf       ONLINE
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp91;
+
+  COUNT(*)
+----------
+         4
+
+-- 백업 이후 커밋한 데이터가 살아 있다.
+
+-- UNDO 복구의 최종 검증은 DML이다.
+
+SYS@orcl> UPDATE hr.employees SET salary = salary WHERE ROWNUM = 1;
+1 row updated.
+
+SYS@orcl> ROLLBACK;
+Rollback complete.
+
+SYS@orcl> SELECT segment_name, status FROM dba_rollback_segs
+  2  WHERE  tablespace_name = 'UNDOTBS1' AND status <> 'ONLINE';
+
+no rows selected
+
+-- 모든 롤백 세그먼트가 ONLINE이다.
+
+SYS@orcl> SELECT resetlogs_change# FROM v$database;
+
+RESETLOGS_CHANGE#
+-----------------
+                1
+
+-- 인카네이션이 그대로다. 5장에서는 전체 복원과 RESETLOGS로 끝났던 상황이다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$transaction;
+
+  COUNT(*)
+----------
+         0
+
+-- 실무 포인트
+-- 1) 사용 중인 UNDO 테이블스페이스는 OFFLINE 할 수 없다(ORA-30042).
+--    떼어 내면 새 트랜잭션이 언두를 확보할 수 없기 때문이다.
+--    8장의 무중단 복구 절차를 UNDO에 그대로 적용할 수 없는 이유다.
+--
+-- 2) SHUTDOWN IMMEDIATE 도 실패할 수 있다.
+--    종료 과정에서 UNDO를 읽어야 하므로 ORA-01275로 거부된다.
+--    ABORT로 내리는 것이 사실상 유일한 선택이다.
+--
+-- 3) ABORT로 내렸으므로 RECOVER DATABASE 를 쓴다.
+--    다른 파일도 인스턴스 복구가 필요하므로 한 번에 처리하는 편이 안전하다.
+--
+-- 4) 오픈 과정에서 롤포워드가 언두 블록을 복구한 뒤 롤백이 수행된다.
+--    alert log의 SMON: enabling tx recovery 뒤에 오류가 없으면 정상이다.
+--    1장의 '롤포워드가 롤백보다 먼저'라는 원리가 여기서도 성립한다.
+--
+-- 5) 최종 검증은 DML과 ROLLBACK 이다.
+--    v$recover_file 이 비었다는 것만으로는 UNDO가 동작하는지 알 수 없다.
+--    dba_rollback_segs 의 상태도 함께 확인한다.
+--
+-- 6) 5장의 같은 장애와 결말을 비교한다.
+--    NOARCHIVELOG에서는 리두가 덮어써지면 전체 복원과 RESETLOGS로 끝났다.
+--    아카이브가 있으면 인카네이션도 그대로이고 손실도 없다.
+
+SYS@orcl> EXIT

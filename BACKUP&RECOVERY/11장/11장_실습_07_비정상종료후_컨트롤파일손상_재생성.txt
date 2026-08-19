@@ -1,0 +1,293 @@
+================================================================================
+ 실습 11-7 : 비정상 종료 후 컨트롤파일 손상 — 재생성
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 22분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- SHUTDOWN ABORT 뒤 컨트롤파일이 전손되었다.
+-- 적용할 리두가 남아 있어 재생성만으로는 열리지 않는다.
+-- USING BACKUP CONTROLFILE 로 복구한 뒤 RESETLOGS로 연다.
+-- 아카이브와 온라인 리두를 함께 써서 완전 복구를 달성한다.
+-- 복구 유형 : 완전 복구(RESETLOGS 강제)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 11-6을 마친 상태에서 이어서 진행한다.
+-- trace 백업이 현재 구조를 반영하고 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2434200
+
+SYS@orcl> CREATE TABLE hr.emp117(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp117 VALUES (1, 'archived');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+SYS@orcl> INSERT INTO hr.emp117 VALUES (2, 'current redo');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         12 YES INACTIVE
+         3         13 NO  CURRENT
+         4         11 YES INACTIVE
+
+SYS@orcl> !ls -l /home/oracle/backup/cf_after_116.sql
+-rw-r--r--. 1 oracle oinstall 4402 May 13 13:02 cf_after_116.sql
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : ABORT 후 컨트롤파일 전손
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+
+SYS@orcl> !ls /u02/oradata/ORCL/*.ctl 2>/dev/null
+[oracle@oel7v9r1 ~]$
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> !grep -n 'Shutting down instance (abort)\|CLOSE NORMAL' \
+        /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -2
+21102:Completed: ALTER DATABASE CLOSE NORMAL
+21160:Shutting down instance (abort) (OS id: 25440)
+
+-- 마지막 기록이 abort다. 비정상 종료였다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log | wc -l
+6
+
+-- 리두 로그는 온전하다.
+
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf | grep -v temp | wc -l
+7
+
+SYS@orcl> !sed -n '/RESETLOGS ARCHIVELOG/,/^;/p' /home/oracle/backup/cf_after_116.sql \
+        | grep -c 'dbf'
+7
+
+SYS@orcl> !ls /u02/arch1/*.dbf | wc -l
+9
+
+-- 판정
+--   ① 사본 : 전손
+--   ② 백업 : trace 보유, 구조 일치
+--   ③ 종료 : abort → 적용할 리두 존재
+--   ④ 리두 로그 : 온전 → NORESETLOGS 형식도 문법상 성립
+--   → 다만 비정상 종료이므로 재생성 후 복구가 필요하다.
+--   → RESETLOGS 형식을 쓰면 리두를 새로 만들어 그 구간을 잃는다.
+--   → NORESETLOGS 형식으로 만들고 USING BACKUP CONTROLFILE 로 복구한다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_117
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.log /home/oracle/before_recover_117/
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.log /home/oracle/before_recover_117/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> @/home/oracle/backup/cf_117_noresetlogs.sql
+
+Control file created.
+
+SYS@orcl> SELECT name, open_mode FROM v$database;
+
+NAME      OPEN_MODE
+--------- ----------
+ORCL      MOUNTED
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2434480 YES
+         3            2434480 YES
+         4            2434480 YES
+         7            2434460 YES
+
+-- FUZZY가 YES다. 적용할 리두가 남아 있다.
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01113: file 1 needs media recovery
+ORA-01110: data file 1: '/u02/oradata/ORCL/system01.dbf'
+
+-- << 원인 파악 >>
+-- 컨트롤파일 생성은 성공했지만 오픈이 막혔다.
+-- 비정상 종료라 데이터파일에 적용되지 않은 리두가 남아 있다.
+-- 새로 만든 컨트롤파일에는 인스턴스 복구에 필요한 정보가 없어 자동 복구가 되지 않는다.
+-- 미디어 복구를 수동으로 수행해야 하며 백업 컨트롤파일로 취급되므로 절이 필요하다.
+
+SYS@orcl> RECOVER DATABASE;
+ORA-00283: recovery session canceled due to errors
+ORA-01610: recovery using the BACKUP CONTROLFILE option must be done
+
+-- << 수정 >>
+
+SYS@orcl> SELECT l.group#, l.sequence#, l.status, f.member
+  2  FROM   v$log l, v$logfile f WHERE l.group# = f.group# ORDER BY l.sequence#;
+
+    GROUP#  SEQUENCE# STATUS     MEMBER
+---------- ---------- ---------- --------------------------------------------
+         4         11 INACTIVE   /u01/app/oracle/oradata/ORCL/redo04.log
+         1         12 INACTIVE   /u01/app/oracle/oradata/ORCL/redo01.log
+         3         13 CURRENT    /u01/app/oracle/oradata/ORCL/redo03.log
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE;
+ORA-00279: change 2434200 generated at 13/05/2025 13:10:02 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_12_1200576220.dbf
+ORA-00280: change 2434200 for thread 1 is in sequence #12
+
+Log applied.
+
+ORA-00279: change 2434460 generated at 13/05/2025 13:14:20 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_13_1200576220.dbf
+ORA-00280: change 2434460 for thread 1 is in sequence #13
+
+ORA-00308: cannot open archived log '/u02/arch1/1_13_1200576220.dbf'
+ORA-27037: unable to obtain file status
+
+-- 시퀀스 13은 CURRENT라 아카이브되지 않았다.
+
+SYS@orcl> SET AUTORECOVERY OFF
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE;
+ORA-00279: change 2434460 generated at 13/05/2025 13:14:20 needed for thread 1
+ORA-00280: change 2434460 for thread 1 is in sequence #13
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+/u01/app/oracle/oradata/ORCL/redo03.log
+Log applied.
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT id, memo FROM hr.emp117 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 archived
+         2 current redo
+
+-- CURRENT 리두에만 있던 2번 행까지 살아났다. 완전 복구다.
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2434720 NO
+         3            2434720 NO
+         4            2434720 NO
+         7            2434720 NO
+
+-- FUZZY가 NO로 바뀌었다.
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  WHERE  status = 'CURRENT';
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+          12           2434720 CURRENT
+
+-- NORESETLOGS 형식으로 만들었어도 RESETLOGS가 강제되었다.
+-- USING BACKUP CONTROLFILE 로 복구했기 때문이다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$datafile WHERE name LIKE '%UNNAMED%';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM v$controlfile;
+
+  COUNT(*)
+----------
+         3
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch11 && mkdir -p /home/oracle/backup/ch11
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch11/
+SYS@orcl> !rm -f /home/oracle/backup/ch11/temp01.dbf
+SYS@orcl> STARTUP
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_after_117.sql';
+Database altered.
+
+-- 실무 포인트
+-- 1) 컨트롤파일 생성 성공과 오픈 가능은 다른 문제다.
+--    비정상 종료 상태에서는 적용할 리두가 남아 ORA-01113으로 막힌다.
+--    실습 11-6에서는 FUZZY가 NO여서 그대로 열렸다.
+--
+-- 2) 새로 만든 컨트롤파일도 백업 컨트롤파일이다.
+--    RECOVER DATABASE 만 쓰면 ORA-01610이 나온다.
+--    리두 적용 이력이 없어 어디까지 복구되었는지 알 수 없기 때문이다.
+--
+-- 3) NORESETLOGS 형식으로 만들었어도 RESETLOGS가 강제된다.
+--    형식 선택과 최종 오픈 방식은 별개의 문제다.
+--    USING BACKUP CONTROLFILE 로 복구했다면 예외 없이 RESETLOGS다.
+--
+-- 4) 아카이브가 자동 적용되고 마지막 구간만 수동이다.
+--    CURRENT 그룹의 리두는 아직 아카이브되지 않아 ORA-00308로 멈춘다.
+--    AUTORECOVERY를 끄고 그 그룹의 멤버 경로를 입력하면 완전 복구가 된다.
+--
+-- 5) 데이터 손실은 없다.
+--    아카이브와 온라인 리두가 모든 구간을 담당했기 때문이다.
+--    손실을 만드는 것은 CURRENT 리두 자체의 손상뿐이다.
+--
+-- 6) trace 재생성이므로 TEMP를 추가해야 한다.
+--    복구 후 확인 항목에 UNNAMED 유무와 TEMP, 사본 수를 포함한다.
+
+SYS@orcl> EXIT

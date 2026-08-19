@@ -1,0 +1,325 @@
+================================================================================
+ 실습 10-2 : Time-based 불완전 복구와 READ ONLY 검증
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 사용자가 대량 UPDATE를 잘못 수행해 그 직전 시점으로 되돌린다.
+-- 사고 시각을 근거로 UNTIL TIME 을 지정한다.
+-- RESETLOGS 전에 READ ONLY로 열어 복구 지점을 검증한다.
+-- 목표보다 이른 지점이면 이어서 적용할 수 있음을 확인한다.
+-- 복구 유형 : 불완전 복구(Time-based, 의도적 시점 복귀)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 10-1을 마친 상태에서 이어서 진행한다.
+-- Flashback 등 대안이 없는 상황을 가정한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> ALTER SESSION SET nls_date_format = 'YYYY-MM-DD HH24:MI:SS';
+Session altered.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2421400
+
+SYS@orcl> CREATE TABLE hr.emp102 TABLESPACE users
+  2  AS SELECT employee_id, last_name, salary FROM hr.employees;
+Table created.
+SYS@orcl> COMMIT;
+
+SYS@orcl> SELECT COUNT(*), MAX(salary) FROM hr.emp102;
+
+  COUNT(*) MAX(SALARY)
+---------- -----------
+       107       24000
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+SYS@orcl> INSERT INTO hr.insa_2025 VALUES (10, SYSDATE);
+SYS@orcl> COMMIT;
+SYS@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS now FROM dual;
+
+NOW
+--------
+10:14:22
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 잘못된 대량 UPDATE
+--------------------------------------------------------------------------------
+-- [터미널 2] 사용자가 WHERE 절을 빠뜨린 UPDATE를 수행한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus hr/hr@orcl
+
+HR@orcl> UPDATE emp102 SET salary = 0;
+107 rows updated.
+
+HR@orcl> COMMIT;
+Commit complete.
+
+HR@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS now FROM dual;
+
+NOW
+--------
+10:22:40
+
+-- [터미널 1]
+
+SYS@orcl> SELECT COUNT(*), MAX(salary) FROM hr.emp102;
+
+  COUNT(*) MAX(SALARY)
+---------- -----------
+       107           0
+
+-- 모든 급여가 0이 되었다.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@orcl> INSERT INTO hr.insa_2025 VALUES (11, SYSDATE);
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT employee_id, last_name, salary FROM hr.emp102
+  2  WHERE  ROWNUM <= 3;
+
+EMPLOYEE_ID LAST_NAME       SALARY
+----------- ------------ ---------
+        100 King                 0
+        101 Kochhar              0
+        102 De Haan              0
+
+-- 데이터는 있으나 값이 잘못되었다. 장애가 아니라 논리적 오류다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$recover_file;
+
+  COUNT(*)
+----------
+         0
+
+-- 파일 손상은 없다. 복구 대상 파일이 없다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- 대안을 먼저 검토한다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp102 AS OF TIMESTAMP
+  2    TO_TIMESTAMP('2025-05-12 10:20:00', 'YYYY-MM-DD HH24:MI:SS');
+SELECT COUNT(*) FROM hr.emp102 AS OF TIMESTAMP
+                     *
+ERROR at line 1:
+ORA-01555: snapshot too old: rollback segment number 3 with name
+"_SYSSMU3_2421748942$" too small
+
+-- UNDO 보존 기간을 넘겨 Flashback Query가 불가능하다.
+-- Flashback Database도 활성화되어 있지 않다.
+
+SYS@orcl> SELECT flashback_on FROM v$database;
+
+FLASHBACK_ON
+------------------
+NO
+
+-- 전체 시점 복구를 선택한다.
+
+SYS@orcl> SELECT sequence#, first_change#, next_change#,
+  2         TO_CHAR(first_time, 'HH24:MI:SS') AS first_time
+  3  FROM   v$log_history ORDER BY sequence# DESC FETCH FIRST 5 ROWS ONLY;
+
+ SEQUENCE# FIRST_CHANGE# NEXT_CHANGE# FIRST_TIME
+---------- ------------- ------------ ----------
+         5       2422600      2422940 10:24:10
+         4       2422180      2422600 10:22:35
+         3       2421800      2422180 10:14:18
+         2       2421400      2421800 10:08:02
+         1       2420101      2421400 09:56:40
+
+SYS@orcl> !ls /home/oracle/backup/ch10/*.dbf | wc -l
+7
+
+-- 판정
+--   ① 사고 시각 : 10:22:40 (COMMIT 시각)
+--   ② 목표 지점 : 10:22:40 직전
+--   ③ 백업본 : 09:56 시점의 전체 백업 보유
+--   ④ 아카이브 : 시퀀스 1~5 연속 보유
+--   → UNTIL TIME 으로 사고 직전까지 복구
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_102
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/before_recover_102/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> !cp -p /home/oracle/backup/ch10/*.dbf /u02/oradata/ORCL/
+
+-- 안전하게 잡으려고 목표보다 이른 시각을 지정한다.
+
+SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 10:10:00';
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN READ ONLY;
+Database altered.
+
+SYS@orcl> SELECT COUNT(*), MAX(salary) FROM hr.emp102;
+
+  COUNT(*) MAX(SALARY)
+---------- -----------
+       107       24000
+
+-- 잘못된 UPDATE는 사라졌다.
+
+SYS@orcl> SELECT id, TO_CHAR(order_date, 'HH24:MI:SS') AS t FROM hr.insa_2025 ORDER BY id;
+
+        ID T
+---------- --------
+         1 09:04:11
+         2 09:08:30
+
+-- << 원인 파악 >>
+-- 10:14:22에 넣은 10번 행이 사라졌다.
+-- 그것은 정상 업무 데이터이며 되돌릴 대상이 아니었다.
+-- 목표 시각을 10:10으로 잡아 12분 이르게 복구된 것이다.
+-- 되돌릴 변경만 사라져야 하고 정상 데이터는 남아야 한다.
+-- 아직 RESETLOGS를 하지 않았으므로 더 적용할 수 있다.
+
+SYS@orcl> SELECT TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS now
+  2  FROM   v$database;
+
+NOW
+--------
+10:09:58
+
+-- << 수정 >>
+-- 사고 직전인 10:22:30 까지 이어서 적용한다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+
+SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 10:22:30';
+Media recovery complete.
+
+-- 복원을 다시 하지 않았다. 멈춘 지점부터 이어서 적용되었다.
+
+SYS@orcl> ALTER DATABASE OPEN READ ONLY;
+
+SYS@orcl> SELECT COUNT(*), MAX(salary) FROM hr.emp102;
+
+  COUNT(*) MAX(SALARY)
+---------- -----------
+       107       24000
+
+SYS@orcl> SELECT id, TO_CHAR(order_date, 'HH24:MI:SS') AS t FROM hr.insa_2025 ORDER BY id;
+
+        ID T
+---------- --------
+         1 09:04:11
+         2 09:08:30
+        10 10:14:22
+
+-- 잘못된 UPDATE는 사라지고 정상 업무 데이터는 남았다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT COUNT(*), MAX(salary), MIN(salary) FROM hr.emp102;
+
+  COUNT(*) MAX(SALARY) MIN(SALARY)
+---------- ----------- -----------
+       107       24000        2100
+
+SYS@orcl> SELECT checkpoint_change# AS recovered_scn,
+  2         TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS recovered_time
+  3  FROM   v$database;
+
+RECOVERED_SCN RECOVERED_TIME
+------------- --------------
+      2422580 10:22:28
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  ORDER BY incarnation#;
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           1                 1 PARENT
+           2           2420100 PARENT
+           3           2422580 CURRENT
+
+SYS@orcl> SELECT id FROM hr.insa_2025 ORDER BY id;
+
+        ID
+----------
+         1
+         2
+        10
+
+-- 사고 이후 넣은 11번은 사라졌다. 예상된 손실이다.
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+Tablespace altered.
+
+-- 손실 구간을 정리한다.
+--   복구 지점 : 10:22:28
+--   손실 구간 : 10:22:28 이후 ~ 복구 시작 시각
+--   영향 : hr.insa_2025 의 11번 이후 데이터, 그 시간대의 모든 업무
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch10 && mkdir -p /home/oracle/backup/ch10
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch10/
+SYS@orcl> !rm -f /home/oracle/backup/ch10/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) 논리적 오류에는 대안을 먼저 검토한다.
+--    Flashback Query, Flashback Table, Flashback Database, RECOVER TABLE 순으로 확인한다.
+--    전체 시점 복구는 정상 업무까지 되돌리므로 최후의 선택지다.
+--
+-- 2) NLS_DATE_FORMAT 을 먼저 지정한다.
+--    형식이 환경마다 달라 지정하지 않으면 혼동이 생긴다.
+--
+-- 3) 목표보다 이르게 잡고 READ ONLY로 확인하며 나아간다.
+--    부족하면 이어서 적용할 수 있지만 지나치면 복원부터 다시 해야 한다.
+--    이 비대칭이 보수적 접근을 권장하는 이유다.
+--
+-- 4) 검증은 두 방향으로 한다.
+--    되돌리려던 변경이 사라졌는가와 정상 데이터가 남아 있는가를 함께 본다.
+--    한쪽만 보면 이 실습의 첫 시도처럼 잘못된 판단을 하게 된다.
+--
+-- 5) 이어서 적용할 때는 복원이 필요 없다.
+--    SHUTDOWN 후 MOUNT에서 RECOVER를 다시 수행하면 멈춘 지점부터 진행된다.
+--    이미 적용한 리두를 다시 적용하지 않는다.
+--
+-- 6) 사고 이후의 정상 업무도 함께 사라진다.
+--    이 실습에서 11번 행이 그렇다. 손실 구간을 현업에 정확히 통보해야 한다.
+
+SYS@orcl> EXIT

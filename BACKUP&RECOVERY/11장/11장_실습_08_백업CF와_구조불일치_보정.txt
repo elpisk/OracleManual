@@ -1,0 +1,385 @@
+================================================================================
+ 실습 11-8 : 백업 컨트롤파일과 현재 구조 불일치 보정
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 컨트롤파일 백업 이후 데이터파일을 추가하고 다른 테이블스페이스를 삭제했다.
+-- 그 백업본으로 복구하면 추가된 파일은 UNNAMED로, 삭제된 파일은 부재로 나타난다.
+-- RENAME FILE 과 CREATE DATAFILE, OFFLINE DROP 세 가지 보정을 모두 다룬다.
+-- ARCHIVELOG 환경에서는 대부분의 어긋남을 보정할 수 있다.
+-- 복구 유형 : 완전 복구(구조 보정 포함)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 11-7을 마친 상태에서 이어서 진행한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a58
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : 백업 후 구조 변경
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name FROM v$datafile ORDER BY file#;
+
+     FILE# NAME
+---------- ----------------------------------------------------------
+         1 /u02/oradata/ORCL/system01.dbf
+         3 /u02/oradata/ORCL/sysaux01.dbf
+         4 /u02/oradata/ORCL/undotbs01.dbf
+         7 /u02/oradata/ORCL/users01.dbf
+        10 /u02/oradata/ORCL/hist01.dbf
+        11 /u02/oradata/ORCL/tbs01.dbf
+        12 /u02/oradata/ORCL/tbs02.dbf
+
+7 rows selected.
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO
+  2    '/home/oracle/backup/control_118.bkp';
+Database altered.
+
+-- 이 시점의 백업본에는 일곱 개 파일이 들어 있다.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+-- 이후 구조를 두 가지로 바꾼다.
+
+SYS@orcl> CREATE TABLESPACE tbs11
+  2    DATAFILE '/u02/oradata/ORCL/tbs11.dbf' SIZE 20M;
+Tablespace created.
+
+SYS@orcl> CREATE TABLE hr.emp118 TABLESPACE tbs11
+  2  AS SELECT employee_id, last_name FROM hr.employees;
+Table created.
+SYS@orcl> COMMIT;
+
+SYS@orcl> DROP TABLESPACE tbs02 INCLUDING CONTENTS AND DATAFILES;
+Tablespace dropped.
+
+SYS@orcl> SELECT file#, name FROM v$datafile ORDER BY file#;
+
+     FILE# NAME
+---------- ----------------------------------------------------------
+         1 /u02/oradata/ORCL/system01.dbf
+         3 /u02/oradata/ORCL/sysaux01.dbf
+         4 /u02/oradata/ORCL/undotbs01.dbf
+         7 /u02/oradata/ORCL/users01.dbf
+        10 /u02/oradata/ORCL/hist01.dbf
+        11 /u02/oradata/ORCL/tbs01.dbf
+        13 /u02/oradata/ORCL/tbs11.dbf
+
+7 rows selected.
+
+-- 12번이 사라지고 13번이 추가되었다. 백업본과 어긋난 상태다.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 컨트롤파일 전손
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+
+SYS@orcl> !ls /home/oracle/backup/*.sql 2>/dev/null | tail -1
+/home/oracle/backup/cf_after_117.sql
+
+-- trace 백업도 구조 변경 이전 것이라고 가정한다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> SHUTDOWN ABORT
+SYS@orcl> !cp -p /home/oracle/backup/control_118.bkp \
+                 /u01/app/oracle/oradata/ORCL/control01.ctl
+SYS@orcl> !cp -p /home/oracle/backup/control_118.bkp \
+                 /u01/app/oracle/oradata/ORCL/control02.ctl
+SYS@orcl> !cp -p /home/oracle/backup/control_118.bkp /u02/oradata/ORCL/control03.ctl
+
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@orcl> SELECT COUNT(*) FROM v$datafile;
+
+  COUNT(*)
+----------
+         7
+
+SYS@orcl> SELECT file#, name FROM v$datafile ORDER BY file#;
+
+     FILE# NAME
+---------- ----------------------------------------------------------
+         1 /u02/oradata/ORCL/system01.dbf
+         3 /u02/oradata/ORCL/sysaux01.dbf
+         4 /u02/oradata/ORCL/undotbs01.dbf
+         7 /u02/oradata/ORCL/users01.dbf
+        10 /u02/oradata/ORCL/hist01.dbf
+        11 /u02/oradata/ORCL/tbs01.dbf
+        12 /u02/oradata/ORCL/tbs02.dbf
+
+7 rows selected.
+
+-- 컨트롤파일은 지워진 12번을 알고 있고 추가된 13번은 모른다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf | grep -v temp
+/u02/oradata/ORCL/hist01.dbf
+/u02/oradata/ORCL/sysaux01.dbf
+/u02/oradata/ORCL/system01.dbf
+/u02/oradata/ORCL/tbs01.dbf
+/u02/oradata/ORCL/tbs11.dbf
+/u02/oradata/ORCL/undotbs01.dbf
+/u02/oradata/ORCL/users01.dbf
+
+-- 실제로는 tbs11.dbf 가 있고 tbs02.dbf 가 없다.
+
+SYS@orcl> SELECT file#, error FROM v$recover_file;
+
+     FILE# ERROR
+---------- --------------------
+         1
+         3
+         4
+         7
+        10
+        11
+        12 FILE NOT FOUND
+
+-- 12번은 실제로 없는 파일이다.
+
+SYS@orcl> SELECT MIN(sequence#), MAX(sequence#), COUNT(*),
+  2         MAX(sequence#) - MIN(sequence#) + 1 AS expected
+  3  FROM   v$archived_log WHERE status = 'A';
+
+MIN(SEQUENCE#) MAX(SEQUENCE#)   COUNT(*)   EXPECTED
+-------------- -------------- ---------- ----------
+             1              3          3          3
+
+-- 아카이브가 연속이다. 구조 변경 기록도 리두에 남아 있다.
+
+-- 판정
+--   ① 백업 CF는 구조 변경 이전 것
+--   ② 12번(삭제됨) : OFFLINE DROP 으로 정리
+--   ③ 13번(추가됨) : 복구 중 UNNAMED로 등록 → RENAME 또는 CREATE DATAFILE
+--   → USING BACKUP CONTROLFILE 복구 중 두 보정을 함께 수행
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_118
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/before_recover_118/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE;
+ORA-00283: recovery session canceled due to errors
+ORA-01110: data file 12: '/u02/oradata/ORCL/tbs02.dbf'
+ORA-01157: cannot identify/lock data file 12 - see DBWR trace file
+
+-- << 원인 파악 >>
+-- 12번 파일은 백업 이후 DROP TABLESPACE 로 지운 것이다.
+-- 컨트롤파일은 그 사실을 모르므로 파일을 요구한다.
+-- 실제로는 필요 없는 파일이므로 복구 대상에서 제외해야 한다.
+-- OFFLINE DROP 으로 떼어 내면 그 파일을 무시하고 진행할 수 있다.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 12;
+
+     FILE# NAME                                                       STATUS
+---------- ---------------------------------------------------------- -------
+        12 /u02/oradata/ORCL/tbs02.dbf                                RECOVER
+
+-- << 수정 >>
+
+SYS@orcl> ALTER DATABASE DATAFILE 12 OFFLINE DROP;
+
+Database altered.
+
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE;
+ORA-00279: change 2434900 generated at 13/05/2025 14:02:10 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_2_1200580210.dbf
+ORA-00280: change 2434900 for thread 1 is in sequence #2
+
+Log applied.
+
+ORA-00279: change 2435180 generated at 13/05/2025 14:08:44 needed for thread 1
+ORA-00280: change 2435180 for thread 1 is in sequence #3
+
+Log applied.
+
+ORA-00308: cannot open archived log '/u02/arch1/1_4_1200580210.dbf'
+
+SYS@orcl> SET AUTORECOVERY OFF
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE;
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+/u01/app/oracle/oradata/ORCL/redo03.log
+Log applied.
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+-- 열렸다. 그러나 추가된 파일이 문제로 남아 있다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp118;
+SELECT COUNT(*) FROM hr.emp118
+                     *
+ERROR at line 1:
+ORA-00376: file 13 cannot be read at this time
+ORA-01111: name for data file 13 is unknown - rename to correct file
+ORA-01110: data file 13:
+           '/u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00013'
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 13;
+
+     FILE# NAME                                                       STATUS
+---------- ---------------------------------------------------------- -------
+        13 /u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00013   RECOVER
+
+-- 복구 과정에서 리두를 적용하다 13번의 존재를 알게 되어 임시 이름으로 등록했다.
+-- 실제 파일이 있으므로 RENAME FILE 로 연결한다.
+
+SYS@orcl> !ls -l /u02/oradata/ORCL/tbs11.dbf
+-rw-r-----. 1 oracle oinstall 20979712 May 13 14:05 tbs11.dbf
+
+SYS@orcl> ALTER TABLESPACE tbs11 OFFLINE IMMEDIATE;
+Tablespace altered.
+
+SYS@orcl> ALTER DATABASE RENAME FILE
+  2    '/u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00013'
+  3  TO '/u02/oradata/ORCL/tbs11.dbf';
+
+Database altered.
+
+SYS@orcl> RECOVER TABLESPACE tbs11;
+Media recovery complete.
+
+SYS@orcl> ALTER TABLESPACE tbs11 ONLINE;
+
+Tablespace altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp118;
+
+  COUNT(*)
+----------
+       107
+
+-- 추가된 테이블스페이스의 데이터가 살아났다.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile ORDER BY file#;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         1 /u02/oradata/ORCL/system01.dbf                SYSTEM
+         3 /u02/oradata/ORCL/sysaux01.dbf                ONLINE
+         4 /u02/oradata/ORCL/undotbs01.dbf               ONLINE
+         7 /u02/oradata/ORCL/users01.dbf                 ONLINE
+        10 /u02/oradata/ORCL/hist01.dbf                  ONLINE
+        11 /u02/oradata/ORCL/tbs01.dbf                   ONLINE
+        12 /u02/oradata/ORCL/tbs02.dbf                   RECOVER
+        13 /u02/oradata/ORCL/tbs11.dbf                   ONLINE
+
+8 rows selected.
+
+-- 12번이 RECOVER 상태로 남아 있다. 지운 테이블스페이스이므로 정리한다.
+
+SYS@orcl> DROP TABLESPACE tbs02 INCLUDING CONTENTS;
+
+Tablespace dropped.
+
+SYS@orcl> SELECT COUNT(*) FROM v$datafile;
+
+  COUNT(*)
+----------
+         7
+
+SYS@orcl> SELECT COUNT(*) FROM v$datafile WHERE name LIKE '%UNNAMED%';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  WHERE  status = 'CURRENT';
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+          13           2435460 CURRENT
+
+-- 현재 구조를 반영한 백업을 즉시 받는다.
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO
+  2    '/home/oracle/backup/control_after_118.bkp';
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_after_118.sql';
+Database altered.
+
+-- 매니페스트도 함께 남긴다.
+
+SYS@orcl> SET PAGESIZE 200
+SYS@orcl> SPOOL /home/oracle/backup/manifest_118.txt
+SYS@orcl> SELECT dbid, name, checkpoint_change#, resetlogs_change# FROM v$database;
+SYS@orcl> SELECT file#, name, bytes/1024/1024 AS mb, status FROM v$datafile ORDER BY file#;
+SYS@orcl> SELECT group#, member FROM v$logfile ORDER BY group#;
+SYS@orcl> SELECT name FROM v$controlfile;
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation;
+SYS@orcl> SPOOL OFF
+
+SYS@orcl> !grep -c 'dbf' /home/oracle/backup/manifest_118.txt
+8
+
+-- 실무 포인트
+-- 1) 구조 변경은 두 방향으로 어긋남을 만든다.
+--    추가된 파일은 UNNAMED로 등록되고 삭제된 파일은 부재로 나타난다.
+--    두 경우의 보정 방법이 다르므로 구분해야 한다.
+--
+-- 2) 삭제된 파일은 OFFLINE DROP 으로 떼어 낸다.
+--    복구가 그 파일을 요구해 ORA-01157로 막히므로 복구 전에 처리한다.
+--    OPEN 후 DROP TABLESPACE INCLUDING CONTENTS 로 완전히 정리한다.
+--
+-- 3) 추가된 파일은 오류 없이 열린 뒤에 드러난다.
+--    그 테이블을 읽는 순간 ORA-00376과 ORA-01111이 나온다.
+--    복구 직후 v$datafile 에서 UNNAMED 경로를 확인하면 미리 발견할 수 있다.
+--
+-- 4) 실제 파일이 있으면 RENAME FILE, 없으면 CREATE DATAFILE 이다.
+--    RENAME은 OFFLINE 상태에서 수행하며 이후 RECOVER 로 마무리한다.
+--    ARCHIVELOG 환경이므로 두 방법 모두 성공률이 높다.
+--
+-- 5) 근본 대책은 구조 변경 직후 컨트롤파일 백업이다.
+--    이 실습의 모든 절차는 백업을 미룬 데서 비롯되었다.
+--    Binary와 trace를 함께 받고 매니페스트도 갱신한다.
+--
+-- 6) 매니페스트의 파일 개수를 백업본과 대조하는 절차를 만든다.
+--    이 실습에서는 백업본 7개와 실제 7개가 같았지만 내용이 달랐다.
+--    개수만이 아니라 파일 목록 자체를 비교해야 한다.
+
+SYS@orcl> EXIT

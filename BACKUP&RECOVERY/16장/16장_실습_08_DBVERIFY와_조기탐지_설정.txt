@@ -1,0 +1,294 @@
+================================================================================
+ 실습 16-8 : DBVERIFY(dbv)와 조기 탐지 파라미터 설정
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- dbv로 데이터파일과 백업 파일을 검사한다.
+-- 결과 항목의 의미를 해석한다.
+-- DB_BLOCK_CHECKSUM과 DB_BLOCK_CHECKING을 설정한다.
+-- 정기 검사 절차를 만든다.
+-- 작업 유형 : 예방 점검(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 16-7까지 완료되어 손상이 정리된 상태여야 한다.
+
+[oracle@oel7v9r1 ~]$ rman target /
+RMAN> VALIDATE DATAFILE 7;
+
+7    OK     0              380          1280            2717600
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ which dbv
+/u01/app/oracle/product/19.3.0/dbhome_1/bin/dbv
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SHOW PARAMETER db_block_check
+
+NAME                 TYPE    VALUE
+-------------------- ------- --------
+db_block_checking    string  FALSE
+db_block_checksum    string  TYPICAL
+
+-- 기본 상태다. checking은 꺼져 있다.
+
+SYS@orcl> SELECT file#, name, block_size FROM v$datafile ORDER BY file#;
+
+     FILE# NAME                                       BLOCK_SIZE
+---------- ------------------------------------------ ----------
+         1 /u03/oradata/ORCL/system01.dbf                   8192
+         3 /u03/oradata/ORCL/sysaux01.dbf                   8192
+         4 /u03/oradata/ORCL/undotbs01.dbf                  8192
+         7 /u02/oradata/ORCL/users01.dbf                    8192
+         8 /u03/oradata/ORCL/tbs13_01.dbf                   8192
+
+-- dbv에 넘길 blocksize를 확인했다.
+
+SYS@orcl> EXIT
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : dbv로 데이터파일 검사
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ dbv file=/u02/oradata/ORCL/users01.dbf blocksize=8192
+
+DBVERIFY: Release 19.0.0.0.0 - Production on Sun May 18 15:02:11 2025
+
+Copyright (c) 1982, 2019, Oracle and/or its affiliates.  All rights reserved.
+
+DBVERIFY - Verification starting : FILE = /u02/oradata/ORCL/users01.dbf
+
+DBVERIFY - Verification complete
+
+Total Pages Examined         : 1280
+Total Pages Processed (Data) : 596
+Total Pages Failing   (Data) : 0
+Total Pages Processed (Index): 0
+Total Pages Failing   (Index): 0
+Total Pages Processed (Other): 62
+Total Pages Processed (Seg)  : 0
+Total Pages Failing   (Seg)  : 0
+Total Pages Empty            : 622
+Total Pages Marked Corrupt   : 0
+Total Pages Influx           : 0
+Total Pages Encrypted        : 0
+Highest block SCN            : 2717600 (0.2717600)
+
+-- 항목의 의미
+--   Examined        : 검사한 전체 블록 수
+--   Processed (Data): 데이터가 있는 블록
+--   Failing         : 검사에 실패한 블록 (손상)
+--   Empty           : 사용되지 않은 블록
+--   Marked Corrupt  : 손상으로 표시된 블록
+--   Influx          : 검사 중 변경된 블록 (열린 상태에서 검사 시 발생)
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 열린 상태에서의 검사
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "INSERT INTO hr.blk165 SELECT LEVEL+1000, RPAD('w',2000,'w')
+   FROM dual CONNECT BY LEVEL <= 200; COMMIT;"
+
+200 rows created.
+Commit complete.
+
+[oracle@oel7v9r1 ~]$ dbv file=/u02/oradata/ORCL/users01.dbf blocksize=8192 \
+>   logfile=/tmp/dbv_open.log
+
+[oracle@oel7v9r1 ~]$ grep -E 'Influx|Corrupt|Examined' /tmp/dbv_open.log
+Total Pages Examined         : 1280
+Total Pages Marked Corrupt   : 0
+Total Pages Influx           : 2
+
+-- Influx가 2다. 검사 중에 변경된 블록이 있다는 뜻이다.
+-- 손상이 아니라 정상 동작이며 열린 상태에서 검사하면 나타난다.
+-- 정확한 검사가 필요하면 데이터베이스를 내리거나 RMAN VALIDATE를 쓴다.
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : 백업 파일 검사
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP AS COPY DATAFILE 7
+  2>   FORMAT '/home/oracle/rmancopy/users01_check.dbf' TAG 'FOR_DBV';
+
+Starting backup at 18-MAY-25
+Finished backup at 18-MAY-25
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ dbv file=/home/oracle/rmancopy/users01_check.dbf \
+>   blocksize=8192 logfile=/tmp/dbv_copy.log
+
+[oracle@oel7v9r1 ~]$ grep -E 'Corrupt|Influx|Examined' /tmp/dbv_copy.log
+Total Pages Examined         : 1280
+Total Pages Marked Corrupt   : 0
+Total Pages Influx           : 0
+
+-- 이미지 카피는 정지된 사본이므로 Influx가 0이다.
+-- 원격지로 옮긴 백업 파일의 무결성을 확인할 때 이 방법을 쓴다.
+-- 백업 세트는 RMAN 고유 형식이라 dbv로 검사할 수 없다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- blocksize를 잘못 지정해 본다.
+
+[oracle@oel7v9r1 ~]$ dbv file=/u02/oradata/ORCL/users01.dbf blocksize=4096
+
+DBVERIFY: Release 19.0.0.0.0 - Production
+
+DBVERIFY - Verification starting : FILE = /u02/oradata/ORCL/users01.dbf
+DBV-00600: Fatal Error - [16388] [37] [0] [0]
+
+-- << 원인 파악 >>
+-- 파일의 실제 블록 크기와 지정한 값이 다르면 검사할 수 없다.
+-- v$datafile 의 BLOCK_SIZE 컬럼으로 확인해야 한다.
+-- 기본값은 2048이므로 대부분의 환경에서 반드시 지정해야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT DISTINCT block_size FROM v\$datafile;"
+
+BLOCK_SIZE
+----------
+      8192
+
+-- << 수정 >>
+
+[oracle@oel7v9r1 ~]$ dbv file=/u02/oradata/ORCL/users01.dbf blocksize=8192 \
+>   logfile=/tmp/dbv_fixed.log
+
+[oracle@oel7v9r1 ~]$ tail -4 /tmp/dbv_fixed.log
+Total Pages Marked Corrupt   : 0
+Total Pages Influx           : 0
+Total Pages Encrypted        : 0
+Highest block SCN            : 2718400 (0.2718400)
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트 — 조기 탐지 설정
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+-- 값을 잘못 지정해 본다.
+
+SYS@orcl> ALTER SYSTEM SET db_block_checking = HIGH SCOPE = BOTH;
+ALTER SYSTEM SET db_block_checking = HIGH SCOPE = BOTH
+*
+ERROR at line 1:
+ORA-00096: invalid value HIGH for parameter db_block_checking, must be from
+among OFF, FULL, MEDIUM, LOW, TRUE, FALSE
+
+-- << 원인 파악 >>
+-- db_block_checking 이 받는 값은 OFF, LOW, MEDIUM, FULL 이다.
+-- db_block_checksum 의 값(OFF, TYPICAL, FULL)과 혼동하기 쉽다.
+-- 두 파라미터의 이름이 비슷해 값을 서로 바꿔 쓰는 실수가 흔하다.
+-- 오류 메시지가 가능한 값을 모두 알려 주므로 그대로 고르면 된다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER SYSTEM SET db_block_checksum = FULL SCOPE = BOTH;
+
+System altered.
+
+SYS@orcl> ALTER SYSTEM SET db_block_checking = MEDIUM SCOPE = BOTH;
+
+System altered.
+
+SYS@orcl> SHOW PARAMETER db_block_check
+
+NAME                 TYPE    VALUE
+-------------------- ------- --------
+db_block_checking    string  MEDIUM
+db_block_checksum    string  FULL
+
+-- 설정 후 부하를 간단히 비교해 본다.
+
+SYS@orcl> SET TIMING ON
+SYS@orcl> INSERT INTO hr.blk165
+  2  SELECT LEVEL+2000, RPAD('v',2000,'v') FROM dual CONNECT BY LEVEL <= 2000;
+
+2000 rows created.
+
+Elapsed: 00:00:02.41
+
+SYS@orcl> COMMIT;
+SYS@orcl> SET TIMING OFF
+
+-- 설정 전에 같은 작업이 2.1초였다면 약 15% 늘어난 셈이다.
+-- 환경에 따라 다르므로 실제로 측정해 판단한다.
+
+SYS@orcl> CREATE PFILE='/home/oracle/backup/initorcl_check.ora' FROM SPFILE;
+
+File created.
+
+-- 파라미터를 바꿨으므로 사본을 남긴다.
+
+SYS@orcl> EXIT
+
+-- 정기 검사 스크립트를 만든다.
+
+[oracle@oel7v9r1 ~]$ cat > /home/oracle/rman/monthly_check.sh <<'EOS'
+#!/bin/bash
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export ORACLE_SID=orcl
+export PATH=$ORACLE_HOME/bin:$PATH
+LOG=/home/oracle/rman/log/check_$(date +%Y%m%d).log
+
+rman target / log=$LOG <<EOF
+VALIDATE CHECK LOGICAL DATABASE;
+EOF
+
+sqlplus -s / as sysdba >> $LOG <<EOF
+SELECT file#, block#, blocks, corruption_type
+FROM   v\$database_block_corruption;
+EOF
+
+if grep -qE 'FAILED|corruption' $LOG; then
+  echo "[ORCL] block corruption detected - see $LOG"
+  exit 1
+fi
+echo "[ORCL] monthly check OK"
+EOS
+
+[oracle@oel7v9r1 ~]$ chmod 700 /home/oracle/rman/monthly_check.sh
+[oracle@oel7v9r1 ~]$ /home/oracle/rman/monthly_check.sh
+[ORCL] monthly check OK
+
+[oracle@oel7v9r1 ~]$ crontab -l | tail -1
+0 3 1 * * /home/oracle/rman/monthly_check.sh >> /home/oracle/rman/log/cron.log 2>&1
+
+-- 매월 1일 새벽 3시에 수행하도록 등록했다.
+
+-- 실무 포인트
+-- 1) dbv는 데이터베이스 밖에서 파일을 검사한다.
+--    인스턴스가 내려간 상태에서도 쓸 수 있어 백업 파일 검증에 유용하다.
+--    다만 백업 세트는 RMAN 고유 형식이라 검사할 수 없고 이미지 카피만 가능하다.
+--
+-- 2) blocksize를 반드시 지정한다.
+--    기본값이 2048이라 대부분의 환경에서 DBV-00600으로 실패한다.
+--    v$datafile 의 BLOCK_SIZE 컬럼으로 확인한다.
+--
+-- 3) Influx는 손상이 아니다.
+--    검사 중 변경된 블록의 수이며 열린 상태에서 검사하면 나타난다.
+--    정확한 검사가 필요하면 RMAN VALIDATE를 쓴다.
+--
+-- 4) DB_BLOCK_CHECKSUM은 체크섬을, DB_BLOCK_CHECKING은 구조 일관성을 검사한다.
+--    두 파라미터 모두 CPU 부담을 늘리므로 실제로 측정해 판단한다.
+--    MEDIUM 정도가 실무에서 무리 없이 쓰이는 값이다.
+--
+-- 5) 파라미터를 바꿨으면 pfile 사본을 남긴다.
+--    복구 후 값을 비교할 근거가 된다.
+--
+-- 6) 정기 검사를 자동화한다.
+--    월 1회 VALIDATE CHECK LOGICAL DATABASE 와 손상 목록 조회를 묶어
+--    크론에 등록하고 손상이 발견되면 알림이 가도록 만든다.

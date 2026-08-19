@@ -1,0 +1,283 @@
+================================================================================
+ 실습 9-6 : 아카이브가 삭제되었어도 온라인 리두로 완전 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 18분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 복구에 필요한 아카이브가 두 대상 모두에서 삭제되었다.
+-- 그러나 그 구간이 아직 온라인 리두 로그에 남아 있다.
+-- 아카이브는 온라인 리두의 사본이므로 원본으로 대체할 수 있다.
+-- SCN 비교로 판정하고 온라인 리두 경로를 입력해 완전 복구한다.
+-- 복구 유형 : 완전 복구(온라인 리두 대체)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 9-5를 마친 상태에서 이어서 진행한다.
+-- 백업 직후에 장애가 발생하는 조건을 만든다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL member FOR a44
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLESPACE users BEGIN BACKUP;
+SYS@orcl> !cp -p /u02/oradata/ORCL/users01.dbf /home/oracle/backup/ch09/
+SYS@orcl> ALTER TABLESPACE users END BACKUP;
+Tablespace altered.
+
+SYS@orcl> SELECT group#, sequence#, first_change#, status FROM v$log
+  2  ORDER BY sequence#;
+
+    GROUP#  SEQUENCE# FIRST_CHANGE# STATUS
+---------- ---------- ------------- ----------
+         3         49       2416200 INACTIVE
+         4         50       2416640 INACTIVE
+         1         51       2417020 CURRENT
+
+SYS@orcl> INSERT INTO hr.emp94 VALUES (6);
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@orcl> INSERT INTO hr.emp94 VALUES (7);
+SYS@orcl> COMMIT;
+System altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp94;
+
+  COUNT(*)
+----------
+         7
+
+SYS@orcl> SELECT group#, sequence#, first_change#, status FROM v$log
+  2  ORDER BY sequence#;
+
+    GROUP#  SEQUENCE# FIRST_CHANGE# STATUS
+---------- ---------- ------------- ----------
+         4         50       2416640 INACTIVE
+         1         51       2417020 INACTIVE
+         3         52       2417480 CURRENT
+
+-- 시퀀스 50~52가 온라인 리두에 남아 있다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 데이터파일 손상 + 아카이브 전량 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u02/oradata/ORCL/users01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+-- 정리 작업이 두 대상의 최근 아카이브까지 지웠다고 가정한다.
+
+SYS@orcl> !rm -f /u02/arch1/1_51_1200530011.dbf /u03/arch2/1_51_1200530011.dbf
+
+SYS@orcl> !ls /u02/arch1/ | grep '_51_' | wc -l
+0
+SYS@orcl> !ls /u03/arch2/ | grep '_51_' | wc -l
+0
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp94;
+SELECT COUNT(*) FROM hr.emp94
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 7
+ORA-01110: data file 7: '/u02/oradata/ORCL/users01.dbf'
+ORA-27041: unable to open file
+
+SYS@orcl> ALTER TABLESPACE users OFFLINE IMMEDIATE;
+Tablespace altered.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch09/users01.dbf /u02/oradata/ORCL/
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER TABLESPACE users;
+ORA-00279: change 2417020 generated at 11/05/2025 14:32:08 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_51_1200530011.dbf
+ORA-00280: change 2417020 for thread 1 is in sequence #51
+
+ORA-00308: cannot open archived log '/u02/arch1/1_51_1200530011.dbf'
+ORA-27037: unable to obtain file status
+Linux-x86_64 Error: 2: No such file or directory
+
+-- 필요한 아카이브가 없다. 여기서 복구를 포기하기 쉽다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         7                          2417020
+
+-- 복구 시작 SCN은 2417020, 요구 시퀀스는 51이다.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_online FROM v$log;
+
+OLDEST_ONLINE
+-------------
+      2416640
+
+-- 복구 시작 SCN(2417020) >= 최소 온라인 리두 SCN(2416640)
+-- 필요한 구간이 온라인 리두에 남아 있다.
+
+SYS@orcl> SELECT l.group#, l.sequence#, l.status, f.member
+  2  FROM   v$log l, v$logfile f WHERE l.group# = f.group# ORDER BY l.sequence#;
+
+    GROUP#  SEQUENCE# STATUS     MEMBER
+---------- ---------- ---------- --------------------------------------------
+         4         50 INACTIVE   /u01/app/oracle/oradata/ORCL/redo04.log
+         4         50 INACTIVE   /u02/oradata/ORCL/redo04b.log
+         1         51 INACTIVE   /u01/app/oracle/oradata/ORCL/redo01.log
+         1         51 INACTIVE   /u02/oradata/ORCL/redo01b.log
+         3         52 CURRENT    /u01/app/oracle/oradata/ORCL/redo03.log
+         3         52 CURRENT    /u02/oradata/ORCL/redo03b.log
+
+6 rows selected.
+
+-- 요구 시퀀스 51이 그룹 1에 있다. 그 멤버 경로를 입력하면 된다.
+
+-- 판정
+--   ① 아카이브 : 시퀀스 51 없음 → 기본 경로로는 불가
+--   ② 온라인 리두 : 시퀀스 51 보유 → 대체 가능
+--   → 온라인 리두 경로를 프롬프트에 입력해 완전 복구
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- AUTORECOVERY를 켠 채 다시 시도한다.
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER TABLESPACE users;
+ORA-00279: change 2417020 generated at 11/05/2025 14:32:08 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_51_1200530011.dbf
+ORA-00280: change 2417020 for thread 1 is in sequence #51
+
+ORA-00308: cannot open archived log '/u02/arch1/1_51_1200530011.dbf'
+
+-- << 원인 파악 >>
+-- AUTORECOVERY는 아카이브 경로에서만 파일을 찾는다.
+-- 온라인 리두 로그는 후보로 삼지 않으므로 스스로 대체하지 않는다.
+-- 온라인 리두로 대체하려면 프롬프트에서 경로를 직접 입력해야 한다.
+-- 따라서 AUTORECOVERY를 끄고 수동으로 진행한다.
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/redo01.log
+/u01/app/oracle/oradata/ORCL/redo01.log
+
+-- << 수정 >>
+
+SYS@orcl> SET AUTORECOVERY OFF
+SYS@orcl> RECOVER TABLESPACE users;
+ORA-00279: change 2417020 generated at 11/05/2025 14:32:08 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_51_1200530011.dbf
+ORA-00280: change 2417020 for thread 1 is in sequence #51
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+/u01/app/oracle/oradata/ORCL/redo01.log
+Log applied.
+
+ORA-00279: change 2417480 generated at 11/05/2025 14:34:20 needed for thread 1
+ORA-00280: change 2417480 for thread 1 is in sequence #52
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+/u01/app/oracle/oradata/ORCL/redo03.log
+Log applied.
+Media recovery complete.
+
+-- 시퀀스 52는 CURRENT 그룹이며 그 경로도 그대로 입력하면 된다.
+
+SYS@orcl> ALTER TABLESPACE users ONLINE;
+
+Tablespace altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp94;
+
+  COUNT(*)
+----------
+         7
+
+-- 아카이브가 없었는데도 마지막 커밋까지 살아났다. 완전 복구다.
+
+SYS@orcl> SELECT resetlogs_change# FROM v$database;
+
+RESETLOGS_CHANGE#
+-----------------
+                1
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 7;
+
+     FILE# NAME                                  STATUS
+---------- ------------------------------------- -------
+         7 /u02/oradata/ORCL/users01.dbf         ONLINE
+
+-- 반대 경우도 계산해 본다. 로그 스위치를 여러 번 돌리면 조건이 깨진다.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> /
+SYS@orcl> /
+System altered.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_online FROM v$log;
+
+OLDEST_ONLINE
+-------------
+      2418900
+
+-- 만약 지금 같은 장애가 났다면 복구 시작 SCN(2417020) < 2418900 이므로
+-- 온라인 리두로는 대체할 수 없고 아카이브가 반드시 필요했을 것이다.
+
+-- 컨트롤파일 기록과 실제 파일을 맞춘다.
+
+[oracle@oel7v9r1 ~]$ rman target /
+
+RMAN> CROSSCHECK ARCHIVELOG ALL;
+Crosschecked 24 objects
+
+RMAN> DELETE NOPROMPT EXPIRED ARCHIVELOG ALL;
+deleted archived log
+archived log file name=/u02/arch1/1_51_1200530011.dbf RECID=71 STAMP=1200535020
+Deleted 2 EXPIRED objects
+
+RMAN> EXIT
+
+-- 실무 포인트
+-- 1) 아카이브가 없다는 오류를 만나면 포기하기 전에 판정한다.
+--    아카이브는 온라인 리두의 사본이므로 원본이 남아 있으면 대체할 수 있다.
+--    이 판정 하나로 완전 복구와 불완전 복구가 갈린다.
+--
+-- 2) 판정은 SCN 비교다.
+--    복구 시작 SCN이 v$log의 최소 FIRST_CHANGE# 이상이면 온라인 리두로 충분하다.
+--    4장에서 배운 리두 생존 판정과 같은 계산이다.
+--
+-- 3) 실무적으로는 요구 시퀀스가 v$log에 있는지 보는 편이 빠르다.
+--    있으면 그 그룹의 멤버 경로를 입력하면 되고, 없으면 복구 한계다.
+--
+-- 4) AUTORECOVERY는 온라인 리두를 후보로 삼지 않는다.
+--    아카이브 경로에서만 찾으므로 ORA-00308로 멈춘다.
+--    반드시 AUTORECOVERY를 끄고 프롬프트에서 경로를 지정해야 한다.
+--
+-- 5) 이 경로는 백업이 최근일 때만 성립한다.
+--    로그 스위치가 몇 번 돌면 조건이 깨지므로 시간이 지날수록 가능성이 낮아진다.
+--    따라서 장애를 인지한 즉시 판정하고 처리하는 것이 중요하다.
+--
+-- 6) OS 삭제로 어긋난 기록은 CROSSCHECK 와 DELETE EXPIRED 로 정리한다.
+--    정리하지 않으면 다음 판정에서 있는 것으로 잘못 계산한다.
+
+SYS@orcl> EXIT

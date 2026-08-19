@@ -1,0 +1,248 @@
+================================================================================
+ 실습 8-2 : 오프라인 상태 테이블스페이스의 데이터파일 손상
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 18분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- OFFLINE 상태의 테이블스페이스에 속한 데이터파일이 유실되었다.
+-- OFFLINE NORMAL은 체크포인트가 완료되어 헤더 SCN이 고정된 상태다.
+-- 백업본이 그 시점 이후 것이면 복원만으로 끝난다.
+-- OFFLINE IMMEDIATE와의 차이를 결과로 확인한다.
+-- 복구 유형 : 완전 복구(복원만 또는 부분 리두 적용)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 8-1을 마친 상태에서 이어서 진행한다.
+-- 실습용 테이블스페이스 HIST를 새로 만들어 사용한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+SYS@orcl> COL tablespace_name FOR a16
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLESPACE hist
+  2    DATAFILE '/u01/app/oracle/oradata/ORCL/hist01.dbf' SIZE 20M;
+Tablespace created.
+
+SYS@orcl> CREATE TABLE hr.emp_hist TABLESPACE hist
+  2  AS SELECT * FROM hr.employees;
+Table created.
+SYS@orcl> COMMIT;
+
+SYS@orcl> SELECT file#, name, status, checkpoint_change#
+  2  FROM   v$datafile WHERE name LIKE '%hist%';
+
+     FILE# NAME                                       STATUS  CHECKPOINT_CHANGE#
+---------- ------------------------------------------ ------- ------------------
+        10 /u01/app/oracle/oradata/ORCL/hist01.dbf    ONLINE             2404020
+
+-- 백업을 받는다.
+
+SYS@orcl> ALTER TABLESPACE hist BEGIN BACKUP;
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/hist01.dbf /home/oracle/backup/ch08/
+SYS@orcl> ALTER TABLESPACE hist END BACKUP;
+Tablespace altered.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 두 가지 OFFLINE의 차이 확인
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLESPACE hist OFFLINE NORMAL;
+Tablespace altered.
+
+SYS@orcl> SELECT file#, checkpoint_change#, status FROM v$datafile WHERE file# = 10;
+
+     FILE# CHECKPOINT_CHANGE# STATUS
+---------- ------------------ -------
+        10            2404160 OFFLINE
+
+SYS@orcl> SELECT * FROM v$recover_file WHERE file# = 10;
+
+no rows selected
+
+-- OFFLINE NORMAL은 복구 대상이 아니다. 체크포인트가 완료되었기 때문이다.
+
+SYS@orcl> ALTER TABLESPACE hist ONLINE;
+SYS@orcl> ALTER TABLESPACE hist OFFLINE IMMEDIATE;
+Tablespace altered.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file WHERE file# = 10;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+        10                          2404220
+
+-- OFFLINE IMMEDIATE는 즉시 복구 대상이 된다. 체크포인트가 없기 때문이다.
+
+SYS@orcl> RECOVER TABLESPACE hist;
+Media recovery complete.
+
+SYS@orcl> ALTER TABLESPACE hist ONLINE;
+Tablespace altered.
+
+-- 다시 NORMAL로 내린 뒤 장애를 유발한다.
+
+SYS@orcl> ALTER TABLESPACE hist OFFLINE NORMAL;
+Tablespace altered.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/hist01.dbf
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+-- OFFLINE 상태이므로 조회 시도 자체가 다른 오류를 낸다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+SELECT COUNT(*) FROM hr.emp_hist
+                     *
+ERROR at line 1:
+ORA-00376: file 10 cannot be read at this time
+ORA-01110: data file 10: '/u01/app/oracle/oradata/ORCL/hist01.dbf'
+
+-- 파일이 없다는 사실은 ONLINE 시도에서 드러난다.
+
+SYS@orcl> ALTER TABLESPACE hist ONLINE;
+ALTER TABLESPACE hist ONLINE
+*
+ERROR at line 1:
+ORA-01157: cannot identify/lock data file 10 - see DBWR trace file
+ORA-01110: data file 10: '/u01/app/oracle/oradata/ORCL/hist01.dbf'
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name, status, checkpoint_change#
+  2  FROM   v$datafile WHERE file# = 10;
+
+     FILE# NAME                                       STATUS  CHECKPOINT_CHANGE#
+---------- ------------------------------------------ ------- ------------------
+        10 /u01/app/oracle/oradata/ORCL/hist01.dbf    OFFLINE            2404380
+
+SYS@orcl> !ls -l /home/oracle/backup/ch08/hist01.dbf
+-rw-r-----. 1 oracle oinstall 20979712 May 11 10:14 hist01.dbf
+
+-- 판정
+--   ① 상태 : 이미 OFFLINE → 내리는 단계가 불필요
+--   ② 백업본 : 있음. 다만 OFFLINE NORMAL 시점보다 이전 것
+--   ③ 리두 : 아카이브 보유 → 그 구간을 메울 수 있음
+--   → 복원 후 v$recover_file 확인, 필요하면 RECOVER, ONLINE
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> !cp -p /home/oracle/backup/ch08/hist01.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> ALTER TABLESPACE hist ONLINE;
+ALTER TABLESPACE hist ONLINE
+*
+ERROR at line 1:
+ORA-01113: file 10 needs media recovery
+ORA-01110: data file 10: '/u01/app/oracle/oradata/ORCL/hist01.dbf'
+
+-- << 원인 파악 >>
+-- 파일은 제자리에 왔지만 백업본이 OFFLINE NORMAL 시점보다 이전 것이다.
+-- 컨트롤파일은 SCN 2404380을 기대하는데 복원한 파일의 헤더는 그보다 작다.
+-- 그 차이를 메우려면 아카이브를 적용해야 한다.
+-- 복원만으로 끝나는 경우는 백업본이 OFFLINE 시점 이후일 때뿐이다.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file WHERE file# = 10;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+        10                          2404100
+
+-- << 수정 >>
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER TABLESPACE hist;
+Media recovery complete.
+
+SYS@orcl> SELECT * FROM v$recover_file WHERE file# = 10;
+
+no rows selected
+
+SYS@orcl> ALTER TABLESPACE hist ONLINE;
+
+Tablespace altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT tablespace_name, status FROM dba_tablespaces
+  2  WHERE  tablespace_name = 'HIST';
+
+TABLESPACE_NAME  STATUS
+---------------- ---------
+HIST             ONLINE
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 10;
+
+     FILE# NAME                                       STATUS
+---------- ------------------------------------------ -------
+        10 /u01/app/oracle/oradata/ORCL/hist01.dbf    ONLINE
+
+-- 복원만으로 끝나는 경우도 확인한다.
+
+SYS@orcl> ALTER TABLESPACE hist OFFLINE NORMAL;
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/hist01.dbf \
+                 /home/oracle/backup/ch08/hist01_after_offline.dbf
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/hist01.dbf
+SYS@orcl> !cp -p /home/oracle/backup/ch08/hist01_after_offline.dbf \
+                 /u01/app/oracle/oradata/ORCL/hist01.dbf
+
+SYS@orcl> SELECT * FROM v$recover_file WHERE file# = 10;
+
+no rows selected
+
+SYS@orcl> ALTER TABLESPACE hist ONLINE;
+
+Tablespace altered.
+
+-- 이번에는 복구 명령 없이 ONLINE 되었다.
+-- 백업본이 OFFLINE NORMAL 시점 이후 것이라 헤더 SCN이 이미 맞았기 때문이다.
+
+SYS@orcl> SELECT resetlogs_change# FROM v$database;
+
+RESETLOGS_CHANGE#
+-----------------
+                1
+
+-- 실무 포인트
+-- 1) OFFLINE NORMAL과 OFFLINE IMMEDIATE는 성격이 전혀 다르다.
+--    NORMAL은 체크포인트를 수행해 헤더 SCN을 고정하므로 복구 대상이 아니다.
+--    IMMEDIATE는 체크포인트 없이 내리므로 즉시 복구 대상이 된다.
+--    v$recover_file 조회 결과가 이 차이를 그대로 보여 준다.
+--
+-- 2) 손상된 파일에는 NORMAL을 쓸 수 없다.
+--    체크포인트를 수행할 수 없어 ORA-01191 등으로 실패한다.
+--    장애 대응에서는 IMMEDIATE가 사실상 유일한 선택이다.
+--
+-- 3) 복원만으로 끝나는지는 백업 시점에 달렸다.
+--    백업본이 OFFLINE 시점 이후 것이면 헤더 SCN이 맞아 복구가 필요 없다.
+--    이전 것이면 그 구간의 아카이브를 적용해야 하며 ORA-01113으로 드러난다.
+--
+-- 4) 복원 후 v$recover_file 을 먼저 조회하는 습관을 들인다.
+--    나오지 않으면 그대로 ONLINE 하고, 나오면 RECOVER 후 ONLINE 한다.
+--    ONLINE 명령 자체가 헤더 SCN을 검사하므로 성공이 곧 복구 완료의 증거가 된다.
+--
+-- 5) OFFLINE 상태의 파일을 조회하면 ORA-00376이 나온다.
+--    ORA-01157과 구분해야 한다. 전자는 '지금 읽을 수 없다', 후자는 '파일을 찾을 수 없다'는 뜻이다.
+--
+-- 6) 장기 보관용 테이블스페이스는 OFFLINE이나 READ ONLY로 두면 복구가 단순해진다.
+--    매일 백업 대상에서도 빠져 백업 시간이 줄어든다.
+
+SYS@orcl> EXIT

@@ -1,0 +1,267 @@
+================================================================================
+ 실습 2-5 : 리두 로그 다중화와 그룹 관리
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실습 개요
+--------------------------------------------------------------------------------
+-- 모든 리두 로그 그룹에 두 번째 멤버를 추가해 다중화한다.
+-- 그룹을 추가하고 삭제하며 상태에 따른 제약을 직접 확인한다.
+-- 제어 파일과 달리 무중단으로 수행할 수 있다.
+-- 복구 유형 : 해당 없음(구성 작업)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 데이터베이스가 OPEN 상태여야 한다.
+-- /u02/oradata/ORCL 디렉터리가 있어야 한다(실습 2-4 에서 생성).
+-- ARCHIVELOG 모드이므로 그룹 삭제 시 아카이브 완료 여부가 제약으로 작용한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL member FOR a46
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT group#, sequence#, bytes/1024/1024 AS mb, members, archived, status
+  2  FROM   v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE#         MB    MEMBERS ARC STATUS
+---------- ---------- ---------- ---------- --- ----------------
+         1         28         10          1 YES INACTIVE
+         2         29         10          1 NO  CURRENT
+         3         27         10          1 YES INACTIVE
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile ORDER BY group#;
+
+    GROUP# MEMBER                                         STATUS
+---------- ---------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log
+         2 /u01/app/oracle/oradata/ORCL/redo02.log
+         3 /u01/app/oracle/oradata/ORCL/redo03.log
+
+-- MEMBERS 가 모두 1 이다. 다중화되어 있지 않다.
+-- CURRENT 인 그룹 2 의 유일한 멤버가 손상되면 완전 복구가 불가능해진다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 멤버 추가로 다중화
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER DATABASE ADD LOGFILE MEMBER
+  2    '/u02/oradata/ORCL/redo01b.log' TO GROUP 1;
+
+Database altered.
+
+SYS@orcl> ALTER DATABASE ADD LOGFILE MEMBER
+  2    '/u02/oradata/ORCL/redo02b.log' TO GROUP 2;
+
+Database altered.
+
+SYS@orcl> ALTER DATABASE ADD LOGFILE MEMBER
+  2    '/u02/oradata/ORCL/redo03b.log' TO GROUP 3;
+
+Database altered.
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile ORDER BY group#, member;
+
+    GROUP# MEMBER                                         STATUS
+---------- ---------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log
+         1 /u02/oradata/ORCL/redo01b.log                  INVALID
+         2 /u01/app/oracle/oradata/ORCL/redo02.log
+         2 /u02/oradata/ORCL/redo02b.log                  INVALID
+         3 /u01/app/oracle/oradata/ORCL/redo03.log
+         3 /u02/oradata/ORCL/redo03b.log                  INVALID
+
+-- 새 멤버가 INVALID 로 표시된다. 손상이 아니라 아직 쓰이지 않았다는 뜻이다.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+
+SYS@orcl> /
+System altered.
+
+SYS@orcl> /
+System altered.
+
+-- 그룹 수만큼 스위치해 모든 그룹이 한 번씩 CURRENT 가 되게 한다.
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile ORDER BY group#, member;
+
+    GROUP# MEMBER                                         STATUS
+---------- ---------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log
+         1 /u02/oradata/ORCL/redo01b.log
+         2 /u01/app/oracle/oradata/ORCL/redo02.log
+         2 /u02/oradata/ORCL/redo02b.log
+         3 /u01/app/oracle/oradata/ORCL/redo03.log
+         3 /u02/oradata/ORCL/redo03b.log
+
+-- STATUS 가 모두 비었다. 다중화가 정상 동작 중이다.
+
+SYS@orcl> SELECT group#, members, status FROM v$log ORDER BY group#;
+
+    GROUP#    MEMBERS STATUS
+---------- ---------- ----------------
+         1          2 INACTIVE
+         2          2 CURRENT
+         3          2 INACTIVE
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 그룹 크기를 50M 로 키우기 위해 새 그룹을 추가하고 기존 그룹을 삭제하려 한다.
+
+SYS@orcl> ALTER DATABASE ADD LOGFILE GROUP 4
+  2    ('/u01/app/oracle/oradata/ORCL/redo04.log',
+  3     '/u02/oradata/ORCL/redo04b.log') SIZE 50M;
+
+Database altered.
+
+SYS@orcl> ALTER DATABASE DROP LOGFILE GROUP 2;
+ALTER DATABASE DROP LOGFILE GROUP 2
+*
+ERROR at line 1:
+ORA-01623: log 2 is current log for instance orcl (thread 1) - cannot drop
+ORA-00312: online log 2 thread 1: '/u01/app/oracle/oradata/ORCL/redo02.log'
+ORA-00312: online log 2 thread 1: '/u02/oradata/ORCL/redo02b.log'
+
+-- << 원인 파악 >>
+-- 그룹 2 가 CURRENT 다. LGWR 가 기록 중인 그룹을 지우면 진행 중인 변경을 잃는다.
+
+SYS@orcl> SELECT group#, status, archived FROM v$log ORDER BY group#;
+
+    GROUP# STATUS           ARC
+---------- ---------------- ---
+         1 INACTIVE         YES
+         2 CURRENT          NO
+         3 INACTIVE         YES
+         4 UNUSED           YES
+
+-- << 수정 >>
+-- 로그 스위치로 CURRENT 를 다른 그룹으로 옮긴다.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+
+SYS@orcl> SELECT group#, status, archived FROM v$log ORDER BY group#;
+
+    GROUP# STATUS           ARC
+---------- ---------------- ---
+         1 INACTIVE         YES
+         2 ACTIVE           NO
+         3 INACTIVE         YES
+         4 CURRENT          NO
+
+-- 아직 ACTIVE 다. 체크포인트가 완료되지 않았고 아카이브도 되지 않았다.
+
+SYS@orcl> ALTER DATABASE DROP LOGFILE GROUP 2;
+ALTER DATABASE DROP LOGFILE GROUP 2
+*
+ERROR at line 1:
+ORA-01624: log 2 needed for crash recovery of instance orcl (thread 1)
+ORA-00312: online log 2 thread 1: '/u01/app/oracle/oradata/ORCL/redo02.log'
+
+-- ACTIVE 그룹도 삭제할 수 없다. 인스턴스 복구에 필요할 수 있기 때문이다.
+
+SYS@orcl> ALTER SYSTEM CHECKPOINT;
+System altered.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG ALL;
+System altered.
+
+SYS@orcl> SELECT group#, status, archived FROM v$log ORDER BY group#;
+
+    GROUP# STATUS           ARC
+---------- ---------------- ---
+         1 INACTIVE         YES
+         2 INACTIVE         YES
+         3 INACTIVE         YES
+         4 CURRENT          NO
+
+SYS@orcl> ALTER DATABASE DROP LOGFILE GROUP 2;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[6] 진단 : 삭제 후 남는 것
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT group#, members, bytes/1024/1024 AS mb, status FROM v$log ORDER BY group#;
+
+    GROUP#    MEMBERS         MB STATUS
+---------- ---------- ---------- ----------------
+         1          2         10 INACTIVE
+         3          2         10 INACTIVE
+         4          2         50 CURRENT
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/redo02.log /u02/oradata/ORCL/redo02b.log
+-rw-r-----. 1 oracle oinstall 10486272 May  9 10:31 /u01/app/oracle/oradata/ORCL/redo02.log
+-rw-r-----. 1 oracle oinstall 10486272 May  9 10:31 /u02/oradata/ORCL/redo02b.log
+
+-- 제어 파일에서는 그룹 정보가 사라졌지만 OS 파일은 남아 있다.
+-- 디스크 공간이 회수되지 않는 이유가 이것이다.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/redo02.log /u02/oradata/ORCL/redo02b.log
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/redo0*.log /u02/oradata/ORCL/redo0*.log
+/u01/app/oracle/oradata/ORCL/redo01.log
+/u01/app/oracle/oradata/ORCL/redo03.log
+/u01/app/oracle/oradata/ORCL/redo04.log
+/u02/oradata/ORCL/redo01b.log
+/u02/oradata/ORCL/redo03b.log
+/u02/oradata/ORCL/redo04b.log
+
+--------------------------------------------------------------------------------
+[7] 검증 : 스위치 빈도 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT TO_CHAR(first_time,'YYYY-MM-DD HH24') AS hour, COUNT(*) AS switches
+  2  FROM   v$log_history
+  3  WHERE  first_time > SYSDATE - 1
+  4  GROUP  BY TO_CHAR(first_time,'YYYY-MM-DD HH24')
+  5  ORDER  BY 1;
+
+HOUR            SWITCHES
+------------- ----------
+2025-05-09 09          6
+2025-05-09 10         11
+
+-- 10시에 11회는 실습으로 강제 스위치를 여러 번 일으킨 결과다.
+-- 운영 환경에서 상시 이 수준이면 리두 로그 크기가 작다는 뜻이다.
+-- 통상 시간당 3~6회를 적정선으로 본다.
+
+SYS@orcl> SELECT COUNT(*) AS groups, MIN(members) AS min_members
+  2  FROM   v$log;
+
+    GROUPS MIN_MEMBERS
+---------- -----------
+         3           2
+
+-- 그룹 3개, 모든 그룹이 멤버 2개 이상이다. 목표한 구성이 되었다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) 멤버 추가 직후의 INVALID 는 정상이다.
+--    해당 그룹이 한 번 CURRENT 가 되면 상태가 빈다.
+--    운영 중 갑자기 나타난 INVALID 와 구분하려면 추가 시각을 함께 본다.
+--
+-- 2) 그룹 삭제 제약은 네 가지다.
+--    CURRENT 그룹(ORA-01623), ACTIVE 그룹(ORA-01624),
+--    아카이브되지 않은 그룹, 삭제 후 그룹이 두 개 미만이 되는 경우.
+--    모두 "아직 필요한 리두를 잃지 않는다"는 하나의 원칙에서 나온다.
+--
+-- 3) 삭제해도 OS 파일은 남는다. 반드시 직접 지운다.
+--    지우지 않으면 나중에 같은 이름으로 그룹을 만들 때 REUSE 를 붙여야 한다.
+--
+-- 4) 리두 로그 크기는 직접 변경할 수 없다.
+--    새 크기의 그룹을 추가하고 기존 그룹을 순차적으로 교체한다.
+--    이 실습에서는 그룹 2 만 교체했으나 실무에서는 전체를 같은 크기로 맞춘다.
+--
+-- 5) 멤버는 서로 다른 물리 디스크에 둔다.
+--    같은 디스크에 두면 그 디스크 손상 시 그룹 전체를 잃어 다중화의 의미가 없다.
+
+SYS@orcl> EXIT

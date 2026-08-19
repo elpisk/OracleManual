@@ -1,0 +1,283 @@
+================================================================================
+ 실습 5-6 : 디스크 전체 손상 — 다중 파일 동시 유실
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 20분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- /u01 디스크가 통째로 손상되어 그 위의 모든 파일이 사라졌다.
+-- 데이터 파일, 제어 파일 사본 하나, 리두 로그 멤버 하나가 동시에 없어진다.
+-- 파일 하나씩 판정하는 방식으로는 감당이 안 되므로 순서를 정해 처리한다.
+-- 다중화 사본이 살아 있는 /u02 덕분에 복구 경로가 열린다.
+-- 복구 유형 : 완전 복구(다중화 사본 활용)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 2장에서 구성한 다중화 상태를 전제로 한다.
+--   제어 파일 : /u01 두 벌, /u02 한 벌
+--   리두 로그 : 그룹마다 /u01 멤버 하나, /u02 멤버 하나
+-- 백업본은 /home/oracle/backup/ch05 에 있으며 /u01 밖에 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ df -h /home/oracle/backup /u01 /u02
+Filesystem            Size  Used Avail Use% Mounted on
+/dev/mapper/ol-home    20G  4.2G   16G  22% /home
+/dev/mapper/ol-u01     40G   18G   22G  45% /u01
+/dev/mapper/ol-u02     20G  2.1G   18G  11% /u02
+
+-- 백업본이 /u01과 다른 파일 시스템에 있다. 이것이 이 실습의 전제다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+SYS@orcl> COL member FOR a44
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : 다중화 배치 파악
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name FROM v$controlfile;
+
+NAME
+------------------------------------------------
+/u01/app/oracle/oradata/ORCL/control01.ctl
+/u01/app/oracle/oradata/ORCL/control02.ctl
+/u02/oradata/ORCL/control03.ctl
+
+SYS@orcl> SELECT group#, member FROM v$logfile ORDER BY group#, member;
+
+    GROUP# MEMBER
+---------- --------------------------------------------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log
+         1 /u02/oradata/ORCL/redo01b.log
+         3 /u01/app/oracle/oradata/ORCL/redo03.log
+         3 /u02/oradata/ORCL/redo03b.log
+         4 /u01/app/oracle/oradata/ORCL/redo04.log
+         4 /u02/oradata/ORCL/redo04b.log
+
+SYS@orcl> SELECT COUNT(*) AS df_on_u01 FROM v$datafile WHERE name LIKE '/u01/%';
+
+ DF_ON_U01
+----------
+         7
+
+-- 데이터 파일은 전부 /u01에 있다. 다중화 개념이 없기 때문이다.
+-- 제어 파일과 리두 로그만 /u02에 사본이 있다.
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2371408
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : /u01 전체 소실
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.dbf \
+                 /u01/app/oracle/oradata/ORCL/*.ctl \
+                 /u01/app/oracle/oradata/ORCL/*.log
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/
+SYS@orcl>
+
+-- 비었다. /u02는 그대로다.
+
+SYS@orcl> !ls /u02/oradata/ORCL/
+control03.ctl  redo01b.log  redo03b.log  redo04b.log
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+STARTED
+
+-- MOUNT조차 되지 않는다. 제어 파일부터 막힌 것이다.
+
+SYS@orcl> !tail -6 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+ORA-00210: cannot open the specified control file
+ORA-00202: control file: '/u01/app/oracle/oradata/ORCL/control01.ctl'
+ORA-27037: unable to obtain file status
+ORA-205 signalled during: ALTER DATABASE   MOUNT...
+
+-- CONTROL_FILES 목록의 첫 항목부터 없다. 하나라도 없으면 MOUNT가 거부된다.
+
+--------------------------------------------------------------------------------
+[6] 진단 : 처리 순서 결정
+--------------------------------------------------------------------------------
+-- 다중 파일 장애는 계층 순서로 처리한다.
+--   ① 제어 파일 → MOUNT 가능하게 만든다
+--   ② 리두 로그 → 복구 재료를 확보한다
+--   ③ 데이터 파일 → 복원 후 복구한다
+-- 진단 도구(v$recover_file 등)는 MOUNT 이후에야 쓸 수 있으므로 ①이 먼저다.
+
+SYS@orcl> SHOW PARAMETER control_files
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+control_files                        string      /u01/app/oracle/oradata/ORCL/co
+                                                 ntrol01.ctl, /u01/app/oracle/or
+                                                 adata/ORCL/control02.ctl, /u02/
+                                                 oradata/ORCL/control03.ctl
+
+-- 살아 있는 control03.ctl을 원본으로 삼아 나머지 두 벌을 복사하면 된다.
+-- 제어 파일 사본은 서로 완전히 동일하므로 단순 복사로 충분하다.
+
+SYS@orcl> !ls -l /u02/oradata/ORCL/control03.ctl
+-rw-r-----. 1 oracle oinstall 18726912 May 10 14:20 /u02/oradata/ORCL/control03.ctl
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- ① 제어 파일 복구
+
+SYS@orcl> !cp -p /u02/oradata/ORCL/control03.ctl \
+                 /u01/app/oracle/oradata/ORCL/control01.ctl
+SYS@orcl> !cp -p /u02/oradata/ORCL/control03.ctl \
+                 /u01/app/oracle/oradata/ORCL/control02.ctl
+
+SYS@orcl> SHUTDOWN ABORT
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+-- MOUNT 성공. 이제 진단 도구를 쓸 수 있다.
+
+SYS@orcl> SELECT file#, error FROM v$recover_file;
+
+     FILE# ERROR
+---------- --------------------
+         1 FILE NOT FOUND
+         3 FILE NOT FOUND
+         4 FILE NOT FOUND
+         5 FILE NOT FOUND
+         6 FILE NOT FOUND
+         7 FILE NOT FOUND
+         8 FILE NOT FOUND
+
+7 rows selected.
+
+-- ② 데이터 파일만 복원하고 복구를 시도한다.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch05/*.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE;
+ORA-00283: recovery session canceled due to errors
+ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/ORCL/redo01.log'
+ORA-27037: unable to obtain file status
+
+-- << 원인 파악 >>
+-- 리두 로그 멤버 하나가 없어 복구가 그 그룹에서 막혔다.
+-- 데이터 파일부터 손대는 순서가 잘못됐다. 리두가 복구의 재료이므로 먼저 갖춰야 한다.
+-- 다행히 /u02 멤버는 살아 있으므로 그것을 복사하면 그룹이 온전해진다.
+-- 사본 없이 손실됐다면 여기서 완전 복구 경로가 끊긴다.
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE member LIKE '/u01/%';
+
+    GROUP# MEMBER                                       STATUS
+---------- -------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log      INVALID
+         3 /u01/app/oracle/oradata/ORCL/redo03.log      INVALID
+         4 /u01/app/oracle/oradata/ORCL/redo04.log      INVALID
+
+-- << 수정 >>
+
+SYS@orcl> !cp -p /u02/oradata/ORCL/redo01b.log /u01/app/oracle/oradata/ORCL/redo01.log
+SYS@orcl> !cp -p /u02/oradata/ORCL/redo03b.log /u01/app/oracle/oradata/ORCL/redo03.log
+SYS@orcl> !cp -p /u02/oradata/ORCL/redo04b.log /u01/app/oracle/oradata/ORCL/redo04.log
+
+SYS@orcl> RECOVER DATABASE;
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- RESETLOGS 없이 열렸다. 완전 복구가 성립한 것이다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile ORDER BY group#;
+
+    GROUP# MEMBER                                       STATUS
+---------- -------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log
+         1 /u02/oradata/ORCL/redo01b.log
+         3 /u01/app/oracle/oradata/ORCL/redo03.log
+         3 /u02/oradata/ORCL/redo03b.log
+         4 /u01/app/oracle/oradata/ORCL/redo04.log
+         4 /u02/oradata/ORCL/redo04b.log
+
+6 rows selected.
+
+-- STATUS가 비었다. INVALID가 해소되었다는 뜻이다.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+
+SYS@orcl> SELECT resetlogs_change#, resetlogs_time FROM v$database;
+
+RESETLOGS_CHANGE# RESETLOGS_TIME
+----------------- ---------------------
+                1 08-MAY-25
+
+-- RESETLOGS 이력이 늘지 않았다. 인카네이션이 그대로다.
+
+-- 실무 포인트
+-- 1) 다중 파일 장애는 계층 순서로 처리한다. 제어 파일 → 리두 로그 → 데이터 파일이다.
+--    파일 하나씩 판정하려 들면 MOUNT도 못 한 채 시간만 쓴다.
+--
+-- 2) 데이터 파일부터 손대면 RECOVER 중에 ORA-00312로 막힌다.
+--    리두는 복구의 재료이므로 재료를 먼저 갖추고 복구를 시작해야 한다.
+--
+-- 3) 이 실습의 복구는 다중화 배치가 만들어 준 것이다.
+--    제어 파일 세 벌이 전부 /u01에 있었다면 여기서 완전 복구가 불가능했다.
+--    2장에서 물리적으로 다른 디스크에 배치하라고 한 이유가 이것이다.
+--
+-- 4) 리두 로그는 그룹 안에 멤버가 하나라도 살아 있으면 복사로 되살릴 수 있다.
+--    같은 그룹의 멤버끼리는 내용이 동일하기 때문이다.
+--
+-- 5) 백업본을 /u01에 두었다면 백업본까지 함께 사라진다.
+--    백업본은 반드시 데이터와 다른 물리 디스크에 둔다.
+--
+-- 6) 복구 직후 다중화 상태를 재점검한다.
+--    이번처럼 사본을 원본으로 되돌린 경우 배치가 의도대로인지 확인이 필요하다.
+--    본문 5.5.4절의 재구성 절차를 함께 수행한다.
+
+SYS@orcl> EXIT

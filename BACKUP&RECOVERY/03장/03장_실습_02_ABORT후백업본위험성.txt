@@ -1,0 +1,236 @@
+================================================================================
+ 실습 3-2 : SHUTDOWN ABORT 후 백업본의 위험성
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 12분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실습 개요
+--------------------------------------------------------------------------------
+-- SHUTDOWN ABORT 로 종료한 뒤 파일을 복사하면 어떤 백업본이 만들어지는지 확인한다.
+-- FUZZY 컬럼으로 일관성 여부를 판별하고, 안전한 백업본으로 만드는 절차를 수행한다.
+-- 이 실습에서 만든 일관성 없는 백업본은 마지막에 폐기한다.
+-- 복구 유형 : 해당 없음(백업본 품질 확인)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 3-1 을 마쳐 정상 백업본이 확보된 상태여야 한다.
+-- 다른 사용자가 접속하지 않은 개별 환경이어야 한다.
+-- ABORT 는 파일을 손상시키지 않으므로 데이터 손실은 없다.
+
+[oracle@oel7v9r1 ~]$ mkdir -p /home/oracle/backup/bad_cold
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2341598
+
+-- 커밋되지 않은 변경과 커밋된 변경을 함께 만들어 둔다.
+
+SYS@orcl> UPDATE hr.employees SET salary = salary + 500 WHERE department_id = 50;
+45 rows updated.
+
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> UPDATE hr.employees SET salary = salary + 999 WHERE department_id = 60;
+5 rows updated.
+
+-- 커밋하지 않는다.
+
+SYS@orcl> SELECT current_scn FROM v$database;
+
+CURRENT_SCN
+-----------
+    2342104
+
+-- CURRENT_SCN(2342104) 과 CHECKPOINT_CHANGE#(2341598) 의 차이가
+-- 아직 데이터 파일에 반영되지 않은 구간이다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : ABORT 후 상태 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+Database mounted.
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy, status FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ STATUS
+---------- ------------------ --- -------
+         1            2341598 YES ONLINE
+         3            2341598 YES ONLINE
+         4            2341598 YES ONLINE
+         7            2341598 YES ONLINE
+
+-- FUZZY 가 모두 YES 다.
+-- 파일 헤더의 SCN 은 2341598 이지만, 그 이후 변경이 데이터 블록에 부분적으로 반영되어 있다.
+-- 즉 파일 내부의 시점이 서로 어긋난 상태다.
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2341598
+
+-- 제어 파일의 값은 그대로다. ABORT 는 체크포인트를 수행하지 않았기 때문이다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 이 상태에서 복사한 백업본의 문제
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+ORA-01109: database not open
+
+Database dismounted.
+ORACLE instance shut down.
+
+[oracle@oel7v9r1 ~]$ cp -p /u01/app/oracle/oradata/ORCL/*.dbf /home/oracle/backup/bad_cold/
+[oracle@oel7v9r1 ~]$ cp -p /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl /home/oracle/backup/bad_cold/
+[oracle@oel7v9r1 ~]$ cp -p /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log /home/oracle/backup/bad_cold/
+
+-- 복사는 정상적으로 끝난다. 겉으로는 아무 문제가 없어 보인다.
+
+[oracle@oel7v9r1 ~]$ ls /home/oracle/backup/bad_cold/ | wc -l
+14
+
+-- << 오류 발생 >>
+-- 이 백업본을 복원했다고 가정하고 열어 본다.
+-- 실습에서는 원본이 그대로이므로 현재 상태로 오픈을 시도해 같은 결과를 확인한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- 열렸다. 온라인 리두 로그가 원본이라 인스턴스 복구가 자동으로 수행된 것이다.
+-- 문제는 이 리두가 없는 상황을 가정할 때다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2342510 NO
+         3            2342510 NO
+         4            2342510 NO
+         7            2342510 NO
+
+-- << 원인 파악 >>
+-- FUZZY 가 NO 로 바뀌었다. 인스턴스 복구가 끝나고 정상 종료했기 때문이다.
+-- 즉 ABORT 직후 복사한 백업본은 "복구가 필요한 상태의 파일"이었다.
+-- NOARCHIVELOG 환경에서 이 백업본만 복원하면 적용할 리두가 없어 열 수 없다.
+-- ARCHIVELOG 환경이라도 백업본과 함께 그 구간의 리두를 확보해야 한다.
+
+-- << 수정 >>
+-- 안전한 백업본을 만드는 절차는 다음과 같다.
+--   STARTUP 으로 인스턴스 복구를 완료시키고
+--   SHUTDOWN IMMEDIATE 로 정상 종료한 뒤
+--   MOUNT 상태에서 FUZZY 가 NO 인지 확인하고 복사한다.
+
+SYS@orcl> ALTER DATABASE OPEN;
+Database altered.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2342510 NO
+         3            2342510 NO
+         4            2342510 NO
+         7            2342510 NO
+
+-- 이 상태에서 복사한 백업본은 안전하다.
+
+--------------------------------------------------------------------------------
+[6] 진단 : 커밋된 변경과 커밋되지 않은 변경의 처리
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER DATABASE OPEN;
+Database altered.
+
+SYS@orcl> SELECT employee_id, salary FROM hr.employees
+  2  WHERE  employee_id IN (120, 103) ORDER BY employee_id;
+
+EMPLOYEE_ID     SALARY
+----------- ----------
+        103       9000
+        120       8600
+
+-- employee_id 120(department_id 50) : 커밋했던 +500 이 살아 있다. 롤포워드 결과다.
+-- employee_id 103(department_id 60) : 커밋하지 않았던 +999 가 사라졌다. 롤백 결과다.
+-- 인스턴스 복구가 정상 수행되었음을 확인할 수 있다.
+
+--------------------------------------------------------------------------------
+[7] 검증 : 두 백업본 비교
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ ls -l /home/oracle/backup/cold/20250509/ | head -3
+total 1553228
+-rw-r-----. 1 oracle oinstall 10600448 May  9 12:02 control01.ctl
+-rw-r-----. 1 oracle oinstall 10600448 May  9 12:02 control02.ctl
+
+[oracle@oel7v9r1 ~]$ ls -l /home/oracle/backup/bad_cold/ | head -3
+total 1553228
+-rw-r-----. 1 oracle oinstall 10600448 May  9 12:31 control01.ctl
+-rw-r-----. 1 oracle oinstall 10600448 May  9 12:31 control02.ctl
+
+-- 파일 개수와 크기는 같다. 겉으로는 구분되지 않는다.
+-- 차이는 파일 내부의 FUZZY 상태뿐이며, 복원해 봐야 드러난다.
+-- 그래서 백업 직후 MOUNT 상태에서 FUZZY 를 확인하는 검증 단계가 필요하다.
+
+-- 일관성 없는 백업본은 폐기한다.
+
+[oracle@oel7v9r1 ~]$ rm -rf /home/oracle/backup/bad_cold
+[oracle@oel7v9r1 ~]$ ls /home/oracle/backup/
+cold  hot
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) ABORT 후 받은 백업본은 오프라인이지만 일관성이 없다.
+--    "종료하고 복사했으니 안전하다"는 판단이 성립하지 않는다.
+--
+-- 2) 가장 위험한 것은 백업이 있다고 착각하는 상태다.
+--    파일 개수도 크기도 정상이라 장애가 나서야 못 쓴다는 사실을 알게 된다.
+--
+-- 3) 안전화 절차는 STARTUP → SHUTDOWN IMMEDIATE 두 줄이다.
+--    한 번 열어 인스턴스 복구를 끝내면 FUZZY 가 NO 로 바뀐다.
+--    이 절차를 거치지 않은 백업본은 폐기하는 편이 낫다.
+--
+-- 4) 백업 스크립트에는 종료 성공 여부를 확인하는 단계를 넣는다.
+--    WHENEVER SQLERROR EXIT 1 과 셸의 set -e 를 함께 쓰면
+--    종료가 실패했을 때 복사로 넘어가지 않는다.
+--
+-- 5) 백업 직후 MOUNT 상태에서 FUZZY 를 확인하는 검증을 스크립트에 포함한다.
+--    이 한 줄이 "쓸 수 없는 백업"을 그날 바로 발견하게 해 준다.
+
+SYS@orcl> EXIT

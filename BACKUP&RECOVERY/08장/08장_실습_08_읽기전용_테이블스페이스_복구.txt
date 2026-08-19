@@ -1,0 +1,273 @@
+================================================================================
+ 실습 8-8 : 읽기 전용 테이블스페이스 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 18분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- READ ONLY 테이블스페이스의 데이터파일이 유실되었다.
+-- 전환 시 헤더 SCN이 고정되어 이후 리두가 생성되지 않는다.
+-- 전환 이후 백업본이면 복원만으로 끝나고, 이전 백업본이면 아카이브를 적용한다.
+-- ARCHIVELOG 환경이라 5장의 NOARCHIVELOG 경우보다 유연하다.
+-- 복구 유형 : 완전 복구(복원만 또는 부분 리두 적용)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 8-7을 마친 상태에서 이어서 진행한다.
+-- HIST 테이블스페이스를 읽기 전용 대상으로 사용한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+SYS@orcl> COL tablespace_name FOR a16
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : 전환 이전 백업 확보
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT tablespace_name, status FROM dba_tablespaces
+  2  WHERE  tablespace_name = 'HIST';
+
+TABLESPACE_NAME  STATUS
+---------------- ---------
+HIST             ONLINE
+
+SYS@orcl> INSERT INTO hr.emp_hist SELECT * FROM hr.employees;
+107 rows created.
+SYS@orcl> COMMIT;
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+
+  COUNT(*)
+----------
+       214
+
+-- 전환 이전 상태의 백업을 받아 둔다.
+
+SYS@orcl> ALTER TABLESPACE hist BEGIN BACKUP;
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/hist01.dbf \
+                 /home/oracle/backup/ch08/hist01_before_ro.dbf
+SYS@orcl> ALTER TABLESPACE hist END BACKUP;
+Tablespace altered.
+
+SYS@orcl> SELECT file#, checkpoint_change#, enabled FROM v$datafile WHERE file# = 10;
+
+     FILE# CHECKPOINT_CHANGE# ENABLED
+---------- ------------------ ----------
+        10            2409620 READ WRITE
+
+-- 이후 변경을 추가한 뒤 읽기 전용으로 전환한다.
+
+SYS@orcl> INSERT INTO hr.emp_hist VALUES
+  2    (999, 'LAST', 'ROW', 'last.row', NULL, SYSDATE, 'AD_VP', 1000, NULL, NULL, 90);
+SYS@orcl> COMMIT;
+
+SYS@orcl> ALTER TABLESPACE hist READ ONLY;
+Tablespace altered.
+
+SYS@orcl> SELECT file#, checkpoint_change#, enabled FROM v$datafile WHERE file# = 10;
+
+     FILE# CHECKPOINT_CHANGE# ENABLED
+---------- ------------------ ----------
+        10            2409880 READ ONLY
+
+-- 전환 시 체크포인트가 수행되어 헤더 SCN이 2409880으로 고정되었다.
+
+SYS@orcl> ALTER TABLESPACE hist BEGIN BACKUP;
+ALTER TABLESPACE hist BEGIN BACKUP
+*
+ERROR at line 1:
+ORA-01642: begin backup not needed for read only tablespace 'HIST'
+
+-- 읽기 전용은 변경이 없으므로 BEGIN BACKUP이 필요 없다. 바로 복사하면 된다.
+
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/hist01.dbf \
+                 /home/oracle/backup/ch08/hist01_after_ro.dbf
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/hist01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+SELECT COUNT(*) FROM hr.emp_hist
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 10
+ORA-01110: data file 10: '/u01/app/oracle/oradata/ORCL/hist01.dbf'
+ORA-27041: unable to open file
+
+SYS@orcl> SELECT file#, name, status, enabled FROM v$datafile WHERE file# = 10;
+
+     FILE# NAME                                       STATUS  ENABLED
+---------- ------------------------------------------ ------- ----------
+        10 /u01/app/oracle/oradata/ORCL/hist01.dbf    RECOVER READ ONLY
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file WHERE file# = 10;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+        10 FILE NOT FOUND                 0
+
+SYS@orcl> !ls -l /home/oracle/backup/ch08/hist01*
+-rw-r-----. 1 oracle oinstall 20979712 May 11 11:52 hist01_after_ro.dbf
+-rw-r-----. 1 oracle oinstall 20979712 May 11 11:50 hist01_before_ro.dbf
+
+-- 백업본이 두 벌 있다. 전환 이전 것과 이후 것이다.
+-- 두 백업본으로 각각 복구해 결과 차이를 확인한다.
+
+-- 판정
+--   ① 전환 이후 백업본 → 헤더 SCN이 이미 2409880 → 복원만으로 완료
+--   ② 전환 이전 백업본 → 헤더 SCN이 그보다 작음 → 전환 시점까지 아카이브 적용
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 먼저 전환 이전 백업본으로 복원해 본다.
+
+SYS@orcl> ALTER TABLESPACE hist OFFLINE IMMEDIATE;
+Tablespace altered.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch08/hist01_before_ro.dbf \
+                 /u01/app/oracle/oradata/ORCL/hist01.dbf
+
+SYS@orcl> ALTER TABLESPACE hist ONLINE;
+ALTER TABLESPACE hist ONLINE
+*
+ERROR at line 1:
+ORA-01113: file 10 needs media recovery
+ORA-01110: data file 10: '/u01/app/oracle/oradata/ORCL/hist01.dbf'
+
+-- << 원인 파악 >>
+-- 읽기 전용이라 복원만으로 끝날 것으로 기대했으나 복구를 요구한다.
+-- 복원한 백업본이 READ ONLY 전환 이전 것이기 때문이다.
+-- 그 백업본의 헤더 SCN은 2409620이고 컨트롤파일은 2409880을 기대한다.
+-- 그 사이에 마지막 INSERT와 전환 시 체크포인트가 들어 있다.
+-- '읽기 전용이면 복원만으로 끝난다'는 명제는 백업 시점이 전환 이후일 때만 성립한다.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file WHERE file# = 10;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+        10                          2409620
+
+-- << 수정 >>
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER TABLESPACE hist;
+Media recovery complete.
+
+SYS@orcl> ALTER TABLESPACE hist ONLINE;
+
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+
+  COUNT(*)
+----------
+       215
+
+-- 아카이브 적용으로 전환 직전의 마지막 행까지 되살아났다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+-- 이번에는 전환 이후 백업본으로 같은 장애를 처리한다.
+
+SYS@orcl> ALTER TABLESPACE hist OFFLINE IMMEDIATE;
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/hist01.dbf
+SYS@orcl> !cp -p /home/oracle/backup/ch08/hist01_after_ro.dbf \
+                 /u01/app/oracle/oradata/ORCL/hist01.dbf
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file WHERE file# = 10;
+
+no rows selected
+
+-- 복구 대상이 아니다. 헤더 SCN이 이미 맞았다.
+
+SYS@orcl> ALTER TABLESPACE hist ONLINE;
+
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+
+  COUNT(*)
+----------
+       215
+
+-- 복구 명령 없이 끝났다.
+
+SYS@orcl> SELECT file#, checkpoint_change#, enabled, status
+  2  FROM   v$datafile WHERE file# = 10;
+
+     FILE# CHECKPOINT_CHANGE# ENABLED    STATUS
+---------- ------------------ ---------- -------
+        10            2409880 READ ONLY  ONLINE
+
+SYS@orcl> SELECT tablespace_name, status FROM dba_tablespaces
+  2  WHERE  tablespace_name = 'HIST';
+
+TABLESPACE_NAME  STATUS
+---------------- ---------
+HIST             READ ONLY
+
+-- 읽기 전용 상태가 유지되었다.
+
+SYS@orcl> INSERT INTO hr.emp_hist VALUES
+  2    (1000, 'X', 'Y', 'x.y', NULL, SYSDATE, 'AD_VP', 1000, NULL, NULL, 90);
+INSERT INTO hr.emp_hist VALUES
+            *
+ERROR at line 1:
+ORA-00372: file 10 cannot be modified at this time
+ORA-01110: data file 10: '/u01/app/oracle/oradata/ORCL/hist01.dbf'
+
+-- 읽기 전용이므로 변경이 거부된다. 정상 동작이다.
+
+SYS@orcl> SELECT resetlogs_change# FROM v$database;
+
+RESETLOGS_CHANGE#
+-----------------
+                1
+
+-- 실무 포인트
+-- 1) READ ONLY 전환 시 체크포인트가 수행되어 헤더 SCN이 고정된다.
+--    이후 변경이 없으므로 리두도 생성되지 않고 그 값이 계속 유지된다.
+--    이것이 복원만으로 복구가 끝나는 근거다.
+--
+-- 2) 다만 백업 시점이 전환 이후일 때만 그렇다.
+--    전환 이전 백업본이면 그 사이 구간의 리두를 적용해야 하며 ORA-01113으로 드러난다.
+--    ARCHIVELOG 환경에서는 아카이브가 그 구간을 담당하므로 문제없이 처리된다.
+--
+-- 3) 5장의 NOARCHIVELOG 경우보다 유연하다.
+--    그때는 온라인 리두가 덮어써지면 전환 이전 백업본을 쓸 수 없었다.
+--    아카이브가 있으면 전환 이전 백업본도 그대로 쓸 수 있다.
+--
+-- 4) 읽기 전용 테이블스페이스는 BEGIN BACKUP이 필요 없다.
+--    변경이 없어 fractured block 문제가 발생하지 않기 때문이며 ORA-01642로 거부된다.
+--    그냥 복사하면 된다.
+--
+-- 5) 전환 직후 백업을 새로 받아 두는 것이 좋다.
+--    그 백업본 하나면 이후 복구가 복원만으로 끝난다.
+--    매일 백업 대상에서는 빼되 별도 위치에 안전하게 보관한다.
+--
+-- 6) 복구 후 ENABLED 컬럼과 dba_tablespaces의 STATUS를 확인한다.
+--    읽기 전용 상태가 유지되어야 하며, 변경 시도가 ORA-00372로 거부되는 것이 정상이다.
+
+SYS@orcl> EXIT

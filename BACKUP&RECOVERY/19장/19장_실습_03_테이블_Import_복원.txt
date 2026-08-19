@@ -1,0 +1,272 @@
+================================================================================
+ 실습 19-3 : 테이블 단위 Import로 복원 — TABLE_EXISTS_ACTION
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 운영 테이블 하나를 실수로 TRUNCATE 했다.
+-- 어제 만든 덤프에서 그 테이블만 되살린다.
+-- TABLE_EXISTS_ACTION 기본값이 무엇을 하는지 직접 확인한다.
+-- SQLFILE로 실행될 DDL을 미리 보는 절차도 익힌다.
+-- 복구 유형 : 논리적 오류 복구, 부분 복원
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 19-2에서 hr_full.dmp 를 만든 상태여야 한다.
+
+[oracle@oel7v9r1 ~]$ ls -lh /u03/dpdump/hr_full.dmp
+
+-rw-r-----. 1 oracle oinstall 356K May 21 10:06 /u03/dpdump/hr_full.dmp
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT constraint_name, constraint_type, table_name
+  2  FROM   dba_constraints
+  3  WHERE  owner = 'HR' AND table_name = 'EMPLOYEES'
+  4  AND    constraint_type IN ('P','R');
+
+CONSTRAINT_NAME     C TABLE_NAME
+------------------- - ---------------
+EMP_EMP_ID_PK       P EMPLOYEES
+EMP_DEPT_FK         R EMPLOYEES
+EMP_JOB_FK          R EMPLOYEES
+EMP_MANAGER_FK      R EMPLOYEES
+
+SYS@orcl> SELECT constraint_name, table_name FROM dba_constraints
+  2  WHERE  owner = 'HR' AND r_constraint_name = 'EMP_EMP_ID_PK';
+
+CONSTRAINT_NAME     TABLE_NAME
+------------------- ---------------
+DEPT_MGR_FK         DEPARTMENTS
+JHIST_EMP_FK        JOB_HISTORY
+EMP_MANAGER_FK      EMPLOYEES
+
+-- EMPLOYEES를 참조하는 외래 키가 셋이다. REPLACE 사용 시 문제가 된다.
+
+SYS@orcl> SELECT index_name, status FROM dba_indexes
+  2  WHERE  owner = 'HR' AND table_name = 'EMPLOYEES';
+
+INDEX_NAME              STATUS
+----------------------- --------
+EMP_EMP_ID_PK           VALID
+EMP_DEPARTMENT_IX       VALID
+EMP_JOB_IX              VALID
+EMP_MANAGER_IX          VALID
+EMP_NAME_IX             VALID
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 잘못된 TRUNCATE
+--------------------------------------------------------------------------------
+SYS@orcl> TRUNCATE TABLE hr.job_history;
+
+Table truncated.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.job_history;
+
+  COUNT(*)
+----------
+         0
+
+-- 정리 대상 테이블을 착각해 운영 테이블을 비웠다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.job_history
+  2  AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '5' MINUTE;
+
+  COUNT(*)
+----------
+         0
+
+-- TRUNCATE는 UNDO를 남기지 않으므로 Flashback Query로도 되살릴 수 없다.
+-- 덤프에서 복원해야 한다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : SQLFILE로 사전 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   dumpfile=hr_full.dmp tables=hr.job_history \
+>   sqlfile=jh_check.sql logfile=jh_check.log
+
+Master table "SYSTEM"."SYS_SQL_FILE_TABLE_01" successfully loaded/unloaded
+Starting "SYSTEM"."SYS_SQL_FILE_TABLE_01":  ...
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+Processing object type SCHEMA_EXPORT/TABLE/INDEX/INDEX
+Processing object type SCHEMA_EXPORT/TABLE/CONSTRAINT/CONSTRAINT
+Job "SYSTEM"."SYS_SQL_FILE_TABLE_01" successfully completed at 11:04:12
+
+[oracle@oel7v9r1 ~]$ head -20 /u03/dpdump/jh_check.sql
+
+-- CONNECT SYSTEM
+ALTER SESSION SET EVENTS '10150 TRACE NAME CONTEXT FOREVER, LEVEL 1';
+-- new object type path: SCHEMA_EXPORT/TABLE/TABLE
+CREATE TABLE "HR"."JOB_HISTORY"
+   (    "EMPLOYEE_ID" NUMBER(6,0) CONSTRAINT "JHIST_EMPLOYEE_NN" NOT NULL,
+        "START_DATE" DATE CONSTRAINT "JHIST_START_DATE_NN" NOT NULL,
+        "END_DATE" DATE CONSTRAINT "JHIST_END_DATE_NN" NOT NULL,
+        "JOB_ID" VARCHAR2(10) CONSTRAINT "JHIST_JOB_NN" NOT NULL,
+        "DEPARTMENT_ID" NUMBER(4,0)
+   ) SEGMENT CREATION IMMEDIATE
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255
+ STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+ ...) TABLESPACE "USERS" ;
+
+-- 실행될 DDL을 미리 볼 수 있다.
+-- 저장 절과 테이블스페이스 이름이 그대로 들어 있다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- 되살릴 대상은 JOB_HISTORY 한 테이블이며 나머지는 정상이다.
+-- 판정
+--   ① 논리적 오류, 파일 정상 → 미디어 복구 대상 아님
+--   ② TRUNCATE라 UNDO 없음 → Flashback Query 불가
+--   ③ 덤프가 있고 그 시점 이후 이 테이블에 변경 없음
+--   → 덤프에서 그 테이블만 반입한다.
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT COUNT(*) FROM hr.job_history;
+
+  COUNT(*)
+----------
+         0
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 우선 옵션 없이 반입해 본다.
+
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   dumpfile=hr_full.dmp tables=hr.job_history logfile=jh_imp1.log
+
+Master table "SYSTEM"."SYS_IMPORT_TABLE_01" successfully loaded/unloaded
+Starting "SYSTEM"."SYS_IMPORT_TABLE_01":  ...
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+ORA-39151: Table "HR"."JOB_HISTORY" exists. All dependent metadata and data
+will be skipped due to table_exists_action of skip
+Job "SYSTEM"."SYS_IMPORT_TABLE_01" completed with 1 error(s) at 11:09:38
+
+SYS@orcl> SELECT COUNT(*) FROM hr.job_history;
+
+  COUNT(*)
+----------
+         0
+
+-- << 원인 파악 >>
+-- TABLE_EXISTS_ACTION의 기본값이 SKIP이다.
+-- 대상 테이블이 이미 있으므로 데이터까지 통째로 건너뛰었다.
+-- ORA-39151은 오류로 표시되지만 작업 자체는 계속 진행된다.
+-- 로그를 자세히 보지 않으면 성공한 것으로 착각하기 쉽다.
+-- TRUNCATE로 비어 있을 뿐 테이블은 존재하므로 SKIP 대상이 되었다.
+
+-- << 수정 >> 기존 내용을 비우고 넣도록 지정한다.
+
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   dumpfile=hr_full.dmp tables=hr.job_history \
+>   table_exists_action=truncate logfile=jh_imp2.log
+
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+Table "HR"."JOB_HISTORY" exists and has been truncated. Data will be loaded but
+all dependent metadata will be skipped due to table_exists_action of truncate
+. . imported "HR"."JOB_HISTORY"               7.19 KB      10 rows
+Job "SYSTEM"."SYS_IMPORT_TABLE_01" successfully completed at 11:12:05
+
+SYS@orcl> SELECT COUNT(*) FROM hr.job_history;
+
+  COUNT(*)
+----------
+        10
+
+-- 10건이 되살아났다. Export 로그의 행 수와 일치한다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT employee_id, TO_CHAR(start_date,'YYYY-MM-DD') AS start_date,
+  2         job_id FROM hr.job_history ORDER BY employee_id;
+
+EMPLOYEE_ID START_DATE JOB_ID
+----------- ---------- ----------
+        101 1989-09-21 AC_ACCOUNT
+        101 1993-10-28 AC_MGR
+        102 1993-01-13 IT_PROG
+        114 1998-03-24 ST_CLERK
+        122 1999-01-01 ST_CLERK
+...
+
+SYS@orcl> SELECT constraint_name, status, validated FROM dba_constraints
+  2  WHERE  owner = 'HR' AND table_name = 'JOB_HISTORY';
+
+CONSTRAINT_NAME     STATUS   VALIDATED
+------------------- -------- -------------
+JHIST_EMP_ID_ST_DATE_PK ENABLED VALIDATED
+JHIST_EMP_FK        ENABLED  VALIDATED
+JHIST_JOB_FK        ENABLED  VALIDATED
+JHIST_DEPT_FK       ENABLED  VALIDATED
+
+-- TRUNCATE 방식은 테이블 구조를 유지하므로 제약이 그대로 남았다.
+
+-- REPLACE를 쓰면 어떻게 되는지 확인한다.
+
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   dumpfile=hr_full.dmp tables=hr.departments \
+>   table_exists_action=replace logfile=dept_imp.log
+
+ORA-39083: Object type TABLE:"HR"."DEPARTMENTS" failed to create with error:
+ORA-02449: unique/primary keys in table referenced by foreign keys
+
+-- 참조하는 외래 키가 있으면 DROP이 막혀 REPLACE가 실패한다.
+-- 이런 테이블은 TRUNCATE 방식을 쓴다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.departments;
+
+  COUNT(*)
+----------
+        27
+
+-- 원본은 손상되지 않았다. DROP이 실패했기 때문이다.
+
+SYS@orcl> SELECT job_name, state FROM dba_datapump_jobs;
+
+no rows selected
+
+-- 실무 포인트
+-- 1) TABLE_EXISTS_ACTION 기본값은 SKIP이다.
+--    복원 목적이라면 반드시 TRUNCATE나 REPLACE를 명시한다.
+--    지정하지 않으면 데이터가 그대로인 채 작업이 끝난다.
+--
+-- 2) ORA-39151은 오류처럼 보이지만 작업을 멈추지 않는다.
+--    completed with N error(s) 로 끝나므로 마지막 줄을 꼭 확인한다.
+--    행 수 대조를 절차에 넣으면 이 유형을 확실히 잡는다.
+--
+-- 3) TRUNCATE와 REPLACE는 결과가 다르다.
+--    TRUNCATE는 구조를 유지하고 데이터만 교체한다.
+--    REPLACE는 테이블을 지우고 다시 만들므로 제약과 인덱스도 재생성된다.
+--    참조하는 외래 키가 있으면 REPLACE는 ORA-02449로 실패한다.
+--
+-- 4) TRUNCATE는 UNDO를 남기지 않는다.
+--    그래서 Flashback Query로 되살릴 수 없다.
+--    DELETE였다면 Flashback Query가 가장 빠른 방법이었을 것이다.
+--
+-- 5) 운영에 반입하기 전 SQLFILE로 DDL을 확인한다.
+--    어떤 테이블스페이스를 참조하는지, 저장 절이 어떤지 미리 알 수 있다.
+--    실제 반입은 하지 않으므로 안전하다.
+--
+-- 6) 반입 후 행 수를 Export 로그와 대조한다.
+--    이 절차가 없으면 SKIP으로 건너뛴 경우를 놓친다.
+--    자동화 스크립트라면 대조 결과를 실패 판정에 넣는다.

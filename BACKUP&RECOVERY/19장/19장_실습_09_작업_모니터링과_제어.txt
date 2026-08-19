@@ -1,0 +1,362 @@
+================================================================================
+ 실습 19-9 : 작업 모니터링과 제어 — ATTACH · STOP_JOB · START_JOB
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 35분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 오래 걸리는 Export를 걸어 두고 진행 상황을 조회한다.
+-- ATTACH로 붙어 병렬도를 조정하고 중단했다가 재개한다.
+-- 비정상 종료된 작업이 남아 다음 실행을 막는 상황을 재현한다.
+-- 마스터 테이블의 역할을 확인하고 정리 방법을 익힌다.
+-- 작업 유형 : 작업 관리
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT job_name, state FROM dba_datapump_jobs;
+
+no rows selected
+
+-- 남아 있는 작업이 없는 깨끗한 상태에서 시작한다.
+
+[oracle@oel7v9r1 ~]$ df -h /u03 | tail -1
+
+/dev/mapper/ol-u03     20G  3.9G   17G  19% /u03
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE USER job19 IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE users QUOTA UNLIMITED ON users;
+SYS@orcl> GRANT CREATE SESSION, RESOURCE TO job19;
+
+SYS@orcl> CREATE TABLE job19.t1 TABLESPACE users AS
+  2  SELECT ROWNUM AS id, RPAD('j-'||ROWNUM, 300, 'q') AS payload
+  3  FROM   dual CONNECT BY LEVEL <= 600000;
+
+Table created.
+
+SYS@orcl> CREATE TABLE job19.t2 TABLESPACE users AS SELECT * FROM job19.t1;
+SYS@orcl> CREATE TABLE job19.t3 TABLESPACE users AS SELECT * FROM job19.t1;
+
+Table created.
+
+SYS@orcl> SELECT ROUND(SUM(bytes)/1024/1024) AS mb FROM dba_segments
+  2  WHERE  owner = 'JOB19';
+
+    MB
+------
+   660
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 작업 시작과 조회
+--------------------------------------------------------------------------------
+-- 창 1에서 실행한다.
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=job_%U.dmp logfile=job.log schemas=job19 \
+>   parallel=2 job_name=JOB19_EXP
+
+Starting "SYSTEM"."JOB19_EXP":  system/******** directory=dp_dir ...
+Estimate in progress using BLOCKS method...
+Total estimation using BLOCKS method: 660 MB
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+
+-- 창 2에서 상태를 조회한다.
+
+SYS@orcl> SELECT owner_name, job_name, operation, job_mode, state,
+  2         degree, attached_sessions
+  3  FROM   dba_datapump_jobs;
+
+OWNER_NAME JOB_NAME     OPERATION JOB_MODE STATE     DEGREE ATTACHED_SESSIONS
+---------- ------------ --------- -------- --------- ------ -----------------
+SYSTEM     JOB19_EXP    EXPORT    SCHEMA   EXECUTING      2                 1
+
+SYS@orcl> SELECT sid, serial#, session_type FROM dba_datapump_sessions;
+
+  SID  SERIAL# SESSION_TYPE
+----- -------- -------------
+   45     3812 DBMS_DATAPUMP
+   58     1024 MASTER
+   72     9931 WORKER
+   91     4402 WORKER
+
+SYS@orcl> SELECT sid, opname, ROUND(sofar/totalwork*100,1) AS pct,
+  2         time_remaining
+  3  FROM   v$session_longops
+  4  WHERE  opname LIKE 'JOB19%' AND sofar <> totalwork;
+
+  SID OPNAME              PCT  TIME_REMAINING
+----- ------------------ ----- --------------
+   58 JOB19_EXP           34.2            112
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : ATTACH로 제어
+--------------------------------------------------------------------------------
+-- 창 3에서 작업에 붙는다.
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U attach=JOB19_EXP
+
+Job: JOB19_EXP
+  Owner: SYSTEM
+  Operation: EXPORT
+  Creator Privs: TRUE
+  GUID: 8A2F41C6D3E14B7A9E0C5D2B6F310A44
+  Start Time: Wednesday, 21 May, 2025 18:02:11
+  Mode: SCHEMA
+  Instance: orcl
+  Max Parallelism: 2
+  State: EXECUTING
+  Bytes Processed: 0
+  Current Parallelism: 2
+  Job Error Count: 0
+  Dump File: /u03/dpdump/job_%u.dmp
+    size: 0
+    bytes written: 4,096
+
+Worker 1 Status:
+  Instance ID: 1
+  Process Name: DW00
+  State: EXECUTING
+  Object Type: SCHEMA_EXPORT/TABLE/TABLE_DATA
+  Completed Objects: 1
+  Total Objects: 3
+
+Export> STATUS
+
+Job: JOB19_EXP
+  State: EXECUTING
+  Bytes Processed: 245,760,000
+  Percent Done: 37
+
+Export> PARALLEL=4
+
+Export> STATUS
+
+  Current Parallelism: 4
+
+-- 실행 중에 병렬도를 올렸다.
+
+Export> STOP_JOB=IMMEDIATE
+Are you sure you wish to stop this job ([yes]/no): yes
+
+-- 창 1의 화면이 종료된다.
+
+SYS@orcl> SELECT job_name, state FROM dba_datapump_jobs;
+
+JOB_NAME     STATE
+------------ -----------
+JOB19_EXP    NOT RUNNING
+
+SYS@orcl> SELECT owner, table_name, num_rows FROM dba_tables
+  2  WHERE  table_name = 'JOB19_EXP';
+
+OWNER   TABLE_NAME   NUM_ROWS
+------- ------------ --------
+SYSTEM  JOB19_EXP        1204
+
+-- 마스터 테이블이 남아 있다. 이것이 재개의 근거다.
+
+[oracle@oel7v9r1 ~]$ ls -lh /u03/dpdump/job_0*.dmp
+
+-rw-r-----. 1 oracle oinstall 128M May 21 18:06 job_01.dmp
+-rw-r-----. 1 oracle oinstall 121M May 21 18:06 job_02.dmp
+
+-- 지금까지 만들어진 덤프도 남아 있다.
+
+--------------------------------------------------------------------------------
+[6] 확인 : 재개
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U attach=JOB19_EXP
+
+Job: JOB19_EXP
+  State: NOT RUNNING
+  Bytes Processed: 261,120,000
+  Percent Done: 39
+
+Export> START_JOB
+
+Export> CONTINUE_CLIENT
+
+Job JOB19_EXP has been reopened at Wednesday, 21 May, 2025 18:09
+Restarting "SYSTEM"."JOB19_EXP":  system/******** ...
+. . exported "JOB19"."T1"                   183.2 MB   600000 rows
+. . exported "JOB19"."T2"                   183.2 MB   600000 rows
+. . exported "JOB19"."T3"                   183.2 MB   600000 rows
+Master table "SYSTEM"."JOB19_EXP" successfully loaded/unloaded
+Job "SYSTEM"."JOB19_EXP" successfully completed at 18:13:44
+
+SYS@orcl> SELECT job_name, state FROM dba_datapump_jobs;
+
+no rows selected
+
+-- 정상 종료되어 마스터 테이블이 자동으로 삭제되었다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 비정상 종료 상황을 만든다.
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=job2_%U.dmp logfile=job2.log schemas=job19 \
+>   parallel=2 job_name=JOB19_EXP
+
+Starting "SYSTEM"."JOB19_EXP":  ...
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+
+-- 다른 창에서 마스터 프로세스를 강제 종료한다.
+
+SYS@orcl> SELECT sid, serial# FROM dba_datapump_sessions
+  2  WHERE  session_type = 'MASTER';
+
+  SID  SERIAL#
+----- --------
+   58     2201
+
+SYS@orcl> ALTER SYSTEM KILL SESSION '58,2201' IMMEDIATE;
+
+System altered.
+
+-- 창 1에 다음이 출력된다.
+
+ORA-39014: One or more workers have prematurely exited.
+ORA-39029: worker 1 with process name "DW00" prematurely terminated
+ORA-31671: Worker process DW00 had an unhandled exception.
+Job "SYSTEM"."JOB19_EXP" stopped due to fatal error at 18:20:03
+
+-- 같은 이름으로 다시 실행해 본다.
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=job2_%U.dmp logfile=job2.log schemas=job19 \
+>   parallel=2 job_name=JOB19_EXP
+
+ORA-31626: job does not exist
+ORA-31633: unable to create master table "SYSTEM.JOB19_EXP"
+ORA-06512: at "SYS.DBMS_SYS_ERROR", line 95
+ORA-06512: at "SYS.KUPV$FT", line 1163
+ORA-00955: name is already used by an existing object
+
+-- << 원인 파악 >>
+-- 비정상 종료로 마스터 테이블이 남았다.
+-- Data Pump는 작업 이름과 같은 이름의 테이블을 만들려 하는데
+-- 이미 그 이름이 쓰이고 있어 ORA-00955로 막힌다.
+-- 정상 종료 시에는 자동으로 지워지므로 이 문제가 생기지 않는다.
+
+SYS@orcl> SELECT owner_name, job_name, state FROM dba_datapump_jobs;
+
+OWNER_NAME JOB_NAME     STATE
+---------- ------------ ------------
+SYSTEM     JOB19_EXP    NOT RUNNING
+
+-- << 수정 >> 두 가지 방법이 있다.
+-- ① 이어서 하려면 ATTACH 후 START_JOB
+-- ② 버리려면 ATTACH 후 KILL_JOB
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U attach=JOB19_EXP
+
+Job: JOB19_EXP
+  State: NOT RUNNING
+
+Export> KILL_JOB
+Are you sure you wish to stop this job ([yes]/no): yes
+
+SYS@orcl> SELECT job_name FROM dba_datapump_jobs;
+
+no rows selected
+
+SYS@orcl> SELECT table_name FROM dba_tables WHERE table_name = 'JOB19_EXP';
+
+no rows selected
+
+[oracle@oel7v9r1 ~]$ ls /u03/dpdump/job2_0*.dmp
+
+ls: cannot access /u03/dpdump/job2_0*.dmp: No such file or directory
+
+-- KILL_JOB은 덤프 파일까지 지웠다.
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=job2_%U.dmp logfile=job2.log schemas=job19 \
+>   parallel=2 job_name=JOB19_EXP
+
+Job "SYSTEM"."JOB19_EXP" successfully completed at 18:26:51
+
+-- 이제 같은 이름으로 실행된다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT job_name, state FROM dba_datapump_jobs;
+
+no rows selected
+
+[oracle@oel7v9r1 ~]$ tail -4 /u03/dpdump/job2.log
+
+. . exported "JOB19"."T3"                   183.2 MB   600000 rows
+Master table "SYSTEM"."JOB19_EXP" successfully loaded/unloaded
+Dump file set for SYSTEM.JOB19_EXP is:
+Job "SYSTEM"."JOB19_EXP" successfully completed at 18:26:51
+
+-- EXIT_CLIENT 동작도 확인한다.
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=job3_%U.dmp logfile=job3.log schemas=job19 \
+>   parallel=2 job_name=JOB19_BG
+
+Starting "SYSTEM"."JOB19_BG":  ...
+
+-- Ctrl+C 를 눌러 대화형 모드로 들어간다.
+
+Export> EXIT_CLIENT
+
+[oracle@oel7v9r1 ~]$
+
+SYS@orcl> SELECT job_name, state FROM dba_datapump_jobs;
+
+JOB_NAME    STATE
+----------- ----------
+JOB19_BG    EXECUTING
+
+-- 클라이언트를 빠져나왔지만 작업은 계속 실행된다.
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U attach=JOB19_BG
+
+Export> CONTINUE_CLIENT
+
+Job "SYSTEM"."JOB19_BG" successfully completed at 18:33:20
+
+-- 정리
+
+SYS@orcl> DROP USER job19 CASCADE;
+[oracle@oel7v9r1 ~]$ rm -f /u03/dpdump/job*.dmp
+
+-- 실무 포인트
+-- 1) Data Pump 작업은 데이터베이스가 관리한다.
+--    클라이언트를 닫아도 작업은 계속 실행된다.
+--    EXIT_CLIENT로 화면만 빠져나오고 나중에 ATTACH로 다시 붙을 수 있다.
+--
+-- 2) STOP_JOB과 KILL_JOB을 절대 혼동하지 않는다.
+--    STOP_JOB은 마스터 테이블과 덤프를 남겨 재개할 수 있다.
+--    KILL_JOB은 덤프까지 지우며 되돌릴 수 없다.
+--    급할 때 잘못 눌러 몇 시간치 작업을 날리는 일이 실제로 일어난다.
+--
+-- 3) 마스터 테이블은 정상 종료 시 자동 삭제된다.
+--    비정상 종료되면 남아 같은 이름의 작업을 막는다.
+--    ORA-31633과 ORA-00955가 함께 나오면 이 상황이다.
+--
+-- 4) 남은 작업은 재개할지 버릴지 먼저 판단한다.
+--    이어서 할 수 있으면 START_JOB이 훨씬 경제적이다.
+--    처음부터 다시 할 이유가 없다면 KILL_JOB을 서두르지 않는다.
+--
+-- 5) JOB_NAME을 지정하면 관리가 쉬워진다.
+--    자동 이름은 어떤 작업인지 구분되지 않는다.
+--    정기 작업은 날짜를 붙여 추적할 수 있게 한다.
+--
+-- 6) 병렬도는 실행 중에 바꿀 수 있다.
+--    업무 시간에 부하를 줄이려면 값을 내리고 한가할 때 올린다.
+--    작업을 멈추지 않고 조정할 수 있다는 점이 큰 이점이다.

@@ -1,0 +1,242 @@
+================================================================================
+ 실습 5-5 : 읽기 전용 테이블스페이스 손상
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- READ ONLY 상태에서 백업한 테이블스페이스의 데이터 파일이 유실되었다.
+-- 이후 리두가 여러 바퀴 돌았지만 복원만으로 복구가 끝난다.
+-- READ ONLY 전환 시 헤더 SCN이 고정되어 이후 리두가 생성되지 않기 때문이다.
+-- 이 장에서 유일하게 리두 생존 판정이 필요 없는 경우다.
+-- 복구 유형 : 완전 복구(리두 적용 불필요)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- NOARCHIVELOG 모드이고 데이터베이스가 OPEN 상태여야 한다.
+-- 실습용 테이블스페이스 HIST를 새로 만들어 진행한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+SYS@orcl> COL tablespace_name FOR a16
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : 이력 테이블스페이스 준비
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLESPACE hist
+  2    DATAFILE '/u01/app/oracle/oradata/ORCL/hist01.dbf' SIZE 20M;
+
+Tablespace created.
+
+SYS@orcl> CREATE TABLE hr.emp_hist TABLESPACE hist
+  2  AS SELECT * FROM hr.employees;
+
+Table created.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT file#, name, checkpoint_change#, enabled
+  2  FROM   v$datafile WHERE name LIKE '%hist%';
+
+     FILE# NAME                                       CHECKPOINT_CHANGE# ENABLED
+---------- ------------------------------------------ ------------------ ----------
+        10 /u01/app/oracle/oradata/ORCL/hist01.dbf               2365102 READ WRITE
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : READ ONLY 전환과 백업
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLESPACE hist READ ONLY;
+
+Tablespace altered.
+
+SYS@orcl> SELECT tablespace_name, status FROM dba_tablespaces
+  2  WHERE  tablespace_name = 'HIST';
+
+TABLESPACE_NAME  STATUS
+---------------- ---------
+HIST             READ ONLY
+
+SYS@orcl> SELECT file#, checkpoint_change#, enabled FROM v$datafile WHERE file# = 10;
+
+     FILE# CHECKPOINT_CHANGE# ENABLED
+---------- ------------------ ----------
+        10            2365240 READ ONLY
+
+-- 전환 시 체크포인트가 수행되어 헤더 SCN이 2365240으로 고정되었다.
+
+SYS@orcl> !mkdir -p /home/oracle/backup/ch05
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/hist01.dbf /home/oracle/backup/ch05/
+
+-- 이 백업본은 READ ONLY가 유지되는 한 계속 유효하다.
+
+SYS@orcl> SELECT SCN_TO_TIMESTAMP(2365240) AS frozen_at FROM dual;
+
+FROZEN_AT
+---------------------------------------------------------
+10-MAY-25 12.31.04.000000000 PM
+
+--------------------------------------------------------------------------------
+[5] 리두 소진과 장애 유발
+--------------------------------------------------------------------------------
+-- 다른 테이블스페이스에서 대량 변경을 일으켜 리두를 여러 바퀴 돌린다.
+
+SYS@orcl> UPDATE hr.employees SET salary = salary + 1;
+107 rows updated.
+SYS@orcl> COMMIT;
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> /
+SYS@orcl> /
+SYS@orcl> /
+SYS@orcl> /
+System altered.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2367010
+
+-- 고정 SCN(2365240) < 최소 리두 SCN(2367010)
+-- 일반 데이터 파일이었다면 리두가 없어 전체 복원 대상이다.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/hist01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+SELECT COUNT(*) FROM hr.emp_hist
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 10
+ORA-01110: data file 10: '/u01/app/oracle/oradata/ORCL/hist01.dbf'
+ORA-27041: unable to open file
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+        10 FILE NOT FOUND                 0
+
+SYS@orcl> SELECT file#, checkpoint_change#, enabled FROM v$datafile WHERE file# = 10;
+
+     FILE# CHECKPOINT_CHANGE# ENABLED
+---------- ------------------ ----------
+        10            2365240 READ ONLY
+
+-- 제어 파일이 기억하는 값이 여전히 2365240이다.
+-- 백업본의 헤더 SCN과 같으므로 복원하면 두 값이 그대로 맞는다.
+-- 리두 생존 판정(3단계)이 필요 없다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_55
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /home/oracle/before_recover_55/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 열린 상태에서 파일만 되돌려 본다.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch05/hist01.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+SELECT COUNT(*) FROM hr.emp_hist
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 10
+ORA-01110: data file 10: '/u01/app/oracle/oradata/ORCL/hist01.dbf'
+
+-- << 원인 파악 >>
+-- 파일은 제자리에 돌아왔는데 여전히 실패한다.
+-- 파일이 없다고 판단된 시점에 Oracle이 그 파일을 사용 불가로 표시했기 때문이다.
+-- 열린 상태에서 파일을 되돌려도 자동으로 다시 열리지는 않는다.
+-- 데이터베이스를 내렸다가 올리거나, 해당 파일을 ONLINE으로 되돌려야 한다.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 10;
+
+     FILE# NAME                                       STATUS
+---------- ------------------------------------------ -------
+        10 /u01/app/oracle/oradata/ORCL/hist01.dbf    RECOVER
+
+-- << 수정 >>
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+-- 복구 대상이 아니다. 복원만으로 SCN이 맞았다는 뜻이다.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name, status, checkpoint_change#, enabled
+  2  FROM   v$datafile WHERE file# = 10;
+
+     FILE# NAME                                    STATUS  CHECKPOINT_CHANGE# ENABLED
+---------- --------------------------------------- ------- ------------------ ----------
+        10 /u01/app/oracle/oradata/ORCL/hist01.dbf ONLINE             2365240 READ ONLY
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+
+  COUNT(*)
+----------
+       107
+
+-- 데이터가 그대로 살아났다. 리두 적용 없이 복원만으로 끝났다.
+
+-- 대조 : 같은 조건의 일반 데이터 파일이었다면
+
+SYS@orcl> SELECT file#, checkpoint_change# FROM v$datafile WHERE file# = 7;
+
+     FILE# CHECKPOINT_CHANGE#
+---------- ------------------
+         7            2367402
+
+-- USERS(file# 7)의 SCN은 계속 움직인다. 리두 없이 복원하면 ORA-01113이 났을 것이다.
+
+-- 실무 포인트
+-- 1) READ ONLY 전환 시 체크포인트가 수행되어 헤더 SCN이 고정된다.
+--    이후 리두가 생성되지 않으므로 제어 파일의 값과 계속 일치한다.
+--    그래서 복원만으로 복구가 끝나고 v$recover_file에도 나타나지 않는다.
+--
+-- 2) 열린 상태에서 파일을 되돌려도 자동으로 다시 열리지는 않는다.
+--    Oracle이 이미 사용 불가로 표시했기 때문이며, 재기동하거나 ONLINE으로 되돌려야 한다.
+--
+-- 3) 백업본이 무효가 되는 경우는 두 가지다.
+--    READ WRITE로 되돌린 뒤 변경이 일어났을 때, 그리고 RESETLOGS가 수행되었을 때다.
+--    따라서 전환·해제 이력을 백업 매니페스트에 기록해 둔다.
+--
+-- 4) 활용 가치가 크다. 이력 파티션을 오래된 것부터 READ ONLY로 돌리면
+--    매일 백업할 대상이 줄고 복구 시간도 짧아진다.
+--
+-- 5) 다만 READ ONLY 백업본은 매일 백업 대상에서 빠지므로 별도 위치에 안전하게 보관해야 한다.
+--    그것을 잃으면 대체할 사본이 없다.
+--
+-- 6) 실습 정리 : HIST 테이블스페이스는 6장 이후 실습에서 쓰지 않으므로 지워도 된다.
+--    지울 때는 READ WRITE로 되돌린 뒤 DROP TABLESPACE를 수행한다.
+
+SYS@orcl> EXIT

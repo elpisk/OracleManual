@@ -1,0 +1,285 @@
+================================================================================
+ 실습 18-5 : Flashback Table — ENABLE ROW MOVEMENT와 TO SCN/TIMESTAMP
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 테이블 전체가 잘못되어 통째로 되돌려야 한다.
+-- ROW MOVEMENT 없이 시도해 오류를 확인한다.
+-- 되돌리기 전 현재 SCN을 기록해 두는 절차를 익힌다.
+-- DDL이 있으면 되돌릴 수 없다는 제약도 확인한다.
+-- 복구 유형 : 테이블 단위 되돌리기, 무중단
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- UNDO 보존 시간이 충분해야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT tuned_undoretention FROM v$undostat
+  2  ORDER BY begin_time DESC FETCH FIRST 1 ROWS ONLY;
+
+TUNED_UNDORETENTION
+-------------------
+               3600
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.dept185 TABLESPACE users
+  2  AS SELECT * FROM hr.departments;
+
+Table created.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.dept185;
+
+  COUNT(*)
+----------
+        27
+
+SYS@orcl> SELECT row_movement FROM dba_tables
+  2  WHERE  owner = 'HR' AND table_name = 'DEPT185';
+
+ROW_MOVE
+--------
+DISABLED
+
+-- 기본값은 DISABLED다.
+
+SYS@orcl> SELECT current_scn FROM v$database;
+
+CURRENT_SCN
+-----------
+    2815200
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 테이블 전체 손상
+--------------------------------------------------------------------------------
+SYS@orcl> UPDATE hr.dept185 SET department_name = 'UNKNOWN';
+
+27 rows updated.
+
+SYS@orcl> COMMIT;
+
+SYS@orcl> DELETE FROM hr.dept185 WHERE department_id > 100;
+
+10 rows deleted.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.dept185;
+
+  COUNT(*)
+----------
+        17
+
+SYS@orcl> SELECT department_id, department_name FROM hr.dept185
+  2  WHERE  ROWNUM <= 3;
+
+DEPARTMENT_ID DEPARTMENT_NAME
+------------- ------------------------------
+           10 UNKNOWN
+           20 UNKNOWN
+           30 UNKNOWN
+
+-- 이름이 모두 지워졌고 일부 행도 사라졌다.
+-- 테이블 전체를 되돌리는 것이 맞는 상황이다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.dept185 AS OF SCN 2815200;
+
+  COUNT(*)
+----------
+        27
+
+SYS@orcl> SELECT department_id, department_name FROM hr.dept185
+  2  AS OF SCN 2815200 WHERE ROWNUM <= 3;
+
+DEPARTMENT_ID DEPARTMENT_NAME
+------------- ------------------------------
+           10 Administration
+           20 Marketing
+           30 Purchasing
+
+-- 되돌릴 시점의 상태가 정상이다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- 판정
+--   ① 테이블 전체가 잘못되었다
+--   ② 그 사이 정상 작업이 없다
+--   ③ UNDO 보존 기간 안이다
+--   → FLASHBACK TABLE이 적절하다.
+
+-- 되돌리기 전 현재 SCN을 기록한다.
+
+SYS@orcl> SELECT current_scn FROM v$database;
+
+CURRENT_SCN
+-----------
+    2815900
+
+-- 이 값이 있으면 결과가 틀렸을 때 즉시 되돌아갈 수 있다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> FLASHBACK TABLE hr.dept185 TO SCN 2815200;
+
+FLASHBACK TABLE hr.dept185 TO SCN 2815200
+*
+ERROR at line 1:
+ORA-08189: cannot flashback the table because row movement is not enabled
+
+-- << 원인 파악 >>
+-- 되돌리는 과정에서 행이 다시 삽입되며 ROWID가 바뀔 수 있다.
+-- Oracle은 ROWID 변경을 허용한다는 명시적 선언을 요구한다.
+-- ROW MOVEMENT를 활성화하면 해결된다.
+-- 이 설정은 파티션 이동 등에도 쓰이는 일반적인 속성이다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER TABLE hr.dept185 ENABLE ROW MOVEMENT;
+
+Table altered.
+
+SYS@orcl> SELECT row_movement FROM dba_tables
+  2  WHERE  owner = 'HR' AND table_name = 'DEPT185';
+
+ROW_MOVE
+--------
+ENABLED
+
+SYS@orcl> FLASHBACK TABLE hr.dept185 TO SCN 2815200;
+
+Flashback complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.dept185;
+
+  COUNT(*)
+----------
+        27
+
+SYS@orcl> SELECT department_id, department_name FROM hr.dept185
+  2  WHERE  ROWNUM <= 3;
+
+DEPARTMENT_ID DEPARTMENT_NAME
+------------- ------------------------------
+           10 Administration
+           20 Marketing
+           30 Purchasing
+
+-- 정상 상태로 되돌아왔다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+-- 기록해 둔 SCN으로 다시 되돌릴 수 있는지 확인한다.
+
+SYS@orcl> FLASHBACK TABLE hr.dept185 TO SCN 2815900;
+
+Flashback complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.dept185;
+
+  COUNT(*)
+----------
+        17
+
+-- 손상된 상태로 다시 돌아갔다.
+-- 되돌리기는 양방향으로 가능하다.
+
+SYS@orcl> FLASHBACK TABLE hr.dept185 TO SCN 2815200;
+
+Flashback complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.dept185;
+
+  COUNT(*)
+----------
+        27
+
+-- DDL이 있으면 어떻게 되는지 확인한다.
+
+SYS@orcl> ALTER TABLE hr.dept185 ADD (memo VARCHAR2(50));
+
+Table altered.
+
+SYS@orcl> SELECT current_scn FROM v$database;
+
+CURRENT_SCN
+-----------
+    2816400
+
+SYS@orcl> UPDATE hr.dept185 SET department_name = 'CHANGED';
+SYS@orcl> COMMIT;
+
+SYS@orcl> FLASHBACK TABLE hr.dept185 TO SCN 2815200;
+
+FLASHBACK TABLE hr.dept185 TO SCN 2815200
+*
+ERROR at line 1:
+ORA-01466: unable to read data - table definition has changed
+
+-- << 원인 파악 >>
+-- 컬럼을 추가한 뒤이므로 그 이전 구조로 되돌릴 수 없다.
+-- 과거 데이터를 현재 구조로 재구성할 방법이 없기 때문이다.
+-- DDL 이후 시점으로는 되돌릴 수 있다.
+
+SYS@orcl> FLASHBACK TABLE hr.dept185 TO SCN 2816400;
+
+Flashback complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.dept185;
+
+  COUNT(*)
+----------
+        27
+
+SYS@orcl> SELECT department_name FROM hr.dept185 WHERE ROWNUM <= 2;
+
+DEPARTMENT_NAME
+------------------------------
+Administration
+Marketing
+
+-- DDL 이후 시점으로는 되돌릴 수 있다.
+
+SYS@orcl> ALTER TABLE hr.dept185 DISABLE ROW MOVEMENT;
+SYS@orcl> DROP TABLE hr.dept185 PURGE;
+
+Table dropped.
+
+-- 실무 포인트
+-- 1) ROW MOVEMENT가 없으면 ORA-08189로 거부된다.
+--    되돌리는 과정에서 ROWID가 바뀔 수 있기 때문이다.
+--    ALTER TABLE ... ENABLE ROW MOVEMENT 로 켠다.
+--
+-- 2) 되돌리기 전 현재 SCN을 반드시 기록한다.
+--    결과가 기대와 다르면 그 값으로 즉시 돌아갈 수 있다.
+--    Flashback Table은 양방향으로 동작한다.
+--
+-- 3) 되돌릴 시점의 상태를 Flashback Query로 먼저 확인한다.
+--    기대한 상태가 맞는지 보고 실행하면 헛수고를 줄인다.
+--
+-- 4) DDL이 있으면 그 이전으로 되돌릴 수 없다.
+--    ORA-01466이 그 상황이며 구조가 달라 재구성할 수 없기 때문이다.
+--    DDL 이후 시점으로는 가능하다.
+--
+-- 5) 그 사이 정상 작업이 있었다면 이 방법은 위험하다.
+--    테이블 전체를 되돌리므로 정상 작업까지 사라진다.
+--    그때는 Flashback Query로 필요한 행만 되살린다.
+--
+-- 6) 관련 테이블이 있으면 함께 지정한다.
+--    FLASHBACK TABLE t1, t2 TO SCN 형태로 한 번에 처리해야
+--    참조 관계가 깨지지 않는다.

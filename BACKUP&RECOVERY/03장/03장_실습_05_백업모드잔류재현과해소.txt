@@ -1,0 +1,260 @@
+================================================================================
+ 실습 3-5 : 백업 모드 잔류 재현과 해소
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실습 개요
+--------------------------------------------------------------------------------
+-- 백업 스크립트가 중간에 실패해 END BACKUP 이 실행되지 않은 상황을 재현한다.
+-- 그 상태에서 SHUTDOWN IMMEDIATE 가 거부되고, ABORT 후 오픈이 막히는 과정을 확인한다.
+-- MOUNT 상태에서 백업 모드를 해제해 정상화한다.
+-- 이 실습은 데이터베이스를 열 수 없는 상태로 만들므로 반드시 해소까지 마쳐야 한다.
+-- 복구 유형 : 해당 없음(장애 재현과 해소)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- ARCHIVELOG 모드이고 데이터베이스가 OPEN 상태여야 한다.
+-- 다른 사용자가 접속하지 않은 개별 환경이어야 한다.
+-- 실습 3-3 을 마쳐 백업 모드 조작에 익숙한 상태를 전제한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a46
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, status FROM v$backup ORDER BY file#;
+
+     FILE# STATUS
+---------- ------------------
+         1 NOT ACTIVE
+         3 NOT ACTIVE
+         4 NOT ACTIVE
+         7 NOT ACTIVE
+
+SYS@orcl> SELECT name, open_mode, checkpoint_change# FROM v$database;
+
+NAME      OPEN_MODE            CHECKPOINT_CHANGE#
+--------- -------------------- ------------------
+ORCL      READ WRITE                      2343405
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 잔류 상황 재현
+--------------------------------------------------------------------------------
+-- 백업 스크립트가 BEGIN BACKUP 후 복사 도중 중단된 상황을 흉내 낸다.
+
+SYS@orcl> ALTER DATABASE BEGIN BACKUP;
+
+Database altered.
+
+SYS@orcl> SELECT file#, status, change#, time FROM v$backup ORDER BY file#;
+
+     FILE# STATUS               CHANGE# TIME
+---------- ------------------ --------- -------------------
+         1 ACTIVE               2343405 2025-05-09 14:02:11
+         3 ACTIVE               2343405 2025-05-09 14:02:11
+         4 ACTIVE               2343405 2025-05-09 14:02:11
+         7 ACTIVE               2343405 2025-05-09 14:02:11
+
+-- 여기서 스크립트가 죽었다고 가정한다. END BACKUP 을 실행하지 않는다.
+
+-- 데이터베이스는 겉으로 정상 동작한다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> UPDATE hr.employees SET salary = salary + 1 WHERE ROWNUM <= 10;
+10 rows updated.
+
+SYS@orcl> COMMIT;
+Commit complete.
+
+-- 사용자는 아무 이상을 느끼지 못한다. 리두만 과다 생성되고 있을 뿐이다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 정기 재기동 작업을 하려고 종료를 시도한다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+ORA-01149: cannot shutdown - file 1 has online backup set
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+
+-- << 원인 파악 (1차) >>
+-- 백업 중인 파일이 있어 닫을 수 없다는 뜻이다.
+-- 백업본이 무효가 되는 것을 막기 위한 안전장치다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$backup WHERE status = 'ACTIVE';
+
+  COUNT(*)
+----------
+         4
+
+-- 여기서 END BACKUP 을 하면 바로 해결되지만,
+-- 원인을 모르고 강제 종료하는 경우를 재현한다.
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+Database mounted.
+ORA-10873: file 1 needs to be either taken out of backup mode or media recovered
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+
+-- << 원인 파악 (2차) >>
+-- MOUNT 까지는 올라갔으나 OPEN 에서 막혔다.
+-- 백업 모드로 남은 파일의 헤더 SCN 이 동결된 상태라
+-- Oracle 이 복구가 필요하다고 판단한 것이다.
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+MOUNTED
+
+SYS@orcl> SELECT b.file#, d.name, b.status, b.change#, b.time
+  2  FROM   v$backup b, v$datafile d
+  3  WHERE  b.file# = d.file# AND b.status = 'ACTIVE' ORDER BY b.file#;
+
+     FILE# NAME                                           STATUS               CHANGE# TIME
+---------- ---------------------------------------------- ------------------ --------- -------------------
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf      ACTIVE               2343405 2025-05-09 14:02:11
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf      ACTIVE               2343405 2025-05-09 14:02:11
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf     ACTIVE               2343405 2025-05-09 14:02:11
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf       ACTIVE               2343405 2025-05-09 14:02:11
+
+-- MOUNT 상태에서도 v$backup 을 조회할 수 있다. 제어 파일에 기록된 정보이기 때문이다.
+
+-- << 수정 >>
+-- 미디어 복구가 아니라 백업 모드 해제로 해결한다.
+
+SYS@orcl> ALTER DATABASE END BACKUP;
+
+Database altered.
+
+SYS@orcl> SELECT COUNT(*) FROM v$backup WHERE status = 'ACTIVE';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+SYS@orcl> SELECT open_mode FROM v$database;
+
+OPEN_MODE
+--------------------
+READ WRITE
+
+--------------------------------------------------------------------------------
+[6] 진단 : 개별 파일만 해제하는 방법
+--------------------------------------------------------------------------------
+-- 일부 파일만 잔류한 경우 전체 해제 대신 개별 해제도 가능하다.
+
+SYS@orcl> ALTER TABLESPACE users BEGIN BACKUP;
+Tablespace altered.
+
+SYS@orcl> SELECT file#, status FROM v$backup WHERE status = 'ACTIVE';
+
+     FILE# STATUS
+---------- ------------------
+         7 ACTIVE
+
+SYS@orcl> ALTER DATABASE DATAFILE '/u01/app/oracle/oradata/ORCL/users01.dbf' END BACKUP;
+
+Database altered.
+
+SYS@orcl> SELECT COUNT(*) FROM v$backup WHERE status = 'ACTIVE';
+
+  COUNT(*)
+----------
+         0
+
+-- 파일 번호로도 지정할 수 있다.
+--   ALTER DATABASE DATAFILE 7 END BACKUP;
+
+--------------------------------------------------------------------------------
+[7] 검증 : 잔류 점검 조회
+--------------------------------------------------------------------------------
+-- 정기 점검 항목으로 만들어 둘 조회다.
+
+SYS@orcl> SELECT b.file#, d.name, b.status, b.time,
+  2         ROUND((SYSDATE - b.time) * 24, 1) AS hours_in_backup
+  3  FROM   v$backup b, v$datafile d
+  4  WHERE  b.file# = d.file# AND b.status = 'ACTIVE'
+  5  ORDER  BY b.file#;
+
+no rows selected
+
+-- 결과가 없으면 정상이다.
+-- 행이 나오고 HOURS_IN_BACKUP 이 몇 시간 이상이면 확실한 잔류다.
+
+-- 스크립트 보호 장치 예시
+
+SYS@orcl> !cat /home/oracle/scripts/hot_backup_guard.sh
+#!/bin/bash
+# 실패해도 백업 모드를 반드시 해제한다
+cleanup() {
+  sqlplus -s / as sysdba <<EOF
+ALTER DATABASE END BACKUP;
+EXIT
+EOF
+}
+trap cleanup EXIT
+
+# ... 백업 본문 ...
+
+-- 이미 해제된 상태에서 END BACKUP 을 호출하면 ORA-01142 가 발생하지만
+-- 잔류를 남기는 쪽이 훨씬 위험하므로 무시해도 된다.
+
+SYS@orcl> ALTER DATABASE END BACKUP;
+ALTER DATABASE END BACKUP
+*
+ERROR at line 1:
+ORA-01142: cannot end online backup - none of the files are in backup
+
+-- 이 오류는 "해제할 것이 없다"는 뜻이므로 정상 상태를 확인한 셈이다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) 잔류 상태는 겉으로 드러나지 않는다.
+--    데이터베이스는 계속 동작하고 사용자도 이상을 느끼지 못한다.
+--    드러나는 것은 리두 과다 생성과, 다음 종료·장애 시 오픈 실패다.
+--
+-- 2) ORA-01149 는 안전장치이지 오류가 아니다.
+--    이 메시지를 보면 END BACKUP 을 먼저 수행하고 종료한다.
+--    ABORT 로 우회하면 다음 기동에서 ORA-10873 을 만난다.
+--
+-- 3) ORA-10873 은 미디어 복구가 아니라 백업 모드 해제로 푼다.
+--    RECOVER DATAFILE 을 시도하면 불필요한 리두 적용이 일어난다.
+--    MOUNT 상태에서 ALTER DATABASE END BACKUP 한 줄이면 끝난다.
+--
+-- 4) MOUNT 상태에서도 v$backup 을 조회할 수 있다.
+--    백업 모드 정보가 제어 파일에 기록되기 때문이며, 진단에 그대로 활용한다.
+--
+-- 5) 백업 스크립트에는 trap 이나 예외 처리로 END BACKUP 보호 장치를 둔다.
+--    ORA-01142 가 나더라도 무시하도록 처리한다.
+--
+-- 6) 정기 점검 조회를 모니터링에 등록한다.
+--    HOURS_IN_BACKUP 이 1시간을 넘으면 경보를 울리는 정도가 적당하다.
+
+SYS@orcl> EXIT

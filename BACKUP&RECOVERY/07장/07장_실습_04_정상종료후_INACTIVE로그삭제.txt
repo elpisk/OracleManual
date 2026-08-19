@@ -1,0 +1,296 @@
+================================================================================
+ 실습 7-4 : 정상 종료 후 INACTIVE 리두 로그 삭제
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 정상 종료 후 INACTIVE 그룹의 멤버가 모두 삭제되었다.
+-- 그 그룹의 리두는 이미 데이터파일에 반영되어 있어 손실이 없다.
+-- CLEAR LOGFILE로 그룹을 다시 만들면 RESETLOGS 없이 열린다.
+-- 멤버 하나만 손상된 경우와의 차이도 함께 확인한다.
+-- 복구 유형 : 복구 불필요(CLEAR 후 정상 오픈)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 리두 로그가 그룹 세 개, 그룹마다 멤버 두 개로 구성되어 있어야 한다.
+-- 데이터베이스가 OPEN 상태여야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL member FOR a44
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT l.group#, l.sequence#, l.status, f.member, f.status AS mem_status
+  2  FROM   v$log l, v$logfile f WHERE l.group# = f.group# ORDER BY l.group#;
+
+    GROUP#  SEQUENCE# STATUS     MEMBER                                    MEM_STATUS
+---------- ---------- ---------- ----------------------------------------- ----------
+         1          3 CURRENT    /u01/app/oracle/oradata/ORCL/redo01.log
+         1          3 CURRENT    /u02/oradata/ORCL/redo01b.log
+         3          1 INACTIVE   /u01/app/oracle/oradata/ORCL/redo03.log
+         3          1 INACTIVE   /u02/oradata/ORCL/redo03b.log
+         4          2 INACTIVE   /u01/app/oracle/oradata/ORCL/redo04.log
+         4          2 INACTIVE   /u02/oradata/ORCL/redo04b.log
+
+6 rows selected.
+
+-- 먼저 멤버 하나만 손상된 경우를 확인한다.
+
+SYS@orcl> !rm -f /u02/oradata/ORCL/redo03b.log
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> /
+System altered.
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE status IS NOT NULL;
+
+    GROUP# MEMBER                                       STATUS
+---------- -------------------------------------------- -------
+         3 /u02/oradata/ORCL/redo03b.log                INVALID
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+-- 서비스가 계속된다. 멤버 하나 손상은 손실을 일으키지 않는다.
+
+SYS@orcl> ALTER SYSTEM CHECKPOINT;
+SYS@orcl> SELECT group#, status FROM v$log WHERE group# = 3;
+
+    GROUP# STATUS
+---------- ----------------
+         3 INACTIVE
+
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/redo03.log /u02/oradata/ORCL/redo03b.log
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM CHECKPOINT;
+SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE group# = 3;
+
+    GROUP# MEMBER                                       STATUS
+---------- -------------------------------------------- -------
+         3 /u01/app/oracle/oradata/ORCL/redo03.log
+         3 /u02/oradata/ORCL/redo03b.log
+
+-- INVALID가 해소되었다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 정상 종료 후 그룹 전손
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp74(id NUMBER) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp74 VALUES (74);
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1          6 CURRENT
+         3          4 INACTIVE
+         4          5 INACTIVE
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/redo03.log /u02/oradata/ORCL/redo03b.log
+
+-- 그룹 3의 멤버가 모두 사라졌다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+Database mounted.
+ORA-00313: open failed for members of log group 3 of thread 1
+ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/ORCL/redo03.log'
+ORA-00312: online log 3 thread 1: '/u02/oradata/ORCL/redo03b.log'
+ORA-27037: unable to obtain file status
+
+-- ORA-00312가 두 줄이다. 멤버 두 개를 모두 열지 못했다는 뜻이다.
+-- 그래서 ORA-00313이 함께 나온다. 그룹 전손이 확정이다.
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+MOUNTED
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1          6 CURRENT
+         3          4 INACTIVE
+         4          5 INACTIVE
+
+-- 손상된 그룹 3이 INACTIVE다. 인스턴스 복구에 필요하지 않다.
+
+SYS@orcl> !grep -n 'CLOSE NORMAL' \
+        /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -1
+19402:Completed: ALTER DATABASE CLOSE NORMAL
+
+-- 정상 종료였다. 인스턴스 복구 자체가 필요 없다.
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+-- 데이터파일은 문제가 없다.
+
+-- 판정
+--   ① 멤버 : 그룹 3은 전손, 나머지 그룹은 온전
+--   ② 그룹 상태 : INACTIVE → CLEAR 가능
+--   ③ 종료 : 정상 → RESETLOGS 불필요
+--   → CLEAR LOGFILE GROUP 3 후 OPEN. 손실 없음.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_74
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /home/oracle/before_recover_74/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 그룹을 제거해 보려 한다.
+
+SYS@orcl> ALTER DATABASE DROP LOGFILE GROUP 3;
+ALTER DATABASE DROP LOGFILE GROUP 3
+*
+ERROR at line 1:
+ORA-00313: open failed for members of log group 3 of thread 1
+ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/ORCL/redo03.log'
+ORA-27037: unable to obtain file status
+
+-- << 원인 파악 >>
+-- DROP LOGFILE 은 그룹을 제거하는 명령이며 파일에 접근할 수 있어야 한다.
+-- 파일이 없어졌으므로 제거 자체가 되지 않는다.
+-- 필요한 것은 제거가 아니라 재생성이다.
+-- CLEAR LOGFILE 은 파일이 없으면 새로 만들어 주므로 이 상황에 맞는 명령이다.
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/redo03.log
+ls: cannot access '/u01/app/oracle/oradata/ORCL/redo03.log': No such file or directory
+
+-- << 수정 >>
+
+SYS@orcl> ALTER DATABASE CLEAR LOGFILE GROUP 3;
+
+Database altered.
+
+SYS@orcl> SELECT group#, sequence#, status FROM v$log WHERE group# = 3;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         3          0 UNUSED
+
+SYS@orcl> SELECT member, status FROM v$logfile WHERE group# = 3;
+
+MEMBER                                       STATUS
+-------------------------------------------- -------
+/u01/app/oracle/oradata/ORCL/redo03.log
+/u02/oradata/ORCL/redo03b.log
+
+-- STATUS가 비었다. 멤버 두 개가 모두 다시 만들어졌다.
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/redo03.log /u02/oradata/ORCL/redo03b.log
+-rw-r-----. 1 oracle oinstall 209715712 May 10 19:52 redo03.log
+-rw-r-----. 1 oracle oinstall 209715712 May 10 19:52 redo03b.log
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- RESETLOGS 없이 열렸다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp74;
+
+  COUNT(*)
+----------
+         1
+
+-- 종료 직전 커밋한 데이터가 그대로다. 손실이 없다.
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  WHERE  status = 'CURRENT';
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           6           2393981 CURRENT
+
+-- 실습 7-3 이후 값 그대로다. 인카네이션이 올라가지 않았다.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+
+SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1          9 INACTIVE
+         3          7 INACTIVE
+         4          8 CURRENT
+
+-- 그룹 3이 정상적으로 순환에 참여한다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         1
+
+-- 컨트롤파일을 건드리지 않았으므로 TEMP 정보가 유지된다.
+
+-- 실무 포인트
+-- 1) ORA-00312의 줄 수가 진단의 열쇠다.
+--    멤버 수만큼 나오면 그룹 전손이고 ORA-00313이 함께 나온다.
+--    한 줄만 나오면 멤버 하나 손상이므로 서비스가 멈추지 않는다.
+--
+-- 2) DROP LOGFILE 과 CLEAR LOGFILE 은 목적이 다르다.
+--    DROP은 그룹을 없애는 명령이라 파일에 접근할 수 있어야 하고,
+--    CLEAR는 내용을 비우고 없으면 새로 만드는 명령이라 이 상황에 맞는다.
+--
+-- 3) 정상 종료 + INACTIVE 조합이면 손실이 없다.
+--    그 그룹의 리두가 이미 데이터파일에 반영되어 있기 때문이다.
+--    RESETLOGS도 필요 없어 기존 백업본이 계속 유효하다.
+--
+-- 4) 멤버 하나 손상은 온라인으로 처리한다.
+--    스위치와 체크포인트로 대상 그룹을 INACTIVE로 만든 뒤
+--    같은 그룹의 멤버를 복사하거나 DROP/ADD MEMBER 를 수행한다.
+--
+-- 5) CLEAR 후 확인은 네 가지다.
+--    v$log의 STATUS, v$logfile의 STATUS, OS 파일 재생성, v$recover_file 공백이다.
+--    이 중 하나라도 어긋나면 아직 남은 문제가 있다는 뜻이다.
+--
+-- 6) 이 실습이 손쉬웠던 이유는 종료 방식과 그룹 상태가 모두 유리했기 때문이다.
+--    다음 실습에서 같은 그룹 손상을 비정상 종료 상태에서 다시 본다.
+
+SYS@orcl> EXIT

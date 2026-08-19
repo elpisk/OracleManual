@@ -1,0 +1,245 @@
+================================================================================
+ 실습 4-5 : SYSTEM 데이터파일 손상 — 리두 있음
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- SYSTEM 테이블스페이스의 데이터 파일이 유실되었다.
+-- 백업 이후 리두가 남아 있어 완전 복구가 가능하다.
+-- 다만 SYSTEM은 오프라인으로 내릴 수 없어 반드시 데이터베이스를 내려야 한다.
+-- 복구 유형 : 완전 복구
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- NOARCHIVELOG 모드여야 한다.
+-- 실습 직전에 Cold Backup을 새로 받아 리두가 남아 있는 조건을 만든다.
+-- 다른 사용자가 접속하지 않은 개별 환경이어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+-- 백업을 새로 받는다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch04 && mkdir -p /home/oracle/backup/ch04
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /u01/app/oracle/oradata/ORCL/*.ctl \
+                 /u01/app/oracle/oradata/ORCL/*.log /home/oracle/backup/ch04/
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.log /home/oracle/backup/ch04/
+SYS@orcl> !rm -f /home/oracle/backup/ch04/temp01.dbf
+SYS@orcl> STARTUP
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2356402
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name, status FROM v$datafile ORDER BY file#;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf     SYSTEM
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf     ONLINE
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf    ONLINE
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf      ONLINE
+         8 /u01/app/oracle/oradata/ORCL/tbs01.dbf        ONLINE
+
+-- file# 1의 STATUS가 SYSTEM이다. 다른 파일과 지위가 다르다.
+
+SYS@orcl> CREATE TABLE hr.emp3(id NUMBER) TABLESPACE users;
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp3 VALUES (100);
+1 row created.
+
+SYS@orcl> COMMIT;
+Commit complete.
+
+-- 백업 이후 만든 객체다. 완전 복구되면 살아 있어야 한다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/system01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH SHARED_POOL;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+-- 이미 캐시된 정보로 처리되는 조회는 잠시 성공한다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp3;
+
+  COUNT(*)
+----------
+         1
+
+-- 딕셔너리를 새로 읽어야 하는 조회는 실패한다.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_tables;
+SELECT COUNT(*) FROM dba_tables
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 1
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+ORA-27041: unable to open file
+Linux-x86_64 Error: 2: No such file or directory
+
+SYS@orcl> !tail -6 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Errors in file /u01/app/oracle/diag/rdbms/orcl/orcl/trace/orcl_ora_10422.trc:
+ORA-01116: error in opening database file 1
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+ORA-27041: unable to open file
+Linux-x86_64 Error: 2: No such file or directory
+Additional information: 3
+
+-- "일부 화면만 오류가 난다"는 형태로 신고가 들어오는 전형적인 상황이다.
+
+--------------------------------------------------------------------------------
+[6] 진단 : 세 줄 점검표
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, log_mode, open_mode FROM v$database;
+
+NAME      LOG_MODE     OPEN_MODE
+--------- ------------ --------------------
+ORCL      NOARCHIVELOG READ WRITE
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         1 FILE NOT FOUND                 0
+
+-- file# 1이다. SYSTEM이므로 데이터베이스를 열어 둔 채로 처리할 수 없다.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2356102
+
+-- 백업본 SCN(2356402) >= 최소 리두 SCN(2356102)
+-- 리두가 살아 있다. 부분 복원 + RECOVER 경로다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_45
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /u01/app/oracle/oradata/ORCL/*.log \
+                 /home/oracle/before_recover_45/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 일반 테이블스페이스처럼 파일만 떼어 내고 서비스를 유지하려 해 본다.
+
+SYS@orcl> ALTER DATABASE DATAFILE 1 OFFLINE DROP;
+ALTER DATABASE DATAFILE 1 OFFLINE DROP
+*
+ERROR at line 1:
+ORA-01541: system tablespace cannot be brought offline; shut down if necessary
+
+-- << 원인 파악 >>
+-- SYSTEM에는 데이터 딕셔너리가 들어 있다.
+-- 그 정보 없이는 데이터베이스가 성립하지 않으므로 오프라인으로 내릴 수 없다.
+-- 오류 메시지가 직접 알려 준다. "shut down if necessary"
+-- 즉 서비스를 유지한 채 처리할 방법이 없다.
+
+-- << 수정 >>
+-- 데이터베이스를 내리고 MOUNT 상태에서 처리한다.
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch04/system01.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2356402 NO
+         3            2356810 YES
+         4            2356810 YES
+         7            2356810 YES
+         8            2356810 YES
+
+-- file# 1만 뒤처져 있다. 나머지가 FUZZY YES인 것은 ABORT로 내렸기 때문이다.
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE;
+Media recovery complete.
+
+-- RECOVER DATAFILE 1 대신 RECOVER DATABASE를 썼다.
+-- 복구가 필요한 모든 파일을 한 번에 처리하므로 대상을 일일이 지정하지 않아도 된다.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile ORDER BY file#;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf     SYSTEM
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf     ONLINE
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf    ONLINE
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf      ONLINE
+         8 /u01/app/oracle/oradata/ORCL/tbs01.dbf        ONLINE
+
+SYS@orcl> SELECT COUNT(*) FROM dba_tables WHERE owner = 'HR';
+
+  COUNT(*)
+----------
+        11
+
+-- 딕셔너리 조회가 정상으로 돌아왔다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp3;
+
+  COUNT(*)
+----------
+         1
+
+-- 백업 이후 만든 객체가 살아 있다. 완전 복구가 성공했다.
+
+-- 실무 포인트
+-- 1) SYSTEM은 OFFLINE DROP조차 불가능하다(ORA-01541).
+--    일반 테이블스페이스와 달리 "그것만 버리고 나머지를 살린다"는 선택지가 없다.
+--
+-- 2) 오류 메시지가 조치를 알려 준다. "shut down if necessary"는
+--    서비스 유지가 불가능하니 내리라는 뜻이다.
+--
+-- 3) SYSTEM 손상은 즉시 드러나지 않는다.
+--    SGA의 딕셔너리 캐시로 잠시 버티다가 캐시에 없는 정보를 읽을 때 터진다.
+--    "일부 화면만 오류가 난다"는 신고가 들어오면 v$recover_file부터 확인한다.
+--
+-- 4) RECOVER DATABASE를 쓰면 복구 대상을 일일이 지정하지 않아도 된다.
+--    SYSTEM 손상은 어차피 MOUNT 상태이므로 이 명령을 쓰기 좋은 상황이다.
+--
+-- 5) FUZZY가 YES인 파일이 여럿 보이는 것은 ABORT로 내렸기 때문이며 정상이다.
+--    RECOVER DATABASE가 인스턴스 복구와 미디어 복구를 함께 처리한다.
+--
+-- 6) SYSTEM 파일은 다중화된 디스크에 두고 백업 주기를 짧게 가져가는 것이 좋다.
+--    리두가 없을 때의 결과가 전체 복원이라 손실 규모가 가장 크기 때문이다.
+
+SYS@orcl> EXIT

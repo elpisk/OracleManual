@@ -1,0 +1,272 @@
+================================================================================
+ 실습 5-1 : UNDO 데이터파일 손상 — 리두 있음
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- UNDO 테이블스페이스의 데이터 파일이 유실되었다.
+-- 백업 이후 리두가 온라인 리두 로그에 남아 있어 완전 복구가 가능하다.
+-- UNDO는 떼어 낸 채로 열 수 없으므로 MOUNT 상태에서 처리한다.
+-- 복구 유형 : 완전 복구
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- NOARCHIVELOG 모드이고 다른 사용자가 접속하지 않은 개별 환경이어야 한다.
+-- 실습 직전에 Cold Backup을 새로 받아 리두가 남아 있는 조건을 만든다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+SYS@orcl> SELECT name, log_mode FROM v$database;
+
+NAME      LOG_MODE
+--------- ------------
+ORCL      NOARCHIVELOG
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch05 && mkdir -p /home/oracle/backup/ch05
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /u01/app/oracle/oradata/ORCL/*.ctl \
+                 /u01/app/oracle/oradata/ORCL/*.log /home/oracle/backup/ch05/
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.log /home/oracle/backup/ch05/
+SYS@orcl> !rm -f /home/oracle/backup/ch05/temp01.dbf
+SYS@orcl> STARTUP
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2361204
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 4;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf    ONLINE
+
+SYS@orcl> SELECT segment_name, tablespace_name, status
+  2  FROM   dba_rollback_segs WHERE tablespace_name = 'UNDOTBS1' FETCH FIRST 3 ROWS ONLY;
+
+SEGMENT_NAME              TABLESPACE_NAME  STATUS
+------------------------- ---------------- --------
+_SYSSMU1_1261223759$      UNDOTBS1         ONLINE
+_SYSSMU2_27624015$        UNDOTBS1         ONLINE
+_SYSSMU3_2421748942$      UNDOTBS1         ONLINE
+
+SYS@orcl> UPDATE hr.employees SET salary = salary + 100 WHERE department_id = 50;
+45 rows updated.
+
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT MAX(salary) AS max_sal FROM hr.employees WHERE department_id = 50;
+
+   MAX_SAL
+----------
+      8300
+
+-- 백업 이후 커밋한 데이터다. 완전 복구되면 이 값이 살아 있어야 한다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/undotbs01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+-- 읽기는 성공한다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+-- 변경은 실패한다. 언두 블록을 새로 할당해야 하기 때문이다.
+
+SYS@orcl> UPDATE hr.employees SET salary = salary + 1 WHERE ROWNUM <= 10;
+UPDATE hr.employees SET salary = salary + 1 WHERE ROWNUM <= 10
+       *
+ERROR at line 1:
+ORA-01116: error in opening database file 4
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+ORA-27041: unable to open file
+Linux-x86_64 Error: 2: No such file or directory
+
+SYS@orcl> !tail -5 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Errors in file .../orcl_ora_13022.trc:
+ORA-01116: error in opening database file 4
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+ORA-27041: unable to open file
+Linux-x86_64 Error: 2: No such file or directory
+
+-- SELECT는 되고 DML만 실패하는 것이 UNDO 손상의 특징적 신호다.
+
+--------------------------------------------------------------------------------
+[6] 진단 : 세 줄 점검표
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, log_mode, open_mode FROM v$database;
+
+NAME      LOG_MODE     OPEN_MODE
+--------- ------------ --------------------
+ORCL      NOARCHIVELOG READ WRITE
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         4 FILE NOT FOUND                 0
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2360910
+
+-- 백업본 SCN(2361204) >= 최소 리두 SCN(2360910) → 리두 생존, 완전 복구 가능
+-- 손상 파일이 UNDO이므로 데이터베이스를 내려야 한다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_51
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /u01/app/oracle/oradata/ORCL/*.log \
+                 /home/oracle/before_recover_51/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 서비스를 유지하며 처리할 수 있는지 먼저 확인한다.
+
+SYS@orcl> ALTER DATABASE DATAFILE 4 OFFLINE DROP;
+
+Database altered.
+
+-- 명령이 성공했다. 이대로 계속 쓸 수 있을 것처럼 보인다.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 4;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf    RECOVER
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+ORA-01157: cannot identify/lock data file 4 - see DBWR trace file
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+
+-- << 원인 파악 >>
+-- OFFLINE DROP 명령은 성공했지만 오픈이 막혔다.
+-- 오픈 과정에서 SMON이 미완료 트랜잭션을 롤백하려면 활성 롤백 세그먼트가 필요한데,
+-- 떼어 낸 UNDO에 그 세그먼트가 있어 읽을 수 없기 때문이다.
+-- SYSTEM은 ORA-01541로 시도 자체를 막지만 UNDO는 여기까지 와서 막힌다.
+-- 명령이 거부되지 않았다고 해서 그 경로가 열려 있는 것은 아니다.
+
+SYS@orcl> !tail -4 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Errors in file .../orcl_smon_13188.trc:
+ORA-01595: error freeing extent (3) of rollback segment (_SYSSMU3$)
+ORA-00376: file 4 cannot be read at this time
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+
+-- << 수정 >>
+-- 정식 복구 경로로 간다. 파일을 복원하고 리두를 적용한다.
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch05/undotbs01.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         4                          2361204
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE;
+Media recovery complete.
+
+-- 프롬프트 없이 완료되었다. 필요한 리두가 온라인 리두 로그에 있었다는 뜻이다.
+
+SYS@orcl> ALTER DATABASE DATAFILE 4 ONLINE;
+Database altered.
+
+SYS@orcl> ALTER DATABASE OPEN;
+Database altered.
+
+-- OFFLINE DROP으로 내렸던 파일은 복구 후 ONLINE으로 되돌려야 한다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 4;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf    ONLINE
+
+SYS@orcl> SELECT MAX(salary) AS max_sal FROM hr.employees WHERE department_id = 50;
+
+   MAX_SAL
+----------
+      8300
+
+-- 백업 이후 커밋한 데이터가 살아 있다. 완전 복구가 성공했다.
+
+-- UNDO 복구의 최종 검증은 DML이 정상 수행되는지 확인하는 것이다.
+
+SYS@orcl> UPDATE hr.employees SET salary = salary WHERE ROWNUM = 1;
+1 row updated.
+
+SYS@orcl> ROLLBACK;
+Rollback complete.
+
+SYS@orcl> SELECT segment_name, status FROM dba_rollback_segs
+  2  WHERE  tablespace_name = 'UNDOTBS1' AND status <> 'ONLINE';
+
+no rows selected
+
+-- 모든 롤백 세그먼트가 ONLINE이다.
+
+-- 실무 포인트
+-- 1) SELECT는 되고 DML만 실패하면 UNDO를 의심한다.
+--    읽기는 캐시된 블록으로 처리되지만 변경은 언두 블록 할당을 요구하기 때문이다.
+--
+-- 2) OFFLINE DROP이 성공한다고 그 경로가 맞는 것은 아니다.
+--    SYSTEM은 ORA-01541로 시도를 막고 UNDO는 오픈에서 ORA-01157로 막는다.
+--    도달하는 지점이 달라 진단 중 혼동하기 쉽다.
+--
+-- 3) UNDO 손상은 데이터베이스를 반드시 내려야 한다. 무중단 처리 경로가 없다.
+--    증상이 보이는 단계에서 계획을 세우고 통제된 종료를 하는 편이 낫다.
+--    방치하면 SMON이 언두를 읽지 못해 인스턴스가 스스로 죽는다.
+--
+-- 4) RECOVER DATAFILE 4 대신 RECOVER DATABASE를 썼다.
+--    ABORT로 내렸다면 다른 파일도 인스턴스 복구가 필요하므로 한 번에 처리된다.
+--
+-- 5) OFFLINE DROP으로 내린 파일은 복구 후 ONLINE으로 되돌리는 것을 잊지 않는다.
+--    잊으면 그 테이블스페이스가 계속 사용 불가 상태로 남는다.
+--
+-- 6) DML 수행과 롤백 세그먼트 상태 확인이 UNDO 복구의 최종 검증이다.
+--    v$recover_file이 비었다는 것만으로는 부족하다.
+
+SYS@orcl> EXIT

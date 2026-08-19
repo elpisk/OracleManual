@@ -1,0 +1,420 @@
+================================================================================
+ 실습 17-8 : 백업 기반 복제와 시점 복제, nid로 DBID 변경
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL → NEWDB
+ 소요 시간 : 약 40분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 원본에 접속하지 않고 백업만으로 복제한다.
+-- UNTIL TIME 으로 과거 시점의 복제본을 만든다.
+-- nid로 복제본의 이름과 DBID를 바꾼다.
+-- 세 방식의 결과를 비교한다.
+-- 작업 유형 : 복제 수행(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 17-7의 NEWDB를 정리하고 다시 시작한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=NEWDB
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SHUTDOWN IMMEDIATE
+   STARTUP MOUNT EXCLUSIVE RESTRICT;
+   SELECT name FROM v\$database;
+   DROP DATABASE;"
+
+NAME
+---------
+NEWDB
+
+Database dropped.
+
+[oracle@oel7v9r1 ~]$ rm -rf /u04/newdb/NEWDB
+[oracle@oel7v9r1 ~]$ ls /u04/newdb
+arch
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT COUNT(*) FROM hr.dup177;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') AS now FROM dual;
+
+NOW
+-------------------
+2025-05-19 13:02:11
+
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'BASE_178';
+
+Starting backup at 19-MAY-25
+Finished backup at 19-MAY-25
+
+RMAN> EXIT
+
+-- 백업 이후에 데이터를 더 넣는다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "INSERT INTO hr.dup177 VALUES (2, 'after backup'); COMMIT;
+   ALTER SYSTEM ARCHIVE LOG CURRENT;"
+
+1 row created.
+Commit complete.
+System altered.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') AS now FROM dual;"
+
+NOW
+-------------------
+2025-05-19 13:14:02
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 백업 기반 복제
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=NEWDB
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "STARTUP NOMOUNT PFILE='?/dbs/initNEWDB.ora';"
+
+ORACLE instance started.
+
+-- 원본에 접속하지 않고 auxiliary만 지정한다.
+
+[oracle@oel7v9r1 ~]$ rman auxiliary sys/oracle_4U@NEWDB
+
+Recovery Manager: Release 19.0.0.0.0 - Production
+
+connected to auxiliary database: NEWDB (not mounted)
+
+RMAN> DUPLICATE DATABASE TO NEWDB
+  2>   BACKUP LOCATION '/home/oracle/rmanbk'
+  3>   SPFILE
+  4>     SET DB_CREATE_FILE_DEST '/u04/newdb'
+  5>     SET LOG_ARCHIVE_DEST_1 'LOCATION=/u04/newdb/arch';
+
+Starting Duplicate Db at 19-MAY-25
+
+contents of Memory Script:
+{
+   restore clone primary controlfile from
+    '/home/oracle/rmanbk/cf_c-1200530011-20250519-01';
+   alter clone database mount;
+}
+executing Memory Script
+
+-- 자동 백업에서 컨트롤파일을 가져온다.
+-- 원본에 접속하지 않으므로 백업 디렉터리에서 모든 것을 찾는다.
+
+contents of Memory Script:
+{
+   set until scn  2801200;
+   set newname for clone datafile  1 to new;
+   ...
+   restore clone database;
+}
+executing Memory Script
+
+Starting restore at 19-MAY-25
+channel ORA_AUX_DISK_1: restoring datafile 00001 to
+ /u04/newdb/NEWDB/datafile/o1_mf_system_lm4a2x_.dbf
+channel ORA_AUX_DISK_1: reading from backup piece
+ /home/oracle/rmanbk/ORCL_20250519_142_1.bkp
+Finished restore at 19-MAY-25
+
+contents of Memory Script:
+{
+   switch clone datafile all;
+   recover clone database delete archivelog;
+   alter clone database open resetlogs;
+}
+executing Memory Script
+
+database opened
+Finished Duplicate Db at 19-MAY-25
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 복제 결과 확인
+--------------------------------------------------------------------------------
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@NEWDB> SELECT dbid, name FROM v$database;
+
+      DBID NAME
+---------- ---------
+1904553271 NEWDB
+
+SYS@NEWDB> SELECT COUNT(*) FROM hr.dup177;
+
+  COUNT(*)
+----------
+         2
+
+-- 백업 이후의 아카이브까지 적용되어 2건이 있다.
+-- BACKUP LOCATION 에 아카이브 백업도 함께 있었기 때문이다.
+
+SYS@NEWDB> SELECT TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#),
+  2    'YYYY-MM-DD HH24:MI:SS') AS clone_point FROM v$database;
+
+CLONE_POINT
+-------------------
+2025-05-19 13:14:41
+
+SYS@NEWDB> EXIT
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : 시점을 지정한 복제
+--------------------------------------------------------------------------------
+-- 백업 직후 시점으로 다시 복제해 본다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SHUTDOWN IMMEDIATE
+   STARTUP MOUNT EXCLUSIVE RESTRICT;
+   DROP DATABASE;"
+
+Database dropped.
+
+[oracle@oel7v9r1 ~]$ rm -rf /u04/newdb/NEWDB
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "STARTUP NOMOUNT PFILE='?/dbs/initNEWDB.ora';"
+
+ORACLE instance started.
+
+[oracle@oel7v9r1 ~]$ rman auxiliary sys/oracle_4U@NEWDB
+
+RMAN> DUPLICATE DATABASE TO NEWDB
+  2>   UNTIL TIME "TO_DATE('2025-05-19 13:10:00','YYYY-MM-DD HH24:MI:SS')"
+  3>   BACKUP LOCATION '/home/oracle/rmanbk'
+  4>   SPFILE
+  5>     SET DB_CREATE_FILE_DEST '/u04/newdb'
+  6>     SET LOG_ARCHIVE_DEST_1 'LOCATION=/u04/newdb/arch';
+
+Starting Duplicate Db at 19-MAY-25
+
+contents of Memory Script:
+{
+   set until time "TO_DATE('2025-05-19 13:10:00','YYYY-MM-DD HH24:MI:SS')";
+   restore clone primary controlfile from ...;
+   alter clone database mount;
+}
+
+-- 지정한 시점에 맞는 컨트롤파일 자동 백업이 선택된다.
+
+...
+database opened
+Finished Duplicate Db at 19-MAY-25
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@NEWDB> SELECT COUNT(*) FROM hr.dup177;
+
+  COUNT(*)
+----------
+         1
+
+-- 백업 이후에 넣은 2번 행이 없다.
+-- 13:10 시점으로 복제되었다.
+
+SYS@NEWDB> SELECT TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#),
+  2    'YYYY-MM-DD HH24:MI:SS') AS clone_point FROM v$database;
+
+CLONE_POINT
+-------------------
+2025-05-19 13:09:58
+
+-- 지정한 시각 직전까지 복구되었다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- nid로 이름을 바꿔 본다. 먼저 OPEN 상태에서 시도한다.
+
+SYS@NEWDB> SELECT status FROM v$instance;
+
+STATUS
+------------
+OPEN
+
+SYS@NEWDB> EXIT
+
+[oracle@oel7v9r1 ~]$ nid TARGET=sys/oracle_4U DBNAME=NEWDB2 SETNAME=NO
+
+DBNEWID: Release 19.0.0.0.0 - Production
+
+Connected to database NEWDB (DBID=1904553271)
+
+NID-00122: Database should not be open
+
+Change of database name failed during validation - database is intact.
+DBNEWID - Completed with validation errors.
+
+-- << 원인 파악 >>
+-- nid는 MOUNT 상태에서만 동작한다.
+-- 열린 상태에서는 파일 헤더를 안전하게 바꿀 수 없기 때문이다.
+-- 데이터베이스를 MOUNT로 내려야 한다.
+
+-- << 수정 >>
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SHUTDOWN IMMEDIATE
+   STARTUP MOUNT;"
+
+ORACLE instance shut down.
+ORACLE instance started.
+Database mounted.
+
+[oracle@oel7v9r1 ~]$ nid TARGET=sys/oracle_4U DBNAME=NEWDB2 SETNAME=NO
+
+DBNEWID: Release 19.0.0.0.0 - Production
+
+Connected to database NEWDB (DBID=1904553271)
+Connected to server version 19.3.0
+
+Control Files in database:
+    /u04/newdb/NEWDB/controlfile/o1_mf_lm4b3x_.ctl
+
+Change database ID and database name NEWDB to NEWDB2? (Y/[N]) => Y
+
+Proceeding with operation
+Changing database ID from 1904553271 to 2044918835
+Changing database name from NEWDB to NEWDB2
+    Control File /u04/newdb/NEWDB/controlfile/o1_mf_lm4b3x_.ctl - modified
+    Datafile /u04/newdb/NEWDB/datafile/o1_mf_system_lm4b4a_.dbf - dbid changed
+    ...
+    Database name changed to NEWDB2.
+Modify parameter file and generate a new password file before restarting.
+Database ID for database NEWDB2 changed to 2044918835.
+All previous backups and archived redo logs for this database are unusable.
+Database has been shutdown, open database with RESETLOGS option.
+Succesfully changed database name and ID.
+DBNEWID - Completed succesfully.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+-- 안내대로 사후 처리를 수행한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "CREATE PFILE='/tmp/initNEWDB2.ora' FROM SPFILE;"
+ORA-01034: ORACLE not available
+
+-- 인스턴스가 내려가 있다. pfile을 직접 만든다.
+
+[oracle@oel7v9r1 ~]$ sed 's/NEWDB/NEWDB2/g' $ORACLE_HOME/dbs/initNEWDB.ora \
+>   > $ORACLE_HOME/dbs/initNEWDB2.ora
+[oracle@oel7v9r1 ~]$ grep db_name $ORACLE_HOME/dbs/initNEWDB2.ora
+db_name=NEWDB2
+
+[oracle@oel7v9r1 ~]$ orapwd file=$ORACLE_HOME/dbs/orapwNEWDB2 \
+>   password=oracle_4U entries=5 force=y
+
+[oracle@oel7v9r1 ~]$ mkdir -p /u01/app/oracle/admin/NEWDB2/adump
+[oracle@oel7v9r1 ~]$ sed -i "s|admin/NEWDB/adump|admin/NEWDB2/adump|" \
+>   $ORACLE_HOME/dbs/initNEWDB2.ora
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=NEWDB2
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@NEWDB2> STARTUP MOUNT PFILE='?/dbs/initNEWDB2.ora';
+
+ORACLE instance started.
+Database mounted.
+
+SYS@NEWDB2> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+SYS@NEWDB2> SELECT dbid, name FROM v$database;
+
+      DBID NAME
+---------- ---------
+2044918835 NEWDB2
+
+-- 이름과 DBID가 모두 바뀌었다.
+
+SYS@NEWDB2> SELECT COUNT(*) FROM hr.dup177;
+
+  COUNT(*)
+----------
+         1
+
+-- 데이터는 그대로다.
+
+SYS@NEWDB2> CREATE SPFILE FROM PFILE='?/dbs/initNEWDB2.ora';
+
+File created.
+
+-- 정리
+
+SYS@NEWDB2> SHUTDOWN IMMEDIATE
+SYS@NEWDB2> STARTUP MOUNT EXCLUSIVE RESTRICT;
+SYS@NEWDB2> SELECT name FROM v$database;
+
+NAME
+---------
+NEWDB2
+
+SYS@NEWDB2> DROP DATABASE;
+
+Database dropped.
+
+SYS@NEWDB2> EXIT
+
+[oracle@oel7v9r1 ~]$ rm -f $ORACLE_HOME/dbs/*NEWDB*
+[oracle@oel7v9r1 ~]$ rm -rf /u01/app/oracle/admin/NEWDB /u01/app/oracle/admin/NEWDB2
+[oracle@oel7v9r1 ~]$ rm -rf /u04/newdb
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT dbid, name FROM v\$database; SELECT COUNT(*) FROM hr.dup177;"
+
+      DBID NAME
+---------- ---------
+1200530011 ORCL
+
+  COUNT(*)
+----------
+         2
+
+-- 원본은 그대로다.
+
+-- 실무 포인트
+-- 1) 백업 기반 복제는 원본에 접속하지 않는다.
+--    rman auxiliary 만으로 수행하며 BACKUP LOCATION 에서 모든 것을 찾는다.
+--    원본에 부하가 없어 복구 훈련 환경 구축에 가장 적합하다.
+--
+-- 2) 자동 백업에 컨트롤파일이 있어야 한다.
+--    BACKUP LOCATION 에서 자동 백업 파일을 찾아 컨트롤파일을 복원한다.
+--    13장에서 자동 백업을 켠 이유가 여기서도 확인된다.
+--
+-- 3) UNTIL 절로 과거 시점의 복제본을 만들 수 있다.
+--    그 시점에 맞는 백업이 선택되고 지정 시각 직전까지 복구된다.
+--    16장의 RECOVER TABLE로 다룰 수 없는 객체를 되살리는 경로가 된다.
+--
+-- 4) nid는 MOUNT 상태에서만 동작한다.
+--    열린 상태에서는 NID-00122로 거부된다.
+--    파일 헤더를 안전하게 바꾸기 위한 제약이다.
+--
+-- 5) nid 수행 후 세 가지를 처리해야 한다.
+--    pfile의 db_name 수정, 패스워드 파일 재생성, RESETLOGS 오픈이다.
+--    안내 메시지가 그 내용을 알려 준다.
+--
+-- 6) nid 이후 이전 백업은 모두 무효가 된다.
+--    DBID가 바뀌었으므로 그 백업은 다른 데이터베이스의 것이 된다.
+--    운영 환경이라면 즉시 새 백업을 받아야 한다.

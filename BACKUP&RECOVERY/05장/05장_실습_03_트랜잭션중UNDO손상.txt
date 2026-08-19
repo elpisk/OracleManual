@@ -1,0 +1,239 @@
+================================================================================
+ 실습 5-3 : 트랜잭션 진행 중 UNDO 손상
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 미완료 트랜잭션이 있는 상태에서 UNDO 데이터 파일이 유실되었다.
+-- 오픈 과정에서 SMON이 그 트랜잭션을 롤백해야 하는데 재료가 없어 막힌다.
+-- 리두가 남아 있으면 롤포워드가 언두 블록까지 복구해 롤백이 정상 완료된다.
+-- 1장에서 배운 "롤포워드가 롤백보다 먼저인 이유"를 실증하는 실습이다.
+-- 복구 유형 : 완전 복구
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- NOARCHIVELOG 모드이고 개별 환경이어야 한다.
+-- 실습 직전에 Cold Backup을 새로 받는다.
+-- 별도 터미널 두 개가 필요하다(HR 세션과 SYSDBA 세션).
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch05 && mkdir -p /home/oracle/backup/ch05
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /u01/app/oracle/oradata/ORCL/*.ctl \
+                 /u01/app/oracle/oradata/ORCL/*.log /home/oracle/backup/ch05/
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.log /home/oracle/backup/ch05/
+SYS@orcl> !rm -f /home/oracle/backup/ch05/temp01.dbf
+SYS@orcl> STARTUP
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2363510
+
+SYS@orcl> SELECT MAX(salary) AS max_sal FROM hr.employees;
+
+   MAX_SAL
+----------
+     24000
+
+-- 복구 후 이 값으로 돌아와야 한다(커밋하지 않은 변경은 롤백되므로).
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 미완료 트랜잭션을 남긴 채 UNDO 삭제
+--------------------------------------------------------------------------------
+-- [터미널 2] HR 세션에서 커밋하지 않은 대량 변경을 만든다.
+
+[oracle@oel7v9r1 ~]$ sqlplus hr/hr@orcl
+
+HR@orcl> UPDATE employees SET salary = salary * 1.5;
+107 rows updated.
+
+HR@orcl> SELECT MAX(salary) FROM employees;
+
+MAX(SALARY)
+-----------
+      36000
+
+-- 커밋하지 않는다. 이 세션을 그대로 둔다.
+
+-- [터미널 1] SYSDBA 세션에서 활성 트랜잭션을 확인한다.
+
+SYS@orcl> SELECT s.sid, s.username, t.status, t.used_ublk
+  2  FROM   v$transaction t, v$session s WHERE t.ses_addr = s.saddr;
+
+       SID USERNAME   STATUS      USED_UBLK
+---------- ---------- ---------- ----------
+        41 HR         ACTIVE             12
+
+-- 언두 블록 12개를 쓰고 있는 활성 트랜잭션이 있다.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/undotbs01.dbf
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+-- ABORT로 내렸으므로 HR의 트랜잭션은 미완료 상태로 남는다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+Database mounted.
+ORA-01157: cannot identify/lock data file 4 - see DBWR trace file
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+MOUNTED
+
+SYS@orcl> !tail -8 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Beginning crash recovery of 1 threads
+Started redo scan
+Completed redo scan
+  read 284 KB redo, 64 data blocks need recovery
+Errors in file .../orcl_ora_14022.trc:
+ORA-01157: cannot identify/lock data file 4
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+ORA-1157 signalled during: ALTER DATABASE OPEN...
+
+-- 인스턴스 복구의 롤포워드까지는 시작했으나 UNDO 파일이 없어 중단되었다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         4 FILE NOT FOUND                 0
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2363208
+
+-- 백업본 SCN(2363510) >= 최소 리두 SCN(2363208) → 리두 생존
+-- 미완료 트랜잭션이 있어도 리두가 있으면 정상 처리된다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_53
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /u01/app/oracle/oradata/ORCL/*.log \
+                 /home/oracle/before_recover_53/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 파일을 복원하고 복구 없이 바로 열어 본다.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch05/undotbs01.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01113: file 4 needs media recovery
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+
+-- << 원인 파악 >>
+-- 파일은 제자리에 있으나 백업 시점 상태다.
+-- 그 안의 언두 블록도 백업 시점 것이므로 미완료 트랜잭션의 변경 전 이미지가 없다.
+-- 복원만으로는 롤백에 쓸 언두를 얻지 못한다.
+-- 롤포워드로 언두 블록을 손상 시점까지 끌어올려야 한다.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         4                          2363510
+
+-- << 수정 >>
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE;
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+SYS@orcl> !tail -6 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Completed redo application of 0.28MB
+Completed crash recovery at
+  Thread 1: logseq 62, block 1841, scn 2363902
+SMON: enabling tx recovery
+Undo initialization finished serial:0 start:... end:...
+Completed: ALTER DATABASE OPEN
+
+-- SMON: enabling tx recovery 이후 오류 없이 완료되었다.
+-- 롤포워드로 복구된 언두를 이용해 롤백이 정상 수행된 것이다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT MAX(salary) AS max_sal FROM hr.employees;
+
+   MAX_SAL
+----------
+     24000
+
+-- 커밋하지 않았던 1.5배 인상이 사라졌다. 롤백이 정상 완료되었다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$transaction;
+
+  COUNT(*)
+----------
+         0
+
+-- 남아 있는 트랜잭션이 없다.
+
+SYS@orcl> SELECT segment_name, status FROM dba_rollback_segs
+  2  WHERE  tablespace_name = 'UNDOTBS1' AND status <> 'ONLINE';
+
+no rows selected
+
+-- 실무 포인트
+-- 1) 이 실습이 1장의 "롤포워드가 롤백보다 먼저"인 이유를 실증한다.
+--    언두 블록도 데이터 블록이므로 리두 적용 대상이다.
+--    롤포워드가 끝나야 온전한 언두를 얻고, 그것으로 롤백할 수 있다.
+--
+-- 2) 복원만 하고 열려고 하면 ORA-01113이 나온다.
+--    파일은 있지만 그 안의 언두가 백업 시점 것이라 롤백에 쓸 수 없기 때문이다.
+--
+-- 3) alert log의 "SMON: enabling tx recovery" 뒤에 오류가 없으면 롤백이 정상 수행된 것이다.
+--    이 줄 뒤에 ORA-00376이 이어지면 언두를 여전히 읽지 못하는 상태다.
+--
+-- 4) 리두가 없으면 이 경로가 막히지만 전체 복원으로 해결된다.
+--    미완료 트랜잭션은 백업 시점에 존재하지 않았으므로 문제 자체가 사라진다.
+--
+-- 5) 긴 트랜잭션이 진행 중인 시간대는 장애 대응이 더 복잡해진다.
+--    v$transaction의 USED_UBLK로 진행 중인 트랜잭션 규모를 파악해 두면
+--    복구 시간을 예측하는 데 도움이 된다.
+--
+-- 6) 지연 롤백 때문에 오픈 직후 성능이 잠시 떨어질 수 있다.
+--    v$transaction으로 롤백 진행 상황을 확인한다.
+
+SYS@orcl> EXIT

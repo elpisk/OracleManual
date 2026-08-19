@@ -1,0 +1,288 @@
+================================================================================
+ 실습 17-5 : 복제 DB 검증과 삭제 — DROP DATABASE
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL → CLONE
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 복제본이 원본과 독립적인지 검증한다.
+-- 복제본에서 데이터를 변경해도 원본에 영향이 없는지 확인한다.
+-- 복제 작업 기록을 남긴다.
+-- DROP DATABASE로 정식 절차에 따라 삭제한다.
+-- 작업 유형 : 검증과 정리(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 17-4가 완료되어 복제본이 열려 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=CLONE
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@CLONE> SELECT dbid, name, open_mode FROM v$database;
+
+      DBID NAME      OPEN_MODE
+---------- --------- --------------------
+1428930055 CLONE     READ WRITE
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+-- 원본과 복제본의 식별자를 나란히 확인한다.
+
+SYS@CLONE> SELECT dbid, name, resetlogs_change# FROM v$database;
+
+      DBID NAME      RESETLOGS_CHANGE#
+---------- --------- -----------------
+1428930055 CLONE               2782401
+
+SYS@CLONE> EXIT
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT dbid, name, resetlogs_change# FROM v\$database;"
+
+      DBID NAME      RESETLOGS_CHANGE#
+---------- --------- -----------------
+1200530011 ORCL                2661201
+
+-- DBID가 다르고 인카네이션 기준도 다르다. 별개의 데이터베이스다.
+
+[oracle@oel7v9r1 ~]$ ps -ef | grep [p]mon
+oracle    3021     1  0 08:40 ?        00:00:01 ora_pmon_orcl
+oracle    4188     1  0 08:52 ?        00:00:00 ora_pmon_rcat
+oracle    9812     1  0 10:38 ?        00:00:00 ora_pmon_CLONE
+
+-- 두 인스턴스가 동시에 떠 있다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 독립성 검증
+--------------------------------------------------------------------------------
+-- 복제본에서 데이터를 바꾼다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=CLONE
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@CLONE> CREATE TABLE hr.clone_only(id NUMBER, memo VARCHAR2(30))
+  2    TABLESPACE users;
+
+Table created.
+
+SYS@CLONE> INSERT INTO hr.clone_only VALUES (1, 'created in clone');
+SYS@CLONE> COMMIT;
+
+SYS@CLONE> DELETE FROM hr.employees WHERE department_id = 50;
+
+45 rows deleted.
+
+SYS@CLONE> COMMIT;
+
+SYS@CLONE> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+        62
+
+-- 복제본에서 45건을 지웠다.
+
+SYS@CLONE> EXIT
+
+-- 원본을 확인한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT COUNT(*) FROM hr.employees;
+   SELECT COUNT(*) FROM hr.clone_only;"
+
+  COUNT(*)
+----------
+       107
+
+SELECT COUNT(*) FROM hr.clone_only
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- 원본은 107건 그대로이고 복제본에서 만든 테이블도 없다.
+-- 두 데이터베이스가 완전히 독립적임이 확인되었다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 백업 관리 관점의 검증
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=CLONE
+[oracle@oel7v9r1 ~]$ rman target /
+
+connected to target database: CLONE (DBID=1428930055)
+
+RMAN> LIST BACKUP SUMMARY;
+
+specification does not match any backup in the repository
+
+-- 복제본에는 백업 기록이 없다.
+-- DBID가 다르므로 원본의 백업을 자기 것으로 인식하지 않는다.
+-- 이것이 DBID를 바꾸는 이유다.
+
+RMAN> REPORT SCHEMA;
+
+Report of database schema for database with db_unique_name CLONE
+
+List of Permanent Datafiles
+===========================
+File Size(MB) Tablespace           RB segs Datafile Name
+---- -------- -------------------- ------- ------------------------------
+1    890      SYSTEM               YES     /u04/clone/CLONE/system01.dbf
+2    550      SYSAUX               NO      /u04/clone/CLONE/sysaux01.dbf
+3    320      UNDOTBS1             YES     /u04/clone/CLONE/undotbs01.dbf
+4    10       USERS                NO      /u04/clone/CLONE/users01.dbf
+5    20       TBS13                NO      /u04/clone/CLONE/tbs13_01.dbf
+
+RMAN> EXIT
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : 복제 작업 기록
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT dbid, name FROM v\$database;
+   SELECT TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#),'YYYY-MM-DD HH24:MI:SS')
+   AS clone_point FROM v\$database;" > /tmp/clone_info.txt
+
+[oracle@oel7v9r1 ~]$ cat > /home/oracle/doc/clone_CLONE_20250519.md <<'EOS'
+# 복제 작업 기록 : CLONE
+
+- 목적       : 복구 훈련용 환경
+- 요청자     : DBA팀 (교육)
+- 원본       : ORCL (DBID 1200530011)
+- 복제 시점  : 2025-05-19 10:02 (마지막 아카이브 시퀀스 57)
+- 사용 백업  : /home/oracle/backup/ch17 (Cold Backup, 2025-05-19 09:12)
+- 복제본     : CLONE (DBID 1428930055), SID=CLONE
+- 파일 경로  : /u04/clone/CLONE/
+- 아카이브   : /u04/clone/arch/
+- pfile      : $ORACLE_HOME/dbs/initCLONE.ora
+- 삭제 예정  : 2025-05-26
+- 담당자     : (이름)
+EOS
+
+[oracle@oel7v9r1 ~]$ ls -l /home/oracle/doc/clone_CLONE_20250519.md
+-rw-r--r--. 1 oracle oinstall 512 May 19 11:02 clone_CLONE_20250519.md
+
+-- 이 기록이 없으면 나중에 지워도 되는지 판단할 수 없다.
+
+--------------------------------------------------------------------------------
+[7] 삭제 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=CLONE
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+-- 열린 상태에서 삭제를 시도해 본다.
+
+SYS@CLONE> DROP DATABASE;
+DROP DATABASE
+*
+ERROR at line 1:
+ORA-01586: database must be mounted EXCLUSIVE and not open for this operation
+
+-- << 원인 파악 >>
+-- DROP DATABASE는 MOUNT EXCLUSIVE RESTRICT 상태에서만 수행할 수 있다.
+-- 열린 상태에서는 파일을 지울 수 없기 때문이다.
+-- 이 제약이 실수로 실행하는 것을 어느 정도 막아 준다.
+
+-- << 수정 >>
+
+SYS@CLONE> SHUTDOWN IMMEDIATE
+
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@CLONE> STARTUP MOUNT EXCLUSIVE RESTRICT;
+
+ORACLE instance started.
+Database mounted.
+
+-- 실행 전 반드시 이름을 확인한다.
+
+SYS@CLONE> SELECT name, dbid FROM v$database;
+
+NAME            DBID
+--------- ----------
+CLONE     1428930055
+
+-- CLONE이 맞다. 원본이 아니다.
+
+SYS@CLONE> DROP DATABASE;
+
+Database dropped.
+Completed: drop database
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@CLONE> EXIT
+
+[oracle@oel7v9r1 ~]$ ls -l /u04/clone/CLONE/
+total 0
+
+-- 데이터파일, 컨트롤파일, 리두가 모두 지워졌다.
+
+[oracle@oel7v9r1 ~]$ ls -l /u04/clone/arch/ | head -3
+total 2097152
+-rw-r-----. 1 oracle oinstall  2148352 May 19 10:41 1_1_1190812441.dbf
+-rw-r-----. 1 oracle oinstall 45213696 May 19 09:41 1_44_1190530011.dbf
+
+-- 아카이브는 남아 있다. DROP DATABASE가 지우지 않는다.
+
+[oracle@oel7v9r1 ~]$ ls $ORACLE_HOME/dbs/initCLONE.ora
+/u01/app/oracle/product/19.3.0/dbhome_1/dbs/initCLONE.ora
+
+-- pfile도 남아 있다.
+
+-- 남은 것을 정리한다.
+
+[oracle@oel7v9r1 ~]$ rm -f $ORACLE_HOME/dbs/initCLONE.ora
+[oracle@oel7v9r1 ~]$ rm -rf /u01/app/oracle/admin/CLONE
+[oracle@oel7v9r1 ~]$ rm -rf /u04/clone
+
+[oracle@oel7v9r1 ~]$ ps -ef | grep [p]mon
+oracle    3021     1  0 08:40 ?        00:00:01 ora_pmon_orcl
+oracle    4188     1  0 08:52 ?        00:00:00 ora_pmon_rcat
+
+-- 복제본 인스턴스가 사라졌다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT COUNT(*) FROM hr.employees; SELECT * FROM v\$recover_file;"
+
+  COUNT(*)
+----------
+       107
+
+no rows selected
+
+-- 원본은 아무 영향도 받지 않았다.
+
+-- 실무 포인트
+-- 1) 복제본의 DBID가 다르면 백업 기록도 분리된다.
+--    복제본에서 RMAN에 접속해도 원본의 백업이 보이지 않는다.
+--    이것이 DBID를 바꾸는 가장 실질적인 이유다.
+--
+-- 2) 복제본의 변경은 원본에 전혀 영향을 주지 않는다.
+--    파일 경로가 완전히 분리되어 있기 때문이다.
+--    반대로 경로가 겹쳐 있으면 그 순간 원본이 위험해진다.
+--
+-- 3) DROP DATABASE는 MOUNT EXCLUSIVE RESTRICT 상태를 요구한다.
+--    ORA-01586이 그 제약을 알려 준다.
+--    이 제약이 실수 실행을 어느 정도 막아 주지만 완전하지는 않다.
+--
+-- 4) 실행 전 반드시 데이터베이스 이름을 확인한다.
+--    v$database 의 name 컬럼을 보고 복제본이 맞는지 확인한 뒤 실행한다.
+--    ORACLE_SID만 믿지 않는다.
+--
+-- 5) DROP DATABASE는 데이터파일·컨트롤파일·리두만 지운다.
+--    아카이브와 pfile, adump 디렉터리는 별도로 지워야 한다.
+--
+-- 6) 복제 작업 기록을 남긴다.
+--    목적, 시점, 사용 백업, 식별자, 경로, 삭제 예정일, 담당자가 항목이다.
+--    기록이 없으면 정체를 알 수 없는 인스턴스가 자원을 계속 쓰게 된다.

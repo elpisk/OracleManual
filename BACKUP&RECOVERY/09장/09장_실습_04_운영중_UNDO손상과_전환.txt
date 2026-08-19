@@ -1,0 +1,288 @@
+================================================================================
+ 실습 9-4 : 운영 중 UNDO 손상과 테이블스페이스 전환
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 22분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 운영 중 UNDO 데이터파일이 손상되었고 즉시 중단할 수 없는 상황이다.
+-- 새 UNDO 테이블스페이스를 만들어 전환하면 서비스를 유지할 수 있다.
+-- 전환은 응급 조치이며 손상된 UNDO의 정리나 정식 복구가 뒤따라야 한다.
+-- 전환의 한계와 후속 처리를 함께 확인한다.
+-- 복구 유형 : 응급 우회 후 정식 복구
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 9-3을 마친 상태에서 이어서 진행한다.
+-- 새 UNDO 테이블스페이스를 만들 디스크 여유가 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ df -h /u02 | tail -1
+/dev/mapper/ol-u02     20G  6.4G   14G  32% /u02
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a44
+SYS@orcl> COL segment_name FOR a26
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SHOW PARAMETER undo_tablespace
+
+NAME               TYPE     VALUE
+------------------ -------- ----------
+undo_tablespace    string   UNDOTBS1
+
+SYS@orcl> SELECT tablespace_name, COUNT(*) AS segs FROM dba_rollback_segs
+  2  GROUP BY tablespace_name;
+
+TABLESPACE_NAME    SEGS
+--------------- -------
+SYSTEM                1
+UNDOTBS1             10
+
+SYS@orcl> ALTER TABLESPACE undotbs1 BEGIN BACKUP;
+SYS@orcl> !cp -p /u02/oradata/ORCL/undotbs01.dbf /home/oracle/backup/ch09/
+SYS@orcl> ALTER TABLESPACE undotbs1 END BACKUP;
+Tablespace altered.
+
+SYS@orcl> CREATE TABLE hr.emp94(id NUMBER) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp94 VALUES (1);
+SYS@orcl> COMMIT;
+Commit complete.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 운영 중 UNDO 파일 삭제
+--------------------------------------------------------------------------------
+-- [터미널 2] HR 세션에서 커밋하지 않은 변경을 만든다.
+
+[oracle@oel7v9r1 ~]$ sqlplus hr/hr@orcl
+
+HR@orcl> UPDATE employees SET commission_pct = 0.1 WHERE department_id = 80;
+34 rows updated.
+
+-- 커밋하지 않는다.
+
+-- [터미널 1]
+
+SYS@orcl> SELECT s.sid, s.username, t.status, t.used_ublk
+  2  FROM   v$transaction t, v$session s WHERE t.ses_addr = s.saddr;
+
+       SID USERNAME   STATUS      USED_UBLK
+---------- ---------- ---------- ----------
+        41 HR         ACTIVE              6
+
+SYS@orcl> !rm -f /u02/oradata/ORCL/undotbs01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> INSERT INTO hr.emp94 VALUES (2);
+INSERT INTO hr.emp94 VALUES (2)
+            *
+ERROR at line 1:
+ORA-01116: error in opening database file 4
+ORA-01110: data file 4: '/u02/oradata/ORCL/undotbs01.dbf'
+ORA-27041: unable to open file
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp94;
+
+  COUNT(*)
+----------
+         1
+
+-- 조회는 되고 변경만 실패한다. 업무가 사실상 멈춘 상태다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 4;
+
+     FILE# NAME                                  STATUS
+---------- ------------------------------------- -------
+         4 /u02/oradata/ORCL/undotbs01.dbf       RECOVER
+
+SYS@orcl> SELECT file#, error FROM v$recover_file;
+
+     FILE# ERROR
+---------- --------------------
+         4 FILE NOT FOUND
+
+-- 정식 복구는 데이터베이스 중단을 수반한다.
+-- 지금은 업무 시간이라 중단 승인을 받기 어렵다고 가정한다.
+
+-- 판정
+--   ① 정식 복구 : 중단 필요 → 지금은 불가
+--   ② 응급 우회 : 새 UNDO 생성 후 전환 → 서비스 유지 가능
+--   ③ 전환 후 : 유지 보수 시간에 정식 복구 또는 정리
+--   → 전환으로 시간을 벌고 후속 처리를 계획한다.
+
+SYS@orcl> !df -h /u02 | tail -1
+/dev/mapper/ol-u02     20G  6.1G   14G  31% /u02
+
+-- 새 테이블스페이스를 만들 공간이 있다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 손상된 테이블스페이스를 먼저 지우고 새로 만들려 한다.
+
+SYS@orcl> DROP TABLESPACE undotbs1 INCLUDING CONTENTS AND DATAFILES;
+DROP TABLESPACE undotbs1 INCLUDING CONTENTS AND DATAFILES
+*
+ERROR at line 1:
+ORA-30013: undo tablespace 'UNDOTBS1' is currently in use
+
+-- << 원인 파악 >>
+-- 현재 UNDO_TABLESPACE 파라미터가 가리키는 테이블스페이스는 지울 수 없다.
+-- 순서가 잘못됐다. 새 것을 만들어 전환한 뒤에야 기존 것을 처리할 수 있다.
+-- 컨트롤파일과 리두에서 익힌 원칙과 같다. 추가가 먼저, 제거가 나중이다.
+
+SYS@orcl> SHOW PARAMETER undo_tablespace
+
+NAME               TYPE     VALUE
+------------------ -------- ----------
+undo_tablespace    string   UNDOTBS1
+
+-- << 수정 >>
+
+SYS@orcl> CREATE UNDO TABLESPACE undotbs2
+  2    DATAFILE '/u02/oradata/ORCL/undotbs02.dbf' SIZE 300M;
+
+Tablespace created.
+
+SYS@orcl> ALTER SYSTEM SET undo_tablespace = 'UNDOTBS2' SCOPE=BOTH;
+
+System altered.
+
+SYS@orcl> SHOW PARAMETER undo_tablespace
+
+NAME               TYPE     VALUE
+------------------ -------- ----------
+undo_tablespace    string   UNDOTBS2
+
+SYS@orcl> INSERT INTO hr.emp94 VALUES (2);
+1 row created.
+SYS@orcl> COMMIT;
+Commit complete.
+
+-- 서비스가 재개되었다. 재기동하지 않았다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp94;
+
+  COUNT(*)
+----------
+         2
+
+SYS@orcl> SELECT segment_name, status FROM dba_rollback_segs
+  2  WHERE  tablespace_name = 'UNDOTBS1' AND status <> 'OFFLINE'
+  3  FETCH FIRST 3 ROWS ONLY;
+
+SEGMENT_NAME               STATUS
+-------------------------- ----------------
+_SYSSMU3_2421748942$       PARTLY AVAILABLE
+
+-- 커밋하지 않은 HR 트랜잭션이 그 세그먼트를 쓰고 있어 아직 정리되지 않았다.
+
+SYS@orcl> SELECT s.sid, s.username, t.status FROM v$transaction t, v$session s
+  2  WHERE  t.ses_addr = s.saddr;
+
+       SID USERNAME   STATUS
+---------- ---------- ----------
+        41 HR         ACTIVE
+
+-- [터미널 2] HR 세션의 트랜잭션을 정리한다.
+
+HR@orcl> ROLLBACK;
+ROLLBACK
+*
+ERROR at line 1:
+ORA-00376: file 4 cannot be read at this time
+ORA-01110: data file 4: '/u02/oradata/ORCL/undotbs01.dbf'
+
+-- 손상된 UNDO의 언두를 읽을 수 없어 롤백이 실패한다.
+-- 전환이 기존 트랜잭션까지 구제하지는 않는다는 뜻이다.
+
+-- [터미널 1] 유지 보수 시간에 정식 복구를 수행한다.
+
+SYS@orcl> SHUTDOWN ABORT
+SYS@orcl> STARTUP MOUNT
+
+SYS@orcl> !cp -p /home/oracle/backup/ch09/undotbs01.dbf /u02/oradata/ORCL/
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE;
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN;
+Database altered.
+
+SYS@orcl> SELECT segment_name, status FROM dba_rollback_segs
+  2  WHERE  tablespace_name = 'UNDOTBS1' AND status NOT IN ('OFFLINE');
+
+no rows selected
+
+-- 복구로 언두가 되살아나 PENDING 상태가 해소되었다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$transaction;
+
+  COUNT(*)
+----------
+         0
+
+-- 이제 기존 UNDO를 정리할 수 있다.
+
+SYS@orcl> DROP TABLESPACE undotbs1 INCLUDING CONTENTS AND DATAFILES;
+
+Tablespace dropped.
+
+SYS@orcl> SELECT tablespace_name, COUNT(*) FROM dba_rollback_segs
+  2  GROUP BY tablespace_name;
+
+TABLESPACE_NAME  COUNT(*)
+--------------- ---------
+SYSTEM                  1
+UNDOTBS2               10
+
+SYS@orcl> !ls /u02/oradata/ORCL/undotbs01.dbf 2>/dev/null
+[oracle@oel7v9r1 ~]$
+
+-- 파일까지 함께 삭제되었다.
+
+-- 실무 포인트
+-- 1) UNDO 전환은 재기동 없이 서비스를 재개시킨다.
+--    UNDO_TABLESPACE가 동적 파라미터이기 때문이며 SCOPE=BOTH 로 지정한다.
+--    업무 시간에 중단 승인을 받기 어려울 때 쓰는 응급 조치다.
+--
+-- 2) 순서가 있다. 새 것을 만들어 전환한 뒤에야 기존 것을 지울 수 있다.
+--    사용 중인 UNDO를 지우려 하면 ORA-30013으로 거부된다.
+--    추가가 먼저이고 제거가 나중이라는 원칙이 여기서도 적용된다.
+--
+-- 3) 전환이 기존 트랜잭션까지 구제하지는 않는다.
+--    손상된 UNDO에 언두가 있는 트랜잭션은 롤백조차 ORA-00376으로 실패한다.
+--    새 트랜잭션만 정상 동작한다는 점을 정확히 이해해야 한다.
+--
+-- 4) 세그먼트가 PARTLY AVAILABLE 로 남으면 정리할 수 없다.
+--    dba_rollback_segs 와 v$transaction 으로 상태를 확인한다.
+--    정식 복구를 하면 언두가 되살아나 이 상태가 해소된다.
+--
+-- 5) 전환 후 반드시 후속 처리를 한다.
+--    정리하지 않은 UNDO가 쌓이면 디스크를 소모하고 원인 파악도 어려워진다.
+--    작업 로그에 후속 처리 항목으로 남긴다.
+--
+-- 6) 근본 원인을 구분한다.
+--    공간 부족이 원인이면 크기를 늘리는 것이 맞고, 손상이면 정식 복구가 맞다.
+--    전환만 반복하는 것은 어느 쪽의 해결도 아니다.
+
+SYS@orcl> EXIT

@@ -1,0 +1,265 @@
+================================================================================
+ 실습 14-5 : Image Copy(BACKUP AS COPY)와 SWITCH를 이용한 즉시 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 35분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 이미지 카피를 만들고 백업 세트와 크기를 비교한다.
+-- 데이터파일을 손상시킨 뒤 SWITCH로 즉시 전환해 복구한다.
+-- 복원 단계가 사라지는 것을 시간으로 확인한다.
+-- 전환 후 데이터파일 위치가 바뀐다는 점과 그 뒷정리를 확인한다.
+-- 복구 유형 : 이미지 카피 전환 복구, 손실 없음
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 14-4까지 완료되어 있어야 한다.
+-- 카피를 둘 디렉터리를 만든다.
+
+[oracle@oel7v9r1 ~]$ mkdir -p /home/oracle/rmancopy
+[oracle@oel7v9r1 ~]$ df -h /home/oracle | tail -1
+/dev/sda3        50G   23G   27G  46% /home
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: ORCL (DBID=1200530011)
+connected to recovery catalog database
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+RMAN> SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';
+
+RMAN> BACKUP AS BACKUPSET DATAFILE 8 TAG 'BS_COMPARE';
+
+Starting backup at 15-MAY-25
+channel ORA_DISK_1: starting full datafile backup set
+Finished backup at 15-MAY-25
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT ROUND(bytes/1024/1024,1) AS mb FROM v\$backup_piece
+   WHERE status='A' ORDER BY completion_time DESC FETCH FIRST 1 ROWS ONLY;"
+
+        MB
+----------
+      18.5
+
+-- 데이터파일은 20MB이고 백업 세트는 18.5MB다. 빈 블록만큼 줄었다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 이미지 카피 생성
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP AS COPY DATAFILE 8
+  2>   FORMAT '/home/oracle/rmancopy/tbs13_01_copy.dbf' TAG 'COPY_TBS13';
+
+Starting backup at 15-MAY-25
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: starting datafile copy
+input datafile file number=00008 name=/u02/oradata/ORCL/tbs13_01.dbf
+output file name=/home/oracle/rmancopy/tbs13_01_copy.dbf tag=COPY_TBS13
+channel ORA_DISK_1: datafile copy complete, elapsed time: 00:00:03
+Finished backup at 15-MAY-25
+
+RMAN> LIST COPY OF DATAFILE 8;
+
+List of Datafile Copies
+=======================
+Key     File S Completion Time Ckp SCN    Ckp Time  Name
+------- ---- - --------------- ---------- --------- --------------------------
+12      8    A 15-MAY-25       2568400    15-MAY-25 /home/oracle/rmancopy/...
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ ls -l /home/oracle/rmancopy/ /u02/oradata/ORCL/tbs13_01.dbf
+-rw-r-----. 1 oracle oinstall 20979712 May 15 11:02 tbs13_01_copy.dbf
+-rw-r-----. 1 oracle oinstall 20979712 May 15 11:01 /u02/oradata/ORCL/tbs13_01.dbf
+
+-- 크기가 원본과 정확히 같다. 빈 블록까지 그대로 복사되었다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰 : 데이터파일 손상
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> INSERT INTO hr.incr_test VALUES (9001, 'after copy');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@orcl> !rm -f /u02/oradata/ORCL/tbs13_01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+SYS@orcl> SELECT COUNT(*) FROM hr.incr_test;
+SELECT COUNT(*) FROM hr.incr_test
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 8
+ORA-01110: data file 8: '/u02/oradata/ORCL/tbs13_01.dbf'
+ORA-27041: unable to open file
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error FROM v$recover_file;
+
+     FILE# ERROR
+---------- --------------------
+         8 FILE NOT FOUND
+
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> LIST COPY OF DATAFILE 8 SUMMARY;
+
+Key     File S Completion Time Ckp SCN    Name
+------- ---- - --------------- ---------- --------------------------
+12      8    A 15-MAY-25       2568400    /home/oracle/rmancopy/...
+
+RMAN> LIST BACKUP OF DATAFILE 8 SUMMARY;
+
+Key     TY LV S Device Type Completion Time #Pieces Tag
+------- -- -- - ----------- --------------- ------- ------------
+50      B  F  A DISK        15-MAY-25       1       BS_COMPARE
+
+-- 판정
+--   ① 데이터파일 8번이 없다. SYSTEM이 아니므로 OFFLINE 가능하다.
+--   ② 이미지 카피와 백업 세트가 모두 있다.
+--   ③ 아카이브가 연속이다.
+--   → SWITCH로 즉시 전환하면 복원 단계가 사라진다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- OFFLINE 하지 않고 바로 SWITCH를 시도해 본다.
+
+RMAN> SWITCH DATAFILE 8 TO COPY;
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of switch command at 05/15/2025 11:14:02
+RMAN-06571: datafile 8 does not have recoverable copy
+
+-- << 원인 파악 >>
+-- 파일이 ONLINE 상태이면 전환할 수 없다.
+-- 데이터베이스가 그 파일을 열어 두고 있기 때문이다.
+-- 먼저 OFFLINE으로 내려야 한다.
+
+RMAN> SQL 'ALTER DATABASE DATAFILE 8 OFFLINE';
+
+sql statement: ALTER DATABASE DATAFILE 8 OFFLINE
+
+-- << 수정 >>
+
+RMAN> SWITCH DATAFILE 8 TO COPY;
+
+datafile 8 switched to datafile copy
+input datafile copy RECID=12 STAMP=1190691842
+file name=/home/oracle/rmancopy/tbs13_01_copy.dbf
+
+-- 즉시 끝났다. 파일을 옮긴 것이 아니라 컨트롤파일의 경로를 바꾼 것이다.
+
+RMAN> RECOVER DATAFILE 8;
+
+Starting recover at 15-MAY-25
+starting media recovery
+archived log file name=/u02/arch1/1_18_1190530011.dbf thread=1 sequence=18
+media recovery complete, elapsed time: 00:00:02
+Finished recover at 15-MAY-25
+
+RMAN> SQL 'ALTER DATABASE DATAFILE 8 ONLINE';
+
+sql statement: ALTER DATABASE DATAFILE 8 ONLINE
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 8;
+
+     FILE# NAME                                       STATUS
+---------- ------------------------------------------ -------
+         8 /home/oracle/rmancopy/tbs13_01_copy.dbf    ONLINE
+
+-- 경로가 카피 위치로 바뀌었다. 이제 이 파일이 정식 데이터파일이다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.incr_test WHERE id = 9001;
+
+  COUNT(*)
+----------
+         1
+
+-- 카피 이후에 넣은 행까지 복구되었다. 손실이 없다.
+
+-- 원래 위치로 되돌린다.
+
+SYS@orcl> EXIT
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP AS COPY DATAFILE 8
+  2>   FORMAT '/u02/oradata/ORCL/tbs13_01.dbf' TAG 'BACK_TO_HOME';
+
+Starting backup at 15-MAY-25
+channel ORA_DISK_1: starting datafile copy
+Finished backup at 15-MAY-25
+
+RMAN> SQL 'ALTER DATABASE DATAFILE 8 OFFLINE';
+RMAN> SWITCH DATAFILE 8 TO COPY;
+
+datafile 8 switched to datafile copy
+file name=/u02/oradata/ORCL/tbs13_01.dbf
+
+RMAN> RECOVER DATAFILE 8;
+RMAN> SQL 'ALTER DATABASE DATAFILE 8 ONLINE';
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT file#, name FROM v\$datafile WHERE file#=8;"
+
+     FILE# NAME
+---------- ------------------------------------------
+         8 /u02/oradata/ORCL/tbs13_01.dbf
+
+-- 원래 위치로 돌아왔다.
+
+-- 실무 포인트
+-- 1) 이미지 카피는 원본과 크기가 같다.
+--    백업 세트는 빈 블록을 건너뛰어 작지만 카피는 그대로 복사한다.
+--    디스크 요구량이 100%라는 점이 이 방식의 대가다.
+--
+-- 2) SWITCH는 파일을 옮기지 않는다.
+--    컨트롤파일에 기록된 경로를 바꾸는 동작이므로 크기와 무관하게 즉시 끝난다.
+--    500GB 데이터베이스에서 40분 걸리던 복원이 수 초로 줄어드는 이유다.
+--
+-- 3) SWITCH 전에 해당 파일을 OFFLINE으로 내려야 한다.
+--    ONLINE 상태에서는 RMAN-06571로 거부된다.
+--    전체를 전환할 때는 MOUNT 상태에서 SWITCH DATABASE TO COPY 를 쓴다.
+--
+-- 4) SWITCH 후에도 RECOVER는 필요하다.
+--    카피를 만든 시점 이후의 변경은 아카이브로 채워야 하기 때문이다.
+--    이 단계는 백업 세트 복구와 동일하다.
+--
+-- 5) 전환 후 카피가 있던 경로가 정식 데이터파일 위치가 된다.
+--    백업용 저성능 디스크라면 성능이 떨어지므로 반드시 뒷정리를 계획한다.
+--    되돌릴 때는 원래 경로로 카피를 만들고 다시 SWITCH 한다.
+--
+-- 6) 이 방식은 복구 시간과 디스크를 맞바꾸는 선택이다.
+--    증분 갱신 백업과 결합하면 카피를 항상 최신에 가깝게 유지할 수 있다.

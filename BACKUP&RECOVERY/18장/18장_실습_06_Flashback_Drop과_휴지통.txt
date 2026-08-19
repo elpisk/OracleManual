@@ -1,0 +1,303 @@
+================================================================================
+ 실습 18-6 : Flashback Drop과 휴지통(RECYCLEBIN) 관리
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 테이블을 실수로 DROP했다.
+-- 휴지통에서 되살린다.
+-- 같은 이름을 여러 번 DROP한 경우를 처리한다.
+-- PURGE로 지운 경우 되살릴 수 없다는 것도 확인한다.
+-- 복구 유형 : DROP 객체 복구, 무중단
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SHOW PARAMETER recyclebin
+
+NAME         TYPE     VALUE
+------------ -------- ------
+recyclebin   string   on
+
+-- 켜져 있어야 Flashback Drop을 쓸 수 있다.
+
+SYS@orcl> PURGE DBA_RECYCLEBIN;
+
+DBA Recyclebin purged.
+
+-- 실습을 위해 휴지통을 비우고 시작한다.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp186 TABLESPACE users
+  2  AS SELECT * FROM hr.employees;
+
+Table created.
+
+SYS@orcl> CREATE INDEX hr.idx_emp186 ON hr.emp186(department_id);
+
+Index created.
+
+SYS@orcl> ALTER TABLE hr.emp186 ADD CONSTRAINT pk_emp186
+  2    PRIMARY KEY (employee_id);
+
+Table altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp186;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT index_name, status FROM dba_indexes
+  2  WHERE  owner = 'HR' AND table_name = 'EMP186';
+
+INDEX_NAME           STATUS
+-------------------- --------
+IDX_EMP186           VALID
+PK_EMP186            VALID
+
+SYS@orcl> SELECT COUNT(*) FROM dba_recyclebin WHERE owner = 'HR';
+
+  COUNT(*)
+----------
+         0
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 테이블 DROP
+--------------------------------------------------------------------------------
+SYS@orcl> DROP TABLE hr.emp186;
+
+Table dropped.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp186;
+SELECT COUNT(*) FROM hr.emp186
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT object_name, original_name, type, droptime, can_undrop
+  2  FROM   dba_recyclebin WHERE owner = 'HR' ORDER BY droptime;
+
+OBJECT_NAME                    ORIGINAL_NAME TYPE  DROPTIME            CAN
+------------------------------ ------------- ----- ------------------- ---
+BIN$aB3kL9xQTGm8Kw==$0         EMP186        TABLE 2025-05-20:11:02:41 YES
+BIN$cD7mN2yRUHn9Lx==$0         IDX_EMP186    INDEX 2025-05-20:11:02:41 NO
+BIN$eF9pQ4zSVIo0My==$0         PK_EMP186     INDEX 2025-05-20:11:02:41 NO
+
+-- 테이블과 인덱스가 모두 휴지통에 들어갔다.
+-- CAN_UNDROP이 YES인 것은 테이블뿐이다.
+-- 인덱스는 테이블을 되살릴 때 함께 복원된다.
+
+SYS@orcl> SELECT SUM(space) * 8192 / 1024 / 1024 AS mb
+  2  FROM   dba_recyclebin WHERE owner = 'HR';
+
+        MB
+----------
+      12.5
+
+-- 휴지통이 공간을 차지하고 있다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- 휴지통 안의 데이터를 조회할 수 있다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr."BIN$aB3kL9xQTGm8Kw==$0";
+
+  COUNT(*)
+----------
+       107
+
+-- 되살리기 전에 내용을 확인할 수 있다.
+-- 같은 이름이 여러 개일 때 어느 것인지 구분하는 데 유용하다.
+
+-- 판정
+--   ① 휴지통에 남아 있고 CAN_UNDROP이 YES다
+--   ② 데이터도 온전하다
+--   → FLASHBACK TABLE ... TO BEFORE DROP 으로 되살린다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> FLASHBACK TABLE hr.emp186 TO BEFORE DROP;
+
+Flashback complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp186;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT index_name, status FROM dba_indexes
+  2  WHERE  owner = 'HR' AND table_name = 'EMP186';
+
+INDEX_NAME                     STATUS
+------------------------------ --------
+BIN$cD7mN2yRUHn9Lx==$0         VALID
+BIN$eF9pQ4zSVIo0My==$0         VALID
+
+-- << 원인 파악 >>
+-- 인덱스는 되살아났지만 이름이 휴지통 이름 그대로다.
+-- 테이블 이름은 복원되지만 인덱스와 제약 조건의 이름은 그렇지 않다.
+-- 운영에 지장은 없으나 관리가 어려워지므로 이름을 바로잡아야 한다.
+
+SYS@orcl> SELECT constraint_name, constraint_type FROM dba_constraints
+  2  WHERE  owner = 'HR' AND table_name = 'EMP186';
+
+CONSTRAINT_NAME                C
+------------------------------ -
+BIN$gH1rS6bUWKp2Nz==$0         P
+
+-- 제약 조건 이름도 마찬가지다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER INDEX hr."BIN$cD7mN2yRUHn9Lx==$0" RENAME TO idx_emp186;
+
+Index altered.
+
+SYS@orcl> ALTER INDEX hr."BIN$eF9pQ4zSVIo0My==$0" RENAME TO pk_emp186;
+
+Index altered.
+
+SYS@orcl> ALTER TABLE hr.emp186 RENAME CONSTRAINT "BIN$gH1rS6bUWKp2Nz==$0"
+  2    TO pk_emp186;
+
+Table altered.
+
+SYS@orcl> SELECT index_name FROM dba_indexes
+  2  WHERE  owner = 'HR' AND table_name = 'EMP186';
+
+INDEX_NAME
+------------------------------
+IDX_EMP186
+PK_EMP186
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+-- 같은 이름을 여러 번 DROP한 경우를 확인한다.
+
+SYS@orcl> DROP TABLE hr.emp186;
+SYS@orcl> CREATE TABLE hr.emp186 AS SELECT * FROM hr.employees WHERE ROWNUM <= 10;
+SYS@orcl> DROP TABLE hr.emp186;
+
+Table dropped.
+
+SYS@orcl> SELECT object_name, original_name, droptime FROM dba_recyclebin
+  2  WHERE  owner = 'HR' AND original_name = 'EMP186' ORDER BY droptime;
+
+OBJECT_NAME                    ORIGINAL_NAME DROPTIME
+------------------------------ ------------- -------------------
+BIN$aB3kL9xQTGm8Kw==$0         EMP186        2025-05-20:11:12:02
+BIN$kM5tU8dWYMr4Pb==$0         EMP186        2025-05-20:11:14:41
+
+-- 두 개가 쌓였다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr."BIN$aB3kL9xQTGm8Kw==$0";
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT COUNT(*) FROM hr."BIN$kM5tU8dWYMr4Pb==$0";
+
+  COUNT(*)
+----------
+        10
+
+-- 내용을 조회해 어느 것인지 구분한다.
+
+SYS@orcl> FLASHBACK TABLE hr.emp186 TO BEFORE DROP;
+
+Flashback complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp186;
+
+  COUNT(*)
+----------
+        10
+
+-- 가장 최근에 DROP된 것이 되살아났다.
+-- 107건짜리를 원했다면 휴지통 이름을 직접 지정해야 한다.
+
+SYS@orcl> FLASHBACK TABLE "BIN$aB3kL9xQTGm8Kw==$0" TO BEFORE DROP
+  2    RENAME TO emp186_full;
+
+Flashback complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp186_full;
+
+  COUNT(*)
+----------
+       107
+
+-- PURGE로 지운 경우를 확인한다.
+
+SYS@orcl> DROP TABLE hr.emp186 PURGE;
+
+Table dropped.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_recyclebin
+  2  WHERE  owner = 'HR' AND original_name = 'EMP186';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> FLASHBACK TABLE hr.emp186 TO BEFORE DROP;
+
+FLASHBACK TABLE hr.emp186 TO BEFORE DROP
+*
+ERROR at line 1:
+ORA-38305: object not in RECYCLE BIN
+
+-- PURGE로 지우면 되살릴 수 없다.
+-- 이 경우 RECOVER TABLE이나 복제본 방식으로 가야 한다.
+
+SYS@orcl> DROP TABLE hr.emp186_full PURGE;
+SYS@orcl> PURGE DBA_RECYCLEBIN;
+
+DBA Recyclebin purged.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_recyclebin;
+
+  COUNT(*)
+----------
+         0
+
+-- 실무 포인트
+-- 1) DROP된 테이블은 이름이 바뀌어 휴지통에 남는다.
+--    dba_recyclebin 으로 목록과 DROP 시각을 확인한다.
+--    CAN_UNDROP이 YES인 것만 직접 되살릴 수 있다.
+--
+-- 2) 되살리기 전에 휴지통 이름으로 내용을 조회할 수 있다.
+--    같은 이름이 여러 개일 때 어느 것인지 구분하는 데 유용하다.
+--    이름에 특수문자가 있으므로 큰따옴표로 감싼다.
+--
+-- 3) 인덱스와 제약 조건은 휴지통 이름 그대로 복원된다.
+--    운영에 지장은 없으나 관리가 어려우므로 이름을 바로잡는다.
+--    ALTER INDEX ... RENAME TO 와 RENAME CONSTRAINT 를 쓴다.
+--
+-- 4) 외래 키 제약은 복원되지 않는다.
+--    복원 후 다시 만들어야 하므로 사전에 정의를 확보해 둔다.
+--
+-- 5) 같은 이름이 여러 개면 TO BEFORE DROP은 최근 것을 되살린다.
+--    이전 것을 원하면 휴지통 이름을 직접 지정하고
+--    RENAME TO 로 다른 이름을 준다.
+--
+-- 6) PURGE로 지우면 되살릴 수 없다.
+--    ORA-38305가 그 상황이며 RECOVER TABLE이나 복제본 방식으로 전환한다.
+--    중요한 테이블을 DROP할 때 PURGE를 붙이지 않는 습관이 안전하다.

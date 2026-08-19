@@ -1,0 +1,298 @@
+================================================================================
+ 실습 9-2 : 모든 데이터파일을 새 위치로 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 모든 데이터파일이 유실되었고 원래 디스크를 더 이상 쓸 수 없다.
+-- 백업본을 새 위치로 복원하고 파일마다 RENAME FILE 을 수행한다.
+-- 파일이 많으므로 조회 결과로 RENAME 스크립트를 생성해 일괄 적용한다.
+-- TEMP 파일 이전과 후속 작업까지 함께 다룬다.
+-- 복구 유형 : 완전 복구(경로 변경, 전면 중단)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 9-1을 마친 상태에서 이어서 진행한다.
+-- /u02 파일 시스템에 데이터베이스 전체 크기 이상의 여유가 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name, bytes/1024/1024 AS mb FROM v$datafile ORDER BY file#;
+
+     FILE# NAME                                              MB
+---------- ---------------------------------------------- -----
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf        900
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf        600
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf       300
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf         200
+        10 /u01/app/oracle/oradata/ORCL/hist01.dbf           20
+        11 /u01/app/oracle/oradata/ORCL/tbs01.dbf            20
+        12 /u01/app/oracle/oradata/ORCL/tbs02.dbf            20
+
+7 rows selected.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch09 && mkdir -p /home/oracle/backup/ch09
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /home/oracle/backup/ch09/
+SYS@orcl> !rm -f /home/oracle/backup/ch09/temp01.dbf
+SYS@orcl> STARTUP
+
+SYS@orcl> INSERT INTO hr.emp91 VALUES (3, 'after backup 92');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 디스크 전체 사용 불가
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.dbf
+
+-- /u01 디스크를 교체해야 해서 당분간 쓸 수 없다고 가정한다.
+-- 컨트롤파일과 리두 로그는 이미 다른 위치에도 사본이 있다.
+
+SYS@orcl> !mkdir -p /u02/oradata/ORCL
+SYS@orcl> !df -h /u02 | tail -1
+/dev/mapper/ol-u02     20G  4.3G   16G  22% /u02
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@orcl> SELECT COUNT(*) FROM v$recover_file;
+
+  COUNT(*)
+----------
+         7
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01157: cannot identify/lock data file 1 - see DBWR trace file
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT MIN(sequence#), MAX(sequence#), COUNT(*),
+  2         MAX(sequence#) - MIN(sequence#) + 1 AS expected
+  3  FROM   v$archived_log WHERE status = 'A';
+
+MIN(SEQUENCE#) MAX(SEQUENCE#)   COUNT(*)   EXPECTED
+-------------- -------------- ---------- ----------
+            20             39         20         20
+
+-- 아카이브가 연속이다. 완전 복구가 가능하다.
+
+SYS@orcl> !ls -l /home/oracle/backup/ch09/*.dbf | wc -l
+7
+
+-- 판정
+--   ① 백업본 : 일곱 개 모두 보유
+--   ② 아카이브 : 연속 보유
+--   ③ 원래 위치 : 사용 불가 → 새 위치 복원 + RENAME 일괄
+--   → 복원 → RENAME 전체 → RECOVER DATABASE → OPEN
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> !cp -p /home/oracle/backup/ch09/*.dbf /u02/oradata/ORCL/
+
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf | wc -l
+7
+
+-- RENAME 없이 복구를 시도한다.
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE;
+ORA-00283: recovery session canceled due to errors
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+ORA-01157: cannot identify/lock data file 1 - see DBWR trace file
+
+-- << 원인 파악 >>
+-- 파일은 /u02에 복원했는데 컨트롤파일은 여전히 /u01 경로를 알고 있다.
+-- 복구는 컨트롤파일이 아는 경로의 파일을 대상으로 한다.
+-- 복원 위치가 달라졌으면 RENAME FILE 로 그 사실을 먼저 알려야 한다.
+-- 파일이 일곱 개이므로 손으로 입력하면 오타가 나기 쉽다.
+
+SYS@orcl> SELECT file#, name FROM v$datafile WHERE file# = 1;
+
+     FILE# NAME
+---------- ------------------------------------------
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf
+
+-- << 수정 >>
+-- 조회 결과로 RENAME 스크립트를 생성한다.
+
+SYS@orcl> SET LINESIZE 200 PAGESIZE 0 FEEDBACK OFF
+SYS@orcl> SPOOL /home/oracle/backup/rename.sql
+SYS@orcl> SELECT 'ALTER DATABASE RENAME FILE ''' || name || '''' ||
+  2         ' TO ''' || REPLACE(name, '/u01/app/oracle/oradata/ORCL',
+  3         '/u02/oradata/ORCL') || ''';'
+  4  FROM   v$datafile ORDER BY file#;
+SYS@orcl> SPOOL OFF
+SYS@orcl> SET PAGESIZE 50 FEEDBACK ON
+
+SYS@orcl> !grep -c 'RENAME FILE' /home/oracle/backup/rename.sql
+7
+
+SYS@orcl> !head -4 /home/oracle/backup/rename.sql
+ALTER DATABASE RENAME FILE '/u01/app/oracle/oradata/ORCL/system01.dbf' TO '/u02/oradata/ORCL/system01.dbf';
+ALTER DATABASE RENAME FILE '/u01/app/oracle/oradata/ORCL/sysaux01.dbf' TO '/u02/oradata/ORCL/sysaux01.dbf';
+ALTER DATABASE RENAME FILE '/u01/app/oracle/oradata/ORCL/undotbs01.dbf' TO '/u02/oradata/ORCL/undotbs01.dbf';
+ALTER DATABASE RENAME FILE '/u01/app/oracle/oradata/ORCL/users01.dbf' TO '/u02/oradata/ORCL/users01.dbf';
+
+-- 실행 전 눈으로 확인한다. SPOOL 파일 끝에 SQL*Plus 프롬프트가 섞이면 지운다.
+
+SYS@orcl> @/home/oracle/backup/rename.sql
+
+Database altered.
+Database altered.
+Database altered.
+Database altered.
+Database altered.
+Database altered.
+Database altered.
+
+SYS@orcl> SELECT file#, name FROM v$datafile ORDER BY file#;
+
+     FILE# NAME
+---------- ------------------------------------------
+         1 /u02/oradata/ORCL/system01.dbf
+         3 /u02/oradata/ORCL/sysaux01.dbf
+         4 /u02/oradata/ORCL/undotbs01.dbf
+         7 /u02/oradata/ORCL/users01.dbf
+        10 /u02/oradata/ORCL/hist01.dbf
+        11 /u02/oradata/ORCL/tbs01.dbf
+        12 /u02/oradata/ORCL/tbs02.dbf
+
+7 rows selected.
+
+SYS@orcl> RECOVER DATABASE;
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT * FROM hr.emp91 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 after cold backup
+         2 second
+         3 after backup 92
+
+-- 백업 이후 커밋한 데이터가 모두 살아 있다.
+
+SYS@orcl> SELECT resetlogs_change# FROM v$database;
+
+RESETLOGS_CHANGE#
+-----------------
+                1
+
+-- TEMP 파일을 확인한다.
+
+SYS@orcl> SELECT file#, name, status FROM v$tempfile;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/temp01.dbf       ONLINE
+
+SYS@orcl> SELECT COUNT(*) FROM (SELECT object_name FROM dba_objects
+  2    UNION SELECT object_name FROM dba_objects);
+SELECT COUNT(*) FROM (SELECT object_name FROM dba_objects
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 201
+ORA-01110: data file 201: '/u01/app/oracle/oradata/ORCL/temp01.dbf'
+
+-- TEMP는 예전 경로 그대로다. 정렬 작업이 실패한다.
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M;
+Tablespace altered.
+
+SYS@orcl> ALTER DATABASE TEMPFILE '/u01/app/oracle/oradata/ORCL/temp01.dbf' DROP;
+Database altered.
+
+SYS@orcl> SELECT COUNT(*) FROM (SELECT object_name FROM dba_objects
+  2    UNION SELECT object_name FROM dba_objects);
+
+  COUNT(*)
+----------
+     73220
+
+-- ADD를 먼저 하고 DROP을 나중에 했다. 5장에서 익힌 순서다.
+
+-- 경로가 바뀌었으므로 후속 작업을 수행한다.
+
+SYS@orcl> COL name FOR a52
+SYS@orcl> SELECT 'DATAFILE' AS type, name FROM v$datafile
+  2  UNION ALL SELECT 'TEMPFILE', name FROM v$tempfile
+  3  UNION ALL SELECT 'CONTROL', name FROM v$controlfile ORDER BY 1, 2;
+
+TYPE     NAME
+-------- ----------------------------------------------------
+CONTROL  /u01/app/oracle/oradata/ORCL/control01.ctl
+CONTROL  /u01/app/oracle/oradata/ORCL/control02.ctl
+CONTROL  /u02/oradata/ORCL/control03.ctl
+DATAFILE /u02/oradata/ORCL/hist01.dbf
+DATAFILE /u02/oradata/ORCL/system01.dbf
+TEMPFILE /u02/oradata/ORCL/temp01.dbf
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_after_move_all.sql';
+Database altered.
+
+-- 백업 스크립트의 경로 목록도 이 결과로 갱신한다.
+
+-- 실무 포인트
+-- 1) 복원 위치가 달라지면 RENAME FILE 이 반드시 필요하다.
+--    컨트롤파일이 아는 경로의 파일이 복구 대상이 되기 때문이다.
+--    RENAME 없이 복구하면 예전 경로를 찾다 ORA-01157로 막힌다.
+--
+-- 2) 파일이 많으면 스크립트를 생성한다.
+--    v$datafile 조회 결과에 REPLACE 를 적용하면 한 번에 만들어진다.
+--    이 쿼리를 복구 절차서에 넣어 두면 장애 시 바로 쓸 수 있다.
+--
+-- 3) 생성한 스크립트는 실행 전에 눈으로 확인한다.
+--    SPOOL 파일에 프롬프트나 머리글이 섞이면 실행이 실패한다.
+--    PAGESIZE 0 과 FEEDBACK OFF 로 불필요한 출력을 줄인다.
+--
+-- 4) TEMP 파일은 RENAME 대상에 포함되지 않는다.
+--    v$datafile 조회로 만든 스크립트에는 TEMP가 없기 때문이다.
+--    ADD TEMPFILE 로 새 위치에 추가하고 예전 것을 DROP 한다.
+--
+-- 5) 경로가 바뀌면 후속 작업이 따라온다.
+--    백업 스크립트, 매니페스트, 모니터링 대상을 모두 갱신하고
+--    컨트롤파일 백업을 새로 받는다.
+--
+-- 6) 갱신을 빠뜨리면 다음 백업이 조용히 실패한다.
+--    그 사실이 다음 장애에서야 드러나므로 경로 변경 후 점검이 중요하다.
+
+SYS@orcl> EXIT

@@ -1,0 +1,272 @@
+================================================================================
+ 실습 14-6 : 압축 백업과 백업 조각 크기 조정
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 같은 대상을 압축 없이와 압축으로 백업해 크기와 시간을 비교한다.
+-- MAXPIECESIZE로 조각 크기를 제한한다.
+-- SECTION SIZE로 큰 파일을 나눠 병렬 처리한다.
+-- MAXSETSIZE를 잘못 설정했을 때의 실패를 확인한다.
+-- 작업 유형 : 백업 최적화(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 14-5까지 완료되어 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> SHOW COMPRESSION ALGORITHM;
+
+RMAN configuration parameters for database with db_unique_name ORCL are:
+CONFIGURE COMPRESSION ALGORITHM 'BASIC' AS OF RELEASE 'DEFAULT'
+ OPTIMIZE FOR LOAD TRUE; # default
+
+-- BASIC이 기본이며 별도 옵션 없이 쓸 수 있다.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : 압축 없는 백업
+--------------------------------------------------------------------------------
+RMAN> BACKUP AS BACKUPSET DATAFILE 1
+  2>   FORMAT '/home/oracle/rmanbk/nocomp_%U' TAG 'NOCOMP';
+
+Starting backup at 15-MAY-25
+channel ORA_DISK_1: starting full datafile backup set
+input datafile file number=00001 name=/u02/oradata/ORCL/system01.dbf
+channel ORA_DISK_1: backup set complete, elapsed time: 00:00:36
+Finished backup at 15-MAY-25
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ ls -l /home/oracle/rmanbk/nocomp_*
+-rw-r-----. 1 oracle oinstall 746840064 May 15 12:04 nocomp_0nttqk8s_1_1
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT input_type, elapsed_seconds AS secs,
+   ROUND(input_bytes/1024/1024) AS in_mb, ROUND(output_bytes/1024/1024) AS out_mb,
+   ROUND(compression_ratio,2) AS ratio
+   FROM v\$rman_backup_job_details ORDER BY start_time DESC FETCH FIRST 1 ROWS ONLY;"
+
+INPUT_TYPE       SECS  IN_MB OUT_MB      RATIO
+--------------- ----- ------ ------ ----------
+DATAFILE FULL      36    890    712       1.25
+
+-- 압축 없이도 890MB가 712MB로 줄었다. 빈 블록을 건너뛴 결과다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 압축 백업
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP AS COMPRESSED BACKUPSET DATAFILE 1
+  2>   FORMAT '/home/oracle/rmanbk/comp_%U' TAG 'COMP';
+
+Starting backup at 15-MAY-25
+channel ORA_DISK_1: starting compressed full datafile backup set
+input datafile file number=00001 name=/u02/oradata/ORCL/system01.dbf
+channel ORA_DISK_1: backup set complete, elapsed time: 00:01:24
+Finished backup at 15-MAY-25
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ ls -l /home/oracle/rmanbk/comp_*
+-rw-r-----. 1 oracle oinstall 187695104 May 15 12:07 comp_0ottqka1_1_1
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT elapsed_seconds AS secs, ROUND(input_bytes/1024/1024) AS in_mb,
+   ROUND(output_bytes/1024/1024) AS out_mb, ROUND(compression_ratio,2) AS ratio
+   FROM v\$rman_backup_job_details ORDER BY start_time DESC FETCH FIRST 1 ROWS ONLY;"
+
+ SECS  IN_MB OUT_MB      RATIO
+----- ------ ------ ----------
+   84    890    179       4.97
+
+-- 712MB가 179MB로 줄었다. 대신 36초가 84초로 늘었다.
+-- 압축은 디스크와 CPU를 맞바꾸는 선택이라는 점이 수치로 드러난다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 조각 크기 제한
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RUN {
+  2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK
+  3>     FORMAT '/home/oracle/rmanbk/piece_%U' MAXPIECESIZE 200M;
+  4>   BACKUP DATAFILE 1 TAG 'PIECES';
+  5>   RELEASE CHANNEL c1;
+  6> }
+
+allocated channel: c1
+channel c1: starting full datafile backup set
+channel c1: starting piece 1 at 15-MAY-25
+channel c1: finished piece 1 at 15-MAY-25
+channel c1: starting piece 2 at 15-MAY-25
+channel c1: finished piece 2 at 15-MAY-25
+channel c1: starting piece 3 at 15-MAY-25
+channel c1: finished piece 3 at 15-MAY-25
+channel c1: starting piece 4 at 15-MAY-25
+Finished backup at 15-MAY-25
+
+RMAN> LIST BACKUP TAG 'PIECES';
+
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ ---------------
+54      Full    712.44M    DISK        00:00:38     15-MAY-25
+  List of Backup Pieces for backup set 54 Copy #1
+  BP Key  Pc# Status      Piece Name
+  ------- --- ----------- ----------------------------------
+  54      1   AVAILABLE   /home/oracle/rmanbk/piece_0pttqkc2_1_1
+  55      2   AVAILABLE   /home/oracle/rmanbk/piece_0pttqkc2_2_1
+  56      3   AVAILABLE   /home/oracle/rmanbk/piece_0pttqkc2_3_1
+  57      4   AVAILABLE   /home/oracle/rmanbk/piece_0pttqkc2_4_1
+
+-- 하나의 백업 세트가 네 조각으로 나뉘었다.
+-- 미디어 크기 제한이 있는 환경에서 필요한 설정이다.
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : 다중 섹션 백업
+--------------------------------------------------------------------------------
+RMAN> BACKUP SECTION SIZE 200M DATAFILE 1
+  2>   FORMAT '/home/oracle/rmanbk/sect_%U' TAG 'SECTION';
+
+Starting backup at 15-MAY-25
+allocated channel: ORA_DISK_1
+allocated channel: ORA_DISK_2
+channel ORA_DISK_1: starting full datafile backup set
+channel ORA_DISK_1: specifying datafile(s) in backup set
+input datafile file number=00001 name=/u02/oradata/ORCL/system01.dbf
+backing up blocks 1 through 25600
+channel ORA_DISK_2: starting full datafile backup set
+backing up blocks 25601 through 51200
+channel ORA_DISK_1: backup set complete, elapsed time: 00:00:11
+Finished backup at 15-MAY-25
+
+-- 파일 하나를 블록 범위로 나눠 두 채널이 동시에 처리했다.
+-- MAXPIECESIZE는 결과 파일을 나누고 SECTION SIZE는 작업 자체를 나눈다.
+-- 큰 데이터파일 하나가 백업 시간을 지배할 때 효과가 크다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- MAXSETSIZE를 데이터파일보다 작게 설정해 본다.
+
+RMAN> CONFIGURE MAXSETSIZE TO 100 M;
+
+new RMAN configuration parameters:
+CONFIGURE MAXSETSIZE TO 100 M;
+new RMAN configuration parameters are successfully stored
+
+RMAN> BACKUP DATAFILE 1;
+
+Starting backup at 15-MAY-25
+channel ORA_DISK_1: starting full datafile backup set
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of backup command at 05/15/2025 12:22:41
+RMAN-06183: datafile or datafile copy larger than MAXSETSIZE:
+ file# 1 /u02/oradata/ORCL/system01.dbf
+
+-- << 원인 파악 >>
+-- MAXSETSIZE는 백업 세트 하나의 최대 크기다.
+-- 데이터파일 하나가 그 값보다 크면 세트를 만들 수 없어 백업이 실패한다.
+-- 조각 크기를 제한하려던 것이라면 MAXPIECESIZE를 썼어야 한다.
+-- 두 옵션의 이름이 비슷해 혼동하기 쉽다.
+
+-- << 수정 >>
+
+RMAN> CONFIGURE MAXSETSIZE CLEAR;
+
+RMAN configuration parameters are successfully reset to default value
+
+RMAN> SHOW MAXSETSIZE;
+
+CONFIGURE MAXSETSIZE TO UNLIMITED; # default
+
+RMAN> BACKUP DATAFILE 1 TAG 'AFTER_FIX';
+
+Starting backup at 15-MAY-25
+Finished backup at 15-MAY-25
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+RMAN> LIST BACKUP OF DATAFILE 1 SUMMARY;
+
+Key     TY LV S Device Type Completion Time #Pieces Compressed Tag
+------- -- -- - ----------- --------------- ------- ---------- ----------
+52      B  F  A DISK        15-MAY-25       1       NO         NOCOMP
+53      B  F  A DISK        15-MAY-25       1       YES        COMP
+54      B  F  A DISK        15-MAY-25       4       NO         PIECES
+55      B  F  A DISK        15-MAY-25       1       NO         SECTION
+56      B  F  A DISK        15-MAY-25       1       NO         SECTION
+58      B  F  A DISK        15-MAY-25       1       NO         AFTER_FIX
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT bs.recid, bs.compressed, bs.pieces,
+  2         ROUND(bs.bytes/1024/1024) AS mb
+  3  FROM   v$backup_set bs WHERE bs.recid BETWEEN 52 AND 58
+  4  ORDER  BY bs.recid;
+
+     RECID COM     PIECES         MB
+---------- --- ---------- ----------
+        52 NO           1        712
+        53 YES          1        179
+        54 NO           4        712
+        55 NO           1        356
+        56 NO           1        356
+
+-- 압축본이 179MB로 가장 작다.
+-- 다중 섹션은 두 세트로 나뉘어 각각 356MB다.
+
+SYS@orcl> SELECT TO_CHAR(start_time,'HH24:MI') AS started, elapsed_seconds AS secs,
+  2         ROUND(output_bytes/1024/1024) AS out_mb
+  3  FROM   v$rman_backup_job_details
+  4  ORDER  BY start_time DESC FETCH FIRST 5 ROWS ONLY;
+
+STARTED  SECS OUT_MB
+------- ----- ------
+12:24      37    712
+12:19      11    712
+12:16      38    712
+12:07      84    179
+12:04      36    712
+
+-- 압축은 84초, 다중 섹션은 11초다.
+-- 목표가 공간이면 압축, 시간이면 다중 섹션이 답이다.
+
+-- 정리
+[oracle@oel7v9r1 ~]$ rman target /
+RMAN> DELETE NOPROMPT BACKUP TAG 'PIECES';
+RMAN> DELETE NOPROMPT BACKUP TAG 'SECTION';
+
+-- 실무 포인트
+-- 1) 압축 없이도 백업 세트는 원본보다 작다.
+--    빈 블록을 건너뛰기 때문이며 이 실습에서 890MB가 712MB가 되었다.
+--    압축을 적용하면 179MB까지 줄었지만 시간이 36초에서 84초로 늘었다.
+--
+-- 2) 압축은 디스크와 CPU를 맞바꾸는 선택이다.
+--    백업 창이 빠듯하면 압축이 오히려 문제가 될 수 있다.
+--    compression_ratio 컬럼으로 효과를 정량적으로 확인한다.
+--
+-- 3) MAXPIECESIZE는 결과 파일을 나눈다.
+--    하나의 백업 세트가 여러 조각이 되며 미디어 크기 제한에 대응한다.
+--
+-- 4) SECTION SIZE는 작업 자체를 나눈다.
+--    파일 하나를 블록 범위로 쪼개 여러 채널이 동시에 처리한다.
+--    큰 데이터파일 하나가 백업 시간을 지배할 때 효과가 크다.
+--
+-- 5) MAXSETSIZE는 백업 세트의 최대 크기다.
+--    데이터파일보다 작게 설정하면 RMAN-06183으로 백업이 실패한다.
+--    조각 크기 제한이 목적이라면 MAXPIECESIZE를 써야 한다.
+--
+-- 6) 설정 실수는 CLEAR로 되돌린다.
+--    SHOW로 기본값 복귀를 확인한 뒤 백업을 다시 시도한다.

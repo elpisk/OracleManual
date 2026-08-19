@@ -1,0 +1,346 @@
+================================================================================
+ 실습 16-1 : RMAN Table Recovery — RECOVER TABLE ... UNTIL
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 40분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 테이블 하나가 잘못된 작업으로 지워졌다.
+-- UNDO는 이미 덮여 Flashback을 쓸 수 없다.
+-- RECOVER TABLE로 그 시점의 테이블만 되살린다.
+-- REMAP TABLE로 다른 이름으로 가져와 확인한 뒤 반영한다.
+-- 복구 유형 : 테이블 단위 복구, 다른 업무에 영향 없음
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 15장까지의 실습이 완료되어 백업과 아카이브가 있어야 한다.
+-- 보조 인스턴스용 공간이 필요하다.
+
+[oracle@oel7v9r1 ~]$ mkdir -p /u03/aux
+[oracle@oel7v9r1 ~]$ df -h /u03 | tail -1
+/dev/sdc1        20G  4.2G   16G  21% /u03
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT tablespace_name, ROUND(SUM(bytes)/1024/1024) AS mb
+   FROM dba_data_files
+   WHERE tablespace_name IN ('SYSTEM','SYSAUX','UNDOTBS1','USERS')
+   GROUP BY tablespace_name ORDER BY 1;"
+
+TABLESPACE_NAME                        MB
+------------------------------ ----------
+SYSAUX                                550
+SYSTEM                                890
+UNDOTBS1                              320
+USERS                                  10
+
+-- 보조 인스턴스가 이 네 테이블스페이스를 복원한다. 약 1.8GB가 필요하다.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> CREATE TABLE hr.emp160 TABLESPACE users
+  2  AS SELECT * FROM hr.employees;
+
+Table created.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp160;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') AS now FROM dual;
+
+NOW
+-------------------
+2025-05-18 09:02:11
+
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'BASE_161';
+
+Starting backup at 18-MAY-25
+Finished backup at 18-MAY-25
+
+RMAN> EXIT
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 테이블 데이터 삭제
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') AS now FROM dual;
+
+NOW
+-------------------
+2025-05-18 09:14:02
+
+SYS@orcl> DELETE FROM hr.emp160 WHERE department_id <> 50;
+
+102 rows deleted.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp160;
+
+  COUNT(*)
+----------
+         5
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+-- Flashback Query를 먼저 시도해 본다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp160
+  2  AS OF TIMESTAMP TO_TIMESTAMP('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS');
+SELECT COUNT(*) FROM hr.emp160
+                     *
+ERROR at line 1:
+ORA-01555: snapshot too old: rollback segment number 3 with name
+"_SYSSMU3_1930754532$" too small
+
+-- << 원인 파악 >>
+-- UNDO가 이미 덮여 그 시점의 이전 이미지를 만들 수 없다.
+-- UNDO_RETENTION을 넘겼거나 UNDO 테이블스페이스가 작아 재사용된 것이다.
+-- Flashback 계열은 UNDO에 의존하므로 이 상황에서는 쓸 수 없다.
+-- 백업과 아카이브를 쓰는 RECOVER TABLE 로 전환한다.
+
+SYS@orcl> SHOW PARAMETER undo_retention
+
+NAME                 TYPE        VALUE
+-------------------- ----------- -----
+undo_retention       integer     900
+
+-- 900초, 즉 15분이다. 그 이전 시점은 보장되지 않는다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> EXIT
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> LIST BACKUP OF TABLESPACE system SUMMARY;
+
+Key     TY LV S Device Type Completion Time #Pieces Tag
+------- -- -- - ----------- --------------- ------- ---------
+118     B  F  A DISK        18-MAY-25       1       BASE_161
+
+RMAN> LIST BACKUP OF TABLESPACE undotbs1 SUMMARY;
+RMAN> LIST BACKUP OF TABLESPACE users SUMMARY;
+
+-- 세 테이블스페이스의 백업이 모두 있다.
+
+-- 판정
+--   ① 대상 : hr.emp160, USERS 테이블스페이스 (SYS나 SYSTEM 아님)
+--   ② 시점 : 09:10 (DELETE 이전)
+--   ③ 백업 : SYSTEM·SYSAUX·UNDO·USERS 모두 존재
+--   ④ 공간 : /u03 에 16GB 여유, 필요량 약 1.8GB
+--   → RECOVER TABLE 수행 가능
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- AUXILIARY DESTINATION 없이 시도해 본다.
+
+RMAN> RECOVER TABLE hr.emp160
+  2>   UNTIL TIME "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')";
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of recover command at 05/18/2025 09:22:41
+RMAN-05902: must specify AUXILIARY DESTINATION or set DB_RECOVERY_FILE_DEST
+
+-- << 원인 파악 >>
+-- 보조 인스턴스가 파일을 만들 위치가 필요하다.
+-- FRA가 구성되어 있으면 그것을 쓰지만 이 환경에는 없다.
+-- AUXILIARY DESTINATION 으로 경로를 지정해야 한다.
+
+-- << 수정 >>
+
+RMAN> RECOVER TABLE hr.emp160
+  2>   UNTIL TIME "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')"
+  3>   AUXILIARY DESTINATION '/u03/aux'
+  4>   REMAP TABLE hr.emp160:emp160_recovered;
+
+Starting recover at 18-MAY-25
+current log archived
+
+Creating automatic instance, with SID='qBxA'
+
+initialization parameters used for automatic instance:
+db_name=ORCL
+db_unique_name=qBxA_pitr_ORCL
+compatible=19.0.0
+db_block_size=8192
+db_files=200
+diagnostic_dest=/u01/app/oracle
+_no_recovery_through_resetlogs=TRUE
+db_create_file_dest=/u03/aux
+control_files=/u03/aux/ORCL/controlfile/o1_mf_...ctl
+
+starting up automatic instance ORCL
+Oracle instance started
+Total System Global Area     1073741824 bytes
+Automatic instance created
+
+contents of Memory Script:
+{
+# set requested point in time
+set until time "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')";
+# restore the controlfile
+restore clone controlfile;
+# mount the controlfile
+sql clone 'alter database mount clone database';
+}
+executing Memory Script
+
+contents of Memory Script:
+{
+# set requested point in time
+set until time "TO_DATE('2025-05-18 09:10:00',...)";
+# restore the tablespaces in the recovery set and the auxiliary set
+restore clone datafile  1, 3, 4, 7;
+switch clone datafile all;
+}
+executing Memory Script
+
+contents of Memory Script:
+{
+# set requested point in time
+recover clone database tablespace  "USERS", "SYSTEM", "UNDOTBS1", "SYSAUX";
+alter clone database open resetlogs;
+}
+executing Memory Script
+
+Performing export of tables...
+   EXPDP> Starting "SYS"."TSPITR_EXP_qBxA_xoDt":
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+   EXPDP> . . exported "HR"."EMP160"                   8.789 KB     107 rows
+   EXPDP> Job "SYS"."TSPITR_EXP_qBxA_xoDt" successfully completed
+Export completed
+
+contents of Memory Script:
+{
+# shutdown clone before import
+shutdown clone abort
+}
+executing Memory Script
+
+Performing import of tables...
+   IMPDP> Master table "SYS"."TSPITR_IMP_qBxA_alkx" successfully loaded/unloaded
+   IMPDP> Starting "SYS"."TSPITR_IMP_qBxA_alkx":
+   IMPDP> . . imported "HR"."EMP160_RECOVERED"         8.789 KB     107 rows
+   IMPDP> Job "SYS"."TSPITR_IMP_qBxA_alkx" successfully completed
+Import completed
+
+Removing automatic instance
+auxiliary instance file /u03/aux/ORCL/datafile/o1_mf_system_... deleted
+auxiliary instance file /u03/aux/ORCL/controlfile/o1_mf_... deleted
+Removing automatic instance complete
+Finished recover at 18-MAY-25
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp160_recovered;
+
+  COUNT(*)
+----------
+       107
+
+-- 삭제 전 상태로 복구되었다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp160;
+
+  COUNT(*)
+----------
+         5
+
+-- 현재 테이블은 그대로다. REMAP 덕분에 덮어쓰지 않았다.
+
+-- 필요한 행만 반영한다.
+
+SYS@orcl> INSERT INTO hr.emp160
+  2  SELECT * FROM hr.emp160_recovered r
+  3  WHERE  NOT EXISTS (SELECT 1 FROM hr.emp160 e
+  4                     WHERE e.employee_id = r.employee_id);
+
+102 rows created.
+
+SYS@orcl> COMMIT;
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp160;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> DROP TABLE hr.emp160_recovered PURGE;
+
+Table dropped.
+
+-- 보조 인스턴스 파일이 정리되었는지 확인한다.
+
+SYS@orcl> !ls -R /u03/aux 2>/dev/null | head -5
+
+SYS@orcl> !du -sh /u03/aux
+4.0K    /u03/aux
+
+-- 비어 있다. 정리가 정상적으로 끝났다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$instance;
+
+  COUNT(*)
+----------
+         1
+
+-- 보조 인스턴스가 남아 있지 않다.
+
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ ps -ef | grep [p]mon
+oracle    3021     1  0 08:40 ?        00:00:01 ora_pmon_orcl
+oracle    4188     1  0 08:52 ?        00:00:00 ora_pmon_rcat
+
+-- 실무 포인트
+-- 1) Flashback이 안 되는 상황에서 RECOVER TABLE이 답이 된다.
+--    ORA-01555는 UNDO가 이미 덮였다는 뜻이며 Flashback 계열을 쓸 수 없다.
+--    RECOVER TABLE은 백업과 아카이브를 쓰므로 UNDO와 무관하다.
+--
+-- 2) AUXILIARY DESTINATION 은 필수다.
+--    FRA가 구성되어 있으면 생략할 수 있으나 그렇지 않으면 RMAN-05902가 나온다.
+--    SYSTEM·SYSAUX·UNDO와 대상 TS만큼의 공간이 필요하다.
+--
+-- 3) REMAP TABLE을 기본으로 쓴다.
+--    생략하면 현재 테이블을 덮어쓰며 되돌릴 수 없다.
+--    다른 이름으로 가져와 확인한 뒤 필요한 행만 반영하는 편이 안전하다.
+--
+-- 4) 로그는 다섯 구간으로 읽는다.
+--    보조 인스턴스 생성, Memory Script, 복원과 복구, Export/Import, 정리다.
+--    clone 이 붙은 명령이 보조 인스턴스를 대상으로 하는 것이다.
+--
+-- 5) Export 단계의 행 수를 확인한다.
+--    기대한 수와 다르면 시점을 잘못 지정한 것이다.
+--
+-- 6) 작업 후 AUXILIARY DESTINATION 을 확인한다.
+--    정리가 실패하면 파일이 남아 다음 수행 때 공간 부족을 만든다.

@@ -1,0 +1,279 @@
+================================================================================
+ 실습 15-5 : 모든 데이터파일을 새 위치로 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 데이터 디스크 전체를 쓸 수 없어 새 디스크로 옮기며 복구한다.
+-- SET NEWNAME FOR DATABASE 로 여러 파일을 한 번에 지정한다.
+-- SWITCH DATAFILE ALL 로 컨트롤파일의 경로를 일괄 갱신한다.
+-- 치환 문자 %b 의 동작을 확인한다.
+-- 복구 유형 : 완전 복구, 전면 중단, 전체 경로 변경
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 15-4까지 완료되어 있어야 한다.
+-- 새 디스크 경로를 준비한다.
+
+[oracle@oel7v9r1 ~]$ mkdir -p /u03/oradata/ORCL
+[oracle@oel7v9r1 ~]$ df -h /u03 | tail -1
+/dev/sdc1        20G  2.1G   18G  11% /u03
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'BASE_155';
+RMAN> EXIT
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT file#, name FROM v$datafile ORDER BY file#;
+
+     FILE# NAME
+---------- ------------------------------------------
+         1 /u02/oradata/ORCL/system01.dbf
+         3 /u02/oradata/ORCL/sysaux01.dbf
+         4 /u02/oradata/ORCL/undotbs01.dbf
+         7 /u02/oradata/ORCL/users01.dbf
+         8 /u03/oradata/ORCL/tbs13_01.dbf
+
+SYS@orcl> INSERT INTO hr.rec154 VALUES (3, 'before move');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : /u02 디스크 사용 불가
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+
+SYS@orcl> !rm -f /u02/oradata/ORCL/*.dbf
+
+-- /u02 를 더 이상 쓸 수 없는 상황을 가정한다.
+-- 데이터파일은 모두 /u03 으로 옮긴다.
+
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf 2>/dev/null | wc -l
+0
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP MOUNT
+
+ORACLE instance started.
+Database mounted.
+
+SYS@orcl> SELECT file#, error FROM v$recover_file ORDER BY file#;
+
+     FILE# ERROR
+---------- --------------------
+         1 FILE NOT FOUND
+         3 FILE NOT FOUND
+         4 FILE NOT FOUND
+         7 FILE NOT FOUND
+
+-- 8번은 이미 /u03 에 있으므로 목록에 없다.
+
+SYS@orcl> EXIT
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> REPORT SCHEMA;
+
+File Size(MB) Tablespace           RB segs Datafile Name
+---- -------- -------------------- ------- ------------------------------
+1    890      SYSTEM               YES     /u02/oradata/ORCL/system01.dbf
+3    550      SYSAUX               NO      /u02/oradata/ORCL/sysaux01.dbf
+4    320      UNDOTBS1             YES     /u02/oradata/ORCL/undotbs01.dbf
+7    10       USERS                NO      /u02/oradata/ORCL/users01.dbf
+8    20       TBS13                NO      /u03/oradata/ORCL/tbs13_01.dbf
+
+RMAN> RESTORE DATABASE PREVIEW SUMMARY;
+
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time #Pieces Tag
+------- -- -- - ----------- --------------- ------- ---------
+84      B  F  A DISK        16-MAY-25       1       BASE_155
+
+-- 판정
+--   ① 네 파일이 /u02 에 있고 그 디스크를 쓸 수 없다
+--   ② 백업과 아카이브는 있다
+--   ③ 새 위치 /u03 에 여유가 있다
+--   → SET NEWNAME FOR DATABASE → RESTORE → SWITCH → RECOVER
+
+-- 필요한 공간을 미리 확인한다.
+
+RMAN> EXIT
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT ROUND(SUM(bytes)/1024/1024) AS total_mb FROM v\$datafile;"
+
+  TOTAL_MB
+----------
+      1790
+
+[oracle@oel7v9r1 ~]$ df -h /u03 | tail -1
+/dev/sdc1        20G  2.1G   18G  11% /u03
+
+-- 1.8GB가 필요하고 18GB가 남아 있다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+-- 파일마다 SET NEWNAME 을 쓰지 않고 한 번에 지정해 본다.
+
+RMAN> RUN {
+  2>   SET NEWNAME FOR DATABASE TO '/u03/oradata/ORCL/';
+  3>   RESTORE DATABASE;
+  4> }
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of set command at 05/16/2025 14:02:11
+RMAN-06970: The format specified for the datafile name is not valid.
+
+-- << 원인 파악 >>
+-- 디렉터리만 지정하면 파일명을 만들 수 없다.
+-- 치환 문자를 포함해야 각 파일의 이름이 결정된다.
+-- %b 는 원래 파일명만, %f 는 파일 번호, %U 는 고유 이름으로 치환된다.
+-- 원래 이름을 유지하려면 %b 를 쓴다.
+
+-- << 수정 >>
+
+RMAN> RUN {
+  2>   SET NEWNAME FOR DATABASE TO '/u03/oradata/ORCL/%b';
+  3>   RESTORE DATABASE;
+  4>   SWITCH DATAFILE ALL;
+  5>   RECOVER DATABASE;
+  6> }
+
+executing command: SET NEWNAME
+
+Starting restore at 16-MAY-25
+channel ORA_DISK_1: restoring datafile 00001 to /u03/oradata/ORCL/system01.dbf
+channel ORA_DISK_2: restoring datafile 00003 to /u03/oradata/ORCL/sysaux01.dbf
+channel ORA_DISK_1: restoring datafile 00004 to /u03/oradata/ORCL/undotbs01.dbf
+channel ORA_DISK_2: restoring datafile 00007 to /u03/oradata/ORCL/users01.dbf
+channel ORA_DISK_1: restoring datafile 00008 to /u03/oradata/ORCL/tbs13_01.dbf
+Finished restore at 16-MAY-25
+
+datafile 1 switched to datafile copy
+input datafile copy RECID=25 STAMP=1190821021
+file name=/u03/oradata/ORCL/system01.dbf
+datafile 3 switched to datafile copy
+file name=/u03/oradata/ORCL/sysaux01.dbf
+datafile 4 switched to datafile copy
+datafile 7 switched to datafile copy
+datafile 8 switched to datafile copy
+
+Starting recover at 16-MAY-25
+starting media recovery
+archived log file name=/u02/arch1/1_33_1190530011.dbf thread=1 sequence=33
+media recovery complete, elapsed time: 00:00:04
+Finished recover at 16-MAY-25
+
+RMAN> ALTER DATABASE OPEN;
+
+Statement processed
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+RMAN> REPORT SCHEMA;
+
+File Size(MB) Tablespace           RB segs Datafile Name
+---- -------- -------------------- ------- ------------------------------
+1    890      SYSTEM               YES     /u03/oradata/ORCL/system01.dbf
+3    550      SYSAUX               NO      /u03/oradata/ORCL/sysaux01.dbf
+4    320      UNDOTBS1             YES     /u03/oradata/ORCL/undotbs01.dbf
+7    10       USERS                NO      /u03/oradata/ORCL/users01.dbf
+8    20       TBS13                NO      /u03/oradata/ORCL/tbs13_01.dbf
+
+-- 모든 파일이 새 위치로 옮겨졌고 이름은 그대로다.
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT id, memo FROM hr.rec154 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 after backup
+         2 in current redo
+         3 before move
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         0
+
+-- 임시 파일은 /u02 에 있던 것이 사라졌고 새로 만들어지지 않았다.
+-- 경로가 없어졌으므로 새 위치로 다시 만든다.
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u03/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+
+Tablespace altered.
+
+SYS@orcl> SELECT name FROM v$tempfile;
+
+NAME
+------------------------------------------
+/u03/oradata/ORCL/temp01.dbf
+
+SYS@orcl> SELECT COUNT(*) FROM dba_objects WHERE status = 'INVALID';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'AFTER_MOVE_ALL';
+
+-- 경로가 모두 바뀌었으므로 백업을 다시 받고 문서를 갱신한다.
+
+RMAN> EXIT
+
+-- 실무 포인트
+-- 1) SET NEWNAME FOR DATABASE 로 여러 파일을 한 번에 지정한다.
+--    파일마다 SET NEWNAME 을 쓰지 않아도 되므로 명령이 크게 줄어든다.
+--
+-- 2) 디렉터리만 지정하면 RMAN-06970으로 거부된다.
+--    파일명을 만들 치환 문자가 필요하기 때문이다.
+--    %b 는 원래 파일명, %f 는 파일 번호, %U 는 고유 이름으로 치환된다.
+--
+-- 3) 원래 이름을 유지하려면 %b 를 쓴다.
+--    %U 를 쓰면 이름이 알아보기 어려운 형태로 바뀌어 운영에 불편하다.
+--
+-- 4) SWITCH DATAFILE ALL 로 모든 경로를 한 번에 갱신한다.
+--    SET NEWNAME 으로 지정한 파일이 모두 처리된다.
+--
+-- 5) 임시 파일은 자동으로 만들어지지 않을 수 있다.
+--    원래 경로가 사라진 경우가 그렇다. 복구 후 v$tempfile 을 반드시 확인한다.
+--
+-- 6) 경로가 바뀌면 백업과 문서를 함께 갱신한다.
+--    복구 절차서의 경로 목록, 백업 스크립트, 매니페스트가 대상이다.
+--    이 작업을 미루면 다음 장애에서 옛 경로를 찾다가 시간을 낭비한다.

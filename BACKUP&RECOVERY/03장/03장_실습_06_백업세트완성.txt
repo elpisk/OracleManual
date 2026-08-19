@@ -1,0 +1,262 @@
+================================================================================
+ 실습 3-6 : 백업 세트 완성
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 12분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실습 개요
+--------------------------------------------------------------------------------
+-- 데이터 파일 복사만으로는 백업이 완성되지 않는다.
+-- 제어 파일 백업, 백업 구간을 덮는 아카이브, 파라미터 파일을 채워 세트를 완성한다.
+-- 마지막으로 매니페스트를 작성해 무엇을 언제 받았는지 기록한다.
+-- 복구 유형 : 해당 없음(백업 세트 구성)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 3-3 을 마쳐 /home/oracle/backup/hot/20250509 에 데이터 파일 백업본이 있어야 한다.
+-- ARCHIVELOG 모드이고 데이터베이스가 OPEN 상태여야 한다.
+-- 백업 모드가 모두 해제된 상태여야 한다(실습 3-5 확인).
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a52
+
+SYS@orcl> SELECT COUNT(*) AS still_active FROM v$backup WHERE status = 'ACTIVE';
+
+STILL_ACTIVE
+------------
+           0
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> !ls -l /home/oracle/backup/hot/20250509/
+total 1541632
+-rw-r-----. 1 oracle oinstall  10600448 May  9 13:38 control.ctl
+-rw-r-----. 1 oracle oinstall 587210752 May  9 13:35 sysaux01.dbf
+-rw-r-----. 1 oracle oinstall 943726592 May  9 13:34 system01.dbf
+-rw-r-----. 1 oracle oinstall 110108672 May  9 13:31 undotbs01.dbf
+-rw-r-----. 1 oracle oinstall   5251072 May  9 13:25 users01.dbf
+
+-- 데이터 파일 4개와 제어 파일 백업 1개가 있다.
+-- 빠진 것은 트레이스 백업, 파라미터 파일, 아카이브 로그, 매니페스트다.
+
+SYS@orcl> SELECT MIN(change#) AS backup_start_scn, MAX(time) AS last_begin
+  2  FROM   v$backup WHERE change# > 0;
+
+BACKUP_START_SCN LAST_BEGIN
+---------------- -------------------
+         2342683 2025-05-09 13:35:02
+
+-- v$backup 은 마지막 백업 모드 진입 정보를 유지한다.
+-- 백업 시작 SCN 은 2342683 이다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 제어 파일 트레이스와 파라미터 파일
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/hot/20250509/control.txt';
+
+Database altered.
+
+SYS@orcl> !grep -c 'CREATE CONTROLFILE' /home/oracle/backup/hot/20250509/control.txt
+2
+
+SYS@orcl> !grep 'CREATE CONTROLFILE' /home/oracle/backup/hot/20250509/control.txt
+CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS  ARCHIVELOG
+CREATE CONTROLFILE REUSE DATABASE "ORCL" RESETLOGS  ARCHIVELOG
+
+-- 두 버전이 들어 있다. 온라인 리두가 온전하면 NORESETLOGS, 유실되었으면 RESETLOGS 를 쓴다.
+
+-- 같은 경로로 트레이스 백업을 한 번 더 받아 본다.
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/hot/20250509/control.txt';
+ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+*
+ERROR at line 1:
+ORA-27038: created file already exists
+Additional information: 1
+
+-- << 원인 파악 >>
+-- 대상 파일이 이미 있으면 덮어쓰지 않고 오류를 낸다.
+-- 실수로 기존 백업을 지우는 것을 막기 위한 동작이다.
+-- 덮어쓰려면 REUSE 를 붙이고, 이력을 남기려면 파일명에 날짜를 넣는다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/hot/20250509/control.txt' REUSE;
+
+Database altered.
+
+-- 파라미터 파일 사본
+
+SYS@orcl> CREATE PFILE='/home/oracle/backup/hot/20250509/initorcl.ora' FROM SPFILE;
+
+File created.
+
+SYS@orcl> !grep -c '^\*\.' /home/oracle/backup/hot/20250509/initorcl.ora
+21
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 백업 구간을 덮는 아카이브를 찾아 복사하려 한다.
+
+SYS@orcl> SELECT sequence#, name, first_change#, next_change#
+  2  FROM   v$archived_log
+  3  WHERE  first_change# > 2342683
+  4  ORDER  BY sequence#;
+
+no rows selected
+
+-- << 오류 발생 >>
+-- 결과가 비었다. 조건이 잘못되었다.
+
+-- << 원인 파악 >>
+-- 각 아카이브 로그는 [FIRST_CHANGE#, NEXT_CHANGE#) 구간을 담는다.
+-- 백업 시작 SCN 2342683 을 포함하는 로그는 FIRST_CHANGE# 가 그보다 작고
+-- NEXT_CHANGE# 가 그보다 큰 것이다.
+-- FIRST_CHANGE# > 2342683 조건은 그 로그를 걸러내 버린다.
+-- 올바른 조건은 NEXT_CHANGE# > 2342683 이다.
+
+SYS@orcl> SELECT sequence#, first_change#, next_change#
+  2  FROM   v$archived_log WHERE dest_id = 1 ORDER BY sequence# DESC FETCH FIRST 5 ROWS ONLY;
+
+ SEQUENCE# FIRST_CHANGE# NEXT_CHANGE#
+---------- ------------- ------------
+        41       2343405      2343910
+        40       2342806      2343405
+        39       2342683      2342806
+        38       2341598      2342683
+        37       2341425      2341598
+
+-- << 수정 >>
+
+SYS@orcl> SELECT sequence#, name, first_change#, next_change#
+  2  FROM   v$archived_log
+  3  WHERE  dest_id = 1 AND next_change# > 2342683
+  4  ORDER  BY sequence#;
+
+ SEQUENCE# NAME                                          FIRST_CHANGE# NEXT_CHANGE#
+---------- --------------------------------------------- ------------- ------------
+        39 /home/oracle/arch1/arch_1_39_1200525254.arc         2342683      2342806
+        40 /home/oracle/arch1/arch_1_40_1200525254.arc         2342806      2343405
+        41 /home/oracle/arch1/arch_1_41_1200525254.arc         2343405      2343910
+
+-- 시퀀스 39부터가 백업 구간을 덮는다.
+
+SYS@orcl> !mkdir -p /home/oracle/backup/hot/20250509/arch
+SYS@orcl> !cp -pv /home/oracle/arch1/arch_1_39_*.arc /home/oracle/arch1/arch_1_40_*.arc \
+                  /home/oracle/arch1/arch_1_41_*.arc /home/oracle/backup/hot/20250509/arch/
+'/home/oracle/arch1/arch_1_39_1200525254.arc' -> '.../arch/arch_1_39_1200525254.arc'
+'/home/oracle/arch1/arch_1_40_1200525254.arc' -> '.../arch/arch_1_40_1200525254.arc'
+'/home/oracle/arch1/arch_1_41_1200525254.arc' -> '.../arch/arch_1_41_1200525254.arc'
+
+--------------------------------------------------------------------------------
+[6] 매니페스트 작성
+--------------------------------------------------------------------------------
+SYS@orcl> SET PAGESIZE 0 FEEDBACK OFF HEADING OFF ECHO OFF TRIMSPOOL ON
+SYS@orcl> SPOOL /home/oracle/backup/hot/20250509/backup_manifest.txt
+
+SYS@orcl> SELECT 'BACKUP TIME  : ' || TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') FROM dual
+  2  UNION ALL SELECT 'BACKUP TYPE  : HOT / WHOLE / INCONSISTENT' FROM dual
+  3  UNION ALL SELECT 'DB NAME      : ' || name FROM v$database
+  4  UNION ALL SELECT 'DBID         : ' || TO_CHAR(dbid) FROM v$database
+  5  UNION ALL SELECT 'LOG MODE     : ' || log_mode FROM v$database
+  6  UNION ALL SELECT 'BACKUP SCN   : ' || TO_CHAR(MIN(change#)) FROM v$backup WHERE change# > 0
+  7  UNION ALL SELECT 'DATAFILE     : ' || name FROM v$datafile
+  8  UNION ALL SELECT 'ARCHIVE FROM : seq 39' FROM dual
+  9  UNION ALL SELECT 'CONTROLFILE  : control.ctl (binary), control.txt (trace)' FROM dual
+ 10  UNION ALL SELECT 'PFILE        : initorcl.ora' FROM dual;
+
+SYS@orcl> SPOOL OFF
+SYS@orcl> SET PAGESIZE 100 FEEDBACK ON HEADING ON
+
+SYS@orcl> !cat /home/oracle/backup/hot/20250509/backup_manifest.txt
+BACKUP TIME  : 2025-05-09 14:45:02
+BACKUP TYPE  : HOT / WHOLE / INCONSISTENT
+DB NAME      : ORCL
+DBID         : 1727762462
+LOG MODE     : ARCHIVELOG
+BACKUP SCN   : 2342683
+DATAFILE     : /u01/app/oracle/oradata/ORCL/system01.dbf
+DATAFILE     : /u01/app/oracle/oradata/ORCL/sysaux01.dbf
+DATAFILE     : /u01/app/oracle/oradata/ORCL/undotbs01.dbf
+DATAFILE     : /u01/app/oracle/oradata/ORCL/users01.dbf
+ARCHIVE FROM : seq 39
+CONTROLFILE  : control.ctl (binary), control.txt (trace)
+PFILE        : initorcl.ora
+
+--------------------------------------------------------------------------------
+[7] 검증
+--------------------------------------------------------------------------------
+SYS@orcl> !ls -lR /home/oracle/backup/hot/20250509/
+/home/oracle/backup/hot/20250509/:
+total 1541644
+drwxr-xr-x. 2 oracle oinstall      4096 May  9 14:40 arch
+-rw-r--r--. 1 oracle oinstall       612 May  9 14:45 backup_manifest.txt
+-rw-r-----. 1 oracle oinstall  10600448 May  9 13:38 control.ctl
+-rw-r--r--. 1 oracle oinstall      6284 May  9 14:32 control.txt
+-rw-r--r--. 1 oracle oinstall      1642 May  9 14:33 initorcl.ora
+-rw-r-----. 1 oracle oinstall 587210752 May  9 13:35 sysaux01.dbf
+-rw-r-----. 1 oracle oinstall 943726592 May  9 13:34 system01.dbf
+-rw-r-----. 1 oracle oinstall 110108672 May  9 13:31 undotbs01.dbf
+-rw-r-----. 1 oracle oinstall   5251072 May  9 13:25 users01.dbf
+
+/home/oracle/backup/hot/20250509/arch:
+-rw-r-----. 1 oracle oinstall  9284608 May  9 14:40 arch_1_39_1200525254.arc
+-rw-r-----. 1 oracle oinstall  4218880 May  9 14:40 arch_1_40_1200525254.arc
+-rw-r-----. 1 oracle oinstall  2109440 May  9 14:40 arch_1_41_1200525254.arc
+
+-- 백업 후 검증 조회
+
+SYS@orcl> SELECT (SELECT COUNT(*) FROM v$datafile)                        AS datafiles,
+  2         (SELECT COUNT(*) FROM v$backup WHERE status = 'ACTIVE')       AS still_in_backup,
+  3         (SELECT MAX(sequence#) FROM v$archived_log WHERE dest_id = 1) AS last_seq
+  4  FROM   dual;
+
+ DATAFILES STILL_IN_BACKUP   LAST_SEQ
+---------- --------------- ----------
+         4               0         41
+
+SYS@orcl> !ls /home/oracle/backup/hot/20250509/*.dbf | wc -l
+4
+
+SYS@orcl> !ls /home/oracle/backup/hot/20250509/*.log 2>/dev/null | wc -l
+0
+
+-- 데이터 파일 4개 일치, 백업 모드 잔류 0, 리두 로그 미포함. 세트가 완성되었다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) 백업 세트는 네 요소로 구성된다.
+--    데이터 파일 / 제어 파일 백업 / 백업 구간을 덮는 아카이브 / 파라미터 파일.
+--    Cold Backup 에서는 온라인 리두 로그가 추가된다.
+--
+-- 2) 아카이브 범위를 찾을 때 조건은 NEXT_CHANGE# > 백업시작SCN 이다.
+--    FIRST_CHANGE# 기준으로 잡으면 백업 시작 SCN 을 포함하는 로그가 빠진다.
+--    이 실수는 복구 시점에 "첫 아카이브가 없다"는 형태로 드러난다.
+--
+-- 3) 매니페스트에 DBID 를 반드시 기록한다.
+--    제어 파일을 모두 잃으면 RMAN 이 카탈로그를 읽지 못하므로
+--    SET DBID 로 자동 백업을 찾아야 한다. 15·16장에서 실제로 사용한다.
+--
+-- 4) 제어 파일 백업은 두 종류를 모두 받는다.
+--    바이너리는 SCN 정보를, 트레이스는 최신 구조를 갖는다.
+--    구조가 바뀔 때마다 새로 받는다.
+--
+-- 5) 검증 조회 한 줄을 백업 스크립트 끝에 넣어 로그에 남긴다.
+--    데이터 파일 수, 백업 모드 잔류 수, 마지막 아카이브 시퀀스 세 값이면
+--    백업이 정상인지 대부분 판별된다.
+--
+-- 6) 이 백업 세트는 8장 이후 ARCHIVELOG 복구 시나리오에서 사용한다.
+--    날짜 디렉터리째 보관하고 다음 세대를 받을 때 덮어쓰지 않는다.
+
+SYS@orcl> EXIT

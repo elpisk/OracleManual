@@ -1,0 +1,222 @@
+================================================================================
+ 실습 1-2 : 인스턴스 복구 동작 확인
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 12분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실습 개요
+--------------------------------------------------------------------------------
+-- SHUTDOWN ABORT 로 인스턴스를 강제 종료한 뒤 재기동하면 Oracle 이 인스턴스 복구를
+-- 자동으로 수행한다. 그 과정을 alert log 로 직접 관찰한다.
+-- 백업본이 전혀 사용되지 않고 온라인 리두 로그와 언두만으로 복구된다는 점을 확인한다.
+-- 복구 유형 : 인스턴스 복구(자동, 데이터 손실 없음)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 데이터베이스가 OPEN 상태여야 한다.
+-- 다른 사용자가 접속해 있지 않은 개별 실습 환경이어야 한다.
+--   SHUTDOWN ABORT 는 진행 중인 모든 세션을 즉시 끊는다.
+-- 파일을 손상시키지 않으므로 데이터 손실은 발생하지 않는다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SELECT COUNT(*) AS other_sessions FROM v$session
+  2  WHERE  type = 'USER' AND username IS NOT NULL AND sid <> SYS_CONTEXT('USERENV','SID');
+
+OTHER_SESSIONS
+--------------
+             0
+
+-- 다른 사용자 세션이 0 이므로 진행해도 된다.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2098460
+
+SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1         97 INACTIVE
+         2         98 CURRENT
+         3         96 INACTIVE
+
+-- alert log 의 현재 끝 지점을 기록해 두면 이후 추가된 부분만 보기 쉽다.
+
+SYS@orcl> SELECT value FROM v$diag_info WHERE name = 'Diag Trace';
+
+VALUE
+--------------------------------------------------
+/u01/app/oracle/diag/rdbms/orcl/orcl/trace
+
+SYS@orcl> !wc -l /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+18452 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 미커밋 트랜잭션을 남긴 채 강제 종료
+--------------------------------------------------------------------------------
+-- 롤포워드와 롤백을 모두 관찰하려면 커밋된 변경과 커밋되지 않은 변경이 함께 있어야 한다.
+-- 별도 터미널에서 HR 세션을 열어 커밋하지 않은 변경을 만든다.
+
+[oracle@oel7v9r1 ~]$ sqlplus hr/hr@orcl
+
+HR@orcl> UPDATE employees SET salary = salary + 100 WHERE department_id = 50;
+45 rows updated.
+
+HR@orcl> COMMIT;
+Commit complete.
+
+HR@orcl> UPDATE employees SET salary = salary + 999 WHERE department_id = 60;
+5 rows updated.
+
+-- 여기서 COMMIT 하지 않는다. 이 변경은 롤백 대상이 된다.
+
+HR@orcl> SELECT salary FROM employees WHERE employee_id = 103;
+
+    SALARY
+----------
+      9999
+
+-- SYSDBA 세션으로 돌아와 강제 종료한다.
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 재기동과 자동 복구
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+Database mounted.
+Database opened.
+
+-- 별도 명령 없이 열렸다. 인스턴스 복구는 STARTUP 과정에서 자동 수행된다.
+
+-- << 오류 발생 → 원인 파악 → 수정 >>
+-- 복구 과정을 확인하려고 alert log 를 OS 계정 없이 조회하려다 오류를 낸다.
+
+SYS@orcl> SELECT * FROM v$alert_log;
+SELECT * FROM v$alert_log
+              *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- << 원인 파악 >>
+-- alert log 를 담은 v$alert_log 라는 뷰는 존재하지 않는다.
+-- alert log 는 동적 성능 뷰가 아니라 파일이며, ADR 의 trace 디렉터리에 있다.
+-- SQL 로 보려면 v$diag_alert_ext 를 쓰거나, OS 에서 파일을 직접 읽는다.
+
+-- << 수정 >>
+
+SYS@orcl> SELECT TO_CHAR(originating_timestamp,'YYYY-MM-DD HH24:MI:SS') AS ts,
+  2         message_text
+  3  FROM   v$diag_alert_ext
+  4  WHERE  message_text LIKE '%recovery%'
+  5  AND    originating_timestamp > SYSDATE - 1/24
+  6  ORDER  BY originating_timestamp;
+
+TS                  MESSAGE_TEXT
+------------------- --------------------------------------------------------
+2025-05-06 09:31:14 Beginning crash recovery of 1 threads
+2025-05-06 09:31:15 Started redo scan
+2025-05-06 09:31:15 Completed redo scan
+2025-05-06 09:31:16 Started redo application at
+2025-05-06 09:31:16 Completed redo application of 0.34MB
+2025-05-06 09:31:17 Completed crash recovery at
+2025-05-06 09:31:17 SMON: enabling tx recovery
+
+7 rows selected.
+
+-- OS 파일로도 같은 내용을 확인한다.
+
+SYS@orcl> !tail -30 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Beginning crash recovery of 1 threads
+ parallel recovery started with 2 processes
+Started redo scan
+Completed redo scan
+ read 412 KB redo, 87 data blocks need recovery
+Started redo application at
+ Thread 1: logseq 98, block 1523, offset 0
+Recovery of Online Redo Log: Thread 1 Group 2 Seq 98 Reading mem 0
+  Mem# 0: /u01/app/oracle/oradata/ORCL/redo02.log
+Completed redo application of 0.34MB
+Completed crash recovery at
+ Thread 1: logseq 98, block 2371, offset 0, scn 2098905
+ 87 data blocks read, 87 data blocks written, 412 redo k-bytes read
+Endian type of dictionary set to little
+SMON: enabling tx recovery
+Database Characterset is AL32UTF8
+Completed: ALTER DATABASE OPEN
+
+--------------------------------------------------------------------------------
+[6] 진단 : 로그가 알려 주는 것
+--------------------------------------------------------------------------------
+-- 'read 412 KB redo, 87 data blocks need recovery'
+--   → 데이터 파일에 반영되지 못한 채 남아 있던 변경이 블록 87개 분량이었다는 뜻이다.
+--     이 값이 클수록 인스턴스 복구가 오래 걸린다.
+--
+-- 'Recovery of Online Redo Log: Thread 1 Group 2 Seq 98'
+--   → 복구에 사용된 재료가 온라인 리두 로그 2번 그룹이다.
+--     백업본이나 아카이브 로그는 등장하지 않는다.
+--
+-- 'SMON: enabling tx recovery'
+--   → 롤포워드가 끝나고 롤백(트랜잭션 복구)이 시작되는 지점이다.
+--     데이터베이스는 이미 열려 있고, 롤백은 백그라운드에서 이어진다.
+
+--------------------------------------------------------------------------------
+[7] 검증 : 커밋된 변경은 살아 있고 미커밋 변경은 사라졌는가
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT employee_id, salary FROM hr.employees
+  2  WHERE  employee_id IN (120, 103) ORDER BY employee_id;
+
+EMPLOYEE_ID     SALARY
+----------- ----------
+        103       9000
+        120       8100
+
+-- employee_id 120 (department_id 50) : 커밋했던 +100 이 반영되어 8100 이다. 롤포워드 결과다.
+-- employee_id 103 (department_id 60) : 커밋하지 않았던 +999 가 사라져 9000 이다. 롤백 결과다.
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2098905
+
+-- 체크포인트 SCN 이 복구 완료 지점(2098905)으로 갱신되었다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) 인스턴스 복구는 DBA 가 명령을 내리지 않는다. STARTUP 만 하면 SMON 이 처리한다.
+--    "복구하려면 무엇을 해야 하나요"라는 질문 자체가 이 경우에는 성립하지 않는다.
+--
+-- 2) 백업본이 전혀 쓰이지 않았다. 파일이 모두 제자리에 있고 온전하기 때문이다.
+--    이 점이 4장부터 다룰 미디어 복구와의 결정적 차이다.
+--
+-- 3) 롤포워드는 커밋 여부를 가리지 않고 리두를 전부 적용한다.
+--    미커밋 변경까지 일단 적용한 뒤 롤백으로 제거하는 순서다.
+--    언두 블록도 데이터 파일에 있어 리두로 복구되어야 하기 때문이다.
+--
+-- 4) 긴 트랜잭션이 진행 중일 때 ABORT 하면 지연 롤백 때문에 재기동 직후 성능이
+--    잠시 떨어질 수 있다. v$transaction 으로 진행 상황을 확인한다.
+--
+-- 5) SHUTDOWN IMMEDIATE 는 종료 전 체크포인트를 완료하므로 이 실습의 로그가 나타나지 않는다.
+--    직접 비교해 보면 차이가 분명해진다.
+
+SYS@orcl> EXIT

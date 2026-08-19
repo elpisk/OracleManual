@@ -1,0 +1,280 @@
+================================================================================
+ 실습 6-4 : 정상 종료 상태에서의 컨트롤파일 재생성 (NORESETLOGS)
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 18분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- SHUTDOWN IMMEDIATE 로 정상 종료한 뒤 컨트롤파일 전체가 유실되었다.
+-- 모든 데이터파일이 같은 SCN에서 일관성 있게 닫혀 있어 복구가 필요 없다.
+-- NORESETLOGS 형식으로 재생성하면 그대로 열린다.
+-- 인카네이션이 올라가지 않아 기존 백업본이 계속 유효하다.
+-- 복구 유형 : 복구 불필요(NORESETLOGS 재생성)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- trace 백업이 현재 구조를 반영하고 있어야 한다.
+-- 리두 로그가 온전해야 NORESETLOGS 경로를 쓸 수 있다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_64.sql';
+Database altered.
+
+SYS@orcl> !grep -c 'dbf' /home/oracle/backup/cf_64.sql
+10
+
+SYS@orcl> SELECT COUNT(*) FROM v$datafile;
+
+  COUNT(*)
+----------
+         5
+
+-- 문에는 각 파일이 두 형식(NORESETLOGS/RESETLOGS)에 한 번씩 나오므로 10이다.
+-- 실제 데이터파일 수 5와 일치한다.
+
+SYS@orcl> CREATE TABLE hr.emp64(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp64 VALUES (1, 'before shutdown');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2384040
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 정상 종료 후 컨트롤파일 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> !grep -n 'CLOSE NORMAL' \
+        /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -1
+18690:Completed: ALTER DATABASE CLOSE NORMAL
+
+-- 정상 종료 기록이 남았다. 이것이 NORESETLOGS 경로의 근거다.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+STARTED
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- 종료 방식이 정상이었음을 이미 확인했다.
+-- 파일 목록을 대조해 DATAFILE 절이 맞는지 확인한다.
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.dbf | grep -v temp
+/u01/app/oracle/oradata/ORCL/sysaux01.dbf
+/u01/app/oracle/oradata/ORCL/system01.dbf
+/u01/app/oracle/oradata/ORCL/undotbs01.dbf
+/u01/app/oracle/oradata/ORCL/users01.dbf
+/u01/app/oracle/oradata/ORCL/users02.dbf
+
+SYS@orcl> !sed -n '/NORESETLOGS NOARCHIVELOG/,/^;/p' /home/oracle/backup/cf_64.sql \
+        | grep -c 'dbf'
+5
+
+-- 문의 DATAFILE 항목 수와 실제 파일 수가 5로 일치한다.
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log
+-rw-r-----. 1 oracle oinstall 209715712 May 10 16:40 redo01.log
+-rw-r-----. 1 oracle oinstall 209715712 May 10 16:40 redo03.log
+-rw-r-----. 1 oracle oinstall 209715712 May 10 16:40 redo04.log
+-rw-r-----. 1 oracle oinstall 209715712 May 10 16:40 redo01b.log
+-rw-r-----. 1 oracle oinstall 209715712 May 10 16:40 redo03b.log
+-rw-r-----. 1 oracle oinstall 209715712 May 10 16:40 redo04b.log
+
+-- 리두 로그 여섯 멤버가 모두 있다. NORESETLOGS 형식이 요구하는 조건이다.
+
+-- 시도 전 원상 복귀 수단 확보
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_64
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.log /home/oracle/before_recover_64/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 인스턴스가 STARTED 상태로 남아 있다. 그대로 실행해 본다.
+
+SYS@orcl> @/home/oracle/backup/cf_64_noresetlogs.sql
+CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS NOARCHIVELOG
+*
+ERROR at line 1:
+ORA-01503: CREATE CONTROLFILE failed
+ORA-01565: error in identifying file
+           '/u01/app/oracle/oradata/ORCL/user01.dbf'
+ORA-27037: unable to obtain file status
+Linux-x86_64 Error: 2: No such file or directory
+
+-- << 원인 파악 >>
+-- ORA-01503은 총괄 오류이므로 바로 뒤 줄을 봐야 한다.
+-- ORA-01565가 실제 원인이며 나열한 파일을 열 수 없다는 뜻이다.
+-- 경로가 user01.dbf 로 되어 있다. 실제 파일명은 users01.dbf 다.
+-- 스크립트를 편집하면서 글자 하나를 빠뜨린 것이다.
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/user*.dbf
+/u01/app/oracle/oradata/ORCL/users01.dbf
+/u01/app/oracle/oradata/ORCL/users02.dbf
+
+-- << 수정 >>
+
+SYS@orcl> !sed -i 's|/user01.dbf|/users01.dbf|' \
+                 /home/oracle/backup/cf_64_noresetlogs.sql
+
+SYS@orcl> !grep 'users0' /home/oracle/backup/cf_64_noresetlogs.sql
+  '/u01/app/oracle/oradata/ORCL/users01.dbf',
+  '/u01/app/oracle/oradata/ORCL/users02.dbf'
+
+-- CREATE CONTROLFILE 은 NOMOUNT에서 실행해야 한다. 현재 상태를 확인한다.
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+STARTED
+
+-- STARTED는 NOMOUNT와 같은 상태다. 그대로 진행할 수 있다.
+
+SYS@orcl> @/home/oracle/backup/cf_64_noresetlogs.sql
+
+Control file created.
+
+SYS@orcl> SELECT name, open_mode FROM v$database;
+
+NAME      OPEN_MODE
+--------- ----------
+ORCL      MOUNTED
+
+-- 자동으로 MOUNT 상태가 되었다.
+
+SYS@orcl> SELECT file#, status, checkpoint_change#, fuzzy FROM v$datafile_header;
+
+     FILE# STATUS  CHECKPOINT_CHANGE# FUZ
+---------- ------- ------------------ ---
+         1 ONLINE             2384040 NO
+         3 ONLINE             2384040 NO
+         4 ONLINE             2384040 NO
+         7 ONLINE             2384040 NO
+         8 ONLINE             2384040 NO
+
+-- SCN이 모두 같고 FUZZY가 NO다. 복구가 필요 없는 상태다.
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- RESETLOGS 없이 열렸다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM hr.emp64;
+
+        ID MEMO
+---------- ------------------------------
+         1 before shutdown
+
+-- 종료 직전 커밋한 데이터가 그대로다.
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation;
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           1                 1 PARENT
+           2           2382140 CURRENT
+
+-- 실습 6-1 이후 값 그대로다. 이번 작업은 인카네이션을 올리지 않았다.
+
+SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1          8 CURRENT
+         3          6 INACTIVE
+         4          7 INACTIVE
+
+-- 시퀀스가 1로 초기화되지 않았다. 리두 이력이 그대로 이어진다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u01/app/oracle/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM (SELECT object_name FROM dba_objects
+  2    UNION SELECT object_name FROM dba_objects);
+
+  COUNT(*)
+----------
+     73208
+
+-- 기존 백업본이 그대로 유효한지 확인한다.
+
+SYS@orcl> !ls /home/oracle/backup/ch06/ | wc -l
+14
+
+-- 인카네이션이 같으므로 이 백업본은 계속 쓸 수 있다.
+
+-- 실무 포인트
+-- 1) 정상 종료 상태는 모든 데이터파일이 같은 SCN에서 닫히고 FUZZY가 NO다.
+--    적용할 리두가 없으므로 복구 명령 없이 열린다.
+--    이 판정을 v$datafile_header 로 확인하는 습관을 들인다.
+--
+-- 2) 컨트롤파일을 만들기 전에는 이 뷰를 볼 수 없다는 점이 함정이다.
+--    그래서 alert log의 Completed: ALTER DATABASE CLOSE NORMAL 기록을 먼저 찾는다.
+--    이 기록이 NORESETLOGS 형식을 선택하는 근거가 된다.
+--
+-- 3) NORESETLOGS 경로의 가치는 인카네이션이 올라가지 않는다는 데 있다.
+--    기존 백업본이 계속 유효하므로 직후 전체 백업의 부담이 없다.
+--    같은 상황을 Binary 백업본으로 처리하면 RESETLOGS를 치러야 한다.
+--
+-- 4) ORA-01503만 보고 원인을 찾지 않는다. 바로 뒤 줄이 실제 원인이다.
+--    ORA-01565는 경로, ORA-01161은 파일의 출신, ORA-01163은 크기 값을 가리킨다.
+--    가장 빠른 확인 방법은 ls 로 실제 파일 목록과 대조하는 것이다.
+--
+-- 5) NORESETLOGS 형식은 리두 로그가 실제로 존재해야 성립한다.
+--    LOGFILE 절에 나열된 파일이 없으면 문 자체가 실패한다.
+--    리두가 함께 손상됐다면 RESETLOGS 형식을 써야 한다.
+--
+-- 6) 판단이 서지 않으면 RESETLOGS 형식이 안전하다.
+--    NORESETLOGS로 잘못 만들면 열리지 않아 다시 만들어야 하지만,
+--    RESETLOGS는 열리기는 하되 인카네이션이 올라가는 대가를 치른다.
+
+SYS@orcl> EXIT

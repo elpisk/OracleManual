@@ -1,0 +1,339 @@
+================================================================================
+ 실습 18-7 : Flashback Data Archive 구성과 이력 조회
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 35분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- UNDO 보존 기간을 넘는 이력 조회 요건이 생겼다.
+-- Flashback Data Archive를 구성해 이력을 장기 보관한다.
+-- UNDO 기반과 FDA 기반의 조회 결과를 같은 방법으로 비교한다.
+-- 적용 이전 이력은 남지 않는다는 제약을 확인한다.
+-- 작업 유형 : 환경 구성과 이력 조회(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT tuned_undoretention FROM v$undostat
+  2  ORDER BY begin_time DESC FETCH FIRST 1 ROWS ONLY;
+
+TUNED_UNDORETENTION
+-------------------
+               3600
+
+-- UNDO 보존은 1시간이다. 그보다 오래된 이력은 조회할 수 없다.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_flashback_archive;
+
+  COUNT(*)
+----------
+         0
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp187 TABLESPACE users
+  2  AS SELECT employee_id, last_name, salary, department_id
+  3     FROM hr.employees;
+
+Table created.
+
+SYS@orcl> ALTER TABLE hr.emp187 ADD CONSTRAINT pk_emp187
+  2    PRIMARY KEY (employee_id);
+
+Table altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp187;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') AS now FROM dual;
+
+NOW
+-------------------
+2025-05-20 11:32:04
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : FDA 구성
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLESPACE fda_ts
+  2    DATAFILE '/u03/oradata/ORCL/fda01.dbf' SIZE 200M
+  3    AUTOEXTEND ON NEXT 20M MAXSIZE 2G;
+
+Tablespace created.
+
+SYS@orcl> CREATE FLASHBACK ARCHIVE fda_1y
+  2    TABLESPACE fda_ts QUOTA 1G RETENTION 1 YEAR;
+
+Flashback archive created.
+
+SYS@orcl> SELECT flashback_archive_name, retention_in_days, status,
+  2         create_time
+  3  FROM   dba_flashback_archive;
+
+FLASHBACK_ARCHIVE_NAME RETENTION_IN_DAYS STATUS  CREATE_TIME
+---------------------- ----------------- ------- --------------------
+FDA_1Y                               365         20-MAY-25 11.34.02
+
+-- 아직 기본 아카이브가 아니다.
+
+SYS@orcl> ALTER FLASHBACK ARCHIVE fda_1y SET DEFAULT;
+
+Flashback archive altered.
+
+SYS@orcl> SELECT flashback_archive_name, status FROM dba_flashback_archive;
+
+FLASHBACK_ARCHIVE_NAME STATUS
+---------------------- -------
+FDA_1Y                 DEFAULT
+
+SYS@orcl> ALTER TABLE hr.emp187 FLASHBACK ARCHIVE fda_1y;
+
+Table altered.
+
+SYS@orcl> SELECT owner_name, table_name, flashback_archive_name,
+  2         archive_table_name, status
+  3  FROM   dba_flashback_archive_tables;
+
+OWNER_NAME TABLE_NAME FLASHBACK_ARCHIVE_NAME ARCHIVE_TABLE_NAME  STATUS
+---------- ---------- ---------------------- ------------------- -------
+HR         EMP187     FDA_1Y                 SYS_FBA_HIST_74821  ENABLED
+
+-- 이력 저장용 내부 테이블이 만들어졌다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 변경과 이력 축적
+--------------------------------------------------------------------------------
+SYS@orcl> UPDATE hr.emp187 SET salary = salary * 1.1
+  2  WHERE  department_id = 60;
+
+5 rows updated.
+
+SYS@orcl> COMMIT;
+
+SYS@orcl> DELETE FROM hr.emp187 WHERE department_id = 10;
+
+1 row deleted.
+
+SYS@orcl> COMMIT;
+
+SYS@orcl> UPDATE hr.emp187 SET salary = 30000 WHERE employee_id = 100;
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp187;
+
+  COUNT(*)
+----------
+       106
+
+-- 이력이 쌓였는지 확인한다.
+
+SYS@orcl> SELECT COUNT(*) FROM sys.SYS_FBA_HIST_74821;
+
+  COUNT(*)
+----------
+         7
+
+-- 변경 전 이미지가 이력 테이블에 저장되었다.
+-- 다만 이력은 백그라운드 프로세스가 주기적으로 옮기므로
+-- 즉시 반영되지 않을 수 있다.
+
+SYS@orcl> EXEC DBMS_FLASHBACK_ARCHIVE.disassociate_fba('HR','EMP187');
+SYS@orcl> EXEC DBMS_FLASHBACK_ARCHIVE.reassociate_fba('HR','EMP187');
+
+-- 필요 시 이력을 즉시 반영시킬 수 있다.
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : 이력 조회
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp187
+  2  AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '5' MINUTE;
+
+  COUNT(*)
+----------
+       107
+
+-- 조회 문법이 Flashback Query와 같다.
+
+SYS@orcl> SELECT versions_startscn, versions_operation, salary
+  2  FROM   hr.emp187
+  3  VERSIONS BETWEEN TIMESTAMP
+  4    SYSTIMESTAMP - INTERVAL '10' MINUTE AND SYSTIMESTAMP
+  5  WHERE  employee_id = 100
+  6  ORDER BY versions_startscn;
+
+VERSIONS_STARTSCN V     SALARY
+----------------- - ----------
+                        24000
+          2818400 U      30000
+
+-- 변경 이력이 조회된다.
+
+-- 지워진 행도 확인할 수 있다.
+
+SYS@orcl> SELECT employee_id, last_name FROM hr.emp187
+  2  AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '5' MINUTE
+  3  WHERE  department_id = 10;
+
+EMPLOYEE_ID LAST_NAME
+----------- -------------------------
+        200 Whalen
+
+-- 지워진 행이 그 시점에는 있었음을 확인할 수 있다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- FDA를 적용하지 않은 테이블과 비교해 본다.
+
+SYS@orcl> CREATE TABLE hr.emp187_no TABLESPACE users
+  2  AS SELECT * FROM hr.emp187;
+
+Table created.
+
+-- 두 테이블 모두 오래된 시점을 조회해 본다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp187_no
+  2  AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '5' HOUR;
+
+ERROR at line 1:
+ORA-01555: snapshot too old: rollback segment number 3 with name
+"_SYSSMU3_1930754532$" too small
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp187
+  2  AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '5' HOUR;
+
+ERROR at line 1:
+ORA-01466: unable to read data - table definition has changed
+
+-- << 원인 파악 >>
+-- 두 오류가 다르다.
+-- emp187_no 는 UNDO가 없어 ORA-01555가 났다.
+-- emp187 은 FDA가 적용되어 있지만 5시간 전에는 테이블 자체가 없었다.
+-- FDA는 적용 시점부터 이력을 쌓으며 소급 적용되지 않는다.
+-- 적용 이전 시점은 조회할 수 없다는 점이 중요한 제약이다.
+
+SYS@orcl> SELECT TO_CHAR(create_time,'YYYY-MM-DD HH24:MI:SS') AS created
+  2  FROM   dba_flashback_archive;
+
+CREATED
+-------------------
+2025-05-20 11:34:02
+
+-- << 수정 >> 적용 이후 시점으로 조회한다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp187
+  2  AS OF TIMESTAMP TO_TIMESTAMP('2025-05-20 11:36:00','YYYY-MM-DD HH24:MI:SS');
+
+  COUNT(*)
+----------
+       107
+
+-- 적용 이후 시점은 정상적으로 조회된다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT ROUND(SUM(bytes)/1024/1024, 1) AS mb FROM dba_segments
+  2  WHERE  tablespace_name = 'FDA_TS';
+
+        MB
+----------
+       1.3
+
+-- 이력이 차지하는 공간이다. 변경이 늘면 함께 커진다.
+
+SYS@orcl> SELECT table_name, ROUND(bytes/1024/1024, 2) AS mb
+  2  FROM   dba_segments s, dba_tables t
+  3  WHERE  s.segment_name = t.table_name AND t.owner = 'HR'
+  4  AND    t.table_name = 'EMP187';
+
+TABLE_NAME       MB
+---------- --------
+EMP187         0.06
+
+-- 원본은 0.06MB인데 이력 영역이 1.3MB다.
+-- 변경이 잦은 테이블은 이력이 원본보다 훨씬 커질 수 있다.
+
+-- 보존 기간을 조정한다.
+
+SYS@orcl> ALTER FLASHBACK ARCHIVE fda_1y MODIFY RETENTION 3 YEAR;
+
+Flashback archive altered.
+
+SYS@orcl> SELECT flashback_archive_name, retention_in_days
+  2  FROM   dba_flashback_archive;
+
+FLASHBACK_ARCHIVE_NAME RETENTION_IN_DAYS
+---------------------- -----------------
+FDA_1Y                              1095
+
+-- 적용을 해제해 본다.
+
+SYS@orcl> ALTER TABLE hr.emp187 NO FLASHBACK ARCHIVE;
+
+Table altered.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_flashback_archive_tables;
+
+  COUNT(*)
+----------
+         0
+
+-- 해제하면 그동안 쌓인 이력도 사라진다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp187
+  2  AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '20' MINUTE;
+
+  COUNT(*)
+----------
+       107
+
+-- UNDO 보존 기간 안이라 아직 조회된다.
+-- 그 범위를 넘으면 조회할 수 없게 된다.
+
+-- 정리
+
+SYS@orcl> DROP TABLE hr.emp187 PURGE;
+SYS@orcl> DROP TABLE hr.emp187_no PURGE;
+SYS@orcl> DROP FLASHBACK ARCHIVE fda_1y;
+
+Flashback archive dropped.
+
+SYS@orcl> DROP TABLESPACE fda_ts INCLUDING CONTENTS AND DATAFILES;
+
+Tablespace dropped.
+
+-- 실무 포인트
+-- 1) FDA는 이력을 별도 테이블스페이스에 보관한다.
+--    UNDO와 무관하므로 보존 기간을 년 단위로 지정할 수 있다.
+--    ORA-01555가 발생하지 않는 것이 가장 큰 차이다.
+--
+-- 2) 조회 문법이 Flashback Query와 같다.
+--    AS OF와 VERSIONS BETWEEN을 그대로 쓰므로 익힐 것이 없다.
+--    애플리케이션도 바꿀 필요가 없다.
+--
+-- 3) 적용 이전 시점은 조회할 수 없다.
+--    소급 적용되지 않으므로 요건이 예상되면 미리 적용해 두어야 한다.
+--    적용 이전을 조회하면 ORA-01466이나 ORA-01555가 나온다.
+--
+-- 4) 이력이 원본보다 커질 수 있다.
+--    변경이 잦은 테이블에서 특히 그렇다.
+--    적용 전에 변경 빈도를 확인하고 공간 계획을 세운다.
+--
+-- 5) 적용을 해제하면 그동안의 이력도 사라진다.
+--    NO FLASHBACK ARCHIVE 는 되돌릴 수 없는 작업이다.
+--    필요한 이력이 있다면 미리 별도로 추출해 둔다.
+--
+-- 6) 모든 테이블에 적용하지 않는다.
+--    감사 요건이 있거나 이력 추적이 꼭 필요한 테이블만 고른다.
+--    누가 바꿨는지가 중요하면 감사 기능과 함께 쓴다.

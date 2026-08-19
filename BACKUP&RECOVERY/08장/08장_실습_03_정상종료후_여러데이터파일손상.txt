@@ -1,0 +1,264 @@
+================================================================================
+ 실습 8-3 : 정상 종료 후 여러 데이터파일 손상
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 22분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 정상 종료 후 SYSTEM을 포함한 여러 데이터파일이 유실되었다.
+-- SYSTEM이 포함되면 무중단 복구가 불가능하다.
+-- MOUNT 상태에서 RECOVER DATABASE 로 일괄 처리한다.
+-- 복구 진행 상황을 확인하는 방법도 함께 다룬다.
+-- 복구 유형 : 완전 복구(전면 중단)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 8-2를 마친 상태에서 이어서 진행한다.
+-- 실습 직전에 Cold Backup을 새로 받는다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch08 && mkdir -p /home/oracle/backup/ch08
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /home/oracle/backup/ch08/
+SYS@orcl> !rm -f /home/oracle/backup/ch08/temp01.dbf
+SYS@orcl> STARTUP
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name, bytes/1024/1024 AS mb FROM v$datafile ORDER BY file#;
+
+     FILE# NAME                                              MB
+---------- ---------------------------------------------- -----
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf        900
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf        600
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf       300
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf         200
+        10 /u01/app/oracle/oradata/ORCL/hist01.dbf           20
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2405100
+
+SYS@orcl> CREATE TABLE hr.emp83(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp83 VALUES (1, 'after cold backup');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+-- 백업 이후 커밋한 데이터다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 정상 종료 후 세 파일 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/system01.dbf \
+                 /u01/app/oracle/oradata/ORCL/sysaux01.dbf \
+                 /u01/app/oracle/oradata/ORCL/users01.dbf
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.dbf
+/u01/app/oracle/oradata/ORCL/hist01.dbf
+/u01/app/oracle/oradata/ORCL/temp01.dbf
+/u01/app/oracle/oradata/ORCL/undotbs01.dbf
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+Database mounted.
+ORA-01157: cannot identify/lock data file 1 - see DBWR trace file
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+
+-- SYSTEM이 없으므로 오픈이 막혔다. MOUNT 상태에 머문다.
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+MOUNTED
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         1 FILE NOT FOUND                 0
+         3 FILE NOT FOUND                 0
+         7 FILE NOT FOUND                 0
+
+-- 세 파일이 대상이다. 오류 메시지는 첫 파일만 알려 준다.
+
+SYS@orcl> !ls -l /home/oracle/backup/ch08/*.dbf
+-rw-r-----. 1 oracle oinstall  20979712 May 11 10:40 hist01.dbf
+-rw-r-----. 1 oracle oinstall 629153792 May 11 10:40 sysaux01.dbf
+-rw-r-----. 1 oracle oinstall 943726592 May 11 10:40 system01.dbf
+-rw-r-----. 1 oracle oinstall 314580992 May 11 10:40 undotbs01.dbf
+-rw-r-----. 1 oracle oinstall 209715712 May 11 10:40 users01.dbf
+
+SYS@orcl> SELECT MIN(sequence#), MAX(sequence#), COUNT(*)
+  2  FROM   v$archived_log WHERE status = 'A';
+
+MIN(SEQUENCE#) MAX(SEQUENCE#)   COUNT(*)
+-------------- -------------- ----------
+            19             26          8
+
+-- 시퀀스 19~26이 연속으로 있다. 완전 복구가 가능하다.
+
+-- 판정
+--   ① 손상 파일 : 1, 3, 7 (SYSTEM 포함)
+--   ② 백업본 : 모두 있음
+--   ③ 아카이브 : 연속 보유
+--   ④ SYSTEM 포함 → 무중단 불가, MOUNT 상태에서 일괄 처리
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 편의상 백업본 전체를 복원해 본다.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch08/*.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         1                          2405100
+         3                          2405100
+         4                          2405100
+         7                          2405100
+        10                          2405100
+
+-- << 원인 파악 >>
+-- 복구 대상이 3개에서 5개로 늘었다.
+-- 멀쩡했던 4번과 10번까지 백업 시점으로 되돌렸기 때문이다.
+-- 그만큼 적용할 아카이브가 늘어 복구 시간이 길어진다.
+-- 복원 대상은 실제로 없어진 파일로 한정해야 한다.
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/undotbs01.dbf
+-rw-r-----. 1 oracle oinstall 314580992 May 11 10:52 undotbs01.dbf
+
+-- 방금 덮어쓴 흔적이 시각으로 드러난다.
+
+-- << 수정 >>
+-- 이 실습에서는 이미 덮어썼으므로 그대로 진행하되,
+-- 실무에서는 아래처럼 대상을 한정해 복원해야 한다.
+--   !cp -p /home/oracle/backup/ch08/system01.dbf \
+--          /home/oracle/backup/ch08/sysaux01.dbf \
+--          /home/oracle/backup/ch08/users01.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE;
+Media recovery complete.
+
+-- [터미널 2] 복구 중 진행 상황 확인
+-- SYS@orcl> SELECT type, item, units, sofar, total
+--   2  FROM   v$recovery_progress WHERE item IN ('Redo Blocks','Redo Applied');
+--
+-- TYPE            ITEM          UNITS       SOFAR      TOTAL
+-- --------------- ------------- ------- ---------- ----------
+-- Media Recovery  Redo Blocks   Blocks       82400     104000
+-- Media Recovery  Redo Applied  Megabytes       40         51
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- RESETLOGS 없이 열렸다. 완전 복구가 성립했다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT status, COUNT(*) FROM v$datafile GROUP BY status;
+
+STATUS    COUNT(*)
+------- ----------
+ONLINE           4
+SYSTEM           1
+
+SYS@orcl> SELECT * FROM hr.emp83;
+
+        ID MEMO
+---------- ------------------------------
+         1 after cold backup
+
+-- 백업 이후 커밋한 데이터가 살아 있다.
+
+SYS@orcl> SELECT resetlogs_change#, resetlogs_time FROM v$database;
+
+RESETLOGS_CHANGE# RESETLOGS_TIME
+----------------- ---------------------
+                1 08-MAY-25
+
+-- 인카네이션이 그대로다. 기존 백업본이 계속 유효하다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         1
+
+-- 컨트롤파일을 건드리지 않았으므로 TEMP 정보가 유지된다.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_hist;
+
+  COUNT(*)
+----------
+       107
+
+-- 실무 포인트
+-- 1) SYSTEM이 포함되면 무중단 복구가 불가능하다.
+--    OFFLINE 시도가 ORA-01541로 거부되기 때문이며 MOUNT 상태에서 처리해야 한다.
+--    UNDO도 사실상 같은 취급을 받는다.
+--
+-- 2) MOUNT 상태에서는 RECOVER DATABASE 를 쓸 수 있다.
+--    복구가 필요한 모든 파일을 한 번에 처리하며 파일마다 시작 SCN이 달라도 알아서 맞춘다.
+--    OPEN 상태였다면 ORA-01126으로 거부된다.
+--
+-- 3) 복원 대상은 실제로 없어진 파일로 한정한다.
+--    멀쩡한 파일까지 되돌리면 복구 대상이 늘어 시간만 길어진다.
+--    v$recover_file 목록과 OS의 파일 존재 여부를 대조해 정한다.
+--
+-- 4) 복구가 길어지면 v$recovery_progress 로 진행 상황을 확인한다.
+--    SOFAR와 TOTAL의 비율로 남은 시간을 가늠해 현업에 안내할 수 있다.
+--
+-- 5) RESETLOGS 없이 열렸다는 것이 완전 복구의 증거다.
+--    인카네이션이 그대로여서 기존 백업본과 아카이브가 계속 유효하다.
+--    4~7장에서 같은 상황이 전체 복원과 RESETLOGS로 끝났던 것과 대비된다.
+--
+-- 6) 복구 시간을 줄이는 근본 대책은 백업 주기 단축이다.
+--    적용할 아카이브가 줄어들기 때문이며, 증분 백업을 쓰면 부담 없이 같은 효과를 얻는다.
+
+SYS@orcl> EXIT

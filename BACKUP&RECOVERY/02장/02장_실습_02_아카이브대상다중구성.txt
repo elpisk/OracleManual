@@ -1,0 +1,251 @@
+================================================================================
+ 실습 2-2 : 아카이브 대상 다중 구성
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 12분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실습 개요
+--------------------------------------------------------------------------------
+-- 아카이브 대상을 두 곳으로 구성하고 MANDATORY / OPTIONAL 속성을 지정한다.
+-- 속성 철자를 틀렸을 때 어떤 일이 벌어지는지 의도적으로 재현하고 수정한다.
+-- 원본 교재의 시나리오에서도 'mandatory' 를 'manatory' 로 잘못 적어
+-- 한쪽 대상에 아카이브가 생성되지 않은 흔적이 남아 있다. 그 상황을 그대로 다룬다.
+-- 복구 유형 : 해당 없음(구성 작업)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 2-1 을 마쳐 ARCHIVELOG 모드로 전환된 상태여야 한다.
+-- /home/oracle/arch1, /home/oracle/arch2 디렉터리가 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL destination FOR a30
+SYS@orcl> COL error FOR a34
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT dest_id, status, binding, target, destination, error
+  2  FROM   v$archive_dest WHERE dest_id <= 3;
+
+   DEST_ID STATUS    BINDING   TARGET  DESTINATION                    ERROR
+---------- --------- --------- ------- ------------------------------ ----------------
+         1 VALID     MANDATORY PRIMARY /home/oracle/arch1
+         2 VALID     OPTIONAL  PRIMARY /home/oracle/arch2
+         3 INACTIVE  OPTIONAL  PRIMARY
+
+-- STATUS 가 VALID 이고 ERROR 가 비어 있으면 정상이다.
+-- INACTIVE 는 설정되지 않은 대상이며 문제가 아니다.
+
+SYS@orcl> SELECT dest_id, COUNT(*) AS cnt, MAX(sequence#) AS last_seq
+  2  FROM   v$archived_log WHERE deleted = 'NO' GROUP BY dest_id ORDER BY dest_id;
+
+   DEST_ID        CNT   LAST_SEQ
+---------- ---------- ----------
+         1          2         25
+         2          2         25
+
+-- 두 대상의 건수와 최종 시퀀스가 같다. 양쪽 모두 정상 기록 중이다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 세 번째 대상 추가와 최소 성공 개수 설정
+--------------------------------------------------------------------------------
+SYS@orcl> !mkdir -p /home/oracle/arch3
+
+SYS@orcl> ALTER SYSTEM SET log_archive_dest_3 = 'location=/home/oracle/arch3 optional' SCOPE=both;
+
+System altered.
+
+SYS@orcl> SELECT dest_id, status, binding, destination FROM v$archive_dest WHERE dest_id <= 3;
+
+   DEST_ID STATUS    BINDING   DESTINATION
+---------- --------- --------- ------------------------------
+         1 VALID     MANDATORY /home/oracle/arch1
+         2 VALID     OPTIONAL  /home/oracle/arch2
+         3 VALID     OPTIONAL  /home/oracle/arch3
+
+-- SCOPE=both 라 즉시 반영되었다. LOG_ARCHIVE_DEST_n 은 동적 파라미터다.
+
+-- 최소 성공 개수를 2로 올려 두 곳 이상 성공해야 진행하도록 만든다.
+
+SYS@orcl> SHOW PARAMETER log_archive_min_succeed_dest
+
+NAME                            TYPE      VALUE
+------------------------------- --------- -------
+log_archive_min_succeed_dest    integer   1
+
+SYS@orcl> ALTER SYSTEM SET log_archive_min_succeed_dest = 2 SCOPE=both;
+
+System altered.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+
+SYS@orcl> !ls /home/oracle/arch1 /home/oracle/arch2 /home/oracle/arch3
+/home/oracle/arch1:
+arch_1_24_1200525254.arc  arch_1_25_1200525254.arc  arch_1_26_1200525254.arc
+
+/home/oracle/arch2:
+arch_1_24_1200525254.arc  arch_1_25_1200525254.arc  arch_1_26_1200525254.arc
+
+/home/oracle/arch3:
+arch_1_26_1200525254.arc
+
+-- arch3 는 방금 추가했으므로 시퀀스 26 부터 생성된다. 정상이다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 속성 철자를 의도적으로 틀려 본다.
+
+SYS@orcl> ALTER SYSTEM SET log_archive_dest_3 = 'location=/home/oracle/arch3 manatory' SCOPE=both;
+ALTER SYSTEM SET log_archive_dest_3 = 'location=/home/oracle/arch3 manatory' SCOPE=both
+*
+ERROR at line 1:
+ORA-02097: parameter cannot be modified because specified value is invalid
+ORA-16179: incremental changes to "log_archive_dest_3" not allowed with SPFILE
+
+-- SCOPE=both 는 즉시 검증되므로 오류가 난다. 여기까지는 안전하다.
+-- 문제는 SCOPE=spfile 로 설정할 때다. 검증이 재기동 시점으로 미뤄진다.
+
+SYS@orcl> ALTER SYSTEM SET log_archive_dest_3 = 'location=/home/oracle/arch3 manatory' SCOPE=spfile;
+
+System altered.
+
+-- << 오류 발생 >>
+-- 명령은 성공했다. 재기동 후 상태를 본다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+Database opened.
+
+SYS@orcl> SELECT dest_id, status, binding, destination, error
+  2  FROM   v$archive_dest WHERE dest_id = 3;
+
+   DEST_ID STATUS    BINDING   DESTINATION          ERROR
+---------- --------- --------- -------------------- ----------------------------------
+         3 ERROR     OPTIONAL                       ORA-16032: parameter LOG_ARCHIVE_DEST_3
+                                                    destination string cannot be translated
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+
+SYS@orcl> !ls /home/oracle/arch3
+arch_1_26_1200525254.arc
+
+-- 시퀀스가 늘었는데도 arch3 에는 새 파일이 생기지 않았다.
+
+-- << 원인 파악 >>
+-- 'manatory' 는 유효한 속성이 아니다. Oracle 이 대상 문자열 전체를 해석하지 못해
+-- 대상이 ERROR 상태로 비활성화되었다.
+-- SCOPE=spfile 은 설정 시점에 검증되지 않으므로 System altered 가 나온다.
+-- OPTIONAL 대상이라 데이터베이스는 멈추지 않았고, 그래서 눈치채기 어렵다.
+
+SYS@orcl> SHOW PARAMETER log_archive_dest_3
+
+NAME                  TYPE     VALUE
+--------------------- -------- --------------------------------------
+log_archive_dest_3    string   location=/home/oracle/arch3 manatory
+
+-- << 수정 >>
+
+SYS@orcl> ALTER SYSTEM SET log_archive_dest_3 = 'location=/home/oracle/arch3 optional' SCOPE=both;
+
+System altered.
+
+SYS@orcl> SELECT dest_id, status, destination, error FROM v$archive_dest WHERE dest_id = 3;
+
+   DEST_ID STATUS    DESTINATION                    ERROR
+---------- --------- ------------------------------ ----------------
+         3 VALID     /home/oracle/arch3
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> !ls /home/oracle/arch3
+arch_1_26_1200525254.arc  arch_1_28_1200525254.arc
+
+-- 다시 생성되기 시작했다. 다만 시퀀스 27 은 영구히 빠졌다.
+
+--------------------------------------------------------------------------------
+[6] 진단 : 빠진 구간 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT dest_id, COUNT(*) AS cnt, MIN(sequence#) AS min_seq, MAX(sequence#) AS max_seq
+  2  FROM   v$archived_log WHERE deleted = 'NO' GROUP BY dest_id ORDER BY dest_id;
+
+   DEST_ID        CNT    MIN_SEQ    MAX_SEQ
+---------- ---------- ---------- ----------
+         1          5         24         28
+         2          5         24         28
+         3          2         26         28
+
+-- 3번 대상만 건수가 적다. 시퀀스 27 이 없다.
+-- 1번과 2번이 정상이므로 지금은 문제가 없지만,
+-- 만약 3번만 남는 상황이 오면 그 구간에서 복구가 멈춘다.
+
+SYS@orcl> SELECT sequence#, dest_id FROM v$archived_log
+  2  WHERE  sequence# = 27 AND deleted = 'NO' ORDER BY dest_id;
+
+ SEQUENCE#    DEST_ID
+---------- ----------
+        27          1
+        27          2
+
+-- 3번 대상에는 시퀀스 27 이 존재하지 않는다.
+
+--------------------------------------------------------------------------------
+[7] 검증 : 정기 점검 조회
+--------------------------------------------------------------------------------
+-- 아카이브 실패는 조용히 누적되므로 정기 점검 항목으로 만들어 둔다.
+
+SYS@orcl> SELECT d.dest_id, d.status, d.error,
+  2         (SELECT COUNT(*) FROM v$archived_log a
+  3          WHERE a.dest_id = d.dest_id AND a.deleted = 'NO') AS archived_cnt,
+  4         (SELECT MAX(completion_time) FROM v$archived_log a
+  5          WHERE a.dest_id = d.dest_id) AS last_archived
+  6  FROM   v$archive_dest d
+  7  WHERE  d.status <> 'INACTIVE'
+  8  ORDER  BY d.dest_id;
+
+   DEST_ID STATUS    ERROR            ARCHIVED_CNT LAST_ARCHIVED
+---------- --------- ---------------- ------------ -------------------
+         1 VALID                                 5 2025-05-09 09:47:12
+         2 VALID                                 5 2025-05-09 09:47:12
+         3 VALID                                 2 2025-05-09 09:47:12
+
+-- 판단 기준
+--   STATUS 가 VALID 가 아닌 활성 대상이 있으면 즉시 조치
+--   ARCHIVED_CNT 가 서로 다르면 그 차이만큼 실패한 것
+--   LAST_ARCHIVED 가 지나치게 오래되었으면 로그 스위치 자체가 멈춘 상태일 수 있음
+
+-- 실습을 마치면 최소 성공 개수를 원래대로 되돌린다.
+
+SYS@orcl> ALTER SYSTEM SET log_archive_min_succeed_dest = 1 SCOPE=both;
+System altered.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) SCOPE=both 는 즉시 검증되지만 SCOPE=spfile 은 재기동 시점까지 검증이 미뤄진다.
+--    파라미터를 spfile 로만 설정했다면 재기동 후 반드시 v$archive_dest 를 확인한다.
+--
+-- 2) OPTIONAL 대상의 실패는 데이터베이스를 멈추지 않아 조용히 누적된다.
+--    MANDATORY 였다면 즉시 ORA-00257 로 드러났을 것이다.
+--    "멈추는 쪽"과 "조용히 잃는 쪽" 중 무엇을 택할지가 속성 선택의 본질이다.
+--
+-- 3) 한 번 빠진 아카이브는 되살릴 수 없다.
+--    다른 대상에 남아 있다면 복사해 채울 수 있으나, 모든 대상에서 빠졌다면 그 구간은 영구 손실이다.
+--
+-- 4) LOG_ARCHIVE_MIN_SUCCEED_DEST 를 2 이상으로 두면 안전성은 올라가지만
+--    한 대상이 실패할 때 데이터베이스가 멈추므로 가용성은 내려간다. RPO 요구 수준에 따라 정한다.
+--
+-- 5) 실습 후 arch3 대상은 남겨 두어도 되고 제거해도 된다.
+--    제거하려면 ALTER SYSTEM SET log_archive_dest_3 = '' SCOPE=both; 를 수행한다.
+
+SYS@orcl> EXIT

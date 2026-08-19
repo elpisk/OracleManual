@@ -1,0 +1,301 @@
+================================================================================
+ 실습 19-6 : PARALLEL · COMPRESSION · ENCRYPTION · ESTIMATE 비교
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 35분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실습 개요
+--------------------------------------------------------------------------------
+-- 테스트 데이터를 만들어 옵션별 소요 시간과 크기를 측정한다.
+-- PARALLEL이 %U 없이는 효과가 없다는 점을 직접 확인한다.
+-- COMPRESSION의 압축률과 ENCRYPTION의 동작을 본다.
+-- ESTIMATE 두 방식의 값 차이를 실제 크기와 비교한다.
+-- 작업 유형 : 성능 옵션 검증
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ nproc
+
+4
+
+[oracle@oel7v9r1 ~]$ df -h /u03 | tail -1
+
+/dev/mapper/ol-u03     20G  3.6G   17G  18% /u03
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT name, value FROM v$parameter
+  2  WHERE  name IN ('cpu_count','parallel_max_servers');
+
+NAME                     VALUE
+------------------------ ------
+cpu_count                4
+parallel_max_servers     40
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE USER perf19 IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE users QUOTA UNLIMITED ON users;
+SYS@orcl> GRANT CREATE SESSION, RESOURCE TO perf19;
+
+Grant succeeded.
+
+SYS@orcl> CREATE TABLE perf19.big1 TABLESPACE users AS
+  2  SELECT ROWNUM AS id,
+  3         RPAD('data-' || ROWNUM, 200, 'x') AS payload,
+  4         SYSDATE - MOD(ROWNUM, 3650) AS reg_date
+  5  FROM   dual CONNECT BY LEVEL <= 400000;
+
+Table created.
+
+SYS@orcl> CREATE TABLE perf19.big2 TABLESPACE users AS
+  2    SELECT * FROM perf19.big1;
+SYS@orcl> CREATE TABLE perf19.big3 TABLESPACE users AS
+  2    SELECT * FROM perf19.big1;
+SYS@orcl> CREATE TABLE perf19.big4 TABLESPACE users AS
+  2    SELECT * FROM perf19.big1;
+
+Table created.
+
+SYS@orcl> EXEC DBMS_STATS.gather_schema_stats('PERF19');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT segment_name, ROUND(bytes/1024/1024,1) AS mb
+  2  FROM   dba_segments WHERE owner = 'PERF19' ORDER BY segment_name;
+
+SEGMENT_NAME    MB
+--------------- ------
+BIG1            104.0
+BIG2            104.0
+BIG3            104.0
+BIG4            104.0
+
+-- 약 416MB 규모다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : ESTIMATE 두 방식
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   schemas=perf19 estimate_only=y
+
+Estimate in progress using BLOCKS method...
+.  estimated "PERF19"."BIG1"                            104 MB
+.  estimated "PERF19"."BIG2"                            104 MB
+.  estimated "PERF19"."BIG3"                            104 MB
+.  estimated "PERF19"."BIG4"                            104 MB
+Total estimation using BLOCKS method: 416 MB
+Job "SYSTEM"."SYS_EXPORT_SCHEMA_01" successfully completed at 15:02:44
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   schemas=perf19 estimate_only=y estimate=statistics
+
+Estimate in progress using STATISTICS method...
+.  estimated "PERF19"."BIG1"                          89.42 MB
+.  estimated "PERF19"."BIG2"                          89.42 MB
+.  estimated "PERF19"."BIG3"                          89.42 MB
+.  estimated "PERF19"."BIG4"                          89.42 MB
+Total estimation using STATISTICS method: 357.7 MB
+
+-- BLOCKS 416MB, STATISTICS 357.7MB. 실제 값과 뒤에서 비교한다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 병렬도별 측정
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ time expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=p1.dmp logfile=p1.log schemas=perf19 job_name=P1
+
+Job "SYSTEM"."P1" successfully completed at 15:06:21 elapsed 0 00:01:52
+
+real    1m54.220s
+
+[oracle@oel7v9r1 ~]$ time expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=p4_%U.dmp logfile=p4.log schemas=perf19 \
+>   parallel=4 job_name=P4
+
+Dump file set for SYSTEM.P4 is:
+  /u03/dpdump/p4_01.dmp
+  /u03/dpdump/p4_02.dmp
+  /u03/dpdump/p4_03.dmp
+  /u03/dpdump/p4_04.dmp
+Job "SYSTEM"."P4" successfully completed at 15:09:04 elapsed 0 00:00:41
+
+real    0m43.118s
+
+-- 1분 54초에서 43초로 줄었다.
+
+[oracle@oel7v9r1 ~]$ ls -lh /u03/dpdump/p1.dmp /u03/dpdump/p4_0*.dmp
+
+-rw-r-----. 1 oracle oinstall 358M May 21 15:06 p1.dmp
+-rw-r-----. 1 oracle oinstall  92M May 21 15:09 p4_01.dmp
+-rw-r-----. 1 oracle oinstall  89M May 21 15:09 p4_02.dmp
+-rw-r-----. 1 oracle oinstall  88M May 21 15:09 p4_03.dmp
+-rw-r-----. 1 oracle oinstall  89M May 21 15:09 p4_04.dmp
+
+-- 합계는 같고 파일만 나뉘었다.
+-- 실제 358MB로 STATISTICS 추정치가 더 가까웠다.
+
+--------------------------------------------------------------------------------
+[6] 확인 : 압축과 암호화
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ time expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=c_%U.dmp logfile=c.log schemas=perf19 \
+>   parallel=4 compression=all job_name=C1
+
+Job "SYSTEM"."C1" successfully completed at 15:12:38 elapsed 0 00:00:58
+
+real    1m0.442s
+
+[oracle@oel7v9r1 ~]$ du -ch /u03/dpdump/c_0*.dmp | tail -1
+
+61M     total
+
+-- 358MB → 61MB. 반복이 많은 데이터라 압축률이 높게 나왔다.
+-- 대신 시간은 43초에서 58초로 늘었다.
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=e_%U.dmp logfile=e.log schemas=perf19 parallel=4 \
+>   encryption=all encryption_password=Dump#2025 job_name=E1
+
+Job "SYSTEM"."E1" successfully completed at 15:15:22 elapsed 0 00:00:51
+
+[oracle@oel7v9r1 ~]$ strings /u03/dpdump/e_01.dmp | grep -c 'data-'
+
+0
+
+-- 평문 문자열이 보이지 않는다.
+
+[oracle@oel7v9r1 ~]$ strings /u03/dpdump/p4_01.dmp | grep -c 'data-'
+
+18422
+
+-- 암호화하지 않은 덤프에서는 내용이 그대로 읽힌다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 병렬을 지정했는데 빨라지지 않는 경우를 재현한다.
+
+[oracle@oel7v9r1 ~]$ time expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=nou.dmp logfile=nou.log schemas=perf19 \
+>   parallel=4 job_name=NOU
+
+Job "SYSTEM"."NOU" successfully completed at 15:19:41 elapsed 0 00:01:50
+
+real    1m52.674s
+
+-- PARALLEL=4를 줬는데 병렬 없이 돌린 것과 시간이 같다.
+
+-- << 원인 파악 >>
+-- 덤프 파일명에 %U가 없어 파일이 하나뿐이다.
+-- 워커 프로세스는 만들어지지만 하나의 파일에 동시에 쓸 수 없다.
+-- 결국 한 워커만 실제 작업을 하고 나머지는 대기한다.
+-- 작업 중 조회하면 이 상태가 보인다.
+
+SYS@orcl> SELECT sid, program, state, event FROM v$session
+  2  WHERE  module LIKE 'Data Pump%';
+
+  SID PROGRAM                  STATE            EVENT
+----- ------------------------ ---------------- -----------------------
+   45 oracle@oel7v9r1 (DW00)   WAITING          wait for unread message
+   58 oracle@oel7v9r1 (DW01)   WAITING          Data Pump slave startup
+   72 oracle@oel7v9r1 (DW02)   WAITING          Data Pump slave startup
+   91 oracle@oel7v9r1 (DW03)   WAITING          Data Pump slave startup
+
+-- 워커 셋이 대기 상태다.
+
+-- << 수정 >> 파일명에 %U를 넣는다.
+
+[oracle@oel7v9r1 ~]$ time expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=fix_%U.dmp logfile=fix.log schemas=perf19 \
+>   parallel=4 job_name=FIX
+
+Dump file set for SYSTEM.FIX is:
+  /u03/dpdump/fix_01.dmp
+  /u03/dpdump/fix_02.dmp
+  /u03/dpdump/fix_03.dmp
+  /u03/dpdump/fix_04.dmp
+Job "SYSTEM"."FIX" successfully completed at 15:22:33 elapsed 0 00:00:42
+
+real    0m44.005s
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+-- 암호화 덤프를 비밀번호 없이 반입해 본다.
+
+SYS@orcl> DROP USER perf19 CASCADE;
+
+User dropped.
+
+SYS@orcl> CREATE USER perf19 IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE users QUOTA UNLIMITED ON users;
+SYS@orcl> GRANT CREATE SESSION, RESOURCE TO perf19;
+
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   dumpfile=e_%U.dmp schemas=perf19 parallel=4
+
+ORA-39002: invalid operation
+ORA-39174: Encryption password must be supplied.
+
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   dumpfile=e_%U.dmp schemas=perf19 parallel=4 \
+>   encryption_password=Dump#2025 logfile=e_imp.log
+
+. . imported "PERF19"."BIG1"                    89.42 MB  400000 rows
+. . imported "PERF19"."BIG2"                    89.42 MB  400000 rows
+. . imported "PERF19"."BIG3"                    89.42 MB  400000 rows
+. . imported "PERF19"."BIG4"                    89.42 MB  400000 rows
+Job "SYSTEM"."SYS_IMPORT_SCHEMA_01" successfully completed at 15:28:10
+
+SYS@orcl> SELECT COUNT(*) FROM perf19.big1;
+
+  COUNT(*)
+----------
+    400000
+
+-- 측정 결과 정리
+--   옵션                    소요 시간   덤프 크기
+--   기본(단일)              1분 54초    358MB
+--   PARALLEL=4 + %U         43초        358MB
+--   PARALLEL=4, %U 없음     1분 52초    358MB
+--   PARALLEL=4 + 압축       58초        61MB
+--   PARALLEL=4 + 암호화     51초        358MB
+
+-- 정리
+
+SYS@orcl> DROP USER perf19 CASCADE;
+[oracle@oel7v9r1 ~]$ rm -f /u03/dpdump/p1.dmp /u03/dpdump/p4_0*.dmp \
+>   /u03/dpdump/c_0*.dmp /u03/dpdump/e_0*.dmp /u03/dpdump/nou.dmp \
+>   /u03/dpdump/fix_0*.dmp
+
+-- 실무 포인트
+-- 1) PARALLEL은 %U와 짝이다.
+--    파일이 하나면 워커가 대기만 하고 시간이 줄지 않는다.
+--    설정했는데 빨라지지 않으면 이것부터 확인한다.
+--
+-- 2) 적정 병렬도는 CPU 코어 수에서 출발한다.
+--    코어를 넘겨 잡으면 문맥 전환만 늘어난다.
+--    디스크가 병목이면 값을 올려도 개선되지 않으므로 v$session의 대기를 본다.
+--
+-- 3) 압축은 시간과 공간의 교환이다.
+--    이 실습에서는 크기가 6분의 1로 줄었지만 시간은 늘었다.
+--    반복이 많은 데이터일수록 압축률이 높다.
+--    COMPRESSION=ALL은 Advanced Compression Option이 필요하다.
+--
+-- 4) 암호화하지 않은 덤프는 내용이 그대로 읽힌다.
+--    strings 명령만으로 데이터가 노출된다.
+--    외부로 반출하는 덤프는 반드시 암호화한다.
+--
+-- 5) 암호화 비밀번호는 복구 불가능하다.
+--    잃으면 덤프를 열 방법이 없으며 ORA-39174로 막힌다.
+--    보관 위치와 담당자를 절차서에 남긴다.
+--
+-- 6) ESTIMATE는 참고값이다.
+--    BLOCKS는 과대 추정, STATISTICS는 통계 의존이다.
+--    이 실습에서는 STATISTICS가 실제에 가까웠으나 항상 그렇지는 않다.
+--    여유 공간은 추정치의 1.5배 정도로 잡는 편이 안전하다.

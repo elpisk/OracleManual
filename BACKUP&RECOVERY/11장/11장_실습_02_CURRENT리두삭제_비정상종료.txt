@@ -1,0 +1,315 @@
+================================================================================
+ 실습 11-2 : CURRENT 리두 로그 삭제 후 비정상 종료
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- SHUTDOWN ABORT 뒤 CURRENT 리두 로그 그룹이 전손되었다.
+-- 데이터파일에 반영되지 않은 커밋 변경이 그 그룹에 있었다.
+-- 아카이브 사본이 없으므로 그 구간을 되살릴 수 없다.
+-- 전체 복원 후 불완전 복구로 전환하고 손실 구간을 산정한다.
+-- 실습 11-1과 종료 방식만 다른데 결과가 달라진다.
+-- 복구 유형 : 불완전 복구(마지막 스위치 이후 손실)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 11-1을 마친 상태에서 이어서 진행한다.
+-- /home/oracle/backup/ch11 백업본이 최신이어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> ALTER SESSION SET nls_date_format = 'YYYY-MM-DD HH24:MI:SS';
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2431400
+
+SYS@orcl> INSERT INTO hr.emp111 VALUES (3, 'archived');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS switch_time FROM dual;
+
+SWITCH_TIME
+------------
+10:12:40
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1          2 YES INACTIVE
+         3          3 NO  CURRENT
+         4          1 YES INACTIVE
+
+SYS@orcl> SELECT MAX(sequence#) AS archived_max FROM v$archived_log WHERE status = 'A';
+
+ARCHIVED_MAX
+------------
+           2
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 미반영 변경 후 ABORT
+--------------------------------------------------------------------------------
+SYS@orcl> INSERT INTO hr.emp111 VALUES (4, 'in current only');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS commit_time FROM dual;
+
+COMMIT_TIME
+------------
+10:18:22
+
+-- 커밋되었으나 데이터파일에는 아직 반영되지 않았다.
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/redo03.log /u02/oradata/ORCL/redo03b.log
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+ORA-00313: open failed for members of log group 3 of thread 1
+ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/ORCL/redo03.log'
+ORA-00312: online log 3 thread 1: '/u02/oradata/ORCL/redo03b.log'
+
+SYS@orcl> !tail -6 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Beginning crash recovery of 1 threads
+Started redo scan
+Errors in file .../orcl_ora_24102.trc:
+ORA-00313: open failed for members of log group 3 of thread 1
+ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/ORCL/redo03.log'
+ORA-313 signalled during: ALTER DATABASE OPEN...
+
+-- 인스턴스 복구를 시작하려다 그룹 3에서 막혔다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1          2 YES INACTIVE
+         3          3 NO  CURRENT
+         4          1 YES INACTIVE
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE status = 'INVALID';
+
+    GROUP# MEMBER                                       STATUS
+---------- -------------------------------------------- -------
+         3 /u01/app/oracle/oradata/ORCL/redo03.log      INVALID
+         3 /u02/oradata/ORCL/redo03b.log                INVALID
+
+SYS@orcl> !grep -n 'Shutting down instance (abort)' \
+        /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -1
+20520:Shutting down instance (abort) (OS id: 24022)
+
+-- 비정상 종료였다.
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2431640 YES
+         3            2431640 YES
+         4            2431640 YES
+         7            2431580 YES
+
+-- FUZZY가 YES다. 실습 11-1과 정반대 상태다.
+
+SYS@orcl> SELECT sequence#, first_change#, next_change#,
+  2         TO_CHAR(first_time, 'HH24:MI:SS') AS first_time
+  3  FROM   v$log_history ORDER BY sequence# DESC FETCH FIRST 3 ROWS ONLY;
+
+ SEQUENCE# FIRST_CHANGE# NEXT_CHANGE# FIRST_TIME
+---------- ------------- ------------ ----------
+         3       2431520      2431900 10:12:40
+         2       2431180      2431520 10:06:14
+         1       2431001      2431180 10:01:02
+
+-- 판정
+--   ① 멤버 : 전손
+--   ② 그룹 : CURRENT, ARCHIVED NO
+--   ③ 종료 : abort → 미적용 리두 존재
+--   ④ 복구 한계 : 아카이브된 마지막 시퀀스 2의 끝 = SCN 2431519
+--   → 불완전 복구. 10:12:40 이후 변경 손실 확정.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_112
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/before_recover_112/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 실습 11-1과 같은 방법으로 처리해 본다.
+
+SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 3;
+
+Database altered.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+ALTER DATABASE OPEN RESETLOGS
+*
+ERROR at line 1:
+ORA-01113: file 1 needs media recovery
+ORA-01110: data file 1: '/u02/oradata/ORCL/system01.dbf'
+
+-- << 원인 파악 >>
+-- 그룹은 다시 만들어졌지만 데이터파일의 일관성 문제가 그대로 남았다.
+-- 비정상 종료라 적용해야 할 리두가 있는데 그것이 CURRENT 그룹에 있었다.
+-- CLEAR로 그 리두를 버렸으므로 적용할 방법이 사라졌다.
+-- 실습 11-1에서는 FUZZY가 NO여서 적용할 리두 자체가 없었다.
+-- 종료 방식 하나가 같은 명령의 결과를 갈랐다.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         1                          2431640
+         3                          2431640
+         4                          2431640
+         7                          2431580
+
+-- << 수정 >>
+-- 전체 복원 후 불완전 복구로 전환한다.
+
+SYS@orcl> SHUTDOWN ABORT
+SYS@orcl> !cp -p /home/oracle/backup/ch11/*.dbf /u02/oradata/ORCL/
+
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2431001 NO
+         3            2431001 NO
+         4            2431001 NO
+         7            2431001 NO
+
+-- 백업 시점으로 되돌아갔다. 모든 파일이 같은 SCN이다.
+
+SYS@orcl> SET AUTORECOVERY OFF
+SYS@orcl> RECOVER DATABASE UNTIL CANCEL;
+ORA-00279: change 2431001 generated at 13/05/2025 10:01:02 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_1_1200574102.dbf
+ORA-00280: change 2431001 for thread 1 is in sequence #1
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+
+Log applied.
+
+ORA-00279: change 2431180 generated at 13/05/2025 10:06:14 needed for thread 1
+ORA-00280: change 2431180 for thread 1 is in sequence #2
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+
+Log applied.
+
+ORA-00279: change 2431520 generated at 13/05/2025 10:12:40 needed for thread 1
+ORA-00280: change 2431520 for thread 1 is in sequence #3
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+CANCEL
+Media recovery cancelled.
+
+-- 시퀀스 3은 CURRENT였고 아카이브되지 않았다. 적용할 수 없다.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT id, memo FROM hr.emp111 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 before shutdown
+         2 in current redo
+         3 archived
+
+-- 4번 행이 사라졌다. CURRENT 리두에만 있던 변경이다.
+-- 커밋했음에도 잃었다는 점이 이 실습의 핵심이다.
+
+SYS@orcl> SELECT checkpoint_change# AS recovered_scn,
+  2         TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS recovered_time
+  3  FROM   v$database;
+
+RECOVERED_SCN RECOVERED_TIME
+------------- --------------
+      2431520 10:12:38
+
+-- 복구 지점은 마지막 로그 스위치 시각이다.
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  WHERE  status = 'CURRENT';
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           9           2431520 CURRENT
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+Tablespace altered.
+
+-- 손실 구간을 정리한다.
+--   복구 지점 : 10:12:38 (마지막 스위치 시각)
+--   손실 구간 : 10:12:38 이후 ~ 장애 시각(10:18:22 이후)
+--   영향 : 그 시간대의 모든 커밋된 변경
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch11 && mkdir -p /home/oracle/backup/ch11
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch11/
+SYS@orcl> !rm -f /home/oracle/backup/ch11/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) 종료 방식 하나가 같은 명령의 결과를 가른다.
+--    실습 11-1은 CLEAR와 RESETLOGS로 손실 없이 끝났고
+--    이 실습은 같은 명령 뒤에 ORA-01113을 만나 불완전 복구로 전환했다.
+--    차이는 FUZZY 컬럼에서 미리 드러난다.
+--
+-- 2) 커밋했어도 잃을 수 있다.
+--    커밋은 리두에 기록되었음을 보장할 뿐 데이터파일 반영을 보장하지 않는다.
+--    그 리두가 CURRENT 그룹에 있었고 사본이 없으면 되살릴 수 없다.
+--
+-- 3) 손실 구간은 마지막 로그 스위치 이후다.
+--    복구 지점이 정확히 스위치 시각과 일치하는 것을 확인할 수 있다.
+--    스위치 간격이 길수록 손실이 커지므로 RPO 설계와 직결된다.
+--
+-- 4) 불완전 복구는 모든 데이터파일을 복원해야 한다.
+--    CLEAR만 하고 열려던 첫 시도가 실패한 이유가 여기에 있다.
+--    10장에서 익힌 원칙이 그대로 적용된다.
+--
+-- 5) 아카이브된 마지막 시퀀스가 복구 한계다.
+--    CURRENT 시퀀스는 사본이 없으므로 프롬프트에서 CANCEL 로 끝낸다.
+--
+-- 6) 예방은 멤버 다중화뿐이다.
+--    멤버 하나가 다른 디스크에 살아 있었다면 복사로 손실 없이 끝났을 상황이다.
+
+SYS@orcl> EXIT

@@ -1,0 +1,317 @@
+================================================================================
+ 실습 16-5 : 블록 손상 재현과 VALIDATE로 감지
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- dd 명령으로 데이터파일의 특정 블록을 손상시킨다.
+-- 조회 시 나타나는 오류와 VALIDATE의 감지 결과를 비교한다.
+-- v$database_block_corruption 에 등록되는 과정을 확인한다.
+-- 손상 블록이 속한 객체를 찾는다.
+-- 작업 유형 : 손상 재현과 진단(복구는 16-7에서)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 반드시 실습 환경에서만 수행한다. 운영 데이터베이스에서는 절대 수행하지 않는다.
+-- 백업이 있어야 이후 복구가 가능하다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'BASE_165';
+
+Starting backup at 18-MAY-25
+Finished backup at 18-MAY-25
+
+RMAN> EXIT
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> CREATE TABLE hr.blk165(id NUMBER, pad VARCHAR2(2000))
+  2    TABLESPACE users;
+
+Table created.
+
+SYS@orcl> INSERT INTO hr.blk165
+  2  SELECT LEVEL, RPAD('x', 2000, 'x') FROM dual CONNECT BY LEVEL <= 500;
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> ALTER SYSTEM CHECKPOINT;
+
+System altered.
+
+-- 손상시킬 블록을 정한다.
+
+SYS@orcl> SELECT MIN(DBMS_ROWID.rowid_block_number(ROWID)) AS min_blk,
+  2         MAX(DBMS_ROWID.rowid_block_number(ROWID)) AS max_blk,
+  3         MIN(DBMS_ROWID.rowid_relative_fno(ROWID)) AS file_no
+  4  FROM   hr.blk165;
+
+   MIN_BLK    MAX_BLK    FILE_NO
+---------- ---------- ----------
+       138        291          7
+
+SYS@orcl> SELECT file#, name FROM v$datafile WHERE file# = 7;
+
+     FILE# NAME
+---------- ------------------------------------------
+         7 /u02/oradata/ORCL/users01.dbf
+
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target /
+RMAN> VALIDATE DATAFILE 7;
+
+File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
+---- ------ -------------- ------------ --------------- ----------
+7    OK     0              384          1280            2710400
+
+RMAN> EXIT
+
+-- 현재는 손상이 없다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : dd로 블록 손상
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< "SHUTDOWN IMMEDIATE"
+
+Database closed.
+ORACLE instance shut down.
+
+-- 데이터베이스를 내린 상태에서 손상시킨다.
+-- 열린 상태에서 하면 버퍼 캐시의 내용과 어긋나 결과가 불확실해진다.
+
+[oracle@oel7v9r1 ~]$ cp -p /u02/oradata/ORCL/users01.dbf /tmp/users01_ok.dbf
+
+-- 만일을 위해 원본을 복사해 둔다.
+
+[oracle@oel7v9r1 ~]$ dd if=/dev/zero of=/u02/oradata/ORCL/users01.dbf \
+>   bs=8192 seek=142 count=3 conv=notrunc
+
+3+0 records in
+3+0 records out
+24576 bytes (25 kB) copied, 0.000312 s, 78.8 MB/s
+
+-- 142번 블록부터 3개를 0으로 채웠다.
+-- seek는 건너뛸 블록 수, count는 쓸 블록 수다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< "STARTUP"
+
+ORACLE instance started.
+Database opened.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+
+System altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.blk165;
+SELECT COUNT(*) FROM hr.blk165
+                     *
+ERROR at line 1:
+ORA-01578: ORACLE data block corrupted (file # 7, block # 142)
+ORA-01110: data file 7: '/u02/oradata/ORCL/users01.dbf'
+
+-- ORA-26040이 없다. NOLOGGING이 아니라 물리적 손상이라는 뜻이다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.blk165 WHERE id <= 10;
+
+  COUNT(*)
+----------
+        10
+
+-- 손상되지 않은 블록의 데이터는 정상적으로 조회된다.
+
+SYS@orcl> SELECT * FROM v$database_block_corruption;
+
+no rows selected
+
+-- << 원인 파악 >>
+-- 조회 중 발견된 손상은 이 뷰에 자동으로 등록되지 않는다.
+-- RMAN의 VALIDATE나 BACKUP이 검사해야 목록이 채워진다.
+-- 복구 명령이 이 목록을 대상으로 하므로 먼저 채워야 한다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> !tail -8 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Hex dump of (file 7, block 142) in trace file
+ /u01/app/oracle/diag/rdbms/orcl/orcl/trace/orcl_ora_9214.trc
+Corrupt block relative dba: 0x0180008e (file 7, block 142)
+Completely zero block found during multiblock buffer read
+Reread of blocknum=142, file=/u02/oradata/ORCL/users01.dbf. found same corrupt data
+
+-- 'Completely zero block' 이 dd로 0을 채운 결과다.
+
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> VALIDATE DATAFILE 7;
+
+Starting validate at 18-MAY-25
+channel ORA_DISK_1: starting validation of datafile
+channel ORA_DISK_1: specifying datafile(s) for validation
+input datafile file number=00007 name=/u02/oradata/ORCL/users01.dbf
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:03
+
+List of Datafiles
+=================
+File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
+---- ------ -------------- ------------ --------------- ----------
+7    FAILED 3              384          1280            2710800
+
+Finished validate at 18-MAY-25
+
+-- Status가 FAILED이고 Marked Corrupt가 3이다.
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT file#, block#, blocks, corruption_change#, corruption_type
+  2  FROM   v$database_block_corruption;
+
+     FILE#     BLOCK#     BLOCKS CORRUPTION_CHANGE# CORRUPTION_TYPE
+---------- ---------- ---------- ------------------ ---------------
+         7        142          3                  0 CORRUPT
+
+-- 목록이 채워졌다. 이제 복구 명령의 대상이 된다.
+
+SYS@orcl> SELECT owner, segment_name, segment_type
+  2  FROM   dba_extents
+  3  WHERE  file_id = 7
+  4  AND    142 BETWEEN block_id AND block_id + blocks - 1;
+
+OWNER  SEGMENT_NAME         SEGMENT_TYPE
+------ -------------------- ------------
+HR     BLK165               TABLE
+
+-- 손상 블록이 속한 객체를 확인했다. 테이블이므로 블록 복구가 적절하다.
+-- 인덱스였다면 REBUILD가 더 빠르다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 손상이 있는 상태로 백업을 시도해 본다.
+
+SYS@orcl> EXIT
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP DATAFILE 7;
+
+Starting backup at 18-MAY-25
+channel ORA_DISK_1: starting full datafile backup set
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03009: failure of backup command on ORA_DISK_1 channel at 05/18/2025
+ORA-19566: exceeded limit of 0 corrupt blocks for file
+ /u02/oradata/ORCL/users01.dbf
+
+-- << 원인 파악 >>
+-- 손상 블록 허용치가 기본 0이므로 백업이 실패한다.
+-- 손상을 담은 백업은 복구에 쓸 수 없으므로 막는 것이 정상 동작이다.
+-- 근본 해결은 블록을 먼저 복구하는 것이다.
+-- 당장 백업이 필요하다면 MAXCORRUPT로 허용치를 정할 수 있다.
+
+-- << 수정 >> 임시로 허용치를 지정해 백업한다.
+
+RMAN> RUN {
+  2>   SET MAXCORRUPT FOR DATAFILE 7 TO 10;
+  3>   BACKUP DATAFILE 7 TAG 'WITH_CORRUPT';
+  4> }
+
+executing command: SET MAXCORRUPT
+Starting backup at 18-MAY-25
+channel ORA_DISK_1: starting full datafile backup set
+channel ORA_DISK_1: backup set complete, elapsed time: 00:00:03
+Finished backup at 18-MAY-25
+
+-- 백업은 되었지만 손상 블록이 그대로 들어갔다.
+-- 이 백업으로는 그 블록을 복구할 수 없다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+RMAN> LIST BACKUP OF DATAFILE 7 SUMMARY;
+
+Key     TY LV S Device Type Completion Time #Pieces Tag
+------- -- -- - ----------- --------------- ------- -------------
+122     B  F  A DISK        18-MAY-25       1       BASE_165
+128     B  F  A DISK        18-MAY-25       1       WITH_CORRUPT
+
+-- BASE_165는 손상 이전 백업이므로 복구에 쓸 수 있다.
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ dbv file=/u02/oradata/ORCL/users01.dbf blocksize=8192
+
+DBVERIFY: Release 19.0.0.0.0 - Production
+
+DBVERIFY - Verification starting : FILE = /u02/oradata/ORCL/users01.dbf
+Page 142 is marked corrupt
+Corrupt block relative dba: 0x0180008e (file 7, block 142)
+Completely zero block found during dbv:
+
+Page 143 is marked corrupt
+Page 144 is marked corrupt
+
+DBVERIFY - Verification complete
+
+Total Pages Examined         : 1280
+Total Pages Processed (Data) : 509
+Total Pages Failing   (Data) : 0
+Total Pages Processed (Index): 0
+Total Pages Marked Corrupt   : 3
+Total Pages Influx           : 0
+Total Pages Encrypted        : 0
+Highest block SCN            : 2710800
+
+-- dbv 결과도 3개로 일치한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT COUNT(*) FROM v\$database_block_corruption;"
+
+  COUNT(*)
+----------
+         1
+
+-- 행 하나에 blocks=3으로 기록되어 있다.
+-- 복구는 실습 16-7에서 수행한다.
+
+-- 실무 포인트
+-- 1) dd 명령으로 블록을 손상시키는 실습은 반드시 실습 환경에서만 수행한다.
+--    seek는 건너뛸 블록 수, count는 쓸 블록 수이며 conv=notrunc를 빠뜨리면
+--    파일이 그 지점에서 잘려 완전히 망가진다.
+--
+-- 2) 조회 중 발견된 손상은 v$database_block_corruption 에 등록되지 않는다.
+--    VALIDATE나 BACKUP이 검사해야 목록이 채워진다.
+--    복구 명령이 이 목록을 대상으로 하므로 먼저 채우는 것이 순서다.
+--
+-- 3) ORA-01578에 ORA-26040이 없으면 물리적 손상이다.
+--    alert log의 'Completely zero block' 같은 표현이 원인을 짐작하게 한다.
+--
+-- 4) 손상되지 않은 블록의 데이터는 정상적으로 조회된다.
+--    그래서 전체 조회에서만 오류가 나고 부분 조회는 성공하기도 한다.
+--    손상을 늦게 발견하는 이유 중 하나다.
+--
+-- 5) 손상이 있으면 백업이 ORA-19566으로 실패한다.
+--    손상을 담은 백업은 복구에 쓸 수 없으므로 막는 것이 정상 동작이다.
+--    MAXCORRUPT는 임시 조치이며 백업 후 반드시 블록 복구를 수행한다.
+--
+-- 6) dba_extents 로 손상 블록이 속한 객체를 확인한다.
+--    인덱스라면 REBUILD가 블록 복구보다 빠르고 확실하다.

@@ -1,0 +1,308 @@
+================================================================================
+ 실습 12-2 : SYSTEM 데이터파일과 컨트롤파일 손상
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- SYSTEM 데이터파일 하나와 컨트롤파일 전부가 손상되었다.
+-- 다른 데이터파일과 리두, 아카이브는 온전하다.
+-- SYSTEM은 OFFLINE 할 수 없어 데이터베이스 전체가 중단된다.
+-- 대신 복원 대상이 하나뿐이므로 복구 시간은 짧다.
+-- 복구 유형 : 완전 복구, RESETLOGS 강제
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- ARCHIVELOG 모드이며 실습 직전에 전체 백업과 컨트롤파일 백업을 받는다.
+-- 백업 매니페스트에 데이터파일 개수를 기록해 둔다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch12 && mkdir -p /home/oracle/backup/ch12
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch12/
+SYS@orcl> !rm -f /home/oracle/backup/ch12/temp01.dbf
+SYS@orcl> STARTUP
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO
+  2    '/home/oracle/backup/control_ch12.bkp' REUSE;
+Database altered.
+
+SYS@orcl> SELECT COUNT(*) AS df_count FROM v$datafile;
+
+  DF_COUNT
+----------
+         4
+
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf | grep -v temp | wc -l
+4
+
+-- 매니페스트에 4개로 기록한다. 이후 손상 범위 판정의 기준이 된다.
+
+SYS@orcl> CREATE TABLE hr.emp122(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp122 VALUES (1, 'after backup');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> INSERT INTO hr.emp122 VALUES (2, 'in current redo');
+SYS@orcl> COMMIT;
+Commit complete.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : SYSTEM 파일과 컨트롤파일 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u02/oradata/ORCL/system01.dbf
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/control0[12].ctl \
+                 /u02/oradata/ORCL/control03.ctl
+
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf | grep -v temp | wc -l
+3
+
+-- 4개 중 3개가 남았다. 하나만 없어졌다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+STARTED
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> !tail -20 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+ORA-00210: cannot open the specified control file
+ORA-00202: control file: '/u01/app/oracle/oradata/ORCL/control01.ctl'
+ORA-27037: unable to obtain file status
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl 2>/dev/null | wc -l
+0
+
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf | grep -v temp | wc -l
+3
+
+SYS@orcl> !grep -c 'dbf' /home/oracle/backup/manifest_ch12.txt
+4
+
+-- 매니페스트는 4개인데 3개만 있다. 데이터파일 하나가 없어졌다.
+
+SYS@orcl> !ls /u02/arch1/*.dbf | wc -l
+16
+
+-- 판정
+--   ① 컨트롤파일 수단 : Binary 백업본 있음
+--   ② 아카이브 연속 : 결손 없음
+--   ③ CURRENT 리두 : 생존
+--   → 완전 복구 가능. 복원 대상은 없어진 파일 하나뿐이다.
+
+-- 0단계 : 남아 있는 파일을 별도 위치로 복사한다.
+
+SYS@orcl> !D=/home/oracle/before_recover_122; mkdir -p $D; \
+          cp -p /u02/oradata/ORCL/*.dbf $D/ 2>/dev/null; \
+          cp -p /u01/app/oracle/oradata/ORCL/*.log $D/ 2>/dev/null; \
+          date > $D/copied_at.txt; ls -l $D >> $D/copied_at.txt
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 1단계 : 컨트롤파일 복원
+
+SYS@orcl> !cp -p /home/oracle/backup/control_ch12.bkp \
+                 /u01/app/oracle/oradata/ORCL/control01.ctl
+SYS@orcl> !cp -p /home/oracle/backup/control_ch12.bkp \
+                 /u01/app/oracle/oradata/ORCL/control02.ctl
+
+SYS@orcl> ALTER DATABASE MOUNT;
+ALTER DATABASE MOUNT
+*
+ERROR at line 1:
+ORA-00205: error in identifying control file, check alert log for more info
+
+-- << 원인 파악 >>
+SYS@orcl> !tail -5 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+ORA-00202: control file: '/u02/oradata/ORCL/control03.ctl'
+ORA-27037: unable to obtain file status
+
+-- 세 번째 경로에 복사하는 것을 빠뜨렸다.
+-- CONTROL_FILES에 나열된 파일이 하나라도 없으면 MOUNT가 되지 않는다.
+
+-- << 수정 >>
+
+SYS@orcl> !cp -p /home/oracle/backup/control_ch12.bkp /u02/oradata/ORCL/control03.ctl
+SYS@orcl> ALTER DATABASE MOUNT;
+
+Database altered.
+
+-- 2단계 : 리두 확인
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         15 YES INACTIVE
+         3         17 NO  CURRENT
+         4         16 YES INACTIVE
+
+-- 리두는 온전하다.
+
+-- 3단계 : 복원 대상 판별
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file ORDER BY file#;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         1 FILE NOT FOUND                 0
+         3                          2450300
+         4                          2450300
+         7                          2450300
+
+-- 1번만 ERROR가 FILE NOT FOUND다. 나머지는 파일이 있고 SCN만 뒤처져 있다.
+-- 뒤처진 것은 백업 컨트롤파일의 SCN이 오래되어 그런 것이며 파일 자체는 최신이다.
+-- 복원 대상은 1번 하나뿐이다.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch12/*.dbf /u02/oradata/ORCL/
+
+-- << 여기서 판단 착오를 확인한다 >>
+-- 전부 복원했다. 편해 보이지만 복구 시간이 늘어난다.
+
+SYS@orcl> SELECT file#, checkpoint_change# FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE#
+---------- ------------------
+         1            2447100
+         3            2447100
+         4            2447100
+         7            2447100
+
+-- 네 파일 모두 백업 시점으로 돌아갔다.
+-- 원래는 3·4·7번이 최신 상태였으므로 그 구간의 아카이브를 다시 적용해야 한다.
+-- 복원 대상을 최소화했다면 적용할 아카이브가 훨씬 적었을 것이다.
+
+-- << 수정 >> 실습에서는 판별의 효과를 확인하기 위해 되돌린다.
+
+SYS@orcl> !cp -p /home/oracle/before_recover_122/sysaux01.dbf \
+                 /home/oracle/before_recover_122/undotbs01.dbf \
+                 /home/oracle/before_recover_122/users01.dbf /u02/oradata/ORCL/
+
+SYS@orcl> SELECT file#, checkpoint_change# FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE#
+---------- ------------------
+         1            2447100
+         3            2451900
+         4            2451900
+         7            2451900
+
+-- 1번만 뒤처져 있다. 적용할 아카이브가 크게 줄었다.
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE;
+ORA-00279: change 2447100 generated at 05/13/2025 11:02:18 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_15_1190000001.dbf
+...
+Log applied.
+ORA-00308: cannot open archived log '/u02/arch1/1_17_1190000001.dbf'
+
+SYS@orcl> SET AUTORECOVERY OFF
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE;
+ORA-00280: change 2452400 for thread 1 is in sequence #17
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+/u01/app/oracle/oradata/ORCL/redo03.log
+Log applied.
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT id, memo FROM hr.emp122 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 after backup
+         2 in current redo
+
+SYS@orcl> SELECT file#, status, checkpoint_change# FROM v$datafile ORDER BY file#;
+
+     FILE# STATUS  CHECKPOINT_CHANGE#
+---------- ------- ------------------
+         1 SYSTEM             2452401
+         3 ONLINE             2452401
+         4 ONLINE             2452401
+         7 ONLINE             2452401
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_objects WHERE status = 'INVALID';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch12 && mkdir -p /home/oracle/backup/ch12
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch12/
+SYS@orcl> !rm -f /home/oracle/backup/ch12/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) SYSTEM이 포함되면 손상 범위가 좁아도 전면 중단이다.
+--    OFFLINE 할 수 없어 부분 처리가 불가능하기 때문이다.
+--    대신 복원 대상이 적어 복구 시간은 오히려 짧다.
+--
+-- 2) 컨트롤파일은 CONTROL_FILES의 모든 경로에 빠짐없이 복사한다.
+--    하나만 빠져도 ORA-00205가 다시 나온다. alert log가 어느 파일인지 알려 준다.
+--
+-- 3) v$recover_file 의 ERROR 컬럼으로 복원 대상을 판별한다.
+--    FILE NOT FOUND면 파일이 없는 것이고, 비어 있으면 파일은 있고 SCN만 뒤처진 것이다.
+--    후자는 복원 대상이 아니다.
+--
+-- 4) 멀쩡한 파일까지 되돌리면 그만큼 아카이브를 더 적용해야 한다.
+--    이 실습에서 전부 복원했을 때와 하나만 복원했을 때의 SCN 차이가 그 증거다.
+--    복원 대상 최소화가 복구 시간 단축의 첫 번째 방법이다.
+--
+-- 5) OS의 파일 개수와 매니페스트의 개수를 비교하면 손상 범위를 몇 초에 확인할 수 있다.
+--    매니페스트를 백업 때마다 갱신해 두는 것이 이 판정을 가능하게 한다.

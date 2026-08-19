@@ -1,0 +1,305 @@
+================================================================================
+ 실습 11-1 : CURRENT 리두 로그 삭제 후 정상 종료
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 20분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 정상 종료 후 CURRENT 리두 로그 그룹의 멤버가 모두 유실되었다.
+-- 종료 시 체크포인트가 완료되어 리두에만 있는 변경이 없다.
+-- CLEAR UNARCHIVED 로 그룹을 다시 만들고 RESETLOGS로 연다.
+-- 손실은 없지만 인카네이션이 올라간다.
+-- 복구 유형 : 복구 불필요(CLEAR + RESETLOGS)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- ARCHIVELOG 모드이며 실습 직전에 전체 백업을 새로 받는다.
+-- 리두 로그는 그룹 세 개, 그룹마다 멤버 두 개다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL member FOR a44
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch11 && mkdir -p /home/oracle/backup/ch11
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch11/
+SYS@orcl> !rm -f /home/oracle/backup/ch11/temp01.dbf
+SYS@orcl> STARTUP
+
+SYS@orcl> CREATE TABLE hr.emp111(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp111 VALUES (1, 'before shutdown');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SELECT l.group#, l.sequence#, l.archived, l.status, f.member
+  2  FROM   v$log l, v$logfile f WHERE l.group# = f.group# ORDER BY l.group#;
+
+    GROUP#  SEQUENCE# ARC STATUS     MEMBER
+---------- ---------- --- ---------- --------------------------------------------
+         1         12 YES INACTIVE   /u01/app/oracle/oradata/ORCL/redo01.log
+         1         12 YES INACTIVE   /u02/oradata/ORCL/redo01b.log
+         3         14 NO  CURRENT    /u01/app/oracle/oradata/ORCL/redo03.log
+         3         14 NO  CURRENT    /u02/oradata/ORCL/redo03b.log
+         4         13 YES INACTIVE   /u01/app/oracle/oradata/ORCL/redo04.log
+         4         13 YES INACTIVE   /u02/oradata/ORCL/redo04b.log
+
+6 rows selected.
+
+-- 그룹 3이 CURRENT이고 ARCHIVED가 NO다. 아카이브 사본이 없다.
+
+SYS@orcl> SELECT MAX(sequence#) AS archived_max FROM v$archived_log WHERE status = 'A';
+
+ARCHIVED_MAX
+------------
+          13
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 정상 종료 후 CURRENT 그룹 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> INSERT INTO hr.emp111 VALUES (2, 'in current redo');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+-- 정상 종료다. 종료 과정에서 체크포인트가 완료되었다.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/redo03.log /u02/oradata/ORCL/redo03b.log
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.log
+/u01/app/oracle/oradata/ORCL/redo01.log
+/u01/app/oracle/oradata/ORCL/redo04.log
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+Database mounted.
+ORA-00313: open failed for members of log group 3 of thread 1
+ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/ORCL/redo03.log'
+ORA-00312: online log 3 thread 1: '/u02/oradata/ORCL/redo03b.log'
+ORA-27037: unable to obtain file status
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+MOUNTED
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE group# = 3;
+
+    GROUP# MEMBER                                       STATUS
+---------- -------------------------------------------- -------
+         3 /u01/app/oracle/oradata/ORCL/redo03.log      INVALID
+         3 /u02/oradata/ORCL/redo03b.log                INVALID
+
+-- 멤버가 하나도 남지 않았다.
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         12 YES INACTIVE
+         3         14 NO  CURRENT
+         4         13 YES INACTIVE
+
+-- 손상 그룹이 CURRENT이고 ARCHIVED가 NO다.
+
+SYS@orcl> !grep -n 'CLOSE NORMAL' \
+        /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -1
+20402:Completed: ALTER DATABASE CLOSE NORMAL
+
+-- 정상 종료였다.
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2431000 NO
+         3            2431000 NO
+         4            2431000 NO
+         7            2431000 NO
+
+-- 모든 파일이 같은 SCN이고 FUZZY가 NO다. 적용할 리두가 없다.
+
+-- 판정
+--   ① 멤버 : 전손
+--   ② 그룹 상태 : CURRENT, ARCHIVED NO
+--   ③ 종료 : 정상
+--   ④ FUZZY : 전부 NO → 손실 없음
+--   → CLEAR UNARCHIVED 후 OPEN RESETLOGS
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_111
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /home/oracle/before_recover_111/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 일반 CLEAR로 처리해 본다.
+
+SYS@orcl> ALTER DATABASE CLEAR LOGFILE GROUP 3;
+ALTER DATABASE CLEAR LOGFILE GROUP 3
+*
+ERROR at line 1:
+ORA-00350: log 3 of instance orcl (thread 1) needs to be archived
+ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/ORCL/redo03.log'
+
+-- << 원인 파악 >>
+-- ARCHIVED가 NO이므로 아직 아카이브되지 않은 그룹이다.
+-- Oracle은 아카이브되지 않은 리두를 그냥 버리지 못하게 막는다.
+-- 그런데 이 그룹은 파일이 이미 없어 아카이브할 원본조차 없다.
+-- 아카이브 대상 문제가 아니라 파일 부재가 원인임을 먼저 확인해야 한다.
+-- 확인 후에만 UNARCHIVED 옵션을 붙이는 것이 정당하다.
+
+SYS@orcl> SELECT dest_id, destination, status, error FROM v$archive_dest
+  2  WHERE  destination IS NOT NULL;
+
+   DEST_ID DESTINATION      STATUS  ERROR
+---------- ---------------- ------- --------------------
+         1 /u02/arch1       VALID
+
+-- 아카이브 대상은 정상이다. 파일이 없어서 아카이브할 수 없는 것이다.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG ALL;
+ALTER SYSTEM ARCHIVE LOG ALL
+*
+ERROR at line 1:
+ORA-16038: log 3 sequence# 14 cannot be archived
+ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/ORCL/redo03.log'
+
+-- 역시 파일이 없어 아카이브할 수 없다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 3;
+
+Database altered.
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log WHERE group# = 3;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         3          0 YES UNUSED
+
+SYS@orcl> SELECT member, status FROM v$logfile WHERE group# = 3;
+
+MEMBER                                       STATUS
+-------------------------------------------- -------
+/u01/app/oracle/oradata/ORCL/redo03.log
+/u02/oradata/ORCL/redo03b.log
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/redo03.log
+-rw-r-----. 1 oracle oinstall 209715712 May 13 09:52 redo03.log
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01589: must use RESETLOGS or NORESETLOGS option for database open
+
+-- 리두 연속성이 끊겨 RESETLOGS를 요구한다. 정상적인 흐름이다.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT id, memo FROM hr.emp111 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 before shutdown
+         2 in current redo
+
+-- CURRENT 리두에만 있던 2번 행까지 살아 있다. 손실이 없다.
+-- 정상 종료 시 체크포인트로 데이터파일에 이미 반영되었기 때문이다.
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  ORDER BY incarnation#;
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           7           2428020 PARENT
+           8           2431001 CURRENT
+
+-- 손실이 없어도 인카네이션은 올라갔다.
+
+SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1          1 CURRENT
+         3          0 UNUSED
+         4          0 UNUSED
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+-- 인카네이션이 달라졌으므로 즉시 전체 백업을 받는다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch11 && mkdir -p /home/oracle/backup/ch11
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch11/
+SYS@orcl> !rm -f /home/oracle/backup/ch11/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) 정상 종료 상태에서는 CURRENT 그룹을 잃어도 손실이 없다.
+--    종료 시 체크포인트가 완료되어 리두에만 있는 변경이 남지 않기 때문이다.
+--    v$datafile_header 의 FUZZY가 모두 NO인 것이 그 증거다.
+--
+-- 2) ORA-00350이 나오면 ARCHIVED가 NO인 이유를 먼저 확인한다.
+--    아카이브 대상 문제로 밀린 것이면 대상을 고쳐 처리하면 손실이 없다.
+--    파일이 이미 없어 아카이브할 수 없는 경우에만 UNARCHIVED가 정당하다.
+--
+-- 3) 이 실습에서는 v$archive_dest 가 VALID였고 ARCHIVE LOG ALL 도 실패했다.
+--    두 확인으로 파일 부재가 원인임을 확정한 뒤 UNARCHIVED를 붙였다.
+--
+-- 4) ORA-01589는 오류가 아니라 정상적인 흐름이다.
+--    컨트롤파일이 그 그룹을 CURRENT로 알고 있어 리두 연속성이 끊긴 상태이므로
+--    RESETLOGS로 열어야 한다는 안내다.
+--
+-- 5) 손실이 없어도 인카네이션은 올라간다.
+--    이전 백업본이 무효가 되므로 즉시 전체 백업을 받아야 한다.
+--
+-- 6) 이 실습이 손쉬웠던 이유는 종료 방식 하나 때문이다.
+--    다음 실습에서 같은 장애를 비정상 종료 상태에서 다시 본다.
+
+SYS@orcl> EXIT

@@ -1,0 +1,311 @@
+================================================================================
+ 실습 12-5 : 로그 스위치로 정지된 상태의 진단과 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 운영 중 데이터베이스가 응답하지 않고 세션이 대기로 쌓인다.
+-- 인스턴스는 살아 있고 OPEN 상태다.
+-- 원인은 두 가지 중 하나다. 리두 파일 문제이거나 아카이브 대상 문제다.
+-- 증상이 같아 원인을 먼저 확정해야 한다. 조치가 전혀 다르기 때문이다.
+-- 복구 유형 : 원인별 대응, 손실 없음
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- ARCHIVELOG 모드이며 아카이브 대상은 /u02/arch1 하나다.
+-- 세션 두 개를 사용한다. 하나는 업무용, 하나는 진단용이다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL destination FOR a20
+SYS@orcl> COL error FOR a30
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         25 YES INACTIVE
+         3         26 YES INACTIVE
+         4         27 NO  CURRENT
+
+SYS@orcl> SELECT dest_id, destination, status, error FROM v$archive_dest
+  2  WHERE  destination IS NOT NULL;
+
+   DEST_ID DESTINATION          STATUS    ERROR
+---------- -------------------- --------- ------------------------------
+         1 /u02/arch1           VALID
+
+SYS@orcl> SELECT process, status, sequence# FROM v$archive_processes
+  2  WHERE  status <> 'STOPPED';
+
+   PROCESS STATUS      SEQUENCE#
+---------- ---------- ----------
+         0 ACTIVE              0
+         1 ACTIVE              0
+
+SYS@orcl> CREATE TABLE hr.emp125(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp125 VALUES (1, 'normal');
+SYS@orcl> COMMIT;
+Commit complete.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : INACTIVE 그룹의 멤버 삭제 후 스위치 진행
+--------------------------------------------------------------------------------
+-- 그룹 1의 멤버를 모두 삭제한다. 스위치가 돌아 이 그룹 차례가 되면 문제가 드러난다.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/redo01.log /u02/oradata/ORCL/redo01b.log
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+
+SYS@orcl> INSERT INTO hr.emp125 VALUES (2, 'after switch');
+-- 응답이 없다. 세션이 멈춘 것처럼 보인다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+-- 진단용 세션에서 확인한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT status, database_status FROM v$instance;
+
+STATUS       DATABASE_STATUS
+------------ -----------------
+OPEN         ACTIVE
+
+-- 인스턴스는 살아 있다.
+
+SYS@orcl> SELECT event, COUNT(*) FROM v$session
+  2  WHERE  wait_class <> 'Idle' GROUP BY event ORDER BY 2 DESC;
+
+EVENT                                      COUNT(*)
+---------------------------------------- ----------
+log file switch (archiving needed)                7
+log buffer space                                  2
+
+-- 로그 스위치를 기다리는 세션이 쌓여 있다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- 두 원인을 구분한다. alert log의 오류 코드가 가장 빠른 단서다.
+
+SYS@orcl> !tail -20 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+ARC0: Beginning to archive thread 1 sequence 28
+ORA-00313: open failed for members of log group 1 of thread 1
+ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/ORCL/redo01.log'
+ORA-00312: online log 1 thread 1: '/u02/oradata/ORCL/redo01b.log'
+ORA-27037: unable to obtain file status
+ARCH: Archival stopped, error occurred. Will continue retrying
+
+-- ORA-00312와 ORA-00313이다. 리두 파일 문제다.
+-- 아카이브 대상 문제라면 ORA-19809나 ORA-16038이 나온다.
+
+SYS@orcl> SELECT dest_id, destination, status, error FROM v$archive_dest
+  2  WHERE  destination IS NOT NULL;
+
+   DEST_ID DESTINATION          STATUS    ERROR
+---------- -------------------- --------- ------------------------------
+         1 /u02/arch1           VALID
+
+-- 아카이브 대상은 정상이다. 공간 문제가 아니다.
+
+SYS@orcl> !df -h /u02/arch1
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb1        30G   12G   18G  40% /u02
+
+-- 공간도 충분하다.
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         28 NO  ACTIVE
+         3         29 NO  CURRENT
+         4         27 YES INACTIVE
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE status IS NOT NULL;
+
+    GROUP# MEMBER                                       STATUS
+---------- -------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log      INVALID
+         1 /u02/oradata/ORCL/redo01b.log                INVALID
+
+-- 판정
+--   ① 원인 : 리두 파일 부재 (아카이브 대상 문제 아님)
+--   ② 손상 그룹 : 1번, 상태 ACTIVE, ARCHIVED NO
+--   ③ 멤버 : 전손
+--   → 아카이브할 원본이 없으므로 CLEAR로 처리한다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 먼저 밀린 아카이브를 처리해 본다. 대상이 정상이므로 될 수도 있다.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG ALL;
+ALTER SYSTEM ARCHIVE LOG ALL
+*
+ERROR at line 1:
+ORA-16038: log 1 sequence# 28 cannot be archived
+ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/ORCL/redo01.log'
+ORA-27037: unable to obtain file status
+
+-- << 원인 파악 >>
+-- 아카이브 대상은 정상인데도 실패했다.
+-- 아카이브할 원본 파일 자체가 없기 때문이다.
+-- 이 두 확인으로 파일 부재가 원인임이 확정되었다.
+
+-- 일반 CLEAR로 처리해 본다.
+
+SYS@orcl> ALTER DATABASE CLEAR LOGFILE GROUP 1;
+ALTER DATABASE CLEAR LOGFILE GROUP 1
+*
+ERROR at line 1:
+ORA-00350: log 1 of instance orcl (thread 1) needs to be archived
+ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/ORCL/redo01.log'
+
+-- << 원인 파악 >>
+-- ARCHIVED가 NO이므로 아직 아카이브되지 않은 그룹이다.
+-- Oracle은 아카이브되지 않은 리두를 그냥 버리지 못하게 막는다.
+-- 그러나 이 그룹은 파일이 없어 아카이브할 방법이 없다.
+-- 위에서 두 가지를 확인했으므로 UNARCHIVED 옵션이 정당하다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 1;
+ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 1
+*
+ERROR at line 1:
+ORA-01624: log 1 needed for crash recovery of instance orcl (thread 1)
+ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/ORCL/redo01.log'
+
+-- << 원인 파악 >>
+-- 그룹 1이 ACTIVE 상태다. 아직 체크포인트가 완료되지 않아
+-- 그 리두 내용이 인스턴스 복구에 필요한 상태다.
+-- 체크포인트를 강제하면 INACTIVE로 내려간다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER SYSTEM CHECKPOINT;
+
+System altered.
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         28 NO  INACTIVE
+         3         29 NO  CURRENT
+         4         27 YES INACTIVE
+
+SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 1;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1          0 YES UNUSED
+         3         29 NO  CURRENT
+         4         27 YES INACTIVE
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile ORDER BY group#;
+
+    GROUP# MEMBER                                       STATUS
+---------- -------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log
+         1 /u02/oradata/ORCL/redo01b.log
+         3 /u01/app/oracle/oradata/ORCL/redo03.log
+         3 /u02/oradata/ORCL/redo03b.log
+         4 /u01/app/oracle/oradata/ORCL/redo04.log
+         4 /u02/oradata/ORCL/redo04b.log
+
+-- 파일이 다시 만들어졌고 STATUS도 정상이다.
+
+-- 업무용 세션의 INSERT가 진행된다.
+
+SYS@orcl> SELECT event, COUNT(*) FROM v$session
+  2  WHERE  wait_class <> 'Idle' GROUP BY event;
+
+no rows selected
+
+-- 대기가 사라졌다.
+
+SYS@orcl> SELECT id, memo FROM hr.emp125 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 normal
+         2 after switch
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SELECT MAX(sequence#) FROM v$archived_log WHERE status = 'A';
+
+MAX(SEQUENCE#)
+--------------
+            30
+
+-- 아카이브가 다시 만들어진다. 시퀀스 28은 영구히 빠졌다.
+
+SYS@orcl> SELECT sequence#, status FROM v$archived_log
+  2  WHERE  sequence# BETWEEN 26 AND 30 ORDER BY sequence#;
+
+ SEQUENCE# S
+---------- -
+        26 A
+        27 A
+        29 A
+        30 A
+
+-- 28이 없다. 이 지점 이전의 백업본은 이제 이 지점을 넘어 복구할 수 없다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch12 && mkdir -p /home/oracle/backup/ch12
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch12/
+SYS@orcl> !rm -f /home/oracle/backup/ch12/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) 정지 상태의 원인은 두 가지이며 증상이 같다.
+--    리두 파일 문제라면 ORA-00312·00313이 나오고
+--    아카이브 대상 문제라면 ORA-19809·16038 계열이 나온다.
+--    alert log의 오류 코드로 먼저 구분한다.
+--
+-- 2) v$archive_dest 의 STATUS와 df 로 아카이브 대상을 확인한다.
+--    VALID이고 공간이 충분하면 대상 문제가 아니다.
+--
+-- 3) ORA-00350이 나오면 ARCHIVED가 NO인 이유를 확인한다.
+--    대상 문제로 밀린 것이면 대상을 고쳐 처리하면 손실이 없다.
+--    파일이 없어 아카이브할 수 없는 경우에만 UNARCHIVED가 정당하다.
+--
+-- 4) ORA-01624는 그룹이 ACTIVE라는 뜻이다.
+--    ALTER SYSTEM CHECKPOINT 로 INACTIVE로 내린 뒤 CLEAR 한다.
+--    ORA-00350과 ORA-01624는 원인이 다르므로 조치도 다르다.
+--
+-- 5) CLEAR UNARCHIVED 로 버려진 시퀀스는 아카이브 연속성을 끊는다.
+--    그 이전 백업본으로는 이 지점을 넘어 복구할 수 없다.
+--    수행 직후 반드시 전체 백업을 다시 받는다.
+--
+-- 6) 이 사례는 아카이브 대상 문제라면 조치가 전혀 달랐다.
+--    공간 확보 후 ALTER SYSTEM ARCHIVE LOG ALL 로 손실 없이 해결된다.
+--    확인 없이 CLEAR UNARCHIVED 를 수행하면 불필요한 손실을 만든다.

@@ -1,0 +1,274 @@
+================================================================================
+ 실습 6-3 : 사본 일부 손상 — 복사와 파라미터 조정
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 18분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 컨트롤파일 사본 세 벌 중 하나가 유실되었다.
+-- 사본끼리 완전히 동일하므로 복사만으로 손실 없이 끝난다.
+-- 디스크를 당장 쓸 수 없는 상황을 가정해 파라미터 조정 우회도 함께 수행한다.
+-- 컨트롤파일 장애 중 유일하게 손실이 없는 경로다.
+-- 복구 유형 : 복구 불필요(사본 복사)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 컨트롤파일이 세 벌로 다중화되어 있어야 한다.
+-- 최소 두 개의 서로 다른 파일 시스템(/u01, /u02)에 배치되어 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+SYS@orcl> COL value FOR a60
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name FROM v$controlfile;
+
+NAME
+------------------------------------------------
+/u01/app/oracle/oradata/ORCL/control01.ctl
+/u01/app/oracle/oradata/ORCL/control02.ctl
+/u02/oradata/ORCL/control03.ctl
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+-rw-r-----. 1 oracle oinstall 18726912 May 10 16:10 /u01/.../control01.ctl
+-rw-r-----. 1 oracle oinstall 18726912 May 10 16:10 /u01/.../control02.ctl
+-rw-r-----. 1 oracle oinstall 18726912 May 10 16:10 /u02/oradata/ORCL/control03.ctl
+
+-- 크기와 수정 시각이 모두 같다. 동시에 기록되기 때문이다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 사본 하나 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/control01.ctl
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+/u01/app/oracle/oradata/ORCL/control02.ctl
+/u02/oradata/ORCL/control03.ctl
+
+-- 두 벌은 그대로다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+ORA-00205: error in identifying control file, check alert log for more info
+
+-- 두 벌이 멀쩡한데도 기동되지 않는다.
+-- 나열된 경로 중 하나라도 열 수 없으면 MOUNT가 거부되기 때문이다.
+
+SYS@orcl> !tail -4 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+ORA-00210: cannot open the specified control file
+ORA-00202: control file: '/u01/app/oracle/oradata/ORCL/control01.ctl'
+ORA-27037: unable to obtain file status
+ORA-205 signalled during: ALTER DATABASE   MOUNT...
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SHOW PARAMETER control_files
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+control_files                        string      /u01/app/oracle/oradata/ORCL/co
+                                                 ntrol01.ctl, /u01/app/oracle/or
+                                                 adata/ORCL/control02.ctl, /u02/
+                                                 oradata/ORCL/control03.ctl
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/control02.ctl /u02/oradata/ORCL/control03.ctl
+-rw-r-----. 1 oracle oinstall 18726912 May 10 16:12 /u01/.../control02.ctl
+-rw-r-----. 1 oracle oinstall 18726912 May 10 16:12 /u02/oradata/ORCL/control03.ctl
+
+-- 판정
+--   ① 사본 : 두 벌 생존 → 복사 경로 가능
+--   ② 남은 사본의 크기·시각이 동일 → ORA-00214 위험 없음
+--   → 살아 있는 사본을 없어진 경로로 복사하면 끝난다. 손실 없음.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 인스턴스를 내리지 않고 복사해 본다.
+
+SYS@orcl> !cp /u02/oradata/ORCL/control03.ctl \
+              /u01/app/oracle/oradata/ORCL/control01.ctl
+
+SYS@orcl> ALTER DATABASE MOUNT;
+ALTER DATABASE MOUNT
+*
+ERROR at line 1:
+ORA-00600: internal error code, arguments: [kccsbck_first], [2], [1129851648]
+
+-- << 원인 파악 >>
+-- STARTED 상태로 남아 있던 인스턴스가 이전 시도의 상태를 들고 있다.
+-- 또한 cp 에 -p 를 붙이지 않아 파일 권한이 달라졌다.
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/control01.ctl
+-rw-r--r--. 1 oracle oinstall 18726912 May 10 16:15 control01.ctl
+
+-- 다른 사본은 640인데 이 파일만 644다.
+-- 권한 문제는 즉시 드러나지 않아도 이후 운영에서 문제가 된다.
+-- 복사는 반드시 인스턴스를 완전히 내린 뒤 -p 옵션으로 수행해야 한다.
+
+-- << 수정 >>
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/control01.ctl
+SYS@orcl> !cp -p /u02/oradata/ORCL/control03.ctl \
+                 /u01/app/oracle/oradata/ORCL/control01.ctl
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/*.ctl
+-rw-r-----. 1 oracle oinstall 18726912 May 10 16:12 control01.ctl
+-rw-r-----. 1 oracle oinstall 18726912 May 10 16:12 control02.ctl
+
+-- 권한과 시각이 나머지 사본과 같아졌다.
+
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+Database opened.
+
+SYS@orcl> SELECT name FROM v$controlfile;
+
+NAME
+------------------------------------------------
+/u01/app/oracle/oradata/ORCL/control01.ctl
+/u01/app/oracle/oradata/ORCL/control02.ctl
+/u02/oradata/ORCL/control03.ctl
+
+-- 복구 명령도 RESETLOGS도 없었다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT resetlogs_change# FROM v$database;
+
+RESETLOGS_CHANGE#
+-----------------
+          2382140
+
+-- 실습 6-2와 같은 값이다. 인카네이션이 올라가지 않았다.
+
+-- ─────────────────────────────────────────────────────────────
+-- 추가 시나리오 : /u01 디스크를 당장 쓸 수 없는 경우
+-- ─────────────────────────────────────────────────────────────
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/control01.ctl
+
+-- 디스크 점검이 진행 중이라 /u01에 쓸 수 없다고 가정한다.
+
+SYS@orcl> STARTUP NOMOUNT
+ORACLE instance started.
+
+SYS@orcl> ALTER SYSTEM SET control_files =
+  2    '/u01/app/oracle/oradata/ORCL/control02.ctl',
+  3    '/u02/oradata/ORCL/control03.ctl' SCOPE=SPFILE;
+
+System altered.
+
+SYS@orcl> ALTER DATABASE MOUNT;
+ALTER DATABASE MOUNT
+*
+ERROR at line 1:
+ORA-00205: error in identifying control file, check alert log for more info
+
+-- 파라미터를 바꿨는데도 같은 오류다.
+-- SCOPE=SPFILE 은 다음 기동부터 적용된다. 현재 인스턴스는 예전 값을 들고 있다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+Database opened.
+
+SYS@orcl> SELECT name FROM v$controlfile;
+
+NAME
+------------------------------------------------
+/u01/app/oracle/oradata/ORCL/control02.ctl
+/u02/oradata/ORCL/control03.ctl
+
+-- 두 벌로 서비스가 재개되었다. 임시 조치다.
+
+-- 디스크 복구 후 원상 복구
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !cp -p /u02/oradata/ORCL/control03.ctl \
+                 /u01/app/oracle/oradata/ORCL/control01.ctl
+
+SYS@orcl> STARTUP NOMOUNT
+SYS@orcl> ALTER SYSTEM SET control_files =
+  2    '/u01/app/oracle/oradata/ORCL/control01.ctl',
+  3    '/u01/app/oracle/oradata/ORCL/control02.ctl',
+  4    '/u02/oradata/ORCL/control03.ctl' SCOPE=SPFILE;
+System altered.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP
+
+SYS@orcl> SELECT COUNT(*) AS cf_count FROM v$controlfile;
+
+  CF_COUNT
+----------
+         3
+
+-- 세 벌로 돌아왔다.
+
+-- 실무 포인트
+-- 1) 사본이 하나라도 살아 있으면 복사만으로 끝난다.
+--    복구 명령도, RESETLOGS도, 데이터 손실도 없다.
+--    나머지 절의 복잡한 절차는 모두 '사본이 없을 때'의 이야기다.
+--
+-- 2) 복사는 인스턴스를 완전히 내린 뒤 cp -p 로 수행한다.
+--    -p 를 빠뜨리면 권한과 소유자가 달라져 나중에 문제가 된다.
+--    열린 상태에서 복사하면 그 사이 갱신이 일어나 사본 간 불일치가 생길 수 있다.
+--
+-- 3) SCOPE=SPFILE 변경은 다음 기동부터 적용된다.
+--    변경 직후 ALTER DATABASE MOUNT 를 시도하면 같은 오류가 반복된다.
+--    반드시 인스턴스를 내렸다 다시 올려야 한다.
+--
+-- 4) 파라미터 조정은 어디까지나 임시 조치다.
+--    사본이 줄어든 만큼 다음 장애에 취약해진다.
+--    작업 로그에 '원복 필요' 항목으로 남기고 정기 점검에 사본 수 확인을 넣는다.
+--
+-- 5) 이 실습의 결론은 절차가 아니라 예방이다.
+--    2장에서 다룬 다중화 배치가 컨트롤파일 보호의 1차 방어선이며,
+--    서로 다른 물리 디스크에 세 벌을 두면 대부분의 장애가 이 경로에서 끝난다.
+--
+-- 6) 남은 사본들의 크기와 수정 시각을 먼저 확인하는 습관을 들인다.
+--    값이 다르면 ORA-00214 상황이므로 최신본 판별이 먼저다.
+
+SYS@orcl> EXIT

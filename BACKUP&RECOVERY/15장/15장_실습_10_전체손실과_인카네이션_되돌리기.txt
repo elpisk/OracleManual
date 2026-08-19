@@ -1,0 +1,320 @@
+================================================================================
+ 실습 15-10 : 전체 손실 복구와 인카네이션 되돌리기
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 40분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 데이터파일·리두·컨트롤파일이 모두 사라진 상황을 RMAN으로 복구한다.
+-- RECOVER가 마지막 아카이브까지 적용한 뒤 RMAN-06054로 멈추는 것을 확인한다.
+-- 이어서 복구 시점을 잘못 잡은 상황을 만들고 인카네이션을 되돌린다.
+-- 12장의 전체 손실 복구와 대응시켜 확인한다.
+-- 복구 유형 : 불완전 복구(마지막 아카이브까지) + 인카네이션 되돌리기
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 15-9까지 완료되어 있어야 한다.
+-- 백업과 아카이브가 데이터 디스크와 분리되어 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'BASE_1510';
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ ls -d /home/oracle/rmanbk /u02/arch1
+/home/oracle/rmanbk
+/u02/arch1
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT dbid FROM v$database;
+
+      DBID
+----------
+1200530011
+
+SYS@orcl> CREATE TABLE hr.rec1510(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.rec1510 VALUES (1, 'archived');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@orcl> INSERT INTO hr.rec1510 VALUES (2, 'only in current redo');
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT MAX(sequence#) FROM v$archived_log WHERE status = 'A';
+
+MAX(SEQUENCE#)
+--------------
+            48
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 전체 손실
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u03/oradata/ORCL/*.dbf
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+
+SYS@orcl> !ls /u02/arch1/*.dbf | wc -l
+48
+
+SYS@orcl> !ls /home/oracle/rmanbk/*.bkp | wc -l
+14
+
+-- 백업과 아카이브는 남아 있다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+
+ORACLE instance started.
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+STARTED
+
+SYS@orcl> EXIT
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ ls /u03/oradata/ORCL/*.dbf 2>/dev/null | wc -l
+0
+[oracle@oel7v9r1 ~]$ ls /u01/app/oracle/oradata/ORCL/*.log 2>/dev/null | wc -l
+0
+[oracle@oel7v9r1 ~]$ ls /u01/app/oracle/oradata/ORCL/*.ctl 2>/dev/null | wc -l
+0
+
+-- 세 종류가 모두 없다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: ORCL (not mounted)
+connected to recovery catalog database
+
+-- 판정
+--   ① 컨트롤파일 : 카탈로그로 복원 가능
+--   ② 아카이브 : 48까지 있음
+--   ③ CURRENT 리두 : 전손 → 시퀀스 49 구간 손실 확정
+--   → 마지막 아카이브까지 복구되는 불완전 복구, RESETLOGS 필요
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+RMAN> RESTORE CONTROLFILE;
+
+Starting restore at 17-MAY-25
+channel ORA_DISK_1: restoring control file
+output file name=/u01/app/oracle/oradata/ORCL/control01.ctl
+output file name=/u01/app/oracle/oradata/ORCL/control02.ctl
+output file name=/u02/oradata/ORCL/control03.ctl
+Finished restore at 17-MAY-25
+
+RMAN> ALTER DATABASE MOUNT;
+
+Statement processed
+
+RMAN> RESTORE DATABASE;
+
+Starting restore at 17-MAY-25
+channel ORA_DISK_1: restoring datafile 00001 to /u03/oradata/ORCL/system01.dbf
+channel ORA_DISK_2: restoring datafile 00003 to /u03/oradata/ORCL/sysaux01.dbf
+Finished restore at 17-MAY-25
+
+RMAN> RECOVER DATABASE;
+
+Starting recover at 17-MAY-25
+starting media recovery
+archived log file name=/u02/arch1/1_47_1190530011.dbf thread=1 sequence=47
+archived log file name=/u02/arch1/1_48_1190530011.dbf thread=1 sequence=48
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of recover command at 05/17/2025 10:41:22
+RMAN-06054: media recovery requesting unknown archived log for thread 1
+ with sequence 49 and starting SCN of 2672400
+
+-- << 원인 파악 >>
+-- 시퀀스 49는 아카이브되지 않은 CURRENT 리두의 내용이다.
+-- 온라인 리두도 함께 사라져 이 구간은 어디에도 없다.
+-- 오류처럼 보이지만 도달 가능한 한계에 이르렀다는 신호다.
+-- 12장에서 UNTIL CANCEL 후 CANCEL을 입력하던 상황과 같다.
+
+-- << 수정 >> RESETLOGS로 마무리한다.
+
+RMAN> ALTER DATABASE OPEN RESETLOGS;
+
+Statement processed
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT id, memo FROM hr.rec1510 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 archived
+
+-- 2번 행이 없다. CURRENT 리두에만 있던 변경이 손실되었다.
+
+SYS@orcl> SELECT TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#),
+  2    'YYYY-MM-DD HH24:MI:SS') AS recovered_time FROM v$database;
+
+RECOVERED_TIME
+-------------------
+2025-05-17 10:33:18
+
+-- 이 시각 이후가 재처리 대상이다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트 — 인카네이션 되돌리기
+--------------------------------------------------------------------------------
+-- 복구 후 시점을 더 앞으로 잡았어야 함이 드러난 상황을 가정한다.
+-- 예를 들어 손실 구간에 잘못된 배치가 포함되어 있었다면
+-- 그 이전 시점으로 다시 가야 한다.
+
+SYS@orcl> EXIT
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> LIST INCARNATION;
+
+DB Key  Inc Key DB Name  DB ID       STATUS  Reset SCN  Reset Time
+------- ------- -------- ----------- ------- ---------- ----------
+1       22      ORCL     1200530011  ORPHAN  2650201    16-MAY-25
+1       27      ORCL     1200530011  PARENT  2661201    17-MAY-25
+1       33      ORCL     1200530011  CURRENT 2672401    17-MAY-25
+
+-- 현재 인카네이션은 33이다.
+-- 27로 되돌려 그 이전 시점으로 복구할 수 있다.
+
+RMAN> SHUTDOWN IMMEDIATE
+RMAN> STARTUP MOUNT
+
+RMAN> RUN {
+  2>   SET UNTIL SCN 2670000;
+  3>   RESTORE DATABASE;
+  4>   RECOVER DATABASE;
+  5> }
+
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 05/17/2025 11:02:41
+RMAN-20208: UNTIL CHANGE is before RESETLOGS change
+
+-- << 원인 파악 >>
+-- 지정한 SCN이 현재 인카네이션의 시작보다 앞선다.
+-- 현재 인카네이션에서는 그 시점의 아카이브를 쓸 수 없다.
+-- 이전 인카네이션으로 되돌려야 그 백업과 아카이브를 사용할 수 있다.
+
+-- << 수정 >>
+
+RMAN> RESET DATABASE TO INCARNATION 27;
+
+database reset to incarnation 27
+
+RMAN> RUN {
+  2>   SET UNTIL SCN 2670000;
+  3>   RESTORE DATABASE;
+  4>   RECOVER DATABASE;
+  5> }
+
+executing command: SET until clause
+
+Starting restore at 17-MAY-25
+channel ORA_DISK_1: restoring datafile 00001 to /u03/oradata/ORCL/system01.dbf
+Finished restore at 17-MAY-25
+
+Starting recover at 17-MAY-25
+starting media recovery
+archived log file name=/u02/arch1/1_46_1190530011.dbf thread=1 sequence=46
+media recovery complete, elapsed time: 00:00:04
+Finished recover at 17-MAY-25
+
+RMAN> ALTER DATABASE OPEN READ ONLY;
+
+Statement processed
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT COUNT(*) FROM hr.rec1510;"
+
+  COUNT(*)
+----------
+         1
+
+-- 원하는 시점인지 확인한 뒤 RESETLOGS로 연다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> SHUTDOWN IMMEDIATE
+RMAN> STARTUP MOUNT
+RMAN> ALTER DATABASE OPEN RESETLOGS;
+
+Statement processed
+
+RMAN> LIST INCARNATION;
+
+DB Key  Inc Key DB Name  DB ID       STATUS  Reset SCN  Reset Time
+------- ------- -------- ----------- ------- ---------- ----------
+1       27      ORCL     1200530011  PARENT  2661201    17-MAY-25
+1       33      ORCL     1200530011  ORPHAN  2672401    17-MAY-25
+1       38      ORCL     1200530011  CURRENT 2670001    17-MAY-25
+
+-- 33번이 ORPHAN이 되었다. 그 갈래는 더 이상 이어지지 않는다.
+
+RMAN> RESYNC CATALOG;
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'AFTER_INCARNATION';
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT COUNT(*) FROM v\$tempfile; SELECT * FROM v\$recover_file;"
+
+  COUNT(*)
+----------
+         1
+
+no rows selected
+
+-- 실무 포인트
+-- 1) 전체 손실도 명령 네 줄로 끝난다.
+--    RESTORE CONTROLFILE → MOUNT → RESTORE DATABASE → RECOVER DATABASE 다.
+--    12장의 User Managed 절차와 비교하면 차이가 크다.
+--
+-- 2) RMAN-06054는 오류가 아니라 신호다.
+--    적용할 아카이브가 더 없다는 뜻이며 도달 가능한 한계에 이른 것이다.
+--    12장의 UNTIL CANCEL 후 CANCEL 입력과 같은 상황이다.
+--
+-- 3) 손실은 마지막 아카이브 이후 구간이다.
+--    백업 스크립트 마지막에 ALTER SYSTEM ARCHIVE LOG CURRENT 를 넣거나
+--    PLUS ARCHIVELOG 를 쓰면 이 구간이 줄어든다.
+--
+-- 4) RESETLOGS 후 그 이전 시점으로 가려면 인카네이션을 되돌려야 한다.
+--    RMAN-20208은 지정한 SCN이 현재 인카네이션의 시작보다 앞선다는 뜻이다.
+--    RESET DATABASE TO INCARNATION n 으로 해결한다.
+--
+-- 5) 되돌린 뒤 다른 갈래로 열면 그 인카네이션은 ORPHAN이 된다.
+--    더 이상 이어지지 않는 갈래이며 이력에는 남는다.
+--
+-- 6) 인카네이션 관리는 카탈로그가 있을 때 특히 안정적이다.
+--    nocatalog 환경에서는 컨트롤파일 기록 수명 안에서만 가능하다.
+--    복구 후에는 RESYNC CATALOG 와 전체 백업을 반드시 수행한다.

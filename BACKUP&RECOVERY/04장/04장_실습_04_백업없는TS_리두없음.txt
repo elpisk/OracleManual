@@ -1,0 +1,261 @@
+================================================================================
+ 실습 4-4 : 백업 받지 않은 테이블스페이스 — 리두 없음
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 백업 이후 만든 테이블스페이스의 데이터 파일이 유실되었고, 리두도 이미 덮어써졌다.
+-- CREATE DATAFILE로 빈 파일을 만들어도 채울 리두가 없다.
+-- 그 테이블스페이스만 버리고 나머지를 최신 상태로 살린다.
+-- 복구 유형 : 부분 포기(해당 테이블스페이스 데이터 전체 손실, 나머지는 최신)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- NOARCHIVELOG 모드여야 한다.
+-- 실습 4-3 종료 후 백업을 새로 받았으므로, 이번에는 그 이후에 다시 테이블스페이스를 만든다.
+-- 리두를 소진시키기 위해 로그 스위치를 그룹 수보다 많이 수행한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2352910
+
+SYS@orcl> CREATE TABLESPACE tbs2
+  2    DATAFILE '/u01/app/oracle/oradata/ORCL/tbs02.dbf' SIZE 10M;
+
+Tablespace created.
+
+SYS@orcl> CREATE TABLE hr.emp2(id NUMBER) TABLESPACE tbs2;
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp2 VALUES (1);
+1 row created.
+
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT file#, name, creation_change# FROM v$datafile WHERE file# = 9;
+
+     FILE# NAME                                       CREATION_CHANGE#
+---------- ------------------------------------------ ----------------
+         9 /u01/app/oracle/oradata/ORCL/tbs02.dbf              2353104
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 리두 소진 후 파일 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+SYS@orcl> /
+System altered.
+SYS@orcl> /
+System altered.
+SYS@orcl> /
+System altered.
+SYS@orcl> /
+System altered.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2354220
+
+-- 생성 SCN(2353104) < 최소 리두 SCN(2354220)
+-- 테이블스페이스 생성 시점의 리두가 이미 덮어써졌다.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/tbs02.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp2;
+SELECT COUNT(*) FROM hr.emp2
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 9
+ORA-01110: data file 9: '/u01/app/oracle/oradata/ORCL/tbs02.dbf'
+ORA-27041: unable to open file
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         9 FILE NOT FOUND                 0
+
+SYS@orcl> SELECT MIN(first_change#) FROM v$log;
+
+MIN(FIRST_CHANGE#)
+------------------
+           2354220
+
+-- 판정 : 생성 SCN보다 현존 리두 구간이 뒤에 있다. 복구 불가.
+-- 선택지는 두 가지다.
+--   전체를 백업 시점으로 되돌린다 → tbs2는 사라지고 다른 데이터도 최신을 잃는다
+--   tbs2만 버린다 → tbs2 데이터만 잃고 나머지는 최신 유지
+-- 손실이 적은 두 번째를 택한다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_44
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /u01/app/oracle/oradata/ORCL/*.log \
+                 /home/oracle/before_recover_44/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 먼저 CREATE DATAFILE + RECOVER를 시도해 실제로 막히는 것을 확인한다.
+
+SYS@orcl> SHUTDOWN ABORT
+SYS@orcl> STARTUP MOUNT
+Database mounted.
+
+SYS@orcl> ALTER DATABASE CREATE DATAFILE
+  2    '/u01/app/oracle/oradata/ORCL/tbs02.dbf'
+  3    AS '/u01/app/oracle/oradata/ORCL/tbs02.dbf';
+
+Database altered.
+
+SYS@orcl> SET AUTORECOVERY OFF
+SYS@orcl> RECOVER DATAFILE 9;
+ORA-00279: change 2353104 generated at 05/09/2025 17:02:44 needed for thread 1
+ORA-00289: suggestion : /u01/app/oracle/product/19.3.0/dbhome_1/dbs/arch1_53_1200525254.dbf
+ORA-00280: change 2353104 for thread 1 is in sequence #53
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+CANCEL
+ORA-01547: warning: RECOVER succeeded but OPEN RESETLOGS would get error below
+ORA-01194: file 9 needs more recovery to be consistent
+ORA-01110: data file 9: '/u01/app/oracle/oradata/ORCL/tbs02.dbf'
+
+-- 빈 파일은 만들어졌으나 채울 리두가 없다.
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01113: file 9 needs media recovery
+ORA-01110: data file 9: '/u01/app/oracle/oradata/ORCL/tbs02.dbf'
+
+-- 이 파일 하나 때문에 데이터베이스 전체가 열리지 않는다.
+
+-- << 오류 발생 : DROP TABLESPACE를 먼저 시도 >>
+-- 데이터베이스를 열어야 DROP TABLESPACE를 쓸 수 있는데 열리지 않는 상황이다.
+-- 순서를 바꿔 파일을 먼저 떼어 낸다.
+
+-- << 원인 파악 >>
+-- ORA-01113은 그 파일이 복구되지 않았다는 뜻이다.
+-- 복구할 수 없는 파일이 목록에 남아 있으면 데이터베이스는 열리지 않는다.
+-- 따라서 그 파일을 데이터베이스에서 떼어 내야 한다.
+-- NOARCHIVELOG에서는 OFFLINE이 금지되므로 OFFLINE DROP을 쓴다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER DATABASE DATAFILE 9 OFFLINE;
+ALTER DATABASE DATAFILE 9 OFFLINE
+*
+ERROR at line 1:
+ORA-01145: offline immediate disallowed unless media recovery enabled
+
+SYS@orcl> ALTER DATABASE DATAFILE 9 OFFLINE DROP;
+
+Database altered.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 9;
+
+     FILE# NAME                                       STATUS
+---------- ------------------------------------------ -------
+         9 /u01/app/oracle/oradata/ORCL/tbs02.dbf     RECOVER
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- 열렸다. 이제 딕셔너리를 정리할 수 있다.
+
+SYS@orcl> DROP TABLESPACE tbs2 INCLUDING CONTENTS AND DATAFILES;
+
+Tablespace dropped.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT tablespace_name FROM dba_tablespaces ORDER BY 1;
+
+TABLESPACE_NAME
+---------------
+SYSAUX
+SYSTEM
+TBS
+TEMP
+UNDOTBS1
+USERS
+
+-- TBS2가 사라졌다. 나머지는 그대로다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp1;
+
+  COUNT(*)
+----------
+         2
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+-- 다른 테이블스페이스의 데이터는 최신 상태로 유지되었다.
+-- 전체 복원을 택했다면 이 데이터도 백업 시점으로 되돌아갔을 것이다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp2;
+SELECT COUNT(*) FROM hr.emp2
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- emp2는 테이블스페이스와 함께 사라졌다. 예상된 손실이다.
+
+-- 실무 포인트
+-- 1) 순서가 핵심이다. OFFLINE DROP → OPEN → DROP TABLESPACE 순으로 진행한다.
+--    OPEN 상태에서 DROP TABLESPACE를 먼저 시도하면 세그먼트 정보를 읽어야 하는데
+--    데이터 파일을 열 수 없어 실패한다.
+--
+-- 2) OFFLINE이 아니라 OFFLINE DROP을 써야 한다(ORA-01145).
+--    NOARCHIVELOG에서는 미디어 복구가 비활성이라 OFFLINE이 허용되지 않는다.
+--
+-- 3) OFFLINE DROP은 파일을 지우지 않는다. STATUS를 RECOVER로 바꿀 뿐이다.
+--    실제 정리는 DROP TABLESPACE ... INCLUDING CONTENTS AND DATAFILES가 한다.
+--
+-- 4) 복구 불가 파일 하나가 데이터베이스 전체의 오픈을 막는다.
+--    그것을 떼어 내는 것이 서비스 재개의 유일한 길인 경우가 있다.
+--
+-- 5) 손실 범위를 정확히 파악해 통보한다.
+--    이 경우 "TBS2 테이블스페이스의 모든 객체"가 손실 범위이며,
+--    dba_segments를 미리 조회해 두었다면 어떤 객체가 있었는지 목록을 제시할 수 있다.
+--
+-- 6) 근본 원인은 테이블스페이스 생성 후 백업을 받지 않은 것이다.
+--    구조 변경 직후 전체 백업을 받는 원칙이 지켜졌다면 완전 복구가 가능했다.
+
+SYS@orcl> EXIT

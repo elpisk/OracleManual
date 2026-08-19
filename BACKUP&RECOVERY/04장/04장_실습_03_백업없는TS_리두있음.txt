@@ -1,0 +1,252 @@
+================================================================================
+ 실습 4-3 : 백업 받지 않은 테이블스페이스 — 리두 있음
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 백업 이후에 만든 테이블스페이스의 데이터 파일이 유실되었다.
+-- 백업본에는 그 파일이 아예 없어 복원할 원본이 존재하지 않는다.
+-- CREATE TABLESPACE 자체가 리두에 기록되므로, 빈 파일을 만든 뒤 리두로 채운다.
+-- 복구 유형 : 완전 복구
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- NOARCHIVELOG 모드여야 한다.
+-- /home/oracle/backup/ch04 백업본이 있어야 한다.
+-- 백업 이후 테이블스페이스를 새로 만들고, 로그 스위치는 최소화한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+SYS@orcl> COL file_name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2350118
+
+-- 백업본의 SCN이다. 아직 실습 4-2 직후 상태다.
+
+SYS@orcl> SELECT tablespace_name, file_id, file_name FROM dba_data_files ORDER BY file_id;
+
+TABLESPACE_NAME    FILE_ID FILE_NAME
+--------------- ---------- ------------------------------------------------
+SYSTEM                   1 /u01/app/oracle/oradata/ORCL/system01.dbf
+SYSAUX                   3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf
+UNDOTBS1                 4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf
+USERS                    7 /u01/app/oracle/oradata/ORCL/users01.dbf
+
+-- 백업 이후 새 테이블스페이스를 만든다.
+
+SYS@orcl> CREATE TABLESPACE tbs
+  2    DATAFILE '/u01/app/oracle/oradata/ORCL/tbs01.dbf' SIZE 10M;
+
+Tablespace created.
+
+SYS@orcl> CREATE TABLE hr.emp1(id NUMBER, name VARCHAR2(30)) TABLESPACE tbs;
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp1 VALUES (1, 'KIM');
+1 row created.
+
+SYS@orcl> INSERT INTO hr.emp1 VALUES (2, 'LEE');
+1 row created.
+
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp1;
+
+  COUNT(*)
+----------
+         2
+
+SYS@orcl> SELECT file#, name FROM v$datafile WHERE file# = 8;
+
+     FILE# NAME
+---------- ------------------------------------------------
+         8 /u01/app/oracle/oradata/ORCL/tbs01.dbf
+
+-- 백업본에 이 파일이 없다는 것을 확인한다.
+
+SYS@orcl> !ls /home/oracle/backup/ch04/tbs01.dbf
+ls: cannot access '/home/oracle/backup/ch04/tbs01.dbf': No such file or directory
+
+--------------------------------------------------------------------------------
+[4] 장애 유발
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/tbs01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp1;
+SELECT COUNT(*) FROM hr.emp1
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 8
+ORA-01110: data file 8: '/u01/app/oracle/oradata/ORCL/tbs01.dbf'
+ORA-27041: unable to open file
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+-- 다른 테이블스페이스는 정상이다.
+
+--------------------------------------------------------------------------------
+[6] 진단 : 세 줄 점검표
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, log_mode FROM v$database;
+
+NAME      LOG_MODE
+--------- ------------
+ORCL      NOARCHIVELOG
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         8 FILE NOT FOUND                 0
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2350118
+
+-- 이 파일은 백업본에 존재하지 않는다는 점이 앞의 두 실습과 다르다.
+-- 판정 기준은 "테이블스페이스 생성 시점부터의 리두가 남아 있는가"다.
+
+SYS@orcl> SELECT creation_change#, creation_time FROM v$datafile WHERE file# = 8;
+
+CREATION_CHANGE# CREATION_TIME
+---------------- -------------------
+         2350904 2025-05-09 16:31:02
+
+-- 생성 SCN(2350904) >= 최소 리두 SCN(2350118)
+-- 생성 이후의 리두가 살아 있다. 복구가 가능하다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_43
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /u01/app/oracle/oradata/ORCL/*.log \
+                 /home/oracle/before_recover_43/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> STARTUP MOUNT
+Database mounted.
+
+-- 백업본에서 복원하려 해 본다.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch04/tbs01.dbf /u01/app/oracle/oradata/ORCL/
+cp: cannot stat '/home/oracle/backup/ch04/tbs01.dbf': No such file or directory
+
+-- << 원인 파악 >>
+-- 이 파일은 백업 이후에 만들어졌으므로 백업본에 존재하지 않는다.
+-- 복원이라는 방법 자체가 성립하지 않는다.
+-- 대신 빈 파일을 만들고 리두로 채우는 방법을 쓴다.
+-- CREATE TABLESPACE부터의 모든 변경이 리두에 기록되어 있기 때문이다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER DATABASE CREATE DATAFILE
+  2    '/u01/app/oracle/oradata/ORCL/tbs01.dbf'
+  3    AS '/u01/app/oracle/oradata/ORCL/tbs01.dbf';
+
+Database altered.
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/tbs01.dbf
+-rw-r-----. 1 oracle oinstall 10493952 May  9 16:44 /u01/app/oracle/oradata/ORCL/tbs01.dbf
+
+-- 원본과 같은 크기의 빈 파일이 만들어졌다.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         8                          2350904
+
+-- ERROR가 비었다. 이제 복구 대상이다.
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATAFILE 8;
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 8;
+
+     FILE# NAME                                       STATUS
+---------- ------------------------------------------ -------
+         8 /u01/app/oracle/oradata/ORCL/tbs01.dbf     ONLINE
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp1;
+
+  COUNT(*)
+----------
+         2
+
+SYS@orcl> SELECT * FROM hr.emp1 ORDER BY id;
+
+        ID NAME
+---------- ------------------------------
+         1 KIM
+         2 LEE
+
+-- 데이터가 그대로 살아났다. 완전 복구가 성공했다.
+
+-- 백업 대상이 늘었으므로 전체 백업을 새로 받는다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/tbs01.dbf /home/oracle/backup/ch04/
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /u01/app/oracle/oradata/ORCL/*.ctl \
+                 /u01/app/oracle/oradata/ORCL/*.log /home/oracle/backup/ch04/
+SYS@orcl> !rm -f /home/oracle/backup/ch04/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) 백업본에 없는 파일은 복원이 아니라 생성으로 접근한다.
+--    ALTER DATABASE CREATE DATAFILE이 그 수단이며, 빈 파일을 만들고 제어 파일에 등록한다.
+--
+-- 2) 이것이 가능한 이유는 CREATE TABLESPACE 자체가 리두에 기록되기 때문이다.
+--    생성 시점부터의 리두가 남아 있으면 테이블스페이스 전체가 재현된다.
+--
+-- 3) 판정 기준이 조금 다르다. 백업본 SCN이 아니라 v$datafile의 CREATION_CHANGE#와
+--    현존 리두 구간을 비교한다.
+--
+-- 4) AS 절을 생략하면 원래 경로에, 새 경로를 주면 다른 위치에 만든다.
+--    디스크가 손상된 경우 새 경로로 만들고 이어서 RECOVER하면 된다.
+--
+-- 5) 테이블스페이스를 새로 만들면 백업 대상이 늘어난다.
+--    구조 변경 직후 전체 백업을 새로 받는 것이 원칙이며,
+--    받지 않으면 이번과 같은 상황이 반복된다.
+
+SYS@orcl> EXIT

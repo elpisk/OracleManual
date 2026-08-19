@@ -1,0 +1,256 @@
+================================================================================
+ 실습 14-7 : RMAN 백업 암호화 — SET ENCRYPTION ON
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 외부 반출용 백업을 비밀번호 방식으로 암호화한다.
+-- 암호화 여부를 v$backup_set으로 확인한다.
+-- 비밀번호 없이 복원을 시도해 실패를 확인한다.
+-- 복호화 키를 지정한 뒤 복원이 되는 것을 확인한다.
+-- 작업 유형 : 백업 보호(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 14-6까지 완료되어 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> SHOW ENCRYPTION FOR DATABASE;
+
+CONFIGURE ENCRYPTION FOR DATABASE OFF; # default
+
+RMAN> SHOW ENCRYPTION ALGORITHM;
+
+CONFIGURE ENCRYPTION ALGORITHM 'AES128'; # default
+
+-- 기본은 꺼져 있고 알고리즘은 AES128이다.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT recid, encrypted, compressed FROM v\$backup_set
+   ORDER BY recid DESC FETCH FIRST 3 ROWS ONLY;"
+
+     RECID ENC COM
+---------- --- ---
+        58 NO  NO
+        56 NO  NO
+        55 NO  NO
+
+-- 지금까지의 백업은 모두 암호화되지 않았다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT wrl_type, status FROM v\$encryption_wallet;"
+
+WRL_TYPE   STATUS
+---------- ------------------
+FILE       NOT_AVAILABLE
+
+-- 지갑이 구성되어 있지 않다.
+-- 따라서 투명 방식은 쓸 수 없고 비밀번호 방식으로 진행한다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 투명 방식 시도
+--------------------------------------------------------------------------------
+RMAN> CONFIGURE ENCRYPTION FOR DATABASE ON;
+
+new RMAN configuration parameters:
+CONFIGURE ENCRYPTION FOR DATABASE ON;
+new RMAN configuration parameters are successfully stored
+
+RMAN> BACKUP DATAFILE 7 TAG 'TDE_TRY';
+
+Starting backup at 15-MAY-25
+channel ORA_DISK_1: starting full datafile backup set
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03009: failure of backup command on ORA_DISK_1 channel at 05/15/2025
+ORA-19914: unable to encrypt backup
+ORA-28365: wallet is not open
+
+-- << 원인 파악 >>
+-- 투명 암호화는 지갑을 사용한다.
+-- 지갑이 구성되어 있지 않거나 열려 있지 않으면 ORA-28365가 발생한다.
+-- 지갑을 구성하려면 별도 설정과 키 관리가 필요하다.
+-- 이 실습에서는 지갑 없이 쓸 수 있는 비밀번호 방식으로 진행한다.
+
+-- << 수정 >>
+
+RMAN> CONFIGURE ENCRYPTION FOR DATABASE OFF;
+
+RMAN configuration parameters are successfully reset to default value
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 비밀번호 방식 암호화
+--------------------------------------------------------------------------------
+RMAN> SET ENCRYPTION ON IDENTIFIED BY 'Backup#2025' ONLY;
+
+executing command: SET encryption
+
+-- ONLY를 붙이면 비밀번호로만 열 수 있다.
+-- 붙이지 않으면 지갑과 비밀번호 둘 다로 열 수 있는 이중 방식이 된다.
+
+RMAN> BACKUP AS COMPRESSED BACKUPSET DATAFILE 7
+  2>   FORMAT '/home/oracle/rmanbk/enc_%U' TAG 'ENC_EXPORT';
+
+Starting backup at 15-MAY-25
+channel ORA_DISK_1: starting compressed full datafile backup set
+channel ORA_DISK_1: backup set complete, elapsed time: 00:00:05
+piece handle=/home/oracle/rmanbk/enc_0uttqm4d_1_1 tag=ENC_EXPORT
+Finished backup at 15-MAY-25
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT recid, encrypted, compressed, ROUND(bytes/1024/1024,1) AS mb
+   FROM v\$backup_set ORDER BY recid DESC FETCH FIRST 2 ROWS ONLY;"
+
+     RECID ENC COM         MB
+---------- --- --- ----------
+        60 YES YES        1.2
+        58 NO  NO         9.8
+
+-- ENCRYPTED가 YES다. 압축과 암호화가 함께 적용되었다.
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : 백업 조각 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ ls -l /home/oracle/rmanbk/enc_*
+-rw-r-----. 1 oracle oinstall 1310720 May 15 13:04 enc_0uttqm4d_1_1
+
+[oracle@oel7v9r1 ~]$ strings /home/oracle/rmanbk/enc_0uttqm4d_1_1 | head -5
+
+-- 읽을 수 있는 문자열이 거의 나오지 않는다.
+-- 암호화되지 않은 백업 조각과 비교해 본다.
+
+[oracle@oel7v9r1 ~]$ strings /home/oracle/rmanbk/nocomp_0nttqk8s_1_1 | head -5
+ORCL
+SYSTEM
+SYSAUX
+UNDOTBS1
+USERS
+
+-- 암호화하지 않은 조각에서는 테이블스페이스 이름 같은 문자열이 보인다.
+-- 외부로 반출하는 백업에 암호화가 필요한 이유가 여기에 있다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 새 세션에서 비밀번호 없이 복원을 시도한다.
+
+[oracle@oel7v9r1 ~]$ rman target /
+
+RMAN> RESTORE DATAFILE 7 VALIDATE FROM TAG 'ENC_EXPORT';
+
+Starting restore at 15-MAY-25
+channel ORA_DISK_1: starting validation of datafile backup set
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 05/15/2025 13:11:22
+ORA-19870: error while restoring backup piece
+ /home/oracle/rmanbk/enc_0uttqm4d_1_1
+ORA-19913: unable to decrypt backup
+
+-- << 원인 파악 >>
+-- ORA-19913은 백업을 복호화할 수 없다는 뜻이다.
+-- 비밀번호 방식으로 암호화했으므로 같은 비밀번호를 지정해야 한다.
+-- SET ENCRYPTION 은 세션 단위 설정이라 새 세션에는 남아 있지 않다.
+-- 비밀번호를 모르면 어떤 방법으로도 열 수 없다.
+
+-- 잘못된 비밀번호로 시도해 본다.
+
+RMAN> SET DECRYPTION IDENTIFIED BY 'WrongPass';
+RMAN> RESTORE DATAFILE 7 VALIDATE FROM TAG 'ENC_EXPORT';
+
+ORA-19913: unable to decrypt backup
+
+-- 같은 오류가 나온다. 비밀번호가 맞아야만 열린다.
+
+-- << 수정 >>
+
+RMAN> SET DECRYPTION IDENTIFIED BY 'Backup#2025';
+
+executing command: SET decryption
+
+RMAN> RESTORE DATAFILE 7 VALIDATE FROM TAG 'ENC_EXPORT';
+
+Starting restore at 15-MAY-25
+channel ORA_DISK_1: starting validation of datafile backup set
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:02
+Finished restore at 15-MAY-25
+
+-- 복호화 키를 지정하니 정상적으로 읽힌다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+RMAN> LIST BACKUP TAG 'ENC_EXPORT';
+
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ ---------------
+60      Full    1.25M      DISK        00:00:05     15-MAY-25
+        BP Key: 60   Status: AVAILABLE  Compressed: YES  Tag: ENC_EXPORT
+        Piece Name: /home/oracle/rmanbk/enc_0uttqm4d_1_1
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT recid, encrypted, compressed, backup_type
+  2  FROM   v$backup_set WHERE encrypted = 'YES';
+
+     RECID ENC COM B
+---------- --- --- -
+        60 YES YES D
+
+SYS@orcl> SELECT COUNT(*) FROM v$backup_set WHERE encrypted = 'YES';
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> EXIT
+
+-- 여러 세션에서 반복 사용할 백업이라면 스크립트에 키를 넣어야 한다.
+
+[oracle@oel7v9r1 ~]$ cat > /home/oracle/rman/export_backup.rmn <<'EOS'
+SET ENCRYPTION ON IDENTIFIED BY '&1' ONLY;
+BACKUP AS COMPRESSED BACKUPSET DATABASE
+  FORMAT '/home/oracle/rmanbk/export_%U' TAG 'ENC_EXPORT';
+EOS
+
+[oracle@oel7v9r1 ~]$ chmod 600 /home/oracle/rman/export_backup.rmn
+
+-- 비밀번호를 파일에 직접 넣지 않고 치환 변수로 받는다.
+-- 스크립트에 평문으로 넣으면 암호화의 의미가 크게 줄어든다.
+
+-- 실무 포인트
+-- 1) 암호화 방식은 세 가지다.
+--    투명 방식은 지갑을 사용하며 복원 시 자동으로 열린다.
+--    비밀번호 방식은 복원 시 같은 비밀번호가 필요하다.
+--    이중 방식은 둘 다로 열 수 있으며 ONLY를 붙이지 않으면 이 방식이 된다.
+--
+-- 2) 지갑이 없으면 투명 방식은 ORA-28365로 실패한다.
+--    운영에서 상시 암호화를 쓰려면 지갑 구성이 선행되어야 한다.
+--
+-- 3) SET ENCRYPTION 은 세션 단위 설정이다.
+--    새 세션에는 남아 있지 않으므로 복원 시 SET DECRYPTION 을 다시 지정한다.
+--
+-- 4) 비밀번호를 모르면 ORA-19913으로 막히며 우회 방법이 없다.
+--    담당자 퇴사로 비밀번호가 사라져 백업을 열지 못한 사례가 실제로 있다.
+--    암호화는 복원 절차의 일부이므로 비밀번호 보관 위치를 절차서에 남긴다.
+--
+-- 5) 암호화하지 않은 백업 조각에서는 문자열이 그대로 보인다.
+--    외부 반출이나 원격 보관 시 암호화가 필요한 이유다.
+--
+-- 6) 스크립트에 비밀번호를 평문으로 넣지 않는다.
+--    치환 변수로 받거나 지갑 기반 투명 방식으로 전환한다.

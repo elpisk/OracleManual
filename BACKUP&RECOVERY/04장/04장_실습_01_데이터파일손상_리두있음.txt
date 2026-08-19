@@ -1,0 +1,270 @@
+================================================================================
+ 실습 4-1 : 특정 데이터파일 손상 — 리두 있음, 완전 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 일반 테이블스페이스(USERS)의 데이터 파일이 유실되었다.
+-- 백업 이후 로그 스위치가 적어 필요한 리두가 온라인 리두 로그에 남아 있다.
+-- 손상된 파일만 복원하고 리두를 적용해 데이터 손실 없이 복구한다.
+-- 복구 유형 : 완전 복구
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- NOARCHIVELOG 모드여야 한다. 2장에서 전환한 ARCHIVELOG를 되돌린다.
+-- 3장 실습 3-1에서 받은 Cold Backup 백업본이 있어야 한다.
+-- 다른 사용자가 접속하지 않은 개별 환경이어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+-- NOARCHIVELOG로 되돌린다 (2장 실습 2-1의 역순)
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> ALTER DATABASE NOARCHIVELOG;
+Database altered.
+SYS@orcl> ALTER DATABASE OPEN;
+Database altered.
+
+SYS@orcl> SELECT name, log_mode, open_mode FROM v$database;
+
+NAME      LOG_MODE     OPEN_MODE
+--------- ------------ --------------------
+ORCL      NOARCHIVELOG READ WRITE
+
+-- 이 실습 구간을 위한 Cold Backup을 새로 받는다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !mkdir -p /home/oracle/backup/ch04
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /u01/app/oracle/oradata/ORCL/*.ctl \
+                 /u01/app/oracle/oradata/ORCL/*.log /home/oracle/backup/ch04/
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.log /home/oracle/backup/ch04/
+SYS@orcl> !rm -f /home/oracle/backup/ch04/temp01.dbf
+
+SYS@orcl> STARTUP
+Database opened.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2350118
+
+-- 이 값이 백업본의 SCN이다. 판정에 쓰이므로 기록해 둔다.
+
+SYS@orcl> CREATE TABLE hr.emp_temp(id NUMBER) TABLESPACE users;
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp_temp VALUES (1);
+1 row created.
+
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_temp;
+
+  COUNT(*)
+----------
+         1
+
+-- 백업 이후 만든 데이터다. 완전 복구되면 이 값이 살아 있어야 한다.
+
+SYS@orcl> SELECT group#, sequence#, first_change#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# FIRST_CHANGE# STATUS
+---------- ---------- ------------- ----------------
+         1         45       2349904 INACTIVE
+         3         46       2350118 CURRENT
+         4         44       2349511 INACTIVE
+
+-- 로그 스위치를 거의 하지 않았으므로 백업 SCN(2350118)이 리두 구간 안에 있다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/users01.dbf
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/users01.dbf
+ls: cannot access '/u01/app/oracle/oradata/ORCL/users01.dbf': No such file or directory
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_temp;
+SELECT COUNT(*) FROM hr.emp_temp
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 7
+ORA-01110: data file 7: '/u01/app/oracle/oradata/ORCL/users01.dbf'
+ORA-27041: unable to open file
+Linux-x86_64 Error: 2: No such file or directory
+
+-- 데이터베이스는 열려 있고 다른 테이블스페이스는 정상이다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> !tail -5 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Errors in file /u01/app/oracle/diag/rdbms/orcl/orcl/trace/orcl_ora_9214.trc:
+ORA-01116: error in opening database file 7
+ORA-01110: data file 7: '/u01/app/oracle/oradata/ORCL/users01.dbf'
+ORA-27041: unable to open file
+Linux-x86_64 Error: 2: No such file or directory
+
+--------------------------------------------------------------------------------
+[6] 진단 : 세 줄 점검표
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, log_mode, open_mode FROM v$database;
+
+NAME      LOG_MODE     OPEN_MODE
+--------- ------------ --------------------
+ORCL      NOARCHIVELOG READ WRITE
+
+-- NOARCHIVELOG이므로 부분 복구라는 선택지가 없다. MOUNT 상태에서 처리한다.
+
+SYS@orcl> SELECT file#, error, change#, time FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE# TIME
+---------- -------------------- ----------- -------------------
+         7 FILE NOT FOUND                 0
+
+-- 파일이 존재하지 않는다. 복원부터 필요하다.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2349511
+
+-- 백업본 SCN(2350118) >= 최소 리두 SCN(2349511)
+-- 필요한 리두가 살아 있다. 부분 복원 + RECOVER 경로로 간다.
+
+-- 복구 전 현재 상태를 복사해 둔다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_41
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /u01/app/oracle/oradata/ORCL/*.log \
+                 /home/oracle/before_recover_41/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+-- 손상된 파일만 복원한다. 제어 파일과 리두 로그는 건드리지 않는다.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch04/users01.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         7                          2350118
+
+-- ERROR가 비고 CHANGE#만 남았다. 파일은 있으나 백업 시점에서 뒤처져 있다는 뜻이다.
+
+-- << 오류 발생 → 원인 파악 → 수정 >>
+-- 복구를 건너뛰고 바로 열어 본다.
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01113: file 7 needs media recovery
+ORA-01110: data file 7: '/u01/app/oracle/oradata/ORCL/users01.dbf'
+
+-- << 원인 파악 >>
+-- ORA-01113은 복구가 필요하다는 뜻이다.
+-- 복원(restore)만 하고 복구(recover)를 생략했다.
+-- 파일은 제자리에 있지만 SCN이 나머지보다 뒤처져 있어 일관성이 맞지 않는다.
+
+-- << 수정 >>
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATAFILE 7;
+Media recovery complete.
+
+-- 프롬프트 없이 즉시 완료되었다. 필요한 리두가 온라인 리두 로그에 있었다는 뜻이다.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile ORDER BY file#;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf     SYSTEM
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf     ONLINE
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf    ONLINE
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf      ONLINE
+
+SYS@orcl> SELECT d.file#, d.checkpoint_change# AS ctl_scn,
+  2         h.checkpoint_change# AS hdr_scn,
+  3         CASE WHEN d.checkpoint_change# = h.checkpoint_change# THEN 'OK' ELSE 'MISMATCH' END AS result
+  4  FROM   v$datafile d, v$datafile_header h
+  5  WHERE  d.file# = h.file# ORDER BY d.file#;
+
+     FILE#    CTL_SCN    HDR_SCN RESULT
+---------- ---------- ---------- --------
+         1    2350602    2350602 OK
+         3    2350602    2350602 OK
+         4    2350602    2350602 OK
+         7    2350602    2350602 OK
+
+-- 데이터 검증 : 백업 이후 만든 데이터가 살아 있는가
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_temp;
+
+  COUNT(*)
+----------
+         1
+
+-- 살아 있다. 완전 복구가 성공했다.
+
+-- 실무 포인트
+-- 1) 복원과 복구는 별개다. ORA-01113은 "복원만 하고 끝냈다"는 신호다.
+--    RECOVER를 수행해야 파일이 나머지와 같은 시점으로 올라온다.
+--
+-- 2) 복원 대상은 손상된 파일 하나뿐이다.
+--    제어 파일을 함께 되돌리면 이후 추가된 파일 정보가 사라지고,
+--    리두 로그를 덮어쓰면 적용할 재료 자체가 없어진다.
+--
+-- 3) RECOVER가 프롬프트 없이 완료된 것 자체가 완전 복구 성공의 신호다.
+--    ORA-00279와 함께 파일명을 물어보면 그 순간 리두가 부족하다는 판정이 내려진 것이다.
+--
+-- 4) 세 줄 점검표를 먼저 실행하는 습관이 이 실습의 핵심이다.
+--    LOG_MODE / v$recover_file / MIN(first_change#) 셋이면 경로가 정해진다.
+--
+-- 5) 구조 검증(v$recover_file, SCN 일치)만으로는 데이터 보존을 알 수 없다.
+--    복구 전에 기록해 둔 값과 대조하는 단계가 반드시 있어야 한다.
+
+SYS@orcl> EXIT

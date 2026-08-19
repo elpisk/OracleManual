@@ -1,0 +1,285 @@
+================================================================================
+ 실습 14-4 : Block Change Tracking 활성화와 효과 확인
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- BCT를 켜지 않은 상태의 증분 백업 읽기량을 먼저 측정한다.
+-- BCT를 활성화하고 같은 변경량으로 다시 측정해 비교한다.
+-- 활성화 직후 첫 증분이 전체를 읽는다는 점을 확인한다.
+-- BCT 파일을 잃었을 때의 동작과 복구 방법을 확인한다.
+-- 작업 유형 : 백업 최적화(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 14-3이 완료되어 증분 백업 체계가 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT status, filename FROM v$block_change_tracking;
+
+STATUS     FILENAME
+---------- ------------------------------
+DISABLED
+
+-- 아직 꺼져 있다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.incr_test;
+
+  COUNT(*)
+----------
+      2000
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : BCT 없이 증분 백업
+--------------------------------------------------------------------------------
+SYS@orcl> UPDATE hr.incr_test SET pad = RPAD('d', 2000, 'd')
+  2  WHERE  id <= 200;
+
+200 rows updated.
+
+SYS@orcl> COMMIT;
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP INCREMENTAL LEVEL 1 TABLESPACE tbs13 TAG 'NO_BCT';
+
+Starting backup at 15-MAY-25
+channel ORA_DISK_1: starting incremental level 1 datafile backup set
+channel ORA_DISK_1: backup set complete, elapsed time: 00:00:14
+Finished backup at 15-MAY-25
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT file#, incremental_level AS lv, blocks, blocks_read,
+  2         ROUND(blocks_read/datafile_blocks, 2) AS read_ratio
+  3  FROM   v$backup_datafile
+  4  WHERE  file# = 8 AND incremental_level = 1
+  5  ORDER  BY completion_time DESC FETCH FIRST 1 ROWS ONLY;
+
+     FILE# LV     BLOCKS BLOCKS_READ READ_RATIO
+---------- -- ---------- ----------- ----------
+         8  1        412        2560          1
+
+-- 실제로 담은 블록은 412개인데 읽은 블록은 2,560개다.
+-- read_ratio가 1이다. 데이터파일 전체를 읽었다는 뜻이다.
+-- 백업 크기는 줄었지만 읽기 부담은 전체 백업과 같다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : BCT 활성화
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER DATABASE ENABLE BLOCK CHANGE TRACKING
+  2    USING FILE '/u02/oradata/ORCL/bct_orcl.chg' REUSE;
+
+Database altered.
+
+SYS@orcl> SELECT status, filename, bytes/1024/1024 AS mb
+  2  FROM   v$block_change_tracking;
+
+STATUS     FILENAME                                MB
+---------- ------------------------------- ----------
+ENABLED    /u02/oradata/ORCL/bct_orcl.chg          11
+
+SYS@orcl> !ls -l /u02/oradata/ORCL/bct_orcl.chg
+-rw-r-----. 1 oracle oinstall 11599872 May 15 10:22 bct_orcl.chg
+
+-- 최소 크기가 10MB 남짓이다. 데이터베이스 크기의 1/30000 정도가 기준이다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 활성화 직후 첫 증분
+--------------------------------------------------------------------------------
+SYS@orcl> UPDATE hr.incr_test SET pad = RPAD('e', 2000, 'e')
+  2  WHERE  id BETWEEN 201 AND 400;
+SYS@orcl> COMMIT;
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP INCREMENTAL LEVEL 1 TABLESPACE tbs13 TAG 'BCT_FIRST';
+
+Starting backup at 15-MAY-25
+Finished backup at 15-MAY-25
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT blocks_read, ROUND(blocks_read/datafile_blocks,2) AS ratio
+   FROM v\$backup_datafile WHERE file#=8 AND incremental_level=1
+   ORDER BY completion_time DESC FETCH FIRST 1 ROWS ONLY;"
+
+BLOCKS_READ      RATIO
+----------- ----------
+       2560          1
+
+-- 여전히 1이다. 활성화 직후에는 변경 기록이 없어 전체를 읽는다.
+-- 이 시점에 BCT가 동작하지 않는다고 판단하면 오판이다.
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : Level 0 이후 효과 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP INCREMENTAL LEVEL 0 TABLESPACE tbs13 TAG 'L0_AFTER_BCT';
+
+Starting backup at 15-MAY-25
+Finished backup at 15-MAY-25
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> UPDATE hr.incr_test SET pad = RPAD('f', 2000, 'f')
+  2  WHERE  id BETWEEN 401 AND 600;
+SYS@orcl> COMMIT;
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP INCREMENTAL LEVEL 1 TABLESPACE tbs13 TAG 'BCT_ON';
+
+Starting backup at 15-MAY-25
+channel ORA_DISK_1: starting incremental level 1 datafile backup set
+channel ORA_DISK_1: backup set complete, elapsed time: 00:00:03
+Finished backup at 15-MAY-25
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT TO_CHAR(completion_time,'HH24:MI') AS done, blocks_read,
+  2         ROUND(blocks_read/datafile_blocks, 2) AS read_ratio
+  3  FROM   v$backup_datafile
+  4  WHERE  file# = 8 AND incremental_level = 1
+  5  ORDER  BY completion_time DESC FETCH FIRST 3 ROWS ONLY;
+
+DONE  BLOCKS_READ READ_RATIO
+----- ----------- ----------
+10:41         288        .11
+10:31        2560          1
+10:22        2560          1
+
+-- read_ratio가 0.11로 떨어졌다. 전체의 11%만 읽었다.
+-- 소요 시간도 14초에서 3초로 줄었다.
+-- 백업 크기는 이전과 비슷하지만 읽기 부담이 사라진 것이 핵심이다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- BCT 파일이 있는 디스크가 손상된 상황을 가정한다.
+
+SYS@orcl> !rm -f /u02/oradata/ORCL/bct_orcl.chg
+
+SYS@orcl> SELECT status FROM v$block_change_tracking;
+
+STATUS
+----------
+ENABLED
+
+-- 상태는 아직 ENABLED다. 파일 부재를 즉시 감지하지 못한다.
+
+SYS@orcl> ALTER SYSTEM CHECKPOINT;
+
+SYS@orcl> !tail -6 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Block change tracking file is inaccessible
+ORA-19755: could not open change tracking file
+ORA-19750: change tracking file: '/u02/oradata/ORCL/bct_orcl.chg'
+ORA-27037: unable to obtain file status
+Block change tracking service stopping.
+
+-- << 원인 파악 >>
+-- ORA-19755는 변경 추적 파일을 열 수 없다는 뜻이다.
+-- 서비스가 중지되며 이후 증분 백업은 전체 읽기 방식으로 되돌아간다.
+-- 데이터베이스 운영 자체에는 영향이 없다. 백업 성능만 나빠진다.
+
+SYS@orcl> SELECT status FROM v$block_change_tracking;
+
+STATUS
+----------
+DISABLED
+
+-- << 수정 >> 다시 활성화한다.
+
+SYS@orcl> ALTER DATABASE DISABLE BLOCK CHANGE TRACKING;
+
+Database altered.
+
+SYS@orcl> ALTER DATABASE ENABLE BLOCK CHANGE TRACKING
+  2    USING FILE '/u02/oradata/ORCL/bct_orcl.chg' REUSE;
+
+Database altered.
+
+SYS@orcl> SELECT status, filename FROM v$block_change_tracking;
+
+STATUS     FILENAME
+---------- ------------------------------
+ENABLED    /u02/oradata/ORCL/bct_orcl.chg
+
+-- 다음 Level 0 이후부터 다시 정상 동작한다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP INCREMENTAL LEVEL 0 TABLESPACE tbs13 TAG 'L0_REENABLE';
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> UPDATE hr.incr_test SET pad = RPAD('g',2000,'g')
+  2  WHERE id BETWEEN 601 AND 700;
+SYS@orcl> COMMIT;
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+RMAN> BACKUP INCREMENTAL LEVEL 1 TABLESPACE tbs13 TAG 'BCT_RECHECK';
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT ROUND(blocks_read/datafile_blocks,2) AS ratio
+   FROM v\$backup_datafile WHERE file#=8 AND incremental_level=1
+   ORDER BY completion_time DESC FETCH FIRST 1 ROWS ONLY;"
+
+     RATIO
+----------
+       .06
+
+-- 다시 정상 동작한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT status, bytes/1024/1024 AS mb FROM v\$block_change_tracking;"
+
+STATUS             MB
+---------- ----------
+ENABLED            11
+
+-- 실무 포인트
+-- 1) BCT가 없으면 증분 백업은 크기만 줄고 시간은 줄지 않는다.
+--    v$backup_datafile 의 blocks_read 와 datafile_blocks 비율로 확인한다.
+--    비율이 1이면 전체를 읽은 것이다.
+--
+-- 2) 활성화 직후 첫 증분은 여전히 전체를 읽는다.
+--    변경 기록이 아직 쌓이지 않았기 때문이다.
+--    다음 Level 0 이후부터 안정적으로 동작하므로 그때 측정한다.
+--
+-- 3) 효과는 읽기량과 소요 시간 두 가지로 나타난다.
+--    이 실습에서는 비율이 1에서 0.11로, 시간이 14초에서 3초로 줄었다.
+--    대형 데이터베이스에서는 그 차이가 시간 단위로 벌어진다.
+--
+-- 4) BCT 파일 크기는 데이터베이스 크기의 1/30000 정도이며 최소 10MB 남짓이다.
+--    데이터파일과 같은 디스크에 두면 함께 잃을 수 있으므로 위치를 검토한다.
+--
+-- 5) 파일을 잃으면 ORA-19755가 alert log에 기록되고 서비스가 중지된다.
+--    운영에는 영향이 없고 백업 성능만 나빠지므로 조용히 지나가기 쉽다.
+--    v$block_change_tracking 의 STATUS를 정기 점검 항목에 넣는다.
+--
+-- 6) 복구 방법은 비활성화 후 재활성화다.
+--    다음 Level 0 이후부터 다시 동작한다는 점을 기억한다.

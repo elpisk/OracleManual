@@ -1,0 +1,293 @@
+================================================================================
+ 실습 12-3 : 리두 로그와 컨트롤파일 손상 (정상 종료)
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 정상 종료 상태에서 리두 로그 전부와 컨트롤파일 전부가 사라졌다.
+-- 데이터파일은 온전하고 컨트롤파일 trace 백업이 있다.
+-- 리두가 없으므로 NORESETLOGS 형식은 성립하지 않는다.
+-- 정상 종료였다면 적용할 리두가 없어 데이터파일 복원조차 필요 없다.
+-- 복구 유형 : 컨트롤파일 재생성(RESETLOGS 형식) 후 즉시 오픈, 손실 없음
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- ARCHIVELOG 모드이며 컨트롤파일 trace 백업을 미리 확보한다.
+-- trace 백업에는 NORESETLOGS와 RESETLOGS 두 형식이 함께 들어 있다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_ch12.sql' REUSE;
+Database altered.
+
+[oracle@oel7v9r1 ~]$ grep -n 'RESETLOGS' /home/oracle/backup/cf_ch12.sql
+41:CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS  ARCHIVELOG
+98:CREATE CONTROLFILE REUSE DATABASE "ORCL" RESETLOGS  ARCHIVELOG
+
+-- 두 형식이 한 파일에 들어 있다. 상황에 맞는 쪽을 골라 써야 한다.
+
+[oracle@oel7v9r1 ~]$ sed -n '98,140p' /home/oracle/backup/cf_ch12.sql \
+>   > /home/oracle/backup/cf_ch12_resetlogs.sql
+[oracle@oel7v9r1 ~]$ head -3 /home/oracle/backup/cf_ch12_resetlogs.sql
+CREATE CONTROLFILE REUSE DATABASE "ORCL" RESETLOGS  ARCHIVELOG
+    MAXLOGFILES 16
+    MAXLOGMEMBERS 3
+
+SYS@orcl> CREATE TABLE hr.emp123(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp123 VALUES (1, 'before shutdown');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2460100 YES
+         3            2460100 YES
+         4            2460100 YES
+         7            2460100 YES
+
+-- 열려 있는 동안은 FUZZY가 YES다. 종료 후 다시 확인한다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 정상 종료 후 리두와 컨트롤파일 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+-- 정상 종료다. 종료 과정에서 체크포인트가 완료되었다.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf | grep -v temp | wc -l
+4
+
+-- 데이터파일은 온전하다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+STARTED
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl 2>/dev/null | wc -l
+0
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log 2>/dev/null | wc -l
+0
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf | grep -v temp | wc -l
+4
+
+-- 컨트롤파일과 리두가 모두 없고 데이터파일만 남았다.
+
+SYS@orcl> !grep -n 'CLOSE NORMAL' \
+          /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -1
+21877:Completed: ALTER DATABASE CLOSE NORMAL
+
+-- 정상 종료였다. 이 판단이 이후 절차 전체를 가른다.
+
+SYS@orcl> !ls /home/oracle/backup/cf_ch12*.sql
+/home/oracle/backup/cf_ch12.sql
+/home/oracle/backup/cf_ch12_resetlogs.sql
+
+-- 판정
+--   ① 컨트롤파일 수단 : trace 백업 있음
+--   ② 리두 : 전손 → NORESETLOGS 형식 불가
+--   ③ 종료 : 정상 → 적용할 리두 없음
+--   → RESETLOGS 형식으로 재생성 후 즉시 오픈. 손실 없음.
+
+-- 0단계 : 데이터파일을 별도 위치로 복사한다.
+
+SYS@orcl> !D=/home/oracle/before_recover_123; mkdir -p $D; \
+          cp -p /u02/oradata/ORCL/*.dbf $D/ 2>/dev/null; \
+          date > $D/copied_at.txt; ls -l $D >> $D/copied_at.txt
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- NORESETLOGS 형식을 먼저 시도해 본다.
+
+[oracle@oel7v9r1 ~]$ sed -n '41,95p' /home/oracle/backup/cf_ch12.sql \
+>   > /home/oracle/backup/cf_ch12_noresetlogs.sql
+
+SYS@orcl> @/home/oracle/backup/cf_ch12_noresetlogs.sql
+CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS  ARCHIVELOG
+*
+ERROR at line 1:
+ORA-01503: CREATE CONTROLFILE failed
+ORA-01565: error in identifying file
+'/u01/app/oracle/oradata/ORCL/redo01.log'
+ORA-27037: unable to obtain file status
+
+-- << 원인 파악 >>
+-- NORESETLOGS 형식은 LOGFILE 절에 나열된 파일이 실제로 존재해야 한다.
+-- 기존 리두를 그대로 인식시켜 연속성을 유지하는 형식이기 때문이다.
+-- 리두가 전부 없어진 지금은 성립할 수 없다.
+-- RESETLOGS 형식은 리두를 새로 만들어 인식시키므로 파일이 없어도 된다.
+
+-- << 수정 >>
+
+SYS@orcl> @/home/oracle/backup/cf_ch12_resetlogs.sql
+
+Control file created.
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+MOUNTED
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2460400 NO
+         3            2460400 NO
+         4            2460400 NO
+         7            2460400 NO
+
+-- SCN이 모두 같고 FUZZY가 NO다. 적용할 리두가 없다.
+-- 데이터파일 복원이 필요 없다는 뜻이다.
+
+SYS@orcl> SELECT group#, member FROM v$logfile ORDER BY group#;
+
+    GROUP# MEMBER
+---------- --------------------------------------------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log
+         1 /u02/oradata/ORCL/redo01b.log
+         3 /u01/app/oracle/oradata/ORCL/redo03.log
+         3 /u02/oradata/ORCL/redo03b.log
+         4 /u01/app/oracle/oradata/ORCL/redo04.log
+         4 /u02/oradata/ORCL/redo04b.log
+
+-- 문에 나열된 구성으로 등록되었다. 파일은 오픈 시 만들어진다.
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01589: must use RESETLOGS or NORESETLOGS option for database open
+
+-- << 원인 파악 >>
+-- RESETLOGS 형식으로 만든 컨트롤파일은 RESETLOGS 오픈을 요구한다.
+-- 리두를 새로 만들어야 하므로 다른 방법이 없다.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT id, memo FROM hr.emp123 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 before shutdown
+
+-- 손실이 없다. 데이터파일 복원도 하지 않았다.
+
+SYS@orcl> !ls -l /u01/app/oracle/oradata/ORCL/*.log
+-rw-r-----. 1 oracle oinstall 209715712 May 13 13:41 redo01.log
+-rw-r-----. 1 oracle oinstall 209715712 May 13 13:41 redo03.log
+-rw-r-----. 1 oracle oinstall 209715712 May 13 13:41 redo04.log
+
+-- 리두 파일이 새로 만들어졌다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM v$controlfile;
+
+  COUNT(*)
+----------
+         3
+
+SYS@orcl> SELECT group#, COUNT(*) AS members FROM v$logfile GROUP BY group# ORDER BY group#;
+
+    GROUP#    MEMBERS
+---------- ----------
+         1          2
+         3          2
+         4          2
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  ORDER BY incarnation#;
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+          10           2455200 PARENT
+          11           2460401 CURRENT
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch12 && mkdir -p /home/oracle/backup/ch12
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch12/
+SYS@orcl> !rm -f /home/oracle/backup/ch12/temp01.dbf
+SYS@orcl> STARTUP
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_ch12.sql' REUSE;
+
+-- 실무 포인트
+-- 1) 손상 파일이 두 종류인데도 가장 간단하게 끝나는 조합이다.
+--    복합 장애라고 해서 항상 복잡한 것은 아니다.
+--    종료 방식이 결과를 가르는 결정적 변수다.
+--
+-- 2) 리두가 없으면 NORESETLOGS 형식은 ORA-01503과 ORA-01565로 실패한다.
+--    LOGFILE 절의 파일이 실제로 있어야 하기 때문이다.
+--    RESETLOGS 형식은 리두를 새로 만들므로 이 상황의 유일한 선택지다.
+--
+-- 3) 재생성 직후 v$datafile_header 의 FUZZY를 반드시 확인한다.
+--    모두 NO면 적용할 리두가 없어 데이터파일 복원이 필요 없다.
+--    YES가 있으면 백업본 복원과 아카이브 적용이 필요하다.
+--
+-- 4) 정상 종료 여부는 alert log의 CLOSE NORMAL 로 확인한다.
+--    이 한 줄의 유무가 절차 전체를 바꾼다.
+--
+-- 5) 컨트롤파일 trace 백업은 구조 변경 시마다 다시 받는다.
+--    구조가 바뀐 뒤의 trace가 없으면 재생성 문에 파일이 빠지고
+--    그 파일은 UNNAMED로 등록되어 별도 보정이 필요해진다.

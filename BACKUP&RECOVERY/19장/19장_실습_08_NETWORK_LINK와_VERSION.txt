@@ -1,0 +1,282 @@
+================================================================================
+ 실습 19-8 : NETWORK_LINK 직접 이관과 VERSION 파라미터
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 35분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실습 개요
+--------------------------------------------------------------------------------
+-- 덤프 파일 없이 데이터베이스 링크로 직접 반입한다.
+-- 링크 생성과 tnsnames 설정, 권한 조건을 확인한다.
+-- VERSION 파라미터의 방향과 미지정 시의 오류를 확인한다.
+-- NETWORK_LINK 방식의 제약도 함께 본다.
+-- 작업 유형 : 스키마 이관
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 같은 서버 안에서 자기 자신을 가리키는 링크로 동작을 확인한다.
+-- 실제 환경에서는 원격 데이터베이스를 가리킨다.
+
+[oracle@oel7v9r1 ~]$ lsnrctl status | head -14
+
+LSNRCTL for Linux: Version 19.0.0.0.0 - Production
+Start Date                21-MAY-2025 08:30:11
+Uptime                    0 days 8 hr. 12 min. 4 sec
+Listening Endpoints Summary...
+  (DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=oel7v9r1)(PORT=1521)))
+Services Summary...
+Service "orcl" has 1 instance(s).
+  Instance "orcl", status READY, has 1 handler(s) for this service...
+The command completed successfully
+
+[oracle@oel7v9r1 ~]$ cat $ORACLE_HOME/network/admin/tnsnames.ora
+
+ORCL =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = oel7v9r1)(PORT = 1521))
+    (CONNECT_DATA = (SERVER = DEDICATED)(SERVICE_NAME = orcl))
+  )
+
+[oracle@oel7v9r1 ~]$ tnsping ORCL | tail -2
+
+OK (0 msec)
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> CREATE USER net19 IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE users QUOTA UNLIMITED ON users;
+SYS@orcl> GRANT CREATE SESSION, RESOURCE TO net19;
+
+SYS@orcl> CREATE TABLE net19.src TABLESPACE users AS
+  2    SELECT LEVEL AS id, RPAD('n-'||LEVEL, 60, 'z') AS memo
+  3    FROM dual CONNECT BY LEVEL <= 20000;
+
+Table created.
+
+SYS@orcl> CREATE INDEX net19.idx_src ON net19.src(id) TABLESPACE users;
+SYS@orcl> EXEC DBMS_STATS.gather_schema_stats('NET19');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT COUNT(*) FROM net19.src;
+
+  COUNT(*)
+----------
+     20000
+
+SYS@orcl> CREATE USER net19b IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE users QUOTA UNLIMITED ON users;
+SYS@orcl> GRANT CREATE SESSION, RESOURCE TO net19b;
+
+User created.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 데이터베이스 링크 생성
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE PUBLIC DATABASE LINK src_link
+  2    CONNECT TO system IDENTIFIED BY oracle_4U USING 'ORCL';
+
+Database link created.
+
+SYS@orcl> SELECT SYSDATE FROM dual@src_link;
+
+SYSDATE
+---------
+21-MAY-25
+
+SYS@orcl> SELECT db_link, host, username FROM dba_db_links;
+
+DB_LINK    HOST  USERNAME
+---------- ----- ---------
+SRC_LINK   ORCL  SYSTEM
+
+-- 링크가 정상 동작한다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : NETWORK_LINK 반입
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   network_link=src_link schemas=net19 \
+>   remap_schema=net19:net19b logfile=net_imp.log
+
+Import: Release 19.0.0.0.0 - Production on Wed May 21 17:04:22 2025
+
+Starting "SYSTEM"."SYS_IMPORT_SCHEMA_01":  system/******** ...
+Estimate in progress using BLOCKS method...
+Processing object type SCHEMA_EXPORT/TABLE/TABLE_DATA
+Total estimation using BLOCKS method: 3 MB
+Processing object type SCHEMA_EXPORT/USER
+ORA-31684: Object type USER:"NET19B" already exists
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+. . imported "NET19B"."SRC"                            20000 rows
+Processing object type SCHEMA_EXPORT/TABLE/INDEX/INDEX
+Processing object type SCHEMA_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+Job "SYSTEM"."SYS_IMPORT_SCHEMA_01" completed with 1 error(s) at 17:05:41
+
+SYS@orcl> SELECT COUNT(*) FROM net19b.src;
+
+  COUNT(*)
+----------
+     20000
+
+-- 덤프 파일 없이 옮겨졌다.
+
+[oracle@oel7v9r1 ~]$ ls -lt /u03/dpdump/*.dmp | head -3
+
+-rw-r-----. 1 oracle oinstall 3.4M May 21 16:22 cons.dmp
+-rw-r-----. 1 oracle oinstall 356K May 21 10:06 hr_full.dmp
+
+-- 새로 만들어진 덤프 파일이 없다. 로그만 생성되었다.
+
+--------------------------------------------------------------------------------
+[6] 확인 : VERSION 파라미터
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value FROM v$parameter WHERE name = 'compatible';
+
+NAME        VALUE
+----------- --------
+compatible  19.0.0
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=v122.dmp logfile=v122.log schemas=net19 version=12.2
+
+Starting "SYSTEM"."SYS_EXPORT_SCHEMA_01":  ...
+. . exported "NET19"."SRC"                    1.42 MB    20000 rows
+Job "SYSTEM"."SYS_EXPORT_SCHEMA_01" successfully completed at 17:10:33
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=v19.dmp logfile=v19.log schemas=net19
+
+Job "SYSTEM"."SYS_EXPORT_SCHEMA_01" successfully completed at 17:11:20
+
+-- 두 덤프의 내부 버전이 다르다.
+-- 19c에서는 둘 다 읽을 수 있다.
+
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   dumpfile=v122.dmp schemas=net19 remap_schema=net19:net19b \
+>   table_exists_action=truncate logfile=v122_imp.log
+
+. . imported "NET19B"."SRC"                   1.42 MB    20000 rows
+Job "SYSTEM"."SYS_IMPORT_SCHEMA_01" successfully completed at 17:12:44
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- NETWORK_LINK에 덤프 파일을 함께 지정해 본다.
+
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   network_link=src_link dumpfile=net.dmp schemas=net19 \
+>   remap_schema=net19:net19b logfile=net2.log
+
+Import: Release 19.0.0.0.0 - Production on Wed May 21 17:15:02 2025
+
+ORA-39002: invalid operation
+ORA-39053: Parameter DUMPFILE is incompatible with NETWORK_LINK parameter
+
+-- << 원인 파악 >>
+-- NETWORK_LINK는 원본에서 읽어 대상에 바로 넣는 방식이다.
+-- 중간 파일을 만들지 않으므로 DUMPFILE이라는 개념 자체가 없다.
+-- 두 파라미터는 서로 다른 동작 방식을 지시하므로 함께 쓸 수 없다.
+-- 덤프 파일이 필요하면 NETWORK_LINK를 쓰지 않고 expdp로 만든다.
+
+-- << 수정 >> DUMPFILE을 뺀다.
+
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   network_link=src_link schemas=net19 \
+>   remap_schema=net19:net19b table_exists_action=truncate \
+>   logfile=net2.log
+
+. . imported "NET19B"."SRC"                            20000 rows
+Job "SYSTEM"."SYS_IMPORT_SCHEMA_01" completed with 1 error(s) at 17:17:30
+
+-- 상위 버전 덤프를 하위 버전에서 읽는 상황도 확인한다.
+-- 12.2 데이터베이스에서 v19.dmp 를 반입하면 다음과 같다.
+
+[oracle@target12 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   dumpfile=v19.dmp schemas=net19
+
+ORA-39001: invalid argument value
+ORA-39000: bad dump file specification
+ORA-39142: incompatible version number 5.1 in dump file
+"/u03/dpdump/v19.dmp"
+
+-- 이 경우 대상에서 할 수 있는 일이 없다.
+-- 원본에서 version=12.2로 다시 내보내야 한다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM net19b.src;
+
+  COUNT(*)
+----------
+     20000
+
+SYS@orcl> SELECT index_name, status FROM dba_indexes
+  2  WHERE  owner = 'NET19B';
+
+INDEX_NAME   STATUS
+------------ --------
+IDX_SRC      VALID
+
+-- LONG 타입이 있으면 NETWORK_LINK를 쓸 수 없다.
+
+SYS@orcl> CREATE TABLE net19.has_long (id NUMBER, txt LONG)
+  2    TABLESPACE users;
+SYS@orcl> INSERT INTO net19.has_long VALUES (1, 'sample long value');
+SYS@orcl> COMMIT;
+
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   network_link=src_link tables=net19.has_long \
+>   remap_schema=net19:net19b logfile=net_long.log
+
+ORA-31696: unable to export/import TABLE_DATA:"NET19"."HAS_LONG" using
+client specified AUTOMATIC method
+Job "SYSTEM"."SYS_IMPORT_TABLE_01" completed with 1 error(s) at 17:22:15
+
+-- 덤프 파일 방식으로는 문제없이 처리된다.
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=lng.dmp logfile=lng.log tables=net19.has_long
+
+. . exported "NET19"."HAS_LONG"               5.90 KB        1 rows
+Job "SYSTEM"."SYS_EXPORT_TABLE_01" successfully completed at 17:23:40
+
+-- 정리
+
+SYS@orcl> DROP PUBLIC DATABASE LINK src_link;
+SYS@orcl> DROP USER net19 CASCADE;
+SYS@orcl> DROP USER net19b CASCADE;
+
+User dropped.
+
+-- 실무 포인트
+-- 1) NETWORK_LINK는 덤프 파일을 만들지 않는다.
+--    DUMPFILE과 함께 쓰면 ORA-39053으로 거부된다.
+--    디스크 여유가 없을 때 유용한 방식이다.
+--
+-- 2) 재시도가 어렵다는 점이 가장 큰 단점이다.
+--    중단되면 남은 것이 없어 처음부터 다시 해야 한다.
+--    네트워크가 불안정하거나 대용량이면 덤프 파일 방식이 안전하다.
+--
+-- 3) 링크의 접속 계정 권한이 그대로 적용된다.
+--    원본에서 읽을 권한이 없으면 그 객체가 빠진다.
+--    권한 있는 계정으로 링크를 만들되 비밀번호 관리에 유의한다.
+--
+-- 4) LONG 타입이 있으면 이 방식을 쓸 수 없다.
+--    ORA-31696이 발생하며 해당 테이블만 실패한다.
+--    그 테이블은 덤프 파일 방식으로 따로 옮긴다.
+--
+-- 5) VERSION은 내보낼 때 지정한다.
+--    반입 시점에 지정하는 것이 아니다.
+--    이미 만든 덤프를 하위 버전에 넣을 수는 없고 다시 내보내야 한다.
+--
+-- 6) 하위에서 상위로는 조치가 필요 없다.
+--    19c 덤프를 21c에 넣는 것은 그대로 된다.
+--    방향을 혼동하지 않도록 절차서에 명시해 둔다.

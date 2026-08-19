@@ -1,0 +1,261 @@
+================================================================================
+ 실습 18-3 : Flashback Version Query — VERSIONS BETWEEN
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 특정 사원의 급여가 이상하다는 신고를 받았다.
+-- 언제 어떤 값으로 바뀌었는지 추적한다.
+-- VERSIONS BETWEEN 절로 변경 이력을 조회한다.
+-- versions_xid 로 원인 트랜잭션을 특정해 다음 단계로 넘어간다.
+-- 작업 유형 : 원인 추적(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 18-2가 완료되어 hr.emp180 이 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180;
+
+  COUNT(*)
+----------
+       109
+
+SYS@orcl> SELECT employee_id, last_name, salary FROM hr.emp180
+  2  WHERE  employee_id = 100;
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        100 King                           24000
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT current_scn FROM v$database;
+
+CURRENT_SCN
+-----------
+    2813200
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') FROM dual;
+
+TO_CHAR(SYSDATE,'YY
+-------------------
+2025-05-20 10:12:04
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 여러 번의 변경 만들기
+--------------------------------------------------------------------------------
+-- 세 번의 UPDATE가 서로 다른 트랜잭션으로 수행된다.
+
+SYS@orcl> UPDATE hr.emp180 SET salary = 25000 WHERE employee_id = 100;
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+-- 두 번째는 잘못된 값이다. 여러 사원을 함께 수정한다.
+
+SYS@orcl> UPDATE hr.emp180 SET salary = salary * 1.5
+  2  WHERE  department_id IN (60, 90);
+
+8 rows updated.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> UPDATE hr.emp180 SET salary = 26400 WHERE employee_id = 100;
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT salary FROM hr.emp180 WHERE employee_id = 100;
+
+    SALARY
+----------
+     26400
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+-- 급여가 이상하다는 신고를 받았다고 가정한다.
+-- 현재 값만으로는 무엇이 잘못되었는지 알 수 없다.
+
+SYS@orcl> SELECT employee_id, last_name, salary, department_id
+  2  FROM   hr.emp180 WHERE department_id IN (60, 90) ORDER BY employee_id;
+
+EMPLOYEE_ID LAST_NAME       SALARY DEPARTMENT_ID
+----------- ------------ --------- -------------
+        100 King             26400            90
+        101 Kochhar          25500            90
+        102 De Haan          25500            90
+        103 Hunold           13500            60
+        104 Ernst            9000             60
+...
+
+-- 값이 부자연스럽다. 언제 이렇게 되었는지 확인해야 한다.
+
+--------------------------------------------------------------------------------
+[6] 진단 : Version Query
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT versions_startscn AS start_scn,
+  2         versions_endscn   AS end_scn,
+  3         versions_xid      AS xid,
+  4         versions_operation AS op,
+  5         salary
+  6  FROM   hr.emp180
+  7  VERSIONS BETWEEN TIMESTAMP
+  8    SYSTIMESTAMP - INTERVAL '30' MINUTE AND SYSTIMESTAMP
+  9  WHERE  employee_id = 100
+ 10  ORDER BY versions_startscn;
+
+ START_SCN   END_SCN XID              O     SALARY
+---------- --------- ---------------- - ----------
+                       2813400          U      24000
+   2813400   2813900 08001A00C1020000 U      25000
+   2813900   2814400 09001C00C8010000 U      37500
+   2814400           0A001200D3020000 U      26400
+
+-- 아래에서 위로 읽는다.
+--   24000 → 25000 → 37500 → 26400 순으로 바뀌었다.
+--   37500이 이상한 값이다. 두 번째 UPDATE의 결과다.
+--   END_SCN이 비어 있는 마지막 행이 현재 값이다.
+
+SYS@orcl> SELECT versions_xid, versions_operation,
+  2         TO_CHAR(versions_starttime,'HH24:MI:SS') AS start_t,
+  3         salary
+  4  FROM   hr.emp180
+  5  VERSIONS BETWEEN TIMESTAMP
+  6    SYSTIMESTAMP - INTERVAL '30' MINUTE AND SYSTIMESTAMP
+  7  WHERE  employee_id = 100 AND salary = 37500;
+
+VERSIONS_XID     V START_T     SALARY
+---------------- - -------- ----------
+09001C00C8010000 U 10:14:22      37500
+
+-- 문제의 값을 만든 트랜잭션은 09001C00C8010000 이다.
+-- 이 값으로 다음 단계인 Transaction Query로 넘어간다.
+
+-- 판정
+--   ① 세 번의 UPDATE 중 두 번째가 잘못되었다
+--   ② 그 트랜잭션의 xid를 확보했다
+--   ③ 같은 트랜잭션이 다른 행도 건드렸는지 확인해야 한다
+--   → 실습 18-4에서 Transaction Query로 이어 간다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 조회 범위를 너무 넓게 잡아 본다.
+
+SYS@orcl> SELECT versions_startscn, salary FROM hr.emp180
+  2  VERSIONS BETWEEN TIMESTAMP
+  3    SYSTIMESTAMP - INTERVAL '5' HOUR AND SYSTIMESTAMP
+  4  WHERE  employee_id = 100;
+
+ERROR at line 1:
+ORA-01555: snapshot too old: rollback segment number 3 with name
+"_SYSSMU3_1930754532$" too small
+
+-- << 원인 파악 >>
+-- 5시간 전은 UNDO 보존 기간(1시간)을 넘는다.
+-- Version Query도 UNDO에 의존하므로 그 범위 안에서만 동작한다.
+-- 범위를 좁히거나 SCN 범위를 명시해야 한다.
+
+SYS@orcl> SELECT tuned_undoretention FROM v$undostat
+  2  ORDER BY begin_time DESC FETCH FIRST 1 ROWS ONLY;
+
+TUNED_UNDORETENTION
+-------------------
+               3600
+
+-- << 수정 >> 보존 기간 안으로 범위를 좁힌다.
+
+SYS@orcl> SELECT versions_startscn, versions_operation, salary
+  2  FROM   hr.emp180
+  3  VERSIONS BETWEEN SCN 2813200 AND 2814500
+  4  WHERE  employee_id = 100
+  5  ORDER BY versions_startscn;
+
+VERSIONS_STARTSCN V     SALARY
+----------------- - ----------
+                                24000
+          2813400 U      25000
+          2813900 U      37500
+          2814400 U      26400
+
+-- SCN 범위로 지정하면 더 명확하다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+-- 같은 트랜잭션이 건드린 다른 행을 찾아본다.
+
+SYS@orcl> SELECT employee_id, versions_operation, salary
+  2  FROM   hr.emp180
+  3  VERSIONS BETWEEN SCN 2813200 AND 2814500
+  4  WHERE  versions_xid = HEXTORAW('09001C00C8010000')
+  5  ORDER BY employee_id;
+
+EMPLOYEE_ID V     SALARY
+----------- - ----------
+        100 U      37500
+        101 U      25500
+        102 U      25500
+        103 U      13500
+        104 U       9000
+        105 U       7200
+        106 U       7200
+        107 U       6300
+
+-- 8건이 같은 트랜잭션에서 함께 바뀌었다.
+-- Version Query만으로도 영향 범위를 파악할 수 있다.
+
+SYS@orcl> SELECT COUNT(DISTINCT versions_xid) AS tx_count
+  2  FROM   hr.emp180
+  3  VERSIONS BETWEEN SCN 2813200 AND 2814500;
+
+  TX_COUNT
+----------
+         3
+
+-- 이 구간에 세 개의 트랜잭션이 있었다.
+
+SYS@orcl> SELECT versions_operation, COUNT(*) FROM hr.emp180
+  2  VERSIONS BETWEEN SCN 2813200 AND 2814500
+  3  GROUP BY versions_operation;
+
+V   COUNT(*)
+- ----------
+U         10
+          109
+
+-- versions_operation 이 비어 있는 행은 그 구간 이전부터 있던 버전이다.
+
+-- 실무 포인트
+-- 1) Version Query는 아래에서 위로 읽는다.
+--    versions_startscn 순으로 정렬하면 시간 흐름대로 보인다.
+--    END_SCN이 비어 있는 행이 현재 값이다.
+--
+-- 2) versions_operation 은 I/U/D로 작업 종류를 알려 준다.
+--    비어 있으면 조회 구간 이전부터 존재하던 버전이다.
+--
+-- 3) versions_xid 가 다음 단계의 열쇠다.
+--    이 값으로 Transaction Query에 넘어가면 그 트랜잭션의 전체 영향이 드러난다.
+--    xid만으로도 같은 테이블의 다른 행은 조회할 수 있다.
+--
+-- 4) Version Query도 UNDO에 의존한다.
+--    보존 기간을 넘는 범위를 지정하면 ORA-01555가 발생한다.
+--    tuned_undoretention 으로 가용 범위를 먼저 확인한다.
+--
+-- 5) SCN 범위로 지정하면 더 명확하다.
+--    시각은 초 단위 이하를 표현하지 못해 경계가 모호할 수 있다.
+--
+-- 6) 이 기능은 되돌리지 않는다.
+--    무엇이 언제 어떻게 바뀌었는지 파악하는 도구이며
+--    되돌리는 방법은 파악 결과를 보고 따로 정한다.

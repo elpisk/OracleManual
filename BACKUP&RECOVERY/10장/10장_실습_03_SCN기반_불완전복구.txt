@@ -1,0 +1,319 @@
+================================================================================
+ 실습 10-3 : SCN-based 불완전 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 같은 시각에 여러 작업이 몰려 시각만으로는 복구 지점을 특정할 수 없다.
+-- LogMiner로 리두를 분석해 문제 DML의 정확한 SCN을 찾는다.
+-- UNTIL CHANGE 로 그 SCN 직전까지 복구한다.
+-- 네 기준 중 가장 정밀한 방식이다.
+-- 복구 유형 : 불완전 복구(SCN-based)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 10-2를 마친 상태에서 이어서 진행한다.
+-- LogMiner 사용 권한(SYSDBA)이 필요하다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> ALTER SESSION SET nls_date_format = 'YYYY-MM-DD HH24:MI:SS';
+Session altered.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2423000
+
+SYS@orcl> CREATE TABLE hr.emp103 TABLESPACE users
+  2  AS SELECT employee_id, last_name FROM hr.employees;
+Table created.
+SYS@orcl> COMMIT;
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp103;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 같은 시각에 여러 작업 수행
+--------------------------------------------------------------------------------
+-- 같은 초에 정상 작업과 잘못된 작업이 섞이도록 만든다.
+
+SYS@orcl> BEGIN
+  2    INSERT INTO hr.insa_2025 VALUES (20, SYSDATE);
+  3    COMMIT;
+  4    DELETE FROM hr.emp103 WHERE ROWNUM <= 50;
+  5    COMMIT;
+  6    INSERT INTO hr.insa_2025 VALUES (21, SYSDATE);
+  7    COMMIT;
+  8  END;
+  9  /
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT id, TO_CHAR(order_date, 'HH24:MI:SS') AS t FROM hr.insa_2025
+  2  WHERE  id >= 20 ORDER BY id;
+
+        ID T
+---------- --------
+        20 11:02:18
+        21 11:02:18
+
+-- 두 INSERT와 DELETE가 모두 같은 초에 수행되었다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp103;
+
+  COUNT(*)
+----------
+        57
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp103;
+
+  COUNT(*)
+----------
+        57
+
+-- 50건이 잘못 삭제되었다. 20번 INSERT는 정상 업무다.
+-- 시각 기준으로 11:02:18 직전을 지정하면 20번 INSERT까지 사라진다.
+-- 정확히 DELETE 직전에서 멈춰야 한다.
+
+--------------------------------------------------------------------------------
+[6] 진단 : LogMiner로 SCN 확보
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sequence#, name FROM v$archived_log
+  2  ORDER BY sequence# DESC FETCH FIRST 2 ROWS ONLY;
+
+ SEQUENCE# NAME
+---------- ----------------------------------------
+         4 /u02/arch1/1_4_1200548120.dbf
+         3 /u02/arch1/1_3_1200548120.dbf
+
+SYS@orcl> BEGIN
+  2    DBMS_LOGMNR.ADD_LOGFILE('/u02/arch1/1_4_1200548120.dbf', DBMS_LOGMNR.NEW);
+  3  END;
+  4  /
+PL/SQL procedure successfully completed.
+
+-- 분석을 시작하지 않고 조회하면 실패한다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$logmnr_contents;
+SELECT COUNT(*) FROM v$logmnr_contents
+                     *
+ERROR at line 1:
+ORA-01306: dbms_logmnr.start_logmnr() must be invoked before selecting from
+v$logmnr_contents
+
+-- 파일 등록과 분석 시작은 별개의 단계다.
+
+SYS@orcl> EXEC DBMS_LOGMNR.START_LOGMNR( -
+  2    OPTIONS => DBMS_LOGMNR.DICT_FROM_ONLINE_CATALOG);
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT scn, TO_CHAR(timestamp, 'HH24:MI:SS') AS t,
+  2         seg_owner, seg_name, operation
+  3  FROM   v$logmnr_contents
+  4  WHERE  seg_owner = 'HR' AND operation IN ('INSERT','DELETE')
+  5  ORDER  BY scn FETCH FIRST 5 ROWS ONLY;
+
+       SCN T        SEG_OWNER SEG_NAME   OPERATION
+---------- -------- --------- ---------- ----------
+   2423412 11:02:18 HR        INSA_2025  INSERT
+   2423418 11:02:18 HR        EMP103     DELETE
+   2423418 11:02:18 HR        EMP103     DELETE
+   2423420 11:02:18 HR        INSA_2025  INSERT
+
+-- 같은 시각이지만 SCN이 다르다.
+-- 정상 INSERT는 2423412, 잘못된 DELETE는 2423418부터 시작한다.
+
+SYS@orcl> SELECT MIN(scn) AS delete_start FROM v$logmnr_contents
+  2  WHERE  seg_owner = 'HR' AND seg_name = 'EMP103' AND operation = 'DELETE';
+
+DELETE_START
+------------
+     2423418
+
+SYS@orcl> EXEC DBMS_LOGMNR.END_LOGMNR;
+PL/SQL procedure successfully completed.
+
+-- 판정
+--   ① 목표 : SCN 2423418 직전
+--   ② 시각 기준으로는 20번 INSERT까지 사라지므로 부적합
+--   ③ UNTIL CHANGE 2423418 로 지정하면 그 직전까지 적용된다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_103
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/before_recover_103/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 먼저 시각 기준으로 시도해 차이를 확인한다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> !cp -p /home/oracle/backup/ch10/*.dbf /u02/oradata/ORCL/
+
+SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 11:02:18';
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN READ ONLY;
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp103;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT id FROM hr.insa_2025 WHERE id >= 20;
+
+no rows selected
+
+-- << 원인 파악 >>
+-- DELETE는 되돌렸지만 정상 INSERT였던 20번도 함께 사라졌다.
+-- UNTIL TIME 은 초 단위까지만 구분하므로 같은 초의 작업을 나눌 수 없다.
+-- 11:02:18 이라는 시각에는 INSERT와 DELETE가 모두 들어 있다.
+-- 초 단위보다 정밀한 기준이 필요하며 그것이 SCN이다.
+
+SYS@orcl> SELECT TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS t
+  2  FROM   v$database;
+
+T
+--------
+11:02:17
+
+-- << 수정 >>
+-- SCN 기준으로 다시 지정한다. 이어서 적용하면 되므로 복원은 필요 없다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+
+SYS@orcl> RECOVER DATABASE UNTIL CHANGE 2423418;
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN READ ONLY;
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp103;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT id, TO_CHAR(order_date, 'HH24:MI:SS') AS t FROM hr.insa_2025
+  2  WHERE  id >= 20 ORDER BY id;
+
+        ID T
+---------- --------
+        20 11:02:18
+
+-- 정상 INSERT는 살아 있고 잘못된 DELETE만 사라졌다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp103;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT id FROM hr.insa_2025 ORDER BY id;
+
+        ID
+----------
+         1
+         2
+        10
+        20
+
+-- 21번은 DELETE 이후의 작업이라 사라졌다. 예상된 손실이다.
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2423418
+
+-- 지정한 SCN이 그대로 복구 지점이 되었다. 그 SCN은 적용되지 않았다.
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  WHERE  status = 'CURRENT';
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           4           2423418 CURRENT
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+Tablespace altered.
+
+-- SCN과 시각의 대응 범위도 확인한다.
+
+SYS@orcl> SELECT TIMESTAMP_TO_SCN(
+  2    TO_TIMESTAMP('2025-05-12 11:02:18', 'YYYY-MM-DD HH24:MI:SS')) AS scn FROM dual;
+
+       SCN
+----------
+   2423410
+
+-- 시각을 SCN으로 환산하면 그 초의 시작 SCN을 돌려준다.
+-- 초 안에서 어느 지점인지는 구분하지 못한다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch10 && mkdir -p /home/oracle/backup/ch10
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch10/
+SYS@orcl> !rm -f /home/oracle/backup/ch10/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) 시각 기준은 초 단위까지만 구분한다.
+--    같은 초에 여러 작업이 있으면 나눌 수 없어 정상 업무까지 되돌리게 된다.
+--    이 실습의 첫 시도가 그 경우다.
+--
+-- 2) SCN 기준은 트랜잭션 단위로 정밀하다.
+--    UNTIL CHANGE 는 지정한 SCN 직전까지 적용하므로
+--    되돌릴 DML의 SCN을 그대로 지정하면 그 직전 상태가 된다.
+--
+-- 3) LogMiner로 SCN을 확보한다.
+--    ADD_LOGFILE 로 아카이브를 등록하고 START_LOGMNR 로 분석을 시작한다.
+--    v$logmnr_contents 에서 소유자·객체·작업 유형으로 필터링한다.
+--
+-- 4) LogMiner는 복구 전에 수행해야 한다.
+--    복구 후에는 그 리두가 이미 적용되었거나 RESETLOGS로 끊긴 상태다.
+--    END_LOGMNR 로 세션을 정리하는 것도 잊지 않는다.
+--
+-- 5) TIMESTAMP_TO_SCN 은 초 단위의 시작 SCN을 돌려준다.
+--    초 안의 위치를 구분하지 못하므로 정밀한 지점에는 LogMiner가 필요하다.
+--
+-- 6) 사고 이후의 작업은 어느 기준을 쓰든 사라진다.
+--    이 실습의 21번 INSERT가 그렇다. 손실 구간을 정확히 통보해야 한다.
+
+SYS@orcl> EXIT

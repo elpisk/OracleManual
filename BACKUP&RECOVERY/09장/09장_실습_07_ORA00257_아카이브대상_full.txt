@@ -1,0 +1,332 @@
+================================================================================
+ 실습 9-7 : ORA-00257 — 아카이브 대상이 가득 차 정지된 데이터베이스 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 20분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 아카이브 대상에 쓸 공간이 없어 로그 스위치가 막혔다.
+-- 일반 사용자는 ORA-00257로 접속조차 못 하고 업무가 전면 정지된다.
+-- 인스턴스는 살아 있으며 SYSDBA 접속은 허용된다.
+-- 공간을 확보하고 밀린 아카이브를 처리해 서비스를 재개한다.
+-- 복구 유형 : 해당 없음(가용성 복구)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 9-6을 마친 상태에서 이어서 진행한다.
+-- FRA를 작은 크기로 설정해 상황을 재현한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a30
+SYS@orcl> COL destination FOR a20
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SHOW PARAMETER db_recovery_file_dest
+
+NAME                       TYPE     VALUE
+-------------------------- -------- ------------
+db_recovery_file_dest      string   /u02/fra
+db_recovery_file_dest_size big integer 8G
+
+SYS@orcl> ALTER SYSTEM SET log_archive_dest_2 = '' SCOPE=BOTH;
+System altered.
+
+SYS@orcl> ALTER SYSTEM SET log_archive_dest_1 = 'LOCATION=USE_DB_RECOVERY_FILE_DEST'
+  2    SCOPE=BOTH;
+System altered.
+
+-- 실습을 위해 FRA 한도를 매우 작게 줄인다.
+
+SYS@orcl> ALTER SYSTEM SET db_recovery_file_dest_size = 200M SCOPE=BOTH;
+System altered.
+
+SYS@orcl> SELECT name, space_limit/1024/1024 AS limit_mb,
+  2         space_used/1024/1024 AS used_mb,
+  3         ROUND(space_used/space_limit*100, 1) AS pct
+  4  FROM   v$recovery_file_dest;
+
+NAME                 LIMIT_MB    USED_MB    PCT
+------------------- --------- ---------- ------
+/u02/fra                  200        150   75.0
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 아카이브 대상 소진
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    FOR i IN 1..6 LOOP
+  3      EXECUTE IMMEDIATE 'ALTER SYSTEM SWITCH LOGFILE';
+  4    END LOOP;
+  5  END;
+  6  /
+BEGIN
+*
+ERROR at line 1:
+ORA-16038: log 3 sequence# 58 cannot be archived
+ORA-19809: limit exceeded for recovery files
+ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/ORCL/redo03.log'
+
+-- 로그 스위치가 막혔다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus hr/hr@orcl
+
+SQL*Plus: Release 19.0.0.0.0 - Production on Sun May 11 15:02:18 2025
+
+ERROR:
+ORA-00257: Archiver error. Connect AS SYSDBA only until resolved.
+
+Enter user-name:
+
+-- 일반 사용자는 접속조차 못 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+OPEN
+
+-- 인스턴스는 살아 있다. 로그 스위치만 막힌 상태다.
+
+SYS@orcl> !tail -8 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+ARC3: Archival started
+ORA-19809: limit exceeded for recovery files
+ORA-19804: cannot reclaim 209715200 bytes disk space from 209715200 limit
+ARCH: Archival stopped, error occurred. Will continue retrying
+ORACLE Instance orcl - Archival Error
+ORA-16038: log 3 sequence# 58 cannot be archived
+ORA-19809: limit exceeded for recovery files
+ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/ORCL/redo03.log'
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT dest_id, destination, status, error FROM v$archive_dest
+  2  WHERE  destination IS NOT NULL;
+
+   DEST_ID DESTINATION          STATUS  ERROR
+---------- -------------------- ------- --------------------------------
+         1 USE_DB_RECOVERY_FILE ERROR   ORA-19809: limit exceeded for re
+             _DEST                      covery files
+
+SYS@orcl> SELECT name, space_limit/1024/1024 AS limit_mb,
+  2         space_used/1024/1024 AS used_mb,
+  3         ROUND(space_used/space_limit*100, 1) AS pct
+  4  FROM   v$recovery_file_dest;
+
+NAME                 LIMIT_MB    USED_MB    PCT
+------------------- --------- ---------- ------
+/u02/fra                  200        200  100.0
+
+SYS@orcl> SELECT file_type, percent_space_used, number_of_files
+  2  FROM   v$flash_recovery_area_usage WHERE percent_space_used > 0;
+
+FILE_TYPE               PERCENT_SPACE_USED NUMBER_OF_FILES
+----------------------- ------------------ ---------------
+ARCHIVED LOG                         98.30              14
+CONTROL FILE                          1.70               1
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         56 NO  ACTIVE
+         3         58 NO  CURRENT
+         4         57 NO  ACTIVE
+
+-- ARCHIVED가 모두 NO다. 완전히 막힌 상태다.
+
+SYS@orcl> !df -h /u02 | tail -1
+/dev/mapper/ol-u02     20G  7.1G   13G  36% /u02
+
+-- 디스크에는 여유가 있다. FRA 한도만 소진되었다.
+
+-- 판정
+--   ① 인스턴스 : OPEN, SYSDBA 접속 가능
+--   ② 원인 : FRA 한도 초과(ORA-19809)
+--   ③ 조치 : 공간 확보 또는 한도 확대 → ARCHIVE LOG ALL
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 재기동으로 해결하려 시도한다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+Database opened.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+ALTER SYSTEM SWITCH LOGFILE
+*
+ERROR at line 1:
+ORA-16038: log 1 sequence# 56 cannot be archived
+ORA-19809: limit exceeded for recovery files
+
+-- << 원인 파악 >>
+-- 재기동해도 아무것도 달라지지 않는다.
+-- 원인은 인스턴스가 아니라 아카이브 대상의 공간이기 때문이다.
+-- 오히려 종료 과정에서 더 막힐 수 있어 위험한 선택이다.
+-- 공간을 확보하는 것이 유일한 해결이다.
+
+SYS@orcl> SELECT space_used/1024/1024 AS used_mb FROM v$recovery_file_dest;
+
+   USED_MB
+----------
+       200
+
+-- << 수정 : 방법 1 — 백업된 아카이브 정리 >>
+
+[oracle@oel7v9r1 ~]$ rman target /
+
+RMAN> CROSSCHECK ARCHIVELOG ALL;
+Crosschecked 14 objects
+
+RMAN> DELETE NOPROMPT ARCHIVELOG UNTIL SEQUENCE 50;
+
+List of Archived Log Copies for database with db_unique_name ORCL
+=====================================================================
+Key     Thrd Seq     S Low Time
+------- ---- ------- - ---------
+61      1    46      A 11-MAY-25
+        Name: /u02/fra/ORCL/archivelog/2025_05_11/o1_mf_1_46_xxxx_.arc
+...
+Deleted 8 objects
+
+RMAN> EXIT
+
+SYS@orcl> SELECT space_used/1024/1024 AS used_mb,
+  2         ROUND(space_used/space_limit*100, 1) AS pct
+  3  FROM   v$recovery_file_dest;
+
+   USED_MB    PCT
+---------- ------
+       112   56.0
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG ALL;
+
+System altered.
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         56 YES INACTIVE
+         3         58 YES CURRENT
+         4         57 YES INACTIVE
+
+-- ARCHIVED가 YES로 바뀌었다. 서비스가 재개된다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus hr/hr@orcl
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+HR@orcl> SELECT COUNT(*) FROM emp94;
+
+  COUNT(*)
+----------
+         7
+
+HR@orcl> INSERT INTO emp94 VALUES (8);
+1 row created.
+HR@orcl> COMMIT;
+Commit complete.
+
+-- 일반 사용자 접속과 변경이 정상 동작한다.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+
+SYS@orcl> SELECT dest_id, status, error FROM v$archive_dest WHERE dest_id = 1;
+
+   DEST_ID STATUS  ERROR
+---------- ------- --------------------
+         1 VALID
+
+-- 대상 상태가 VALID로 돌아왔다.
+
+-- 방법 2 : 한도 확대도 확인한다.
+
+SYS@orcl> ALTER SYSTEM SET db_recovery_file_dest_size = 8G SCOPE=BOTH;
+System altered.
+
+SYS@orcl> SELECT space_limit/1024/1024/1024 AS limit_gb,
+  2         ROUND(space_used/space_limit*100, 1) AS pct
+  3  FROM   v$recovery_file_dest;
+
+  LIMIT_GB    PCT
+---------- ------
+         8    1.4
+
+-- 용량 산정 근거를 수집한다.
+
+SYS@orcl> SELECT TO_CHAR(completion_time, 'YYYY-MM-DD') AS day, COUNT(*) AS logs,
+  2         ROUND(SUM(blocks * block_size)/1024/1024, 1) AS mb
+  3  FROM   v$archived_log WHERE completion_time > SYSDATE - 7
+  4  GROUP  BY TO_CHAR(completion_time, 'YYYY-MM-DD') ORDER BY 1;
+
+DAY              LOGS      MB
+---------- ---------- -------
+2025-05-10         18   540.2
+2025-05-11         26   820.6
+
+-- 최대 820MB/일이다. 3일 보관이면 2.4GB, 여유율 30%를 더해 3.2GB 이상이 필요하다.
+
+-- 감시 설정도 확인한다.
+
+SYS@orcl> SELECT reason, message_type, message_level, resolution
+  2  FROM   dba_outstanding_alerts WHERE object_name LIKE '%recovery%';
+
+REASON                                        MESSAGE_TYPE MESSAGE_LEVEL RESOLUTION
+--------------------------------------------- ------------ ------------- ----------
+db_recovery_file_dest_size of 8589934592 bytes Warning                  5
+
+-- 실무 포인트
+-- 1) ORA-00257은 복구가 아니라 가용성의 문제다.
+--    파일이 손상된 것이 아니라 아카이브를 쓸 공간이 없어 로그 스위치가 막힌 것이다.
+--    장애 복구 능력보다 일상적인 용량 감시가 가용성에 더 크게 기여한다.
+--
+-- 2) 인스턴스는 살아 있고 SYSDBA 접속은 허용된다.
+--    v$instance의 STATUS가 OPEN인 것을 확인하고 그 자리에서 진단한다.
+--    재기동은 도움이 되지 않으며 종료 과정에서 더 막힐 수 있다.
+--
+-- 3) 진단은 세 가지를 본다.
+--    v$archive_dest 의 STATUS와 ERROR, FRA 사용량, v$log의 ARCHIVED 컬럼이다.
+--    ARCHIVED가 모두 NO이면 완전히 막힌 상태다.
+--
+-- 4) 공간 확보는 백업 여부를 조건으로 한다.
+--    RMAN의 조건부 삭제가 안전하며 OS로 지웠다면 CROSSCHECK 로 기록을 맞춘다.
+--    백업되지 않은 아카이브를 지우면 복구 가능성을 스스로 버리는 것이다.
+--
+-- 5) FRA를 쓴다면 한도 확대가 즉효약이다.
+--    DB_RECOVERY_FILE_DEST_SIZE 는 동적 파라미터라 즉시 적용된다.
+--    다만 디스크에 실제 여유가 있어야 의미가 있다.
+--
+-- 6) 재발 방지는 감시·정리 정책·용량 산정 세 가지다.
+--    사용률 70~80%에서 경고가 오도록 하고, 백업과 연동한 정리 작업을 두며,
+--    최대 일일 생성량을 기준으로 용량을 산정한다.
+
+SYS@orcl> EXIT

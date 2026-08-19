@@ -1,0 +1,248 @@
+================================================================================
+ 실습 5-2 : UNDO 데이터파일 손상 — 리두 없음
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- UNDO 데이터 파일이 유실되었고 필요한 리두는 이미 덮어써졌다.
+-- UNDO는 떼어 낸 채로 열 수 없으므로 부분 포기라는 선택지가 없다.
+-- 전체를 백업 시점으로 되돌린다.
+-- 복구 유형 : 불완전 복구(백업 시점 복귀)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 5-1을 마친 상태에서 이어서 진행한다.
+-- /home/oracle/backup/ch05 백업본이 온전해야 한다.
+
+[oracle@oel7v9r1 ~]$ ls /home/oracle/backup/ch05/ | wc -l
+13
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2361204
+
+-- 백업본의 SCN이다.
+
+SYS@orcl> CREATE TABLE hr.emp5(id NUMBER) TABLESPACE users;
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp5 VALUES (1);
+SYS@orcl> INSERT INTO hr.emp5 VALUES (2);
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp5;
+
+  COUNT(*)
+----------
+         2
+
+-- 백업 이후 데이터다. 전체 복원하면 사라진다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 리두 소진 후 UNDO 파일 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+SYS@orcl> /
+System altered.
+SYS@orcl> /
+System altered.
+SYS@orcl> /
+System altered.
+SYS@orcl> /
+System altered.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2362840
+
+-- 백업본 SCN(2361204) < 최소 리두 SCN(2362840). 리두가 덮어써졌다.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/undotbs01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> INSERT INTO hr.emp5 VALUES (3);
+INSERT INTO hr.emp5 VALUES (3)
+            *
+ERROR at line 1:
+ORA-01116: error in opening database file 4
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+ORA-27041: unable to open file
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         4 FILE NOT FOUND                 0
+
+SYS@orcl> SELECT MIN(first_change#) FROM v$log;
+
+MIN(FIRST_CHANGE#)
+------------------
+           2362840
+
+-- 판정
+--   1단계 : 손상 파일이 UNDO → 데이터베이스를 내리고 MOUNT에서 처리
+--   2단계 : 백업본에 존재 → 복원 가능
+--   3단계 : 백업본 SCN(2361204) < 최소 리두 SCN(2362840) → 리두 부족
+--   4단계 : UNDO는 떼어 낼 수 없으므로 전체 복원
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_52
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /u01/app/oracle/oradata/ORCL/*.log \
+                 /home/oracle/before_recover_52/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 손실을 줄이려고 UNDO만 복원하고 RECOVER를 시도한다.
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch05/undotbs01.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> STARTUP MOUNT
+Database mounted.
+
+SYS@orcl> SET AUTORECOVERY OFF
+SYS@orcl> RECOVER DATABASE;
+ORA-00279: change 2361204 generated at 05/10/2025 11:02:41 needed for thread 1
+ORA-00289: suggestion : /u01/app/oracle/product/19.3.0/dbhome_1/dbs/arch1_58_1200525254.dbf
+ORA-00280: change 2361204 for thread 1 is in sequence #58
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+CANCEL
+ORA-01547: warning: RECOVER succeeded but OPEN RESETLOGS would get error below
+ORA-01194: file 4 needs more recovery to be consistent
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01113: file 4 needs media recovery
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+
+-- << 원인 파악 >>
+-- 시퀀스 58의 리두를 요구하는데 이미 덮어써졌고 아카이브본도 없다.
+-- 일반 테이블스페이스라면 OFFLINE DROP 후 DROP TABLESPACE로 그것만 버릴 수 있다.
+-- UNDO는 그 우회로가 없다. 확인해 본다.
+
+SYS@orcl> ALTER DATABASE DATAFILE 4 OFFLINE DROP;
+Database altered.
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01157: cannot identify/lock data file 4 - see DBWR trace file
+ORA-01110: data file 4: '/u01/app/oracle/oradata/ORCL/undotbs01.dbf'
+
+-- 떼어 내도 열리지 않는다. 활성 롤백 세그먼트가 없기 때문이다.
+
+-- << 수정 >>
+-- 전체 복원으로 전환한다.
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch05/*.dbf /u01/app/oracle/oradata/ORCL/
+SYS@orcl> !cp -p /home/oracle/backup/ch05/control01.ctl /home/oracle/backup/ch05/control02.ctl \
+                 /u01/app/oracle/oradata/ORCL/
+SYS@orcl> !cp -p /home/oracle/backup/ch05/control03.ctl /u02/oradata/ORCL/
+SYS@orcl> !cp -p /home/oracle/backup/ch05/redo01.log /home/oracle/backup/ch05/redo03.log \
+                 /home/oracle/backup/ch05/redo04.log /u01/app/oracle/oradata/ORCL/
+SYS@orcl> !cp -p /home/oracle/backup/ch05/redo01b.log /home/oracle/backup/ch05/redo03b.log \
+                 /home/oracle/backup/ch05/redo04b.log /u02/oradata/ORCL/
+
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+Database opened.
+
+-- 복구 명령 없이 열렸다. 일관성 있는 상태 전체를 되돌렸기 때문이다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2361204
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp5;
+SELECT COUNT(*) FROM hr.emp5
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- 백업 이후 만든 테이블 자체가 사라졌다. 예상된 손실이다.
+
+SYS@orcl> UPDATE hr.employees SET salary = salary WHERE ROWNUM = 1;
+1 row updated.
+
+SYS@orcl> ROLLBACK;
+Rollback complete.
+
+-- DML은 정상이다. UNDO가 복구되었다.
+
+SYS@orcl> SELECT SCN_TO_TIMESTAMP(2361204) FROM dual;
+
+SCN_TO_TIMESTAMP(2361204)
+---------------------------------------------------------
+10-MAY-25 11.02.41.000000000 AM
+
+-- 이 시각 이후의 업무를 재처리해야 한다. 현업에 통보할 정보다.
+
+-- 실무 포인트
+-- 1) UNDO는 일반 테이블스페이스와 결정적으로 다르다.
+--    4장 실습 4-4에서는 OFFLINE DROP 후 DROP TABLESPACE로 그것만 버릴 수 있었으나,
+--    UNDO는 떼어 내도 열리지 않아 그 경로가 막힌다.
+--
+-- 2) ORA-01547의 "RECOVER succeeded"에 속지 않는다.
+--    이어지는 ORA-01194가 미완료를 알리고 OPEN에서 ORA-01113이 나온다.
+--
+-- 3) 전체 복원에서는 데이터 파일뿐 아니라 제어 파일과 리두 로그까지 되돌린다.
+--    실습 5-1의 부분 복원과 정반대이므로 두 절차를 섞지 않는다.
+--
+-- 4) 손실이 감당 불가능하다면 UNDO 수동 전환이라는 최후 수단이 있으나,
+--    정합성을 보장하지 않으며 데이터를 꺼내기 위한 임시 조치일 뿐이다.
+--    본문 5.2.4절에서 절차만 다루고 이 실습에서는 수행하지 않는다.
+--
+-- 5) 복구 지점을 SCN_TO_TIMESTAMP로 환산해 반드시 기록한다.
+--    이 정보가 없으면 복구가 끝나도 현업 업무가 멈춘다.
+--
+-- 6) 근본 원인은 백업 주기다. 백업이 최근일수록 리두가 살아 있을 확률이 높다.
+--    ARCHIVELOG 전환이면 이 문제 자체가 사라진다.
+
+SYS@orcl> EXIT

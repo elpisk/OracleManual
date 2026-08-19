@@ -1,0 +1,248 @@
+================================================================================
+ 실습 3-4 : 백업 모드의 리두 생성량 관찰
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 10분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실습 개요
+--------------------------------------------------------------------------------
+-- 백업 모드에서 리두 생성량이 얼마나 늘어나는지 같은 작업으로 측정해 비교한다.
+-- 증가 원인이 "변경 블록의 전체 이미지 기록"임을 수치로 확인한다.
+-- 아카이브 생성량에 미치는 영향까지 이어서 확인한다.
+-- 복구 유형 : 해당 없음(동작 관찰)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- ARCHIVELOG 모드이고 데이터베이스가 OPEN 상태여야 한다.
+-- 측정은 반드시 같은 세션에서 수행한다. 접속을 끊으면 v$mystat 값이 초기화된다.
+-- HR 스키마가 설치되어 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+-- 측정용 조회를 미리 정의해 둔다.
+
+SYS@orcl> SELECT m.value AS redo_size FROM v$mystat m, v$statname s
+  2  WHERE  m.statistic# = s.statistic# AND s.name = 'redo size';
+
+ REDO_SIZE
+----------
+     41236
+
+SYS@orcl> SAVE redo.sql
+Created file redo.sql
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, status FROM v$backup ORDER BY file#;
+
+     FILE# STATUS
+---------- ------------------
+         1 NOT ACTIVE
+         3 NOT ACTIVE
+         4 NOT ACTIVE
+         7 NOT ACTIVE
+
+-- 백업 모드에 들어간 파일이 없다. 비교의 기준 상태다.
+
+SYS@orcl> SELECT COUNT(*) AS emp_cnt FROM hr.employees;
+
+   EMP_CNT
+----------
+       107
+
+SYS@orcl> SELECT tablespace_name FROM dba_tables WHERE owner='HR' AND table_name='EMPLOYEES';
+
+TABLESPACE_NAME
+---------------
+USERS
+
+-- EMPLOYEES 는 USERS 테이블스페이스에 있다. 백업 모드 대상은 USERS 다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 백업 모드가 아닌 상태에서 측정
+--------------------------------------------------------------------------------
+SYS@orcl> @redo
+
+ REDO_SIZE
+----------
+     41236
+
+SYS@orcl> UPDATE hr.employees SET salary = salary + 1;
+107 rows updated.
+
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> @redo
+
+ REDO_SIZE
+----------
+     68420
+
+-- 증가분 : 68,420 - 41,236 = 27,184 바이트
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 백업 모드로 전환한 뒤 같은 작업을 반복하려 했으나 대상을 잘못 지정한다.
+
+SYS@orcl> ALTER TABLESPACE system BEGIN BACKUP;
+Tablespace altered.
+
+SYS@orcl> @redo
+
+ REDO_SIZE
+----------
+     68420
+
+SYS@orcl> UPDATE hr.employees SET salary = salary - 1;
+107 rows updated.
+
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> @redo
+
+ REDO_SIZE
+----------
+     95810
+
+-- 증가분 27,390 바이트. 백업 모드가 아닐 때와 거의 같다.
+
+-- << 원인 파악 >>
+-- 백업 모드로 전환한 것은 SYSTEM 테이블스페이스인데,
+-- 갱신한 EMPLOYEES 테이블은 USERS 테이블스페이스에 있다.
+-- 백업 모드의 리두 증가는 그 테이블스페이스에 속한 블록에만 적용된다.
+
+SYS@orcl> SELECT file#, status FROM v$backup ORDER BY file#;
+
+     FILE# STATUS
+---------- ------------------
+         1 ACTIVE
+         3 NOT ACTIVE
+         4 NOT ACTIVE
+         7 NOT ACTIVE
+
+-- file# 7(USERS)이 NOT ACTIVE 다. 대상이 틀렸다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER TABLESPACE system END BACKUP;
+Tablespace altered.
+
+SYS@orcl> ALTER TABLESPACE users BEGIN BACKUP;
+Tablespace altered.
+
+SYS@orcl> SELECT file#, status, change# FROM v$backup WHERE status = 'ACTIVE';
+
+     FILE# STATUS               CHANGE#
+---------- ------------------ ---------
+         7 ACTIVE               2343218
+
+SYS@orcl> @redo
+
+ REDO_SIZE
+----------
+     95810
+
+SYS@orcl> UPDATE hr.employees SET salary = salary + 1;
+107 rows updated.
+
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> @redo
+
+ REDO_SIZE
+----------
+    220254
+
+-- 증가분 : 220,254 - 95,810 = 124,444 바이트
+
+SYS@orcl> ALTER TABLESPACE users END BACKUP;
+Tablespace altered.
+
+--------------------------------------------------------------------------------
+[6] 진단 : 결과 해석
+--------------------------------------------------------------------------------
+-- 같은 UPDATE 107건에 대한 리두 생성량
+--
+--   백업 모드 아님        27,184 바이트
+--   백업 모드(대상 아님)  27,390 바이트   ← SYSTEM 을 백업 모드로 두어도 USERS 에는 영향 없음
+--   백업 모드(대상 맞음) 124,444 바이트   ← 약 4.6배
+--
+-- 증가 원인은 변경 블록의 전체 이미지가 리두에 기록되기 때문이다.
+-- EMPLOYEES 의 107행이 여러 블록에 흩어져 있고, 각 블록의 첫 변경마다
+-- 8KB 블록 전체가 리두에 들어갔다.
+--
+-- 한 블록 안의 여러 행을 고치는 경우 첫 변경에만 전체 이미지가 기록되고
+-- 이후는 평소와 같으므로 증가 폭이 작다.
+-- 넓게 흩어진 블록을 조금씩 고치면 증가 폭이 커진다.
+
+SYS@orcl> SELECT COUNT(DISTINCT DBMS_ROWID.ROWID_BLOCK_NUMBER(rowid)) AS blocks
+  2  FROM   hr.employees;
+
+    BLOCKS
+----------
+         5
+
+-- 107행이 5개 블록에 걸쳐 있다. 블록당 8KB 씩 5개면 약 40KB 가 추가로 기록된다.
+-- 언두 블록의 전체 이미지까지 함께 기록되므로 실제 증가분은 그보다 크다.
+
+--------------------------------------------------------------------------------
+[7] 검증 : 아카이브 생성량에 미치는 영향
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT TO_CHAR(completion_time,'YYYY-MM-DD HH24') AS hour,
+  2         COUNT(*) AS files,
+  3         ROUND(SUM(blocks*block_size)/1024/1024) AS mb
+  4  FROM   v$archived_log
+  5  WHERE  dest_id = 1 AND completion_time > SYSDATE - 1
+  6  GROUP  BY TO_CHAR(completion_time,'YYYY-MM-DD HH24')
+  7  ORDER  BY 1;
+
+HOUR               FILES         MB
+------------- ---------- ----------
+2025-05-09 11          4         38
+2025-05-09 12          3         29
+2025-05-09 13          9        102
+
+-- 13시는 Hot Backup 을 수행한 시간대다. 파일 수와 용량이 모두 크게 늘었다.
+-- 아카이브 대상 공간을 평상시 기준으로만 잡아 두면 이 시간대에 부족해진다.
+
+SYS@orcl> SELECT COUNT(*) AS still_active FROM v$backup WHERE status = 'ACTIVE';
+
+STILL_ACTIVE
+------------
+           0
+
+-- 실습에서 사용한 백업 모드가 모두 해제되었는지 확인한다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) 백업 모드의 리두 증가는 해당 테이블스페이스에만 적용된다.
+--    다른 테이블스페이스의 DML 은 영향을 받지 않는다.
+--    이것이 테이블스페이스 단위로 나눠 받는 이유이기도 하다.
+--
+-- 2) 측정은 반드시 같은 세션에서 한다.
+--    v$mystat 은 세션별 누적값이라 접속을 끊으면 초기화된다.
+--    여러 세션의 합을 보려면 v$sysstat 을 쓴다.
+--
+-- 3) 증가 배수는 환경마다 다르다.
+--    블록당 변경 행 수, 블록 크기, 언두 생성량에 따라 2배에서 10배까지 벌어진다.
+--    자기 시스템에서 직접 측정해 두는 것이 의미 있다.
+--
+-- 4) 아카이브 대상 공간은 "백업 시간대 최대 생성량" 기준으로 잡는다.
+--    평상시 기준으로 산정하면 백업 도중 ORA-00257 이 발생해
+--    백업과 서비스가 동시에 멈춘다.
+--
+-- 5) RMAN 은 백업 모드를 쓰지 않으므로 이 증가가 아예 없다.
+--    Oracle 블록 단위로 읽고 정합성을 직접 검사하기 때문이다. 14장에서 다시 다룬다.
+
+SYS@orcl> EXIT

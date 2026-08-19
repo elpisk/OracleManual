@@ -1,0 +1,339 @@
+================================================================================
+ 실습 6-2 : 컨트롤파일 전체 손상 — trace로 재생성
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 컨트롤파일 사본이 모두 유실되었고 Binary 백업본도 없다.
+-- TO TRACE 로 뽑아 둔 CREATE CONTROLFILE 문으로 재생성한다.
+-- 텍스트이므로 경로와 목록을 편집할 수 있다는 점이 Binary와 다르다.
+-- 데이터파일이 추가된 상황을 함께 다뤄 편집의 필요성을 확인한다.
+-- 복구 유형 : 완전 복구(NORESETLOGS 또는 RESETLOGS)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 6-1을 마친 상태에서 이어서 진행한다.
+-- 데이터베이스가 OPEN 상태여야 TO TRACE 를 수행할 수 있다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : trace 백업 확보
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, open_mode FROM v$database;
+
+NAME      OPEN_MODE
+--------- --------------------
+ORCL      READ WRITE
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_20250510.sql';
+
+Database altered.
+
+SYS@orcl> !grep -c 'CREATE CONTROLFILE' /home/oracle/backup/cf_20250510.sql
+2
+
+-- NORESETLOGS 형식과 RESETLOGS 형식 두 가지가 들어 있다.
+
+SYS@orcl> !grep -n 'RESETLOGS' /home/oracle/backup/cf_20250510.sql
+32:CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS NOARCHIVELOG
+78:CREATE CONTROLFILE REUSE DATABASE "ORCL" RESETLOGS NOARCHIVELOG
+
+SYS@orcl> !sed -n '32,56p' /home/oracle/backup/cf_20250510.sql
+CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS NOARCHIVELOG
+    MAXLOGFILES 16
+    MAXLOGMEMBERS 3
+    MAXDATAFILES 100
+    MAXINSTANCES 8
+    MAXLOGHISTORY 292
+LOGFILE
+  GROUP 1 (
+    '/u01/app/oracle/oradata/ORCL/redo01.log',
+    '/u02/oradata/ORCL/redo01b.log'
+  ) SIZE 200M BLOCKSIZE 512,
+  GROUP 3 (
+    '/u01/app/oracle/oradata/ORCL/redo03.log',
+    '/u02/oradata/ORCL/redo03b.log'
+  ) SIZE 200M BLOCKSIZE 512,
+  GROUP 4 (
+    '/u01/app/oracle/oradata/ORCL/redo04.log',
+    '/u02/oradata/ORCL/redo04b.log'
+  ) SIZE 200M BLOCKSIZE 512
+DATAFILE
+  '/u01/app/oracle/oradata/ORCL/system01.dbf',
+  '/u01/app/oracle/oradata/ORCL/sysaux01.dbf',
+  '/u01/app/oracle/oradata/ORCL/undotbs01.dbf',
+  '/u01/app/oracle/oradata/ORCL/users01.dbf'
+CHARACTER SET AL32UTF8
+;
+
+-- TEMP 파일이 목록에 없다. 재생성 후 따로 추가해야 한다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 구조 변경 후 컨트롤파일 삭제
+--------------------------------------------------------------------------------
+-- trace 백업 이후 데이터파일을 추가한다. 실무에서 흔한 상황이다.
+
+SYS@orcl> ALTER TABLESPACE users ADD DATAFILE
+  2    '/u01/app/oracle/oradata/ORCL/users02.dbf' SIZE 50M;
+
+Tablespace altered.
+
+SYS@orcl> SELECT file#, name FROM v$datafile ORDER BY file#;
+
+     FILE# NAME
+---------- ------------------------------------------------
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf
+         8 /u01/app/oracle/oradata/ORCL/users02.dbf
+
+SYS@orcl> CREATE TABLE hr.emp62(id NUMBER) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp62 VALUES (10);
+SYS@orcl> COMMIT;
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+-- 정상 종료다. NORESETLOGS 경로를 쓸 수 있는 조건이다.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> !ls /home/oracle/backup/*.bkp 2>/dev/null
+[oracle@oel7v9r1 ~]$
+
+-- Binary 백업본이 없다고 가정한다. trace 파일만 남았다.
+
+SYS@orcl> !ls -l /home/oracle/backup/cf_20250510.sql
+-rw-r--r--. 1 oracle oinstall 4218 May 10 15:40 /home/oracle/backup/cf_20250510.sql
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- 마지막 종료 방식을 alert log로 확인한다.
+
+SYS@orcl> !grep -n 'CLOSE NORMAL' \
+        /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -1
+18422:Completed: ALTER DATABASE CLOSE NORMAL
+
+-- 정상 종료였다. NORESETLOGS 형식을 쓸 수 있다.
+
+-- trace 파일의 DATAFILE 절과 실제 파일 목록을 대조한다.
+
+SYS@orcl> !grep -c 'dbf' /home/oracle/backup/cf_20250510.sql
+8
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.dbf
+/u01/app/oracle/oradata/ORCL/sysaux01.dbf
+/u01/app/oracle/oradata/ORCL/system01.dbf
+/u01/app/oracle/oradata/ORCL/temp01.dbf
+/u01/app/oracle/oradata/ORCL/undotbs01.dbf
+/u01/app/oracle/oradata/ORCL/users01.dbf
+/u01/app/oracle/oradata/ORCL/users02.dbf
+
+-- users02.dbf 가 trace 파일에 없다. 백업 이후 추가한 파일이다.
+
+-- 시도 전 원상 복귀 수단을 확보한다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_62
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.log /home/oracle/before_recover_62/
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.log /home/oracle/before_recover_62/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- trace 파일을 그대로 실행해 본다.
+
+SYS@orcl> STARTUP NOMOUNT
+ORACLE instance started.
+
+SYS@orcl> CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS NOARCHIVELOG
+  2      MAXLOGFILES 16
+  3      MAXLOGMEMBERS 3
+  4      MAXDATAFILES 100
+  5      MAXINSTANCES 8
+  6      MAXLOGHISTORY 292
+  7  LOGFILE
+  8    GROUP 1 (
+  9      '/u01/app/oracle/oradata/ORCL/redo01.log',
+ 10      '/u02/oradata/ORCL/redo01b.log'
+ 11    ) SIZE 200M BLOCKSIZE 512,
+ 12    GROUP 3 (
+ 13      '/u01/app/oracle/oradata/ORCL/redo03.log',
+ 14      '/u02/oradata/ORCL/redo03b.log'
+ 15    ) SIZE 200M BLOCKSIZE 512,
+ 16    GROUP 4 (
+ 17      '/u01/app/oracle/oradata/ORCL/redo04.log',
+ 18      '/u02/oradata/ORCL/redo04b.log'
+ 19    ) SIZE 200M BLOCKSIZE 512
+ 20  DATAFILE
+ 21    '/u01/app/oracle/oradata/ORCL/system01.dbf',
+ 22    '/u01/app/oracle/oradata/ORCL/sysaux01.dbf',
+ 23    '/u01/app/oracle/oradata/ORCL/undotbs01.dbf',
+ 24    '/u01/app/oracle/oradata/ORCL/users01.dbf'
+ 25  CHARACTER SET AL32UTF8
+ 26  ;
+
+Control file created.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- 오류 없이 열렸다. 그런데 문제가 남아 있다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp62;
+SELECT COUNT(*) FROM hr.emp62
+                     *
+ERROR at line 1:
+ORA-00376: file 8 cannot be read at this time
+ORA-01111: name for data file 8 is unknown - rename to correct file
+ORA-01110: data file 8: '/u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00008'
+
+-- << 원인 파악 >>
+-- DATAFILE 절에 users02.dbf 를 넣지 않았다.
+-- 컨트롤파일에는 그 파일이 등록되지 않았고 Oracle은 UNNAMED00008 이라는
+-- 임시 이름으로 자리만 잡아 두었다.
+-- 오류 없이 열렸기 때문에 발견이 늦다는 점이 이 실수의 위험이다.
+-- CREATE CONTROLFILE 문의 DATAFILE 절은 실제 파일 목록과 반드시 일치해야 한다.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 8;
+
+     FILE# NAME                                                        STATUS
+---------- ----------------------------------------------------------- -------
+         8 /u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00008    RECOVER
+
+-- << 수정 >>
+-- 방법 1 : RENAME FILE 로 실제 경로를 지정한다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+
+SYS@orcl> ALTER DATABASE RENAME FILE
+  2    '/u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00008'
+  3  TO '/u01/app/oracle/oradata/ORCL/users02.dbf';
+
+Database altered.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 8;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         8 /u01/app/oracle/oradata/ORCL/users02.dbf      ONLINE
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- 방법 2 : 처음부터 DATAFILE 절에 넣어 재생성한다(권장).
+--   CREATE CONTROLFILE 실행 전에 아래를 확인하면 이 오류 자체가 발생하지 않는다.
+--   !ls /u01/app/oracle/oradata/ORCL/*.dbf | grep -v temp
+--   위 목록과 문의 DATAFILE 절 항목 수가 같아야 한다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp62;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile ORDER BY file#;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf     SYSTEM
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf     ONLINE
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf    ONLINE
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf      ONLINE
+         8 /u01/app/oracle/oradata/ORCL/users02.dbf      ONLINE
+
+SYS@orcl> SELECT resetlogs_change#, resetlogs_time FROM v$database;
+
+RESETLOGS_CHANGE# RESETLOGS_TIME
+----------------- ---------------------
+          2382140 10-MAY-25
+
+-- 실습 6-1의 값 그대로다. 이번 재생성은 인카네이션을 올리지 않았다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         0
+
+-- TEMP 정보가 사라졌다. trace 재생성의 필수 마무리 작업이다.
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u01/app/oracle/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM (SELECT object_name FROM dba_objects
+  2    UNION SELECT object_name FROM dba_objects);
+
+  COUNT(*)
+----------
+     73206
+
+-- 정렬 쿼리가 성공한다.
+
+-- 현재 구조를 반영한 백업을 새로 받는다.
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_after_add.sql';
+Database altered.
+
+SYS@orcl> !grep -c 'users02' /home/oracle/backup/cf_after_add.sql
+1
+
+-- 새 백업에는 users02.dbf 가 포함되어 있다.
+
+-- 실무 포인트
+-- 1) DATAFILE 절 누락은 오류 없이 지나간다는 점이 가장 위험하다.
+--    데이터베이스는 정상적으로 열리고, 그 파일을 실제로 읽을 때가 되어서야 드러난다.
+--    파일이 UNNAMEDnnnnn 이라는 임시 이름으로 등록된 것이 그 증거다.
+--
+-- 2) 실행 전 목록 대조를 절차로 만든다.
+--    ls 로 뽑은 데이터파일 개수와 문의 DATAFILE 항목 수가 같은지 확인한다.
+--    TEMP 파일은 제외해야 하므로 grep -v temp 를 함께 쓴다.
+--
+-- 3) 누락이 발견되면 ALTER DATABASE RENAME FILE 로 되살릴 수 있다.
+--    MOUNT 상태에서 UNNAMED 경로를 실제 경로로 바꿔 준다.
+--    다만 처음부터 목록을 맞추는 편이 훨씬 안전하다.
+--
+-- 4) 정상 종료 상태였으므로 NORESETLOGS 형식으로 복구 없이 열렸다.
+--    인카네이션이 올라가지 않아 기존 백업본이 계속 유효하다.
+--    같은 상황을 Binary 백업본으로 처리했다면 RESETLOGS를 치러야 했다.
+--
+-- 5) trace 재생성은 TEMP 정보를 남기지 않는다.
+--    Binary 복원과 다른 점이며, 마무리 작업에서 반드시 TEMPFILE을 추가한다.
+--
+-- 6) 구조를 변경했으면 그 자리에서 컨트롤파일 백업을 다시 받는다.
+--    이 실습의 모든 문제는 데이터파일 추가 후 백업을 미룬 데서 시작됐다.
+
+SYS@orcl> EXIT

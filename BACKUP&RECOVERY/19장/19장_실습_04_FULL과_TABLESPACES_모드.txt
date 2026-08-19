@@ -1,0 +1,270 @@
+================================================================================
+ 실습 19-4 : FULL 모드와 TABLESPACES 모드
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실습 개요
+--------------------------------------------------------------------------------
+-- 네 가지 모드 가운데 FULL과 TABLESPACES를 확인한다.
+-- 모드마다 대상 범위가 어떻게 달라지는지 로그로 비교한다.
+-- FULL 모드에 필요한 롤과 그것이 없을 때의 증상을 확인한다.
+-- 테이블스페이스 모드가 소유자와 무관하다는 점을 검증한다.
+-- 작업 유형 : 논리 백업 생성
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT tablespace_name, status, contents FROM dba_tablespaces
+  2  ORDER BY tablespace_name;
+
+TABLESPACE_NAME  STATUS    CONTENTS
+---------------- --------- ---------
+SYSAUX           ONLINE    PERMANENT
+SYSTEM           ONLINE    PERMANENT
+TEMP             ONLINE    TEMPORARY
+UNDOTBS1         ONLINE    UNDO
+USERS            ONLINE    PERMANENT
+
+SYS@orcl> SELECT directory_path FROM dba_directories
+  2  WHERE  directory_name = 'DP_DIR';
+
+DIRECTORY_PATH
+--------------------
+/u03/dpdump
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+-- 테이블스페이스 모드 비교용으로 두 스키마를 준비한다.
+
+SYS@orcl> CREATE TABLESPACE dp_ts DATAFILE
+  2    '/u03/oradata/ORCL/dp_ts01.dbf' SIZE 100M AUTOEXTEND ON NEXT 10M;
+
+Tablespace created.
+
+SYS@orcl> CREATE USER app1 IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE dp_ts QUOTA UNLIMITED ON dp_ts;
+SYS@orcl> CREATE USER app2 IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE dp_ts QUOTA UNLIMITED ON dp_ts;
+SYS@orcl> GRANT CREATE SESSION, CREATE TABLE TO app1, app2;
+
+Grant succeeded.
+
+SYS@orcl> CREATE TABLE app1.t1 TABLESPACE dp_ts AS
+  2    SELECT LEVEL AS id, 'a1-' || LEVEL AS memo
+  3    FROM dual CONNECT BY LEVEL <= 500;
+SYS@orcl> CREATE TABLE app2.t2 TABLESPACE dp_ts AS
+  2    SELECT LEVEL AS id, 'a2-' || LEVEL AS memo
+  3    FROM dual CONNECT BY LEVEL <= 300;
+
+Table created.
+
+-- app1의 테이블 하나는 일부러 USERS에 만든다.
+
+SYS@orcl> ALTER USER app1 QUOTA UNLIMITED ON users;
+SYS@orcl> CREATE TABLE app1.t_users TABLESPACE users AS
+  2    SELECT LEVEL AS id FROM dual CONNECT BY LEVEL <= 100;
+
+Table created.
+
+SYS@orcl> SELECT owner, table_name, tablespace_name FROM dba_tables
+  2  WHERE  owner IN ('APP1','APP2') ORDER BY owner, table_name;
+
+OWNER TABLE_NAME  TABLESPACE_NAME
+----- ----------- ----------------
+APP1  T1          DP_TS
+APP1  T_USERS     USERS
+APP2  T2          DP_TS
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : TABLESPACES 모드
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=ts_dpts.dmp logfile=ts_dpts.log \
+>   tablespaces=dp_ts job_name=TS_EXP_01
+
+Starting "SYSTEM"."TS_EXP_01":  system/******** directory=dp_dir ...
+Processing object type TABLE_EXPORT/TABLE/TABLE
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+. . exported "APP1"."T1"                     18.42 KB     500 rows
+. . exported "APP2"."T2"                     14.06 KB     300 rows
+Master table "SYSTEM"."TS_EXP_01" successfully loaded/unloaded
+Dump file set for SYSTEM.TS_EXP_01 is:
+  /u03/dpdump/ts_dpts.dmp
+Job "SYSTEM"."TS_EXP_01" successfully completed at 13:22:11
+
+-- 소유자가 다른 두 테이블이 함께 담겼다.
+-- APP1.T_USERS는 USERS에 있으므로 대상이 아니다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 모드별 대상 비교
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=sc_app1.dmp logfile=sc_app1.log schemas=app1
+
+. . exported "APP1"."T1"                     18.42 KB     500 rows
+. . exported "APP1"."T_USERS"                 6.75 KB     100 rows
+Job "SYSTEM"."SYS_EXPORT_SCHEMA_01" successfully completed at 13:24:50
+
+-- 스키마 모드는 소유자 기준이므로 테이블스페이스와 무관하게 둘 다 담겼다.
+
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=tb_t1.dmp logfile=tb_t1.log tables=app1.t1
+
+. . exported "APP1"."T1"                     18.42 KB     500 rows
+Job "SYSTEM"."SYS_EXPORT_TABLE_01" successfully completed at 13:25:38
+
+-- 정리
+--   TABLESPACES=dp_ts : APP1.T1, APP2.T2      (위치 기준)
+--   SCHEMAS=app1      : APP1.T1, APP1.T_USERS (소유자 기준)
+--   TABLES=app1.t1    : APP1.T1               (개별 지정)
+
+--------------------------------------------------------------------------------
+[6] 확인 : FULL 모드
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ expdp system/oracle_4U directory=dp_dir \
+>   dumpfile=full_db.dmp logfile=full_db.log \
+>   full=y estimate_only=y
+
+Estimate in progress using BLOCKS method...
+Processing object type DATABASE_EXPORT/SCHEMA/TABLE/TABLE_DATA
+.  estimated "SYSTEM"."REDO_DB"                          64 KB
+.  estimated "HR"."EMPLOYEES"                            64 KB
+.  estimated "APP1"."T1"                                128 KB
+.  estimated "APP2"."T2"                                 64 KB
+...
+Total estimation using BLOCKS method: 132.4 MB
+Job "SYSTEM"."SYS_EXPORT_FULL_01" successfully completed at 13:28:02
+
+-- FULL 모드는 SYS 등 일부를 제외한 전체가 대상이다.
+-- 크기가 커지므로 사전 확인이 특히 중요하다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 일반 사용자로 FULL 모드를 시도해 본다.
+
+[oracle@oel7v9r1 ~]$ expdp app1/oracle_4U directory=dp_dir \
+>   dumpfile=full_app1.dmp logfile=full_app1.log full=y
+
+Export: Release 19.0.0.0.0 - Production on Wed May 21 13:30:44 2025
+
+ORA-31631: privileges are required
+ORA-39161: Full database jobs require privileges
+
+-- << 원인 파악 >>
+-- FULL 모드는 데이터베이스 전체를 대상으로 한다.
+-- 다른 사용자의 객체까지 읽어야 하므로 별도 롤이 필요하다.
+-- DATAPUMP_EXP_FULL_DATABASE 롤이 그것이다.
+-- app1에게는 CREATE SESSION과 CREATE TABLE만 부여했다.
+
+SYS@orcl> SELECT granted_role FROM dba_role_privs WHERE grantee = 'APP1';
+
+no rows selected
+
+SYS@orcl> SELECT granted_role FROM dba_role_privs WHERE grantee = 'SYSTEM'
+  2  AND    granted_role LIKE 'DATAPUMP%';
+
+GRANTED_ROLE
+------------------------------
+DATAPUMP_EXP_FULL_DATABASE
+DATAPUMP_IMP_FULL_DATABASE
+
+-- SYSTEM은 이 롤을 가지고 있어 성공한 것이다.
+
+-- << 수정 >> 두 가지 선택지가 있다.
+-- ① 권한 있는 계정으로 실행한다. (권장)
+-- ② 꼭 필요하면 롤을 부여한다. 다만 광범위한 권한이므로 신중히 판단한다.
+
+SYS@orcl> GRANT DATAPUMP_EXP_FULL_DATABASE TO app1;
+
+Grant succeeded.
+
+[oracle@oel7v9r1 ~]$ expdp app1/oracle_4U directory=dp_dir \
+>   dumpfile=full_app1.dmp logfile=full_app1.log \
+>   full=y estimate_only=y
+
+Total estimation using BLOCKS method: 132.4 MB
+Job "APP1"."SYS_EXPORT_FULL_01" successfully completed at 13:34:19
+
+-- 실습 후에는 회수한다.
+
+SYS@orcl> REVOKE DATAPUMP_EXP_FULL_DATABASE FROM app1;
+
+Revoke succeeded.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+-- 테이블스페이스 모드 덤프를 다른 스키마로 반입해 본다.
+
+SYS@orcl> DROP TABLE app1.t1 PURGE;
+SYS@orcl> DROP TABLE app2.t2 PURGE;
+
+Table dropped.
+
+[oracle@oel7v9r1 ~]$ impdp system/oracle_4U directory=dp_dir \
+>   dumpfile=ts_dpts.dmp logfile=ts_imp.log
+
+Processing object type TABLE_EXPORT/TABLE/TABLE
+. . imported "APP1"."T1"                     18.42 KB     500 rows
+. . imported "APP2"."T2"                     14.06 KB     300 rows
+Job "SYSTEM"."SYS_IMPORT_FULL_01" successfully completed at 13:38:55
+
+SYS@orcl> SELECT owner, table_name, COUNT(*) OVER () AS cnt
+  2  FROM   dba_tables WHERE owner IN ('APP1','APP2');
+
+OWNER TABLE_NAME  CNT
+----- ----------- ---
+APP1  T1            3
+APP1  T_USERS       3
+APP2  T2            3
+
+SYS@orcl> SELECT COUNT(*) FROM app1.t1;
+
+  COUNT(*)
+----------
+       500
+
+SYS@orcl> SELECT COUNT(*) FROM app2.t2;
+
+  COUNT(*)
+----------
+       300
+
+-- 정리
+
+SYS@orcl> DROP USER app1 CASCADE;
+SYS@orcl> DROP USER app2 CASCADE;
+SYS@orcl> DROP TABLESPACE dp_ts INCLUDING CONTENTS AND DATAFILES;
+
+Tablespace dropped.
+
+-- 실무 포인트
+-- 1) 모드마다 대상 선정 기준이 다르다.
+--    SCHEMAS는 소유자 기준, TABLESPACES는 위치 기준이다.
+--    같은 사용자의 테이블이라도 테이블스페이스가 다르면 갈린다.
+--
+-- 2) TABLESPACES 모드는 소유자와 무관하다.
+--    여러 사용자의 객체가 한 덤프에 섞여 담긴다.
+--    반입 시 어느 스키마로 갈지 미리 확인해야 혼란이 없다.
+--
+-- 3) FULL 모드는 DATAPUMP_EXP_FULL_DATABASE 롤이 필요하다.
+--    없으면 ORA-31631과 ORA-39161로 거부된다.
+--    이 롤은 다른 사용자 객체를 모두 읽을 수 있어 부여에 신중해야 한다.
+--
+-- 4) FULL 모드라도 SYS 스키마는 제외된다.
+--    데이터 사전은 반입 대상이 아니며 그럴 필요도 없다.
+--    데이터베이스 전체 복제가 목적이라면 17장의 RMAN DUPLICATE가 맞다.
+--
+-- 5) FULL 모드는 크기가 커진다.
+--    반드시 ESTIMATE로 사전 확인하고 디스크 여유를 본다.
+--    중간에 공간이 부족해지면 작업이 실패하고 정리 부담이 생긴다.
+--
+-- 6) 실습용으로 부여한 롤은 반드시 회수한다.
+--    권한이 남아 있으면 감사에서 지적 대상이 된다.

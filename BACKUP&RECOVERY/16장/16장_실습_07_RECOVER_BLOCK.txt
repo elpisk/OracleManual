@@ -1,0 +1,328 @@
+================================================================================
+ 실습 16-7 : RECOVER BLOCK으로 손상 블록만 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 블록 손상을 다시 만들고 블록 단위로만 복구한다.
+-- 복구 중에도 다른 블록에 접근할 수 있음을 확인한다.
+-- 파일 복구와 소요 시간을 비교한다.
+-- NOLOGGING 블록은 복구되지 않는 것도 확인한다.
+-- 복구 유형 : 블록 미디어 복구, 업무 중단 없음
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 16-6까지 완료되어 있어야 한다.
+-- 손상 이전 백업이 반드시 필요하다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP DATAFILE 7 TAG 'BASE_167';
+
+Starting backup at 18-MAY-25
+Finished backup at 18-MAY-25
+
+RMAN> EXIT
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT COUNT(*) FROM hr.blk165;
+
+  COUNT(*)
+----------
+       500
+
+-- 실습 16-5에서 만든 테이블이며 손상은 이미 복구되었다.
+
+SYS@orcl> INSERT INTO hr.blk165
+  2  SELECT LEVEL + 500, RPAD('y', 2000, 'y') FROM dual CONNECT BY LEVEL <= 100;
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@orcl> ALTER SYSTEM CHECKPOINT;
+
+System altered.
+
+-- NOLOGGING으로 적재한 테이블도 만들어 둔다.
+
+SYS@orcl> CREATE TABLE hr.blk167_nl NOLOGGING TABLESPACE users
+  2  AS SELECT LEVEL AS id, RPAD('z',2000,'z') AS pad
+  3     FROM dual CONNECT BY LEVEL <= 100;
+
+Table created.
+
+SYS@orcl> SELECT MIN(DBMS_ROWID.rowid_block_number(ROWID)) AS min_blk
+  2  FROM   hr.blk167_nl;
+
+   MIN_BLK
+----------
+       420
+
+SYS@orcl> EXIT
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 두 종류의 블록 손상
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< "SHUTDOWN IMMEDIATE"
+
+[oracle@oel7v9r1 ~]$ dd if=/dev/zero of=/u02/oradata/ORCL/users01.dbf \
+>   bs=8192 seek=150 count=2 conv=notrunc
+
+2+0 records in
+2+0 records out
+
+-- 일반 테이블의 블록 두 개를 손상시켰다.
+
+[oracle@oel7v9r1 ~]$ dd if=/dev/zero of=/u02/oradata/ORCL/users01.dbf \
+>   bs=8192 seek=420 count=1 conv=notrunc
+
+1+0 records in
+1+0 records out
+
+-- NOLOGGING 테이블의 블록 하나도 손상시켰다.
+-- 백업 이후에 만든 테이블이므로 백업에 그 블록의 내용이 없다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< "STARTUP"
+
+ORACLE instance started.
+Database opened.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+
+SYS@orcl> SELECT COUNT(*) FROM hr.blk165;
+SELECT COUNT(*) FROM hr.blk165
+                     *
+ERROR at line 1:
+ORA-01578: ORACLE data block corrupted (file # 7, block # 150)
+ORA-01110: data file 7: '/u02/oradata/ORCL/users01.dbf'
+
+SYS@orcl> SELECT COUNT(*) FROM hr.blk167_nl;
+SELECT COUNT(*) FROM hr.blk167_nl
+                     *
+ERROR at line 1:
+ORA-01578: ORACLE data block corrupted (file # 7, block # 420)
+ORA-01110: data file 7: '/u02/oradata/ORCL/users01.dbf'
+
+-- 두 테이블 모두 오류가 난다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+-- 같은 파일의 다른 객체는 정상 조회된다.
+-- 손상 블록을 읽는 세션만 오류를 만난다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> EXIT
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> VALIDATE DATAFILE 7;
+
+List of Datafiles
+=================
+File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
+---- ------ -------------- ------------ --------------- ----------
+7    FAILED 3              380          1280            2716400
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT file#, block#, blocks, corruption_type
+  2  FROM   v$database_block_corruption ORDER BY block#;
+
+     FILE#     BLOCK#     BLOCKS CORRUPTION_TYPE
+---------- ---------- ---------- ---------------
+         7        150          2 CORRUPT
+         7        420          1 CORRUPT
+
+SYS@orcl> SELECT owner, segment_name, segment_type
+  2  FROM   dba_extents
+  3  WHERE  file_id = 7
+  4  AND    (150 BETWEEN block_id AND block_id + blocks - 1
+  5     OR   420 BETWEEN block_id AND block_id + blocks - 1);
+
+OWNER  SEGMENT_NAME         SEGMENT_TYPE
+------ -------------------- ------------
+HR     BLK165               TABLE
+HR     BLK167_NL            TABLE
+
+-- 판정
+--   ① 손상 블록 3개 → 블록 복구가 적절 (파일 복구는 과하다)
+--   ② BLK165는 백업이 있고 아카이브가 연속 → 복구 가능
+--   ③ BLK167_NL은 백업 이후 NOLOGGING으로 만든 테이블 → 복구 불가 예상
+--   → RECOVER CORRUPTION LIST 후 남는 항목을 확인한다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> EXIT
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RECOVER CORRUPTION LIST;
+
+Starting recover at 18-MAY-25
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: restoring block(s)
+channel ORA_DISK_1: specifying block(s) to restore from backup set
+restoring blocks of datafile 00007
+channel ORA_DISK_1: reading from backup piece /home/oracle/rmanbk/...
+channel ORA_DISK_1: restored block(s) from backup piece 1
+channel ORA_DISK_1: block restore complete, elapsed time: 00:00:01
+
+starting media recovery
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of recover command at 05/18/2025 14:12:41
+RMAN-06023: no backup or copy of datafile 7 found to restore
+-- (블록 420에 대해)
+
+-- << 원인 파악 >>
+-- 블록 150은 복구되었으나 420에서 실패했다.
+-- 420은 백업 이후에 만들어진 NOLOGGING 테이블의 블록이다.
+-- 백업에 그 블록의 내용이 없고 리두에도 기록되지 않았다.
+-- 어떤 방법으로도 되살릴 수 없다.
+
+RMAN> EXIT
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT file#, block#, blocks, corruption_type
+  2  FROM   v$database_block_corruption;
+
+     FILE#     BLOCK#     BLOCKS CORRUPTION_TYPE
+---------- ---------- ---------- ---------------
+         7        420          1 CORRUPT
+
+-- 150은 목록에서 사라졌다. 420만 남았다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.blk165;
+
+  COUNT(*)
+----------
+       600
+
+-- 일반 테이블은 완전히 복구되었다.
+
+-- << 수정 >> 복구할 수 없는 테이블은 재생성한다.
+
+SYS@orcl> DROP TABLE hr.blk167_nl PURGE;
+
+Table dropped.
+
+SYS@orcl> CREATE TABLE hr.blk167_nl TABLESPACE users
+  2  AS SELECT LEVEL AS id, RPAD('z',2000,'z') AS pad
+  3     FROM dual CONNECT BY LEVEL <= 100;
+
+Table created.
+
+-- NOLOGGING 없이 다시 만들었다.
+
+SYS@orcl> EXIT
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> VALIDATE DATAFILE 7;
+
+7    OK     0              380          1280            2717200
+
+-- 테이블을 지우면서 그 블록이 재사용되어 손상이 해소되었다.
+
+RMAN> EXIT
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT COUNT(*) FROM v\$database_block_corruption;"
+
+  COUNT(*)
+----------
+         0
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT COUNT(*) FROM hr.blk165;
+
+  COUNT(*)
+----------
+       600
+
+SYS@orcl> SELECT COUNT(*) FROM hr.blk167_nl;
+
+  COUNT(*)
+----------
+       100
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> EXIT
+
+-- 소요 시간을 비교한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT operation, TO_CHAR(start_time,'HH24:MI:SS') AS s,
+   TO_CHAR(end_time,'HH24:MI:SS') AS e FROM v\$rman_status
+   WHERE start_time > SYSDATE-1/24 ORDER BY start_time;"
+
+OPERATION           S        E
+------------------- -------- --------
+VALIDATE            14:08:12 14:08:15
+RECOVER             14:12:38 14:12:41
+BACKUP              14:20:02 14:20:41
+
+-- 블록 복구는 3초에 끝났다.
+-- 같은 파일을 전체 복구했다면 복원에만 수십 초가 걸렸을 것이다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+RMAN> BACKUP DATAFILE 7 TAG 'AFTER_BLOCK';
+RMAN> VALIDATE DATAFILE 7;
+
+7    OK     0              380          1280            2717600
+
+RMAN> EXIT
+
+-- 실무 포인트
+-- 1) 블록 복구는 손상 블록만 백업에서 꺼내 되돌린다.
+--    이 실습에서는 3초에 끝났다. 파일 복구와 비교하면 차이가 크다.
+--    파일을 OFFLINE으로 내리지 않아 업무도 멈추지 않는다.
+--
+-- 2) 같은 파일의 다른 객체는 정상적으로 조회된다.
+--    손상 블록을 읽는 세션만 오류를 만난다.
+--    이것이 파일 복구와의 가장 큰 차이다.
+--
+-- 3) RECOVER CORRUPTION LIST 는 목록 전체를 대상으로 한다.
+--    복구된 블록은 목록에서 사라지고 실패한 것만 남는다.
+--    남은 항목을 확인하는 것이 복구 후 첫 검증이다.
+--
+-- 4) 백업 이후에 만들어진 객체의 블록은 복구할 수 없다.
+--    백업에 그 블록의 내용이 없기 때문이다.
+--    RMAN-06023이 그 사실을 알려 준다.
+--
+-- 5) NOLOGGING으로 적재된 블록도 마찬가지다.
+--    리두에 내용이 없어 어떤 방법으로도 되살릴 수 없다.
+--    해당 객체를 재생성하거나 재적재하는 수밖에 없다.
+--
+-- 6) 객체를 지우면 그 블록이 재사용되어 손상 표시가 해소된다.
+--    다만 데이터는 잃은 것이므로 재적재 계획이 함께 필요하다.
+--    복구 후 VALIDATE로 손상이 없는지 다시 확인한다.

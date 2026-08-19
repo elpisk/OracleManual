@@ -1,0 +1,273 @@
+================================================================================
+ 실습 17-3 : CREATE CONTROLFILE SET DATABASE 실행
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL → CLONE
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 복제본용 컨트롤파일을 생성한다.
+-- SET DATABASE 절로 이름이 바뀌고 DBID가 새로 만들어지는 것을 확인한다.
+-- 문에 오류가 있을 때 어떻게 실패하는지 확인한다.
+-- 생성 후 파일 목록이 복제본의 것인지 검증한다.
+-- 작업 유형 : 복제 수행(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 17-2가 완료되어 /tmp/cf_clone.sql 이 검증을 통과해야 한다.
+
+[oracle@oel7v9r1 ~]$ /tmp/check_clone_sql.sh /tmp/cf_clone.sql
+
+== 원본 경로 검사 ==
+OK - 원본 경로 없음
+== SET DATABASE 확인 ==
+1:CREATE CONTROLFILE SET DATABASE "CLONE" RESETLOGS  ARCHIVELOG
+== 파일 개수 ==
+문: 5  실제: 5
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=CLONE
+[oracle@oel7v9r1 ~]$ echo $ORACLE_SID
+CLONE
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@CLONE> STARTUP NOMOUNT PFILE='?/dbs/initCLONE.ora';
+
+ORACLE instance started.
+
+Total System Global Area  536870912 bytes
+Fixed Size                  8896512 bytes
+Variable Size             184549376 bytes
+Database Buffers          335544320 bytes
+Redo Buffers                7880704 bytes
+
+SYS@CLONE> SELECT instance_name, status FROM v$instance;
+
+INSTANCE_NAME    STATUS
+---------------- ------------
+CLONE            STARTED
+
+SYS@CLONE> !ls /u04/clone/CLONE/*.ctl 2>/dev/null | wc -l
+0
+
+-- 아직 컨트롤파일이 없다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 잘못된 문으로 먼저 시도
+--------------------------------------------------------------------------------
+-- 파일 하나를 빠뜨린 문을 만들어 본다.
+
+SYS@CLONE> !sed '/users01.dbf/d' /tmp/cf_clone.sql > /tmp/cf_missing.sql
+SYS@CLONE> !grep -c 'dbf' /tmp/cf_missing.sql
+4
+
+-- users01.dbf 가 빠졌다.
+
+SYS@CLONE> @/tmp/cf_missing.sql
+
+Control file created.
+
+-- 문법 오류가 아니므로 그대로 만들어진다.
+-- 빠진 파일은 나중에 문제가 된다.
+
+SYS@CLONE> SELECT file#, name FROM v$datafile ORDER BY file#;
+
+     FILE# NAME
+---------- ------------------------------------------
+         1 /u04/clone/CLONE/system01.dbf
+         2 /u04/clone/CLONE/sysaux01.dbf
+         3 /u04/clone/CLONE/undotbs01.dbf
+         4 /u04/clone/CLONE/tbs13_01.dbf
+
+-- << 원인 파악 >>
+-- 파일이 네 개뿐이고 번호도 원본과 다르게 다시 매겨졌다.
+-- CREATE CONTROLFILE은 문에 나열된 순서대로 번호를 부여한다.
+-- 빠진 users01.dbf 는 이 데이터베이스에 존재하지 않는 파일이 된다.
+-- 이 상태로 복구하면 그 테이블스페이스를 쓸 수 없다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@CLONE> RECOVER DATABASE USING BACKUP CONTROLFILE UNTIL CANCEL;
+
+ORA-00279: change 2760100 generated at 05/19/2025 09:12:04 needed for thread 1
+ORA-00289: suggestion : /u04/clone/arch/1_46_1190530011.dbf
+ORA-00280: change 2760100 for thread 1 is in sequence #46
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+CANCEL
+
+Media recovery cancelled.
+
+SYS@CLONE> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+SYS@CLONE> SELECT tablespace_name FROM dba_tablespaces;
+
+TABLESPACE_NAME
+------------------------------
+SYSTEM
+SYSAUX
+UNDOTBS1
+TEMP
+TBS13
+
+-- USERS 테이블스페이스가 없다.
+-- 데이터 사전에는 있지만 파일이 없어 접근할 수 없는 상태다.
+
+SYS@CLONE> SELECT COUNT(*) FROM v$datafile WHERE name LIKE '%UNNAMED%';
+
+  COUNT(*)
+----------
+         0
+
+-- 이 경우는 UNNAMED로도 나타나지 않는다.
+-- 컨트롤파일을 만들 때부터 그 파일이 없는 것으로 정의되었기 때문이다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@CLONE> SELECT file_name FROM dba_data_files ORDER BY file_id;
+
+FILE_NAME
+------------------------------------------
+/u04/clone/CLONE/system01.dbf
+/u04/clone/CLONE/sysaux01.dbf
+/u04/clone/CLONE/undotbs01.dbf
+/u04/clone/CLONE/tbs13_01.dbf
+
+SYS@CLONE> !ls /u04/clone/CLONE/*.dbf
+/u04/clone/CLONE/sysaux01.dbf
+/u04/clone/CLONE/system01.dbf
+/u04/clone/CLONE/tbs13_01.dbf
+/u04/clone/CLONE/undotbs01.dbf
+/u04/clone/CLONE/users01.dbf
+
+-- 파일은 있는데 데이터베이스가 모른다.
+
+-- 판정
+--   ① 컨트롤파일 문에서 파일 하나가 빠졌다
+--   ② 이미 RESETLOGS로 열었으므로 되돌릴 수 없다
+--   → 컨트롤파일을 다시 만들어야 한다. 처음부터 재수행한다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- << 수정 >> 올바른 문으로 다시 만든다.
+
+SYS@CLONE> SHUTDOWN IMMEDIATE
+
+Database closed.
+ORACLE instance shut down.
+
+SYS@CLONE> !rm -f /u04/clone/CLONE/*.ctl /u04/clone/CLONE/*.log
+
+-- 잘못 만들어진 컨트롤파일과 리두를 지운다.
+-- 데이터파일은 그대로 두어도 되지만 RESETLOGS로 열렸으므로
+-- 백업본에서 다시 복사하는 편이 안전하다.
+
+SYS@CLONE> !cp -p /home/oracle/backup/ch17/*.dbf /u04/clone/CLONE/
+
+SYS@CLONE> STARTUP NOMOUNT PFILE='?/dbs/initCLONE.ora';
+
+ORACLE instance started.
+
+SYS@CLONE> @/tmp/cf_clone.sql
+
+Control file created.
+
+SYS@CLONE> SELECT file#, name FROM v$datafile ORDER BY file#;
+
+     FILE# NAME
+---------- ------------------------------------------
+         1 /u04/clone/CLONE/system01.dbf
+         2 /u04/clone/CLONE/sysaux01.dbf
+         3 /u04/clone/CLONE/undotbs01.dbf
+         4 /u04/clone/CLONE/users01.dbf
+         5 /u04/clone/CLONE/tbs13_01.dbf
+
+-- 다섯 개 모두 등록되었다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@CLONE> SELECT dbid, name, log_mode FROM v$database;
+
+      DBID NAME      LOG_MODE
+---------- --------- ------------
+1428930055 CLONE     ARCHIVELOG
+
+-- 이름이 CLONE이고 DBID가 원본(1200530011)과 다르다.
+-- SET DATABASE 절의 효과다.
+
+SYS@CLONE> SELECT status FROM v$instance;
+
+STATUS
+------------
+MOUNTED
+
+SYS@CLONE> SELECT member FROM v$logfile ORDER BY group#;
+
+MEMBER
+------------------------------------------
+/u04/clone/CLONE/redo01.log
+/u04/clone/CLONE/redo01b.log
+/u04/clone/CLONE/redo03.log
+/u04/clone/CLONE/redo03b.log
+/u04/clone/CLONE/redo04.log
+/u04/clone/CLONE/redo04b.log
+
+-- 모든 리두 경로가 복제본의 것이다.
+
+SYS@CLONE> SELECT name FROM v$controlfile;
+
+NAME
+------------------------------------------
+/u04/clone/CLONE/control01.ctl
+
+SYS@CLONE> !ls -l /u04/clone/CLONE/control01.ctl
+-rw-r-----. 1 oracle oinstall 10600448 May 19 10:22 control01.ctl
+
+-- 컨트롤파일이 만들어졌다. 다음 실습에서 복구하고 연다.
+
+SYS@CLONE> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header
+  2  ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2760100 NO
+         2            2760100 NO
+         3            2760100 NO
+         4            2760100 NO
+         5            2760100 NO
+
+-- Cold Backup에서 복사했으므로 FUZZY가 NO다.
+
+-- 실무 포인트
+-- 1) CREATE CONTROLFILE은 문에 나열된 순서대로 파일 번호를 부여한다.
+--    원본의 번호와 달라질 수 있으며 그 자체는 문제가 아니다.
+--    다만 빠진 파일이 있으면 그 테이블스페이스를 쓸 수 없게 된다.
+--
+-- 2) 파일이 빠져도 문법 오류가 아니므로 그대로 만들어진다.
+--    실행 전에 파일 개수를 대조해야 하는 이유가 여기에 있다.
+--
+-- 3) 빠진 파일은 UNNAMED로도 나타나지 않는다.
+--    컨트롤파일을 만들 때부터 없는 것으로 정의되었기 때문이다.
+--    6장의 UNNAMED 상황과는 성격이 다르다.
+--
+-- 4) RESETLOGS로 연 뒤에는 되돌릴 수 없다.
+--    컨트롤파일을 다시 만들고 데이터파일도 백업본에서 다시 복사해야 한다.
+--
+-- 5) SET DATABASE 절이 이름과 DBID를 모두 바꾼다.
+--    DBID가 원본과 다른지 반드시 확인한다. 같으면 복제본이 아니다.
+--
+-- 6) 생성 직후 파일 목록을 전수 확인한다.
+--    v$datafile, v$logfile, v$controlfile 세 뷰를 모두 조회한다.
+--    하나라도 원본 경로가 있으면 즉시 중단하고 바로잡는다.

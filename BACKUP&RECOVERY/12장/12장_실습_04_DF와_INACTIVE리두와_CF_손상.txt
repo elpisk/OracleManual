@@ -1,0 +1,306 @@
+================================================================================
+ 실습 12-4 : 일반 데이터파일 + INACTIVE 리두 + 컨트롤파일 손상
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 디스크 하나가 손상되어 일반 데이터파일, INACTIVE 리두 그룹, 컨트롤파일이 함께 사라졌다.
+-- CURRENT 그룹은 다른 디스크에 있어 살아 있다.
+-- 손상된 리두 그룹은 이미 아카이브가 완료되어 사본이 있다.
+-- 세 종류가 동시에 손상되었지만 손실은 없다.
+-- 복구 유형 : 완전 복구, RESETLOGS 강제
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- ARCHIVELOG 모드이며 실습 직전에 전체 백업과 컨트롤파일 백업을 받는다.
+-- 리두는 그룹 세 개, 그룹마다 멤버 두 개이며 두 디스크에 분산되어 있다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL member FOR a44
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch12 && mkdir -p /home/oracle/backup/ch12
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch12/
+SYS@orcl> !rm -f /home/oracle/backup/ch12/temp01.dbf
+SYS@orcl> STARTUP
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO
+  2    '/home/oracle/backup/control_ch12.bkp' REUSE;
+Database altered.
+
+SYS@orcl> CREATE TABLE hr.emp124(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp124 VALUES (1, 'after backup');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@orcl> INSERT INTO hr.emp124 VALUES (2, 'seq n+1');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@orcl> INSERT INTO hr.emp124 VALUES (3, 'in current redo');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT l.group#, l.sequence#, l.archived, l.status, f.member
+  2  FROM   v$log l, v$logfile f WHERE l.group# = f.group# ORDER BY l.group#, f.member;
+
+    GROUP#  SEQUENCE# ARC STATUS     MEMBER
+---------- ---------- --- ---------- --------------------------------------------
+         1         20 YES INACTIVE   /u01/app/oracle/oradata/ORCL/redo01.log
+         1         20 YES INACTIVE   /u02/oradata/ORCL/redo01b.log
+         3         21 YES INACTIVE   /u01/app/oracle/oradata/ORCL/redo03.log
+         3         21 YES INACTIVE   /u02/oradata/ORCL/redo03b.log
+         4         22 NO  CURRENT    /u01/app/oracle/oradata/ORCL/redo04.log
+         4         22 NO  CURRENT    /u02/oradata/ORCL/redo04b.log
+
+6 rows selected.
+
+-- 그룹 1과 3은 INACTIVE이고 아카이브가 완료되었다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 디스크 손상 (일부 파일만)
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+-- 일반 데이터파일 하나
+SYS@orcl> !rm -f /u02/oradata/ORCL/users01.dbf
+
+-- INACTIVE 그룹 1의 멤버 전부
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/redo01.log /u02/oradata/ORCL/redo01b.log
+
+-- 컨트롤파일 전부
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/control03.ctl
+
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.log
+/u01/app/oracle/oradata/ORCL/redo03.log
+/u01/app/oracle/oradata/ORCL/redo04.log
+
+-- CURRENT 그룹 4는 살아 있다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+STARTED
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf | grep -v temp | wc -l
+3
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log 2>/dev/null | wc -l
+4
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl 2>/dev/null | wc -l
+0
+
+-- 데이터파일 1개, 리두 그룹 1개, 컨트롤파일 전부가 없다.
+
+SYS@orcl> !ls /u02/arch1/*.dbf | wc -l
+22
+
+-- 판정
+--   ① 컨트롤파일 수단 : Binary 백업본 있음
+--   ② 아카이브 연속 : 22개, 결손 없음
+--   ③ CURRENT 리두 : 그룹 4 생존
+--   → 완전 복구 가능. 손실 없음.
+--   손상된 그룹 1은 INACTIVE이며 아카이브 사본이 있으므로 문제되지 않는다.
+
+-- 0단계 : 남아 있는 파일을 별도 위치로 복사한다.
+
+SYS@orcl> !D=/home/oracle/before_recover_124; mkdir -p $D; \
+          cp -p /u02/oradata/ORCL/*.dbf $D/ 2>/dev/null; \
+          cp -p /u01/app/oracle/oradata/ORCL/*.log $D/ 2>/dev/null; \
+          cp -p /u02/oradata/ORCL/*.log $D/ 2>/dev/null; \
+          date > $D/copied_at.txt; ls -l $D >> $D/copied_at.txt
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 1단계 : 컨트롤파일 복원
+
+SYS@orcl> !cp -p /home/oracle/backup/control_ch12.bkp \
+                 /u01/app/oracle/oradata/ORCL/control01.ctl
+SYS@orcl> !cp -p /home/oracle/backup/control_ch12.bkp \
+                 /u01/app/oracle/oradata/ORCL/control02.ctl
+SYS@orcl> !cp -p /home/oracle/backup/control_ch12.bkp /u02/oradata/ORCL/control03.ctl
+
+SYS@orcl> ALTER DATABASE MOUNT;
+
+Database altered.
+
+-- 2단계 : 리두 상태 확인
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         20 YES INACTIVE
+         3         21 YES INACTIVE
+         4         22 NO  CURRENT
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE status IS NOT NULL;
+
+    GROUP# MEMBER                                       STATUS
+---------- -------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log      INVALID
+         1 /u02/oradata/ORCL/redo01b.log                INVALID
+
+-- 그룹 1이 전손이다. 상태는 INACTIVE이고 ARCHIVED가 YES다.
+
+-- 3단계 : 데이터파일 복원
+
+SYS@orcl> SELECT file#, error FROM v$recover_file ORDER BY file#;
+
+     FILE# ERROR
+---------- --------------------
+         1
+         3
+         4
+         7 FILE NOT FOUND
+
+SYS@orcl> !cp -p /home/oracle/backup/ch12/users01.dbf /u02/oradata/ORCL/
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE;
+ORA-00279: change 2470100 generated at 05/13/2025 14:05:11 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_20_1190000001.dbf
+Log applied.
+ORA-00308: cannot open archived log '/u02/arch1/1_22_1190000001.dbf'
+
+SYS@orcl> SET AUTORECOVERY OFF
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE;
+ORA-00280: change 2472600 for thread 1 is in sequence #22
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+/u01/app/oracle/oradata/ORCL/redo04.log
+Log applied.
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+ALTER DATABASE OPEN RESETLOGS
+*
+ERROR at line 1:
+ORA-00344: unable to re-create online log
+'/u01/app/oracle/oradata/ORCL/redo01.log'
+ORA-27040: file create error, unable to create file
+Linux-x86_64 Error: 13: Permission denied
+
+-- << 원인 파악 >>
+-- RESETLOGS 오픈은 리두 파일을 새로 만든다.
+-- 그런데 그룹 1의 파일을 만들 디렉터리에 쓰기 권한이 없다.
+-- 장애 복구 과정에서 디렉터리 권한이 잘못 바뀐 상황이다.
+
+SYS@orcl> !ls -ld /u01/app/oracle/oradata/ORCL
+dr-xr-x---. 2 oracle oinstall 4096 May 13 14:11 /u01/app/oracle/oradata/ORCL
+
+-- 쓰기 권한이 없다.
+
+-- << 수정 >>
+
+SYS@orcl> !chmod u+w /u01/app/oracle/oradata/ORCL
+SYS@orcl> !ls -ld /u01/app/oracle/oradata/ORCL
+drwxr-x---. 2 oracle oinstall 4096 May 13 14:11 /u01/app/oracle/oradata/ORCL
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT id, memo FROM hr.emp124 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 after backup
+         2 seq n+1
+         3 in current redo
+
+-- 세 행 모두 살아 있다. 손실이 없다.
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile ORDER BY group#;
+
+    GROUP# MEMBER                                       STATUS
+---------- -------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/redo01.log
+         1 /u02/oradata/ORCL/redo01b.log
+         3 /u01/app/oracle/oradata/ORCL/redo03.log
+         3 /u02/oradata/ORCL/redo03b.log
+         4 /u01/app/oracle/oradata/ORCL/redo04.log
+         4 /u02/oradata/ORCL/redo04b.log
+
+-- 없어졌던 그룹 1의 파일이 다시 만들어졌다. STATUS도 정상이다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$datafile WHERE name LIKE '%UNNAMED%';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_objects WHERE status = 'INVALID';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch12 && mkdir -p /home/oracle/backup/ch12
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch12/
+SYS@orcl> !rm -f /home/oracle/backup/ch12/temp01.dbf
+SYS@orcl> STARTUP
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO
+  2    '/home/oracle/backup/control_ch12.bkp' REUSE;
+
+-- 실무 포인트
+-- 1) 세 종류가 동시에 손상되어도 손실이 없을 수 있다.
+--    손상된 리두가 INACTIVE이고 아카이브가 완료되어 사본이 있었기 때문이다.
+--    파일 종류의 개수가 아니라 어느 그룹이 손상되었는지가 결과를 정한다.
+--
+-- 2) 손상된 INACTIVE 그룹에 대해 CLEAR를 따로 수행할 필요가 없다.
+--    RESETLOGS 오픈이 모든 그룹의 파일을 새로 만들기 때문이다.
+--
+-- 3) ORA-00344와 ORA-27040은 리두를 만들 위치의 문제다.
+--    디렉터리 권한, 소유자, 공간을 순서대로 확인한다.
+--    복구 도중 권한이 바뀌는 일은 실무에서 드물지 않다.
+--
+-- 4) 리두 멤버를 두 디스크에 분산했기 때문에 CURRENT 그룹이 살아남았다.
+--    같은 디스크에 몰려 있었다면 CURRENT까지 잃어 불완전 복구가 되었을 것이다.
+--    다중화의 효과가 가장 직접적으로 드러나는 사례다.
+--
+-- 5) 복구 후 v$logfile 의 STATUS가 비어 있는지 확인한다.
+--    INVALID가 남아 있으면 파일이 제대로 만들어지지 않은 것이다.

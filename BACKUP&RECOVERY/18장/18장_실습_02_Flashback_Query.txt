@@ -1,0 +1,291 @@
+================================================================================
+ 실습 18-2 : Flashback Query — AS OF TIMESTAMP / AS OF SCN
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 잘못된 DELETE로 데이터가 지워졌다.
+-- 그 사이 정상적인 INSERT도 있었다.
+-- Flashback Query로 지워진 행만 골라 되살린다.
+-- 시각 기준과 SCN 기준의 차이를 확인한다.
+-- 복구 유형 : 논리적 오류 복구, 무중단
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 18-1에서 UNDO 보존 시간을 3600초로 설정한 상태여야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SHOW PARAMETER undo_retention
+
+NAME                 TYPE        VALUE
+-------------------- ----------- ------
+undo_retention       integer     3600
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp180 TABLESPACE users
+  2  AS SELECT * FROM hr.employees;
+
+Table created.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') AS now,
+  2         current_scn FROM v$database, dual;
+
+NOW                 CURRENT_SCN
+------------------- -----------
+2025-05-20 09:40:02     2811200
+
+-- 이 시점을 기록해 둔다.
+
+SYS@orcl> SELECT department_id, COUNT(*) FROM hr.emp180
+  2  GROUP BY department_id ORDER BY department_id;
+
+DEPARTMENT_ID   COUNT(*)
+------------- ----------
+           10          1
+           20          2
+           50         45
+           60          5
+...
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 잘못된 DELETE
+--------------------------------------------------------------------------------
+SYS@orcl> DELETE FROM hr.emp180 WHERE department_id = 50;
+
+45 rows deleted.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180;
+
+  COUNT(*)
+----------
+        62
+
+-- 조건을 잘못 써서 45건이 지워졌다.
+-- 그 뒤 정상적인 작업이 이어졌다고 가정한다.
+
+SYS@orcl> INSERT INTO hr.emp180 (employee_id, last_name, email, hire_date, job_id)
+  2  VALUES (9001, 'NEW_EMP', 'NEWEMP', SYSDATE, 'IT_PROG');
+SYS@orcl> INSERT INTO hr.emp180 (employee_id, last_name, email, hire_date, job_id)
+  2  VALUES (9002, 'NEW_EMP2', 'NEWEMP2', SYSDATE, 'IT_PROG');
+SYS@orcl> COMMIT;
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180;
+
+  COUNT(*)
+----------
+        64
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180 WHERE department_id = 50;
+
+  COUNT(*)
+----------
+         0
+
+-- 50번 부서의 데이터가 모두 사라졌다.
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+-- 물리적 손상이 아니므로 이 뷰는 비어 있다.
+-- 논리적 오류이며 파일은 정상이다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- 되돌릴 시점의 상태를 먼저 확인한다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180
+  2  AS OF TIMESTAMP SYSTIMESTAMP - INTERVAL '10' MINUTE;
+
+  COUNT(*)
+----------
+       107
+
+-- UNDO가 남아 있어 조회된다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180 AS OF SCN 2811200;
+
+  COUNT(*)
+----------
+       107
+
+-- SCN 기준으로도 같은 결과다.
+
+-- 판정
+--   ① 논리적 오류, 파일 정상
+--   ② UNDO 보존 기간 안 → Flashback 가능
+--   ③ 그 사이 정상 INSERT 2건이 있다
+--   → FLASHBACK TABLE은 부적절. 지워진 행만 되살린다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180 AS OF SCN 2811200 old
+  2  WHERE  NOT EXISTS (SELECT 1 FROM hr.emp180 cur
+  3                     WHERE cur.employee_id = old.employee_id);
+
+  COUNT(*)
+----------
+        45
+
+-- 되살릴 대상이 45건이다. 새로 넣은 2건은 대상이 아니다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 먼저 FLASHBACK TABLE로 처리해 본다.
+
+SYS@orcl> FLASHBACK TABLE hr.emp180 TO SCN 2811200;
+FLASHBACK TABLE hr.emp180 TO SCN 2811200
+*
+ERROR at line 1:
+ORA-08189: cannot flashback the table because row movement is not enabled
+
+-- ROW MOVEMENT를 먼저 켜야 한다. 실습 18-5에서 자세히 다룬다.
+
+SYS@orcl> ALTER TABLE hr.emp180 ENABLE ROW MOVEMENT;
+SYS@orcl> FLASHBACK TABLE hr.emp180 TO SCN 2811200;
+
+Flashback complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180 WHERE employee_id IN (9001, 9002);
+
+  COUNT(*)
+----------
+         0
+
+-- << 원인 파악 >>
+-- 45건은 되살아났지만 그 사이 정상적으로 넣은 2건이 사라졌다.
+-- FLASHBACK TABLE은 테이블 전체를 그 시점 상태로 되돌리기 때문이다.
+-- 잘못된 작업 이후의 정상 작업까지 함께 없어진다.
+-- 이 상황에서는 지워진 행만 골라 되살리는 방법이 맞다.
+
+-- << 수정 >> 원래 상태로 되돌린 뒤 다른 방법을 쓴다.
+
+SYS@orcl> SELECT current_scn FROM v$database;
+
+CURRENT_SCN
+-----------
+    2812800
+
+SYS@orcl> FLASHBACK TABLE hr.emp180 TO SCN 2812700;
+
+Flashback complete.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180;
+
+  COUNT(*)
+----------
+        64
+
+-- DELETE 이후 상태로 돌아왔다. 2건도 살아 있다.
+
+SYS@orcl> INSERT INTO hr.emp180
+  2  SELECT * FROM hr.emp180 AS OF SCN 2811200 old
+  3  WHERE  NOT EXISTS (SELECT 1 FROM hr.emp180 cur
+  4                     WHERE cur.employee_id = old.employee_id);
+
+45 rows created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180;
+
+  COUNT(*)
+----------
+       109
+
+-- 원래 107건에 정상 INSERT 2건을 더한 값이다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp180 WHERE department_id = 50;
+
+  COUNT(*)
+----------
+        45
+
+SYS@orcl> SELECT employee_id, last_name FROM hr.emp180
+  2  WHERE  employee_id IN (9001, 9002);
+
+EMPLOYEE_ID LAST_NAME
+----------- -------------------------
+       9001 NEW_EMP
+       9002 NEW_EMP2
+
+-- 지워진 45건이 되살아났고 정상 INSERT 2건도 그대로다.
+
+-- 시각과 SCN의 차이를 확인한다.
+
+SYS@orcl> SELECT TIMESTAMP_TO_SCN(
+  2    TO_TIMESTAMP('2025-05-20 09:40:00','YYYY-MM-DD HH24:MI:SS')) AS scn
+  3  FROM dual;
+
+       SCN
+----------
+   2811180
+
+-- 시각으로 구한 SCN은 정확히 09:40:02의 값(2811200)과 다르다.
+-- 시각은 초 단위 이하를 표현하지 못해 근사값이 나온다.
+-- 정확한 시점이 필요하면 SCN을 직접 쓴다.
+
+SYS@orcl> SELECT SCN_TO_TIMESTAMP(2811200) FROM dual;
+
+SCN_TO_TIMESTAMP(2811200)
+---------------------------------
+20-MAY-25 09.40.02.000000000 AM
+
+SYS@orcl> ALTER TABLE hr.emp180 DISABLE ROW MOVEMENT;
+
+Table altered.
+
+-- 실무 포인트
+-- 1) 논리적 오류는 v$recover_file 에 나타나지 않는다.
+--    파일은 정상이고 내용만 잘못된 상태이므로 진단 방법이 다르다.
+--
+-- 2) Flashback Query는 조회만 한다.
+--    되살리려면 조회 결과를 INSERT 하는 등의 작업이 별도로 필요하다.
+--    그래서 되살릴 범위를 정밀하게 고를 수 있다.
+--
+-- 3) 잘못된 작업 이후 정상 작업이 있었다면 FLASHBACK TABLE은 위험하다.
+--    테이블 전체를 되돌리므로 그 정상 작업까지 사라진다.
+--    지워진 행만 골라 되살리는 방법이 맞다.
+--
+-- 4) NOT EXISTS 조건으로 대상을 고른다.
+--    기본 키를 비교해 현재 없는 행만 되살린다.
+--    실행 전에 SELECT COUNT(*)로 대상 건수를 먼저 확인한다.
+--
+-- 5) 시각과 SCN은 정밀도가 다르다.
+--    시각은 초 단위 이하를 표현하지 못해 근사값이 된다.
+--    정확한 시점이 필요하면 SCN을 직접 지정한다.
+--
+-- 6) 작업 전 현재 SCN을 기록해 두면 되돌리기가 쉽다.
+--    이 실습에서도 그 값으로 FLASHBACK TABLE을 되돌렸다.

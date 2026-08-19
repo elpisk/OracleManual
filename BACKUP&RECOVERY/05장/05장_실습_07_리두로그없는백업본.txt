@@ -1,0 +1,286 @@
+================================================================================
+ 실습 5-7 : 리두 로그가 빠진 백업본으로 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / NOARCHIVELOG
+ 소요 시간 : 약 18분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- Cold Backup을 받을 때 리두 로그를 빠뜨렸다.
+-- 전체 복원 후 기동하면 리두 로그가 없어 ORA-00314가 발생한다.
+-- CLEAR LOGFILE로 로그를 재생성하고 RESETLOGS로 열어야 한다.
+-- 3장에서 "리두 로그도 백업 대상"이라고 한 이유를 결과로 확인한다.
+-- 복구 유형 : 불완전 복구(RESETLOGS)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- NOARCHIVELOG 모드이고 데이터베이스가 OPEN 상태여야 한다.
+-- 실습 5-6까지 마친 상태에서 이어서 진행한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : 불완전한 백업 만들기
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> !rm -rf /home/oracle/backup/ch05_bad && mkdir -p /home/oracle/backup/ch05_bad
+
+-- 데이터 파일과 제어 파일만 복사한다. 리두 로그는 의도적으로 뺀다.
+
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /home/oracle/backup/ch05_bad/
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /home/oracle/backup/ch05_bad/
+SYS@orcl> !cp -p /u02/oradata/ORCL/control03.ctl /home/oracle/backup/ch05_bad/control03.ctl
+
+SYS@orcl> !ls /home/oracle/backup/ch05_bad/ | grep -c '\.log'
+0
+
+-- .log 파일이 0개다. 이 백업본은 불완전하다.
+
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+Database opened.
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2374120
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 백업 이후 변경과 데이터 파일 유실
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp57(id NUMBER) TABLESPACE users;
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp57 VALUES (1);
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> /
+SYS@orcl> /
+SYS@orcl> /
+SYS@orcl> /
+System altered.
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2375880
+
+-- 백업본 SCN(2374120) < 최소 리두 SCN(2375880) → 리두 부족. 전체 복원 대상이다.
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/system01.dbf
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+ORA-01157: cannot identify/lock data file 1 - see DBWR trace file
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+
+-- SYSTEM 손상이므로 떼어 낼 수 없다. 리두도 부족하다. 전체 복원으로 간다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error FROM v$recover_file;
+
+     FILE# ERROR
+---------- --------------------
+         1 FILE NOT FOUND
+
+SYS@orcl> !ls /home/oracle/backup/ch05_bad/
+control01.ctl  control02.ctl  control03.ctl  hist01.dbf  sysaux01.dbf
+system01.dbf   undotbs01.dbf  users01.dbf
+
+-- 백업본에 데이터 파일과 제어 파일은 있으나 리두 로그가 없다.
+-- 복원 후 제어 파일이 요구하는 리두 로그와 실제 파일이 어긋날 것이다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_57
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.ctl /home/oracle/before_recover_57/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch05_bad/*.dbf /u01/app/oracle/oradata/ORCL/
+SYS@orcl> !cp -p /home/oracle/backup/ch05_bad/control01.ctl \
+                 /home/oracle/backup/ch05_bad/control02.ctl /u01/app/oracle/oradata/ORCL/
+SYS@orcl> !cp -p /home/oracle/backup/ch05_bad/control03.ctl /u02/oradata/ORCL/
+
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+ORA-00314: log 1 of thread 1, expected sequence# 63 doesn't match 68
+ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/ORCL/redo01.log'
+
+-- << 원인 파악 >>
+-- 복원한 제어 파일은 백업 시점 기준으로 시퀀스 63을 기대한다.
+-- 그러나 디스크의 리두 로그는 그 뒤로 계속 쓰여 시퀀스 68이 되어 있다.
+-- 백업본에 리두 로그가 없어 함께 되돌리지 못한 결과다.
+-- 제어 파일과 리두 로그는 짝을 이루어야 하며 한쪽만 되돌리면 어긋난다.
+
+SYS@orcl> SELECT group#, sequence#, status, archived FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS           ARC
+---------- ---------- ---------------- ---
+         1         63 CURRENT          NO
+         3         61 INACTIVE         NO
+         4         62 INACTIVE         NO
+
+-- 제어 파일이 기억하는 값이다. 실제 파일 내용과 다르다.
+
+-- 어긋난 로그를 그대로 두고 열어 본다.
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-00314: log 1 of thread 1, expected sequence# 63 doesn't match 68
+ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/ORCL/redo01.log'
+
+-- << 수정 >>
+-- 내용이 맞지 않는 로그이므로 비워서 다시 만든다.
+
+SYS@orcl> ALTER DATABASE CLEAR LOGFILE GROUP 1;
+ALTER DATABASE CLEAR LOGFILE GROUP 1
+*
+ERROR at line 1:
+ORA-01624: log 1 needed for crash recovery of instance orcl (thread 1)
+ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/ORCL/redo01.log'
+
+-- CURRENT로 표시된 그룹은 그냥 지울 수 없다.
+-- UNARCHIVED 옵션을 붙여 강제로 비운다.
+
+SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 1;
+Database altered.
+
+SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 3;
+Database altered.
+
+SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 4;
+Database altered.
+
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01113: file 1 needs media recovery
+ORA-01110: data file 1: '/u01/app/oracle/oradata/ORCL/system01.dbf'
+
+SYS@orcl> RECOVER DATABASE UNTIL CANCEL;
+ORA-00279: change 2374120 generated at 05/10/2025 14:51:03 needed for thread 1
+ORA-00289: suggestion : /u01/app/oracle/product/19.3.0/dbhome_1/dbs/arch1_63_1200525254.dbf
+ORA-00280: change 2374120 for thread 1 is in sequence #63
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+CANCEL
+Media recovery cancelled.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2374120
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp57;
+SELECT COUNT(*) FROM hr.emp57
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- 백업 이후 데이터는 사라졌다. 예상된 손실이다.
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation;
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           1                 1 PARENT
+           2           2374121 CURRENT
+
+-- 인카네이션이 2로 올라갔다. 이전 백업본은 모두 무효가 되었다.
+
+SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1          1 CURRENT
+         3          0 UNUSED
+         4          0 UNUSED
+
+-- 시퀀스가 1부터 다시 시작한다.
+
+-- 즉시 새 백업을 받는다. 이것이 RESETLOGS 이후의 필수 조치다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch05 && mkdir -p /home/oracle/backup/ch05
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /u01/app/oracle/oradata/ORCL/*.ctl \
+                 /u01/app/oracle/oradata/ORCL/*.log /home/oracle/backup/ch05/
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.log /home/oracle/backup/ch05/
+SYS@orcl> !rm -f /home/oracle/backup/ch05/temp01.dbf
+SYS@orcl> STARTUP
+
+SYS@orcl> !ls /home/oracle/backup/ch05/ | grep -c '\.log'
+6
+
+-- 이번에는 리두 로그가 포함되었다.
+
+-- 실무 포인트
+-- 1) Cold Backup의 대상은 데이터 파일·제어 파일·리두 로그 세 가지다.
+--    하나라도 빠지면 복원 후 짝이 어긋나 ORA-00314가 발생한다.
+--    3장에서 리두 로그를 백업 대상에 넣으라고 한 근거가 이것이다.
+--
+-- 2) ORA-00314의 expected/actual 시퀀스 차이가 곧 제어 파일과 리두의 시차다.
+--    이 숫자를 보면 어느 쪽이 오래된 것인지 즉시 판단할 수 있다.
+--
+-- 3) CURRENT 그룹은 CLEAR LOGFILE만으로는 지워지지 않는다(ORA-01624).
+--    UNARCHIVED를 붙여야 하며, 이는 그 안의 리두를 버린다는 선언이다.
+--
+-- 4) CLEAR로 비운 로그는 내용이 없으므로 완전 복구가 불가능하다.
+--    반드시 RESETLOGS로 열어야 하며 그 순간 인카네이션이 올라간다.
+--
+-- 5) RESETLOGS 직후에는 예외 없이 전체 백업을 새로 받는다.
+--    이전 백업본은 인카네이션이 달라 더 이상 쓸 수 없기 때문이다.
+--
+-- 6) 백업 스크립트를 만들었으면 복원까지 한 번은 해 봐야 한다.
+--    이 실습의 결함은 백업 시점이 아니라 복원 시점에야 드러났다.
+--    3장의 백업 매니페스트에 파일 종류별 개수를 기록해 두면 사전에 걸러진다.
+
+SYS@orcl> EXIT

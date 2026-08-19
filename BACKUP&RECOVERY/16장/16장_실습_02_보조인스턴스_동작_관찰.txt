@@ -1,0 +1,272 @@
+================================================================================
+ 실습 16-2 : 보조 인스턴스 동작 관찰과 공간 요구 확인
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 35분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- RECOVER TABLE 수행 중 보조 인스턴스가 어떻게 만들어지고 사라지는지 관찰한다.
+-- 공간이 부족할 때 어떤 오류가 나는지 재현한다.
+-- Memory Script의 내용을 해석한다.
+-- 정리가 실패했을 때의 뒷정리 절차를 확인한다.
+-- 작업 유형 : 동작 관찰(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 16-1이 완료되어 있어야 한다.
+-- 공간 부족을 재현하기 위해 작은 디렉터리를 준비한다.
+
+[oracle@oel7v9r1 ~]$ mkdir -p /u03/aux_small
+[oracle@oel7v9r1 ~]$ df -h /u03 | tail -1
+/dev/sdc1        20G  4.2G   16G  21% /u03
+
+[oracle@oel7v9r1 ~]$ sudo mount -t tmpfs -o size=300M tmpfs /u03/aux_small
+[oracle@oel7v9r1 ~]$ df -h /u03/aux_small | tail -1
+tmpfs           300M     0  300M   0% /u03/aux_small
+
+-- 300MB만 쓸 수 있는 공간을 만들었다. 필요량보다 훨씬 작다.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> CREATE TABLE hr.emp162 TABLESPACE users
+  2  AS SELECT * FROM hr.employees WHERE ROWNUM <= 50;
+
+Table created.
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') AS now FROM dual;
+
+NOW
+-------------------
+2025-05-18 10:02:41
+
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'BASE_162';
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "DELETE FROM hr.emp162; COMMIT;"
+
+50 rows deleted.
+Commit complete.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 공간이 부족한 상태로 시도
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RECOVER TABLE hr.emp162
+  2>   UNTIL TIME "TO_DATE('2025-05-18 10:03:00','YYYY-MM-DD HH24:MI:SS')"
+  3>   AUXILIARY DESTINATION '/u03/aux_small'
+  4>   REMAP TABLE hr.emp162:emp162_rec;
+
+Starting recover at 18-MAY-25
+Creating automatic instance, with SID='pQmZ'
+Automatic instance created
+
+contents of Memory Script:
+{
+# set requested point in time
+set until time "TO_DATE('2025-05-18 10:03:00',...)";
+restore clone controlfile;
+sql clone 'alter database mount clone database';
+}
+executing Memory Script
+
+Starting restore at 18-MAY-25
+channel ORA_AUX_DISK_1: restoring datafile 00001 to
+ /u03/aux_small/ORCL/datafile/o1_mf_system_%u_.dbf
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of recover command at 05/18/2025 10:09:22
+ORA-19504: failed to create file
+ "/u03/aux_small/ORCL/datafile/o1_mf_system_lk2f8x_.dbf"
+ORA-17502: ksfdcre:4 Failed to create file
+ORA-15041: diskgroup "" space exhausted
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ df -h /u03/aux_small | tail -1
+tmpfs           300M  300M     0 100% /u03/aux_small
+
+[oracle@oel7v9r1 ~]$ ls -R /u03/aux_small | head -10
+/u03/aux_small:
+ORCL
+
+/u03/aux_small/ORCL:
+controlfile
+datafile
+
+/u03/aux_small/ORCL/datafile:
+o1_mf_system_lk2f8x_.dbf
+
+-- 보조 인스턴스가 만들던 파일이 그대로 남아 있다.
+
+[oracle@oel7v9r1 ~]$ ps -ef | grep [p]mon
+oracle    3021     1  0 08:40 ?        00:00:01 ora_pmon_orcl
+oracle    4188     1  0 08:52 ?        00:00:00 ora_pmon_rcat
+oracle    7742     1  0 10:07 ?        00:00:00 ora_pmon_pQmZ
+
+-- 보조 인스턴스가 정리되지 않고 남아 있다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+-- << 원인 파악 >>
+-- ORA-19504와 ORA-15041은 공간 부족을 뜻한다.
+-- 보조 인스턴스는 SYSTEM·SYSAUX·UNDO와 대상 TS를 모두 복원한다.
+-- 복구할 테이블이 50행에 불과해도 약 1.8GB가 필요하다.
+-- 300MB 공간으로는 SYSTEM 파일 하나도 복원할 수 없다.
+
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba <<< \
+> "SELECT ROUND(SUM(bytes)/1024/1024) AS need_mb FROM dba_data_files
+   WHERE tablespace_name IN ('SYSTEM','SYSAUX','UNDOTBS1','USERS');"
+
+   NEED_MB
+----------
+      1770
+
+-- 실행 전에 이 값을 확인했어야 한다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 먼저 남은 보조 인스턴스를 정리한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=pQmZ
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@pQmZ> SHUTDOWN ABORT
+
+ORACLE instance shut down.
+
+SYS@pQmZ> EXIT
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rm -rf /u03/aux_small/ORCL
+[oracle@oel7v9r1 ~]$ ls /u03/aux_small
+[oracle@oel7v9r1 ~]$
+
+[oracle@oel7v9r1 ~]$ ps -ef | grep [p]mon
+oracle    3021     1  0 08:40 ?        00:00:01 ora_pmon_orcl
+oracle    4188     1  0 08:52 ?        00:00:00 ora_pmon_rcat
+
+-- 정리가 끝났다.
+
+-- << 수정 >> 충분한 공간이 있는 경로로 다시 수행한다.
+
+[oracle@oel7v9r1 ~]$ df -h /u03 | tail -1
+/dev/sdc1        20G  4.2G   16G  21% /u03
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RECOVER TABLE hr.emp162
+  2>   UNTIL TIME "TO_DATE('2025-05-18 10:03:00','YYYY-MM-DD HH24:MI:SS')"
+  3>   AUXILIARY DESTINATION '/u03/aux'
+  4>   REMAP TABLE hr.emp162:emp162_rec;
+
+Creating automatic instance, with SID='wRtY'
+
+-- 다른 세션에서 보조 인스턴스를 관찰한다.
+
+[oracle@oel7v9r1 ~]$ ps -ef | grep [p]mon
+oracle    3021     1  0 08:40 ?        00:00:01 ora_pmon_orcl
+oracle    4188     1  0 08:52 ?        00:00:00 ora_pmon_rcat
+oracle    8102     1  1 10:18 ?        00:00:00 ora_pmon_wRtY
+
+[oracle@oel7v9r1 ~]$ du -sh /u03/aux
+1.2G    /u03/aux
+
+-- 복원이 진행되며 공간이 채워진다.
+
+-- 원래 세션의 진행
+
+Performing export of tables...
+   EXPDP> . . exported "HR"."EMP162"                   6.132 KB      50 rows
+Export completed
+
+Performing import of tables...
+   IMPDP> . . imported "HR"."EMP162_REC"               6.132 KB      50 rows
+Import completed
+
+Removing automatic instance
+Removing automatic instance complete
+Finished recover at 18-MAY-25
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ ps -ef | grep [p]mon
+oracle    3021     1  0 08:40 ?        00:00:01 ora_pmon_orcl
+oracle    4188     1  0 08:52 ?        00:00:00 ora_pmon_rcat
+
+-- 보조 인스턴스가 사라졌다.
+
+[oracle@oel7v9r1 ~]$ du -sh /u03/aux
+4.0K    /u03/aux
+
+-- 파일도 정리되었다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp162_rec;
+
+  COUNT(*)
+----------
+        50
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp162;
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> INSERT INTO hr.emp162 SELECT * FROM hr.emp162_rec;
+SYS@orcl> COMMIT;
+SYS@orcl> DROP TABLE hr.emp162_rec PURGE;
+
+Table dropped.
+
+SYS@orcl> EXIT
+
+-- 임시 공간을 정리한다.
+
+[oracle@oel7v9r1 ~]$ sudo umount /u03/aux_small
+[oracle@oel7v9r1 ~]$ rmdir /u03/aux_small
+
+-- 실무 포인트
+-- 1) 보조 인스턴스는 대상 데이터베이스와 별개의 인스턴스다.
+--    임의의 SID가 부여되며 ps 명령으로 확인할 수 있다.
+--    작업이 끝나면 자동으로 정리된다.
+--
+-- 2) 공간 요구는 복구할 테이블 크기와 무관하다.
+--    SYSTEM·SYSAUX·UNDO와 대상 TS를 모두 복원하기 때문이다.
+--    50행짜리 테이블에도 약 1.8GB가 필요했다.
+--
+-- 3) 실행 전에 필요량을 계산한다.
+--    dba_data_files 에서 네 테이블스페이스의 합을 구하면 된다.
+--    여유를 두고 1.5배 정도의 공간을 확보하는 편이 안전하다.
+--
+-- 4) 실패하면 보조 인스턴스가 남을 수 있다.
+--    ps 로 확인하고 ORACLE_SID를 그 값으로 바꿔 SHUTDOWN ABORT 한다.
+--    AUXILIARY DESTINATION 의 파일도 함께 지운다.
+--
+-- 5) 정리하지 않으면 다음 수행 때 공간 부족을 만든다.
+--    실패 후에는 반드시 디렉터리를 확인한다.
+--
+-- 6) Memory Script는 RMAN이 자동 구성한 복구 스크립트다.
+--    clone 이 붙은 명령이 보조 인스턴스를 대상으로 한다.
+--    15장에서 배운 절차와 같은 내용임을 확인할 수 있다.

@@ -1,0 +1,231 @@
+================================================================================
+ 실습 18-9 : (부록) Cursor Sharing 동작 확인
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 원본 시나리오에 포함되어 있던 주제를 보존용으로 남긴다.
+-- 백업·복구와 직접 관련은 없으며 본문에서는 다루지 않는다.
+-- CURSOR_SHARING 설정에 따라 공유 커서가 어떻게 달라지는지 확인한다.
+-- v$sql로 실행 계획 재사용 여부를 관찰한다.
+-- 작업 유형 : 부록(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SHOW PARAMETER cursor_sharing
+
+NAME             TYPE     VALUE
+---------------- -------- -------
+cursor_sharing   string   EXACT
+
+-- 19c의 기본값은 EXACT다.
+
+SYS@orcl> SELECT name, value FROM v$parameter
+  2  WHERE  name IN ('cursor_sharing','open_cursors','session_cached_cursors');
+
+NAME                     VALUE
+------------------------ -------
+cursor_sharing           EXACT
+open_cursors             300
+session_cached_cursors   50
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.cur189(id NUMBER, memo VARCHAR2(30))
+  2    TABLESPACE users;
+
+Table created.
+
+SYS@orcl> INSERT INTO hr.cur189
+  2  SELECT LEVEL, 'row-' || LEVEL FROM dual CONNECT BY LEVEL <= 10000;
+SYS@orcl> COMMIT;
+
+SYS@orcl> CREATE INDEX hr.idx_cur189 ON hr.cur189(id);
+
+Index created.
+
+SYS@orcl> EXEC DBMS_STATS.gather_table_stats('HR','CUR189', cascade => TRUE);
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> ALTER SYSTEM FLUSH SHARED_POOL;
+
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : EXACT 설정에서의 동작
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.cur189 WHERE id = 100;
+SYS@orcl> SELECT COUNT(*) FROM hr.cur189 WHERE id = 200;
+SYS@orcl> SELECT COUNT(*) FROM hr.cur189 WHERE id = 300;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT sql_id, executions, parse_calls, sql_text
+  2  FROM   v$sql
+  3  WHERE  sql_text LIKE 'SELECT COUNT(*) FROM hr.cur189 WHERE id =%'
+  4  AND    sql_text NOT LIKE '%v$sql%';
+
+SQL_ID        EXECUTIONS PARSE_CALLS SQL_TEXT
+------------- ---------- ----------- ------------------------------------------
+8vwv1x2q9j3kd          1           1 SELECT COUNT(*) FROM hr.cur189 WHERE id = 100
+9awx2y3r0k4le          1           1 SELECT COUNT(*) FROM hr.cur189 WHERE id = 200
+0bxy3z4s1l5mf          1           1 SELECT COUNT(*) FROM hr.cur189 WHERE id = 300
+
+-- 값이 다르면 별개의 SQL로 취급되어 각각 파싱되었다.
+-- 공유 풀에 세 개의 커서가 만들어졌다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 바인드 변수 사용
+--------------------------------------------------------------------------------
+SYS@orcl> VARIABLE v_id NUMBER
+
+SYS@orcl> EXEC :v_id := 100;
+SYS@orcl> SELECT COUNT(*) FROM hr.cur189 WHERE id = :v_id;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> EXEC :v_id := 200;
+SYS@orcl> SELECT COUNT(*) FROM hr.cur189 WHERE id = :v_id;
+
+SYS@orcl> EXEC :v_id := 300;
+SYS@orcl> SELECT COUNT(*) FROM hr.cur189 WHERE id = :v_id;
+
+SYS@orcl> SELECT sql_id, executions, parse_calls, sql_text
+  2  FROM   v$sql WHERE sql_text LIKE '%hr.cur189 WHERE id = :v_id%'
+  3  AND    sql_text NOT LIKE '%v$sql%';
+
+SQL_ID        EXECUTIONS PARSE_CALLS SQL_TEXT
+------------- ---------- ----------- ------------------------------------------
+1cyz4a5t2m6ng          3           3 SELECT COUNT(*) FROM hr.cur189 WHERE id = :v_id
+
+-- 커서 하나가 세 번 실행되었다.
+-- 바인드 변수를 쓰면 값이 달라도 같은 SQL로 공유된다.
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : FORCE 설정
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SESSION SET cursor_sharing = FORCE;
+
+Session altered.
+
+SYS@orcl> ALTER SYSTEM FLUSH SHARED_POOL;
+
+SYS@orcl> SELECT COUNT(*) FROM hr.cur189 WHERE id = 400;
+SYS@orcl> SELECT COUNT(*) FROM hr.cur189 WHERE id = 500;
+SYS@orcl> SELECT COUNT(*) FROM hr.cur189 WHERE id = 600;
+
+SYS@orcl> SELECT sql_id, executions, sql_text FROM v$sql
+  2  WHERE  sql_text LIKE '%hr.cur189 WHERE id =%'
+  3  AND    sql_text NOT LIKE '%v$sql%';
+
+SQL_ID        EXECUTIONS SQL_TEXT
+------------- ---------- ---------------------------------------------------
+2dza5b6u3n7oh          3 SELECT COUNT(*) FROM hr.cur189 WHERE id = :"SYS_B_0"
+
+-- 리터럴이 :"SYS_B_0" 로 자동 치환되었다.
+-- 세 문장이 하나의 커서를 공유한다.
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 잘못된 값을 설정해 본다.
+
+SYS@orcl> ALTER SESSION SET cursor_sharing = SIMILAR;
+
+ERROR:
+ORA-00096: invalid value SIMILAR for parameter cursor_sharing, must be from
+among FORCE, EXACT
+
+-- << 원인 파악 >>
+-- SIMILAR는 11g까지 있던 값이며 12c에서 제거되었다.
+-- 19c에서는 FORCE와 EXACT만 유효하다.
+-- 오래된 문서나 스크립트를 그대로 쓰면 이 오류를 만난다.
+-- 오류 메시지가 가능한 값을 알려 주므로 그대로 고르면 된다.
+
+-- << 수정 >>
+
+SYS@orcl> ALTER SESSION SET cursor_sharing = EXACT;
+
+Session altered.
+
+SYS@orcl> SHOW PARAMETER cursor_sharing
+
+NAME             TYPE     VALUE
+---------------- -------- -------
+cursor_sharing   string   EXACT
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT SUM(sharable_mem)/1024/1024 AS shared_mb, COUNT(*) AS cursors
+  2  FROM   v$sql WHERE parsing_schema_name = 'SYS';
+
+ SHARED_MB    CURSORS
+---------- ----------
+      12.4        184
+
+SYS@orcl> SELECT name, value FROM v$sysstat
+  2  WHERE  name IN ('parse count (total)','parse count (hard)',
+  3                  'execute count');
+
+NAME                            VALUE
+------------------------------ ------
+parse count (total)             48210
+parse count (hard)               2104
+execute count                  184220
+
+-- 하드 파싱 비율이 높으면 리터럴 SQL이 많다는 신호다.
+
+SYS@orcl> SELECT ROUND(
+  2    (SELECT value FROM v$sysstat WHERE name = 'parse count (hard)') /
+  3    (SELECT value FROM v$sysstat WHERE name = 'parse count (total)') * 100,
+  4    2) AS hard_parse_pct FROM dual;
+
+HARD_PARSE_PCT
+--------------
+          4.36
+
+SYS@orcl> DROP TABLE hr.cur189 PURGE;
+
+Table dropped.
+
+SYS@orcl> ALTER SYSTEM FLUSH SHARED_POOL;
+
+System altered.
+
+-- 실무 포인트
+-- 1) 이 실습은 백업·복구와 직접 관련이 없다.
+--    원본 시나리오에 포함되어 있어 보존용으로 남긴 부록이다.
+--    본문에서는 다루지 않는 주제다.
+--
+-- 2) CURSOR_SHARING의 유효한 값은 FORCE와 EXACT뿐이다.
+--    SIMILAR는 12c에서 제거되었으며 지정하면 ORA-00096이 나온다.
+--    오래된 문서를 참고할 때 주의한다.
+--
+-- 3) EXACT는 문장이 완전히 같아야 커서를 공유한다.
+--    리터럴 값이 다르면 별개의 SQL로 취급되어 하드 파싱이 늘어난다.
+--
+-- 4) FORCE는 리터럴을 바인드 변수로 자동 치환한다.
+--    커서 공유가 늘지만 실행 계획이 부적절해질 수 있다.
+--    근본 해결은 애플리케이션에서 바인드 변수를 쓰는 것이다.
+--
+-- 5) 하드 파싱 비율로 문제를 진단한다.
+--    v$sysstat 의 parse count (hard)와 total의 비율을 본다.
+--    비율이 높으면 리터럴 SQL이 많다는 신호다.
+--
+-- 6) 이 설정은 성능 영역의 주제다.
+--    백업·복구 절차와는 무관하며 ADMIN 과정에서 자세히 다룬다.
+--    여기서는 원본 시나리오 보존 차원에서만 기록한다.

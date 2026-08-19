@@ -1,0 +1,293 @@
+================================================================================
+ 실습 10-6 : Cold Backup 기반 불완전 복구
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 20분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- Cold Backup으로 받은 백업본을 기반으로 시점 복구를 수행한다.
+-- 모든 파일이 같은 SCN에서 닫혀 있어 출발점이 일관적이다.
+-- Hot Backup과 달리 최소 복구 지점의 제약이 없다.
+-- 두 백업 방식의 차이를 결과로 비교한다.
+-- 복구 유형 : 불완전 복구(Cold Backup 기반)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 10-5를 마친 상태에서 이어서 진행한다.
+-- 실습 직전에 Cold Backup을 새로 받는다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> ALTER SESSION SET nls_date_format = 'YYYY-MM-DD HH24:MI:SS';
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 : Cold Backup 수행
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS now FROM dual;
+
+NOW
+--------
+14:02:04
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> !rm -rf /home/oracle/backup/cold10 && mkdir -p /home/oracle/backup/cold10
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/cold10/
+SYS@orcl> !rm -f /home/oracle/backup/cold10/temp01.dbf
+
+SYS@orcl> STARTUP
+
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2427200
+
+-- Cold Backup은 종료 상태에서 복사하므로 모든 파일이 같은 SCN이다.
+
+SYS@orcl> CREATE TABLE hr.emp106(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp106 VALUES (1, 'first');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS t1 FROM dual;
+
+T1
+--------
+14:08:12
+
+SYS@orcl> INSERT INTO hr.emp106 VALUES (2, 'second');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 사고 유발
+--------------------------------------------------------------------------------
+SYS@orcl> TRUNCATE TABLE hr.emp106;
+
+Table truncated.
+
+SYS@orcl> SELECT TO_CHAR(SYSDATE, 'HH24:MI:SS') AS accident FROM dual;
+
+ACCIDENT
+------------
+14:14:36
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp106;
+
+  COUNT(*)
+----------
+         0
+
+-- TRUNCATE는 롤백할 수 없고 UNDO도 남기지 않는다.
+-- Flashback Query로도 되돌릴 수 없다.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : 대안 검토
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp106 AS OF TIMESTAMP
+  2    TO_TIMESTAMP('2025-05-12 14:12:00', 'YYYY-MM-DD HH24:MI:SS');
+SELECT COUNT(*) FROM hr.emp106 AS OF TIMESTAMP
+                     *
+ERROR at line 1:
+ORA-01466: unable to read data - table definition has changed
+
+-- TRUNCATE는 세그먼트를 다시 만들므로 Flashback Query가 불가능하다.
+
+SYS@orcl> SELECT object_name, original_name FROM recyclebin;
+
+no rows selected
+
+-- 휴지통에도 없다. TRUNCATE는 휴지통을 쓰지 않는다.
+
+SYS@orcl> SELECT flashback_on FROM v$database;
+
+FLASHBACK_ON
+------------------
+NO
+
+-- 전체 시점 복구가 유일한 방법이다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sequence#, first_change#, next_change#,
+  2         TO_CHAR(first_time, 'HH24:MI:SS') AS first_time
+  3  FROM   v$log_history ORDER BY sequence# DESC FETCH FIRST 4 ROWS ONLY;
+
+ SEQUENCE# FIRST_CHANGE# NEXT_CHANGE# FIRST_TIME
+---------- ------------- ------------ ----------
+         3       2428000      2428400 14:14:30
+         2       2427600      2428000 14:08:08
+         1       2427200      2427600 14:02:30
+
+SYS@orcl> !ls -l /home/oracle/backup/cold10/*.dbf | wc -l
+7
+
+-- 판정
+--   ① 백업 종류 : Cold Backup (종료 상태에서 복사)
+--   ② 백업 시점 : SCN 2427200 / 14:02:04
+--   ③ 목표 지점 : 14:14:30 (TRUNCATE 직전)
+--   ④ 최소 복구 지점 제약 : 없음(일관성 있는 출발점)
+--   → 백업 시점부터 목표 지점 사이 어디든 지정할 수 있다.
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_106
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/before_recover_106/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> !cp -p /home/oracle/backup/cold10/*.dbf /u02/oradata/ORCL/
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2427200 NO
+         3            2427200 NO
+         4            2427200 NO
+         7            2427200 NO
+
+-- 모든 파일이 같은 SCN이고 FUZZY가 NO다. Hot Backup과 결정적으로 다르다.
+
+-- 복구 없이 바로 열어 본다.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+ALTER DATABASE OPEN RESETLOGS
+*
+ERROR at line 1:
+ORA-01139: RESETLOGS option only valid after an incomplete database recovery
+
+-- << 원인 파악 >>
+-- 일관성 있는 상태이므로 RESETLOGS를 요구할 이유가 없다는 뜻이다.
+-- 복구를 한 번도 수행하지 않았기 때문에 RESETLOGS 옵션이 거부되었다.
+-- Cold Backup은 그대로 열 수 있지만 그러면 백업 시점(14:02:04)으로 끝난다.
+-- 14:08의 정상 업무까지 잃게 되므로 목표 지점까지 복구해야 한다.
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+-- 복구 대상이 없다. 일관성 있는 상태의 특징이다.
+
+-- << 수정 >>
+-- 목표 지점까지 불완전 복구를 수행한 뒤 RESETLOGS로 연다.
+
+SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 14:14:30';
+ORA-00279: change 2427200 generated at 12/05/2025 14:02:04 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_1_1200562204.dbf
+ORA-00280: change 2427200 for thread 1 is in sequence #1
+
+Log applied.
+Log applied.
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE OPEN READ ONLY;
+
+SYS@orcl> SELECT id, memo FROM hr.emp106 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 first
+         2 second
+
+-- TRUNCATE 직전 상태다. 두 행이 모두 살아 있다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP MOUNT
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT id, memo FROM hr.emp106 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 first
+         2 second
+
+SYS@orcl> SELECT checkpoint_change# AS recovered_scn,
+  2         TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS recovered_time
+  3  FROM   v$database;
+
+RECOVERED_SCN RECOVERED_TIME
+------------- --------------
+      2428020 14:14:28
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  WHERE  status = 'CURRENT';
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+           7           2428020 CURRENT
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+Tablespace altered.
+
+-- 두 백업 방식의 차이를 정리한다.
+
+SYS@orcl> SELECT 'Cold' AS backup_type, '일관적(FUZZY NO)' AS restore_state,
+  2         '제약 없음' AS min_point FROM dual
+  3  UNION ALL
+  4  SELECT 'Hot', '비일관적(FUZZY YES)', 'END BACKUP 이후' FROM dual;
+
+BACKUP_TYPE RESTORE_STATE        MIN_POINT
+----------- -------------------- ---------------
+Cold        일관적(FUZZY NO)     제약 없음
+Hot         비일관적(FUZZY YES)  END BACKUP 이후
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch10 && mkdir -p /home/oracle/backup/ch10
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch10/
+SYS@orcl> !rm -f /home/oracle/backup/ch10/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) Cold Backup은 복원 직후 상태가 일관적이다.
+--    모든 파일이 같은 SCN이고 FUZZY가 NO다.
+--    복구 없이 열 수 있지만 그러면 백업 시점으로 끝난다.
+--
+-- 2) 복구 없이 RESETLOGS로 열면 ORA-01139가 발생한다.
+--    불완전 복구를 수행한 뒤에만 RESETLOGS 옵션이 유효하다.
+--    일관성 있는 상태에서는 그냥 OPEN 하면 된다.
+--
+-- 3) Cold Backup 기반에는 최소 복구 지점 제약이 없다.
+--    백업 시점부터 아카이브가 있는 어느 지점이든 지정할 수 있다.
+--    Hot Backup의 END BACKUP 제약과 대비된다.
+--
+-- 4) TRUNCATE는 되돌리기 어려운 작업이다.
+--    UNDO를 남기지 않아 Flashback Query가 불가능하고 휴지통도 쓰지 않는다.
+--    ORA-01466이 그 신호이며 시점 복구가 사실상 유일한 방법이다.
+--
+-- 5) 실무는 대부분 Hot Backup을 쓴다.
+--    중단 없이 받을 수 있기 때문이며, 그만큼 최소 복구 지점을 항상 의식해야 한다.
+--    Cold Backup은 계획된 정지 시간에 추가로 받아 두면 선택지가 넓어진다.
+--
+-- 6) 어느 방식이든 결론은 같다.
+--    RESETLOGS로 열고 즉시 전체 백업을 받으며 손실 구간을 통보한다.
+
+SYS@orcl> EXIT

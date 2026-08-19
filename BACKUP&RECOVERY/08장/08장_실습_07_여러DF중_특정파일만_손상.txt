@@ -1,0 +1,269 @@
+================================================================================
+ 실습 8-7 : 테이블스페이스의 여러 파일 중 특정 파일만 손상
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 18분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 데이터파일이 두 개인 테이블스페이스에서 하나만 유실되었다.
+-- 파일 단위로 OFFLINE 하면 나머지 파일의 세그먼트는 계속 서비스된다.
+-- 영향 범위를 먼저 파악하고 최소 범위로 처리한다.
+-- 부분 처리가 사용자에게 어떻게 보이는지도 함께 확인한다.
+-- 복구 유형 : 완전 복구(파일 단위 무중단)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 8-6을 마친 상태에서 이어서 진행한다.
+-- USERS 테이블스페이스에 데이터파일을 하나 추가해 사용한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+SYS@orcl> COL segment_name FOR a16
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLESPACE users ADD DATAFILE
+  2    '/u01/app/oracle/oradata/ORCL/users02.dbf' SIZE 100M;
+Tablespace altered.
+
+SYS@orcl> SELECT file#, name, bytes/1024/1024 AS mb FROM v$datafile
+  2  WHERE  name LIKE '%users%' ORDER BY file#;
+
+     FILE# NAME                                              MB
+---------- ---------------------------------------------- -----
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf         200
+        13 /u01/app/oracle/oradata/ORCL/users02.dbf         100
+
+-- 새 파일에만 세그먼트가 들어가도록 기존 파일을 가득 채운 상태를 가정한다.
+
+SYS@orcl> ALTER TABLE hr.emp81 ALLOCATE EXTENT (DATAFILE
+  2    '/u01/app/oracle/oradata/ORCL/users02.dbf' SIZE 8M);
+Table altered.
+
+SYS@orcl> CREATE TABLE hr.emp87 TABLESPACE users
+  2  AS SELECT ROWNUM AS id, object_name FROM dba_objects WHERE ROWNUM <= 2000;
+Table created.
+SYS@orcl> COMMIT;
+
+SYS@orcl> SELECT DISTINCT file_id, segment_name FROM dba_extents
+  2  WHERE  tablespace_name = 'USERS' ORDER BY file_id, segment_name;
+
+   FILE_ID SEGMENT_NAME
+---------- ----------------
+         7 EMP81
+         7 EMP83
+        13 EMP81
+        13 EMP87
+
+-- EMP81은 두 파일에 걸쳐 있고 EMP87은 13번 파일에만 있다.
+
+SYS@orcl> ALTER TABLESPACE users BEGIN BACKUP;
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/users01.dbf \
+                 /u01/app/oracle/oradata/ORCL/users02.dbf /home/oracle/backup/ch08/
+SYS@orcl> ALTER TABLESPACE users END BACKUP;
+Tablespace altered.
+
+SYS@orcl> INSERT INTO hr.emp87 VALUES (9999, 'AFTER BACKUP');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 파일 하나만 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/users02.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+-- 13번 파일에만 있는 테이블은 실패한다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp87;
+SELECT COUNT(*) FROM hr.emp87
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 13
+ORA-01110: data file 13: '/u01/app/oracle/oradata/ORCL/users02.dbf'
+ORA-27041: unable to open file
+
+-- 7번 파일에만 있는 테이블은 정상이다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp83;
+
+  COUNT(*)
+----------
+         2
+
+-- 두 파일에 걸친 테이블은 전체 스캔에서 실패한다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp81;
+SELECT COUNT(*) FROM hr.emp81
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 13
+ORA-01110: data file 13: '/u01/app/oracle/oradata/ORCL/users02.dbf'
+
+-- 같은 테이블스페이스인데도 되는 조회와 안 되는 조회가 섞인다.
+-- 사용자에게는 '되다 안 되다'로 보인다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name, status FROM v$datafile
+  2  WHERE  name LIKE '%users%' ORDER BY file#;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf      ONLINE
+        13 /u01/app/oracle/oradata/ORCL/users02.dbf      RECOVER
+
+-- 13번만 문제다. 7번은 정상이다.
+
+SYS@orcl> SELECT DISTINCT owner, segment_name, segment_type
+  2  FROM   dba_extents WHERE file_id = 13;
+
+OWNER  SEGMENT_NAME     SEGMENT_TYPE
+------ ---------------- ------------
+HR     EMP81            TABLE
+HR     EMP87            TABLE
+
+-- 영향받는 객체는 두 개다. 이 정보를 현업에 먼저 공지한다.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+        13 FILE NOT FOUND                 0
+
+-- 판정
+--   ① 손상 파일 : 13번 하나
+--   ② 백업본 : 있음
+--   ③ 아카이브 : 연속 보유
+--   ④ 파일 단위 OFFLINE 가능 → 최소 범위로 처리
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 테이블스페이스 전체를 내려 처리해 본다.
+
+SYS@orcl> ALTER TABLESPACE users OFFLINE IMMEDIATE;
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp83;
+SELECT COUNT(*) FROM hr.emp83
+                     *
+ERROR at line 1:
+ORA-00376: file 7 cannot be read at this time
+ORA-01110: data file 7: '/u01/app/oracle/oradata/ORCL/users01.dbf'
+
+-- << 원인 파악 >>
+-- 멀쩡한 7번 파일까지 함께 내려가 EMP83 조회가 막혔다.
+-- 손상은 13번 하나뿐인데 영향 범위를 스스로 넓힌 셈이다.
+-- 파일 단위로 처리하면 7번의 세그먼트는 계속 서비스할 수 있다.
+-- 다만 두 파일에 걸친 EMP81은 어느 쪽을 택하든 접근이 막힌다.
+
+SYS@orcl> ALTER TABLESPACE users ONLINE;
+Tablespace altered.
+
+-- << 수정 >>
+-- 파일 단위로 다시 처리한다.
+
+SYS@orcl> ALTER DATABASE DATAFILE 13 OFFLINE;
+
+Database altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp83;
+
+  COUNT(*)
+----------
+         2
+
+-- 7번 파일의 세그먼트는 정상 서비스된다.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch08/users02.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATAFILE 13;
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE DATAFILE 13 ONLINE;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile
+  2  WHERE  name LIKE '%users%' ORDER BY file#;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf      ONLINE
+        13 /u01/app/oracle/oradata/ORCL/users02.dbf      ONLINE
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp87;
+
+  COUNT(*)
+----------
+      2001
+
+-- 백업 이후 추가한 행까지 살아 있다. 완전 복구가 성공했다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp81;
+
+  COUNT(*)
+----------
+      1000
+
+SYS@orcl> SELECT resetlogs_change# FROM v$database;
+
+RESETLOGS_CHANGE#
+-----------------
+                1
+
+SYS@orcl> SELECT tablespace_name, status FROM dba_tablespaces
+  2  WHERE  tablespace_name = 'USERS';
+
+TABLESPACE_NAME  STATUS
+---------------- ---------
+USERS            ONLINE
+
+-- 실무 포인트
+-- 1) 파일 단위 OFFLINE으로 영향 범위를 최소화할 수 있다.
+--    테이블스페이스 전체를 내리면 멀쩡한 파일의 세그먼트까지 막힌다.
+--    손상된 파일 번호만 내리는 것이 원칙이다.
+--
+-- 2) 복구 전 dba_extents 로 영향 객체를 먼저 파악한다.
+--    어떤 테이블과 인덱스가 그 파일에 있는지 알아야 현업에 정확히 공지할 수 있다.
+--    FILE_ID 컬럼으로 조회한다.
+--
+-- 3) 여러 파일에 걸친 객체는 부분 처리로도 구제되지 않는다.
+--    이 실습의 EMP81이 그렇다. 어느 한 파일만 막혀도 전체 스캔이 실패한다.
+--    파티션 테이블이나 큰 인덱스에서 자주 나타나는 상황이다.
+--
+-- 4) 사용자에게는 '되다 안 되다'로 보인다는 점을 고려한다.
+--    같은 테이블스페이스인데 어떤 조회는 되고 어떤 조회는 실패한다.
+--    영향 범위를 먼저 공지하는 편이 문의를 줄이고 실제로 더 빠른 대응이 된다.
+--
+-- 5) ORA-00376과 ORA-01116을 구분한다.
+--    전자는 '지금 읽을 수 없다'(OFFLINE 상태), 후자는 '파일을 열 수 없다'(부재)는 뜻이다.
+--    OFFLINE으로 내린 뒤에는 오류 코드가 바뀐다.
+--
+-- 6) 파일 단위 명령도 절차는 같다.
+--    OFFLINE → 복원 → RECOVER DATAFILE → ONLINE 순이며 대상만 파일 번호로 바뀐다.
+
+SYS@orcl> EXIT

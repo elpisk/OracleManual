@@ -1,0 +1,294 @@
+================================================================================
+ 실습 16-3 : spfile 손상 복구 — 자동 백업에서 RESTORE SPFILE
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- spfile이 사라져 인스턴스를 기동할 수 없다.
+-- 최소 내용의 임시 pfile로 인스턴스만 띄운다.
+-- SET DBID 후 자동 백업에서 spfile을 복원한다.
+-- 복원 후 파라미터 값이 최신인지 확인한다.
+-- 복구 유형 : 파라미터 파일 복구, 전면 중단
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 컨트롤파일 자동 백업이 켜져 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> SHOW CONTROLFILE AUTOBACKUP;
+
+CONFIGURE CONTROLFILE AUTOBACKUP ON;
+
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'BASE_163';
+
+Starting Control File and SPFILE Autobackup at 18-MAY-25
+piece handle=/home/oracle/rmanbk/cf_c-1200530011-20250518-02
+Finished Control File and SPFILE Autobackup at 18-MAY-25
+
+RMAN> EXIT
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SHOW PARAMETER spfile
+
+NAME    TYPE   VALUE
+------- ------ ------------------------------------------------------------
+spfile  string /u01/app/oracle/product/19.3.0/dbhome_1/dbs/spfileorcl.ora
+
+SYS@orcl> SELECT dbid FROM v$database;
+
+      DBID
+----------
+1200530011
+
+SYS@orcl> SELECT name, value FROM v$parameter
+  2  WHERE  isdefault = 'FALSE' AND name IN
+  3    ('control_file_record_keep_time','log_archive_dest_1','sga_target');
+
+NAME                          VALUE
+----------------------------- --------------------------------
+control_file_record_keep_time 31
+log_archive_dest_1            LOCATION=/u02/arch1
+sga_target                    1073741824
+
+-- 복원 후 이 값들과 비교한다.
+
+SYS@orcl> !ls -l $ORACLE_HOME/dbs/spfileorcl.ora
+-rw-r-----. 1 oracle oinstall 3584 May 18 10:32 spfileorcl.ora
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : spfile 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN IMMEDIATE
+
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f $ORACLE_HOME/dbs/spfileorcl.ora
+
+SYS@orcl> !ls $ORACLE_HOME/dbs/*orcl*
+/u01/app/oracle/product/19.3.0/dbhome_1/dbs/hc_orcl.dat
+/u01/app/oracle/product/19.3.0/dbhome_1/dbs/orapworcl
+
+-- spfile도 pfile도 없다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+
+ORA-01078: failure in processing system parameters
+LRM-00109: could not open parameter file
+'/u01/app/oracle/product/19.3.0/dbhome_1/dbs/initorcl.ora'
+
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target /
+
+connected to target database (not started)
+
+RMAN> STARTUP NOMOUNT
+
+startup failed: ORA-01078: failure in processing system parameters
+LRM-00109: could not open parameter file
+ '/u01/app/oracle/product/19.3.0/dbhome_1/dbs/initorcl.ora'
+
+-- RMAN으로도 인스턴스를 올릴 수 없다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ ls -lt /home/oracle/rmanbk/cf_* | head -2
+-rw-r-----. 1 oracle oinstall 18939904 May 18 10:34 cf_c-1200530011-20250518-02
+-rw-r-----. 1 oracle oinstall 18939904 May 18 09:04 cf_c-1200530011-20250518-01
+
+-- 자동 백업이 있다. 파일명에 DBID가 들어 있다.
+
+[oracle@oel7v9r1 ~]$ ls /home/oracle/backup/init*.ora 2>/dev/null
+[oracle@oel7v9r1 ~]$
+
+-- pfile 사본이 없다. 있었다면 그것으로 즉시 기동할 수 있었다.
+
+-- 판정
+--   ① spfile과 pfile 모두 부재 → 인스턴스 기동 불가
+--   ② 자동 백업 있음, DBID는 파일명에서 확인 가능
+--   ③ 순서 : 임시 pfile로 기동 → SET DBID → RESTORE SPFILE
+--   → 전면 중단이며 몇 분이면 복구된다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 임시 pfile 없이 복원을 시도해 본다.
+
+[oracle@oel7v9r1 ~]$ rman target /
+
+RMAN> SET DBID 1200530011;
+
+executing command: SET DBID
+
+RMAN> RESTORE SPFILE FROM AUTOBACKUP;
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 05/18/2025 10:41:02
+RMAN-06403: could not obtain a fully authorized session
+ORA-01034: ORACLE not available
+
+-- << 원인 파악 >>
+-- 인스턴스가 없으면 RMAN이 작업을 수행할 수 없다.
+-- 복원 작업도 인스턴스의 서버 프로세스가 하기 때문이다.
+-- spfile이 없어 인스턴스를 못 올리고, 인스턴스가 없어 복원을 못 하는 상황이다.
+-- 최소한의 pfile로 인스턴스만 먼저 띄워야 한다.
+
+-- << 수정 >>
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ echo "db_name=orcl" > /tmp/init_tmp.ora
+[oracle@oel7v9r1 ~]$ cat /tmp/init_tmp.ora
+db_name=orcl
+
+[oracle@oel7v9r1 ~]$ rman target /
+
+RMAN> STARTUP NOMOUNT PFILE='/tmp/init_tmp.ora';
+
+Oracle instance started
+
+Total System Global Area     398458880 bytes
+Fixed Size                     8895488 bytes
+Variable Size                318767104 bytes
+Database Buffers              62914560 bytes
+Redo Buffers                   7881728 bytes
+
+-- 기본값으로 작은 인스턴스가 떴다. 복원에는 충분하다.
+
+RMAN> SET DBID 1200530011;
+
+executing command: SET DBID
+
+RMAN> SET CONTROLFILE AUTOBACKUP FORMAT FOR DEVICE TYPE DISK
+  2>   TO '/home/oracle/rmanbk/cf_%F';
+
+executing command: SET CONTROLFILE AUTOBACKUP FORMAT
+
+RMAN> RESTORE SPFILE FROM AUTOBACKUP;
+
+Starting restore at 18-MAY-25
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: looking for AUTOBACKUP on day: 20250518
+channel ORA_DISK_1: AUTOBACKUP found: /home/oracle/rmanbk/cf_c-1200530011-20250518-02
+channel ORA_DISK_1: restoring SPFILE
+output file name=/u01/app/oracle/product/19.3.0/dbhome_1/dbs/spfileorcl.ora
+channel ORA_DISK_1: SPFILE restore from AUTOBACKUP complete
+Finished restore at 18-MAY-25
+
+RMAN> SHUTDOWN IMMEDIATE
+
+Oracle instance shut down
+
+RMAN> STARTUP
+
+connected to target database (not started)
+Oracle instance started
+database mounted
+database opened
+
+Total System Global Area    1073741824 bytes
+
+-- 복원된 spfile로 정상 기동되었다. SGA 크기가 원래 값으로 돌아왔다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SHOW PARAMETER spfile
+
+NAME    TYPE   VALUE
+------- ------ ------------------------------------------------------------
+spfile  string /u01/app/oracle/product/19.3.0/dbhome_1/dbs/spfileorcl.ora
+
+SYS@orcl> SELECT name, value FROM v$parameter
+  2  WHERE  isdefault = 'FALSE' AND name IN
+  3    ('control_file_record_keep_time','log_archive_dest_1','sga_target');
+
+NAME                          VALUE
+----------------------------- --------------------------------
+control_file_record_keep_time 31
+log_archive_dest_1            LOCATION=/u02/arch1
+sga_target                    1073741824
+
+-- 값이 복구 전과 같다. 자동 백업 이후 변경이 없었기 때문이다.
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+OPEN
+
+SYS@orcl> SELECT COUNT(*) FROM v$parameter WHERE isdefault = 'FALSE';
+
+  COUNT(*)
+----------
+        18
+
+-- 재발 대비로 pfile 사본을 남긴다.
+
+SYS@orcl> CREATE PFILE='/home/oracle/backup/initorcl_20250518.ora' FROM SPFILE;
+
+File created.
+
+SYS@orcl> !ls -l /home/oracle/backup/init*
+-rw-r--r--. 1 oracle oinstall 1421 May 18 10:52 initorcl_20250518.ora
+
+SYS@orcl> !head -5 /home/oracle/backup/initorcl_20250518.ora
+orcl.__data_transfer_cache_size=0
+orcl.__db_cache_size=671088640
+*.control_file_record_keep_time=31
+*.control_files='/u01/app/oracle/oradata/ORCL/control01.ctl',...
+
+SYS@orcl> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'AFTER_SPFILE';
+RMAN> EXIT
+
+-- 실무 포인트
+-- 1) spfile이 없으면 인스턴스를 올릴 수 없다.
+--    ORA-01078과 LRM-00109가 그 신호이며 찾는 순서는
+--    spfile<SID>.ora → spfile.ora → init<SID>.ora 다.
+--
+-- 2) 인스턴스 없이는 RMAN 복원도 불가능하다.
+--    RMAN-06403과 ORA-01034가 그 사실을 알려 준다.
+--    복원 작업도 인스턴스의 서버 프로세스가 수행하기 때문이다.
+--
+-- 3) 최소 pfile로 인스턴스만 띄우는 것이 해결의 열쇠다.
+--    db_name 한 줄이면 충분하며 기본값으로 작은 인스턴스가 뜬다.
+--    복원 작업에는 그것으로 충분하다.
+--
+-- 4) SET DBID가 필요하다.
+--    자동 백업 파일명이 c-DBID-YYYYMMDD-NN 형식이기 때문이다.
+--    자동 백업 위치가 기본값이 아니면 FORMAT도 지정한다.
+--
+-- 5) 복원본은 자동 백업 시점의 내용이다.
+--    그 이후 파라미터를 바꿨다면 그 변경은 사라진다.
+--    v$parameter 로 isdefault='FALSE' 목록을 확인해 비교한다.
+--
+-- 6) pfile 사본이 있었다면 이 모든 절차가 한 줄로 끝났다.
+--    STARTUP PFILE='...' 로 기동한 뒤 CREATE SPFILE 하면 된다.
+--    파라미터를 바꿀 때마다 사본을 남기는 습관이 가장 단순한 대비책이다.

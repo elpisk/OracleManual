@@ -1,0 +1,255 @@
+================================================================================
+ 실습 4-7 : SYSAUX 데이터파일 손상 — SYSTEM과의 차이 확인
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 소요 시간 : 약 15분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- SYSAUX 데이터 파일이 유실되었다.
+-- 핵심 딕셔너리는 SYSTEM에 있으므로 일반 업무 트랜잭션은 계속된다.
+-- 리두가 있으면 복원 후 복구하고, 없으면 OFFLINE DROP으로 서비스를 유지한다.
+-- 원본 시나리오에 없는 결손 보완 케이스이며, SYSTEM과의 대비가 학습 목적이다.
+-- 복구 유형 : 완전 복구(리두 O) / 기능 일부 포기 후 정비 시간 복원(리두 X)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- NOARCHIVELOG 모드여야 한다.
+-- 실습 직전 Cold Backup을 새로 받아 리두가 남아 있는 조건을 만든다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch04 && mkdir -p /home/oracle/backup/ch04
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.dbf /u01/app/oracle/oradata/ORCL/*.ctl \
+                 /u01/app/oracle/oradata/ORCL/*.log /home/oracle/backup/ch04/
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.log /home/oracle/backup/ch04/
+SYS@orcl> !rm -f /home/oracle/backup/ch04/temp01.dbf
+SYS@orcl> STARTUP
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT checkpoint_change# FROM v$database;
+
+CHECKPOINT_CHANGE#
+------------------
+           2359214
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile ORDER BY file#;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         1 /u01/app/oracle/oradata/ORCL/system01.dbf     SYSTEM
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf     ONLINE
+         4 /u01/app/oracle/oradata/ORCL/undotbs01.dbf    ONLINE
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf      ONLINE
+         8 /u01/app/oracle/oradata/ORCL/tbs01.dbf        ONLINE
+
+-- SYSAUX(file# 3)의 STATUS는 ONLINE이다. SYSTEM과 달리 일반 파일과 같은 지위다.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_hist_snapshot;
+
+  COUNT(*)
+----------
+        24
+
+--------------------------------------------------------------------------------
+[4] 장애 유발
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/sysaux01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰 : SYSTEM 손상과의 대비
+--------------------------------------------------------------------------------
+-- 일반 업무 조회는 정상이다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp1;
+
+  COUNT(*)
+----------
+         2
+
+-- 딕셔너리 조회도 정상이다. 핵심 딕셔너리는 SYSTEM에 있기 때문이다.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_tables WHERE owner = 'HR';
+
+  COUNT(*)
+----------
+        11
+
+-- AWR 관련 조회만 실패한다.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_hist_snapshot;
+SELECT COUNT(*) FROM dba_hist_snapshot
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 3
+ORA-01110: data file 3: '/u01/app/oracle/oradata/ORCL/sysaux01.dbf'
+ORA-27041: unable to open file
+
+-- 실습 4-5의 SYSTEM 손상에서는 dba_tables 조회부터 실패했다.
+-- 증상만으로 어느 파일이 문제인지 좁힐 수 있다.
+
+SYS@orcl> !tail -4 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+Errors in file /u01/app/oracle/diag/rdbms/orcl/orcl/trace/orcl_m000_11284.trc:
+ORA-01110: data file 3: '/u01/app/oracle/oradata/ORCL/sysaux01.dbf'
+ORA-01116: error in opening database file 3
+ORA-27041: unable to open file
+
+-- m000은 MMON의 슬레이브 프로세스다. AWR 스냅숏 수집이 실패하고 있다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         3 FILE NOT FOUND                 0
+
+SYS@orcl> SELECT MIN(first_change#) AS oldest_redo_scn FROM v$log;
+
+OLDEST_REDO_SCN
+---------------
+        2358902
+
+-- 백업본 SCN(2359214) >= 최소 리두 SCN(2358902) → 리두 생존, 완전 복구 가능
+
+SYS@orcl> !mkdir -p /home/oracle/before_recover_47
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/*.ctl /u01/app/oracle/oradata/ORCL/*.log \
+                 /home/oracle/before_recover_47/
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- 서비스를 유지한 채 처리할 수 있는지 먼저 확인한다.
+
+SYS@orcl> ALTER DATABASE DATAFILE 3 OFFLINE;
+ALTER DATABASE DATAFILE 3 OFFLINE
+*
+ERROR at line 1:
+ORA-01145: offline immediate disallowed unless media recovery enabled
+
+-- << 원인 파악 >>
+-- SYSTEM과 달리 ORA-01541이 아니라 ORA-01145가 나왔다.
+-- 즉 "SYSAUX라서 안 된다"가 아니라 "NOARCHIVELOG라서 OFFLINE이 안 된다"는 뜻이다.
+-- SYSAUX 자체는 오프라인 대상이 될 수 있으며, OFFLINE DROP은 허용된다.
+
+SYS@orcl> ALTER DATABASE DATAFILE 3 OFFLINE DROP;
+
+Database altered.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 3;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf     RECOVER
+
+-- SYSTEM에서는 이 명령 자체가 거부되었다. 여기가 결정적 차이다.
+-- 다만 이번 실습은 리두가 살아 있으므로 정식 복구로 진행한다.
+
+-- << 수정 >>
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch04/sysaux01.dbf /u01/app/oracle/oradata/ORCL/
+
+SYS@orcl> STARTUP MOUNT
+Database mounted.
+
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         3                          2359214
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATAFILE 3;
+Media recovery complete.
+
+SYS@orcl> ALTER DATABASE DATAFILE 3 ONLINE;
+Database altered.
+
+SYS@orcl> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- OFFLINE DROP으로 내렸던 파일은 복구 후 ONLINE으로 되돌려야 한다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 3;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         3 /u01/app/oracle/oradata/ORCL/sysaux01.dbf     ONLINE
+
+SYS@orcl> SELECT COUNT(*) FROM dba_hist_snapshot;
+
+  COUNT(*)
+----------
+        24
+
+-- AWR 조회가 정상으로 돌아왔다.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
+
+  COUNT(*)
+----------
+       107
+
+-- 세 종류 테이블스페이스 비교 정리
+--
+--   구분        OFFLINE DROP   DROP TABLESPACE   손상 시 서비스
+--   ---------   ------------   ---------------   -------------------------
+--   SYSTEM      불가(01541)    불가              사실상 중단
+--   SYSAUX      가능           불가(필수 TS)     유지, AWR·통계만 실패
+--   일반 TS     가능           가능              유지, 해당 객체만 오류
+--
+-- 복구 우선순위 : SYSTEM → UNDO → 일반 → SYSAUX
+
+-- 실무 포인트
+-- 1) 증상만으로 손상 파일을 좁힐 수 있다.
+--    업무 조회는 되는데 dba_hist_* 만 실패하면 SYSAUX를 의심한다.
+--    dba_tables부터 실패하면 SYSTEM이다.
+--
+-- 2) ORA-01145와 ORA-01541을 구분한다.
+--    전자는 "NOARCHIVELOG라서 OFFLINE 불가", 후자는 "SYSTEM이라서 오프라인 불가"다.
+--    같은 상황처럼 보이지만 남은 선택지가 다르다.
+--
+-- 3) 리두가 없을 때 SYSAUX는 OFFLINE DROP으로 서비스를 유지할 수 있다.
+--    AWR 수집과 통계 갱신은 멈추지만 업무는 계속된다.
+--    정비 시간에 전체 복원을 계획하면 된다.
+--
+-- 4) 다만 SYSAUX는 필수 테이블스페이스라 DROP TABLESPACE로 지울 수 없다.
+--    OFFLINE DROP은 시간을 버는 임시 조치일 뿐이다.
+--
+-- 5) OFFLINE DROP으로 내린 파일은 복구 후 반드시 ONLINE으로 되돌린다.
+--    잊으면 그 테이블스페이스가 계속 사용 불가 상태로 남는다.
+--
+-- 6) 이 실습으로 4장이 끝난다. 8장을 위해 ARCHIVELOG로 다시 전환하고
+--    전체 백업을 새로 받아 둔다. 절차는 2장 실습 2-1과 3장 실습 3-1을 따른다.
+
+SYS@orcl> EXIT

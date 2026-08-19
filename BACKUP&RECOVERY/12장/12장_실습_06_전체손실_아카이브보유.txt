@@ -1,0 +1,306 @@
+================================================================================
+ 실습 12-6 : 전체 손실 — 아카이브 보유
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 35분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 데이터파일, 리두 로그, 컨트롤파일이 모두 사라졌다.
+-- 백업본과 아카이브는 다른 디스크에 있어 온전하다.
+-- 컨트롤파일을 재생성하고 전체 복원 후 아카이브를 적용한다.
+-- 아카이브된 마지막 시퀀스까지 복구되며 CURRENT 구간만 손실된다.
+-- 복구 유형 : 불완전 복구(UNTIL CANCEL), 마지막 스위치 이후 손실
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- ARCHIVELOG 모드이며 Hot Backup과 컨트롤파일 trace 백업이 있다.
+-- 백업본과 아카이브는 데이터 디스크와 분리된 위치에 있다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER DATABASE BEGIN BACKUP;
+Database altered.
+
+SYS@orcl> !rm -rf /home/oracle/backup/hot12 && mkdir -p /home/oracle/backup/hot12
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/hot12/
+SYS@orcl> !rm -f /home/oracle/backup/hot12/temp01.dbf
+
+SYS@orcl> ALTER DATABASE END BACKUP;
+Database altered.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+-- 백업 직후 아카이브를 만든다. 백업 구간의 리두를 확보하는 조치다.
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_ch12.sql' REUSE;
+Database altered.
+
+[oracle@oel7v9r1 ~]$ sed -n '/RESETLOGS  ARCHIVELOG/,/^;/p' \
+>   /home/oracle/backup/cf_ch12.sql > /home/oracle/backup/cf_ch12_resetlogs.sql
+[oracle@oel7v9r1 ~]$ head -1 /home/oracle/backup/cf_ch12_resetlogs.sql
+CREATE CONTROLFILE REUSE DATABASE "ORCL" RESETLOGS  ARCHIVELOG
+
+SYS@orcl> CREATE TABLE hr.emp126(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp126 VALUES (1, 'after hot backup');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@orcl> INSERT INTO hr.emp126 VALUES (2, 'archived too');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@orcl> INSERT INTO hr.emp126 VALUES (3, 'only in current redo');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT MAX(sequence#) AS archived_max FROM v$archived_log WHERE status = 'A';
+
+ARCHIVED_MAX
+------------
+          34
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         33 YES INACTIVE
+         3         34 YES INACTIVE
+         4         35 NO  CURRENT
+
+-- 3번 행은 시퀀스 35, 즉 CURRENT 그룹에만 있다.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 전체 손실
+--------------------------------------------------------------------------------
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> !rm -f /u02/oradata/ORCL/*.dbf
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl
+
+SYS@orcl> !ls /u02/arch1/*.dbf | wc -l
+34
+
+SYS@orcl> !ls /home/oracle/backup/hot12/*.dbf | wc -l
+4
+
+-- 백업본과 아카이브는 남아 있다.
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> STARTUP
+ORACLE instance started.
+
+Total System Global Area 1140849904 bytes
+Fixed Size                  8895728 bytes
+Variable Size             754974720 bytes
+Database Buffers          369098752 bytes
+Redo Buffers                7880704 bytes
+ORA-00205: error in identifying control file, check alert log for more info
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+STARTED
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> !ls /u02/oradata/ORCL/*.dbf 2>/dev/null | wc -l
+0
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.log /u02/oradata/ORCL/*.log 2>/dev/null | wc -l
+0
+SYS@orcl> !ls /u01/app/oracle/oradata/ORCL/*.ctl /u02/oradata/ORCL/*.ctl 2>/dev/null | wc -l
+0
+
+-- 세 종류가 모두 없다.
+
+SYS@orcl> !ls /u02/arch1/*.dbf | sed 's/.*1_\([0-9]*\)_.*/\1/' | sort -n | tail -3
+32
+33
+34
+
+-- 아카이브는 34까지 있다. 시퀀스 35는 CURRENT 그룹에만 있었고 함께 사라졌다.
+
+-- 판정
+--   ① 컨트롤파일 수단 : trace 백업 있음
+--   ② 아카이브 연속 : 1~34, 결손 없음
+--   ③ CURRENT 리두 : 전손 → 시퀀스 35 구간 손실 확정
+--   → 시퀀스 34까지 복구되는 불완전 복구. 손실 범위를 미리 통보한다.
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> @/home/oracle/backup/cf_ch12_resetlogs.sql
+
+Control file created.
+
+SYS@orcl> !cp -p /home/oracle/backup/hot12/*.dbf /u02/oradata/ORCL/
+
+SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# FUZ
+---------- ------------------ ---
+         1            2481200 YES
+         3            2481240 YES
+         4            2481260 YES
+         7            2481210 YES
+
+-- Hot Backup이므로 SCN이 파일마다 다르고 FUZZY가 YES다.
+-- 아카이브를 적용해 일관성을 맞춰야 한다.
+
+-- 컨트롤파일을 새로 만들었으므로 일반 복구를 시도해 본다.
+
+SYS@orcl> RECOVER DATABASE;
+ORA-00283: recovery session canceled due to errors
+ORA-01610: recovery using the BACKUP CONTROLFILE option must be used
+
+-- << 원인 파악 >>
+-- 재생성한 컨트롤파일은 데이터파일의 최신 SCN 정보를 갖고 있지 않다.
+-- 어디까지 복구해야 하는지 판단할 근거가 없으므로
+-- USING BACKUP CONTROLFILE 로 그 판단을 사람에게 넘기라는 뜻이다.
+
+-- << 수정 >>
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE UNTIL CANCEL;
+ORA-00279: change 2481200 generated at 05/13/2025 15:22:40 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_32_1190000001.dbf
+Log applied.
+ORA-00279: change 2483100 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_34_1190000001.dbf
+Log applied.
+ORA-00308: cannot open archived log '/u02/arch1/1_35_1190000001.dbf'
+ORA-27037: unable to obtain file status
+
+-- << 원인 파악 >>
+-- 시퀀스 35는 아카이브되지 않은 CURRENT 그룹의 내용이다.
+-- 온라인 리두도 함께 사라져 이 구간은 어디에도 없다.
+-- 34까지 적용된 상태가 도달 가능한 최대치다.
+
+-- << 수정 >> CANCEL로 마무리한다.
+
+SYS@orcl> SET AUTORECOVERY OFF
+SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE UNTIL CANCEL;
+ORA-00279: change 2484700 generated at 05/13/2025 15:31:02 needed for thread 1
+ORA-00289: suggestion : /u02/arch1/1_35_1190000001.dbf
+ORA-00280: change 2484700 for thread 1 is in sequence #35
+
+Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+CANCEL
+Media recovery cancelled.
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT id, memo FROM hr.emp126 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 after hot backup
+         2 archived too
+
+-- 3번 행이 없다. CURRENT 그룹에만 있던 변경이다.
+-- 시퀀스 35 구간이 손실되었다.
+
+SYS@orcl> SELECT checkpoint_change# AS recovered_scn,
+  2         TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#),
+  3                 'YYYY-MM-DD HH24:MI:SS') AS recovered_time FROM v$database;
+
+RECOVERED_SCN RECOVERED_TIME
+------------- -------------------
+      2484700 2025-05-13 15:31:02
+
+-- 이 시각 이후의 업무가 재처리 대상이다. 현업에 이 범위를 통보한다.
+
+SYS@orcl> SELECT COUNT(*) FROM v$datafile WHERE name LIKE '%UNNAMED%';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
+  2    '/u02/oradata/ORCL/temp01.dbf' SIZE 60M REUSE;
+
+Tablespace altered.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_objects WHERE status = 'INVALID';
+
+  COUNT(*)
+----------
+        14
+
+SYS@orcl> BEGIN
+  2    DBMS_UTILITY.compile_schema(schema => 'HR', compile_all => FALSE);
+  3  END;
+  4  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_objects WHERE status = 'INVALID';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
+  2  ORDER BY incarnation#;
+
+INCARNATION# RESETLOGS_CHANGE# STATUS
+------------ ----------------- -------
+          12           2478100 PARENT
+          13           2484701 CURRENT
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch12 && mkdir -p /home/oracle/backup/ch12
+SYS@orcl> !cp -p /u02/oradata/ORCL/*.dbf /home/oracle/backup/ch12/
+SYS@orcl> !rm -f /home/oracle/backup/ch12/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 실무 포인트
+-- 1) 모든 파일이 사라져도 백업본과 아카이브가 있으면 복구는 성공한다.
+--    손실은 마지막 아카이브 이후, 즉 CURRENT 구간뿐이다.
+--    두 가지를 데이터 디스크와 분리해 두는 것이 이 결과를 만든다.
+--
+-- 2) 손실 범위는 로그 스위치 간격에 비례한다.
+--    백업 스크립트 마지막에 ALTER SYSTEM ARCHIVE LOG CURRENT 를 넣어 두면
+--    그 시점까지의 리두가 아카이브로 확보되어 손실 후보 구간이 줄어든다.
+--
+-- 3) 재생성한 컨트롤파일로 일반 RECOVER를 시도하면 ORA-01610이 나온다.
+--    복구 한계를 판단할 근거가 컨트롤파일에 없기 때문이다.
+--    USING BACKUP CONTROLFILE 로 그 판단을 사람이 맡는다.
+--
+-- 4) 마지막에 없는 시퀀스를 요구하면 CANCEL로 마무리한다.
+--    ORA-00308은 오류가 아니라 도달 가능한 한계에 이르렀다는 신호다.
+--
+-- 5) 복구 후 SCN_TO_TIMESTAMP 로 복구 시점을 확인해 현업에 통보한다.
+--    그 시각 이후의 업무가 재처리 대상이다.
+--
+-- 6) 전체 복원 후 일부 객체가 INVALID로 남을 수 있다.
+--    compile_schema 또는 UTL_RECOMP 로 정리한 뒤 서비스를 재개한다.

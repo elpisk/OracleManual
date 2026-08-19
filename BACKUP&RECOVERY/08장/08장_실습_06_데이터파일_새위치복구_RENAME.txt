@@ -1,0 +1,267 @@
+================================================================================
+ 실습 8-6 : 데이터파일을 새 위치로 복구 — RENAME FILE
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+ 소요 시간 : 약 20분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 데이터파일이 유실되었고 원래 디스크에는 복원할 공간이 없다.
+-- 백업본을 다른 위치로 복원하고 RENAME FILE로 경로를 갱신한다.
+-- RENAME과 RECOVER의 순서가 결과를 가른다.
+-- 19c의 MOVE DATAFILE과의 차이도 함께 확인한다.
+-- 복구 유형 : 완전 복구(경로 변경)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 실습 8-5를 마친 상태에서 이어서 진행한다.
+-- USERS 테이블스페이스의 백업본이 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COL name FOR a48
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, name FROM v$datafile WHERE file# = 7;
+
+     FILE# NAME
+---------- ------------------------------------------
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf
+
+SYS@orcl> ALTER TABLESPACE users BEGIN BACKUP;
+SYS@orcl> !cp -p /u01/app/oracle/oradata/ORCL/users01.dbf /home/oracle/backup/ch08/
+SYS@orcl> ALTER TABLESPACE users END BACKUP;
+Tablespace altered.
+
+SYS@orcl> INSERT INTO hr.emp83 VALUES (2, 'after hot backup');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT * FROM hr.emp83 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 after cold backup
+         2 after hot backup
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+--------------------------------------------------------------------------------
+[4] 장애 유발 : 파일 유실과 원래 위치 사용 불가
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u01/app/oracle/oradata/ORCL/users01.dbf
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+-- /u01의 여유 공간이 부족해 200MB 파일을 복원할 수 없다고 가정한다.
+
+SYS@orcl> !df -h /u01 /u02
+Filesystem            Size  Used Avail Use% Mounted on
+/dev/mapper/ol-u01     40G   40G   80M 100% /u01
+/dev/mapper/ol-u02     20G  3.6G   17G  18% /u02
+
+--------------------------------------------------------------------------------
+[5] 증상 관찰
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) FROM hr.emp83;
+SELECT COUNT(*) FROM hr.emp83
+                     *
+ERROR at line 1:
+ORA-01116: error in opening database file 7
+ORA-01110: data file 7: '/u01/app/oracle/oradata/ORCL/users01.dbf'
+ORA-27041: unable to open file
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 7;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf      RECOVER
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file WHERE file# = 7;
+
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         7 FILE NOT FOUND                 0
+
+SYS@orcl> !ls -l /home/oracle/backup/ch08/users01.dbf
+-rw-r-----. 1 oracle oinstall 209715712 May 11 11:32 users01.dbf
+
+SYS@orcl> SELECT sequence#, status FROM v$archived_log
+  2  ORDER BY sequence# DESC FETCH FIRST 3 ROWS ONLY;
+
+ SEQUENCE# S
+---------- -
+        33 A
+        32 A
+        31 A
+
+-- 판정
+--   ① 백업본 : 있음
+--   ② 아카이브 : 연속 보유 → 완전 복구 가능
+--   ③ 원래 위치 : 공간 부족 → 새 위치로 복원 후 RENAME
+--   → OFFLINE → 새 위치 복원 → RENAME → RECOVER → ONLINE
+
+SYS@orcl> !mkdir -p /u02/oradata/ORCL
+SYS@orcl> !df -h /u02 | tail -1
+/dev/mapper/ol-u02     20G  3.6G   17G  18% /u02
+
+--------------------------------------------------------------------------------
+[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLESPACE users OFFLINE IMMEDIATE;
+Tablespace altered.
+
+SYS@orcl> !cp -p /home/oracle/backup/ch08/users01.dbf /u02/oradata/ORCL/
+
+-- RENAME 없이 바로 복구를 시도한다.
+
+SYS@orcl> SET AUTORECOVERY ON
+SYS@orcl> RECOVER TABLESPACE users;
+ORA-00283: recovery session canceled due to errors
+ORA-01110: data file 7: '/u01/app/oracle/oradata/ORCL/users01.dbf'
+ORA-01115: IO error reading block from file 7 (block # 1)
+ORA-01110: data file 7: '/u01/app/oracle/oradata/ORCL/users01.dbf'
+ORA-27041: unable to open file
+
+-- << 원인 파악 >>
+-- 파일은 /u02에 복원했는데 복구는 /u01의 예전 경로를 찾고 있다.
+-- 컨트롤파일이 아는 경로가 여전히 /u01이기 때문이다.
+-- 복원 위치가 달라졌으면 그 사실을 컨트롤파일에 먼저 알려야 한다.
+-- 그 명령이 ALTER DATABASE RENAME FILE 이며 복구보다 먼저 수행해야 한다.
+
+SYS@orcl> SELECT file#, name FROM v$datafile WHERE file# = 7;
+
+     FILE# NAME
+---------- ------------------------------------------
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf
+
+-- << 수정 >>
+
+SYS@orcl> ALTER DATABASE RENAME FILE
+  2    '/u01/app/oracle/oradata/ORCL/users01.dbf'
+  3  TO '/u02/oradata/ORCL/users01.dbf';
+
+Database altered.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 7;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         7 /u02/oradata/ORCL/users01.dbf                 OFFLINE
+
+-- RENAME은 파일을 옮기지 않고 컨트롤파일의 기록만 바꾼다.
+
+SYS@orcl> RECOVER TABLESPACE users;
+Media recovery complete.
+
+SYS@orcl> ALTER TABLESPACE users ONLINE;
+
+Tablespace altered.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+SYS@orcl> SELECT * FROM hr.emp83 ORDER BY id;
+
+        ID MEMO
+---------- ------------------------------
+         1 after cold backup
+         2 after hot backup
+
+-- Hot Backup 이후 커밋한 데이터가 살아 있다. 완전 복구가 성공했다.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 7;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         7 /u02/oradata/ORCL/users01.dbf                 ONLINE
+
+SYS@orcl> SELECT resetlogs_change# FROM v$database;
+
+RESETLOGS_CHANGE#
+-----------------
+                1
+
+-- 디스크 공간이 확보된 뒤 원래 위치로 되돌린다.
+
+SYS@orcl> !df -h /u01 | tail -1
+/dev/mapper/ol-u01     40G   19G   21G  48% /u01
+
+-- RENAME으로 되돌리려 하면 실패한다.
+
+SYS@orcl> ALTER DATABASE RENAME FILE
+  2    '/u02/oradata/ORCL/users01.dbf'
+  3  TO '/u01/app/oracle/oradata/ORCL/users01.dbf';
+ALTER DATABASE RENAME FILE
+*
+ERROR at line 1:
+ORA-01511: error in renaming log/data files
+ORA-01141: error renaming data file 7 - new file
+           '/u01/app/oracle/oradata/ORCL/users01.dbf' not found
+ORA-01110: data file 7: '/u02/oradata/ORCL/users01.dbf'
+
+-- RENAME은 새 경로에 실제 파일이 있어야 한다. 옮기는 명령이 아니기 때문이다.
+
+SYS@orcl> ALTER DATABASE MOVE DATAFILE
+  2    '/u02/oradata/ORCL/users01.dbf'
+  3  TO '/u01/app/oracle/oradata/ORCL/users01.dbf';
+
+Database altered.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile WHERE file# = 7;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+         7 /u01/app/oracle/oradata/ORCL/users01.dbf      ONLINE
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp83;
+
+  COUNT(*)
+----------
+         2
+
+-- 서비스 중단 없이 원래 위치로 돌아왔다.
+
+SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO TRACE
+  2    AS '/home/oracle/backup/cf_after_ch08_06.sql';
+Database altered.
+
+-- 실무 포인트
+-- 1) RENAME FILE 은 파일을 옮기지 않는다.
+--    컨트롤파일에 기록된 경로만 바꾸는 명령이며 실제 파일이 새 경로에 있어야 성공한다.
+--    없으면 ORA-01141로 거부된다.
+--
+-- 2) 순서가 결과를 가른다. 복원 → RENAME → RECOVER 순이다.
+--    RENAME을 건너뛰고 복구하면 예전 경로를 찾다 ORA-01115로 실패한다.
+--    RENAME이 먼저여야 복구가 새 파일을 대상으로 진행된다.
+--
+-- 3) RENAME은 MOUNT 상태이거나 대상이 OFFLINE인 OPEN 상태에서만 가능하다.
+--    온라인 파일에 시도하면 ORA-01511 계열 오류가 나온다.
+--
+-- 4) MOVE DATAFILE 은 실제로 파일을 옮기며 온라인으로 수행된다.
+--    원본이 정상일 때 쓰는 이동 명령이므로 손상된 파일에는 쓸 수 없다.
+--    복구가 끝난 뒤 경로 체계를 정리하는 용도에 적합하다.
+--
+-- 5) 두 명령을 한 문장으로 구분한다.
+--    RENAME은 '이미 옮겨진 파일을 알려 주는' 명령, MOVE는 '지금 옮기는' 명령이다.
+--
+-- 6) 경로가 바뀌면 백업 스크립트와 매니페스트, 모니터링 대상을 함께 갱신한다.
+--    구조가 바뀌었으므로 컨트롤파일 백업도 다시 받는다.
+
+SYS@orcl> EXIT

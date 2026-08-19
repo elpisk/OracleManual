@@ -1,0 +1,259 @@
+================================================================================
+ 실습 17-1 : 백업 데이터파일·아카이브 복사와 pfile 준비
+ 과정      : Oracle Database 19c Backup & Recovery
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL → CLONE
+ 소요 시간 : 약 30분
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 수동 복제(Clone DB)의 첫 단계다.
+-- 복제본이 쓸 디렉터리를 만들고 백업 파일과 아카이브를 복사한다.
+-- 원본의 pfile을 바탕으로 복제본용 파라미터 파일을 만든다.
+-- 공간을 미리 계산해 부족으로 중단되는 일을 막는다.
+-- 작업 유형 : 복제 준비(장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- 원본 ORCL이 ARCHIVELOG 모드로 운영 중이어야 한다.
+-- 최근 백업과 그 이후의 아카이브가 있어야 한다.
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT name, log_mode, open_mode FROM v$database;
+
+NAME      LOG_MODE     OPEN_MODE
+--------- ------------ --------------------
+ORCL      ARCHIVELOG   READ WRITE
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> !rm -rf /home/oracle/backup/ch17 && mkdir -p /home/oracle/backup/ch17
+SYS@orcl> !cp -p /u03/oradata/ORCL/*.dbf /home/oracle/backup/ch17/
+SYS@orcl> !rm -f /home/oracle/backup/ch17/temp01.dbf
+SYS@orcl> STARTUP
+
+-- 복제용 백업을 새로 받았다. Cold Backup이므로 일관성이 있다.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT ROUND(SUM(bytes)/1024/1024/1024, 2) AS df_gb FROM v$datafile;
+
+     DF_GB
+----------
+      1.75
+
+SYS@orcl> SELECT ROUND(SUM(bytes)/1024/1024/1024, 2) AS temp_gb FROM v$tempfile;
+
+   TEMP_GB
+----------
+       .06
+
+SYS@orcl> SELECT COUNT(*) AS log_groups,
+  2         ROUND(SUM(bytes)/1024/1024/1024, 2) AS redo_gb FROM v$log;
+
+LOG_GROUPS    REDO_GB
+---------- ----------
+         3        .59
+
+-- 필요 공간 : 데이터파일 1.75 + 임시 0.06 + 리두 0.59 = 약 2.4GB
+-- 아카이브까지 고려해 3GB 이상을 확보한다.
+
+SYS@orcl> !df -h /u04 | tail -1
+/dev/sdd1        30G  1.2G   29G   4% /u04
+
+SYS@orcl> EXIT
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 : 디렉터리 생성과 파일 복사
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ mkdir -p /u04/clone/CLONE
+[oracle@oel7v9r1 ~]$ mkdir -p /u04/clone/arch
+[oracle@oel7v9r1 ~]$ mkdir -p /u01/app/oracle/admin/CLONE/adump
+
+[oracle@oel7v9r1 ~]$ cp -p /home/oracle/backup/ch17/*.dbf /u04/clone/CLONE/
+
+[oracle@oel7v9r1 ~]$ ls -l /u04/clone/CLONE/
+total 1789432
+-rw-r-----. 1 oracle oinstall 576724992 May 19 09:12 sysaux01.dbf
+-rw-r-----. 1 oracle oinstall 933392384 May 19 09:12 system01.dbf
+-rw-r-----. 1 oracle oinstall  20979712 May 19 09:12 tbs13_01.dbf
+-rw-r-----. 1 oracle oinstall 335552512 May 19 09:12 undotbs01.dbf
+-rw-r-----. 1 oracle oinstall  10493952 May 19 09:12 users01.dbf
+
+-- 임시 파일은 복사하지 않았다. 복제본을 연 뒤 새로 만든다.
+-- 온라인 리두도 복사하지 않는다. 재생성 시 만들어진다.
+
+[oracle@oel7v9r1 ~]$ cp -p /u02/arch1/*.dbf /u04/clone/arch/
+[oracle@oel7v9r1 ~]$ ls /u04/clone/arch/*.dbf | wc -l
+14
+
+[oracle@oel7v9r1 ~]$ du -sh /u04/clone
+2.1G    /u04/clone
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 : pfile 생성
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> CREATE PFILE='/tmp/initclone.ora' FROM SPFILE;
+
+File created.
+
+SYS@orcl> !grep -E 'db_name|control_files|audit|log_archive|recovery|sga' \
+          /tmp/initclone.ora
+
+*.audit_file_dest='/u01/app/oracle/admin/ORCL/adump'
+*.control_files='/u01/app/oracle/oradata/ORCL/control01.ctl',
+ '/u01/app/oracle/oradata/ORCL/control02.ctl','/u02/oradata/ORCL/control03.ctl'
+*.db_name='orcl'
+*.db_recovery_file_dest_size=8589934592
+*.log_archive_dest_1='LOCATION=/u02/arch1'
+*.sga_target=1073741824
+
+-- 이 값들이 모두 원본을 가리킨다. 하나씩 바꿔야 한다.
+
+SYS@orcl> EXIT
+
+--------------------------------------------------------------------------------
+[6] 진행 로그 : pfile 수정
+--------------------------------------------------------------------------------
+[oracle@oel7v9r1 ~]$ sed -i "s|^\*.db_name=.*|*.db_name='CLONE'|" /tmp/initclone.ora
+[oracle@oel7v9r1 ~]$ sed -i "s|^\*.db_unique_name=.*|*.db_unique_name='CLONE'|" \
+>   /tmp/initclone.ora
+[oracle@oel7v9r1 ~]$ sed -i "s|^\*.control_files=.*|*.control_files='/u04/clone/CLONE/control01.ctl'|" \
+>   /tmp/initclone.ora
+[oracle@oel7v9r1 ~]$ sed -i "s|^\*.audit_file_dest=.*|*.audit_file_dest='/u01/app/oracle/admin/CLONE/adump'|" \
+>   /tmp/initclone.ora
+[oracle@oel7v9r1 ~]$ sed -i "s|^\*.log_archive_dest_1=.*|*.log_archive_dest_1='LOCATION=/u04/clone/arch'|" \
+>   /tmp/initclone.ora
+[oracle@oel7v9r1 ~]$ sed -i "s|^\*.sga_target=.*|*.sga_target=536870912|" \
+>   /tmp/initclone.ora
+
+-- 원본을 가리키는 값이 남아 있는지 확인한다.
+
+[oracle@oel7v9r1 ~]$ grep -n 'ORCL\|orcl\|/u02\|/u03' /tmp/initclone.ora
+7:orcl.__db_cache_size=671088640
+8:orcl.__java_pool_size=16777216
+9:orcl.__large_pool_size=33554432
+15:*.db_recovery_file_dest='/u02/fra'
+
+-- 두 종류가 남아 있다.
+-- orcl.__ 로 시작하는 줄은 인스턴스별 메모리 값이며 무시해도 된다.
+-- db_recovery_file_dest 는 반드시 바꿔야 한다.
+
+[oracle@oel7v9r1 ~]$ sed -i "s|^\*.db_recovery_file_dest=.*|*.db_recovery_file_dest=''|" \
+>   /tmp/initclone.ora
+[oracle@oel7v9r1 ~]$ sed -i "/^orcl\.__/d" /tmp/initclone.ora
+
+[oracle@oel7v9r1 ~]$ cp /tmp/initclone.ora $ORACLE_HOME/dbs/initCLONE.ora
+[oracle@oel7v9r1 ~]$ cat $ORACLE_HOME/dbs/initCLONE.ora | head -12
+
+*.audit_file_dest='/u01/app/oracle/admin/CLONE/adump'
+*.compatible='19.0.0'
+*.control_files='/u04/clone/CLONE/control01.ctl'
+*.db_block_size=8192
+*.db_name='CLONE'
+*.db_unique_name='CLONE'
+*.db_recovery_file_dest=''
+*.log_archive_dest_1='LOCATION=/u04/clone/arch'
+*.sga_target=536870912
+
+--------------------------------------------------------------------------------
+[7] 오류 발생 → 원인 파악 → 수정
+--------------------------------------------------------------------------------
+-- adump 디렉터리 없이 기동을 시도해 본다.
+
+[oracle@oel7v9r1 ~]$ rmdir /u01/app/oracle/admin/CLONE/adump
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=CLONE
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@CLONE> STARTUP NOMOUNT PFILE='?/dbs/initCLONE.ora';
+
+ORA-09925: Unable to create audit trail file
+Linux-x86_64 Error: 2: No such file or directory
+Additional information: 9925
+
+-- << 원인 파악 >>
+-- audit_file_dest 로 지정한 디렉터리가 없다.
+-- 인스턴스는 기동 시 감사 파일을 만들려 하며 그 경로가 없으면 실패한다.
+-- 복제 절차에서 가장 자주 빠뜨리는 디렉터리다.
+
+-- << 수정 >>
+
+SYS@CLONE> !mkdir -p /u01/app/oracle/admin/CLONE/adump
+
+SYS@CLONE> STARTUP NOMOUNT PFILE='?/dbs/initCLONE.ora';
+
+ORACLE instance started.
+
+Total System Global Area  536870912 bytes
+Fixed Size                  8896512 bytes
+Variable Size             184549376 bytes
+Database Buffers          335544320 bytes
+Redo Buffers                7880704 bytes
+
+-- 인스턴스가 떴다. 다음 실습에서 컨트롤파일을 만든다.
+
+--------------------------------------------------------------------------------
+[8] 검증 및 실무 포인트
+--------------------------------------------------------------------------------
+SYS@CLONE> SELECT instance_name, status FROM v$instance;
+
+INSTANCE_NAME    STATUS
+---------------- ------------
+CLONE            STARTED
+
+SYS@CLONE> SHOW PARAMETER db_name
+
+NAME     TYPE   VALUE
+-------- ------ ------
+db_name  string CLONE
+
+SYS@CLONE> SHOW PARAMETER control_files
+
+NAME           TYPE   VALUE
+-------------- ------ ---------------------------------
+control_files  string /u04/clone/CLONE/control01.ctl
+
+SYS@CLONE> SHOW PARAMETER log_archive_dest_1
+
+NAME                 TYPE   VALUE
+-------------------- ------ ---------------------------
+log_archive_dest_1   string LOCATION=/u04/clone/arch
+
+-- 세 값이 모두 복제본을 가리킨다.
+
+SYS@CLONE> SHUTDOWN IMMEDIATE
+
+ORACLE instance shut down.
+
+SYS@CLONE> EXIT
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ du -sh /u04/clone
+2.1G    /u04/clone
+
+-- 실무 포인트
+-- 1) 필요 공간을 미리 계산한다.
+--    데이터파일 + 임시 + 리두 + 아카이브가 대상이며 여유를 두고 확보한다.
+--    작업 도중 공간이 부족하면 처음부터 다시 해야 한다.
+--
+-- 2) 임시 파일과 온라인 리두는 복사하지 않는다.
+--    임시 파일은 복제본을 연 뒤 새로 만들고
+--    온라인 리두는 컨트롤파일 재생성 시 만들어진다.
+--
+-- 3) pfile에서 바꿔야 할 항목이 여섯 가지다.
+--    db_name, db_unique_name, control_files, audit_file_dest,
+--    log_archive_dest, db_recovery_file_dest 다.
+--
+-- 4) audit_file_dest 디렉터리를 빠뜨리면 ORA-09925로 기동이 실패한다.
+--    복제 절차에서 가장 자주 빠뜨리는 항목이다.
+--
+-- 5) db_recovery_file_dest 를 원본 값 그대로 두면 위험하다.
+--    복제본이 원본 FRA에 파일을 만들어 원본의 공간을 잠식한다.
+--
+-- 6) 수정 후 grep 으로 원본 경로가 남아 있는지 확인한다.
+--    orcl.__ 로 시작하는 인스턴스별 메모리 값은 지워도 무방하다.
