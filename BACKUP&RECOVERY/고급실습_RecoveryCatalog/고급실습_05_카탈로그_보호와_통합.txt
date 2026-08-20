@@ -1,0 +1,1049 @@
+================================================================================
+ 고급 실습 05 : 카탈로그 자체의 보호·통합·업그레이드
+ 과정      : Oracle Database 19c Backup & Recovery — Recovery Catalog 고급
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / oel7v9r1(운영계) + oel7v9r2(관리계)
+ 대상 DB   : orcl, sales (oel7v9r1) / hrdb (oel7v9r2)
+ 카탈로그  : rcat @ oel7v9r2 (스키마 rcatowner, rcatowner2)
+ 소요 시간 : 약 3시간
+ 선행 조건 : 고급 실습 01~04 완료
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실무 상황
+--------------------------------------------------------------------------------
+-- 고급 실습 03에서 확인한 약점이 현실이 되었다.
+-- 지난 금요일 밤 rcat 서버의 디스크가 고장 났다.
+--   - 세 대의 야간 백업이 모두 실패했다 (RMAN-06171)
+--   - 표준 스토어드 스크립트를 쓸 수 없었다
+--   - 복구 이력을 조회할 수 없어 장애 대응 판단이 늦어졌다
+--
+-- 카탈로그가 백업 체계 전체의 단일 장애점이 되어 있다.
+--
+-- 동시에 다른 요구가 들어왔다.
+--   인접 팀이 별도로 운영하던 카탈로그(rcatowner2)를 통합하라는 지시다.
+--   그 카탈로그에는 hrdb 를 포함한 두 대의 백업 이력이 3년치 들어 있다.
+--   재등록하면 이력이 사라지므로 그대로 옮겨야 한다.
+--
+-- 그리고 다음 분기에 21c 타깃이 들어온다.
+--   카탈로그 스키마 버전이 낮으면 접속 자체가 거부된다는 것을 알게 되었다.
+--
+-- 요구 사항
+--   ① 카탈로그 DB 자체를 백업하고 복구 절차를 검증한다
+--   ② 카탈로그를 잃어도 백업 체계가 멈추지 않게 한다
+--   ③ 별도 카탈로그를 이력 손실 없이 통합한다
+--   ④ 카탈로그 버전 관리 규칙을 정하고 업그레이드 절차를 만든다
+--
+-- 이 실습은 "백업을 관리하는 것을 백업하는" 문제를 다룬다.
+
+--------------------------------------------------------------------------------
+[2] 사전 설계
+--------------------------------------------------------------------------------
+-- 2-1. 카탈로그 보호 3중 구조
+--
+--   계층   | 수단                       | 복구 대상        | 소요 시간
+--   -------|----------------------------|------------------|----------
+--   1차    | rcat DB의 RMAN 백업        | DB 전체          | 30분~1시간
+--   2차    | 카탈로그 스키마 Data Pump  | 스키마만         | 5~10분
+--   3차    | 스토어드 스크립트 파일 추출| 절차만           | 즉시
+--
+--   1차는 완전하지만 느리다.
+--   2차는 다른 DB에 옮겨 붙일 수 있어 유연하다.
+--   3차는 고급 실습 03의 rc_export_scripts.sh 가 담당한다.
+--
+--   중요한 원칙
+--     rcat 의 백업은 카탈로그를 쓰지 않는다. nocatalog 로 받는다.
+--     자기 자신을 저장소로 쓰면 그 저장소가 사라졌을 때 복구할 수 없다.
+
+-- 2-2. 카탈로그가 없을 때의 운영 (요구 사항 ②)
+--
+--   대상 DB의 컨트롤파일이 2차 저장소 역할을 한다.
+--   그래서 CONTROL_FILE_RECORD_KEEP_TIME 이 중요해진다.
+--
+--   설정 원칙
+--     CONTROL_FILE_RECORD_KEEP_TIME >= 보존 기간 + 카탈로그 복구 여유
+--     이 실습 환경 : 21일 + 9일 = 30일
+--
+--   고급 실습 04의 4-1에서 이미 30으로 올려 두었다.
+--   이 값이 있으면 카탈로그가 며칠 없어도 nocatalog 로 버틸 수 있다.
+
+-- 2-3. 통합 방식 비교 (요구 사항 ③)
+--
+--   방식              | 이력 보존 | 소요 시간 | 위험
+--   ------------------|-----------|-----------|------------------
+--   IMPORT CATALOG    | 완전 보존 | 분 단위   | DBID 충돌
+--   재등록(REGISTER)  | 전부 소실 | 즉시      | 과거 복구 불가
+--   Data Pump 스키마  | 별도 스키마| 분 단위  | 통합되지 않음
+--
+--   IMPORT CATALOG 를 쓴다. 3년치 이력을 잃을 수 없다.
+--
+--   IMPORT CATALOG 의 규칙
+--     - 원본 카탈로그 스키마 버전 <= 대상 카탈로그 스키마 버전
+--     - 같은 DBID 가 대상에 이미 있으면 실패한다
+--     - 기본 동작은 원본에서 등록을 해제한다. NO UNREGISTER 로 막을 수 있다
+--     - DBID 나 DB_NAME 을 지정해 일부만 가져올 수 있다
+
+-- 2-4. 버전 규칙 (요구 사항 ④)
+--
+--   카탈로그 스키마 버전 >= RMAN 클라이언트 버전
+--
+--   이 조건이 깨지면 접속 단계에서 RMAN-06429 로 거부된다.
+--   새 버전의 타깃이 들어오기 전에 카탈로그를 먼저 올려야 한다는 뜻이다.
+--
+--   운영 규칙으로 정리하면
+--     ① 카탈로그 DB 버전은 관리 대상 중 가장 높은 버전 이상으로 유지한다
+--     ② 타깃 업그레이드 계획이 잡히면 카탈로그를 먼저 올린다
+--     ③ UPGRADE CATALOG 전에 반드시 스키마 백업을 받는다
+
+-- 2-5. 작업 순서
+--
+--   ① rcat 의 ARCHIVELOG 모드와 백업 구성 확인
+--   ② 카탈로그 스키마 Data Pump 백업
+--   ③ 두 번째 카탈로그 스키마 준비 (통합 대상 재현)
+--   ④ IMPORT CATALOG 로 통합
+--   ⑤ UPGRADE CATALOG 절차 확인
+--   ⑥ 카탈로그 유실과 재구축 훈련
+--   ⑦ 정기 보호 작업 등록
+
+--------------------------------------------------------------------------------
+[3] 환경 준비
+--------------------------------------------------------------------------------
+-- 3-1. rcat 데이터베이스 상태
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=rcat
+[oracle@oel7v9r2 ~]$ sqlplus / as sysdba
+
+SYS@rcat> ARCHIVE LOG LIST
+
+Database log mode              Archive Mode
+Automatic archival             Enabled
+Archive destination            /home/oracle/arch_rcat
+Oldest online log sequence     88
+Next log sequence to archive   90
+Current log sequence           90
+
+-- 카탈로그 DB도 ARCHIVELOG 여야 한다.
+-- NOARCHIVELOG 면 시점 복구가 불가능해 통합 이력을 잃을 수 있다.
+
+SYS@rcat> SELECT tablespace_name, ROUND(SUM(bytes)/1024/1024) AS mb,
+  2         MAX(autoextensible) AS ext
+  3  FROM   dba_data_files GROUP BY tablespace_name ORDER BY 1;
+
+TABLESPACE_NAME       MB EXT
+--------------- -------- ---
+RCAT_DATA            2048 YES
+SYSAUX                800 YES
+SYSTEM                900 YES
+UNDOTBS1              400 YES
+USERS                 100 YES
+
+-- 3-2. 카탈로그 스키마 현황
+
+SYS@rcat> SELECT owner, COUNT(*) AS objects,
+  2         ROUND(SUM(NVL(s.bytes,0))/1024/1024,1) AS mb
+  3  FROM   dba_objects o
+  4    LEFT JOIN dba_segments s
+  5      ON s.owner = o.owner AND s.segment_name = o.object_name
+  6  WHERE  o.owner IN ('RCATOWNER')
+  7  GROUP  BY owner;
+
+OWNER        OBJECTS       MB
+---------- --------- --------
+RCATOWNER        341     74.0
+
+SYS@rcat> SELECT * FROM rcatowner.rcver;
+
+VERSION
+------------
+19.03.00.00
+
+-- 3-3. 백업 경로 준비
+
+[oracle@oel7v9r2 ~]$ mkdir -p /backup/RCAT /u03/dpdump_rcat
+[oracle@oel7v9r2 ~]$ ls -ld /backup/RCAT /u03/dpdump_rcat
+
+drwxr-x---. 2 oracle oinstall 4096 Jun  6 08:11 /backup/RCAT
+drwxr-x---. 2 oracle oinstall 4096 Jun  6 08:11 /u03/dpdump_rcat
+
+SYS@rcat> CREATE OR REPLACE DIRECTORY dp_rcat AS '/u03/dpdump_rcat';
+
+Directory created.
+
+SYS@rcat> GRANT READ, WRITE ON DIRECTORY dp_rcat TO system;
+
+Grant succeeded.
+
+-- 3-4. 통합 대상 재현 — 두 번째 카탈로그 스키마
+--
+-- 실제로는 다른 서버의 다른 DB에 있는 카탈로그다.
+-- 이 실습에서는 같은 rcat 안에 별도 스키마로 만들어 재현한다.
+-- 동작 원리는 동일하다.
+
+SYS@rcat> CREATE USER rcatowner2 IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE rcat_data
+  3    TEMPORARY TABLESPACE temp
+  4    QUOTA UNLIMITED ON rcat_data;
+
+User created.
+
+SYS@rcat> GRANT RECOVERY_CATALOG_OWNER TO rcatowner2;
+
+Grant succeeded.
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner2@rcat
+
+recovery catalog database Password:
+connected to recovery catalog database
+
+RMAN> CREATE CATALOG;
+
+recovery catalog created
+
+RMAN> EXIT
+
+-- 3-5. 두 번째 카탈로그에 DB를 등록하고 이력을 만든다
+--
+-- 통합할 이력이 있어야 실습이 성립한다.
+-- hrdb 는 rcatowner 에 이미 등록되어 있으므로
+-- 여기서는 sales 를 rcatowner2 에도 등록해 충돌 상황까지 만든다.
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=hrdb
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner2@rcat
+
+connected to target database: HRDB (DBID=3391560212)
+connected to recovery catalog database
+
+RMAN> REGISTER DATABASE;
+
+database registered in recovery catalog
+starting full resync of recovery catalog
+full resync complete
+
+RMAN> BACKUP TABLESPACE users TAG 'OLDCAT_01';
+RMAN> BACKUP ARCHIVELOG ALL TAG 'OLDCAT_ARCH';
+
+Finished backup at 2025-06-06 08:32:11
+
+RMAN> LIST BACKUP SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- -----------
+2       B  F  A DISK        2025-06-06 08:31:44       1       1  NO         OLDCAT_01
+4       B  A  A DISK        2025-06-06 08:32:11       1       1  NO         OLDCAT_ARCH
+
+RMAN> EXIT
+
+-- 3-6. 통합 전 양쪽 상태 확인
+
+[oracle@oel7v9r2 ~]$ sqlplus -s system/oracle_4U@rcat
+
+SYSTEM@rcat> SELECT 'rcatowner ' AS cat, name FROM rcatowner.rc_database
+  2  UNION ALL
+  3  SELECT 'rcatowner2', name FROM rcatowner2.rc_database
+  4  ORDER BY 1, 2;
+
+CAT        NAME
+---------- --------
+rcatowner  HRDB
+rcatowner  ORCL
+rcatowner  SALES
+rcatowner2 HRDB
+
+-- HRDB 가 양쪽에 있다. 이것이 [5]의 오류 ②가 된다.
+
+--------------------------------------------------------------------------------
+[4] 구축과 수행
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 4-1. 1차 보호 : rcat DB의 RMAN 백업
+-- ────────────────────────────────────────────────
+-- 반드시 nocatalog 로 받는다.
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=rcat
+[oracle@oel7v9r2 ~]$ rman target / nocatalog
+
+connected to target database: RCAT (DBID=889012455)
+using target database control file instead of recovery catalog
+
+RMAN> CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 30 DAYS;
+RMAN> CONFIGURE CONTROLFILE AUTOBACKUP ON;
+RMAN> CONFIGURE CHANNEL DEVICE TYPE DISK FORMAT '/backup/RCAT/%U';
+
+new RMAN configuration parameters are successfully stored
+
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'RCAT_FULL';
+
+Starting backup at 2025-06-06 08:44:02
+current log archived
+channel ORA_DISK_1: starting archived log backup set
+piece handle=/backup/RCAT/31a4c1e2_8_1_1 tag=RCAT_FULL
+channel ORA_DISK_1: starting full datafile backup set
+piece handle=/backup/RCAT/32a4c3f3_9_1_1 tag=RCAT_FULL
+Finished backup at 2025-06-06 08:47:33
+
+Starting Control File and SPFILE Autobackup at 2025-06-06 08:47:33
+piece handle=/backup/RCAT/c-889012455-20250606-00
+Finished Control File and SPFILE Autobackup at 2025-06-06 08:47:36
+
+-- DBID 를 반드시 기록해 둔다. 컨트롤파일 유실 시 필요하다.
+
+SYS@rcat> SELECT name, dbid FROM v$database;
+
+NAME       DBID
+---------- ----------
+RCAT        889012455
+
+[oracle@oel7v9r2 ~]$ echo "RCAT DBID = 889012455" >> /home/oracle/rcadm/DBID_LIST.txt
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/DBID_LIST.txt
+
+ORCL  DBID = 1547823901
+SALES DBID = 2284410077
+HRDB  DBID = 3391560212
+RCAT  DBID = 889012455
+
+-- ────────────────────────────────────────────────
+-- 4-2. 2차 보호 : 카탈로그 스키마 Data Pump 백업
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r2 ~]$ expdp system/oracle_4U directory=dp_rcat \
+>   dumpfile=rcatowner_$(date +%Y%m%d).dmp \
+>   logfile=rcatowner_$(date +%Y%m%d).log \
+>   schemas=rcatowner flashback_time=systimestamp
+
+Export: Release 19.0.0.0.0 - Production on Fri Jun 6 08:52:11 2025
+
+Starting "SYSTEM"."SYS_EXPORT_SCHEMA_01":  ...
+Processing object type SCHEMA_EXPORT/USER
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+Processing object type SCHEMA_EXPORT/PACKAGE/PACKAGE_SPEC
+Processing object type SCHEMA_EXPORT/PACKAGE/COMPILE_PACKAGE/PACKAGE_SPEC/ALTER_PACKAGE_SPEC
+. . exported "RCATOWNER"."AL"                          12.42 MB   88214 rows
+. . exported "RCATOWNER"."BP"                           4.18 MB   22140 rows
+. . exported "RCATOWNER"."BS"                           2.91 MB   18022 rows
+. . exported "RCATOWNER"."DF"                         188.40 KB     412 rows
+. . exported "RCATOWNER"."RSR"                          1.02 MB    6841 rows
+Master table "SYSTEM"."SYS_EXPORT_SCHEMA_01" successfully loaded/unloaded
+Dump file set for SYSTEM.SYS_EXPORT_SCHEMA_01 is:
+  /u03/dpdump_rcat/rcatowner_20250606.dmp
+Job "SYSTEM"."SYS_EXPORT_SCHEMA_01" successfully completed at 08:53:44
+
+-- flashback_time 을 지정한 이유
+--   카탈로그 스키마는 테이블 간 참조가 많다.
+--   덤프 도중 백업 작업이 돌면 테이블별 시점이 어긋난다.
+--   19장에서 다룬 일관성 문제가 그대로 적용된다.
+
+[oracle@oel7v9r2 ~]$ ls -lh /u03/dpdump_rcat/
+
+-rw-r-----. 1 oracle oinstall  22M Jun  6 08:53 rcatowner_20250606.dmp
+-rw-r--r--. 1 oracle oinstall 4.1K Jun  6 08:53 rcatowner_20250606.log
+
+-- 22MB 다. 1차 백업(약 4GB)에 비해 훨씬 가볍다.
+-- 매일 받아도 부담이 없다.
+
+-- ────────────────────────────────────────────────
+-- 4-3. IMPORT CATALOG 로 통합
+-- ────────────────────────────────────────────────
+-- 대상 카탈로그(rcatowner)로 접속해 원본을 지정한다.
+-- 방향을 헷갈리지 않도록 주의한다.
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+
+recovery catalog database Password:
+connected to recovery catalog database
+
+RMAN> IMPORT CATALOG rcatowner2/oracle_4U@rcat;
+
+Starting import catalog at 2025-06-06 09:04:11
+connected to source recovery catalog database
+import validation complete
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03009: failure of import catalog command at 06/06/2025 09:04:14
+RMAN-06004: ORACLE error from recovery catalog database:
+RMAN-20002: target database already registered in recovery catalog
+
+-- 이 오류는 [5]에서 자세히 다룬다.
+-- 먼저 충돌하지 않는 대상만 가져오는 방법을 확인한다.
+
+-- ────────────────────────────────────────────────
+-- 4-4. UPGRADE CATALOG 절차
+-- ────────────────────────────────────────────────
+-- 실제 업그레이드가 필요한 상황이 아니어도 절차는 익혀 두어야 한다.
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+
+RMAN> UPGRADE CATALOG;
+
+recovery catalog owner is RCATOWNER
+enter UPGRADE CATALOG command again to confirm catalog upgrade
+
+RMAN> UPGRADE CATALOG;
+
+recovery catalog upgraded to version 19.03.00.00
+DBMS_RCVMAN package upgraded to version 19.03.00.00
+DBMS_RCVCAT package upgraded to version 19.03.00.00
+
+RMAN> EXIT
+
+-- 두 번 입력하게 하는 것은 실수 방지 장치다.
+-- 이미 최신 버전이면 패키지만 다시 컴파일되고 데이터는 그대로다.
+
+SYS@rcat> SELECT * FROM rcatowner.rcver;
+
+VERSION
+------------
+19.03.00.00
+
+-- 업그레이드 전 반드시 해야 하는 것
+--   ① 4-2의 Data Pump 백업을 먼저 받는다
+--   ② 진행 중인 백업 작업이 없는지 확인한다
+--   ③ 대상 DB들의 RMAN 클라이언트 버전을 파악한다
+
+RC_REPORT@rcat> SELECT DISTINCT db_name, session_recid,
+  2         SUBSTR(rman_status_recid, 1, 1) AS x
+  3  FROM   rc_rman_status WHERE 1=0;
+
+-- 실무에서는 각 서버에서 직접 확인한다.
+
+[oracle@oel7v9r1 ~]$ rman | head -3
+
+Recovery Manager: Release 19.0.0.0.0 - Production on Fri Jun 6 09:12:04 2025
+Version 19.3.0.0.0
+
+--------------------------------------------------------------------------------
+[5] 오류 주입과 대응
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 오류 ① DBID 충돌로 IMPORT CATALOG 실패
+-- ────────────────────────────────────────────────
+-- 4-3에서 만난 오류를 해결한다.
+
+-- << 원인 파악 >>
+-- hrdb 가 rcatowner 와 rcatowner2 양쪽에 등록되어 있다.
+-- IMPORT CATALOG 는 원본의 모든 DB를 대상에 옮기려 한다.
+-- 같은 DBID 가 이미 있으므로 RMAN-20002 로 중단된다.
+--
+-- 이 상황은 통합 작업에서 매우 흔하다.
+-- 두 팀이 같은 DB를 각자 카탈로그에 등록해 두는 경우다.
+--
+-- 판단해야 할 것
+--   어느 쪽 이력을 살릴 것인가.
+--   rcatowner2 에 3년치가 있고 rcatowner 에는 최근 것만 있다면
+--   대상에서 먼저 등록을 해제하고 가져오는 편이 낫다.
+
+-- 양쪽 이력의 범위를 비교한다.
+
+SYSTEM@rcat> SELECT 'rcatowner ' AS cat,
+  2         TO_CHAR(MIN(completion_time),'YYYY-MM-DD') AS oldest,
+  3         COUNT(*) AS pieces
+  4  FROM   rcatowner.rc_backup_piece p
+  5    JOIN rcatowner.rc_database d ON p.db_key = d.db_key
+  6  WHERE  d.name = 'HRDB'
+  7  UNION ALL
+  8  SELECT 'rcatowner2',
+  9         TO_CHAR(MIN(completion_time),'YYYY-MM-DD'), COUNT(*)
+ 10  FROM   rcatowner2.rc_backup_piece;
+
+CAT        OLDEST     PIECES
+---------- ---------- ------
+rcatowner  2025-05-05     96
+rcatowner2 2025-06-06      2
+
+-- 이 실습 환경에서는 rcatowner 쪽이 더 오래되었다.
+-- 실제 통합 상황이라면 반대인 경우가 많다.
+
+-- << 수정 방법 1 >> 충돌하지 않는 DB만 선택해 가져온다
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+
+RMAN> IMPORT CATALOG rcatowner2/oracle_4U@rcat DB_NAME=SOMEDB;
+
+-- 원본에 없는 이름을 지정하면 다음과 같이 나온다.
+
+RMAN-00571: ===========================================================
+RMAN-03009: failure of import catalog command at 06/06/2025 09:22:41
+RMAN-06004: ORACLE error from recovery catalog database:
+RMAN-20005: target database name is ambiguous
+
+-- << 수정 방법 2 >> 대상에서 등록을 해제한 뒤 가져온다
+--
+-- 주의 : UNREGISTER 는 그 DB의 이력을 전부 지운다.
+--        반드시 어느 쪽 이력을 살릴지 판단한 뒤 실행한다.
+
+RMAN> LIST INCARNATION OF DATABASE hrdb;
+
+List of Database Incarnations
+DB Key  Inc Key DB Name  DB ID       STATUS  Reset SCN  Reset Time
+------- ------- -------- ----------- ------- ---------- -------------------
+41      42      HRDB     3391560212  CURRENT 1          2025-05-19 14:20:07
+
+-- 살릴 이력을 먼저 덤프로 확보한다 (되돌리기 대비).
+
+[oracle@oel7v9r2 ~]$ expdp system/oracle_4U directory=dp_rcat \
+>   dumpfile=before_import.dmp schemas=rcatowner \
+>   flashback_time=systimestamp
+
+Job "SYSTEM"."SYS_EXPORT_SCHEMA_01" successfully completed at 09:26:02
+
+RMAN> UNREGISTER DATABASE hrdb;
+
+database name is "HRDB" and DBID is 3391560212
+
+Do you really want to unregister the database (enter YES or NO)? YES
+database unregistered from the recovery catalog
+
+RMAN> IMPORT CATALOG rcatowner2/oracle_4U@rcat;
+
+Starting import catalog at 2025-06-06 09:29:14
+connected to source recovery catalog database
+import validation complete
+database unregistered from the source recovery catalog
+Finished import catalog at 2025-06-06 09:29:31
+
+RMAN> LIST DB_UNIQUE_NAME ALL;
+
+List of Databases
+DB Key  DB Name  DB ID            Database Role    Db_unique_name
+------- -------- ---------------- ---------------  ------------------
+1       ORCL     1547823901       PRIMARY          ORCL
+21      SALES    2284410077       PRIMARY          SALES
+61      HRDB     3391560212       PRIMARY          HRDB
+
+RMAN> EXIT
+
+-- 원본 카탈로그를 확인한다. 등록이 해제되었다.
+
+SYSTEM@rcat> SELECT COUNT(*) FROM rcatowner2.rc_database;
+
+  COUNT(*)
+----------
+         0
+
+-- NO UNREGISTER 옵션을 쓰면 원본에도 남겨 둘 수 있다.
+--   IMPORT CATALOG rcatowner2/oracle_4U@rcat NO UNREGISTER;
+-- 통합 검증 기간에는 이 옵션이 안전하다.
+
+-- ────────────────────────────────────────────────
+-- 오류 ② 카탈로그 스키마가 사라진 상태에서 접속
+-- ────────────────────────────────────────────────
+-- 통합이 끝난 rcatowner2 를 정리하다가 실수로 rcatowner 를 지운 상황을 만든다.
+
+SYS@rcat> DROP USER rcatowner2 CASCADE;
+
+User dropped.
+
+-- 여기까지는 정상이다. 이제 실수를 재현한다.
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner2@rcat
+
+recovery catalog database Password:
+RMAN-00571: ===========================================================
+RMAN-00554: initialization of internal recovery manager package failed
+RMAN-04005: error from target database:
+ORA-01017: invalid username/password; logon denied
+
+-- 계정 자체가 없다.
+
+-- 이번에는 계정은 있으나 카탈로그가 설치되지 않은 경우다.
+
+SYS@rcat> CREATE USER rcat_empty IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE rcat_data QUOTA UNLIMITED ON rcat_data;
+SYS@rcat> GRANT RECOVERY_CATALOG_OWNER TO rcat_empty;
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog rcat_empty@rcat
+
+connected to target database: ORCL (DBID=1547823901)
+recovery catalog database Password:
+connected to recovery catalog database
+
+RMAN> LIST BACKUP SUMMARY;
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of list command at 06/06/2025 09:41:22
+RMAN-06428: recovery catalog is not installed
+
+-- << 원인 파악 >>
+-- 계정과 롤은 있으나 CREATE CATALOG 를 실행하지 않았다.
+-- 카탈로그 테이블이 없다는 뜻이다.
+--
+-- 세 가지 오류를 구분해야 한다.
+--   ORA-01017     : 계정이 없거나 비밀번호가 틀렸다
+--   RMAN-06428    : 계정은 있으나 카탈로그가 설치되지 않았다
+--   RMAN-20001    : 카탈로그는 있으나 그 DB가 등록되지 않았다
+--
+-- 실제 장애 상황에서 이 셋을 빨리 구분해야 대응이 빨라진다.
+
+-- << 수정 >>
+
+[oracle@oel7v9r2 ~]$ rman catalog rcat_empty@rcat
+
+RMAN> CREATE CATALOG;
+
+recovery catalog created
+
+RMAN> EXIT
+
+-- 실습용이므로 정리한다.
+
+SYS@rcat> DROP USER rcat_empty CASCADE;
+
+User dropped.
+
+-- ────────────────────────────────────────────────
+-- 오류 ③ 카탈로그 버전 부족
+-- ────────────────────────────────────────────────
+-- 21c 타깃이 들어왔을 때 무슨 일이 생기는지 확인한다.
+-- 이 환경은 19.3 단일 버전이므로 실제 재현은 불가능하다.
+-- 아래는 실제 발생 시의 메시지와 대응 절차다.
+
+[oracle@oel7v9r3 ~]$ rman target / catalog rcatowner@rcat
+
+Recovery Manager: Release 21.0.0.0.0 - Production
+connected to target database: NEWDB (DBID=4102255610)
+recovery catalog database Password:
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-00554: initialization of internal recovery manager package failed
+RMAN-06429: RCVCAT database is not compatible with this version of RMAN
+
+-- << 원인 파악 >>
+-- 카탈로그 스키마 버전이 19.03.00.00 인데
+-- 접속하려는 RMAN 클라이언트는 21.0 이다.
+--
+-- 규칙 : 카탈로그 스키마 버전 >= RMAN 클라이언트 버전
+--
+-- 이 조건이 깨지면 접속 자체가 되지 않는다.
+-- 백업을 받을 수도, 기존 이력을 조회할 수도 없다.
+-- 신규 DB 하나 때문에 기존 세 대의 운영까지 영향을 받을 수 있다.
+--
+-- 그래서 [2-4]의 운영 규칙이 필요하다.
+--   타깃 업그레이드 계획이 잡히면 카탈로그를 먼저 올린다.
+
+-- << 수정 >> 순서가 정해져 있다.
+
+-- ① 카탈로그 스키마를 Data Pump 로 백업한다 (되돌리기 대비)
+[oracle@oel7v9r2 ~]$ expdp system/oracle_4U directory=dp_rcat \
+>   dumpfile=before_upgrade.dmp schemas=rcatowner \
+>   flashback_time=systimestamp
+
+-- ② rcat 데이터베이스 자체를 상위 버전으로 업그레이드한다
+--    (DBUA 또는 수동 업그레이드. 이 과정의 범위를 벗어난다)
+
+-- ③ 카탈로그 스키마를 업그레이드한다
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+RMAN> UPGRADE CATALOG;
+RMAN> UPGRADE CATALOG;
+
+recovery catalog upgraded to version 21.03.00.00
+
+-- ④ 기존 19c 타깃들이 여전히 접속되는지 확인한다
+--    카탈로그가 상위 버전이면 하위 클라이언트는 접속된다
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+RMAN> LIST BACKUP SUMMARY;
+-- 정상 동작한다
+
+-- 방향을 기억한다
+--   카탈로그가 더 높다 → 문제없다
+--   클라이언트가 더 높다 → RMAN-06429
+--
+-- 19장의 Data Pump VERSION 파라미터와 같은 구조의 규칙이다.
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+-- 6-1. 통합 결과 확인
+
+[oracle@oel7v9r2 ~]$ sqlplus -s rc_report/oracle_4U@rcat
+
+RC_REPORT@rcat> SELECT d.name, COUNT(p.bp_key) AS pieces,
+  2         TO_CHAR(MIN(p.completion_time),'YYYY-MM-DD') AS oldest,
+  3         TO_CHAR(MAX(p.completion_time),'YYYY-MM-DD') AS newest
+  4  FROM   rc_database d LEFT JOIN rc_backup_piece p ON d.db_key = p.db_key
+  5  GROUP  BY d.name ORDER BY d.name;
+
+NAME     PIECES OLDEST     NEWEST
+-------- ------ ---------- ----------
+HRDB          2 2025-06-06 2025-06-06
+ORCL        254 2025-05-16 2025-06-04
+SALES       159 2025-05-16 2025-06-04
+
+-- HRDB 의 이력이 rcatowner2 의 것으로 대체되었다.
+-- 통합 방향을 반대로 잡았다면 96건이 남았을 것이다.
+-- 이 판단은 되돌릴 수 없으므로 사전 확인이 중요하다.
+
+-- 6-2. 통합된 이력으로 실제 복원이 되는지
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=hrdb
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: HRDB (DBID=3391560212)
+connected to recovery catalog database
+
+RMAN> LIST BACKUP TAG 'OLDCAT_01';
+
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ -------------------
+2       Full 2.11M      DISK        00:00:09     2025-06-06 08:31:44
+
+RMAN> RESTORE TABLESPACE users VALIDATE;
+
+Starting restore at 2025-06-06 10:02:11
+channel ORA_DISK_1: starting validation of datafile backup set
+channel ORA_DISK_1: reading from backup piece /backup/HRDB/33a4d1g1_2_1_1
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:07
+Finished restore at 2025-06-06 10:02:19
+
+-- 통합된 이력이 실제로 사용 가능하다. 요구 사항 ③ 충족.
+
+-- 6-3. 카탈로그 유실 복구 훈련
+--
+-- 스키마를 지우고 Data Pump 덤프로 되살린다.
+
+SYS@rcat> SELECT COUNT(*) FROM rcatowner.rc_backup_piece;
+
+  COUNT(*)
+----------
+       415
+
+-- 현재 상태를 먼저 덤프로 확보한다.
+
+[oracle@oel7v9r2 ~]$ expdp system/oracle_4U directory=dp_rcat \
+>   dumpfile=rcat_drill.dmp schemas=rcatowner flashback_time=systimestamp
+
+Job "SYSTEM"."SYS_EXPORT_SCHEMA_01" successfully completed at 10:08:22
+
+-- 유실을 재현한다.
+
+SYS@rcat> DROP USER rcatowner CASCADE;
+
+User dropped.
+
+-- 대상 DB에서 확인한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN-00554: initialization of internal recovery manager package failed
+RMAN-04005: error from target database:
+ORA-01017: invalid username/password; logon denied
+
+-- 백업 체계가 멈췄다. 요구 사항 ②의 검증 지점이다.
+-- 이때 nocatalog 로는 계속 운영할 수 있다.
+
+[oracle@oel7v9r1 ~]$ rman target / nocatalog
+
+RMAN> LIST BACKUP OF DATABASE SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+1288    B  1  A DISK        2025-06-04 09:16:22       1       1  NO         ORCL_INCR
+...
+-- 30일치가 보인다. CONTROL_FILE_RECORD_KEEP_TIME=30 덕분이다.
+
+RMAN> BACKUP TABLESPACE users TAG 'NOCAT_DRILL';
+
+Finished backup at 2025-06-06 10:14:02
+
+-- 백업도 계속 받을 수 있다.
+-- 다만 스토어드 스크립트는 쓸 수 없다 (실습 03 오류 ③).
+-- 폴백 파일로 대응한다.
+
+[oracle@oel7v9r1 ~]$ ls /home/oracle/rcadm/fallback/
+
+gs_archive_only.rman  gs_daily_incr.rman  gs_maint_obsolete.rman
+gs_validate_full.rman gs_weekly_full.rman
+
+-- 6-4. 카탈로그 복구
+
+[oracle@oel7v9r2 ~]$ impdp system/oracle_4U directory=dp_rcat \
+>   dumpfile=rcat_drill.dmp logfile=rcat_restore.log \
+>   schemas=rcatowner
+
+Import: Release 19.0.0.0.0 - Production on Fri Jun 6 10:18:04 2025
+
+Processing object type SCHEMA_EXPORT/USER
+Processing object type SCHEMA_EXPORT/SYSTEM_GRANT
+Processing object type SCHEMA_EXPORT/ROLE_GRANT
+Processing object type SCHEMA_EXPORT/TABLE/TABLE
+. . imported "RCATOWNER"."AL"                          12.42 MB   88214 rows
+. . imported "RCATOWNER"."BP"                           4.18 MB   22140 rows
+. . imported "RCATOWNER"."BS"                           2.91 MB   18022 rows
+Processing object type SCHEMA_EXPORT/PACKAGE/PACKAGE_SPEC
+Processing object type SCHEMA_EXPORT/PACKAGE/PACKAGE_BODY
+Job "SYSTEM"."SYS_IMPORT_SCHEMA_01" successfully completed at 10:20:41
+
+SYS@rcat> SELECT COUNT(*) FROM dba_objects
+  2  WHERE  owner = 'RCATOWNER' AND status = 'INVALID';
+
+  COUNT(*)
+----------
+         2
+
+SYS@rcat> @?/rdbms/admin/utlrp.sql
+
+SYS@rcat> SELECT COUNT(*) FROM dba_objects
+  2  WHERE  owner = 'RCATOWNER' AND status = 'INVALID';
+
+  COUNT(*)
+----------
+         0
+
+SYS@rcat> SELECT COUNT(*) FROM rcatowner.rc_backup_piece;
+
+  COUNT(*)
+----------
+       415
+
+-- 415건이 그대로 돌아왔다.
+
+-- 6-5. 복구 후 동기화
+--
+-- 카탈로그가 없는 동안 받은 백업(NOCAT_DRILL)이 빠져 있다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: ORCL (DBID=1547823901)
+connected to recovery catalog database
+
+RMAN> LIST BACKUP TAG 'NOCAT_DRILL';
+
+specification does not match any backup in the repository
+
+RMAN> RESYNC CATALOG;
+
+starting full resync of recovery catalog
+full resync complete
+
+RMAN> LIST BACKUP TAG 'NOCAT_DRILL';
+
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ -------------------
+1402    Full 3.44M      DISK        00:00:08     2025-06-06 10:14:02
+
+-- 컨트롤파일에 남아 있던 기록이 카탈로그로 옮겨졌다.
+-- 세 대 모두 RESYNC 해야 한다.
+
+[oracle@oel7v9r1 ~]$ for S in orcl sales; do
+>   export ORACLE_SID=$S
+>   echo "RESYNC CATALOG;" | rman target / catalog rcatowner@rcat | tail -2
+> done
+
+full resync complete
+full resync complete
+
+-- 6-6. 훈련 결과 정리
+--
+-- 단계                          | 소요 시간 | 비고
+-- ------------------------------|-----------|--------------------------
+-- 유실 인지                     | 즉시      | 백업 실패 알림으로 감지
+-- nocatalog 전환 판단           | 5분       | 폴백 파일 확인
+-- Data Pump 덤프로 스키마 복구  | 3분       | 22MB
+-- utlrp 재컴파일                | 1분       |
+-- 세 대 RESYNC                  | 2분       |
+-- 합계                          | 약 11분   |
+--
+-- 1차 백업(RMAN 전체 복원)을 썼다면 30분~1시간이 걸린다.
+-- 스키마만 잃은 경우에는 2차 보호로 충분하다는 것이 확인되었다.
+
+--------------------------------------------------------------------------------
+[7] 운영 산출물과 확장 과제
+--------------------------------------------------------------------------------
+-- 7-1. rc_catalog_backup.sh — 3중 보호 일괄 수행
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/rc_catalog_backup.sh
+
+#!/bin/bash
+# 카탈로그 3중 보호 : RMAN 백업 + 스키마 덤프 + 스크립트 추출
+set -u
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export ORACLE_SID=rcat
+export PATH=$ORACLE_HOME/bin:$PATH
+D=$(date +%Y%m%d)
+LOG=/home/oracle/rcadm/log/rcat_protect_$D.log
+DUMPDIR=/u03/dpdump_rcat
+MAILTO="dba-team@example.com"
+
+echo "=== $(date) 카탈로그 보호 작업 시작 ===" > $LOG
+
+# --- 1차 : rcat DB 백업 (반드시 nocatalog)
+rman target / nocatalog >> $LOG 2>&1 << 'EOF'
+BACKUP DATABASE PLUS ARCHIVELOG TAG 'RCAT_FULL' DELETE INPUT;
+DELETE NOPROMPT OBSOLETE;
+EOF
+
+# --- 2차 : 카탈로그 스키마 논리 백업
+expdp system/oracle_4U directory=dp_rcat \
+  dumpfile=rcatowner_${D}.dmp logfile=rcatowner_${D}.log \
+  schemas=rcatowner flashback_time=systimestamp >> $LOG 2>&1
+
+# --- 3차 : 글로벌 스크립트 추출
+sh /home/oracle/rcadm/rc_export_scripts.sh >> $LOG 2>&1
+
+# --- DBID 목록 갱신 (컨트롤파일 유실 대비)
+sqlplus -s rc_report/oracle_4U@rcat >> /home/oracle/rcadm/DBID_LIST.txt << 'EOF'
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT name || '  DBID = ' || dbid FROM rc_database ORDER BY name;
+EXIT
+EOF
+
+# --- 판정
+if grep -qE 'ORA-[0-9]+|RMAN-[0-9]+' $LOG; then
+  mailx -s "[FAIL] catalog protection $D" $MAILTO < $LOG
+  exit 1
+fi
+
+# --- 보관 정리 (덤프 14세대)
+ls -1t $DUMPDIR/rcatowner_*.dmp | tail -n +15 | xargs -r rm -f
+
+echo "[OK] catalog protection completed"
+exit 0
+
+[oracle@oel7v9r2 ~]$ crontab -l | grep catalog_backup
+
+30 3 * * * /home/oracle/rcadm/rc_catalog_backup.sh
+
+-- 7-2. 카탈로그 복구 런북
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/RUNBOOK_catalog_recovery.md
+
+# 카탈로그 장애 대응 런북
+
+## 판정 — 세 가지 오류를 구분한다
+| 증상 | 원인 | 절차 |
+|---|---|---|
+| ORA-01017 | 계정 없음/비밀번호 오류 | 절차 A |
+| RMAN-06428 | 카탈로그 미설치 | 절차 B |
+| RMAN-20001 | DB 미등록 | 절차 C |
+| 접속 자체 불가 | rcat DB 다운 | 절차 D |
+
+## 즉시 조치 (모든 경우 공통)
+1. 대상 DB들을 nocatalog 로 전환한다
+2. /home/oracle/rcadm/fallback/ 의 스크립트로 백업을 계속한다
+3. 복구 후 반드시 세 대 모두 RESYNC CATALOG 를 수행한다
+
+## 절차 A — 계정 유실
+sqlplus / as sysdba
+CREATE USER rcatowner IDENTIFIED BY <pw> DEFAULT TABLESPACE rcat_data;
+GRANT RECOVERY_CATALOG_OWNER TO rcatowner;
+→ 이어서 절차 B
+
+## 절차 B — 스키마 유실 (권장 · 약 11분)
+impdp system/<pw> directory=dp_rcat \
+  dumpfile=rcatowner_<최신날짜>.dmp schemas=rcatowner
+@?/rdbms/admin/utlrp.sql
+→ 이어서 RESYNC
+
+## 절차 C — 등록 해제
+rman target / catalog rcatowner@rcat
+RMAN> REGISTER DATABASE;
+RMAN> RESYNC CATALOG;
+※ 과거 이력은 복구되지 않는다. CATALOG START WITH 로 되찾는다.
+
+## 절차 D — rcat DB 전체 유실 (약 40분)
+export ORACLE_SID=rcat
+rman target /
+RMAN> STARTUP NOMOUNT;
+RMAN> SET DBID 889012455;      # DBID_LIST.txt 참조
+RMAN> RESTORE SPFILE FROM AUTOBACKUP;
+RMAN> SHUTDOWN IMMEDIATE; STARTUP NOMOUNT;
+RMAN> RESTORE CONTROLFILE FROM AUTOBACKUP;
+RMAN> ALTER DATABASE MOUNT;
+RMAN> RESTORE DATABASE; RECOVER DATABASE;
+RMAN> ALTER DATABASE OPEN RESETLOGS;
+→ 이어서 RESYNC
+
+## 복구 후 필수 확인
+- SELECT * FROM rcatowner.rcver;          버전 확인
+- SELECT COUNT(*) FROM rc_backup_piece;   건수 확인
+- 세 대에서 RESYNC CATALOG
+- 고급 실습 02의 일일 리포트 정상 출력 확인
+
+-- 7-3. 카탈로그 통합 체크리스트
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/CHECKLIST_catalog_import.txt
+
+□ 원본과 대상의 카탈로그 스키마 버전 확인 (원본 <= 대상)
+□ 양쪽에 중복 등록된 DBID 목록 작성
+□ 중복 DB의 이력 범위 비교 — 어느 쪽을 살릴지 결정
+□ 대상 카탈로그 Data Pump 백업 (되돌리기 대비)
+□ 원본 카탈로그 Data Pump 백업
+□ 검증 기간 동안은 NO UNREGISTER 옵션 사용
+□ IMPORT CATALOG 수행
+□ LIST DB_UNIQUE_NAME ALL 로 등록 확인
+□ 각 DB에서 RESTORE ... VALIDATE 로 실사용 검증
+□ 대상 DB들의 접속 문자열을 새 카탈로그로 변경
+□ 원본 카탈로그 스키마 제거 (검증 완료 후 2주 경과)
+
+-- 7-4. 확장 과제
+--
+-- 과제 A. rcat DB 전체 복구 훈련
+--   7-2의 절차 D를 실제로 수행하시오.
+--   rcat 의 데이터파일과 컨트롤파일을 지우고 처음부터 복구한다.
+--   소요 시간을 측정하고 런북의 40분 추정치가 맞는지 검증하시오.
+--
+-- 과제 B. 카탈로그 이중화
+--   두 번째 카탈로그를 다른 서버에 두고 주기적으로 동기화하는 구성을 설계하시오.
+--   IMPORT CATALOG NO UNREGISTER 를 주기적으로 실행하는 방식과
+--   Data Guard 로 rcat 을 보호하는 방식을 비교한다.
+--   각 방식의 복구 목표 시간과 운영 부담을 정리한다.
+--
+-- 과제 C. CONTROL_FILE_RECORD_KEEP_TIME 값 산정
+--   [2-2]의 30일은 21일 + 9일로 잡은 값이다.
+--   9일의 근거가 무엇이어야 하는지 논하고
+--   이 값을 늘렸을 때 컨트롤파일 크기가 얼마나 증가하는지 측정하시오.
+--
+-- 과제 D. 통합 방향 판단
+--   [6-1]에서 HRDB 의 이력이 96건에서 2건으로 줄었다.
+--   반대 방향으로 통합하려면 어떻게 해야 하는지 절차를 작성하시오.
+--   IMPORT CATALOG 로는 불가능한 이유를 설명하고 대안을 제시한다.
+--
+-- 과제 E. 버전 업그레이드 계획서
+--   내년에 세 대를 21c로 올린다고 가정하고
+--   카탈로그를 포함한 전체 업그레이드 순서를 작성하시오.
+--   각 단계에서 백업이 중단되는 구간과 그 대비책을 명시한다.
+
+-- 7-5. 정리 — 이 실습에서 남는 것
+--
+--   ① rc_catalog_backup.sh          : 3중 보호 일괄 수행
+--   ② RUNBOOK_catalog_recovery.md   : 장애 유형별 복구 절차
+--   ③ CHECKLIST_catalog_import.txt  : 통합 작업 체크리스트
+--   ④ DBID_LIST.txt                 : 자동 갱신되는 DBID 목록
+--   ⑤ 복구 훈련 소요 시간 실측치    : [6-6]
+--
+-- 다음 예제에서는 보존 정책의 예외인 장기 보관 백업을 다룬다.
+
+-- 실무 포인트
+-- 1) 카탈로그의 백업은 카탈로그를 쓰지 않는다.
+--    nocatalog 로 받아야 한다. 자기 자신을 저장소로 삼으면
+--    그것이 사라졌을 때 복구 경로가 없다.
+--
+-- 2) 스키마 논리 백업이 가장 실용적인 보호 수단이다.
+--    22MB 짜리 덤프 하나로 11분 만에 복구되었다.
+--    DB 전체 복원은 30분 이상 걸린다. 상황에 맞게 고른다.
+--
+-- 3) 세 가지 오류를 구분한다.
+--    ORA-01017 계정 문제, RMAN-06428 미설치, RMAN-20001 미등록.
+--    장애 상황에서 이 구분이 대응 속도를 좌우한다.
+--
+-- 4) IMPORT CATALOG 는 방향이 정해져 있다.
+--    대상 카탈로그로 접속해 원본을 지정한다.
+--    같은 DBID 가 대상에 있으면 RMAN-20002 로 막힌다.
+--    검증 기간에는 NO UNREGISTER 를 쓴다.
+--
+-- 5) 카탈로그 스키마 버전은 클라이언트 버전 이상이어야 한다.
+--    낮으면 RMAN-06429 로 접속 자체가 거부된다.
+--    타깃을 올리기 전에 카탈로그를 먼저 올린다.
+--
+-- 6) 카탈로그가 없어도 며칠은 버틸 수 있게 설계한다.
+--    CONTROL_FILE_RECORD_KEEP_TIME 을 보존 기간보다 넉넉히 잡고
+--    스토어드 스크립트를 파일로 추출해 두면
+--    카탈로그 복구 시간을 벌 수 있다.

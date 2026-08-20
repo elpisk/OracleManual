@@ -1,0 +1,1070 @@
+================================================================================
+ 고급 실습 09 : 암호화 백업의 외부 반출과 복원
+ 과정      : Oracle Database 19c Backup & Recovery — Recovery Catalog 고급
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / oel7v9r1(운영계) + oel7v9r2(복원 검증)
+ 대상 DB   : sales (oel7v9r1)
+ 카탈로그  : rcat @ oel7v9r2
+ 소요 시간 : 약 2시간 30분
+ 선행 조건 : 고급 실습 01~08 완료
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실무 상황
+--------------------------------------------------------------------------------
+-- 보안 점검에서 두 가지가 지적되었다.
+--
+--   지적 1
+--     "/backup 의 백업 파일에서 평문 고객 데이터가 확인됨.
+--      파일 시스템 권한 외에 추가 보호 수단이 없음."
+--
+--   지적 2
+--     "외부 위탁 업체에 전달한 백업 매체의 기밀성 통제 절차가 없음."
+--
+-- 실제로 확인해 보니 지적이 맞았다.
+-- 백업 조각을 strings 로 훑으면 고객명과 전화번호가 그대로 나온다.
+--
+-- 동시에 다른 요구도 있다.
+--   외부 감사 법인이 sales 데이터베이스의 특정 시점 사본을 요구했다.
+--   USB 매체로 전달해야 하고 그쪽 서버에서 복원할 수 있어야 한다.
+--   그쪽에는 우리 지갑이 없다.
+--
+-- 요구 사항
+--   ① 정기 백업이 암호화되어 저장된다
+--   ② 운영 중에는 사람의 개입 없이 암호화·복호화가 이루어진다
+--   ③ 외부로 반출하는 백업은 우리 지갑 없이도 복원할 수 있어야 한다
+--   ④ 키를 잃었을 때의 영향과 대비책을 명확히 한다
+--   ⑤ 어떤 백업이 어떤 방식으로 암호화되었는지 카탈로그에서 조회된다
+--
+-- 14.6절에서 암호화 세 가지 방식을 다뤘다.
+-- 이 실습에서는 그것을 실제 운영과 반출 상황에 적용한다.
+
+--------------------------------------------------------------------------------
+[2] 사전 설계
+--------------------------------------------------------------------------------
+-- 2-1. 세 가지 암호화 방식
+--
+--   방식        | 키 저장    | 복원 조건            | 용도
+--   ------------|------------|----------------------|-------------------
+--   투명(지갑)  | 지갑 파일  | 같은 지갑 필요       | 정기 백업
+--   비밀번호    | 없음       | 비밀번호 필요        | 외부 반출
+--   이중        | 지갑 + 비번| 둘 중 하나로 가능    | 양쪽 겸용
+--
+--   요구 사항 ②는 투명 방식을, ③은 비밀번호 방식을 가리킨다.
+--   이중 방식을 쓰면 하나의 백업으로 둘 다 만족할 수 있다.
+
+-- 2-2. 키 관리 설계
+--
+--   구분           | 위치                                  | 접근 통제
+--   ---------------|---------------------------------------|-------------
+--   지갑           | /u01/app/oracle/admin/sales/wallet    | oracle 만
+--   지갑 비밀번호  | 사내 비밀번호 관리 시스템             | DBA 2인
+--   자동 로그인    | 같은 경로의 cwallet.sso               | oracle 만
+--   반출 비밀번호  | 건별 생성, 전달 시 별도 경로로 통보   | 요청자
+--
+--   절대 원칙
+--     지갑과 백업을 같은 매체에 함께 두지 않는다.
+--     함께 두면 암호화의 의미가 사라진다.
+--     이 원칙은 백업 매체를 외부에 맡길 때 특히 중요하다.
+
+-- 2-3. 지갑을 잃으면 어떻게 되는가 (요구 사항 ④)
+--
+--   투명 방식으로 암호화된 백업은 그 지갑으로만 열린다.
+--   지갑을 잃으면 백업 전체가 무용지물이 된다.
+--   되살릴 방법은 없다. 오라클도 열어 줄 수 없다.
+--
+--   그래서 지갑 자체의 백업이 데이터베이스 백업만큼 중요하다.
+--     ① 지갑 파일을 별도 매체에 보관한다
+--     ② 마스터 키를 변경할 때마다 지갑을 다시 백업한다
+--     ③ 지갑 비밀번호를 잃으면 지갑도 열 수 없다. 별도 관리한다
+--
+--   이것이 고급 실습 06에서 언급한 "5년 뒤 복원 가능성"의 또 다른 축이다.
+
+-- 2-4. 작업 순서
+--
+--   ① 지갑 생성과 마스터 키 설정
+--   ② 자동 로그인 지갑 생성 (요구 사항 ②)
+--   ③ CONFIGURE ENCRYPTION FOR DATABASE ON
+--   ④ 정기 백업 수행과 평문 노출 여부 확인
+--   ⑤ 반출용 이중 모드 백업
+--   ⑥ 지갑 없는 서버에서 복원 검증 (요구 사항 ③)
+--   ⑦ 카탈로그 조회로 암호화 현황 확인 (요구 사항 ⑤)
+--   ⑧ 지갑 백업 절차 수립
+
+--------------------------------------------------------------------------------
+[3] 환경 준비
+--------------------------------------------------------------------------------
+-- 3-1. 현재 상태 — 평문 노출 확인
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@sales> CREATE TABLE itwill.customer TABLESPACE users AS
+  2  SELECT ROWNUM AS cust_id,
+  3         '고객' || ROWNUM AS cust_name,
+  4         '010-' || LPAD(MOD(ROWNUM,10000),4,'0') || '-'
+  5           || LPAD(MOD(ROWNUM*7,10000),4,'0') AS phone,
+  6         'cust' || ROWNUM || '@example.com' AS email
+  7  FROM   dual CONNECT BY LEVEL <= 50000;
+
+Table created.
+
+SYS@sales> COMMIT;
+SYS@sales> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP TABLESPACE users TAG 'PLAIN_TEST';
+
+Starting backup at 2025-08-04 09:12:11
+piece handle=/backup/SALES/4ma7b1c1_58_1_1 tag=PLAIN_TEST
+Finished backup at 2025-08-04 09:12:44
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ strings /backup/SALES/4ma7b1c1_58_1_1 | grep -c '010-'
+
+18422
+
+[oracle@oel7v9r1 ~]$ strings /backup/SALES/4ma7b1c1_58_1_1 \
+>   | grep 'example.com' | head -3
+
+cust41@example.com
+cust42@example.com
+cust43@example.com
+
+-- 지적이 사실임을 확인했다.
+-- 백업 파일을 읽을 수 있는 사람은 데이터베이스 권한과 무관하게
+-- 모든 데이터를 볼 수 있다.
+
+-- 3-2. 지갑 경로 준비
+
+[oracle@oel7v9r1 ~]$ mkdir -p /u01/app/oracle/admin/sales/wallet
+[oracle@oel7v9r1 ~]$ chmod 700 /u01/app/oracle/admin/sales/wallet
+
+-- 3-3. WALLET_ROOT 설정 (19c 권장 방식)
+
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@sales> ALTER SYSTEM SET wallet_root =
+  2    '/u01/app/oracle/admin/sales/wallet' SCOPE=SPFILE;
+
+System altered.
+
+SYS@sales> SHUTDOWN IMMEDIATE
+SYS@sales> STARTUP
+
+Database opened.
+
+SYS@sales> ALTER SYSTEM SET tde_configuration = 'KEYSTORE_CONFIGURATION=FILE'
+  2    SCOPE=BOTH;
+
+System altered.
+
+SYS@sales> SHOW PARAMETER wallet_root
+
+NAME          TYPE     VALUE
+------------- -------- ------------------------------------
+wallet_root   string   /u01/app/oracle/admin/sales/wallet
+
+-- 참고 : 이전 방식은 sqlnet.ora 의 ENCRYPTION_WALLET_LOCATION 이다.
+--        19c 에서도 동작하지만 WALLET_ROOT 방식이 권장된다.
+--        둘을 함께 쓰면 WALLET_ROOT 가 우선한다.
+
+-- 3-4. 복원 검증용 서버 준비
+
+[oracle@oel7v9r2 ~]$ mkdir -p /u02/oradata/SALESV /u02/export_test
+[oracle@oel7v9r2 ~]$ df -h /u02 | tail -1
+
+/dev/mapper/ol-u02    300G   42G  258G  14% /u02
+
+--------------------------------------------------------------------------------
+[4] 구축과 수행
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 4-1. 지갑 생성과 마스터 키 설정
+-- ────────────────────────────────────────────────
+
+SYS@sales> ADMINISTER KEY MANAGEMENT CREATE KEYSTORE
+  2    IDENTIFIED BY "Wallet#Sales2025";
+
+keystore altered.
+
+[oracle@oel7v9r1 ~]$ ls -l /u01/app/oracle/admin/sales/wallet/tde/
+
+-rw-------. 1 oracle oinstall 2555 Aug  4 09:32 ewallet.p12
+
+SYS@sales> SELECT wrl_type, wrl_parameter, status, wallet_type
+  2  FROM   v$encryption_wallet;
+
+WRL_TYPE  WRL_PARAMETER                                 STATUS  WALLET_TYPE
+--------- --------------------------------------------- ------- -----------
+FILE      /u01/app/oracle/admin/sales/wallet/tde/        CLOSED  UNKNOWN
+
+SYS@sales> ADMINISTER KEY MANAGEMENT SET KEYSTORE OPEN
+  2    IDENTIFIED BY "Wallet#Sales2025";
+
+keystore altered.
+
+SYS@sales> ADMINISTER KEY MANAGEMENT SET KEY
+  2    IDENTIFIED BY "Wallet#Sales2025" WITH BACKUP USING 'initial_key';
+
+keystore altered.
+
+SYS@sales> SELECT status, wallet_type, keystore_mode FROM v$encryption_wallet;
+
+STATUS  WALLET_TYPE  KEYSTORE_MODE
+------- ------------ -------------
+OPEN    PASSWORD     UNITED
+
+-- WITH BACKUP 옵션이 지갑을 자동으로 복사해 둔다.
+
+[oracle@oel7v9r1 ~]$ ls -l /u01/app/oracle/admin/sales/wallet/tde/
+
+-rw-------. 1 oracle oinstall 4045 Aug  4 09:36 ewallet.p12
+-rw-------. 1 oracle oinstall 2555 Aug  4 09:36 ewallet_2025080409361_initial_key.p12
+
+-- 마스터 키 확인
+
+SYS@sales> SELECT key_id, creation_time, activation_time, key_use
+  2  FROM   v$encryption_keys;
+
+KEY_ID                                        CREATION_TIME       KEY_USE
+--------------------------------------------- ------------------- --------
+AeR4kP2mN0v8fzYQ1wXsT3EAAAAAAAAAAAAAAAAAAAAAA 2025-08-04 09:36:11 TDE
+
+-- ────────────────────────────────────────────────
+-- 4-2. 자동 로그인 지갑 (요구 사항 ②)
+-- ────────────────────────────────────────────────
+-- 사람이 매번 지갑을 열지 않아도 되게 한다.
+
+SYS@sales> ADMINISTER KEY MANAGEMENT CREATE AUTO_LOGIN KEYSTORE
+  2    FROM KEYSTORE '/u01/app/oracle/admin/sales/wallet/tde'
+  3    IDENTIFIED BY "Wallet#Sales2025";
+
+keystore altered.
+
+[oracle@oel7v9r1 ~]$ ls -l /u01/app/oracle/admin/sales/wallet/tde/
+
+-rw-------. 1 oracle oinstall 4045 Aug  4 09:36 ewallet.p12
+-rw-------. 1 oracle oinstall 2555 Aug  4 09:36 ewallet_2025080409361_initial_key.p12
+-rw-------. 1 oracle oinstall 4093 Aug  4 09:41 cwallet.sso
+
+SYS@sales> SHUTDOWN IMMEDIATE
+SYS@sales> STARTUP
+
+Database opened.
+
+SYS@sales> SELECT status, wallet_type FROM v$encryption_wallet;
+
+STATUS  WALLET_TYPE
+------- -----------
+OPEN    AUTOLOGIN
+
+-- 재기동해도 지갑이 자동으로 열린다.
+-- 야간 백업이 사람 개입 없이 수행될 수 있다.
+--
+-- 보안상의 함정
+--   cwallet.sso 를 가져가면 비밀번호 없이 지갑을 쓸 수 있다.
+--   이 파일이 백업 매체에 함께 들어가면 암호화가 무의미해진다.
+--   [2-2]의 절대 원칙이 여기서 나온다.
+
+-- ────────────────────────────────────────────────
+-- 4-3. 정기 백업 암호화 (요구 사항 ①)
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> SHOW ENCRYPTION FOR DATABASE;
+
+RMAN configuration parameters for database with db_unique_name SALES are:
+CONFIGURE ENCRYPTION FOR DATABASE OFF; # default
+
+RMAN> CONFIGURE ENCRYPTION FOR DATABASE ON;
+
+new RMAN configuration parameters:
+CONFIGURE ENCRYPTION FOR DATABASE ON;
+new RMAN configuration parameters are successfully stored
+starting full resync of recovery catalog
+full resync complete
+
+RMAN> SHOW ENCRYPTION ALGORITHM;
+
+CONFIGURE ENCRYPTION ALGORITHM 'AES128'; # default
+
+RMAN> CONFIGURE ENCRYPTION ALGORITHM 'AES256';
+
+new RMAN configuration parameters:
+CONFIGURE ENCRYPTION ALGORITHM 'AES256';
+
+RMAN> BACKUP TABLESPACE users TAG 'ENC_TDE';
+
+Starting backup at 2025-08-04 09:52:11
+channel ORA_DISK_1: starting full datafile backup set
+channel ORA_DISK_1: specifying datafile(s) in backup set
+input datafile file number=00004
+  name=/u01/app/oracle/oradata/SALES/users01.dbf
+channel ORA_DISK_1: starting piece 1 at 2025-08-04 09:52:14
+piece handle=/backup/SALES/4pa7b5f2_61_1_1 tag=ENC_TDE
+channel ORA_DISK_1: finished piece 1 at 2025-08-04 09:53:02
+Finished backup at 2025-08-04 09:53:04
+
+-- 평문 노출 여부를 다시 확인한다.
+
+[oracle@oel7v9r1 ~]$ strings /backup/SALES/4pa7b5f2_61_1_1 | grep -c '010-'
+
+0
+
+[oracle@oel7v9r1 ~]$ strings /backup/SALES/4pa7b5f2_61_1_1 \
+>   | grep -c 'example.com'
+
+0
+
+-- 평문이 나오지 않는다. 요구 사항 ① 충족.
+
+-- 복원이 되는지 확인한다. 지갑이 열려 있으므로 자동으로 처리된다.
+
+RMAN> RESTORE TABLESPACE users VALIDATE;
+
+Starting restore at 2025-08-04 09:55:11
+channel ORA_DISK_1: starting validation of datafile backup set
+channel ORA_DISK_1: reading from backup piece /backup/SALES/4pa7b5f2_61_1_1
+channel ORA_DISK_1: piece handle=/backup/SALES/4pa7b5f2_61_1_1 tag=ENC_TDE
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:24
+Finished restore at 2025-08-04 09:55:36
+
+-- 사람의 개입이 없었다. 요구 사항 ② 충족.
+
+-- ────────────────────────────────────────────────
+-- 4-4. 반출용 이중 모드 백업
+-- ────────────────────────────────────────────────
+-- 외부 감사 법인용 백업을 만든다.
+
+[oracle@oel7v9r1 ~]$ mkdir -p /export/audit_2025Q3
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RUN {
+2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK
+3>     FORMAT '/export/audit_2025Q3/%d_AUDIT_%U';
+4>   SET ENCRYPTION ON IDENTIFIED BY "Export#Audit#Q3_2025";
+5>   BACKUP AS COMPRESSED BACKUPSET
+6>     DATABASE
+7>     TAG 'EXPORT_AUDIT_2025Q3'
+8>     KEEP UNTIL TIME 'SYSDATE+180'
+9>     RESTORE POINT SALES_AUDIT_2025Q3;
+10>  RELEASE CHANNEL c1;
+11> }
+
+allocated channel: c1
+executing command: SET encryption
+
+Starting backup at 2025-08-04 10:04:11
+current log archived
+channel c1: starting compressed full datafile backup set
+channel c1: starting piece 1 at 2025-08-04 10:04:14
+piece handle=/export/audit_2025Q3/SALES_AUDIT_4ra7c1h1_63_1_1
+channel c1: starting compressed archived log backup set
+piece handle=/export/audit_2025Q3/SALES_AUDIT_4sa7c3i2_64_1_1
+channel c1: starting compressed full datafile backup set
+including current SPFILE in backup set
+including current control file in backup set
+piece handle=/export/audit_2025Q3/SALES_AUDIT_4ta7c5j3_65_1_1
+Finished backup at 2025-08-04 10:11:44
+
+-- SET ENCRYPTION ON IDENTIFIED BY ... 만 쓰면 이중 모드다.
+--   지갑으로도 열리고 비밀번호로도 열린다.
+-- ONLY 를 붙이면 비밀번호 전용이 된다.
+--   SET ENCRYPTION ON IDENTIFIED BY "..." ONLY;
+--   지갑으로는 열 수 없다. 완전한 격리가 필요할 때 쓴다.
+
+[oracle@oel7v9r1 ~]$ ls -lh /export/audit_2025Q3/
+
+-rw-r-----. 1 oracle oinstall 402M Aug  4 10:08 SALES_AUDIT_4ra7c1h1_63_1_1
+-rw-r-----. 1 oracle oinstall  88M Aug  4 10:09 SALES_AUDIT_4sa7c3i2_64_1_1
+-rw-r-----. 1 oracle oinstall  19M Aug  4 10:11 SALES_AUDIT_4ta7c5j3_65_1_1
+
+[oracle@oel7v9r1 ~]$ strings /export/audit_2025Q3/SALES_AUDIT_4ra7c1h1_63_1_1 \
+>   | grep -c '010-'
+
+0
+
+-- 전달 매체에 지갑 파일이 없는지 확인한다.
+
+[oracle@oel7v9r1 ~]$ find /export/audit_2025Q3 -name '*wallet*' -o -name '*.sso' \
+>   -o -name '*.p12'
+
+-- 아무것도 나오지 않는다. [2-2]의 원칙이 지켜졌다.
+
+--------------------------------------------------------------------------------
+[5] 오류 주입과 대응
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 오류 ① 지갑이 닫힌 상태에서 백업
+-- ────────────────────────────────────────────────
+-- 자동 로그인 지갑을 쓰지 않는 구성에서 자주 발생한다.
+
+SYS@sales> ADMINISTER KEY MANAGEMENT SET KEYSTORE CLOSE;
+
+keystore altered.
+
+SYS@sales> SELECT status, wallet_type FROM v$encryption_wallet;
+
+STATUS  WALLET_TYPE
+------- -----------
+CLOSED  UNKNOWN
+
+-- 자동 로그인 지갑이 있으면 닫아도 다시 열린다.
+-- 확인을 위해 cwallet.sso 를 잠시 옮긴다.
+
+[oracle@oel7v9r1 ~]$ mv /u01/app/oracle/admin/sales/wallet/tde/cwallet.sso \
+>   /tmp/cwallet.sso.bak
+
+SYS@sales> ADMINISTER KEY MANAGEMENT SET KEYSTORE CLOSE;
+SYS@sales> SELECT status FROM v$encryption_wallet;
+
+STATUS
+-------
+CLOSED
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP TABLESPACE users TAG 'ENC_CLOSED';
+
+Starting backup at 2025-08-04 10:22:11
+allocated channel: ORA_DISK_1
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03009: failure of backup command on ORA_DISK_1 channel at 08/04/2025 10:22:14
+ORA-19914: unable to encrypt backup
+ORA-28365: wallet is not open
+
+-- << 원인 파악 >>
+-- CONFIGURE ENCRYPTION FOR DATABASE ON 이므로 모든 백업이 암호화된다.
+-- 암호화에는 마스터 키가 필요하고 그 키는 지갑 안에 있다.
+-- 지갑이 닫혀 있으면 키를 꺼낼 수 없다.
+--
+-- 두 오류를 함께 읽어야 한다.
+--   ORA-19914 : 백업을 암호화할 수 없다 (결과)
+--   ORA-28365 : 지갑이 열려 있지 않다 (원인)
+--
+-- 이 오류가 야간 정기 백업에서 나면 그날 백업이 통째로 실패한다.
+-- 그래서 자동 로그인 지갑을 쓰는 것이다.
+--
+-- 자동 로그인 지갑을 쓸 수 없는 정책이라면
+-- 기동 후 지갑을 여는 절차를 반드시 자동화해야 한다.
+
+-- << 수정 >>
+
+SYS@sales> ADMINISTER KEY MANAGEMENT SET KEYSTORE OPEN
+  2    IDENTIFIED BY "Wallet#Sales2025";
+
+keystore altered.
+
+SYS@sales> SELECT status, wallet_type FROM v$encryption_wallet;
+
+STATUS  WALLET_TYPE
+------- -----------
+OPEN    PASSWORD
+
+RMAN> BACKUP TABLESPACE users TAG 'ENC_CLOSED';
+
+Finished backup at 2025-08-04 10:26:33
+
+-- 자동 로그인 지갑을 복구한다.
+
+[oracle@oel7v9r1 ~]$ mv /tmp/cwallet.sso.bak \
+>   /u01/app/oracle/admin/sales/wallet/tde/cwallet.sso
+
+SYS@sales> ADMINISTER KEY MANAGEMENT SET KEYSTORE CLOSE;
+SYS@sales> SELECT status, wallet_type FROM v$encryption_wallet;
+
+STATUS  WALLET_TYPE
+------- -----------
+OPEN    AUTOLOGIN
+
+-- 기동 전 점검 항목에 지갑 상태를 넣는다. ([7-2] 참조)
+
+-- ────────────────────────────────────────────────
+-- 오류 ② 비밀번호 없이 반출 백업 복원
+-- ────────────────────────────────────────────────
+-- 외부 서버에서 복원을 시도한다.
+
+[oracle@oel7v9r1 ~]$ scp /export/audit_2025Q3/* oracle@oel7v9r2:/u02/export_test/
+
+SALES_AUDIT_4ra7c1h1_63_1_1                     100%  402MB  88.2MB/s
+SALES_AUDIT_4sa7c3i2_64_1_1                     100%   88MB  92.1MB/s
+SALES_AUDIT_4ta7c5j3_65_1_1                     100%   19MB  95.4MB/s
+
+[oracle@oel7v9r2 ~]$ echo "db_name=salesv" > $ORACLE_HOME/dbs/initsalesv.ora
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=salesv
+[oracle@oel7v9r2 ~]$ sqlplus -s / as sysdba << 'EOF'
+STARTUP NOMOUNT;
+EOF
+
+ORACLE instance started.
+
+[oracle@oel7v9r2 ~]$ rman target /
+
+connected to target database: SALESV (not mounted)
+
+RMAN> SET DBID 2284410077;
+
+executing command: SET DBID
+
+RMAN> RESTORE CONTROLFILE FROM '/u02/export_test/SALES_AUDIT_4ta7c5j3_65_1_1';
+
+Starting restore at 2025-08-04 10:41:02
+allocated channel: ORA_DISK_1
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 08/04/2025 10:41:04
+ORA-19870: error while restoring backup piece
+  /u02/export_test/SALES_AUDIT_4ta7c5j3_65_1_1
+ORA-19913: unable to decrypt backup
+
+-- << 원인 파악 >>
+-- 이 서버에는 지갑이 없다.
+-- 이중 모드 백업이므로 비밀번호로 열 수 있지만
+-- RMAN 에 비밀번호를 알려 주지 않았다.
+--
+-- 복호화 비밀번호는 세션 단위로 설정한다.
+--   SET DECRYPTION IDENTIFIED BY '<비밀번호>';
+--
+-- 여러 비밀번호로 만들어진 백업이 섞여 있으면 쉼표로 나열할 수 있다.
+--   SET DECRYPTION IDENTIFIED BY 'pw1', 'pw2';
+
+-- << 수정 >>
+
+RMAN> SET DECRYPTION IDENTIFIED BY "Export#Audit#Q3_2025";
+
+executing command: SET decryption
+
+RMAN> RESTORE CONTROLFILE FROM '/u02/export_test/SALES_AUDIT_4ta7c5j3_65_1_1';
+
+Starting restore at 2025-08-04 10:43:11
+channel ORA_DISK_1: restoring control file
+channel ORA_DISK_1: restore complete, elapsed time: 00:00:08
+output file name=/u02/oradata/SALESV/control01.ctl
+Finished restore at 2025-08-04 10:43:22
+
+-- 요구 사항 ③ 의 절반이 확인되었다.
+-- 전체 복원은 [6-2]에서 이어서 한다.
+
+-- ────────────────────────────────────────────────
+-- 오류 ③ 지갑 전용 백업을 외부에서 복원
+-- ────────────────────────────────────────────────
+-- 4-3의 정기 백업(투명 방식)을 외부 서버로 가져가 본다.
+
+[oracle@oel7v9r1 ~]$ scp /backup/SALES/4pa7b5f2_61_1_1 \
+>   oracle@oel7v9r2:/u02/export_test/
+
+[oracle@oel7v9r2 ~]$ rman target /
+
+RMAN> SET DBID 2284410077;
+RMAN> SET DECRYPTION IDENTIFIED BY "Wallet#Sales2025";
+
+executing command: SET decryption
+
+RMAN> RESTORE TABLESPACE users VALIDATE
+2>   FROM '/u02/export_test/4pa7b5f2_61_1_1';
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 08/04/2025 10:52:11
+ORA-19870: error while restoring backup piece
+  /u02/export_test/4pa7b5f2_61_1_1
+ORA-19913: unable to decrypt backup
+
+-- << 원인 파악 >>
+-- 지갑 비밀번호를 SET DECRYPTION 에 넣어도 소용없다.
+-- 투명 방식은 백업에 비밀번호 정보를 담지 않는다.
+-- 마스터 키 자체가 있어야 하며 그 키는 지갑 파일 안에 있다.
+--
+-- 지갑 비밀번호는 "지갑 파일을 여는" 비밀번호이지
+-- "백업을 여는" 비밀번호가 아니다. 두 개념이 다르다.
+--
+-- 이것이 반출용 백업을 별도로 만드는 이유다.
+-- 정기 백업을 그대로 외부에 줄 수는 없다.
+
+-- << 수정 방법 1 >> 지갑을 함께 옮긴다 (자체 DR 서버에만 허용)
+
+[oracle@oel7v9r1 ~]$ mkdir -p /tmp/wallet_transfer
+[oracle@oel7v9r1 ~]$ cp /u01/app/oracle/admin/sales/wallet/tde/ewallet.p12 \
+>   /tmp/wallet_transfer/
+
+[oracle@oel7v9r1 ~]$ scp /tmp/wallet_transfer/ewallet.p12 \
+>   oracle@oel7v9r2:/u02/oradata/SALESV/wallet/tde/
+
+[oracle@oel7v9r2 ~]$ sqlplus / as sysdba
+
+SYS@salesv> ALTER SYSTEM SET wallet_root='/u02/oradata/SALESV/wallet'
+  2    SCOPE=SPFILE;
+SYS@salesv> ALTER SYSTEM SET tde_configuration='KEYSTORE_CONFIGURATION=FILE'
+  2    SCOPE=BOTH;
+
+-- 재기동 후 지갑을 열면 복원할 수 있다.
+--
+-- 주의 : 이 방법은 자사 DR 서버에만 쓴다.
+--        외부 업체에 지갑을 넘기면 정기 백업 전체가 노출된다.
+
+[oracle@oel7v9r1 ~]$ rm -rf /tmp/wallet_transfer
+
+-- << 수정 방법 2 >> 반출용을 이중 모드로 다시 만든다 (권장)
+--
+-- 4-4에서 이미 그렇게 만들었다.
+-- 정기 백업과 반출용 백업을 분리하는 것이 설계의 핵심이다.
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+-- 6-1. 암호화 현황 조회 (요구 사항 ⑤)
+
+[oracle@oel7v9r2 ~]$ sqlplus -s rc_report/oracle_4U@rcat
+
+RC_REPORT@rcat> SET LINESIZE 170 PAGESIZE 60
+RC_REPORT@rcat> COLUMN tag FORMAT A24
+
+RC_REPORT@rcat> SELECT db_name, tag,
+  2    TO_CHAR(completion_time,'MM-DD HH24:MI') AS done,
+  3    DECODE(encrypted,'YES','암호화','NO','평문') AS enc,
+  4    DECODE(compressed,'YES','Y','N') AS comp
+  5  FROM  rc_backup_set
+  6  WHERE db_name = 'SALES' AND completion_time > SYSDATE - 1
+  7  ORDER BY completion_time;
+
+DB_NAME  TAG                      DONE        ENC      COMP
+-------- ------------------------ ----------- -------- ----
+SALES    PLAIN_TEST               08-04 09:12 평문     N
+SALES    ENC_TDE                  08-04 09:53 암호화   N
+SALES    EXPORT_AUDIT_2025Q3      08-04 10:11 암호화   Y
+SALES    ENC_CLOSED               08-04 10:26 암호화   N
+
+-- 평문 백업이 하나 남아 있다. 지적 대상이므로 제거한다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> DELETE NOPROMPT BACKUP TAG 'PLAIN_TEST';
+
+Deleted 1 objects
+
+-- 전체 이력에서 평문 백업이 있는지 확인한다.
+
+RC_REPORT@rcat> SELECT db_name, encrypted, COUNT(*) AS sets,
+  2    TO_CHAR(MAX(completion_time),'MM-DD HH24:MI') AS latest
+  3  FROM  rc_backup_set
+  4  WHERE completion_time > SYSDATE - 30
+  5  GROUP BY db_name, encrypted ORDER BY db_name, encrypted;
+
+DB_NAME  ENC   SETS LATEST
+-------- ---- ----- -----------
+HRDB     NO      88 08-04 02:14
+ORCL     NO     102 08-04 02:01
+SALES    NO      64 08-03 02:31
+SALES    YES      3 08-04 10:26
+
+-- SALES 는 오늘부터 암호화되었고 이전 백업은 평문이다.
+-- 보존 기간이 지나면 자연히 사라진다.
+-- 즉시 제거해야 한다면 재백업 후 삭제한다.
+--
+-- ORCL 과 HRDB 에도 같은 조치가 필요하다.
+
+-- 6-2. 지갑 없는 서버에서 전체 복원 (요구 사항 ③)
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=salesv
+[oracle@oel7v9r2 ~]$ rman target /
+
+connected to target database: SALESV (not mounted)
+
+RMAN> SET DBID 2284410077;
+RMAN> SET DECRYPTION IDENTIFIED BY "Export#Audit#Q3_2025";
+RMAN> RESTORE CONTROLFILE FROM '/u02/export_test/SALES_AUDIT_4ta7c5j3_65_1_1';
+RMAN> ALTER DATABASE MOUNT;
+
+RMAN> RUN {
+2>   SET DECRYPTION IDENTIFIED BY "Export#Audit#Q3_2025";
+3>   SET NEWNAME FOR DATABASE TO '/u02/oradata/SALESV/%b';
+4>   RESTORE DATABASE;
+5>   SWITCH DATAFILE ALL;
+6>   RECOVER DATABASE;
+7> }
+
+executing command: SET decryption
+executing command: SET NEWNAME
+
+Starting restore at 2025-08-04 11:04:11
+channel ORA_DISK_1: restoring datafile 00001 to /u02/oradata/SALESV/system01.dbf
+channel ORA_DISK_1: restoring datafile 00003 to /u02/oradata/SALESV/sysaux01.dbf
+channel ORA_DISK_1: restoring datafile 00004 to /u02/oradata/SALESV/users01.dbf
+channel ORA_DISK_1: reading from backup piece
+  /u02/export_test/SALES_AUDIT_4ra7c1h1_63_1_1
+channel ORA_DISK_1: restore complete, elapsed time: 00:06:22
+Finished restore at 2025-08-04 11:10:44
+
+datafile 1 switched to datafile copy
+datafile 3 switched to datafile copy
+datafile 4 switched to datafile copy
+
+Starting recover at 2025-08-04 11:10:52
+channel ORA_DISK_1: starting archived log restore to default destination
+channel ORA_DISK_1: reading from backup piece
+  /u02/export_test/SALES_AUDIT_4sa7c3i2_64_1_1
+media recovery complete, elapsed time: 00:01:34
+Finished recover at 2025-08-04 11:12:41
+
+RMAN> EXIT
+
+[oracle@oel7v9r2 ~]$ sqlplus / as sysdba
+
+SYS@salesv> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+SYS@salesv> SELECT COUNT(*) FROM itwill.customer;
+
+  COUNT(*)
+----------
+     50000
+
+SYS@salesv> SELECT cust_name, phone FROM itwill.customer WHERE ROWNUM <= 3;
+
+CUST_NAME   PHONE
+----------- -------------
+고객1       010-0001-0007
+고객2       010-0002-0014
+고객3       010-0003-0021
+
+-- 지갑 없이 비밀번호만으로 전체 복원에 성공했다. 요구 사항 ③ 충족.
+-- SET NEWNAME FOR DATABASE TO '<경로>/%b' 는
+-- 모든 데이터파일을 한 줄로 옮기는 축약 구문이다.
+
+-- 6-3. 반출 백업의 격리 확인
+
+[oracle@oel7v9r2 ~]$ ls -l /u02/oradata/SALESV/wallet/tde/ 2>/dev/null
+
+ls: cannot access /u02/oradata/SALESV/wallet/tde/: No such file or directory
+
+-- 이 서버에는 지갑이 없다.
+-- 그런데도 반출 백업은 복원되었고 정기 백업은 복원되지 않았다.
+-- 설계 의도대로 동작한다.
+
+-- 6-4. 키 손실 영향 검증 (요구 사항 ④)
+--
+-- 지갑을 잃었을 때 정기 백업이 어떻게 되는지 확인한다.
+
+[oracle@oel7v9r1 ~]$ cp -r /u01/app/oracle/admin/sales/wallet /tmp/wallet_safe
+[oracle@oel7v9r1 ~]$ mv /u01/app/oracle/admin/sales/wallet/tde/ewallet.p12 \
+>   /tmp/ewallet.p12.hidden
+[oracle@oel7v9r1 ~]$ mv /u01/app/oracle/admin/sales/wallet/tde/cwallet.sso \
+>   /tmp/cwallet.sso.hidden
+
+SYS@sales> SHUTDOWN IMMEDIATE
+SYS@sales> STARTUP
+
+Database opened.
+
+SYS@sales> SELECT status FROM v$encryption_wallet;
+
+STATUS
+-------
+CLOSED
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RESTORE TABLESPACE users VALIDATE FROM TAG 'ENC_TDE';
+
+Starting restore at 2025-08-04 11:24:11
+
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 08/04/2025 11:24:14
+ORA-19870: error while restoring backup piece /backup/SALES/4pa7b5f2_61_1_1
+ORA-19913: unable to decrypt backup
+
+-- 지갑이 없으면 정기 백업 전체를 복원할 수 없다.
+-- 데이터베이스는 열려 있지만 백업은 무용지물이다.
+--
+-- 이것이 [2-3]에서 말한 위험이다.
+-- 지갑 백업이 데이터베이스 백업만큼 중요한 이유다.
+
+-- 복구한다.
+
+[oracle@oel7v9r1 ~]$ mv /tmp/ewallet.p12.hidden \
+>   /u01/app/oracle/admin/sales/wallet/tde/ewallet.p12
+[oracle@oel7v9r1 ~]$ mv /tmp/cwallet.sso.hidden \
+>   /u01/app/oracle/admin/sales/wallet/tde/cwallet.sso
+
+SYS@sales> ADMINISTER KEY MANAGEMENT SET KEYSTORE CLOSE;
+SYS@sales> SELECT status, wallet_type FROM v$encryption_wallet;
+
+STATUS  WALLET_TYPE
+------- -----------
+OPEN    AUTOLOGIN
+
+RMAN> RESTORE TABLESPACE users VALIDATE FROM TAG 'ENC_TDE';
+
+Finished restore at 2025-08-04 11:28:41
+
+-- 6-5. 성능 영향 측정
+
+RC_REPORT@rcat> SELECT t.tag, j.elapsed_seconds,
+  2    ROUND(j.input_bytes/1024/1024) AS read_mb,
+  3    ROUND(j.output_bytes/1024/1024) AS write_mb
+  4  FROM  rc_rman_backup_job_details j
+  5    JOIN rc_backup_set t ON t.session_key = j.session_key
+  6  WHERE t.tag IN ('PLAIN_TEST','ENC_TDE','ENC_CLOSED')
+  7  ORDER BY j.start_time;
+
+TAG          ELAPSED_SECONDS READ_MB WRITE_MB
+------------ --------------- ------- --------
+PLAIN_TEST                33    1024      412
+ENC_TDE                   50    1024      414
+ENC_CLOSED                48    1024      414
+
+-- 33초 → 49초. 약 48% 증가.
+-- AES256 을 썼기 때문이다. AES128 이면 증가폭이 작다.
+-- 백업 창이 빠듯하면 알고리즘 선택을 재검토한다.
+--
+-- 고급 실습 08에서 확보한 여유(4분 22초 / 60분)로 충분히 흡수된다.
+
+-- 6-6. 요구 사항 대조
+--
+-- 요구 사항                                | 충족 | 근거
+-- -----------------------------------------|------|--------------
+-- ① 정기 백업 암호화                      | 예   | 4-3, 6-1
+-- ② 운영 중 무개입                         | 예   | 4-2, 4-3
+-- ③ 지갑 없이 외부 복원                    | 예   | 6-2
+-- ④ 키 손실 영향 규명                      | 예   | 6-4
+-- ⑤ 카탈로그에서 암호화 현황 조회          | 예   | 6-1
+
+--------------------------------------------------------------------------------
+[7] 운영 산출물과 확장 과제
+--------------------------------------------------------------------------------
+-- 7-1. rc_secure_export.sh — 반출용 백업 생성
+
+[oracle@oel7v9r1 ~]$ cat /home/oracle/rcadm/rc_secure_export.sh
+
+#!/bin/bash
+# 외부 반출용 암호화 백업 생성
+# 사용법 : rc_secure_export.sh <ORACLE_SID> <반출식별자> <보관일수>
+# 예     : rc_secure_export.sh sales AUDIT_2025Q3 180
+set -u
+SID=$1; LABEL=$2; KEEPDAYS=$3
+DBNAME=$(echo $SID | tr 'a-z' 'A-Z')
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export ORACLE_SID=$SID
+export PATH=$ORACLE_HOME/bin:$PATH
+OUTDIR=/export/${LABEL}
+LOG=/home/oracle/rcadm/log/export_${LABEL}.log
+mkdir -p $OUTDIR
+
+# --- 반출 비밀번호 생성 (건별 생성이 원칙)
+PW=$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)
+echo "생성된 반출 비밀번호 : $PW"
+echo "이 값은 화면에만 표시된다. 별도 경로로 요청자에게 전달할 것."
+
+# --- 안전장치 1 : 반출 경로에 지갑 파일이 없어야 한다
+if find $OUTDIR -name '*.p12' -o -name '*.sso' | grep -q .; then
+  echo "[ABORT] wallet file found in export directory" | tee -a $LOG
+  exit 2
+fi
+
+# --- 안전장치 2 : 카탈로그 접속 (KEEP 사용을 위해)
+if ! echo exit | rman target / catalog rcatowner/oracle_4U@rcat >/dev/null 2>&1
+then
+  echo "[ABORT] recovery catalog required" | tee -a $LOG
+  exit 2
+fi
+
+# --- 수행 (이중 모드 : 지갑으로도 비밀번호로도 열림)
+rman target / catalog rcatowner/oracle_4U@rcat >> $LOG 2>&1 << EOF
+RUN {
+  ALLOCATE CHANNEL c1 DEVICE TYPE DISK FORMAT '$OUTDIR/%d_${LABEL}_%U';
+  SET ENCRYPTION ON IDENTIFIED BY "$PW";
+  BACKUP AS COMPRESSED BACKUPSET DATABASE
+    TAG 'EXPORT_${LABEL}'
+    KEEP UNTIL TIME 'SYSDATE+${KEEPDAYS}'
+    RESTORE POINT ${DBNAME}_${LABEL};
+  RELEASE CHANNEL c1;
+}
+EXIT
+EOF
+
+# --- 검증 : 평문 노출이 없는지
+for f in $OUTDIR/*; do
+  if strings "$f" | grep -qE '@example\.com|010-[0-9]{4}'; then
+    echo "[FATAL] plaintext detected in $f" | tee -a $LOG
+    exit 1
+  fi
+done
+
+# --- 검증 : 복호화가 되는지 (조각 하나만)
+FIRST=$(ls -1 $OUTDIR | head -1)
+rman target / catalog rcatowner/oracle_4U@rcat >> $LOG 2>&1 << EOF
+SET DECRYPTION IDENTIFIED BY "$PW";
+RESTORE DATABASE VALIDATE FROM TAG 'EXPORT_${LABEL}';
+EXIT
+EOF
+
+if grep -qE 'ORA-19913|ORA-19870' $LOG; then
+  echo "[FATAL] decryption verification failed" | tee -a $LOG
+  exit 1
+fi
+
+# --- 인수인계 문서 생성
+cat > $OUTDIR/README_${LABEL}.txt << TXT
+반출 백업 정보
+  대상 DB     : $DBNAME (DBID 는 별도 통보)
+  생성 일시   : $(date '+%Y-%m-%d %H:%M:%S')
+  태그        : EXPORT_${LABEL}
+  보관 기한   : $(date -d "+${KEEPDAYS} days" '+%Y-%m-%d')
+  암호화      : 이중 모드 (AES256)
+  복원 절차   :
+    1) STARTUP NOMOUNT
+    2) rman target /
+       SET DBID <별도 통보>;
+       SET DECRYPTION IDENTIFIED BY '<별도 통보>';
+       RESTORE CONTROLFILE FROM '<컨트롤파일 조각>';
+       ALTER DATABASE MOUNT;
+       RUN { SET DECRYPTION IDENTIFIED BY '<별도 통보>';
+             SET NEWNAME FOR DATABASE TO '<경로>/%b';
+             RESTORE DATABASE; SWITCH DATAFILE ALL; RECOVER DATABASE; }
+    3) ALTER DATABASE OPEN RESETLOGS;
+  주의        : 비밀번호는 이 문서에 포함되지 않는다. 별도 경로로 통보된다.
+TXT
+
+echo "[OK] export created at $OUTDIR"
+ls -lh $OUTDIR
+
+-- 7-2. 지갑 상태 점검과 백업
+
+[oracle@oel7v9r1 ~]$ cat /home/oracle/rcadm/rc_wallet_check.sh
+
+#!/bin/bash
+# 지갑 상태 점검과 정기 백업
+SID=$1
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export ORACLE_SID=$SID
+export PATH=$ORACLE_HOME/bin:$PATH
+WALLET_BK=/backup_wallet/$SID
+MAILTO="dba-team@example.com"
+mkdir -p $WALLET_BK
+
+STATUS=$(sqlplus -s / as sysdba << 'EOF'
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT status || '|' || wallet_type || '|' || wrl_parameter
+FROM v$encryption_wallet WHERE ROWNUM = 1;
+EXIT
+EOF
+)
+
+WSTATUS=$(echo $STATUS | cut -d'|' -f1)
+WTYPE=$(echo $STATUS | cut -d'|' -f2)
+WPATH=$(echo $STATUS | cut -d'|' -f3)
+
+echo "wallet: status=$WSTATUS type=$WTYPE path=$WPATH"
+
+# --- 점검 1 : 백업 암호화가 켜져 있는데 지갑이 닫혀 있는가
+ENC=$(rman target / catalog rcatowner/oracle_4U@rcat << 'EOF' 2>/dev/null | grep 'ENCRYPTION FOR DATABASE'
+SHOW ENCRYPTION FOR DATABASE;
+EXIT
+EOF
+)
+if echo "$ENC" | grep -q 'ON' && [ "$WSTATUS" != "OPEN" ]; then
+  echo "[CRIT] encryption is ON but wallet is $WSTATUS" \
+    | mailx -s "[CRIT] wallet closed - backup will fail ($SID)" $MAILTO
+  exit 1
+fi
+
+# --- 점검 2 : 지갑 파일이 실제로 있는가
+if [ ! -f "${WPATH}ewallet.p12" ]; then
+  echo "[CRIT] wallet file missing: ${WPATH}ewallet.p12" \
+    | mailx -s "[CRIT] wallet file missing ($SID)" $MAILTO
+  exit 1
+fi
+
+# --- 지갑 백업 (백업 매체와 다른 위치로)
+D=$(date +%Y%m%d)
+tar czf $WALLET_BK/wallet_${SID}_${D}.tar.gz -C "$(dirname ${WPATH%/})" \
+  "$(basename ${WPATH%/})" 2>/dev/null
+chmod 600 $WALLET_BK/wallet_${SID}_${D}.tar.gz
+
+# --- 보관 세대 관리 (30세대)
+ls -1t $WALLET_BK/wallet_${SID}_*.tar.gz | tail -n +31 | xargs -r rm -f
+
+echo "[OK] wallet checked and backed up"
+
+[oracle@oel7v9r1 ~]$ crontab -l | grep wallet
+
+10 3 * * * /home/oracle/rcadm/rc_wallet_check.sh sales
+
+-- 7-3. 확장 과제
+--
+-- 과제 A. ORCL 과 HRDB 적용
+--   같은 절차를 나머지 두 DB에 적용하시오.
+--   기존 평문 백업을 어떻게 처리할지 결정하고 그 근거를 서술한다.
+--   보존 기간 만료를 기다릴지 즉시 재백업할지 판단한다.
+--
+-- 과제 B. 마스터 키 교체
+--   보안 정책상 마스터 키를 1년마다 교체해야 한다.
+--   ADMINISTER KEY MANAGEMENT SET KEY 로 교체한 뒤
+--   교체 이전 백업이 여전히 복원되는지 확인하시오.
+--   지갑에 이전 키가 유지되는 구조를 설명한다.
+--
+-- 과제 C. 암호화와 압축의 순서
+--   RMAN 은 압축과 암호화를 어떤 순서로 수행하는가.
+--   순서가 반대라면 무슨 문제가 생기는지 설명하고
+--   실제 압축률을 측정해 확인하시오.
+--
+-- 과제 D. ONLY 옵션 검토
+--   SET ENCRYPTION ON IDENTIFIED BY '...' ONLY 를 쓰면
+--   지갑으로도 열리지 않는다.
+--   어떤 상황에서 이 옵션이 필요한지 논하고
+--   비밀번호 분실 시의 위험을 평가하시오.
+--
+-- 과제 E. 지갑 재해 복구 훈련
+--   지갑과 운영 서버를 함께 잃었다고 가정하고
+--   [7-2]의 지갑 백업으로 복구하는 절차를 수행하시오.
+--   고급 실습 07의 절차와 결합해 전체 순서를 만든다.
+--   지갑 복구가 어느 단계에 들어가야 하는지 판단한다.
+
+-- 7-4. 정리 — 이 실습에서 남는 것
+--
+--   ① rc_secure_export.sh   : 반출용 백업 생성 (검증·인수문서 포함)
+--   ② rc_wallet_check.sh    : 지갑 상태 점검과 정기 백업
+--   ③ 키 관리 설계표        : [2-2]
+--   ④ 세 방식 비교표        : [2-1]
+--   ⑤ 암호화 현황 조회      : [6-1]
+--
+-- 마지막 예제에서는 지금까지 만든 모든 것이 실제로 동작하는지 검증한다.
+
+-- 실무 포인트
+-- 1) 백업 파일은 데이터베이스 권한 밖에 있다.
+--    strings 명령 하나로 고객 데이터가 노출된다.
+--    파일 시스템 권한만으로는 부족하다.
+--
+-- 2) 정기 백업과 반출 백업을 분리한다.
+--    정기 백업은 투명 방식, 반출은 이중 모드로 별도 생성한다.
+--    지갑을 외부에 넘기는 순간 모든 정기 백업이 노출된다.
+--
+-- 3) 지갑 비밀번호와 백업 비밀번호는 다른 것이다.
+--    지갑 비밀번호는 지갑 파일을 여는 것이고
+--    백업 비밀번호는 백업을 여는 것이다.
+--    투명 방식 백업은 SET DECRYPTION 으로 열 수 없다.
+--
+-- 4) 자동 로그인 지갑이 없으면 야간 백업이 실패한다.
+--    ORA-19914 와 ORA-28365 가 함께 나오면 지갑 상태를 확인한다.
+--    자동 로그인을 못 쓰는 정책이라면 여는 절차를 자동화한다.
+--
+-- 5) 지갑을 잃으면 백업 전체가 무용지물이다.
+--    되살릴 방법이 없다. 오라클도 열어 줄 수 없다.
+--    지갑 백업을 데이터베이스 백업과 다른 매체에 보관한다.
+--
+-- 6) 암호화는 백업 시간을 늘린다.
+--    이 환경에서는 AES256 으로 약 48% 증가했다.
+--    백업 창에 여유가 있는지 먼저 확인하고 알고리즘을 고른다.

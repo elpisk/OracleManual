@@ -1,0 +1,1198 @@
+================================================================================
+ 고급 실습 07 : 재해복구 — 카탈로그만으로 타 서버에 전체 재구축
+ 과정      : Oracle Database 19c Backup & Recovery — Recovery Catalog 고급
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / oel7v9r1(소실) → oel7v9r2(복구 대상)
+ 대상 DB   : orcl (DBID 1547823901)
+ 카탈로그  : rcat @ oel7v9r2
+ 소요 시간 : 약 3시간 30분
+ 선행 조건 : 고급 실습 01~06 완료
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실무 상황
+--------------------------------------------------------------------------------
+-- 새벽 3시 20분. 운영 서버 oel7v9r1 이 응답하지 않는다.
+-- 데이터센터에서 연락이 왔다. 해당 랙의 전원 계통 사고로
+-- 서버와 로컬 디스크가 모두 손상되었다. 복구 불가 판정이다.
+--
+-- 사라진 것
+--   - oel7v9r1 서버 전체
+--   - /u01/app/oracle/oradata/ORCL/ (모든 데이터파일과 컨트롤파일)
+--   - /home/oracle/arch1/ (아카이브 로그)
+--   - $ORACLE_HOME/dbs/spfileorcl.ora
+--   - 온라인 리두 로그
+--
+-- 남아 있는 것
+--   - oel7v9r2 서버 (rcat, hrdb 가 돌고 있다)
+--   - /backup (NFS 원본이 oel7v9r2 에 있어 무사하다)
+--   - /archive_keep (별도 스토리지, 무사)
+--   - Recovery Catalog (rcat)
+--
+-- 업무 요구
+--   "오전 8시 전까지 orcl 을 되살릴 것. 데이터 손실은 최소화."
+--
+-- 이 상황에서 카탈로그가 하는 일은 결정적이다.
+--   - orcl 의 DBID 를 알려 준다
+--   - 데이터파일이 몇 개였고 각각 어느 테이블스페이스였는지 알려 준다
+--   - 리두 로그 그룹 구성과 크기를 알려 준다
+--   - 어떤 백업으로 어디까지 복구할 수 있는지 알려 준다
+--
+-- 이 정보 없이는 복구 계획조차 세울 수 없다.
+--
+-- 요구 사항
+--   ① 카탈로그에서 복구에 필요한 정보를 모두 수집한다
+--   ② 경로가 완전히 다른 서버에 복구한다
+--   ③ 데이터 손실 범위를 정확히 산정하고 보고한다
+--   ④ 복구 후 백업 체계를 정상화한다
+--   ⑤ 소요 시간을 측정해 RTO 산정 근거로 남긴다
+
+--------------------------------------------------------------------------------
+[2] 사전 설계
+--------------------------------------------------------------------------------
+-- 2-1. 카탈로그에서 수집해야 할 정보
+--
+--   정보              | 조회 대상            | 없으면 생기는 문제
+--   ------------------|----------------------|--------------------------
+--   DBID              | rc_database          | 자동 백업을 찾지 못한다
+--   데이터파일 구성   | rc_datafile          | SET NEWNAME 목록을 못 만든다
+--   테이블스페이스    | rc_tablespace        | 구조를 파악할 수 없다
+--   리두 로그 구성    | rc_redo_log          | LOGFILE 절을 못 만든다
+--   마지막 백업 시각  | rc_backup_set        | 손실 범위를 산정할 수 없다
+--   마지막 아카이브   | rc_archived_log      | 복구 종점을 모른다
+--   백업 조각 경로    | rc_backup_piece      | 매체를 준비할 수 없다
+--   CONFIGURE 설정    | rc_rman_configuration| 채널 구성을 재현할 수 없다
+--
+--   이 중 DBID 하나만 있어도 시작은 할 수 있다.
+--   그러나 계획 수립과 시간 산정에는 나머지가 모두 필요하다.
+
+-- 2-2. 경로 매핑 설계
+--
+--   구분           | 원본 (oel7v9r1)                  | 대상 (oel7v9r2)
+--   ---------------|----------------------------------|---------------------
+--   데이터파일     | /u01/app/oracle/oradata/ORCL/    | /u02/oradata/ORCL/
+--   온라인 리두    | /u01/app/oracle/oradata/ORCL/    | /u02/oradata/ORCL/
+--   컨트롤파일     | /u01/app/oracle/oradata/ORCL/    | /u02/oradata/ORCL/
+--   아카이브       | /home/oracle/arch1/              | /u02/arch_orcl/
+--   FRA            | /u01/app/oracle/fast_recovery_area | /u02/fra
+--   감사 로그      | /u01/app/oracle/admin/orcl/adump | /u02/admin/orcl/adump
+--
+--   경로 변경 수단 두 가지
+--     SET NEWNAME + SWITCH        데이터파일 개별 지정. 정밀하다
+--     DB_FILE_NAME_CONVERT        일괄 치환. spfile 파라미터
+--
+--   이 실습에서는 SET NEWNAME 을 쓴다.
+--   재해 상황에서는 원본 경로 구조를 그대로 유지할 수 없는 경우가 많고
+--   파일별로 다른 위치에 두어야 할 수도 있다.
+
+-- 2-3. 복구 순서
+--
+--   ① 카탈로그에서 정보 수집          (10분)
+--   ② 대상 서버 준비 — 경로, 비밀번호 파일, 최소 pfile  (10분)
+--   ③ NOMOUNT 기동                    (2분)
+--   ④ spfile 복원                     (3분)
+--   ⑤ spfile 수정 후 재기동           (5분)
+--   ⑥ 컨트롤파일 복원 후 MOUNT        (5분)
+--   ⑦ SET NEWNAME + RESTORE + SWITCH  (40분)
+--   ⑧ RECOVER                         (20분)
+--   ⑨ OPEN RESETLOGS                  (5분)
+--   ⑩ 리스너·tnsnames·검증            (15분)
+--   ⑪ 새 인카네이션 전체 백업         (30분)
+--
+--   추정 합계 약 2시간 25분. 목표 시각(08시)까지 여유가 있다.
+
+-- 2-4. 데이터 손실 산정 방법
+--
+--   손실 범위 = 마지막으로 백업된 아카이브 이후의 변경
+--
+--   온라인 리두 로그가 사라졌으므로
+--   백업되지 않은 아카이브와 현재 리두의 내용은 복구할 수 없다.
+--   이것이 물리 백업 체계에서 RPO 를 결정하는 지점이다.
+--
+--   산정에 필요한 두 값
+--     ① 마지막으로 백업된 아카이브의 종료 SCN 과 시각
+--     ② 장애 발생 시각
+--   이 둘의 차이가 손실 구간이다.
+
+--------------------------------------------------------------------------------
+[3] 환경 준비
+--------------------------------------------------------------------------------
+-- 3-1. 장애 재현
+--
+-- 실습에서는 oel7v9r1 의 orcl 관련 자원을 모두 제거해 재현한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ sqlplus -s / as sysdba << 'EOF'
+SELECT TO_CHAR(SYSDATE,'YYYY-MM-DD HH24:MI:SS') AS failure_time,
+       current_scn FROM v$database;
+SHUTDOWN ABORT
+EOF
+
+FAILURE_TIME        CURRENT_SCN
+------------------- -----------
+2025-07-08 03:20:11     3488022
+
+ORACLE instance shut down.
+
+[oracle@oel7v9r1 ~]$ rm -rf /u01/app/oracle/oradata/ORCL
+[oracle@oel7v9r1 ~]$ rm -rf /home/oracle/arch1/*
+[oracle@oel7v9r1 ~]$ rm -f $ORACLE_HOME/dbs/spfileorcl.ora
+[oracle@oel7v9r1 ~]$ rm -f $ORACLE_HOME/dbs/orapworcl
+
+-- 이후 모든 작업은 oel7v9r2 에서 수행한다.
+
+-- 3-2. 대상 서버 상태 확인
+
+[oracle@oel7v9r2 ~]$ hostname
+
+oel7v9r2
+
+[oracle@oel7v9r2 ~]$ ps -ef | grep pmon | grep -v grep
+
+oracle    3021     1  0 Jun06 ?   00:04:12 ora_pmon_rcat
+oracle    3455     1  0 Jun06 ?   00:03:44 ora_pmon_hrdb
+
+[oracle@oel7v9r2 ~]$ echo $ORACLE_HOME
+
+/u01/app/oracle/product/19.3.0/dbhome_1
+
+[oracle@oel7v9r2 ~]$ df -h /u02 /backup /archive_keep
+
+Filesystem            Size  Used Avail Use% Mounted on
+/dev/mapper/ol-u02    300G   18G  282G   6% /u02
+/dev/mapper/ol-bk     200G  109G   91G  55% /backup
+/dev/mapper/ol-keep   500G   14G  486G   3% /archive_keep
+
+-- 백업이 로컬에 있다. NFS 원본 서버가 살아 있었기 때문이다.
+-- 이 구성이 아니었다면 백업까지 잃었을 것이다.
+
+-- 3-3. 메모리 여유 확인
+--
+-- 이미 두 인스턴스가 돌고 있다. 세 번째를 올릴 여유를 확인한다.
+
+[oracle@oel7v9r2 ~]$ free -g
+
+              total        used        free      shared  buff/cache   available
+Mem:             16           6           2           4           7           5
+Swap:             8           0           8
+
+-- 5GB 가용. orcl 의 SGA 를 2GB 로 잡는다.
+
+--------------------------------------------------------------------------------
+[4] 구축과 수행
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 4-1. 카탈로그에서 정보 수집 (요구 사항 ①)
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r2 ~]$ date
+
+Tue Jul  8 03:34:02 KST 2025
+
+-- 시각을 기록해 둔다. RTO 측정의 시작점이다.
+
+[oracle@oel7v9r2 ~]$ sqlplus -s rc_report/oracle_4U@rcat
+
+RC_REPORT@rcat> SET LINESIZE 180 PAGESIZE 100
+
+-- (1) DBID 와 인카네이션
+
+RC_REPORT@rcat> SELECT dbid, name, TO_CHAR(reset_time,'YYYY-MM-DD HH24:MI:SS')
+  2         AS reset_time, dbinc_key
+  3  FROM   rc_database WHERE name = 'ORCL';
+
+      DBID NAME  RESET_TIME           DBINC_KEY
+---------- ----- ------------------- ----------
+1547823901 ORCL  2025-05-22 16:44:11          3
+
+-- (2) 데이터파일 구성
+
+RC_REPORT@rcat> COLUMN file_name FORMAT A48
+RC_REPORT@rcat> SELECT f.file#, f.tablespace_name,
+  2         ROUND(f.bytes/1024/1024) AS mb, f.name AS file_name
+  3  FROM   rc_datafile f
+  4  WHERE  f.dbinc_key = 3 ORDER BY f.file#;
+
+FILE# TABLESPACE_NAME    MB FILE_NAME
+----- --------------- ----- ------------------------------------------
+    1 SYSTEM            900 /u01/app/oracle/oradata/ORCL/system01.dbf
+    2 SYSAUX            780 /u01/app/oracle/oradata/ORCL/sysaux01.dbf
+    3 UNDOTBS1          420 /u01/app/oracle/oradata/ORCL/undotbs01.dbf
+    4 USERS            1024 /u01/app/oracle/oradata/ORCL/users01.dbf
+    5 EXAMPLE           340 /u01/app/oracle/oradata/ORCL/example01.dbf
+    6 SAMPLE             50 /home/oracle/testdir/sample01.dbf
+
+-- 6번 파일이 다른 경로에 있다.
+-- 고급 실습 04의 종합 과제에서 SWITCH 로 옮긴 결과다.
+-- 카탈로그가 없었다면 이 파일의 존재조차 몰랐을 것이다.
+
+-- (3) 리두 로그 구성
+
+RC_REPORT@rcat> SELECT group#, thread#, ROUND(bytes/1024/1024) AS mb, members
+  2  FROM   rc_redo_log WHERE dbinc_key = 3 ORDER BY group#;
+
+GROUP# THREAD#    MB MEMBERS
+------ ------- ----- -------
+     1       1   200       2
+     2       1   200       2
+     3       1   200       2
+
+-- 200MB 3그룹 각 2멤버. RESETLOGS 시 이 구성으로 만들어진다.
+
+-- (4) 마지막 백업과 아카이브 (요구 사항 ③의 근거)
+
+RC_REPORT@rcat> SELECT bs_key, bck_type, incr_level,
+  2         TO_CHAR(completion_time,'MM-DD HH24:MI:SS') AS done,
+  3         ROUND(SUM(p.bytes)/1024/1024) AS mb
+  4  FROM   rc_backup_set s JOIN rc_backup_piece p ON s.bs_key = p.bs_key
+  5  WHERE  s.db_name = 'ORCL' AND s.completion_time > SYSDATE - 3
+  6  GROUP  BY bs_key, bck_type, incr_level, completion_time
+  7  ORDER  BY completion_time;
+
+BS_KEY B INCR_LEVEL DONE              MB
+------ - ---------- --------------- ----
+  1602 D          0 07-06 01:04:22   1188
+  1608 L            07-06 01:12:41    142
+  1644 D          1 07-07 02:02:11    188
+  1650 L            07-07 02:06:33     94
+  1688 D          1 07-08 02:01:44    191
+  1694 L            07-08 02:05:12     88
+
+-- 마지막 아카이브 백업이 07-08 02:05:12 이다.
+
+RC_REPORT@rcat> SELECT MAX(sequence#) AS last_backed_seq,
+  2         TO_CHAR(MAX(next_time),'YYYY-MM-DD HH24:MI:SS') AS covered_until,
+  3         MAX(next_change#) AS covered_scn
+  4  FROM   rc_archived_log a
+  5  WHERE  a.dbinc_key = 3
+  6  AND    EXISTS (SELECT 1 FROM rc_backup_redolog b
+  7                 WHERE b.dbinc_key = a.dbinc_key
+  8                 AND   b.sequence# = a.sequence#);
+
+LAST_BACKED_SEQ COVERED_UNTIL       COVERED_SCN
+--------------- ------------------- -----------
+            488 2025-07-08 02:04:55     3487104
+
+-- 백업된 아카이브는 시퀀스 488, SCN 3487104, 시각 02:04:55 까지다.
+-- 장애는 03:20:11, SCN 3488022 에 발생했다.
+--
+-- 손실 구간 : 02:04:55 ~ 03:20:11  (약 1시간 15분)
+-- 손실 SCN  : 3487104 ~ 3488022    (918)
+--
+-- 이 값을 즉시 업무 담당자에게 보고한다.
+
+-- (5) CONFIGURE 설정
+
+RC_REPORT@rcat> SELECT value FROM rc_rman_configuration
+  2  WHERE  db_key = 1 ORDER BY conf#;
+
+VALUE
+------------------------------------------------------------
+RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS
+BACKUP OPTIMIZATION ON
+CONTROLFILE AUTOBACKUP ON
+DEVICE TYPE DISK PARALLELISM 2 BACKUP TYPE TO BACKUPSET
+CHANNEL DEVICE TYPE DISK FORMAT   '/backup/%d/%U'
+
+-- (6) 백업 조각 위치 확인
+
+RC_REPORT@rcat> SELECT DISTINCT SUBSTR(handle, 1, INSTR(handle,'/',-1)) AS dir,
+  2         COUNT(*) AS pieces
+  3  FROM   rc_backup_piece WHERE db_name = 'ORCL' AND status = 'A'
+  4  GROUP  BY SUBSTR(handle, 1, INSTR(handle,'/',-1));
+
+DIR                        PIECES
+------------------------- ------
+/backup/ORCL/                248
+/archive_keep/ORCL/            3
+/backup/orphan/                3
+
+-- 세 경로에 나뉘어 있다. 모두 oel7v9r2 에서 접근 가능하다.
+
+-- ────────────────────────────────────────────────
+-- 4-2. 대상 서버 준비
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r2 ~]$ mkdir -p /u02/oradata/ORCL /u02/arch_orcl /u02/fra \
+>   /u02/admin/orcl/adump
+
+[oracle@oel7v9r2 ~]$ orapwd file=$ORACLE_HOME/dbs/orapworcl \
+>   password=oracle_4U entries=5 format=12
+
+[oracle@oel7v9r2 ~]$ cat > $ORACLE_HOME/dbs/initorcl.ora << 'EOF'
+db_name=orcl
+db_unique_name=orcl
+sga_target=2G
+pga_aggregate_target=512M
+db_block_size=8192
+compatible=19.0.0
+control_files='/u02/oradata/ORCL/control01.ctl'
+db_recovery_file_dest='/u02/fra'
+db_recovery_file_dest_size=30G
+audit_file_dest='/u02/admin/orcl/adump'
+diagnostic_dest='/u01/app/oracle'
+EOF
+
+-- 이 pfile 은 임시다. spfile 을 복원하면 대체된다.
+-- 최소한의 값만 넣어 NOMOUNT 로 올리는 것이 목적이다.
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r2 ~]$ sqlplus / as sysdba
+
+SYS@orcl> STARTUP NOMOUNT PFILE='$ORACLE_HOME/dbs/initorcl.ora';
+
+ORACLE instance started.
+
+Total System Global Area 2147481600 bytes
+Fixed Size                  9137152 bytes
+Variable Size             452984832 bytes
+Database Buffers         1677721600 bytes
+Redo Buffers                7638016 bytes
+
+SYS@orcl> EXIT
+
+-- ────────────────────────────────────────────────
+-- 4-3. spfile 복원
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: ORCL (not mounted)
+recovery catalog database Password:
+connected to recovery catalog database
+
+-- 카탈로그에 접속했으므로 SET DBID 없이도 대상을 식별한다.
+-- 카탈로그가 없다면 다음이 필요하다.
+--   RMAN> SET DBID 1547823901;
+
+RMAN> RESTORE SPFILE TO '/tmp/spfileorcl_restored.ora'
+2>   FROM AUTOBACKUP;
+
+Starting restore at 2025-07-08 03:48:11
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: looking for AUTOBACKUP on day: 20250708
+channel ORA_DISK_1: AUTOBACKUP found: /backup/ORCL/c-1547823901-20250708-01
+channel ORA_DISK_1: restoring SPFILE
+output file name=/tmp/spfileorcl_restored.ora
+channel ORA_DISK_1: SPFILE restore from AUTOBACKUP complete
+Finished restore at 2025-07-08 03:48:24
+
+RMAN> EXIT
+
+-- 원본 경로가 그대로 들어 있으므로 수정해야 한다.
+
+[oracle@oel7v9r2 ~]$ sqlplus / as sysdba
+
+SYS@orcl> CREATE PFILE='/tmp/initorcl_from_spfile.ora'
+  2    FROM SPFILE='/tmp/spfileorcl_restored.ora';
+
+File created.
+
+[oracle@oel7v9r2 ~]$ grep -E 'control_files|dest|dump' /tmp/initorcl_from_spfile.ora
+
+*.audit_file_dest='/u01/app/oracle/admin/orcl/adump'
+*.control_files='/u01/app/oracle/oradata/ORCL/control01.ctl',
+'/u01/app/oracle/fast_recovery_area/ORCL/control02.ctl'
+*.db_recovery_file_dest='/u01/app/oracle/fast_recovery_area'
+*.diagnostic_dest='/u01/app/oracle'
+*.log_archive_dest_1='location=/home/oracle/arch1 mandatory'
+
+-- 경로를 대상 서버 기준으로 고친다.
+
+[oracle@oel7v9r2 ~]$ sed -i \
+>  -e "s|/u01/app/oracle/oradata/ORCL|/u02/oradata/ORCL|g" \
+>  -e "s|/u01/app/oracle/fast_recovery_area|/u02/fra|g" \
+>  -e "s|/u01/app/oracle/admin/orcl/adump|/u02/admin/orcl/adump|g" \
+>  -e "s|/home/oracle/arch1|/u02/arch_orcl|g" \
+>  /tmp/initorcl_from_spfile.ora
+
+[oracle@oel7v9r2 ~]$ grep -E 'control_files|dest' /tmp/initorcl_from_spfile.ora
+
+*.audit_file_dest='/u02/admin/orcl/adump'
+*.control_files='/u02/oradata/ORCL/control01.ctl','/u02/fra/ORCL/control02.ctl'
+*.db_recovery_file_dest='/u02/fra'
+*.diagnostic_dest='/u01/app/oracle'
+*.log_archive_dest_1='location=/u02/arch_orcl mandatory'
+
+[oracle@oel7v9r2 ~]$ mkdir -p /u02/fra/ORCL
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> CREATE SPFILE FROM PFILE='/tmp/initorcl_from_spfile.ora';
+
+File created.
+
+SYS@orcl> STARTUP NOMOUNT;
+
+ORACLE instance started.
+
+Total System Global Area 3221224016 bytes
+
+SYS@orcl> SHOW PARAMETER control_files
+
+NAME           TYPE   VALUE
+-------------- ------ ------------------------------------------------
+control_files  string /u02/oradata/ORCL/control01.ctl,
+                      /u02/fra/ORCL/control02.ctl
+
+-- ────────────────────────────────────────────────
+-- 4-4. 컨트롤파일 복원과 MOUNT
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: ORCL (not mounted)
+connected to recovery catalog database
+
+RMAN> RESTORE CONTROLFILE;
+
+Starting restore at 2025-07-08 03:58:02
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: restoring control file
+channel ORA_DISK_1: restore complete, elapsed time: 00:00:07
+output file name=/u02/oradata/ORCL/control01.ctl
+output file name=/u02/fra/ORCL/control02.ctl
+Finished restore at 2025-07-08 03:58:11
+
+-- 카탈로그가 있으면 FROM AUTOBACKUP 없이 복원된다.
+-- 카탈로그가 최신 백업의 위치를 알고 있기 때문이다.
+
+RMAN> ALTER DATABASE MOUNT;
+
+Statement processed
+released channel: ORA_DISK_1
+
+RMAN> REPORT SCHEMA;
+
+Report of database schema for database with db_unique_name ORCL
+
+List of Permanent Datafiles
+===========================
+File Size(MB) Tablespace     RB segs Datafile Name
+---- -------- -------------- ------- ------------------------------------------
+1    900      SYSTEM         YES     /u01/app/oracle/oradata/ORCL/system01.dbf
+2    780      SYSAUX         NO      /u01/app/oracle/oradata/ORCL/sysaux01.dbf
+3    420      UNDOTBS1       YES     /u01/app/oracle/oradata/ORCL/undotbs01.dbf
+4    1024     USERS          NO      /u01/app/oracle/oradata/ORCL/users01.dbf
+5    340      EXAMPLE        NO      /u01/app/oracle/oradata/ORCL/example01.dbf
+6    50       SAMPLE         NO      /home/oracle/testdir/sample01.dbf
+
+-- 컨트롤파일은 여전히 원본 경로를 가리킨다.
+-- 이 상태로 RESTORE 하면 없는 경로에 쓰려다 실패한다. [5] 오류 ②에서 확인한다.
+
+-- ────────────────────────────────────────────────
+-- 4-5. 경로 변경 복원
+-- ────────────────────────────────────────────────
+-- 4-1의 (2)에서 수집한 목록으로 SET NEWNAME 을 작성한다.
+
+RMAN> RUN {
+2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK;
+3>   ALLOCATE CHANNEL c2 DEVICE TYPE DISK;
+4>   SET NEWNAME FOR DATAFILE 1 TO '/u02/oradata/ORCL/system01.dbf';
+5>   SET NEWNAME FOR DATAFILE 2 TO '/u02/oradata/ORCL/sysaux01.dbf';
+6>   SET NEWNAME FOR DATAFILE 3 TO '/u02/oradata/ORCL/undotbs01.dbf';
+7>   SET NEWNAME FOR DATAFILE 4 TO '/u02/oradata/ORCL/users01.dbf';
+8>   SET NEWNAME FOR DATAFILE 5 TO '/u02/oradata/ORCL/example01.dbf';
+9>   SET NEWNAME FOR DATAFILE 6 TO '/u02/oradata/ORCL/sample01.dbf';
+10>  RESTORE DATABASE;
+11>  SWITCH DATAFILE ALL;
+12>  RELEASE CHANNEL c1;
+13>  RELEASE CHANNEL c2;
+14> }
+
+allocated channel: c1
+allocated channel: c2
+
+Starting restore at 2025-07-08 04:02:14
+channel c1: starting datafile backup set restore
+channel c1: specifying datafile(s) to restore from backup set
+channel c1: restoring datafile 00001 to /u02/oradata/ORCL/system01.dbf
+channel c1: restoring datafile 00003 to /u02/oradata/ORCL/undotbs01.dbf
+channel c1: reading from backup piece /backup/ORCL/3xa6k1a1_78_1_1
+channel c2: starting datafile backup set restore
+channel c2: restoring datafile 00002 to /u02/oradata/ORCL/sysaux01.dbf
+channel c2: restoring datafile 00004 to /u02/oradata/ORCL/users01.dbf
+channel c2: restoring datafile 00005 to /u02/oradata/ORCL/example01.dbf
+channel c2: restoring datafile 00006 to /u02/oradata/ORCL/sample01.dbf
+channel c1: restored backup piece 1
+channel c1: restore complete, elapsed time: 00:14:22
+channel c2: restore complete, elapsed time: 00:18:41
+Finished restore at 2025-07-08 04:21:02
+
+datafile 1 switched to datafile copy
+input datafile copy RECID=12 STAMP=1194502211
+  file name=/u02/oradata/ORCL/system01.dbf
+datafile 2 switched to datafile copy
+...
+datafile 6 switched to datafile copy
+  file name=/u02/oradata/ORCL/sample01.dbf
+
+RMAN> REPORT SCHEMA;
+
+List of Permanent Datafiles
+===========================
+File Size(MB) Tablespace     RB segs Datafile Name
+---- -------- -------------- ------- ------------------------------------------
+1    900      SYSTEM         YES     /u02/oradata/ORCL/system01.dbf
+2    780      SYSAUX         NO      /u02/oradata/ORCL/sysaux01.dbf
+3    420      UNDOTBS1       YES     /u02/oradata/ORCL/undotbs01.dbf
+4    1024     USERS          NO      /u02/oradata/ORCL/users01.dbf
+5    340      EXAMPLE        NO      /u02/oradata/ORCL/example01.dbf
+6    50       SAMPLE         NO      /u02/oradata/ORCL/sample01.dbf
+
+-- SWITCH 로 컨트롤파일의 경로가 갱신되었다.
+
+-- ────────────────────────────────────────────────
+-- 4-6. 복구와 오픈
+-- ────────────────────────────────────────────────
+
+RMAN> RECOVER DATABASE;
+
+Starting recover at 2025-07-08 04:23:11
+using channel ORA_DISK_1
+
+starting media recovery
+
+channel ORA_DISK_1: starting archived log restore to default destination
+channel ORA_DISK_1: restoring archived log
+archived log thread=1 sequence=486
+channel ORA_DISK_1: restoring archived log
+archived log thread=1 sequence=487
+channel ORA_DISK_1: restoring archived log
+archived log thread=1 sequence=488
+channel ORA_DISK_1: reading from backup piece /backup/ORCL/3ya6k3b2_79_1_1
+channel ORA_DISK_1: restored backup piece 1
+archived log file name=/u02/arch_orcl/1_486_1189200011.dbf thread=1 sequence=486
+archived log file name=/u02/arch_orcl/1_487_1189200011.dbf thread=1 sequence=487
+archived log file name=/u02/arch_orcl/1_488_1189200011.dbf thread=1 sequence=488
+media recovery complete, elapsed time: 00:11:44
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of recover command at 07/08/2025 04:35:02
+RMAN-06054: media recovery requesting unknown archived log for thread 1
+  with sequence 489 and starting SCN of 3487104
+
+-- 예상된 결과다.
+-- 시퀀스 489 는 백업되지 않았고 온라인 리두도 사라졌다.
+-- 4-1의 (4)에서 산정한 손실 구간이 여기서 확정된다.
+
+RMAN> EXIT
+
+[oracle@oel7v9r2 ~]$ sqlplus / as sysdba
+
+SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+
+Database altered.
+
+SYS@orcl> SELECT open_mode, database_role FROM v$database;
+
+OPEN_MODE            DATABASE_ROLE
+-------------------- ----------------
+READ WRITE           PRIMARY
+
+[oracle@oel7v9r2 ~]$ date
+
+Tue Jul  8 04:41:33 KST 2025
+
+-- 03:34 시작, 04:41 오픈. 1시간 7분 소요.
+-- 추정 2시간 25분보다 빨랐다. 백업이 로컬 디스크에 있었기 때문이다.
+
+--------------------------------------------------------------------------------
+[5] 오류 주입과 대응
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 오류 ① 인스턴스를 올리지 않고 RMAN 접속
+-- ────────────────────────────────────────────────
+-- 4-2를 건너뛰고 바로 4-3을 시도한 경우다.
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=orcl2
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database (not started)
+recovery catalog database Password:
+connected to recovery catalog database
+
+RMAN> RESTORE SPFILE FROM AUTOBACKUP;
+
+Starting restore at 2025-07-08 05:02:11
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 07/08/2025 05:02:12
+RMAN-06403: could not access the recovery area
+RMAN-06403: could not obtain a fully authorized session
+ORA-01034: ORACLE not available
+
+-- << 원인 파악 >>
+-- "connected to target database (not started)" 가 단서다.
+-- 인스턴스가 메모리에 없으면 RMAN 은 복원 작업을 수행할 수 없다.
+-- 복원은 서버 프로세스가 하는 일이고 그 프로세스가 없기 때문이다.
+--
+-- spfile 조차 없는 상태에서 NOMOUNT 로 올리는 방법
+--   ① 최소 pfile 을 손으로 만든다 (4-2의 방식)
+--   ② 아무 파라미터 없이 STARTUP NOMOUNT 를 시도한다
+--      → $ORACLE_HOME/dbs/init<SID>.ora 가 없으면 ORA-01078 로 실패
+--
+-- 재해 복구에서 db_name 하나만 있는 pfile 로도 NOMOUNT 는 된다.
+-- 그 상태에서 spfile 을 복원하고 다시 올리는 것이 표준 절차다.
+
+-- << 수정 >>
+
+[oracle@oel7v9r2 ~]$ echo "db_name=orcl" > $ORACLE_HOME/dbs/initorcl2.ora
+[oracle@oel7v9r2 ~]$ sqlplus / as sysdba
+
+SYS@orcl2> STARTUP NOMOUNT;
+
+ORACLE instance started.
+Total System Global Area 1073741824 bytes
+
+-- 기본 SGA 로 올라간다. spfile 복원에는 이것으로 충분하다.
+
+SYS@orcl2> SHUTDOWN IMMEDIATE
+[oracle@oel7v9r2 ~]$ rm -f $ORACLE_HOME/dbs/initorcl2.ora
+
+-- ────────────────────────────────────────────────
+-- 오류 ② SET NEWNAME 없이 복원
+-- ────────────────────────────────────────────────
+-- 4-5에서 SET NEWNAME 을 빠뜨린 경우를 재현한다.
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RESTORE DATAFILE 5;
+
+Starting restore at 2025-07-08 05:14:02
+allocated channel: ORA_DISK_1
+
+channel ORA_DISK_1: starting datafile backup set restore
+channel ORA_DISK_1: restoring datafile 00005 to
+  /u01/app/oracle/oradata/ORCL/example01.dbf
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 07/08/2025 05:14:05
+ORA-19504: failed to create file "/u01/app/oracle/oradata/ORCL/example01.dbf"
+ORA-27040: file create error, unable to create file
+Linux-x86_64 Error: 2: No such file or directory
+
+-- << 원인 파악 >>
+-- 컨트롤파일에 기록된 경로는 원본 서버의 것이다.
+-- SET NEWNAME 을 지정하지 않으면 그 경로로 복원하려 한다.
+-- 대상 서버에는 /u01/app/oracle/oradata/ORCL 이 없다.
+--
+-- 흔한 실수 두 가지
+--   ① 디렉터리를 만들어 우회한다 → 경로 구조가 원본과 뒤섞여 관리가 어려워진다
+--   ② SET NEWNAME 을 일부 파일에만 지정한다 → 나머지가 이 오류로 실패한다
+--
+-- 4-1에서 데이터파일 목록을 수집한 이유가 여기에 있다.
+-- 6번 파일처럼 예외 경로가 있으면 목록 없이는 반드시 빠뜨린다.
+
+-- << 수정 >> 전체 파일에 SET NEWNAME 을 지정한다.
+--
+-- 파일이 많으면 카탈로그 조회로 구문을 생성한다.
+
+RC_REPORT@rcat> SET PAGESIZE 0 FEEDBACK OFF LINESIZE 200
+RC_REPORT@rcat> SELECT '  SET NEWNAME FOR DATAFILE ' || file# ||
+  2         ' TO ''/u02/oradata/ORCL/' ||
+  3         SUBSTR(name, INSTR(name,'/',-1)+1) || ''';'
+  4  FROM   rc_datafile WHERE dbinc_key = 3 ORDER BY file#;
+
+  SET NEWNAME FOR DATAFILE 1 TO '/u02/oradata/ORCL/system01.dbf';
+  SET NEWNAME FOR DATAFILE 2 TO '/u02/oradata/ORCL/sysaux01.dbf';
+  SET NEWNAME FOR DATAFILE 3 TO '/u02/oradata/ORCL/undotbs01.dbf';
+  SET NEWNAME FOR DATAFILE 4 TO '/u02/oradata/ORCL/users01.dbf';
+  SET NEWNAME FOR DATAFILE 5 TO '/u02/oradata/ORCL/example01.dbf';
+  SET NEWNAME FOR DATAFILE 6 TO '/u02/oradata/ORCL/sample01.dbf';
+
+-- 이 출력을 그대로 RUN 블록에 붙여 넣는다.
+-- [7-2]의 스크립트가 이 과정을 자동화한다.
+
+-- ────────────────────────────────────────────────
+-- 오류 ③ SWITCH 없이 RECOVER
+-- ────────────────────────────────────────────────
+
+RMAN> RUN {
+2>   SET NEWNAME FOR DATAFILE 5 TO '/u02/oradata/ORCL/example01.dbf';
+3>   RESTORE DATAFILE 5;
+4>   RECOVER DATAFILE 5;
+5> }
+
+executing command: SET NEWNAME
+
+Starting restore at 2025-07-08 05:22:11
+channel ORA_DISK_1: restoring datafile 00005 to /u02/oradata/ORCL/example01.dbf
+channel ORA_DISK_1: restore complete, elapsed time: 00:01:12
+Finished restore at 2025-07-08 05:23:24
+
+Starting recover at 2025-07-08 05:23:24
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of recover command at 07/08/2025 05:23:26
+RMAN-06571: datafile 5 does not have recoverable copy
+
+-- << 원인 파악 >>
+-- SET NEWNAME + RESTORE 는 새 경로에 "데이터파일 복사본"을 만든다.
+-- 컨트롤파일은 아직 원본 경로를 데이터파일로 알고 있다.
+-- 복구 대상은 컨트롤파일이 아는 파일이므로 복사본은 대상이 아니다.
+--
+-- SWITCH 가 그 연결을 바꾼다.
+--   SWITCH DATAFILE 5;      한 파일
+--   SWITCH DATAFILE ALL;    새 이름이 지정된 전체
+--
+-- 세 명령의 역할
+--   SET NEWNAME  어디에 복원할지 지정
+--   RESTORE      그 위치에 파일을 만든다
+--   SWITCH       컨트롤파일이 그 파일을 데이터파일로 인식하게 한다
+--   RECOVER      그 파일에 리두를 적용한다
+--
+-- 순서를 바꾸거나 하나를 빠뜨리면 반드시 막힌다.
+
+-- << 수정 >>
+
+RMAN> SWITCH DATAFILE 5 TO COPY;
+
+datafile 5 switched to datafile copy
+input datafile copy RECID=18 STAMP=1194506611
+  file name=/u02/oradata/ORCL/example01.dbf
+
+RMAN> RECOVER DATAFILE 5;
+
+Starting recover at 2025-07-08 05:25:02
+starting media recovery
+media recovery complete, elapsed time: 00:00:14
+Finished recover at 2025-07-08 05:25:18
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+-- 6-1. 데이터베이스 상태
+
+[oracle@oel7v9r2 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT name, dbid, open_mode, TO_CHAR(resetlogs_time,
+  2         'YYYY-MM-DD HH24:MI:SS') AS resetlogs
+  3  FROM   v$database;
+
+NAME       DBID       OPEN_MODE   RESETLOGS
+---------- ---------- ----------- -------------------
+ORCL       1547823901 READ WRITE  2025-07-08 04:41:12
+
+-- DBID 가 그대로다.
+-- 재해 복구는 복제가 아니므로 DBID 가 유지되어야 한다.
+-- 17장의 DUPLICATE 는 새 DBID 를 만든다는 점이 다르다.
+
+SYS@orcl> SELECT file#, name, status FROM v$datafile ORDER BY file#;
+
+FILE# NAME                                    STATUS
+----- --------------------------------------- -------
+    1 /u02/oradata/ORCL/system01.dbf          SYSTEM
+    2 /u02/oradata/ORCL/sysaux01.dbf          ONLINE
+    3 /u02/oradata/ORCL/undotbs01.dbf         ONLINE
+    4 /u02/oradata/ORCL/users01.dbf           ONLINE
+    5 /u02/oradata/ORCL/example01.dbf         ONLINE
+    6 /u02/oradata/ORCL/sample01.dbf          ONLINE
+
+SYS@orcl> SELECT group#, ROUND(bytes/1024/1024) AS mb, members, status
+  2  FROM   v$log ORDER BY group#;
+
+GROUP#    MB MEMBERS STATUS
+------ ----- ------- ----------
+     1   200       2 CURRENT
+     2   200       2 UNUSED
+     3   200       2 UNUSED
+
+SYS@orcl> SELECT member FROM v$logfile ORDER BY group#, member;
+
+MEMBER
+------------------------------------------
+/u02/oradata/ORCL/redo01a.log
+/u02/oradata/ORCL/redo01b.log
+/u02/oradata/ORCL/redo02a.log
+...
+
+-- 4-1의 (3)에서 확인한 구성(200MB 3그룹 2멤버)대로 만들어졌다.
+
+-- 6-2. 데이터 검증
+
+SYS@orcl> SELECT COUNT(*) FROM itwill.emp;
+
+  COUNT(*)
+----------
+       107
+
+SYS@orcl> SELECT tablespace_name, status FROM dba_tablespaces ORDER BY 1;
+
+TABLESPACE_NAME  STATUS
+---------------- ---------
+EXAMPLE          ONLINE
+SAMPLE           ONLINE
+SYSAUX           ONLINE
+SYSTEM           ONLINE
+TEMP             ONLINE
+UNDOTBS1         ONLINE
+USERS            ONLINE
+
+SYS@orcl> SELECT COUNT(*) FROM dba_objects WHERE status = 'INVALID';
+
+  COUNT(*)
+----------
+         0
+
+SYS@orcl> SELECT * FROM v$recover_file;
+
+no rows selected
+
+-- 6-3. 손실 범위 확정 (요구 사항 ③)
+
+SYS@orcl> SELECT TO_CHAR(MAX(next_time),'YYYY-MM-DD HH24:MI:SS') AS recovered_to,
+  2         MAX(next_change#) AS recovered_scn
+  3  FROM   v$archived_log WHERE applied = 'YES';
+
+RECOVERED_TO        RECOVERED_SCN
+------------------- -------------
+2025-07-08 02:04:55       3487104
+
+-- 최종 보고 내용
+--   복구 완료 시점 : 2025-07-08 02:04:55 (SCN 3487104)
+--   장애 발생 시점 : 2025-07-08 03:20:11 (SCN 3488022)
+--   손실 구간      : 1시간 15분 16초
+--   복구 소요 시간 : 1시간 7분 (03:34 ~ 04:41)
+--
+-- 손실을 줄이려면 아카이브 백업 주기를 줄여야 한다.
+-- 현재 일 1회에서 시간당 1회로 바꾸면 손실이 최대 1시간으로 줄어든다.
+-- 실시간 보호가 필요하면 Data Guard 를 검토해야 한다.
+
+-- 6-4. 카탈로그 정상화 (요구 사항 ④)
+
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: ORCL (DBID=1547823901)
+connected to recovery catalog database
+
+RMAN> LIST INCARNATION OF DATABASE;
+
+List of Database Incarnations
+DB Key  Inc Key DB Name  DB ID       STATUS  Reset SCN  Reset Time
+------- ------- -------- ----------- ------- ---------- -------------------
+1       3       ORCL     1547823901  PARENT  1          2025-05-22 16:44:11
+1       88      ORCL     1547823901  CURRENT 3487105    2025-07-08 04:41:12
+
+-- 새 인카네이션이 카탈로그에 자동 등록되었다.
+
+RMAN> RESYNC CATALOG;
+
+starting full resync of recovery catalog
+full resync complete
+
+-- CONFIGURE 설정이 복원된 컨트롤파일에서 온 것이므로 경로를 고쳐야 한다.
+
+RMAN> SHOW ALL;
+
+CONFIGURE CHANNEL DEVICE TYPE DISK FORMAT   '/backup/%d/%U';
+CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS;
+CONFIGURE CONTROLFILE AUTOBACKUP ON;
+
+-- /backup 은 대상 서버에서도 유효하므로 그대로 둔다.
+
+RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'ORCL_POST_DR';
+
+Starting backup at 2025-07-08 05:44:11
+Finished backup at 2025-07-08 06:12:33
+
+-- 새 인카네이션 기준선을 만든다.
+-- 이 백업이 없으면 다음 장애에서 복구 경로가 매우 복잡해진다.
+
+-- 6-5. 접속 경로 정상화
+
+[oracle@oel7v9r2 ~]$ lsnrctl status | grep -A2 'Service "orcl"'
+
+Service "orcl" has 1 instance(s).
+  Instance "orcl", status READY, has 1 handler(s) for this service...
+
+[oracle@oel7v9r2 ~]$ tnsping ORCL | tail -2
+
+OK (0 msec)
+
+-- 애플리케이션의 접속 정보를 oel7v9r2 로 변경해야 한다.
+-- 서비스 이름은 그대로이므로 tnsnames 의 HOST 만 바꾸면 된다.
+
+-- 6-6. 고급 실습 02의 리포트로 최종 확인
+
+[oracle@oel7v9r2 ~]$ sqlplus -s rc_report/oracle_4U@rcat \
+>   @/home/oracle/rcadm/rc_daily_report.sql | head -12
+
+================================================================================
+ Recovery Catalog 일일 백업 점검 리포트
+================================================================================
+
+[ 섹션 1. 요약 ]
+DB_NAME    LAST_FULL     LAST_ARCH     NEED_BKP UNUSABLE RESYNC_H JUDGE
+---------- ------------- ------------- -------- -------- -------- ------
+HRDB       07-06 01:04   07-08 02:16          0        0      3.9 OK
+ORCL       07-08 05:44   07-08 06:10          0        0      0.1 OK
+SALES      07-06 01:20   07-08 02:31          0        0      3.7 OK
+
+-- ORCL 이 정상으로 돌아왔다. 요구 사항 ④ 충족.
+
+-- 6-7. 소요 시간 실측 (요구 사항 ⑤)
+--
+--   단계                        | 추정   | 실측   | 비고
+--   ----------------------------|--------|--------|--------------------
+--   ① 카탈로그 정보 수집       | 10분   | 14분   | 조회 작성에 시간 소요
+--   ② 대상 서버 준비           | 10분   |  6분   |
+--   ③ NOMOUNT                  |  2분   |  1분   |
+--   ④ spfile 복원              |  3분   |  2분   |
+--   ⑤ spfile 수정·재기동       |  5분   |  8분   | sed 경로 확인에 시간
+--   ⑥ 컨트롤파일 복원·MOUNT    |  5분   |  3분   |
+--   ⑦ RESTORE + SWITCH         | 40분   | 19분   | 로컬 디스크라 빨랐다
+--   ⑧ RECOVER                  | 20분   | 12분   |
+--   ⑨ OPEN RESETLOGS           |  5분   |  2분   |
+--   ⑩ 검증                     | 15분   | 10분   |
+--   ----------------------------|--------|--------|
+--   오픈까지 합계               | 100분  | 67분   |
+--   ⑪ 새 기준 백업             | 30분   | 28분   |
+--   전체 정상화                 | 130분  | 95분   |
+--
+--   RTO 산정 근거로 이 표를 남긴다.
+--   백업이 원격에 있었다면 ⑦이 크게 늘었을 것이다.
+--   최악의 경우를 가정해 RTO 를 3시간으로 선언한다.
+
+--------------------------------------------------------------------------------
+[7] 운영 산출물과 확장 과제
+--------------------------------------------------------------------------------
+-- 7-1. dr_collect_info.sql — 재해 시 정보 수집
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/dr_collect_info.sql
+
+-- 재해 복구 정보 수집
+-- 실행 : sqlplus -s rc_report/<pw>@rcat @dr_collect_info.sql <DB_NAME>
+SET LINESIZE 200 PAGESIZE 200 FEEDBACK OFF VERIFY OFF TRIMSPOOL ON
+DEFINE dbname = &1
+SPOOL /tmp/dr_info_&dbname..txt
+
+PROMPT ================================================================
+PROMPT  재해 복구 정보 : &dbname
+PROMPT ================================================================
+
+PROMPT === 1. DBID 와 인카네이션 (가장 먼저 확보) ===
+SELECT dbid, name, dbinc_key,
+       TO_CHAR(reset_time,'YYYY-MM-DD HH24:MI:SS') AS reset_time
+FROM   rc_database WHERE name = UPPER('&dbname');
+
+PROMPT === 2. 데이터파일 구성 ===
+SELECT file#, tablespace_name, ROUND(bytes/1024/1024) AS mb, name
+FROM   rc_datafile
+WHERE  dbinc_key = (SELECT MAX(dbinc_key) FROM rc_database
+                    WHERE name = UPPER('&dbname'))
+ORDER  BY file#;
+
+PROMPT === 3. SET NEWNAME 구문 생성 (경로는 수정해서 사용) ===
+SELECT '  SET NEWNAME FOR DATAFILE ' || file# ||
+       ' TO ''<신규경로>/' || SUBSTR(name, INSTR(name,'/',-1)+1) || ''';'
+FROM   rc_datafile
+WHERE  dbinc_key = (SELECT MAX(dbinc_key) FROM rc_database
+                    WHERE name = UPPER('&dbname'))
+ORDER  BY file#;
+
+PROMPT === 4. 리두 로그 구성 ===
+SELECT group#, thread#, ROUND(bytes/1024/1024) AS mb, members
+FROM   rc_redo_log
+WHERE  dbinc_key = (SELECT MAX(dbinc_key) FROM rc_database
+                    WHERE name = UPPER('&dbname'))
+ORDER  BY group#;
+
+PROMPT === 5. 임시 테이블스페이스 ===
+SELECT tablespace_name, ROUND(bytes/1024/1024) AS mb
+FROM   rc_tempfile
+WHERE  dbinc_key = (SELECT MAX(dbinc_key) FROM rc_database
+                    WHERE name = UPPER('&dbname'));
+
+PROMPT === 6. 최근 백업 (복원 대상 판단) ===
+SELECT bs_key, bck_type, incr_level,
+       TO_CHAR(completion_time,'MM-DD HH24:MI') AS done
+FROM   rc_backup_set
+WHERE  db_name = UPPER('&dbname') AND completion_time > SYSDATE - 7
+ORDER  BY completion_time;
+
+PROMPT === 7. 백업 조각 위치 (매체 준비) ===
+SELECT DISTINCT SUBSTR(handle, 1, INSTR(handle,'/',-1)) AS directory,
+       COUNT(*) AS pieces
+FROM   rc_backup_piece
+WHERE  db_name = UPPER('&dbname') AND status = 'A'
+GROUP  BY SUBSTR(handle, 1, INSTR(handle,'/',-1));
+
+PROMPT === 8. 복구 가능 종점 (손실 산정) ===
+SELECT MAX(sequence#) AS last_backed_seq,
+       TO_CHAR(MAX(next_time),'YYYY-MM-DD HH24:MI:SS') AS covered_until,
+       MAX(next_change#) AS covered_scn
+FROM   rc_archived_log a
+WHERE  a.db_name = UPPER('&dbname')
+AND    EXISTS (SELECT 1 FROM rc_backup_redolog b
+               WHERE b.dbinc_key = a.dbinc_key AND b.sequence# = a.sequence#);
+
+PROMPT === 9. CONFIGURE 설정 (재현용) ===
+SELECT value FROM rc_rman_configuration
+WHERE  db_key = (SELECT db_key FROM rc_database WHERE name = UPPER('&dbname'))
+ORDER  BY conf#;
+
+SPOOL OFF
+
+-- 7-2. dr_rebuild.sh — 재구축 실행 보조
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/dr_rebuild.sh
+
+#!/bin/bash
+# 타 서버 재구축 보조 스크립트
+# 사용법 : dr_rebuild.sh <DB_NAME> <신규 데이터 경로> <신규 아카이브 경로>
+# 예    : dr_rebuild.sh ORCL /u02/oradata/ORCL /u02/arch_orcl
+#
+# 주의 : 이 스크립트는 준비와 구문 생성까지만 한다.
+#        실제 RESTORE/RECOVER 는 사람이 확인 후 실행한다.
+set -u
+DBNAME=$1
+DATADIR=$2
+ARCHDIR=$3
+SID=$(echo $DBNAME | tr 'A-Z' 'a-z')
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export ORACLE_SID=$SID
+export PATH=$ORACLE_HOME/bin:$PATH
+WORK=/tmp/dr_$DBNAME
+
+mkdir -p $WORK $DATADIR $ARCHDIR
+
+echo "=== 1. 카탈로그에서 정보 수집 ==="
+sqlplus -s rc_report/oracle_4U@rcat \
+  @/home/oracle/rcadm/dr_collect_info.sql $DBNAME > /dev/null
+cp /tmp/dr_info_$DBNAME.txt $WORK/
+grep -A20 '=== 1\.' $WORK/dr_info_$DBNAME.txt
+
+DBID=$(grep -A3 '=== 1\.' $WORK/dr_info_$DBNAME.txt | tail -1 | awk '{print $1}')
+echo "DBID = $DBID"
+
+echo "=== 2. SET NEWNAME 구문 생성 ==="
+sqlplus -s rc_report/oracle_4U@rcat << EOF > $WORK/set_newname.txt
+SET PAGESIZE 0 FEEDBACK OFF LINESIZE 200 HEADING OFF
+SELECT '  SET NEWNAME FOR DATAFILE ' || file# || ' TO ''$DATADIR/' ||
+       SUBSTR(name, INSTR(name,'/',-1)+1) || ''';'
+FROM   rc_datafile
+WHERE  dbinc_key = (SELECT MAX(dbinc_key) FROM rc_database
+                    WHERE name = '$DBNAME')
+ORDER  BY file#;
+EXIT
+EOF
+cat $WORK/set_newname.txt
+
+echo "=== 3. 복원 스크립트 생성 ==="
+{
+  echo "RUN {"
+  echo "  ALLOCATE CHANNEL c1 DEVICE TYPE DISK;"
+  echo "  ALLOCATE CHANNEL c2 DEVICE TYPE DISK;"
+  cat $WORK/set_newname.txt
+  echo "  RESTORE DATABASE;"
+  echo "  SWITCH DATAFILE ALL;"
+  echo "  RECOVER DATABASE;"
+  echo "  RELEASE CHANNEL c1;"
+  echo "  RELEASE CHANNEL c2;"
+  echo "}"
+} > $WORK/restore.rman
+
+cat $WORK/restore.rman
+
+echo
+echo "=== 4. 최소 pfile 생성 ==="
+cat > $ORACLE_HOME/dbs/init${SID}.ora << EOF
+db_name=$SID
+sga_target=2G
+db_block_size=8192
+compatible=19.0.0
+control_files='$DATADIR/control01.ctl'
+audit_file_dest='/u02/admin/$SID/adump'
+EOF
+mkdir -p /u02/admin/$SID/adump
+echo "생성됨 : $ORACLE_HOME/dbs/init${SID}.ora"
+
+echo
+echo "=== 다음 단계를 수동으로 수행한다 ==="
+cat << EOF
+1) sqlplus / as sysdba
+   STARTUP NOMOUNT PFILE='\$ORACLE_HOME/dbs/init${SID}.ora';
+2) rman target / catalog rcatowner@rcat
+   RESTORE SPFILE TO '/tmp/spfile_${SID}.ora' FROM AUTOBACKUP;
+3) pfile 로 변환해 경로를 수정한 뒤 spfile 재생성, NOMOUNT 재기동
+4) rman target / catalog rcatowner@rcat
+   RESTORE CONTROLFILE;
+   ALTER DATABASE MOUNT;
+   @$WORK/restore.rman
+5) ALTER DATABASE OPEN RESETLOGS;
+6) RESYNC CATALOG; BACKUP DATABASE PLUS ARCHIVELOG;
+EOF
+
+-- 7-3. 확장 과제
+--
+-- 과제 A. 카탈로그도 함께 잃었다면
+--   이 실습은 카탈로그가 살아 있는 것을 전제로 했다.
+--   카탈로그와 운영 서버를 동시에 잃었을 때의 복구 절차를 작성하시오.
+--   고급 실습 05의 절차 D와 결합해 전체 순서를 만든다.
+--   DBID_LIST.txt 가 어디에 보관되어야 하는지도 재검토한다.
+--
+-- 과제 B. 손실 구간 축소
+--   [6-3]의 손실 1시간 15분을 10분 이내로 줄이는 방안을 세 가지 제시하고
+--   각각의 비용과 운영 부담을 비교하시오.
+--   아카이브 백업 주기 단축 / 아카이브 다중 대상 / Data Guard 를 검토한다.
+--
+-- 과제 C. 복구 순서의 근거
+--   [2-3]의 11단계에서 순서를 바꿀 수 있는 단계와
+--   절대 바꿀 수 없는 단계를 구분하고 이유를 설명하시오.
+--
+-- 과제 D. 임시 테이블스페이스
+--   이 실습에서 TEMP 는 어떻게 처리되었는가.
+--   RESETLOGS 후 임시 파일이 자동으로 만들어지는지 확인하고
+--   그렇지 않다면 어떤 조치가 필요한지 서술하시오.
+--
+-- 과제 E. 애플리케이션 전환
+--   DB 복구는 끝났지만 서비스는 아직 정상이 아니다.
+--   접속 정보 변경, 커넥션 풀 재시작, 배치 재개 순서를 포함한
+--   서비스 전환 절차를 작성하시오.
+
+-- 7-4. 정리 — 이 실습에서 남는 것
+--
+--   ① dr_collect_info.sql : 재해 시 정보 수집 (9개 항목)
+--   ② dr_rebuild.sh       : 준비와 구문 생성 자동화
+--   ③ 경로 매핑 설계표    : [2-2]
+--   ④ 복구 순서 11단계    : [2-3]
+--   ⑤ RTO 실측 근거표     : [6-7]
+--
+-- 다음 예제에서는 이 복구 시간을 좌우하는 백업 성능을 다룬다.
+
+-- 실무 포인트
+-- 1) 카탈로그가 복구 계획의 출발점이다.
+--    DBID 없이는 자동 백업을 찾지 못하고
+--    파일 목록 없이는 SET NEWNAME 을 만들 수 없다.
+--    dr_collect_info.sql 을 평시에 정기 실행해 결과를 별도 보관한다.
+--
+-- 2) SET NEWNAME · RESTORE · SWITCH · RECOVER 는 한 묶음이다.
+--    하나라도 빠지면 ORA-19504 나 RMAN-06571 로 막힌다.
+--    각 명령이 무엇을 바꾸는지 이해하면 순서를 외울 필요가 없다.
+--
+-- 3) spfile 은 원본 경로를 그대로 담고 있다.
+--    복원한 뒤 반드시 pfile 로 변환해 경로를 고치고 다시 만든다.
+--    이 단계를 건너뛰면 MOUNT 부터 실패한다.
+--
+-- 4) 재해 복구는 복제가 아니다.
+--    DBID 가 유지되어야 하며 카탈로그의 기존 이력을 이어서 쓴다.
+--    17장의 DUPLICATE 는 새 DBID 를 만든다는 점에서 목적이 다르다.
+--
+-- 5) 손실 범위를 먼저 산정해 보고한다.
+--    복구 시작 전에 "어디까지 살릴 수 있는가"를 확정해야
+--    업무 측이 수작업 복원 계획을 병행할 수 있다.
+--    이 판단이 늦으면 전체 복구 시간이 길어진다.
+--
+-- 6) 복구 완료는 오픈이 아니라 백업 체계 정상화까지다.
+--    RESETLOGS 후 새 기준 백업을 받지 않으면
+--    다음 장애에서 인카네이션을 거슬러야 하는 훨씬 어려운 상황이 된다.

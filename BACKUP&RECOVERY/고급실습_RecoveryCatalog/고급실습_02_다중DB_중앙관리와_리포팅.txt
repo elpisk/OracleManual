@@ -1,0 +1,836 @@
+================================================================================
+ 고급 실습 02 : 다중 데이터베이스 중앙 등록과 백업 현황 리포팅
+ 과정      : Oracle Database 19c Backup & Recovery — Recovery Catalog 고급
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / oel7v9r1(운영계) + oel7v9r2(관리계)
+ 대상 DB   : orcl, sales (oel7v9r1) / hrdb (oel7v9r2)
+ 카탈로그  : rcat @ oel7v9r2
+ 소요 시간 : 약 3시간
+ 선행 조건 : 고급 실습 01 완료 (VPC 구성)
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실무 상황
+--------------------------------------------------------------------------------
+-- 지금은 매일 아침 이렇게 확인한다.
+--   ① 서버 세 대에 각각 접속한다
+--   ② 백업 로그 파일을 열어 마지막 줄을 본다
+--   ③ "Finished backup" 이 있으면 정상으로 판단한다
+--
+-- 지난달에 사고가 있었다.
+--   sales 의 아카이브 로그 백업이 11일간 수행되지 않았다.
+--   로그 파일에는 매일 "Finished backup" 이 찍혀 있었다.
+--   전체 백업은 성공했고 아카이브 백업 구문만 스크립트에서 빠져 있었다.
+--   마지막 줄만 보는 점검으로는 잡을 수 없는 유형이었다.
+--
+-- 그 사이 아카이브 대상이 가득 차 DB가 두 시간 멈췄다.
+--
+-- 요구 사항
+--   ① 세 대의 백업 현황을 한 화면에서 본다
+--   ② 성공 여부가 아니라 "복구 가능한 상태인가"를 판정한다
+--   ③ 판정 기준을 수치로 정의하고 임계값을 넘으면 경고한다
+--   ④ 매일 아침 자동으로 생성되어 메일로 도착한다
+--   ⑤ 감사 제출용으로 월간 이력을 뽑을 수 있다
+--
+-- 카탈로그에는 세 대의 백업 이력이 이미 모여 있다.
+-- 이 실습에서는 그 데이터를 판정 가능한 형태로 가공한다.
+
+--------------------------------------------------------------------------------
+[2] 사전 설계
+--------------------------------------------------------------------------------
+-- 2-1. 점검 항목과 판정 기준
+--
+--   항목                      | 조회 대상                    | 경고 기준
+--   --------------------------|------------------------------|-------------------
+--   최근 백업 작업 결과       | rc_rman_backup_job_details   | FAILED 또는 오류 존재
+--   전체 백업 최신성          | rc_backup_set                | 7일 초과
+--   아카이브 백업 최신성      | rc_backup_set (input_type)   | 1일 초과
+--   백업이 없는 데이터파일    | rc_datafile / rc_backup_datafile | 1건 이상
+--   사용 불가 백업            | rc_unusable_backupfile_details | 1건 이상
+--   컨트롤파일 자동 백업      | rc_backup_controlfile        | 1일 초과
+--   카탈로그 동기화 시각      | rc_resync                    | 1일 초과
+--   백업 소요 시간 급증       | rc_rman_backup_job_details   | 직전 평균의 150%
+--
+--   ※ "성공 여부"가 아니라 "복구 가능한가"로 기준을 잡은 것이 핵심이다.
+--     명령이 성공했어도 대상이 빠졌으면 복구할 수 없다.
+
+-- 2-2. 리포트 구성
+--
+--   섹션 1. 요약     — DB별 한 줄. 신호등(OK / WARN / CRIT)
+--   섹션 2. 상세     — 항목별 수치와 임계값
+--   섹션 3. 예외     — 경고 항목만 모아서
+--   섹션 4. 추세     — 최근 7일 백업 크기와 소요 시간
+--
+--   출력은 고정폭 텍스트로 한다.
+--   메일 본문에 그대로 붙일 수 있고 터미널에서도 읽힌다.
+
+-- 2-3. 리포팅 전용 계정
+--
+--   고급 실습 01의 확장 과제 A에서 제기된 문제를 여기서 해결한다.
+--   VPC는 조회와 변경 권한을 함께 부여하므로 읽기 전용 감사자를 만들 수 없다.
+--   대신 rc_ 뷰에 대한 SELECT 권한만 가진 별도 계정을 만든다.
+--
+--   계정명 : rc_report
+--   권한   : CREATE SESSION + rcatowner 소유 rc_ 뷰에 대한 SELECT
+--   제약   : 어떤 RMAN 명령도 실행할 수 없다
+
+-- 2-4. 리포트가 판정하지 못하는 것
+--
+--   카탈로그에 기록되지 않은 백업은 리포트에 나타나지 않는다.
+--   nocatalog 로 수행한 백업이 대표적이다.
+--   그래서 리포트에 "카탈로그 동기화 시각" 항목을 넣는다.
+--   이 값이 오래되었으면 리포트 자체를 믿을 수 없다는 뜻이다.
+
+--------------------------------------------------------------------------------
+[3] 환경 준비
+--------------------------------------------------------------------------------
+-- 3-1. 세 대의 등록 상태와 최근 백업 확인
+
+[oracle@oel7v9r2 ~]$ sqlplus rcatowner/oracle_4U@rcat
+
+RCATOWNER@rcat> SET LINESIZE 160 PAGESIZE 100
+
+RCATOWNER@rcat> SELECT dbid, name, reset_time, dbinc_key
+  2  FROM   rc_database ORDER BY name;
+
+      DBID NAME     RESET_TIME           DBINC_KEY
+---------- -------- ------------------- ----------
+3391560212 HRDB     2025-05-19 14:20:07         42
+1547823901 ORCL     2025-05-22 16:44:11          3
+2284410077 SALES    2025-05-18 09:02:33         22
+
+-- 3-2. 사용할 뷰 목록 확인
+
+RCATOWNER@rcat> SELECT view_name FROM dba_views
+  2  WHERE  owner = 'RCATOWNER' AND view_name LIKE 'RC_%'
+  3  AND    view_name IN ('RC_DATABASE','RC_BACKUP_SET','RC_BACKUP_PIECE',
+  4                       'RC_BACKUP_DATAFILE','RC_BACKUP_CONTROLFILE',
+  5                       'RC_RMAN_STATUS','RC_RMAN_BACKUP_JOB_DETAILS',
+  6                       'RC_UNUSABLE_BACKUPFILE_DETAILS','RC_DATAFILE',
+  7                       'RC_ARCHIVED_LOG','RC_RESYNC','RC_BACKUP_FILES')
+  8  ORDER BY view_name;
+
+VIEW_NAME
+--------------------------------
+RC_ARCHIVED_LOG
+RC_BACKUP_CONTROLFILE
+RC_BACKUP_DATAFILE
+RC_BACKUP_FILES
+RC_BACKUP_PIECE
+RC_BACKUP_SET
+RC_DATABASE
+RC_DATAFILE
+RC_RESYNC
+RC_RMAN_BACKUP_JOB_DETAILS
+RC_RMAN_STATUS
+RC_UNUSABLE_BACKUPFILE_DETAILS
+
+12 rows selected.
+
+-- 3-3. 리포팅 전용 계정 생성
+
+SYS@rcat> CREATE USER rc_report IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE rcat_data
+  3    TEMPORARY TABLESPACE temp
+  4    QUOTA 0 ON rcat_data;
+
+User created.
+
+SYS@rcat> GRANT CREATE SESSION TO rc_report;
+
+Grant succeeded.
+
+-- QUOTA 0 으로 두어 어떤 객체도 만들지 못하게 한다.
+
+-- 3-4. 필요한 뷰에만 SELECT 권한을 부여한다
+
+RCATOWNER@rcat> BEGIN
+  2    FOR v IN (SELECT view_name FROM user_views
+  3              WHERE view_name LIKE 'RC\_%' ESCAPE '\') LOOP
+  4      EXECUTE IMMEDIATE 'GRANT SELECT ON ' || v.view_name || ' TO rc_report';
+  5    END LOOP;
+  6  END;
+  7  /
+
+PL/SQL procedure successfully completed.
+
+RCATOWNER@rcat> SELECT COUNT(*) FROM user_tab_privs
+  2  WHERE  grantee = 'RC_REPORT' AND privilege = 'SELECT';
+
+  COUNT(*)
+----------
+        58
+
+-- 3-5. 동의어를 만들어 스키마 접두어 없이 쓰게 한다
+
+SYS@rcat> BEGIN
+  2    FOR v IN (SELECT view_name FROM dba_views
+  3              WHERE owner = 'RCATOWNER' AND view_name LIKE 'RC\_%' ESCAPE '\')
+  4    LOOP
+  5      EXECUTE IMMEDIATE 'CREATE OR REPLACE SYNONYM rc_report.' ||
+  6        v.view_name || ' FOR rcatowner.' || v.view_name;
+  7    END LOOP;
+  8  END;
+  9  /
+
+PL/SQL procedure successfully completed.
+
+-- 3-6. 접속 확인
+
+[oracle@oel7v9r2 ~]$ sqlplus rc_report/oracle_4U@rcat
+
+RC_REPORT@rcat> SELECT name FROM rc_database ORDER BY name;
+
+NAME
+--------
+HRDB
+ORCL
+SALES
+
+-- 세 대가 모두 보인다. VPC와 달리 전체를 조회할 수 있다.
+
+--------------------------------------------------------------------------------
+[4] 구축과 수행
+--------------------------------------------------------------------------------
+-- 조회를 하나씩 만들며 무엇을 판정하는지 확인한다.
+-- 마지막에 하나의 스크립트로 합친다.
+
+-- ────────────────────────────────────────────────
+-- 4-1. 최근 백업 작업 결과
+-- ────────────────────────────────────────────────
+
+RC_REPORT@rcat> SET LINESIZE 170 PAGESIZE 60
+RC_REPORT@rcat> COLUMN db_name FORMAT A10
+RC_REPORT@rcat> COLUMN input_type FORMAT A18
+RC_REPORT@rcat> COLUMN status FORMAT A24
+
+RC_REPORT@rcat> SELECT db_name, input_type, status,
+  2         TO_CHAR(start_time,'MM-DD HH24:MI') AS started,
+  3         time_taken_display AS elapsed,
+  4         output_bytes_display AS size
+  5  FROM   rc_rman_backup_job_details
+  6  WHERE  start_time > SYSDATE - 1
+  7  ORDER  BY db_name, start_time;
+
+DB_NAME    INPUT_TYPE         STATUS                   STARTED     ELAPSED  SIZE
+---------- ------------------ ------------------------ ----------- -------- ------
+HRDB       DB INCR            COMPLETED                06-03 02:10 00:04:22 412.5M
+HRDB       ARCHIVELOG         COMPLETED                06-03 02:16 00:00:48  62.1M
+ORCL       DB INCR            COMPLETED                06-03 02:00 00:08:11 1.24G
+ORCL       ARCHIVELOG         COMPLETED                06-03 02:09 00:01:32 188.4M
+SALES      DB INCR            COMPLETED WITH WARNINGS  06-03 02:30 00:06:03 780.2M
+
+-- SALES 의 아카이브 백업 행이 없다.
+-- 그리고 전체 백업은 경고를 동반해 끝났다.
+-- 이것이 [1]에서 말한 사고의 형태다.
+
+-- STATUS 값의 종류를 확인한다.
+
+RC_REPORT@rcat> SELECT status, COUNT(*) FROM rc_rman_backup_job_details
+  2  WHERE  start_time > SYSDATE - 30 GROUP BY status ORDER BY 2 DESC;
+
+STATUS                     COUNT(*)
+------------------------ ----------
+COMPLETED                        84
+COMPLETED WITH WARNINGS           3
+FAILED                            2
+RUNNING                           1
+
+-- COMPLETED 가 아닌 것을 모두 경고 대상으로 삼는다.
+
+-- ────────────────────────────────────────────────
+-- 4-2. 백업 최신성 — 종류별 마지막 시각
+-- ────────────────────────────────────────────────
+
+RC_REPORT@rcat> SELECT d.name AS db_name,
+  2    MAX(CASE WHEN b.incr_level = 0 OR b.incr_level IS NULL
+  3             THEN b.completion_time END) AS last_full,
+  4    MAX(CASE WHEN b.incr_level > 0 THEN b.completion_time END) AS last_incr,
+  5    MAX(CASE WHEN b.bck_type = 'L' THEN b.completion_time END) AS last_arch
+  6  FROM   rc_database d JOIN rc_backup_set b ON d.db_key = b.db_key
+  7  GROUP  BY d.name ORDER BY d.name;
+
+DB_NAME    LAST_FULL           LAST_INCR           LAST_ARCH
+---------- ------------------- ------------------- -------------------
+HRDB       2025-06-01 02:04:11 2025-06-03 02:14:33 2025-06-03 02:16:52
+ORCL       2025-06-01 02:00:08 2025-06-03 02:08:41 2025-06-03 02:10:19
+SALES      2025-06-01 02:20:44 2025-06-03 02:36:12 2025-05-23 02:22:07
+
+-- SALES 의 아카이브 백업이 11일 전이다.
+-- 로그 마지막 줄만 보는 점검으로는 이것을 절대 잡지 못한다.
+
+-- 경과 시간으로 바꿔 판정한다.
+
+RC_REPORT@rcat> SELECT d.name AS db_name,
+  2    ROUND(SYSDATE - MAX(CASE WHEN b.bck_type = 'L'
+  3          THEN b.completion_time END), 1) AS arch_age_days,
+  4    CASE WHEN SYSDATE - MAX(CASE WHEN b.bck_type = 'L'
+  5              THEN b.completion_time END) > 1 THEN 'CRIT' ELSE 'OK' END AS judge
+  6  FROM   rc_database d JOIN rc_backup_set b ON d.db_key = b.db_key
+  7  GROUP  BY d.name ORDER BY d.name;
+
+DB_NAME    ARCH_AGE_DAYS JUDGE
+---------- ------------- -----
+HRDB                  .3 OK
+ORCL                  .3 OK
+SALES               11.4 CRIT
+
+-- ────────────────────────────────────────────────
+-- 4-3. 백업이 없는 데이터파일
+-- ────────────────────────────────────────────────
+-- 파일이 새로 추가되었는데 백업 스크립트가 테이블스페이스를
+-- 명시적으로 나열하는 방식이면 그 파일이 빠진다.
+
+RC_REPORT@rcat> SELECT d.name AS db_name, f.file#, f.tablespace_name,
+  2         ROUND(f.bytes/1024/1024) AS mb
+  3  FROM   rc_database d
+  4    JOIN rc_datafile f ON d.dbinc_key = f.dbinc_key
+  5  WHERE  NOT EXISTS (
+  6           SELECT 1 FROM rc_backup_datafile bd
+  7           WHERE  bd.dbinc_key = f.dbinc_key AND bd.file# = f.file#
+  8           AND    bd.completion_time > SYSDATE - 7)
+  9  ORDER  BY d.name, f.file#;
+
+DB_NAME    FILE# TABLESPACE_NAME        MB
+---------- ----- -------------------- ----
+SALES          7 SALES_ARCHIVE        2048
+
+-- 지난주에 추가된 테이블스페이스가 백업 대상에서 빠져 있다.
+-- 이 항목은 REPORT NEED BACKUP 으로도 확인할 수 있으나
+-- 리포트에서는 SQL로 한 번에 뽑는 편이 낫다.
+
+-- RMAN 명령과 대조해 본다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> REPORT NEED BACKUP;
+
+RMAN retention policy will be applied to the command
+RMAN retention policy is set to recovery window of 14 days
+Report of files with less than 1 redundant backups
+File #bkps Name
+---- ----- -----------------------------------------------------
+7    0     /u01/app/oracle/oradata/SALES/sales_arch01.dbf
+
+RMAN> REPORT UNRECOVERABLE;
+
+Report of files that need backup due to unrecoverable operations
+File Type of Backup Required Name
+---- ----------------------- -----------------------------------
+(none)
+
+-- ────────────────────────────────────────────────
+-- 4-4. 사용 불가 백업
+-- ────────────────────────────────────────────────
+
+RC_REPORT@rcat> SELECT db_name, type, status, COUNT(*) AS cnt
+  2  FROM   rc_unusable_backupfile_details
+  3  GROUP  BY db_name, type, status ORDER BY db_name;
+
+DB_NAME    TYPE            STATUS     CNT
+---------- --------------- ---------- ---
+ORCL       BACKUP PIECE    EXPIRED      4
+SALES      BACKUP PIECE    UNAVAILABLE  1
+
+-- EXPIRED     : 카탈로그에는 있으나 실제 파일이 없다
+-- UNAVAILABLE : 사람이 CHANGE ... UNAVAILABLE 로 표시했다
+--
+-- EXPIRED 는 CROSSCHECK 로 확인되며 예제 4에서 자세히 다룬다.
+-- 리포트에서는 존재 여부만 알리고 조치는 별도 절차로 넘긴다.
+
+-- ────────────────────────────────────────────────
+-- 4-5. 카탈로그 동기화 시각
+-- ────────────────────────────────────────────────
+-- 이 값이 오래되었으면 위의 모든 판정이 무의미하다.
+
+RC_REPORT@rcat> SELECT d.name AS db_name,
+  2         TO_CHAR(MAX(r.resync_time),'MM-DD HH24:MI') AS last_resync,
+  3         ROUND((SYSDATE - MAX(r.resync_time)) * 24, 1) AS hours_ago
+  4  FROM   rc_database d JOIN rc_resync r ON d.dbinc_key = r.dbinc_key
+  5  GROUP  BY d.name ORDER BY d.name;
+
+DB_NAME    LAST_RESYNC HOURS_AGO
+---------- ----------- ---------
+HRDB       06-03 02:16       7.2
+ORCL       06-03 02:10       7.3
+SALES      06-03 02:36       6.9
+
+-- 세 대 모두 최근이다. 리포트를 신뢰할 수 있다.
+
+-- ────────────────────────────────────────────────
+-- 4-6. 소요 시간 추세
+-- ────────────────────────────────────────────────
+
+RC_REPORT@rcat> SELECT db_name,
+  2         TO_CHAR(start_time,'MM-DD') AS day,
+  3         ROUND(AVG(elapsed_seconds)) AS avg_sec,
+  4         ROUND(SUM(output_bytes)/1024/1024/1024, 2) AS out_gb
+  5  FROM   rc_rman_backup_job_details
+  6  WHERE  start_time > SYSDATE - 7 AND input_type = 'DB INCR'
+  7  GROUP  BY db_name, TO_CHAR(start_time,'MM-DD')
+  8  ORDER  BY db_name, day;
+
+DB_NAME    DAY     AVG_SEC OUT_GB
+---------- ----- --------- ------
+ORCL       05-28       402   1.18
+ORCL       05-29       411   1.19
+ORCL       05-30       408   1.20
+ORCL       05-31       415   1.21
+ORCL       06-01       491   1.22
+ORCL       06-02       478   1.23
+ORCL       06-03       491   1.24
+SALES      05-28       298   0.71
+SALES      06-03       363   0.78
+
+-- ORCL 이 6월 1일부터 20% 정도 늘었다.
+-- 크기 증가폭보다 시간 증가폭이 크므로 원인을 봐야 한다.
+-- 이 분석은 예제 8에서 이어서 다룬다.
+
+--------------------------------------------------------------------------------
+[5] 오류 주입과 대응
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 오류 ① VPC 계정으로 리포트를 돌리면 한 대만 나온다
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r2 ~]$ sqlplus vpc_core/oracle_4U@rcat
+
+VPC_CORE@rcat> SELECT db_name, input_type, status
+  2  FROM   rc_rman_backup_job_details
+  3  WHERE  start_time > SYSDATE - 1 ORDER BY db_name;
+
+DB_NAME    INPUT_TYPE  STATUS
+---------- ----------- ----------
+ORCL       DB INCR     COMPLETED
+ORCL       ARCHIVELOG  COMPLETED
+
+-- << 원인 파악 >>
+-- 고급 실습 01에서 vpc_core 에게는 orcl 만 부여했다.
+-- VPC의 rc_ 뷰는 부여된 DB로 자동 필터링된다.
+-- 리포트가 "이상 없음"으로 나오지만 실제로는 두 대를 못 본 것이다.
+--
+-- 이 오류가 위험한 이유는 조용하기 때문이다.
+-- 오류 메시지가 없고 결과가 비어 있지도 않다.
+-- SALES 의 11일 지연을 놓치고도 정상으로 보고하게 된다.
+
+-- << 수정 >> 리포트는 반드시 전체를 볼 수 있는 계정으로 돌린다.
+
+[oracle@oel7v9r2 ~]$ sqlplus rc_report/oracle_4U@rcat
+
+RC_REPORT@rcat> SELECT COUNT(DISTINCT db_name) AS visible_dbs
+  2  FROM   rc_rman_backup_job_details;
+
+VISIBLE_DBS
+-----------
+          3
+
+-- 스크립트에 안전장치를 넣는다.
+
+RC_REPORT@rcat> SELECT CASE WHEN COUNT(*) < 3
+  2    THEN '*** 경고 : 조회 가능한 DB가 ' || COUNT(*) ||
+  3         '대뿐이다. 계정 권한을 확인하라 ***'
+  4    ELSE '점검 대상 DB : ' || COUNT(*) || '대' END AS check_scope
+  5  FROM   rc_database;
+
+CHECK_SCOPE
+--------------------------------------------------
+점검 대상 DB : 3대
+
+-- ────────────────────────────────────────────────
+-- 오류 ② 뷰가 아닌 내부 테이블을 참조했을 때
+-- ────────────────────────────────────────────────
+-- 인터넷에서 찾은 예제를 그대로 붙여 넣으면 자주 생긴다.
+
+RC_REPORT@rcat> SELECT bs_key, bck_type FROM bs WHERE ROWNUM <= 5;
+SELECT bs_key, bck_type FROM bs WHERE ROWNUM <= 5
+                             *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- << 원인 파악 >>
+-- BS 는 rcatowner 스키마의 내부 테이블이다.
+-- rc_report 에는 rc_ 뷰에 대한 권한만 부여했다.
+-- 이것은 실수가 아니라 설계다.
+--
+-- 내부 테이블에 직접 접근하면 두 가지 문제가 생긴다.
+--   ① 버전이 올라가면 구조가 바뀌어 스크립트가 깨진다
+--   ② VPC 필터링이 적용되지 않아 권한 경계를 우회한다
+--
+-- rc_ 뷰는 오라클이 보장하는 공개 인터페이스다.
+-- 리포트는 반드시 rc_ 뷰만 사용한다.
+
+-- << 수정 >>
+
+RC_REPORT@rcat> SELECT bs_key, bck_type, completion_time
+  2  FROM   rc_backup_set WHERE ROWNUM <= 5;
+
+    BS_KEY B COMPLETION_TIME
+---------- - -------------------
+      1201 D 2025-06-02 02:05:12
+      1204 L 2025-06-02 02:08:44
+      1211 D 2025-06-03 02:00:41
+      1214 L 2025-06-03 02:09:18
+      1250 D 2025-06-03 10:18:10
+
+-- ────────────────────────────────────────────────
+-- 오류 ③ nocatalog 백업이 리포트에 잡히지 않는다
+-- ────────────────────────────────────────────────
+-- 담당자가 급하게 백업을 하나 받았다고 한다. 리포트에는 없다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ rman target / nocatalog
+
+connected to target database: SALES (DBID=2284410077)
+using target database control file instead of recovery catalog
+
+RMAN> BACKUP TABLESPACE users TAG 'ADHOC_0603';
+
+Starting backup at 2025-06-03 11:02:14
+piece handle=/backup/SALES/1a2y5m8v_44_1_1 tag=ADHOC_0603
+Finished backup at 2025-06-03 11:02:29
+
+RMAN> LIST BACKUP TAG 'ADHOC_0603';
+
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ -------------------
+88      Full 2.11M      DISK        00:00:15     2025-06-03 11:02:29
+
+RMAN> EXIT
+
+-- 카탈로그에서 같은 태그를 찾아본다.
+
+RC_REPORT@rcat> SELECT COUNT(*) FROM rc_backup_piece WHERE tag = 'ADHOC_0603';
+
+  COUNT(*)
+----------
+         0
+
+-- << 원인 파악 >>
+-- nocatalog 로 접속하면 컨트롤파일만 저장소로 쓴다.
+-- 백업 자체는 정상이며 컨트롤파일에는 기록되었다.
+-- 그러나 카탈로그에는 반영되지 않았다.
+--
+-- 이 상태에서 두 가지 위험이 있다.
+--   ① 리포트가 그 백업을 세지 않는다
+--   ② CONTROL_FILE_RECORD_KEEP_TIME 이 지나면 기록 자체가 사라진다
+--
+-- 그래서 [2-4]에서 "카탈로그 동기화 시각"을 점검 항목에 넣은 것이다.
+
+-- << 수정 >> 카탈로그와 동기화한다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: SALES (DBID=2284410077)
+connected to recovery catalog database
+
+RMAN> RESYNC CATALOG;
+
+starting full resync of recovery catalog
+full resync complete
+
+RMAN> EXIT
+
+RC_REPORT@rcat> SELECT tag, TO_CHAR(completion_time,'MM-DD HH24:MI') AS done
+  2  FROM   rc_backup_piece WHERE tag = 'ADHOC_0603';
+
+TAG          DONE
+------------ -----------
+ADHOC_0603   06-03 11:02
+
+-- 이제 리포트에 반영된다.
+--
+-- 재발 방지
+--   운영 절차에 "nocatalog 사용 금지" 를 명시한다.
+--   불가피하게 사용했다면 즉시 RESYNC CATALOG 를 수행한다.
+--   리포트의 동기화 시각 항목으로 누락을 사후에 잡는다.
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+-- 6-1. 통합 리포트 실행
+
+[oracle@oel7v9r2 ~]$ sqlplus -s rc_report/oracle_4U@rcat \
+>   @/home/oracle/rcadm/rc_daily_report.sql
+
+================================================================================
+ Recovery Catalog 일일 백업 점검 리포트
+ 생성 시각 : 2025-06-03 08:00:04      카탈로그 : rcat @ oel7v9r2
+================================================================================
+
+[ 섹션 1. 요약 ]
+DB_NAME    LAST_FULL     LAST_ARCH     NEED_BKP UNUSABLE RESYNC_H JUDGE
+---------- ------------- ------------- -------- -------- -------- ------
+HRDB       06-01 02:04   06-03 02:16          0        0      7.2 OK
+ORCL       06-01 02:00   06-03 02:10          0        4      7.3 WARN
+SALES      06-01 02:20   05-23 02:22          1        1      6.9 CRIT
+
+[ 섹션 2. 상세 ]
+항목                        HRDB        ORCL        SALES       임계값
+--------------------------- ----------- ----------- ----------- ----------
+전체 백업 경과(일)                  2.3         2.3         2.3      > 7
+아카이브 백업 경과(일)               .3          .3        11.4      > 1
+백업 없는 데이터파일                  0           0           1      > 0
+사용 불가 백업                        0           4           1      > 0
+카탈로그 동기화 경과(시간)          7.2         7.3         6.9     > 24
+최근 24시간 실패 작업                 0           0           1      > 0
+
+[ 섹션 3. 예외 — 조치 필요 ]
+[CRIT] SALES : 아카이브 로그 백업이 11.4일간 수행되지 않음
+       → 백업 스크립트에 PLUS ARCHIVELOG 누락 여부 확인
+[CRIT] SALES : 백업이 없는 데이터파일 1개 (file# 7, SALES_ARCHIVE)
+       → 백업 대상 목록에 신규 테이블스페이스 추가
+[WARN] ORCL  : EXPIRED 백업 조각 4개
+       → CROSSCHECK 후 DELETE EXPIRED 수행 (고급 실습 04 참조)
+[WARN] SALES : UNAVAILABLE 백업 조각 1개
+       → 의도된 표시인지 확인
+
+[ 섹션 4. 최근 7일 추세 ]
+DB_NAME    05-28   05-29   05-30   05-31   06-01   06-02   06-03
+---------- ------- ------- ------- ------- ------- ------- -------
+ORCL 소요     402     411     408     415     491     478     491
+ORCL 크기    1.18    1.19    1.20    1.21    1.22    1.23    1.24
+SALES 소요    298     301     305     299     356     360     363
+SALES 크기    .71     .72     .72     .73     .77     .78     .78
+
+================================================================================
+ 판정 : CRIT 2건, WARN 2건  —  즉시 조치 필요
+================================================================================
+
+-- 6-2. 리포트가 사고를 잡아내는지 확인
+--
+-- [1]에서 말한 사고는 다음 두 가지였다.
+--   ① 아카이브 백업이 11일간 누락
+--   ② 로그 마지막 줄에는 성공으로 표시
+--
+-- 리포트는 ①을 CRIT 로 잡았다.
+-- ②는 애초에 로그를 보지 않으므로 영향받지 않는다.
+
+-- 6-3. 의도적으로 누락을 만들어 재검증한다
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=hrdb
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> SQL 'ALTER SYSTEM SWITCH LOGFILE';
+RMAN> SQL 'ALTER SYSTEM SWITCH LOGFILE';
+RMAN> SQL 'ALTER SYSTEM SWITCH LOGFILE';
+
+-- 아카이브만 생성하고 백업하지 않는다.
+
+RMAN> EXIT
+
+-- 시각을 앞당기지 않고도 확인할 수 있도록 임계값을 조정해 시험한다.
+
+RC_REPORT@rcat> SELECT d.name,
+  2    (SELECT COUNT(*) FROM rc_archived_log a
+  3     WHERE a.dbinc_key = d.dbinc_key
+  4     AND   a.completion_time > (SELECT NVL(MAX(b.completion_time), SYSDATE-999)
+  5                                FROM rc_backup_set b
+  6                                WHERE b.db_key = d.db_key AND b.bck_type='L')
+  7    ) AS unbacked_archives
+  8  FROM  rc_database d ORDER BY d.name;
+
+NAME     UNBACKED_ARCHIVES
+-------- -----------------
+HRDB                     3
+ORCL                     1
+SALES                  214
+
+-- 백업되지 않은 아카이브 개수다.
+-- SALES 의 214건이 11일치 누적분이다.
+-- 이 지표를 섹션 2에 추가하면 판정이 더 빨라진다.
+
+-- 6-4. 리포팅 계정이 아무것도 바꿀 수 없는지 확인
+
+RC_REPORT@rcat> DELETE FROM rc_backup_set WHERE ROWNUM = 1;
+DELETE FROM rc_backup_set WHERE ROWNUM = 1
+            *
+ERROR at line 1:
+ORA-01031: insufficient privileges
+
+RC_REPORT@rcat> CREATE TABLE t_test (a NUMBER);
+CREATE TABLE t_test (a NUMBER)
+*
+ERROR at line 1:
+ORA-01031: insufficient privileges
+
+[oracle@oel7v9r2 ~]$ rman catalog rc_report@rcat
+
+recovery catalog database Password:
+connected to recovery catalog database
+
+RMAN> LIST DB_UNIQUE_NAME ALL;
+
+RMAN-00571: ===========================================================
+RMAN-03002: failure of list command at 06/03/2025 12:04:11
+RMAN-06004: ORACLE error from recovery catalog database:
+ORA-00942: table or view does not exist
+
+-- RMAN 도구로는 사용할 수 없다.
+-- 조회 전용이라는 설계가 지켜진다.
+-- 고급 실습 01의 확장 과제 A가 이 방식으로 해결된다.
+
+--------------------------------------------------------------------------------
+[7] 운영 산출물과 확장 과제
+--------------------------------------------------------------------------------
+-- 7-1. rc_daily_report.sql
+--
+-- 운영스크립트/rc_daily_report.sql 로 제공한다.
+-- 임계값은 파일 상단의 DEFINE 으로 조정한다.
+
+[oracle@oel7v9r2 ~]$ head -30 /home/oracle/rcadm/rc_daily_report.sql
+
+-- Recovery Catalog 일일 백업 점검 리포트
+-- 실행 : sqlplus -s rc_report/<pw>@rcat @rc_daily_report.sql
+SET LINESIZE 200 PAGESIZE 0 FEEDBACK OFF VERIFY OFF HEADING ON TRIMSPOOL ON
+SET SERVEROUTPUT ON SIZE UNLIMITED
+
+DEFINE full_warn_days = 7
+DEFINE arch_warn_days = 1
+DEFINE resync_warn_hours = 24
+DEFINE expected_db_count = 3
+
+PROMPT ====================================================================
+PROMPT  Recovery Catalog 일일 백업 점검 리포트
+PROMPT ====================================================================
+
+-- 조회 범위 안전장치
+SELECT CASE WHEN COUNT(*) < &expected_db_count
+       THEN '*** 경고 : 조회 가능 DB ' || COUNT(*) || '대 — 권한 확인 필요 ***'
+       ELSE '점검 대상 : ' || COUNT(*) || '대' END
+FROM   rc_database;
+...
+
+-- 7-2. 크론 등록과 메일 발송
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/rc_daily_report.sh
+
+#!/bin/bash
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export PATH=$ORACLE_HOME/bin:$PATH
+D=$(date +%Y%m%d)
+OUT=/home/oracle/rcadm/report/backup_report_$D.txt
+MAILTO="dba-team@example.com"
+
+sqlplus -s rc_report/oracle_4U@rcat \
+  @/home/oracle/rcadm/rc_daily_report.sql > $OUT 2>&1
+
+# 판정 결과에 따라 제목을 바꾼다
+if grep -q '\[CRIT\]' $OUT; then
+  SUBJ="[CRIT] Oracle 백업 점검 $D"
+elif grep -q '\[WARN\]' $OUT; then
+  SUBJ="[WARN] Oracle 백업 점검 $D"
+else
+  SUBJ="[OK] Oracle 백업 점검 $D"
+fi
+
+mailx -s "$SUBJ" "$MAILTO" < $OUT
+
+# 90일 지난 리포트 정리
+find /home/oracle/rcadm/report -name 'backup_report_*.txt' -mtime +90 -delete
+
+[oracle@oel7v9r2 ~]$ chmod +x /home/oracle/rcadm/rc_daily_report.sh
+[oracle@oel7v9r2 ~]$ crontab -l
+
+0 8 * * * /home/oracle/rcadm/rc_daily_report.sh >> /home/oracle/rcadm/cron.log 2>&1
+
+-- 7-3. 월간 감사 제출용 조회
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/rc_monthly_audit.sql
+
+SET LINESIZE 180 PAGESIZE 200
+COLUMN db_name FORMAT A10
+COLUMN day FORMAT A6
+
+PROMPT === 월간 백업 수행 이력 (DB별 일자별) ===
+SELECT db_name, TO_CHAR(start_time,'MM-DD') AS day, input_type,
+       status, time_taken_display, output_bytes_display
+FROM   rc_rman_backup_job_details
+WHERE  start_time >= TRUNC(ADD_MONTHS(SYSDATE,-1),'MM')
+AND    start_time <  TRUNC(SYSDATE,'MM')
+ORDER  BY db_name, start_time;
+
+PROMPT === 월간 성공률 ===
+SELECT db_name,
+       COUNT(*) AS total_jobs,
+       SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS ok_jobs,
+       ROUND(SUM(CASE WHEN status='COMPLETED' THEN 1 ELSE 0 END)
+             / COUNT(*) * 100, 1) AS success_pct
+FROM   rc_rman_backup_job_details
+WHERE  start_time >= TRUNC(ADD_MONTHS(SYSDATE,-1),'MM')
+AND    start_time <  TRUNC(SYSDATE,'MM')
+GROUP  BY db_name ORDER BY db_name;
+
+-- 실행 결과
+
+=== 월간 성공률 ===
+DB_NAME    TOTAL_JOBS   OK_JOBS SUCCESS_PCT
+---------- ---------- --------- -----------
+HRDB               62        62       100.0
+ORCL               62        61        98.4
+SALES              48        45        93.8
+
+-- SALES 의 작업 수가 적은 것 자체가 신호다.
+-- 아카이브 백업이 빠져 있으니 작업 건수가 다른 DB보다 적다.
+-- 성공률만 보면 93.8% 로 그럭저럭 보이지만
+-- 작업 건수를 함께 보면 문제가 드러난다.
+
+-- 7-4. 확장 과제
+--
+-- 과제 A. 임계값의 근거 만들기
+--   전체 백업 7일, 아카이브 1일이라는 임계값은 임의로 정한 값이다.
+--   각 DB의 복구 목표 시간(RTO)과 복구 지점 목표(RPO)를 정의하고
+--   그로부터 임계값을 도출하시오.
+--   힌트 : RPO가 4시간이면 아카이브 백업 주기도 4시간 이내여야 한다.
+--
+-- 과제 B. 백업되지 않은 아카이브 지표 추가
+--   6-3의 조회를 섹션 2에 넣고 임계값을 정하시오.
+--   개수보다 "가장 오래된 미백업 아카이브의 나이"가 더 나은 지표인지 검토하시오.
+--
+-- 과제 C. 리포트의 사각지대 찾기
+--   현재 리포트가 잡지 못하는 장애 유형을 세 가지 이상 찾으시오.
+--   힌트 : 백업 파일이 실제로 읽히는지는 검사하지 않는다.
+--          이 부분은 고급 실습 10에서 다룬다.
+--
+-- 과제 D. HTML 출력
+--   메일 클라이언트에서 색으로 구분되도록 HTML 리포트를 만드시오.
+--   SET MARKUP HTML ON 을 쓰거나 SQL에서 태그를 직접 생성한다.
+--   CRIT는 붉은색, WARN은 주황색으로 표시한다.
+--
+-- 과제 E. 신규 DB 자동 감지
+--   카탈로그에 새 DB가 등록되면 리포트에 자동으로 포함된다.
+--   반대로 등록되어야 할 DB가 빠진 것은 감지하지 못한다.
+--   기대 DB 목록을 별도 테이블로 관리하고 대조하는 방법을 구현하시오.
+
+-- 7-5. 정리 — 이 실습에서 남는 것
+--
+--   ① rc_daily_report.sql   : 일일 점검 리포트
+--   ② rc_daily_report.sh    : 크론 실행기와 메일 발송
+--   ③ rc_monthly_audit.sql  : 월간 감사 제출용
+--   ④ rc_report 계정        : 읽기 전용 리포팅 계정 구성 절차
+--   ⑤ 점검 항목과 임계값 표 : [2-1]의 설계 문서
+
+-- 실무 포인트
+-- 1) "성공했는가"가 아니라 "복구 가능한가"로 판정한다.
+--    명령이 성공해도 대상이 빠져 있으면 복구할 수 없다.
+--    SALES 사례가 정확히 그 경우였다.
+--
+-- 2) 작업 건수의 변화가 누락의 신호다.
+--    성공률 93.8% 는 그럴듯해 보이지만 작업 수가 다른 DB보다 적었다.
+--    비율 지표만 보면 이런 유형을 놓친다.
+--
+-- 3) 리포트는 반드시 전체를 볼 수 있는 계정으로 돌린다.
+--    VPC 계정으로 돌리면 조용히 일부만 점검하고 정상으로 보고한다.
+--    조회 가능 DB 수를 리포트 첫 줄에 찍어 안전장치로 삼는다.
+--
+-- 4) rc_ 뷰만 사용한다.
+--    내부 테이블은 버전 간 구조가 바뀌고 VPC 필터링도 우회한다.
+--    rc_ 뷰가 오라클이 보장하는 공개 인터페이스다.
+--
+-- 5) 카탈로그 동기화 시각을 반드시 점검 항목에 넣는다.
+--    이 값이 오래되었으면 리포트의 다른 모든 항목을 믿을 수 없다.
+--    nocatalog 백업이 있었는지 사후에 잡아내는 유일한 수단이다.
+--
+-- 6) 리포팅 계정은 조회만 되게 만든다.
+--    RMAN 도구로 접속조차 되지 않는 편이 안전하다.
+--    감사에서 "조회 권한과 변경 권한이 분리되어 있는가"를 묻는다.

@@ -1,0 +1,1068 @@
+================================================================================
+ 고급 실습 06 : KEEP FOREVER 장기 보관과 보존 요건 대응
+ 과정      : Oracle Database 19c Backup & Recovery — Recovery Catalog 고급
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / oel7v9r1(운영계) + oel7v9r2(관리계)
+ 대상 DB   : orcl, sales (oel7v9r1) / hrdb (oel7v9r2)
+ 카탈로그  : rcat @ oel7v9r2
+ 소요 시간 : 약 2시간 30분
+ 선행 조건 : 고급 실습 01~05 완료
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실무 상황
+--------------------------------------------------------------------------------
+-- 규제 대응 부서에서 요구가 내려왔다.
+--
+--   "분기 마감 시점의 데이터베이스 상태를 5년간 보관할 것.
+--    감사 요청 시 해당 시점의 데이터를 조회할 수 있어야 함."
+--
+-- 지금 상태로는 불가능하다.
+--   - 보존 정책이 21일이다
+--   - 매일 05시 정기 정리(고급 실습 04)가 21일 넘은 백업을 지운다
+--   - 작년 4분기 마감 백업을 찾아봤으나 이미 없다
+--
+-- 동시에 개발팀에서 요청이 왔다.
+--   "작년 3월 말 상태의 sales 스키마가 필요합니다. 통계 재계산 검증용입니다."
+--
+-- 실무자가 시도한 우회책도 문제가 있었다.
+--   분기말 백업을 별도 디렉터리에 cp 로 복사해 두었는데
+--   그 파일이 어느 시점의 것인지, 복원에 필요한 아카이브가 무엇인지
+--   기록이 남아 있지 않다.
+--
+-- 요구 사항
+--   ① 분기말 백업이 정기 정리에서 제외되어야 한다
+--   ② 5년 뒤에도 그 백업만으로 복원할 수 있어야 한다
+--   ③ 어떤 백업이 장기 보관 대상인지 조회할 수 있어야 한다
+--   ④ 보존 기한이 지난 것은 자동으로 해제되어야 한다
+--   ⑤ 보관 목록을 감사에 제출할 수 있어야 한다
+--
+-- KEEP 옵션이 정확히 이 요구를 위해 있다.
+-- 그리고 KEEP FOREVER 는 Recovery Catalog 가 있어야만 쓸 수 있다.
+
+--------------------------------------------------------------------------------
+[2] 사전 설계
+--------------------------------------------------------------------------------
+-- 2-1. KEEP 옵션의 세 가지 형태
+--
+--   구문                          | 보존 기한   | 카탈로그 | 용도
+--   ------------------------------|-------------|----------|----------------
+--   KEEP UNTIL TIME '<날짜>'      | 지정 시각   | 불필요   | 기한이 정해진 보관
+--   KEEP FOREVER                  | 무기한      | 필수     | 영구 보관
+--   KEEP ... RESTORE POINT <이름> | 위와 동일   | 위와 동일| 시점에 이름 부여
+--
+--   KEEP FOREVER 에 카탈로그가 필요한 이유
+--     컨트롤파일은 순환 재사용 영역이다.
+--     CONTROL_FILE_RECORD_KEEP_TIME 이 지나면 기록이 덮인다.
+--     "영원히"를 보장할 수 있는 저장소가 카탈로그뿐이다.
+
+-- 2-2. KEEP 백업의 성질
+--
+--   ① 보존 정책의 대상에서 제외된다
+--      REPORT OBSOLETE 에 나타나지 않는다
+--      DELETE OBSOLETE 로 지워지지 않는다
+--
+--   ② 자기 완결적으로 만들어진다
+--      복원에 필요한 아카이브 로그와 spfile, 컨트롤파일이 함께 백업된다
+--      그래서 KEEP 백업 하나만 있으면 그 시점으로 복원할 수 있다
+--
+--   ③ FRA 에 저장할 수 없다
+--      FRA 는 보존 정책에 따라 자동 관리되는 공간이다
+--      "지우지 말 것"과 "자동 관리"는 양립하지 않는다
+--
+--   ④ RESTORE POINT 로 시점에 이름을 붙일 수 있다
+--      SCN 을 외우지 않고 이름으로 복원 시점을 지정한다
+
+-- 2-3. 보관 설계
+--
+--   대상       | 주기      | 보존 기한 | 저장 위치           | 태그
+--   -----------|-----------|-----------|---------------------|-------------------
+--   orcl       | 분기말    | 5년       | /archive_keep/ORCL  | ORCL_QTR_YYYYQn
+--   sales      | 분기말    | 5년       | /archive_keep/SALES | SALES_QTR_YYYYQn
+--   hrdb       | 연말      | 7년       | /archive_keep/HRDB  | HRDB_YEAR_YYYY
+--   임시 보관  | 요청 시   | 90일      | /archive_keep/ADHOC | ADHOC_<사유>_YYYYMMDD
+--
+--   복원 지점 이름 규칙 : <DB>_Q<분기>_<YYYY>  예) ORCL_Q1_2025
+--
+--   저장 위치를 정기 백업과 분리하는 이유
+--     ① 정기 백업 경로의 정리 작업이 실수로 건드리는 것을 막는다
+--     ② 장기 보관 매체(테이프, 오브젝트 스토리지)로 옮기기 쉽다
+--     ③ 용량 산정과 비용 배분이 분리된다
+
+-- 2-4. 5년 보관의 현실적 문제
+--
+--   문제 1. 5년 뒤 그 버전의 오라클이 있는가
+--     19c 백업은 19c 이상에서만 복원된다.
+--     장기 보관은 소프트웨어 보관 계획과 함께 세워야 한다.
+--
+--   문제 2. 매체 수명
+--     디스크는 5년을 보장하지 않는다.
+--     정기적으로 매체를 교체하고 검증해야 한다.
+--
+--   문제 3. 용량
+--     분기 4회 × 5년 = 20세대. DB 크기의 20배가 필요하다.
+--     압축을 반드시 적용한다.
+--
+--   대안 검토
+--     데이터만 필요하다면 19장의 Data Pump 논리 백업이 더 적합할 수 있다.
+--     버전 종속이 낮고 크기도 작다.
+--     반면 "그 시점 전체 상태"가 필요하면 KEEP 백업이 맞다.
+
+--------------------------------------------------------------------------------
+[3] 환경 준비
+--------------------------------------------------------------------------------
+-- 3-1. 장기 보관 경로 준비
+
+[oracle@oel7v9r1 ~]$ su -
+[root@oel7v9r1 ~]# mkdir -p /archive_keep/ORCL /archive_keep/SALES \
+>   /archive_keep/ADHOC
+[root@oel7v9r1 ~]# chown -R oracle:oinstall /archive_keep
+[root@oel7v9r1 ~]# chmod 750 /archive_keep
+[root@oel7v9r1 ~]# exit
+
+[oracle@oel7v9r1 ~]$ df -h /archive_keep
+
+Filesystem            Size  Used Avail Use% Mounted on
+/dev/mapper/ol-keep    500G   12G  488G   3% /archive_keep
+
+-- 3-2. FRA 사용 여부 확인
+--
+-- KEEP 백업은 FRA 에 저장할 수 없다. [5] 오류 ①에서 확인한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SHOW PARAMETER db_recovery_file_dest
+
+NAME                          TYPE     VALUE
+----------------------------- -------- ------------------------------------
+db_recovery_file_dest         string   /u01/app/oracle/fast_recovery_area
+db_recovery_file_dest_size    big integer 20G
+
+SYS@orcl> SELECT name, space_limit/1024/1024/1024 AS limit_gb,
+  2         ROUND(space_used/1024/1024/1024,2) AS used_gb
+  3  FROM   v$recovery_file_dest;
+
+NAME                                  LIMIT_GB  USED_GB
+------------------------------------ --------- --------
+/u01/app/oracle/fast_recovery_area          20     4.82
+
+-- 3-3. 현재 보존 정책과 백업 현황
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> SHOW RETENTION POLICY;
+
+CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS;
+
+RMAN> LIST BACKUP OF DATABASE SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+1288    B  1  A DISK        2025-06-04 09:16:22       1       1  NO         ORCL_INCR
+1301    B  0  A DISK        2025-06-01 01:22:11       4       1  NO         ORCL_FULL
+...
+
+-- 21일 이전 백업은 이미 없다. 요구 사항의 출발점이 여기다.
+
+-- 3-4. 기존 KEEP 백업 확인 (없어야 정상)
+
+RMAN> LIST BACKUP KEEP;
+
+specification does not match any backup in the repository
+
+-- 3-5. 복원 지점 확인
+
+SYS@orcl> SELECT name, scn, guarantee_flashback_database, time
+  2  FROM   v$restore_point ORDER BY scn;
+
+no rows selected
+
+-- 18장에서 다룬 보장 복원 지점과 혼동하지 않는다.
+-- KEEP ... RESTORE POINT 로 만드는 것은 일반 복원 지점이며
+-- Flashback 로그를 사용하지 않는다.
+
+--------------------------------------------------------------------------------
+[4] 구축과 수행
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 4-1. 분기말 장기 보관 백업
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: ORCL (DBID=1547823901)
+connected to recovery catalog database
+
+RMAN> RUN {
+2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK
+3>     FORMAT '/archive_keep/ORCL/%d_Q2_2025_%U';
+4>   BACKUP AS COMPRESSED BACKUPSET
+5>     DATABASE
+6>     TAG 'ORCL_QTR_2025Q2'
+7>     KEEP FOREVER
+8>     RESTORE POINT ORCL_Q2_2025;
+9>   RELEASE CHANNEL c1;
+10> }
+
+allocated channel: c1
+channel c1: SID=142 device type=DISK
+
+Starting backup at 2025-06-30 22:04:11
+current log archived
+channel c1: starting compressed full datafile backup set
+channel c1: specifying datafile(s) in backup set
+input datafile file number=00001
+  name=/u01/app/oracle/oradata/ORCL/system01.dbf
+input datafile file number=00003
+  name=/u01/app/oracle/oradata/ORCL/sysaux01.dbf
+input datafile file number=00004
+  name=/u01/app/oracle/oradata/ORCL/users01.dbf
+channel c1: starting piece 1 at 2025-06-30 22:04:14
+channel c1: finished piece 1 at 2025-06-30 22:11:38
+piece handle=/archive_keep/ORCL/ORCL_Q2_2025_38a5f1k1_62_1_1
+  tag=ORCL_QTR_2025Q2 comment=NONE
+
+channel c1: starting compressed archived log backup set
+channel c1: specifying archived log(s) in backup set
+input archived log thread=1 sequence=442 RECID=442
+channel c1: starting piece 1 at 2025-06-30 22:11:41
+piece handle=/archive_keep/ORCL/ORCL_Q2_2025_39a5f3m2_63_1_1
+  tag=ORCL_QTR_2025Q2 comment=NONE
+
+channel c1: starting compressed full datafile backup set
+including current SPFILE in backup set
+including current control file in backup set
+channel c1: starting piece 1 at 2025-06-30 22:12:02
+piece handle=/archive_keep/ORCL/ORCL_Q2_2025_3aa5f5n3_64_1_1
+  tag=ORCL_QTR_2025Q2 comment=NONE
+
+Finished backup at 2025-06-30 22:12:14
+
+-- 세 종류가 자동으로 함께 백업되었다.
+--   ① 데이터파일
+--   ② 복원에 필요한 아카이브 로그
+--   ③ spfile 과 컨트롤파일
+--
+-- 이것이 [2-2]에서 말한 자기 완결성이다.
+-- 명시하지 않아도 KEEP 백업은 이렇게 구성된다.
+
+-- 4-2. 복원 지점 확인
+
+SYS@orcl> SELECT name, scn, TO_CHAR(time,'YYYY-MM-DD HH24:MI:SS') AS created,
+  2         guarantee_flashback_database AS guaranteed
+  3  FROM   v$restore_point;
+
+NAME              SCN           CREATED             GUARANTEED
+----------------- ------------- ------------------- ----------
+ORCL_Q2_2025      3402881       2025-06-30 22:04:14 NO
+
+-- guarantee 가 NO 다. Flashback 로그를 쓰지 않는다.
+-- 이 복원 지점은 "그 SCN에 붙인 이름표"일 뿐이다.
+-- KEEP 백업과 짝을 이루어야 의미가 있다.
+
+RMAN> LIST RESTORE POINT ALL;
+
+SCN              RSP Time  Type       Time      Name
+---------------- --------- ---------- --------- ------------------
+3402881                               30-JUN-25 ORCL_Q2_2025
+
+-- 4-3. KEEP 속성 확인
+
+RMAN> LIST BACKUP KEEP;
+
+List of Backup Sets
+===================
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ -------------------
+1520    Full 842.11M    DISK        00:07:24     2025-06-30 22:11:38
+        BP Key: 1520   Status: AVAILABLE  Compressed: YES  Tag: ORCL_QTR_2025Q2
+        Piece Name: /archive_keep/ORCL/ORCL_Q2_2025_38a5f1k1_62_1_1
+  Keep: LOGS      Until: FOREVER
+
+  List of Datafiles in backup set 1520
+  File LV Type Ckp SCN    Ckp Time            Name
+  ---- -- ---- ---------- ------------------- ----------------------------
+  1       Full 3402881    2025-06-30 22:04:14 .../system01.dbf
+  3       Full 3402881    2025-06-30 22:04:14 .../sysaux01.dbf
+  4       Full 3402881    2025-06-30 22:04:14 .../users01.dbf
+
+BS Key  Size       Device Type Elapsed Time Completion Time
+------- ---------- ----------- ------------ -------------------
+1521    18.42M     DISK        00:00:21     2025-06-30 22:11:41
+        BP Key: 1521   Status: AVAILABLE  Compressed: YES  Tag: ORCL_QTR_2025Q2
+        Piece Name: /archive_keep/ORCL/ORCL_Q2_2025_39a5f3m2_63_1_1
+  Keep: LOGS      Until: FOREVER
+
+-- "Keep: LOGS  Until: FOREVER" 가 핵심이다.
+-- LOGS 는 복원에 필요한 로그가 함께 보관된다는 뜻이다.
+
+-- 4-4. 보존 정책에서 제외되는지 확인 (요구 사항 ①)
+
+RMAN> REPORT OBSOLETE;
+
+RMAN retention policy will be applied to the command
+RMAN retention policy is set to recovery window of 21 days
+Report of obsolete backups and copies
+Type                 Key    Completion Time     Filename/Handle
+-------------------- ------ ------------------- --------------------------------
+Backup Set           1188   2025-06-02
+  Backup Piece       1188   2025-06-02          /backup/ORCL/2b3a5j9t_48_1_1
+Archived Log         4102   2025-06-02          /home/oracle/arch1/1_402_...dbf
+
+-- KEEP 백업(1520, 1521)이 목록에 없다.
+
+RMAN> DELETE NOPROMPT OBSOLETE;
+
+Deleted 24 objects
+
+RMAN> LIST BACKUP KEEP;
+
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ -------------------
+1520    Full 842.11M    DISK        00:07:24     2025-06-30 22:11:38
+1521         18.42M     DISK        00:00:21     2025-06-30 22:11:41
+1522    Full 18.91M     DISK        00:00:12     2025-06-30 22:12:14
+
+-- 정기 정리 후에도 그대로 남아 있다. 요구 사항 ① 충족.
+
+-- 4-5. 기한이 있는 임시 보관
+--
+-- 개발팀 요청 대응. 90일만 보관한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RUN {
+2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK
+3>     FORMAT '/archive_keep/ADHOC/%d_DEVREQ_%U';
+4>   BACKUP AS COMPRESSED BACKUPSET
+5>     TABLESPACE users, sales_data
+6>     TAG 'ADHOC_DEVREQ_20250630'
+7>     KEEP UNTIL TIME 'SYSDATE+90'
+8>     RESTORE POINT SALES_DEVREQ_20250630;
+9>   RELEASE CHANNEL c1;
+10> }
+
+Starting backup at 2025-06-30 22:22:03
+channel c1: starting compressed full datafile backup set
+piece handle=/archive_keep/ADHOC/SALES_DEVREQ_3ca5g2p1_31_1_1
+channel c1: starting compressed archived log backup set
+piece handle=/archive_keep/ADHOC/SALES_DEVREQ_3da5g4q2_32_1_1
+Finished backup at 2025-06-30 22:26:41
+
+RMAN> LIST BACKUP KEEP;
+
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ -------------------
+44      Full 288.42M    DISK        00:03:12     2025-06-30 22:25:44
+        Tag: ADHOC_DEVREQ_20250630
+  Keep: LOGS      Until: 28-SEP-25
+
+-- Until 에 만료일이 표시된다.
+-- 그날이 지나면 자동으로 보존 정책의 대상이 된다. 요구 사항 ④ 충족.
+
+-- 4-6. 이미 받은 백업에 KEEP 부여
+--
+-- 사후에 "이 백업은 보관하라"는 지시가 내려온 경우다.
+
+RMAN> LIST BACKUP OF DATABASE SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+38      B  0  A DISK        2025-06-29 01:20:41       4       1  YES        SALES_FULL
+
+RMAN> CHANGE BACKUPSET 38 KEEP UNTIL TIME 'SYSDATE+365';
+
+keep attributes for the backup are changed
+backup will be obsolete on date 30-JUN-26
+archived logs required to recover from this backup will be backed up
+
+RMAN> LIST BACKUP KEEP SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+38      B  0  A DISK        2025-06-29 01:20:41       4       1  YES        SALES_FULL
+44      B  F  A DISK        2025-06-30 22:25:44       2       1  YES        ADHOC_DEVREQ_20250630
+
+-- 주의할 점
+--   "archived logs required to recover from this backup will be backed up"
+--   메시지가 나오지만 실제 아카이브 백업은 아직 수행되지 않았다.
+--   그 아카이브가 이미 지워졌다면 이 백업은 복원할 수 없다.
+--   [5] 오류 ③에서 이 문제를 다룬다.
+
+-- 4-7. KEEP 해제
+
+RMAN> CHANGE BACKUPSET 38 NOKEEP;
+
+keep attributes for the backup are deleted
+backup will be obsolete based on retention policy
+
+RMAN> LIST BACKUP KEEP SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+44      B  F  A DISK        2025-06-30 22:25:44       2       1  YES        ADHOC_DEVREQ_20250630
+
+-- 해제하면 즉시 보존 정책의 대상이 된다.
+-- 다음 DELETE OBSOLETE 에서 지워질 수 있으므로 신중히 실행한다.
+
+--------------------------------------------------------------------------------
+[5] 오류 주입과 대응
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 오류 ① FRA 에 KEEP 백업 시도
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> BACKUP DATABASE TAG 'FRA_KEEP_TEST' KEEP FOREVER;
+
+Starting backup at 2025-06-30 22:38:11
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=98 device type=DISK
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of backup command at 06/30/2025 22:38:14
+ORA-19811: cannot have files in recovery area with keep attributes
+
+-- << 원인 파악 >>
+-- CONFIGURE CHANNEL 의 기본 FORMAT 이 FRA 를 가리키거나
+-- FORMAT 을 지정하지 않으면 FRA 가 기본 대상이 된다.
+--
+-- FRA 는 보존 정책에 따라 오라클이 자동으로 공간을 관리하는 영역이다.
+-- 공간이 부족하면 정책상 불필요한 파일을 스스로 지운다.
+-- KEEP 백업은 "지우지 말 것"을 뜻하므로 두 성질이 충돌한다.
+-- 그래서 아예 저장을 거부한다.
+--
+-- 이 제약은 설계 의도이며 우회할 방법이 없다.
+-- 장기 보관 백업은 반드시 FRA 밖에 둔다.
+
+SYS@orcl> SELECT name, space_limit, space_used FROM v$recovery_file_dest;
+
+NAME                                 SPACE_LIMIT  SPACE_USED
+------------------------------------ ------------ -----------
+/u01/app/oracle/fast_recovery_area    21474836480  5175967744
+
+-- << 수정 >> 채널에 명시적으로 다른 경로를 지정한다.
+
+RMAN> RUN {
+2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK
+3>     FORMAT '/archive_keep/ORCL/%d_TEST_%U';
+4>   BACKUP DATABASE TAG 'FRA_KEEP_TEST' KEEP FOREVER
+5>     RESTORE POINT ORCL_TEST_RP;
+6>   RELEASE CHANNEL c1;
+7> }
+
+Starting backup at 2025-06-30 22:41:02
+piece handle=/archive_keep/ORCL/ORCL_TEST_3fa5h1s1_66_1_1
+Finished backup at 2025-06-30 22:48:33
+
+-- 정리한다.
+
+RMAN> DELETE NOPROMPT BACKUP TAG 'FRA_KEEP_TEST';
+
+-- KEEP 백업은 그냥 DELETE 로 지워진다.
+-- KEEP 은 보존 정책의 자동 삭제만 막는다. 수동 삭제는 막지 않는다.
+
+RMAN> SQL 'DROP RESTORE POINT ORCL_TEST_RP';
+
+-- ────────────────────────────────────────────────
+-- 오류 ② nocatalog 에서 KEEP FOREVER
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r1 ~]$ rman target / nocatalog
+
+connected to target database: ORCL (DBID=1547823901)
+using target database control file instead of recovery catalog
+
+RMAN> RUN {
+2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK
+3>     FORMAT '/archive_keep/ORCL/%d_NOCAT_%U';
+4>   BACKUP DATABASE TAG 'NOCAT_KEEP' KEEP FOREVER;
+5>   RELEASE CHANNEL c1;
+6> }
+
+allocated channel: c1
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of backup command at 06/30/2025 22:52:08
+RMAN-06511: cannot use KEEP FOREVER option without a recovery catalog
+
+-- << 원인 파악 >>
+-- 컨트롤파일은 순환 재사용 영역이다.
+-- CONTROL_FILE_RECORD_KEEP_TIME 이 지나면 기록이 덮인다.
+-- 파일은 남아 있어도 "이것이 무엇인지"를 아는 기록이 사라진다.
+--
+-- 5년 뒤에 그 파일을 발견해도 CATALOG START WITH 로 되찾아야 하고
+-- 어느 시점의 것인지는 파일 헤더를 읽어야 알 수 있다.
+-- 그래서 오라클은 아예 허용하지 않는다.
+--
+-- 이것이 장기 보관 요건이 있는 조직에서
+-- Recovery Catalog 도입이 선택이 아니라 필수인 이유다.
+
+-- << 수정 방법 1 >> 카탈로그로 접속한다 (권장)
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RUN {
+2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK
+3>     FORMAT '/archive_keep/ORCL/%d_NOCAT_%U';
+4>   BACKUP DATABASE TAG 'NOCAT_KEEP' KEEP FOREVER;
+5>   RELEASE CHANNEL c1;
+6> }
+
+Finished backup at 2025-06-30 22:56:41
+
+-- << 수정 방법 2 >> 카탈로그를 쓸 수 없다면 기한을 지정한다
+
+[oracle@oel7v9r1 ~]$ rman target / nocatalog
+
+RMAN> RUN {
+2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK
+3>     FORMAT '/archive_keep/ORCL/%d_UNTIL_%U';
+4>   BACKUP DATABASE TAG 'UNTIL_TEST'
+5>     KEEP UNTIL TIME 'SYSDATE+20';
+6>   RELEASE CHANNEL c1;
+7> }
+
+Finished backup at 2025-06-30 23:02:14
+
+-- KEEP UNTIL TIME 은 nocatalog 에서도 동작한다.
+-- 다만 CONTROL_FILE_RECORD_KEEP_TIME 안의 기간만 안전하다.
+-- 30일 설정이므로 20일은 가능하지만 100일은 위험하다.
+
+RMAN> DELETE NOPROMPT BACKUP TAG 'UNTIL_TEST';
+RMAN> DELETE NOPROMPT BACKUP TAG 'NOCAT_KEEP';
+
+-- ────────────────────────────────────────────────
+-- 오류 ③ 아카이브가 없어 KEEP 백업을 복원하지 못한다
+-- ────────────────────────────────────────────────
+-- 4-6의 CHANGE ... KEEP 이 남긴 문제를 확인한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+-- 오래된 백업에 사후로 KEEP 을 걸어 본다.
+
+RMAN> LIST BACKUP OF DATABASE SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+30      B  0  A DISK        2025-06-14 01:20:08       4       1  YES        SALES_FULL
+
+RMAN> CHANGE BACKUPSET 30 KEEP UNTIL TIME 'SYSDATE+365';
+
+keep attributes for the backup are changed
+backup will be obsolete on date 30-JUN-26
+archived logs required to recover from this backup will be backed up
+
+-- 그 시점으로 복원이 가능한지 확인한다.
+
+RMAN> RESTORE DATABASE UNTIL TIME
+2>   "TO_DATE('2025-06-14 02:00:00','YYYY-MM-DD HH24:MI:SS')" PREVIEW;
+
+Starting restore at 2025-06-30 23:11:04
+
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+30      B  0  A DISK        2025-06-14 01:20:08       4       1  YES        SALES_FULL
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 06/30/2025 23:11:09
+RMAN-06025: no backup of archived log for thread 1 with sequence 2288
+  and starting SCN of 9012455 found to restore
+RMAN-06025: no backup of archived log for thread 1 with sequence 2287
+  and starting SCN of 9008120 found to restore
+
+-- << 원인 파악 >>
+-- 데이터파일 백업은 있으나 복구에 필요한 아카이브 로그가 없다.
+-- 6월 14일 백업은 그 시점의 데이터파일 이미지일 뿐이다.
+-- 백업이 끝난 시점까지 일관성을 맞추려면 그 사이의 리두가 필요하다.
+--
+-- 그 아카이브는 고급 실습 04의 정기 정리에서 이미 지워졌다.
+-- 21일 보존 정책이 적용되었고 6월 14일은 그 범위 밖이었다.
+--
+-- CHANGE ... KEEP 의 메시지가 오해를 부른다.
+--   "archived logs required to recover from this backup will be backed up"
+-- 이것은 "앞으로 백업하겠다"는 뜻이지 "이미 있다"는 뜻이 아니다.
+-- 필요한 아카이브가 이미 없으면 이 백업은 복원할 수 없다.
+--
+-- 교훈
+--   장기 보관은 사후에 지정하는 것이 아니라 처음부터 KEEP 으로 받아야 한다.
+--   4-1처럼 BACKUP ... KEEP 으로 받으면 아카이브가 함께 백업된다.
+
+-- << 수정 >> 지금 시점으로 새 KEEP 백업을 받는다.
+
+RMAN> CHANGE BACKUPSET 30 NOKEEP;
+
+keep attributes for the backup are deleted
+
+RMAN> RUN {
+2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK
+3>     FORMAT '/archive_keep/SALES/%d_Q2_2025_%U';
+4>   BACKUP AS COMPRESSED BACKUPSET DATABASE
+5>     TAG 'SALES_QTR_2025Q2'
+6>     KEEP FOREVER
+7>     RESTORE POINT SALES_Q2_2025;
+8>   RELEASE CHANNEL c1;
+9> }
+
+Starting backup at 2025-06-30 23:18:22
+channel c1: starting compressed full datafile backup set
+piece handle=/archive_keep/SALES/SALES_Q2_2025_3ka5j1w1_36_1_1
+channel c1: starting compressed archived log backup set
+piece handle=/archive_keep/SALES/SALES_Q2_2025_3la5j3x2_37_1_1
+channel c1: starting compressed full datafile backup set
+including current SPFILE in backup set
+including current control file in backup set
+piece handle=/archive_keep/SALES/SALES_Q2_2025_3ma5j5y3_38_1_1
+Finished backup at 2025-06-30 23:24:11
+
+RMAN> RESTORE DATABASE UNTIL RESTORE POINT SALES_Q2_2025 PREVIEW SUMMARY;
+
+Starting restore at 2025-06-30 23:25:02
+
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+52      B  0  A DISK        2025-06-30 23:22:41       1       1  YES        SALES_QTR_2025Q2
+53      B  A  A DISK        2025-06-30 23:23:18       1       1  YES        SALES_QTR_2025Q2
+
+Finished restore at 2025-06-30 23:25:08
+
+-- 복원 경로가 온전하다. 요구 사항 ② 충족.
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+-- 6-1. 장기 보관 백업 목록 (요구 사항 ③)
+
+[oracle@oel7v9r2 ~]$ sqlplus -s rc_report/oracle_4U@rcat
+
+RC_REPORT@rcat> SET LINESIZE 175 PAGESIZE 60
+RC_REPORT@rcat> COLUMN db_name FORMAT A8
+RC_REPORT@rcat> COLUMN tag FORMAT A24
+RC_REPORT@rcat> COLUMN handle FORMAT A48
+
+RC_REPORT@rcat> SELECT s.db_name, s.tag,
+  2         TO_CHAR(s.completion_time,'YYYY-MM-DD') AS taken,
+  3         CASE WHEN s.keep_until IS NULL THEN 'FOREVER'
+  4              ELSE TO_CHAR(s.keep_until,'YYYY-MM-DD') END AS keep_until,
+  5         s.keep_options,
+  6         ROUND(SUM(p.bytes)/1024/1024) AS mb
+  7  FROM   rc_backup_set s JOIN rc_backup_piece p ON s.bs_key = p.bs_key
+  8  WHERE  s.keep_options IS NOT NULL
+  9  GROUP  BY s.db_name, s.tag, s.completion_time, s.keep_until, s.keep_options
+ 10  ORDER  BY s.db_name, s.completion_time;
+
+DB_NAME  TAG                      TAKEN      KEEP_UNTIL KEEP_OPTIONS   MB
+-------- ------------------------ ---------- ---------- ------------ ----
+ORCL     ORCL_QTR_2025Q2          2025-06-30 FOREVER    LOGS          880
+SALES    ADHOC_DEVREQ_20250630    2025-06-30 2025-09-28 LOGS          304
+SALES    SALES_QTR_2025Q2         2025-06-30 FOREVER    LOGS          412
+
+-- 6-2. 실제 복원 검증 (요구 사항 ②)
+--
+-- 목록에 있다는 것과 복원된다는 것은 다르다.
+-- KEEP 백업은 반드시 실사용 검증을 해야 한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RESTORE DATABASE UNTIL RESTORE POINT ORCL_Q2_2025 VALIDATE;
+
+Starting restore at 2025-07-01 09:04:11
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: starting validation of datafile backup set
+channel ORA_DISK_1: reading from backup piece
+  /archive_keep/ORCL/ORCL_Q2_2025_38a5f1k1_62_1_1
+channel ORA_DISK_1: piece handle=/archive_keep/ORCL/ORCL_Q2_2025_38a5f1k1_62_1_1
+  tag=ORCL_QTR_2025Q2
+channel ORA_DISK_1: validation complete, elapsed time: 00:02:41
+Finished restore at 2025-07-01 09:06:52
+
+RMAN> RESTORE ARCHIVELOG FROM SCN 3402881 VALIDATE;
+
+Starting restore at 2025-07-01 09:07:04
+channel ORA_DISK_1: starting validation of archived log backup set
+channel ORA_DISK_1: reading from backup piece
+  /archive_keep/ORCL/ORCL_Q2_2025_39a5f3m2_63_1_1
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:14
+Finished restore at 2025-07-01 09:07:18
+
+-- 데이터파일과 아카이브 모두 읽힌다.
+-- 5년 뒤에도 이 검증을 정기적으로 반복해야 한다.
+
+-- 6-3. 자동 만료 확인 (요구 사항 ④)
+--
+-- KEEP UNTIL 이 지난 백업이 어떻게 되는지 확인한다.
+-- 90일을 기다릴 수 없으므로 짧은 기한으로 재현한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RUN {
+2>   ALLOCATE CHANNEL c1 DEVICE TYPE DISK
+3>     FORMAT '/archive_keep/ADHOC/%d_EXPTEST_%U';
+4>   BACKUP TABLESPACE users TAG 'EXP_TEST'
+5>     KEEP UNTIL TIME 'SYSDATE+1/1440';
+6>   RELEASE CHANNEL c1;
+7> }
+
+Finished backup at 2025-07-01 09:12:02
+
+RMAN> LIST BACKUP KEEP SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+44      B  F  A DISK        2025-06-30 22:25:44       2       1  YES        ADHOC_DEVREQ_20250630
+52      B  0  A DISK        2025-06-30 23:22:41       1       1  YES        SALES_QTR_2025Q2
+58      B  F  A DISK        2025-07-01 09:12:02       1       1  NO         EXP_TEST
+
+-- 1분 뒤 다시 확인한다.
+
+RMAN> REPORT OBSOLETE;
+
+RMAN retention policy is set to recovery window of 21 days
+Report of obsolete backups and copies
+Type                 Key    Completion Time     Filename/Handle
+-------------------- ------ ------------------- --------------------------------
+Backup Set           58     2025-07-01
+  Backup Piece       58     2025-07-01          /archive_keep/ADHOC/SALES_EXPTEST_...
+
+-- 기한이 지나자 보존 정책의 대상이 되었다.
+-- 다음 정기 정리에서 자동으로 지워진다.
+
+RMAN> DELETE NOPROMPT OBSOLETE;
+
+Deleted 1 objects
+
+RMAN> LIST BACKUP KEEP SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+44      B  F  A DISK        2025-06-30 22:25:44       2       1  YES        ADHOC_DEVREQ_20250630
+52      B  0  A DISK        2025-06-30 23:22:41       1       1  YES        SALES_QTR_2025Q2
+
+-- FOREVER 는 남고 만료된 것만 사라졌다. 요구 사항 ④ 충족.
+
+-- 6-4. 정기 정리와의 공존 확인
+--
+-- 고급 실습 04의 rc_maint_crosscheck.sh 를 실행해도
+-- 장기 보관 백업이 영향받지 않아야 한다.
+
+[oracle@oel7v9r1 ~]$ sh /home/oracle/rcadm/rc_maint_crosscheck.sh sales
+
+[OK] maintenance completed for sales
+
+[oracle@oel7v9r1 ~]$ ls -1 /archive_keep/SALES/
+
+SALES_Q2_2025_3ka5j1w1_36_1_1
+SALES_Q2_2025_3la5j3x2_37_1_1
+SALES_Q2_2025_3ma5j5y3_38_1_1
+
+-- 세 조각이 그대로 있다.
+
+-- 6-5. 용량 산정 검증
+--
+-- [2-4]의 문제 3을 실제 수치로 확인한다.
+
+RC_REPORT@rcat> SELECT db_name,
+  2         ROUND(SUM(p.bytes)/1024/1024) AS keep_mb,
+  3         COUNT(DISTINCT s.bs_key) AS keep_sets
+  4  FROM   rc_backup_set s JOIN rc_backup_piece p ON s.bs_key = p.bs_key
+  5  WHERE  s.keep_options IS NOT NULL
+  6  GROUP  BY db_name ORDER BY db_name;
+
+DB_NAME     KEEP_MB KEEP_SETS
+-------- ---------- ---------
+ORCL            880         3
+SALES           716         3
+
+-- 압축을 적용해 orcl 이 880MB 다. 원본 데이터베이스는 약 3.2GB 다.
+-- 압축률 약 3.6:1.
+--
+-- 5년 20세대 추정
+--   ORCL  : 880MB × 20 = 17.6GB
+--   SALES : 412MB × 20 =  8.2GB
+--   합계  : 약 26GB
+--
+-- /archive_keep 의 488GB 여유로 충분하다.
+-- 다만 DB 증가율을 반영해야 한다. 연 20% 증가 가정 시 5년 뒤 약 65GB.
+
+-- 6-6. 요구 사항 대조
+--
+-- 요구 사항                                | 충족 | 근거
+-- -----------------------------------------|------|--------------
+-- ① 정기 정리에서 제외                    | 예   | 4-4, 6-4
+-- ② 그 백업만으로 복원 가능                | 예   | 6-2
+-- ③ 보관 대상 조회 가능                    | 예   | 6-1
+-- ④ 기한 경과 시 자동 해제                 | 예   | 6-3
+-- ⑤ 감사 제출용 목록                       | 예   | 7-1
+
+--------------------------------------------------------------------------------
+[7] 운영 산출물과 확장 과제
+--------------------------------------------------------------------------------
+-- 7-1. rc_keep_audit.sql — 장기 보관 감사 리포트
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/rc_keep_audit.sql
+
+-- 장기 보관 백업 감사 리포트
+-- 실행 : sqlplus -s rc_report/<pw>@rcat @rc_keep_audit.sql
+SET LINESIZE 190 PAGESIZE 200 FEEDBACK OFF VERIFY OFF TRIMSPOOL ON
+COLUMN db_name FORMAT A8
+COLUMN tag FORMAT A24
+COLUMN handle FORMAT A50
+
+PROMPT ================================================================
+PROMPT  장기 보관 백업 현황
+PROMPT ================================================================
+
+PROMPT === 1. 보관 중인 백업 세트 ===
+SELECT s.db_name, s.tag,
+       TO_CHAR(s.completion_time,'YYYY-MM-DD') AS taken,
+       CASE WHEN s.keep_until IS NULL THEN 'FOREVER'
+            ELSE TO_CHAR(s.keep_until,'YYYY-MM-DD') END AS keep_until,
+       CASE WHEN s.keep_until IS NULL THEN NULL
+            ELSE ROUND(s.keep_until - SYSDATE) END AS days_left,
+       ROUND(SUM(p.bytes)/1024/1024) AS mb
+FROM   rc_backup_set s JOIN rc_backup_piece p ON s.bs_key = p.bs_key
+WHERE  s.keep_options IS NOT NULL
+GROUP  BY s.db_name, s.tag, s.completion_time, s.keep_until
+ORDER  BY s.db_name, s.completion_time;
+
+PROMPT === 2. 30일 내 만료 예정 ===
+SELECT db_name, tag, TO_CHAR(keep_until,'YYYY-MM-DD') AS expires,
+       ROUND(keep_until - SYSDATE) AS days_left
+FROM   rc_backup_set
+WHERE  keep_until IS NOT NULL AND keep_until BETWEEN SYSDATE AND SYSDATE+30
+ORDER  BY keep_until;
+
+PROMPT === 3. 조각 상태 (파일 존재 여부) ===
+SELECT s.db_name, s.tag, p.status, COUNT(*) AS pieces
+FROM   rc_backup_set s JOIN rc_backup_piece p ON s.bs_key = p.bs_key
+WHERE  s.keep_options IS NOT NULL
+GROUP  BY s.db_name, s.tag, p.status
+ORDER  BY s.db_name, p.status;
+
+PROMPT === 4. 분기별 보관 누락 점검 ===
+SELECT q.db_name, q.qtr,
+       NVL(TO_CHAR(b.completion_time,'YYYY-MM-DD'),'*** 누락 ***') AS taken
+FROM  (SELECT d.name AS db_name,
+              TO_CHAR(ADD_MONTHS(TRUNC(SYSDATE,'Q'), -3*LEVEL),'YYYY"Q"Q') AS qtr,
+              ADD_MONTHS(TRUNC(SYSDATE,'Q'), -3*LEVEL) AS qstart
+       FROM   rc_database d CONNECT BY LEVEL <= 8
+       AND    PRIOR d.name = d.name AND PRIOR SYS_GUID() IS NOT NULL) q
+  LEFT JOIN rc_backup_set b
+    ON b.db_name = q.db_name AND b.keep_options IS NOT NULL
+   AND b.completion_time BETWEEN q.qstart AND ADD_MONTHS(q.qstart,3)
+ORDER BY q.db_name, q.qtr DESC;
+
+PROMPT === 5. 보관 용량 ===
+SELECT db_name, COUNT(DISTINCT s.bs_key) AS sets,
+       ROUND(SUM(p.bytes)/1024/1024/1024,2) AS gb
+FROM   rc_backup_set s JOIN rc_backup_piece p ON s.bs_key = p.bs_key
+WHERE  s.keep_options IS NOT NULL
+GROUP  BY db_name ORDER BY db_name;
+
+-- 실행 결과 일부
+
+=== 4. 분기별 보관 누락 점검 ===
+DB_NAME  QTR     TAKEN
+-------- ------- --------------
+ORCL     2025Q2  2025-06-30
+ORCL     2025Q1  *** 누락 ***
+ORCL     2024Q4  *** 누락 ***
+SALES    2025Q2  2025-06-30
+SALES    2025Q1  *** 누락 ***
+
+-- 과거 분기의 누락이 드러난다.
+-- 이것이 [1]의 상황이며 이제부터는 누락이 즉시 보인다.
+
+-- 7-2. 분기말 자동 수행 스크립트
+
+[oracle@oel7v9r1 ~]$ cat /home/oracle/rcadm/rc_quarterly_keep.sh
+
+#!/bin/bash
+# 분기말 장기 보관 백업
+# 사용법 : rc_quarterly_keep.sh <ORACLE_SID>
+set -u
+SID=$1
+DBNAME=$(echo $SID | tr 'a-z' 'A-Z')
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export ORACLE_SID=$SID
+export PATH=$ORACLE_HOME/bin:$PATH
+
+# 분기 계산
+YEAR=$(date +%Y)
+MON=$(date +%m)
+QTR=$(( (10#$MON - 1) / 3 + 1 ))
+TAG="${DBNAME}_QTR_${YEAR}Q${QTR}"
+RP="${DBNAME}_Q${QTR}_${YEAR}"
+KEEPDIR=/archive_keep/$DBNAME
+LOG=/home/oracle/rcadm/log/keep_${SID}_${YEAR}Q${QTR}.log
+MAILTO="dba-team@example.com"
+
+mkdir -p $KEEPDIR
+
+# --- 안전장치 1 : 카탈로그 필수 (KEEP FOREVER 요건)
+if ! echo "exit" | rman target / catalog rcatowner/oracle_4U@rcat >/dev/null 2>&1
+then
+  echo "[ABORT] recovery catalog required for KEEP FOREVER" | tee -a $LOG
+  mailx -s "[ABORT] quarterly keep - catalog down ($SID)" $MAILTO < $LOG
+  exit 2
+fi
+
+# --- 안전장치 2 : 보관 경로가 FRA 밖인가 (ORA-19811 방지)
+FRA=$(sqlplus -s / as sysdba << 'EOF'
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT value FROM v$parameter WHERE name='db_recovery_file_dest';
+EXIT
+EOF
+)
+case "$KEEPDIR" in
+  ${FRA}*) echo "[ABORT] keep path is inside FRA" | tee -a $LOG; exit 2 ;;
+esac
+
+# --- 안전장치 3 : 중복 방지
+if rman target / catalog rcatowner/oracle_4U@rcat << EOF 2>/dev/null | grep -q "$TAG"
+LIST BACKUP TAG '$TAG' SUMMARY;
+EXIT
+EOF
+then
+  echo "[SKIP] $TAG already exists" | tee -a $LOG
+  exit 0
+fi
+
+# --- 수행
+rman target / catalog rcatowner/oracle_4U@rcat >> $LOG 2>&1 << EOF
+RUN {
+  ALLOCATE CHANNEL c1 DEVICE TYPE DISK FORMAT '$KEEPDIR/%d_Q${QTR}_${YEAR}_%U';
+  BACKUP AS COMPRESSED BACKUPSET DATABASE
+    TAG '$TAG' KEEP FOREVER RESTORE POINT $RP;
+  RELEASE CHANNEL c1;
+}
+EXIT
+EOF
+
+# --- 즉시 검증 (요구 사항 ②)
+rman target / catalog rcatowner/oracle_4U@rcat >> $LOG 2>&1 << EOF
+RESTORE DATABASE UNTIL RESTORE POINT $RP VALIDATE;
+LIST BACKUP TAG '$TAG';
+EXIT
+EOF
+
+if grep -qE 'ORA-[0-9]+|RMAN-[0-9]+' $LOG; then
+  mailx -s "[FAIL] quarterly keep $TAG" $MAILTO < $LOG
+  exit 1
+fi
+
+echo "[OK] $TAG completed and validated"
+exit 0
+
+[oracle@oel7v9r1 ~]$ crontab -l | grep quarterly
+
+# 분기말 (3,6,9,12월 마지막 날 22시)
+0 22 31 3,12 * /home/oracle/rcadm/rc_quarterly_keep.sh orcl
+0 22 30 6,9 * /home/oracle/rcadm/rc_quarterly_keep.sh orcl
+30 22 31 3,12 * /home/oracle/rcadm/rc_quarterly_keep.sh sales
+30 22 30 6,9 * /home/oracle/rcadm/rc_quarterly_keep.sh sales
+
+-- 7-3. 연 1회 복원 검증
+
+[oracle@oel7v9r1 ~]$ cat /home/oracle/rcadm/rc_keep_verify.sh
+
+#!/bin/bash
+# 장기 보관 백업 전량 검증 (연 1회)
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export PATH=$ORACLE_HOME/bin:$PATH
+LOG=/home/oracle/rcadm/log/keep_verify_$(date +%Y%m%d).log
+
+for SID in orcl sales; do
+  export ORACLE_SID=$SID
+  echo "=== $SID ===" >> $LOG
+  rman target / catalog rcatowner/oracle_4U@rcat >> $LOG 2>&1 << 'EOF'
+CROSSCHECK BACKUP;
+LIST BACKUP KEEP;
+RESTORE DATABASE VALIDATE;
+EXIT
+EOF
+done
+
+grep -c "found to be 'EXPIRED'" $LOG
+mailx -s "장기 보관 백업 연간 검증 $(date +%Y)" dba-team@example.com < $LOG
+
+-- 7-4. 확장 과제
+--
+-- 과제 A. Data Pump 와의 비교
+--   5년 보관 요건에 KEEP 백업과 Data Pump 논리 백업 중 무엇이 나은지
+--   다음 관점에서 비교하고 결론을 내리시오.
+--     버전 종속성 / 용량 / 복원 시간 / 부분 조회 가능성 / 매체 이전
+--   두 방식을 병행하는 구성도 검토한다.
+--
+-- 과제 B. 매체 이전 절차
+--   3년 지난 KEEP 백업을 테이프나 오브젝트 스토리지로 옮겨야 한다.
+--   카탈로그 기록을 유지하면서 옮기는 절차를 설계하시오.
+--   BACKUP BACKUPSET 과 CHANGE ... UNAVAILABLE 을 검토한다.
+--
+-- 과제 C. 복원 지점만으로 부족한 이유
+--   RESTORE POINT 는 SCN 에 이름을 붙인 것뿐이다.
+--   복원 지점만 만들고 KEEP 백업을 받지 않으면 어떻게 되는지 확인하시오.
+--   18장의 보장 복원 지점과의 차이도 함께 정리한다.
+--
+-- 과제 D. 감사 시나리오 수행
+--   "2025년 2분기 말 orcl 의 특정 테이블 데이터를 제출하라"는 요청을 처리하시오.
+--   전체 복원 없이 그 테이블만 뽑는 방법을 설계하고 수행한다.
+--   힌트 : RECOVER TABLE ... UNTIL RESTORE POINT 또는 보조 인스턴스 복원.
+--
+-- 과제 E. 보관 정책 문서 작성
+--   [2-3]의 설계표를 조직 표준 문서 형태로 확장하시오.
+--   보관 대상, 주기, 기한, 저장 위치, 검증 주기, 폐기 절차, 책임자를 포함한다.
+
+-- 7-5. 정리 — 이 실습에서 남는 것
+--
+--   ① rc_keep_audit.sql       : 장기 보관 감사 리포트 (분기 누락 점검 포함)
+--   ② rc_quarterly_keep.sh    : 분기말 자동 보관 (안전장치 3중)
+--   ③ rc_keep_verify.sh       : 연 1회 전량 복원 검증
+--   ④ 보관 설계표             : [2-3]
+--   ⑤ 용량 산정 근거          : [6-5]
+--
+-- 다음 예제에서는 이 백업들을 실제로 다른 서버에서 복구해 본다.
+
+-- 실무 포인트
+-- 1) KEEP FOREVER 는 카탈로그가 있어야만 쓸 수 있다.
+--    컨트롤파일은 순환 재사용 영역이라 영구 보관을 보장할 수 없다.
+--    장기 보관 요건이 있는 조직에서 카탈로그는 선택이 아니다.
+--
+-- 2) KEEP 백업은 FRA 에 둘 수 없다.
+--    ORA-19811 로 거부된다. 자동 관리와 영구 보관은 양립하지 않는다.
+--    채널 FORMAT 을 명시해 FRA 밖으로 보낸다.
+--
+-- 3) 장기 보관은 처음부터 KEEP 으로 받는다.
+--    사후에 CHANGE ... KEEP 을 걸면 필요한 아카이브가 이미 없을 수 있다.
+--    "will be backed up" 메시지는 미래형이지 완료형이 아니다.
+--
+-- 4) KEEP 백업은 자기 완결적으로 만들어진다.
+--    데이터파일, 아카이브, spfile, 컨트롤파일이 함께 백업된다.
+--    그래서 그 세트만으로 해당 시점 복원이 가능하다.
+--
+-- 5) 목록에 있는 것과 복원되는 것은 다르다.
+--    KEEP 백업은 오래 방치되므로 정기 검증이 반드시 필요하다.
+--    받을 때 한 번, 그리고 연 1회 전량 검증을 절차로 만든다.
+--
+-- 6) 5년 보관은 소프트웨어 보관 계획과 함께 세운다.
+--    19c 백업은 19c 이상에서만 복원된다.
+--    매체 수명, 용량 증가, 버전 지원 종료를 함께 고려해야 실제로 쓸 수 있다.

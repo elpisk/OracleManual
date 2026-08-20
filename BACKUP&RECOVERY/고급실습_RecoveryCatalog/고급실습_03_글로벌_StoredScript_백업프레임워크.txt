@@ -1,0 +1,979 @@
+================================================================================
+ 고급 실습 03 : 파라미터화 글로벌 Stored Script 백업 프레임워크
+ 과정      : Oracle Database 19c Backup & Recovery — Recovery Catalog 고급
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / oel7v9r1(운영계) + oel7v9r2(관리계)
+ 대상 DB   : orcl, sales (oel7v9r1) / hrdb (oel7v9r2)
+ 카탈로그  : rcat @ oel7v9r2
+ 소요 시간 : 약 3시간
+ 선행 조건 : 고급 실습 01~02 완료
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실무 상황
+--------------------------------------------------------------------------------
+-- 현재 백업 스크립트는 이렇게 흩어져 있다.
+--
+--   oel7v9r1:/home/oracle/bin/backup_orcl.sh    (작성자 A, 2023년)
+--   oel7v9r1:/home/oracle/bin/bk_sales.sh       (작성자 B, 2024년)
+--   oel7v9r2:/home/oracle/scripts/hrdb_bkup.sh  (작성자 C, 2024년)
+--
+-- 세 스크립트의 내용이 조금씩 다르다.
+--   - orcl 만 CHECK LOGICAL 을 붙인다
+--   - sales 는 PLUS ARCHIVELOG 가 빠져 있다 (고급 실습 02의 그 사고)
+--   - hrdb 는 태그를 붙이지 않는다
+--
+-- 지난달 보존 정책을 14일에서 21일로 늘리라는 지시가 있었다.
+-- 세 곳을 고쳐야 했고 한 곳을 빠뜨려 아직도 14일로 돌고 있다.
+--
+-- 요구 사항
+--   ① 백업 절차를 한 곳에서 정의하고 세 DB가 같은 절차를 쓴다
+--   ② DB마다 다른 값(태그, 경로, 보존일)은 파라미터로 넘긴다
+--   ③ 절차를 고치면 세 DB에 즉시 반영된다
+--   ④ 실행 결과가 로그로 남고 실패하면 알림이 간다
+--   ⑤ 서버에 셸 스크립트를 배포하지 않아도 절차가 유지된다
+--
+-- 카탈로그의 글로벌 스토어드 스크립트가 이 요구를 정확히 충족한다.
+-- 13.6절에서 다룬 스토어드 스크립트를 다중 DB 환경으로 확장한다.
+
+--------------------------------------------------------------------------------
+[2] 사전 설계
+--------------------------------------------------------------------------------
+-- 2-1. 로컬 스크립트와 글로벌 스크립트
+--
+--   구분        | 로컬 스크립트           | 글로벌 스크립트
+--   ------------|-------------------------|---------------------------
+--   생성 명령   | CREATE SCRIPT           | CREATE GLOBAL SCRIPT
+--   소속        | 특정 대상 DB            | 카탈로그 전체
+--   접속 요건   | 대상 DB에 접속 필요     | 카탈로그만 접속해도 생성 가능
+--   가시 범위   | 그 DB에서만             | 등록된 모든 DB에서
+--   VPC 사용자  | 자기 DB의 것만          | 모두 보임 (실습 01 6-4)
+--   용도        | 그 DB에만 있는 예외 절차| 조직 표준 절차
+--
+--   이 실습에서는 표준 절차를 글로벌로, 예외를 로컬로 둔다.
+
+-- 2-2. 치환 변수
+--
+--   스크립트 본문에 &1, &2, &3 형태로 넣는다.
+--   실행할 때 USING 절로 값을 넘긴다.
+--
+--     RUN { EXECUTE GLOBAL SCRIPT gs_backup_ts USING 'users', 'TAG01'; }
+--
+--   주의할 점
+--     - EXECUTE SCRIPT 는 반드시 RUN 블록 안에 있어야 한다
+--     - USING 값의 개수와 &n 의 개수가 맞아야 한다
+--     - 대화형으로 CREATE 하면 값 입력을 요구할 수 있다.
+--       파일에서 만들면 그 문제가 없다.
+
+-- 2-3. 만들 스크립트 목록
+--
+--   이름                  | 파라미터                    | 용도
+--   ----------------------|-----------------------------|-------------------
+--   gs_daily_incr         | &1 태그접두어               | 일일 증분 + 아카이브
+--   gs_weekly_full        | &1 태그접두어               | 주간 Level 0
+--   gs_archive_only       | &1 태그접두어               | 아카이브만 (임시)
+--   gs_maint_obsolete     | (없음)                      | 보존 정책 적용 정리
+--   gs_validate_full      | (없음)                      | 복구 가능성 검증
+--
+--   태그 규칙 : <접두어>_<종류>_<YYYYMMDD>
+--     예) ORCL_INCR_20250604
+--   경로 규칙 : /backup/%d/   ← %d 가 DB 이름으로 치환된다
+--               경로를 파라미터로 넘길 필요가 없어진다
+
+-- 2-4. 실행 구조
+--
+--   crontab (각 서버)
+--        └─ rc_backup_framework.sh <DB_SID> <스크립트명> <태그접두어>
+--              └─ rman target / catalog rcatowner@rcat
+--                    └─ RUN { EXECUTE GLOBAL SCRIPT <스크립트명> USING '<접두어>'; }
+--              └─ 로그 저장 · 오류 판정 · 실패 시 메일
+--
+--   셸 스크립트는 실행기 하나만 배포한다.
+--   백업 절차 자체는 카탈로그에 있으므로 서버에 없다.
+--   절차를 바꾸면 다음 실행부터 세 DB에 동시에 반영된다.
+
+-- 2-5. 표준 CONFIGURE 설정
+--
+--   스크립트 안에 넣지 않고 DB별 영구 설정으로 둔다.
+--   스크립트는 "무엇을 백업할지", CONFIGURE 는 "어떻게 저장할지"를 맡는다.
+--
+--     RETENTION POLICY  : RECOVERY WINDOW OF 21 DAYS
+--     CONTROLFILE AUTOBACKUP : ON
+--     DEVICE TYPE DISK PARALLELISM 2
+--     CHANNEL DEVICE TYPE DISK FORMAT '/backup/%d/%U'
+--     BACKUP OPTIMIZATION : ON
+
+--------------------------------------------------------------------------------
+[3] 환경 준비
+--------------------------------------------------------------------------------
+-- 3-1. 기존 스크립트 조사 — 무엇이 다른지 확인한다
+
+[oracle@oel7v9r1 ~]$ grep -h 'BACKUP' /home/oracle/bin/backup_orcl.sh \
+>   /home/oracle/bin/bk_sales.sh
+
+BACKUP INCREMENTAL LEVEL 1 CHECK LOGICAL DATABASE PLUS ARCHIVELOG DELETE INPUT;
+BACKUP INCREMENTAL LEVEL 1 DATABASE;
+
+[oracle@oel7v9r2 ~]$ grep -h 'BACKUP' /home/oracle/scripts/hrdb_bkup.sh
+
+BACKUP INCREMENTAL LEVEL 1 DATABASE PLUS ARCHIVELOG;
+
+-- 세 줄이 모두 다르다. 이것을 하나로 통일한다.
+
+-- 3-2. 백업 경로 준비 (세 DB 모두)
+
+[oracle@oel7v9r1 ~]$ mkdir -p /backup/ORCL /backup/SALES
+[oracle@oel7v9r1 ~]$ ls -ld /backup/*
+
+drwxr-x---. 2 oracle oinstall 4096 Jun  4 08:02 /backup/ORCL
+drwxr-x---. 2 oracle oinstall 4096 Jun  4 08:02 /backup/SALES
+
+-- hrdb 쪽 경로는 일부러 만들지 않는다. [5]에서 오류로 재현한다.
+
+[oracle@oel7v9r2 ~]$ ls -ld /backup/*
+
+drwxr-x---. 2 oracle oinstall 4096 Jun  4 08:03 /backup/RCAT
+
+-- 3-3. 표준 CONFIGURE 적용 — orcl
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: ORCL (DBID=1547823901)
+connected to recovery catalog database
+
+RMAN> CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS;
+RMAN> CONFIGURE CONTROLFILE AUTOBACKUP ON;
+RMAN> CONFIGURE DEVICE TYPE DISK PARALLELISM 2 BACKUP TYPE TO BACKUPSET;
+RMAN> CONFIGURE CHANNEL DEVICE TYPE DISK FORMAT '/backup/%d/%U';
+RMAN> CONFIGURE BACKUP OPTIMIZATION ON;
+
+new RMAN configuration parameters are successfully stored
+starting full resync of recovery catalog
+full resync complete
+
+RMAN> SHOW ALL;
+
+RMAN configuration parameters for database with db_unique_name ORCL are:
+CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS;
+CONFIGURE BACKUP OPTIMIZATION ON;
+CONFIGURE CONTROLFILE AUTOBACKUP ON;
+CONFIGURE DEVICE TYPE DISK PARALLELISM 2 BACKUP TYPE TO BACKUPSET;
+CONFIGURE CHANNEL DEVICE TYPE DISK FORMAT '/backup/%d/%U';
+CONFIGURE MAXSETSIZE TO UNLIMITED;
+
+-- 3-4. sales 와 hrdb 에도 같은 설정을 적용한다
+--
+-- 같은 명령을 세 번 치는 대신 파일로 만들어 돌린다.
+
+[oracle@oel7v9r1 ~]$ cat > /home/oracle/rcadm/std_configure.rman << 'EOF'
+CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS;
+CONFIGURE CONTROLFILE AUTOBACKUP ON;
+CONFIGURE DEVICE TYPE DISK PARALLELISM 2 BACKUP TYPE TO BACKUPSET;
+CONFIGURE CHANNEL DEVICE TYPE DISK FORMAT '/backup/%d/%U';
+CONFIGURE BACKUP OPTIMIZATION ON;
+SHOW RETENTION POLICY;
+EOF
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat \
+>   @/home/oracle/rcadm/std_configure.rman
+
+RMAN configuration parameters for database with db_unique_name SALES are:
+CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS;
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=hrdb
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat \
+>   @/home/oracle/rcadm/std_configure.rman
+
+RMAN configuration parameters for database with db_unique_name HRDB are:
+CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS;
+
+-- 3-5. 설정이 일치하는지 카탈로그에서 확인
+
+[oracle@oel7v9r2 ~]$ sqlplus -s rc_report/oracle_4U@rcat
+
+RC_REPORT@rcat> SET LINESIZE 150
+RC_REPORT@rcat> COLUMN name FORMAT A8
+RC_REPORT@rcat> COLUMN value FORMAT A55
+
+RC_REPORT@rcat> SELECT d.name, c.value
+  2  FROM   rc_database d JOIN rc_rman_configuration c ON d.db_key = c.db_key
+  3  WHERE  c.value LIKE 'RETENTION%' ORDER BY d.name;
+
+NAME     VALUE
+-------- -------------------------------------------------------
+HRDB     RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS
+ORCL     RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS
+SALES    RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS
+
+-- 세 대가 같은 정책을 쓴다.
+-- 이 조회를 일일 리포트에 넣으면 설정 이탈을 상시 감시할 수 있다.
+
+--------------------------------------------------------------------------------
+[4] 구축과 수행
+--------------------------------------------------------------------------------
+-- 4-1. 스크립트 본문을 파일로 작성한다
+--
+-- 대화형으로 CREATE 하면 치환 변수 값을 물어볼 수 있다.
+-- 파일에서 만들면 그 문제가 없고 형상 관리도 쉬워진다.
+
+[oracle@oel7v9r2 ~]$ mkdir -p /home/oracle/rcadm/scripts
+[oracle@oel7v9r2 ~]$ cat > /home/oracle/rcadm/scripts/gs_daily_incr.rman << 'EOF'
+{
+  BACKUP INCREMENTAL LEVEL 1
+    CHECK LOGICAL
+    DATABASE
+    TAG '&1_INCR'
+    PLUS ARCHIVELOG
+    TAG '&1_ARCH'
+    NOT BACKED UP 1 TIMES;
+  BACKUP CURRENT CONTROLFILE TAG '&1_CF';
+  DELETE NOPROMPT OBSOLETE;
+}
+EOF
+
+[oracle@oel7v9r2 ~]$ cat > /home/oracle/rcadm/scripts/gs_weekly_full.rman << 'EOF'
+{
+  BACKUP INCREMENTAL LEVEL 0
+    CHECK LOGICAL
+    DATABASE
+    TAG '&1_FULL'
+    PLUS ARCHIVELOG
+    TAG '&1_ARCH';
+  BACKUP CURRENT CONTROLFILE TAG '&1_CF';
+  DELETE NOPROMPT OBSOLETE;
+}
+EOF
+
+[oracle@oel7v9r2 ~]$ cat > /home/oracle/rcadm/scripts/gs_archive_only.rman << 'EOF'
+{
+  SQL 'ALTER SYSTEM ARCHIVE LOG CURRENT';
+  BACKUP ARCHIVELOG ALL TAG '&1_ARCH' NOT BACKED UP 1 TIMES;
+}
+EOF
+
+[oracle@oel7v9r2 ~]$ cat > /home/oracle/rcadm/scripts/gs_validate_full.rman << 'EOF'
+{
+  RESTORE DATABASE VALIDATE;
+  RESTORE ARCHIVELOG ALL VALIDATE;
+  BACKUP VALIDATE CHECK LOGICAL DATABASE ARCHIVELOG ALL;
+}
+EOF
+
+[oracle@oel7v9r2 ~]$ cat > /home/oracle/rcadm/scripts/gs_maint_obsolete.rman << 'EOF'
+{
+  CROSSCHECK BACKUP;
+  CROSSCHECK ARCHIVELOG ALL;
+  DELETE NOPROMPT EXPIRED BACKUP;
+  DELETE NOPROMPT EXPIRED ARCHIVELOG ALL;
+  DELETE NOPROMPT OBSOLETE;
+  REPORT NEED BACKUP;
+}
+EOF
+
+-- 4-2. 카탈로그에 등록한다
+--
+-- 글로벌 스크립트는 대상 DB 접속 없이 카탈로그만으로 만들 수 있다.
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+
+recovery catalog database Password:
+connected to recovery catalog database
+
+RMAN> CREATE GLOBAL SCRIPT gs_daily_incr
+2>   COMMENT '표준 일일 증분 백업 (파라미터 &1 = 태그 접두어)'
+3>   FROM FILE '/home/oracle/rcadm/scripts/gs_daily_incr.rman';
+
+created global script gs_daily_incr
+
+RMAN> CREATE GLOBAL SCRIPT gs_weekly_full
+2>   COMMENT '표준 주간 Level 0 백업 (파라미터 &1 = 태그 접두어)'
+3>   FROM FILE '/home/oracle/rcadm/scripts/gs_weekly_full.rman';
+
+created global script gs_weekly_full
+
+RMAN> CREATE GLOBAL SCRIPT gs_archive_only
+2>   COMMENT '아카이브 로그만 백업 (파라미터 &1 = 태그 접두어)'
+3>   FROM FILE '/home/oracle/rcadm/scripts/gs_archive_only.rman';
+
+RMAN> CREATE GLOBAL SCRIPT gs_validate_full
+2>   COMMENT '복구 가능성 검증 (파라미터 없음)'
+3>   FROM FILE '/home/oracle/rcadm/scripts/gs_validate_full.rman';
+
+RMAN> CREATE GLOBAL SCRIPT gs_maint_obsolete
+2>   COMMENT '정합성 점검과 보존 정책 적용 (파라미터 없음)'
+3>   FROM FILE '/home/oracle/rcadm/scripts/gs_maint_obsolete.rman';
+
+created global script gs_maint_obsolete
+
+-- 4-3. 등록 결과 확인
+
+RMAN> LIST GLOBAL SCRIPT NAMES;
+
+List of Stored Scripts in Recovery Catalog
+
+    Global Scripts
+
+    Script Name
+    Description
+    -----------------------------------------------------------------
+    gs_archive_only
+    아카이브 로그만 백업 (파라미터 &1 = 태그 접두어)
+
+    gs_daily_incr
+    표준 일일 증분 백업 (파라미터 &1 = 태그 접두어)
+
+    gs_maint_obsolete
+    정합성 점검과 보존 정책 적용 (파라미터 없음)
+
+    gs_validate_full
+    복구 가능성 검증 (파라미터 없음)
+
+    gs_weekly_full
+    표준 주간 Level 0 백업 (파라미터 &1 = 태그 접두어)
+
+RMAN> PRINT GLOBAL SCRIPT gs_daily_incr;
+
+printing stored global script: gs_daily_incr
+{
+  BACKUP INCREMENTAL LEVEL 1
+    CHECK LOGICAL
+    DATABASE
+    TAG '&1_INCR'
+    PLUS ARCHIVELOG
+    TAG '&1_ARCH'
+    NOT BACKED UP 1 TIMES;
+  BACKUP CURRENT CONTROLFILE TAG '&1_CF';
+  DELETE NOPROMPT OBSOLETE;
+}
+
+RMAN> EXIT
+
+-- 카탈로그 뷰로도 확인할 수 있다.
+
+RC_REPORT@rcat> SELECT script_name, db_key,
+  2         CASE WHEN db_key IS NULL THEN 'GLOBAL' ELSE 'LOCAL' END AS scope
+  3  FROM   rc_stored_script ORDER BY scope, script_name;
+
+SCRIPT_NAME              DB_KEY SCOPE
+-------------------- ---------- ------
+gs_archive_only                 GLOBAL
+gs_daily_incr                   GLOBAL
+gs_maint_obsolete               GLOBAL
+gs_validate_full                GLOBAL
+gs_weekly_full                  GLOBAL
+
+-- db_key 가 비어 있으면 글로벌이다.
+
+-- 4-4. 실행 — orcl
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: ORCL (DBID=1547823901)
+connected to recovery catalog database
+
+RMAN> RUN { EXECUTE GLOBAL SCRIPT gs_daily_incr USING 'ORCL'; }
+
+executing global script: gs_daily_incr
+
+Starting backup at 2025-06-04 09:12:03
+current log archived
+allocated channel: ORA_DISK_1
+allocated channel: ORA_DISK_2
+channel ORA_DISK_1: starting archived log backup set
+channel ORA_DISK_1: starting piece 1 at 2025-06-04 09:12:06
+piece handle=/backup/ORCL/2f3a7n1w_52_1_1 tag=ORCL_ARCH
+Finished backup at 2025-06-04 09:12:41
+
+Starting backup at 2025-06-04 09:12:41
+channel ORA_DISK_1: starting incremental level 1 datafile backup set
+channel ORA_DISK_1: starting piece 1 at 2025-06-04 09:12:44
+piece handle=/backup/ORCL/2g3a7p2x_53_1_1 tag=ORCL_INCR
+Finished backup at 2025-06-04 09:16:22
+
+Starting backup at 2025-06-04 09:16:22
+channel ORA_DISK_1: starting full datafile backup set
+including current control file in backup set
+piece handle=/backup/ORCL/2i3a7r4z_55_1_1 tag=ORCL_CF
+Finished backup at 2025-06-04 09:16:31
+
+RMAN retention policy will be applied to the command
+RMAN retention policy is set to recovery window of 21 days
+no obsolete backups found
+
+-- 태그가 파라미터로 치환된 것을 확인한다.
+
+RMAN> LIST BACKUP TAG 'ORCL_INCR' SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+1288    B  1  A DISK        2025-06-04 09:16:22       1       1  NO         ORCL_INCR
+
+RMAN> EXIT
+
+-- 4-5. 같은 스크립트를 다른 DB에서 실행
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RUN { EXECUTE GLOBAL SCRIPT gs_daily_incr USING 'SALES'; }
+
+executing global script: gs_daily_incr
+
+Starting backup at 2025-06-04 09:22:11
+current log archived
+piece handle=/backup/SALES/2k3a8t6b_29_1_1 tag=SALES_ARCH
+Finished backup at 2025-06-04 09:23:04
+
+Starting backup at 2025-06-04 09:23:04
+piece handle=/backup/SALES/2l3a8v7c_30_1_1 tag=SALES_INCR
+Finished backup at 2025-06-04 09:26:18
+
+Starting backup at 2025-06-04 09:26:18
+piece handle=/backup/SALES/2n3a8x9e_32_1_1 tag=SALES_CF
+Finished backup at 2025-06-04 09:26:27
+
+-- SALES 에도 아카이브 백업이 포함되었다.
+-- 고급 실습 02에서 발견한 누락이 구조적으로 해결되었다.
+-- 스크립트가 하나이므로 DB마다 다를 수가 없다.
+
+RMAN> EXIT
+
+-- 4-6. 절차 변경이 즉시 반영되는지 확인
+--
+-- 요구 사항 ③의 검증이다.
+-- 백업 조각 크기를 제한하라는 지시가 내려왔다고 하자.
+
+[oracle@oel7v9r2 ~]$ cat > /home/oracle/rcadm/scripts/gs_daily_incr.rman << 'EOF'
+{
+  BACKUP INCREMENTAL LEVEL 1
+    CHECK LOGICAL
+    DATABASE
+    TAG '&1_INCR'
+    MAXPIECESIZE 2G
+    PLUS ARCHIVELOG
+    TAG '&1_ARCH'
+    NOT BACKED UP 1 TIMES;
+  BACKUP CURRENT CONTROLFILE TAG '&1_CF';
+  DELETE NOPROMPT OBSOLETE;
+}
+EOF
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+
+RMAN> REPLACE GLOBAL SCRIPT gs_daily_incr
+2>   COMMENT '표준 일일 증분 백업 (조각 2G 제한 추가 2025-06-04)'
+3>   FROM FILE '/home/oracle/rcadm/scripts/gs_daily_incr.rman';
+
+replaced global script gs_daily_incr
+
+RMAN> EXIT
+
+-- 세 DB 어디서 실행해도 바뀐 절차가 적용된다.
+-- 서버에 아무것도 배포하지 않았다.
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=hrdb
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> PRINT GLOBAL SCRIPT gs_daily_incr;
+
+printing stored global script: gs_daily_incr
+{
+  BACKUP INCREMENTAL LEVEL 1
+    CHECK LOGICAL
+    DATABASE
+    TAG '&1_INCR'
+    MAXPIECESIZE 2G
+    ...
+
+-- hrdb 에서도 변경된 내용이 보인다.
+
+--------------------------------------------------------------------------------
+[5] 오류 주입과 대응
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 오류 ① RUN 블록 없이 실행
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=hrdb
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+
+connected to target database: HRDB (DBID=3391560212)
+connected to recovery catalog database
+
+RMAN> EXECUTE GLOBAL SCRIPT gs_daily_incr USING 'HRDB';
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-00558: error encountered while parsing input commands
+RMAN-01009: syntax error: found "execute": expecting one of: "advise,
+allocate, alter, backup, @, catalog, change, connect, convert, copy, create,
+crosscheck, configure, duplicate, debug, delete, describe, drop, exit, endinline,
+flashback, grant, host, {, import, list, mount, open, print, quit, recover,
+register, release, repair, replace, replicate, report, reset, restore, resync,
+revoke, run, rman, send, set, show, shutdown, spool, sql, startup, switch,
+transport, unregister, upgrade, validate"
+RMAN-01008: the bad identifier was: execute
+RMAN-01007: at line 1 column 1 file: standard input
+
+-- << 원인 파악 >>
+-- EXECUTE SCRIPT 는 독립 명령이 아니라 RUN 블록 안에서만 쓰는 작업이다.
+-- 오류 메시지의 "expecting one of" 목록에 execute 가 없다.
+-- 목록에 run 은 있으므로 그것으로 감싸야 한다는 뜻이다.
+--
+-- PRINT SCRIPT 나 LIST SCRIPT NAMES 는 RUN 블록 없이 실행된다.
+-- 그래서 더 헷갈린다. 실행만 RUN 블록이 필요하다.
+
+-- << 수정 >>
+
+RMAN> RUN { EXECUTE GLOBAL SCRIPT gs_daily_incr USING 'HRDB'; }
+
+executing global script: gs_daily_incr
+
+Starting backup at 2025-06-04 09:41:12
+current log archived
+allocated channel: ORA_DISK_1
+allocated channel: ORA_DISK_2
+channel ORA_DISK_1: starting archived log backup set
+channel ORA_DISK_1: starting piece 1 at 2025-06-04 09:41:15
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03009: failure of backup command on ORA_DISK_1 channel at 06/04/2025 09:41:16
+ORA-19504: failed to create file "/backup/HRDB/2p3b1a2g_18_1_1"
+ORA-27040: file create error, unable to create file
+Linux-x86_64 Error: 2: No such file or directory
+Additional information: 1
+
+-- ────────────────────────────────────────────────
+-- 오류 ② 표준 경로가 없는 서버
+-- ────────────────────────────────────────────────
+-- << 원인 파악 >>
+-- CONFIGURE CHANNEL ... FORMAT '/backup/%d/%U' 를 세 DB에 똑같이 적용했다.
+-- %d 는 DB 이름으로 치환되므로 hrdb 는 /backup/HRDB 를 쓴다.
+-- 그런데 oel7v9r2 에는 /backup/RCAT 만 만들어 두었다.
+--
+-- 설정을 표준화할 때 흔히 놓치는 부분이다.
+-- 카탈로그에 담긴 설정은 서버의 디렉터리 존재 여부를 알지 못한다.
+-- 표준화 대상은 설정과 절차이고, 서버 준비는 별도 점검 항목이어야 한다.
+
+[oracle@oel7v9r2 ~]$ ls -ld /backup/HRDB
+
+ls: cannot access /backup/HRDB: No such file or directory
+
+-- << 수정 >>
+
+[oracle@oel7v9r2 ~]$ mkdir -p /backup/HRDB
+[oracle@oel7v9r2 ~]$ chmod 750 /backup/HRDB
+[oracle@oel7v9r2 ~]$ ls -ld /backup/HRDB
+
+drwxr-x---. 2 oracle oinstall 4096 Jun  4 09:43 /backup/HRDB
+
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RUN { EXECUTE GLOBAL SCRIPT gs_daily_incr USING 'HRDB'; }
+
+executing global script: gs_daily_incr
+
+Starting backup at 2025-06-04 09:44:02
+piece handle=/backup/HRDB/2q3b1c3h_19_1_1 tag=HRDB_ARCH
+Finished backup at 2025-06-04 09:44:38
+
+Starting backup at 2025-06-04 09:44:38
+piece handle=/backup/HRDB/2r3b1e4i_20_1_1 tag=HRDB_INCR
+Finished backup at 2025-06-04 09:47:11
+
+Starting backup at 2025-06-04 09:47:11
+piece handle=/backup/HRDB/2t3b1g6k_22_1_1 tag=HRDB_CF
+Finished backup at 2025-06-04 09:47:19
+
+-- 재발 방지를 위해 실행기에 사전 점검을 넣는다. ([7-1] 참조)
+
+-- ────────────────────────────────────────────────
+-- 오류 ③ nocatalog 상태에서 스토어드 스크립트 사용
+-- ────────────────────────────────────────────────
+-- 카탈로그 서버가 잠시 내려간 상황을 가정한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / nocatalog
+
+connected to target database: ORCL (DBID=1547823901)
+using target database control file instead of recovery catalog
+
+RMAN> RUN { EXECUTE GLOBAL SCRIPT gs_daily_incr USING 'ORCL'; }
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of execute script command at 06/04/2025 09:52:30
+RMAN-06171: not connected to recovery catalog
+
+-- << 원인 파악 >>
+-- 스토어드 스크립트는 카탈로그에만 저장된다.
+-- 컨트롤파일에는 저장할 자리가 없다.
+-- 따라서 카탈로그에 접속하지 않으면 스크립트를 쓸 수 없다.
+--
+-- 이것이 이 프레임워크의 가장 큰 약점이다.
+-- 카탈로그 DB가 내려가면 표준 백업 절차 전체가 멈춘다.
+--
+-- 실무에서는 반드시 대비책이 있어야 한다.
+
+-- << 수정 >> 두 가지를 함께 준비한다.
+
+-- 대비책 1 : 스크립트 본문을 파일로 상시 보관한다.
+--            원본이 /home/oracle/rcadm/scripts 에 있으므로 그대로 실행한다.
+
+[oracle@oel7v9r1 ~]$ cat > /tmp/fallback_orcl.rman << 'EOF'
+RUN {
+  BACKUP INCREMENTAL LEVEL 1 CHECK LOGICAL DATABASE
+    TAG 'ORCL_INCR' MAXPIECESIZE 2G
+    PLUS ARCHIVELOG TAG 'ORCL_ARCH' NOT BACKED UP 1 TIMES;
+  BACKUP CURRENT CONTROLFILE TAG 'ORCL_CF';
+}
+EOF
+
+[oracle@oel7v9r1 ~]$ rman target / nocatalog @/tmp/fallback_orcl.rman
+
+Starting backup at 2025-06-04 09:55:11
+piece handle=/backup/ORCL/2v3b2j8m_58_1_1 tag=ORCL_ARCH
+Finished backup at 2025-06-04 09:57:44
+
+-- 백업은 수행되었으나 카탈로그에는 기록되지 않았다.
+
+-- 대비책 2 : 카탈로그 복구 후 반드시 동기화한다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RESYNC CATALOG;
+
+starting full resync of recovery catalog
+full resync complete
+
+-- 자동으로 뽑아 두는 절차를 만들어 둔다. ([7-2] 참조)
+-- 이 주제는 고급 실습 05에서 카탈로그 자체의 보호로 이어진다.
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+-- 6-1. 세 DB가 같은 절차로 백업되었는지
+
+RC_REPORT@rcat> SELECT db_name, input_type, status,
+  2         TO_CHAR(start_time,'MM-DD HH24:MI') AS started,
+  3         time_taken_display
+  4  FROM   rc_rman_backup_job_details
+  5  WHERE  start_time > SYSDATE - 1/24 ORDER BY db_name, start_time;
+
+DB_NAME    INPUT_TYPE   STATUS     STARTED     TIME_TAKEN_DISPLAY
+---------- ------------ ---------- ----------- ------------------
+HRDB       DB INCR      COMPLETED  06-04 09:44 00:03:17
+HRDB       ARCHIVELOG   COMPLETED  06-04 09:44 00:00:36
+ORCL       DB INCR      COMPLETED  06-04 09:12 00:04:19
+ORCL       ARCHIVELOG   COMPLETED  06-04 09:12 00:00:38
+SALES      DB INCR      COMPLETED  06-04 09:23 00:03:14
+SALES      ARCHIVELOG   COMPLETED  06-04 09:22 00:00:53
+
+-- 세 대 모두 증분과 아카이브가 짝을 이룬다.
+-- 고급 실습 02의 리포트로 확인해도 CRIT 가 사라진다.
+
+-- 6-2. 태그 규칙이 지켜지는지
+
+RC_REPORT@rcat> SELECT tag, COUNT(*) AS pieces,
+  2         TO_CHAR(MAX(completion_time),'MM-DD HH24:MI') AS last_done
+  3  FROM   rc_backup_piece WHERE completion_time > SYSDATE - 1/24
+  4  GROUP  BY tag ORDER BY tag;
+
+TAG              PIECES LAST_DONE
+------------ ---------- -----------
+HRDB_ARCH             1 06-04 09:44
+HRDB_CF               1 06-04 09:47
+HRDB_INCR             1 06-04 09:47
+ORCL_ARCH             2 06-04 09:57
+ORCL_CF               1 06-04 09:16
+ORCL_INCR             1 06-04 09:16
+SALES_ARCH            1 06-04 09:23
+SALES_CF              1 06-04 09:26
+SALES_INCR            1 06-04 09:26
+
+-- 치환 변수가 의도대로 동작한다.
+-- 태그만 보고도 어느 DB의 어떤 백업인지 알 수 있다.
+
+-- 6-3. 절차 변경의 전파 확인
+
+RC_REPORT@rcat> SELECT script_name,
+  2         TO_CHAR(SYSDATE,'YYYY-MM-DD') AS checked
+  3  FROM   rc_stored_script WHERE db_key IS NULL ORDER BY script_name;
+
+SCRIPT_NAME          CHECKED
+-------------------- ----------
+gs_archive_only      2025-06-04
+gs_daily_incr        2025-06-04
+gs_maint_obsolete    2025-06-04
+gs_validate_full     2025-06-04
+gs_weekly_full       2025-06-04
+
+RC_REPORT@rcat> SELECT text FROM rc_stored_script_line s
+  2  WHERE  s.script_name = 'gs_daily_incr' AND text LIKE '%MAXPIECESIZE%';
+
+TEXT
+--------------------------------------------------
+    MAXPIECESIZE 2G
+
+-- 한 번의 REPLACE 로 세 DB에 반영되었다. 요구 사항 ③ 충족.
+
+-- 6-4. 서버에 셸 스크립트가 없어도 되는지
+
+[oracle@oel7v9r1 ~]$ ls -l /home/oracle/bin/backup_orcl.sh /home/oracle/bin/bk_sales.sh
+
+-rw-r--r--. 1 oracle oinstall 1842 Mar 11  2023 /home/oracle/bin/backup_orcl.sh
+-rw-r--r--. 1 oracle oinstall 1204 Feb 02  2024 /home/oracle/bin/bk_sales.sh
+
+-- 기존 스크립트는 참고용으로만 남기고 크론에서 제거한다.
+-- 새 구조에서는 실행기 하나만 배포한다.
+
+[oracle@oel7v9r1 ~]$ mkdir -p /home/oracle/bin/deprecated
+[oracle@oel7v9r1 ~]$ mv /home/oracle/bin/backup_orcl.sh \
+>   /home/oracle/bin/bk_sales.sh /home/oracle/bin/deprecated/
+
+-- 6-5. 요구 사항 대조
+--
+-- 요구 사항                                  | 충족 | 근거
+-- -------------------------------------------|------|--------------
+-- ① 한 곳에서 정의하고 세 DB가 공유          | 예   | 6-1, 6-2
+-- ② DB별 값을 파라미터로 전달                | 예   | 6-2
+-- ③ 고치면 즉시 반영                         | 예   | 6-3
+-- ④ 로그와 실패 알림                         | 예   | 7-1
+-- ⑤ 서버에 절차를 배포하지 않음              | 예   | 6-4
+--
+-- 다만 오류 ③에서 확인한 약점이 남는다.
+-- 카탈로그가 없으면 절차 전체가 멈춘다. 고급 실습 05에서 이어서 다룬다.
+
+--------------------------------------------------------------------------------
+[7] 운영 산출물과 확장 과제
+--------------------------------------------------------------------------------
+-- 7-1. 실행기 — rc_backup_framework.sh
+--
+-- 서버에 배포하는 유일한 파일이다.
+-- 사전 점검, 실행, 판정, 알림을 담당한다.
+
+[oracle@oel7v9r1 ~]$ cat /home/oracle/rcadm/rc_backup_framework.sh
+
+#!/bin/bash
+# 사용법 : rc_backup_framework.sh <ORACLE_SID> <글로벌스크립트명> [태그접두어]
+# 예     : rc_backup_framework.sh orcl gs_daily_incr ORCL
+
+set -u
+SID=$1
+SCRIPT=$2
+PREFIX=${3:-$(echo $1 | tr 'a-z' 'A-Z')}
+
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export ORACLE_SID=$SID
+export PATH=$ORACLE_HOME/bin:$PATH
+export NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS'
+
+CATALOG="rcatowner/oracle_4U@rcat"
+D=$(date +%Y%m%d_%H%M)
+LOGDIR=/home/oracle/rcadm/log
+LOG=$LOGDIR/${SID}_${SCRIPT}_${D}.log
+MAILTO="dba-team@example.com"
+mkdir -p $LOGDIR
+
+# --- 사전 점검 1 : 인스턴스가 살아 있는가
+if ! ps -ef | grep -q "[o]ra_pmon_${SID}"; then
+  echo "[FATAL] instance $SID is not running" | tee -a $LOG
+  mailx -s "[FATAL] backup abort - $SID down" $MAILTO < $LOG
+  exit 2
+fi
+
+# --- 사전 점검 2 : 백업 경로가 있는가 (오류 ② 재발 방지)
+DBNAME=$(echo $SID | tr 'a-z' 'A-Z')
+if [ ! -d /backup/$DBNAME ]; then
+  echo "[FATAL] backup directory /backup/$DBNAME not found" | tee -a $LOG
+  mailx -s "[FATAL] backup abort - path missing $DBNAME" $MAILTO < $LOG
+  exit 2
+fi
+
+# --- 사전 점검 3 : 여유 공간 20% 이상인가
+USEPCT=$(df -P /backup | tail -1 | awk '{print $5}' | tr -d '%')
+if [ $USEPCT -ge 80 ]; then
+  echo "[WARN] /backup usage ${USEPCT}%" | tee -a $LOG
+fi
+
+# --- 사전 점검 4 : 카탈로그에 접속되는가
+if ! echo "exit" | rman target / catalog $CATALOG > /tmp/cat_$$.log 2>&1; then
+  echo "[WARN] recovery catalog unreachable - fallback mode" | tee -a $LOG
+  cat /tmp/cat_$$.log >> $LOG
+  # 폴백 : 파일 기반 절차로 수행 (오류 ③ 대비)
+  if [ -f /home/oracle/rcadm/fallback/${SCRIPT}_${DBNAME}.rman ]; then
+    rman target / nocatalog \
+      @/home/oracle/rcadm/fallback/${SCRIPT}_${DBNAME}.rman >> $LOG 2>&1
+    echo "[INFO] fallback executed - RESYNC required later" >> $LOG
+    mailx -s "[WARN] backup ran in fallback mode - $SID" $MAILTO < $LOG
+    exit 1
+  fi
+  mailx -s "[FATAL] catalog down and no fallback - $SID" $MAILTO < $LOG
+  exit 2
+fi
+rm -f /tmp/cat_$$.log
+
+# --- 실행
+echo "=== $(date) : $SID / $SCRIPT / prefix=$PREFIX ===" >> $LOG
+
+rman target / catalog $CATALOG >> $LOG 2>&1 << EOF
+RUN { EXECUTE GLOBAL SCRIPT $SCRIPT USING '$PREFIX'; }
+EXIT
+EOF
+
+# --- 판정
+if grep -qE 'RMAN-[0-9]+|ORA-[0-9]+' $LOG; then
+  echo "[FAIL] errors found in $LOG"
+  mailx -s "[FAIL] RMAN backup $SID / $SCRIPT" $MAILTO < $LOG
+  exit 1
+fi
+
+if ! grep -q 'Finished backup' $LOG; then
+  echo "[FAIL] no completion marker in $LOG"
+  mailx -s "[FAIL] RMAN backup incomplete $SID / $SCRIPT" $MAILTO < $LOG
+  exit 1
+fi
+
+echo "[OK] $SID / $SCRIPT completed"
+find $LOGDIR -name "${SID}_*.log" -mtime +60 -delete
+exit 0
+
+-- 7-2. 크론 등록
+
+[oracle@oel7v9r1 ~]$ crontab -l
+
+# 일일 증분 (평일 02시)
+0 2 * * 1-6 /home/oracle/rcadm/rc_backup_framework.sh orcl  gs_daily_incr ORCL
+30 2 * * 1-6 /home/oracle/rcadm/rc_backup_framework.sh sales gs_daily_incr SALES
+# 주간 Level 0 (일요일 01시)
+0 1 * * 0 /home/oracle/rcadm/rc_backup_framework.sh orcl  gs_weekly_full ORCL
+30 1 * * 0 /home/oracle/rcadm/rc_backup_framework.sh sales gs_weekly_full SALES
+# 정합성 점검 (매일 05시)
+0 5 * * * /home/oracle/rcadm/rc_backup_framework.sh orcl  gs_maint_obsolete
+20 5 * * * /home/oracle/rcadm/rc_backup_framework.sh sales gs_maint_obsolete
+
+[oracle@oel7v9r2 ~]$ crontab -l
+
+0 2 * * 1-6 /home/oracle/rcadm/rc_backup_framework.sh hrdb gs_daily_incr HRDB
+0 1 * * 0 /home/oracle/rcadm/rc_backup_framework.sh hrdb gs_weekly_full HRDB
+40 5 * * * /home/oracle/rcadm/rc_backup_framework.sh hrdb gs_maint_obsolete
+# 일일 리포트 (고급 실습 02)
+0 8 * * * /home/oracle/rcadm/rc_daily_report.sh
+
+-- 7-3. 폴백 파일 자동 생성
+--
+-- 카탈로그가 내려간 상황을 대비해 스크립트 본문을 매일 뽑아 둔다.
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/rc_export_scripts.sh
+
+#!/bin/bash
+# 글로벌 스크립트를 파일로 추출해 폴백용으로 보관한다.
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export PATH=$ORACLE_HOME/bin:$PATH
+OUT=/home/oracle/rcadm/fallback
+mkdir -p $OUT
+
+for S in gs_daily_incr gs_weekly_full gs_archive_only \
+         gs_maint_obsolete gs_validate_full; do
+  rman catalog rcatowner/oracle_4U@rcat << EOF > /dev/null 2>&1
+PRINT GLOBAL SCRIPT $S TO FILE '$OUT/$S.rman';
+EXIT
+EOF
+done
+
+# 배포 대상 서버로 복사
+scp -q $OUT/*.rman oracle@oel7v9r1:/home/oracle/rcadm/fallback/
+echo "exported $(ls $OUT/*.rman | wc -l) scripts at $(date)"
+
+[oracle@oel7v9r2 ~]$ sh /home/oracle/rcadm/rc_export_scripts.sh
+
+exported 5 scripts at Wed Jun  4 10:12:03 KST 2025
+
+-- 폴백 파일은 치환 변수가 그대로 남아 있으므로
+-- DB별로 값을 넣은 판을 따로 만들어 두어야 한다.
+-- 이 부분은 확장 과제 C로 남긴다.
+
+-- 7-4. 스크립트 형상 관리
+--
+-- 카탈로그의 스크립트는 이력이 남지 않는다.
+-- REPLACE 하면 이전 내용을 볼 수 없다.
+-- 원본 파일을 형상 관리 도구에 넣고 카탈로그는 배포 대상으로만 쓴다.
+
+[oracle@oel7v9r2 ~]$ cd /home/oracle/rcadm/scripts
+[oracle@oel7v9r2 scripts]$ git log --oneline -3
+
+a3f21c8 gs_daily_incr : MAXPIECESIZE 2G 추가 (2025-06-04)
+7b9e440 gs_maint_obsolete : REPORT NEED BACKUP 추가
+1c02fd5 초기 등록 - 표준 백업 스크립트 5종
+
+-- 7-5. 확장 과제
+--
+-- 과제 A. 로컬 스크립트와의 병용
+--   sales 에만 필요한 예외 절차가 생겼다.
+--   특정 테이블스페이스를 백업에서 제외해야 한다.
+--   글로벌 스크립트를 건드리지 않고 처리하는 방법을 설계하고 구현하시오.
+--   힌트 : CONFIGURE EXCLUDE FOR TABLESPACE 와 로컬 스크립트를 비교 검토한다.
+--
+-- 과제 B. 파라미터 두 개 이상
+--   태그 접두어 외에 보존일수를 두 번째 파라미터로 받는 스크립트를 만드시오.
+--   &1 과 &2 를 함께 쓰고 USING 절에 값 두 개를 넘긴다.
+--   보존일수를 스크립트 파라미터로 두는 것이 CONFIGURE 로 두는 것보다
+--   나은지 판단하고 근거를 서술하시오.
+--
+-- 과제 C. 폴백 파일 완성
+--   7-3에서 만든 폴백 파일은 치환 변수가 남아 있어 그대로 실행되지 않는다.
+--   DB별로 값을 치환한 파일을 생성하도록 스크립트를 개선하시오.
+--   sed 로 &1 을 DB 이름으로 바꾸는 방법을 검토한다.
+--
+-- 과제 D. 실행 이력 추적
+--   어떤 스크립트가 언제 실행되었는지 카탈로그에서 확인하는 조회를 만드시오.
+--   rc_rman_status 의 operation 과 command_id 를 이용한다.
+--   실행기에서 SET COMMAND ID TO 로 식별자를 넣으면 추적이 쉬워진다.
+--
+-- 과제 E. 스크립트 변경 감지
+--   글로벌 스크립트가 승인 없이 바뀌는 것을 막아야 한다.
+--   원본 파일의 해시와 카탈로그 내용의 해시를 비교하는 점검을 구현하시오.
+--   불일치 시 일일 리포트에 경고를 출력한다.
+
+-- 7-6. 정리 — 이 실습에서 남는 것
+--
+--   ① 글로벌 스크립트 5종      : 조직 표준 백업 절차
+--   ② rc_backup_framework.sh   : 사전 점검·실행·판정·알림 실행기
+--   ③ rc_export_scripts.sh     : 폴백 파일 추출기
+--   ④ std_configure.rman       : 표준 CONFIGURE 일괄 적용
+--   ⑤ 크론 등록 예시           : 서버별 스케줄
+--
+-- 다음 예제에서는 이 프레임워크가 매일 쌓는 백업과
+-- 카탈로그 기록 사이의 불일치를 다룬다.
+
+-- 실무 포인트
+-- 1) EXECUTE SCRIPT 는 RUN 블록 안에서만 동작한다.
+--    PRINT 와 LIST 는 밖에서 되므로 더 헷갈린다.
+--    RMAN-01009 의 "expecting one of" 목록을 읽으면 원인이 바로 보인다.
+--
+-- 2) 절차는 카탈로그에, 설정은 CONFIGURE 에, 준비는 서버에 둔다.
+--    이 세 가지를 섞으면 표준화가 무너진다.
+--    /backup 경로 누락 사고가 그 경계를 보여 준다.
+--
+-- 3) 스토어드 스크립트는 카탈로그가 있어야만 쓸 수 있다.
+--    RMAN-06171 이 나오면 카탈로그 접속을 먼저 확인한다.
+--    카탈로그 장애 시의 폴백을 반드시 준비해 둔다.
+--
+-- 4) 스크립트를 파일에서 만든다.
+--    대화형 CREATE 는 치환 변수 값을 물어볼 수 있어 자동화에 맞지 않는다.
+--    FROM FILE 방식은 형상 관리와도 자연스럽게 이어진다.
+--
+-- 5) 카탈로그는 스크립트 변경 이력을 남기지 않는다.
+--    REPLACE 하면 이전 내용을 되돌릴 수 없다.
+--    원본을 형상 관리 도구에 두고 카탈로그는 배포 대상으로만 다룬다.
+--
+-- 6) 실행기의 판정은 종료 코드가 아니라 로그 내용으로 한다.
+--    RMAN 은 일부 실패에도 0으로 끝나는 경우가 있다.
+--    ORA- 와 RMAN- 문자열 검사, 완료 표시 검사를 함께 쓴다.

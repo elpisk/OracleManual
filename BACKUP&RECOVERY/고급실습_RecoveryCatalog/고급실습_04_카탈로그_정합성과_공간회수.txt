@@ -1,0 +1,944 @@
+================================================================================
+ 고급 실습 04 : 카탈로그·컨트롤파일 불일치 해소와 백업 공간 회수
+ 과정      : Oracle Database 19c Backup & Recovery — Recovery Catalog 고급
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / oel7v9r1(운영계) + oel7v9r2(관리계)
+ 대상 DB   : orcl, sales (oel7v9r1) / hrdb (oel7v9r2)
+ 카탈로그  : rcat @ oel7v9r2
+ 소요 시간 : 약 2시간 30분
+ 선행 조건 : 고급 실습 01~03 완료
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실무 상황
+--------------------------------------------------------------------------------
+-- 백업 파일 시스템이 91% 찼다는 경보가 왔다.
+--
+-- 담당자가 이미 시도한 것들
+--   ① DELETE OBSOLETE 를 돌렸다 → "no obsolete backups found"
+--   ② 오래된 파일을 눈으로 골라 rm 으로 지웠다 → 공간은 줄었다
+--   ③ 그런데 LIST BACKUP 에는 지운 파일이 그대로 보인다
+--   ④ 지난주 테이프로 옮긴 백업이 어떻게 처리되었는지 모른다
+--
+-- 그리고 더 심각한 것이 하나 있다.
+--   지난달 nocatalog 로 받은 백업이 있었는데
+--   컨트롤파일에서도 카탈로그에서도 찾을 수 없다.
+--   파일은 /backup 아래에 그대로 있다.
+--
+-- 요구 사항
+--   ① 공간을 안전하게 회수한다. 필요한 백업은 절대 지우지 않는다
+--   ② 카탈로그 기록과 실제 파일을 일치시킨다
+--   ③ 저장소에서 사라진 기록을 되살린다
+--   ④ 같은 상황이 반복되지 않도록 정기 작업을 만든다
+--
+-- 13.5절에서 CROSSCHECK 와 DELETE 를 다뤘다.
+-- 이 실습에서는 다중 DB 환경에서 그것을 안전하게 운영하는 절차를 만든다.
+
+--------------------------------------------------------------------------------
+[2] 사전 설계
+--------------------------------------------------------------------------------
+-- 2-1. 네 가지 상태를 구분한다
+--
+--   상태        | 뜻                              | 판정 명령      | 조치
+--   ------------|---------------------------------|----------------|-------------
+--   AVAILABLE   | 기록도 있고 파일도 있다         | (기본)         | 없음
+--   EXPIRED     | 기록은 있는데 파일이 없다       | CROSSCHECK     | DELETE EXPIRED
+--   OBSOLETE    | 보존 정책상 더 이상 필요 없다   | REPORT OBSOLETE| DELETE OBSOLETE
+--   UNAVAILABLE | 사람이 일시적으로 제외 표시함   | (수동 지정)    | 확인 후 복원
+--
+--   가장 흔한 오해
+--     EXPIRED 는 "오래되었다"는 뜻이 아니다. "파일이 없다"는 뜻이다.
+--     OBSOLETE 는 파일 유무와 무관하다. 보존 정책만 본다.
+--     둘은 완전히 다른 축이며 동시에 성립할 수 있다.
+
+-- 2-2. 처리 순서와 그 이유
+--
+--   ① 보존 정책 확인          — 정책이 없으면 OBSOLETE 판정 자체가 안 된다
+--   ② 저장 장치 마운트 확인    — 안 되어 있으면 CROSSCHECK 가 전량 EXPIRED 로 만든다
+--   ③ CROSSCHECK              — 기록과 파일을 대조한다
+--   ④ EXPIRED 목록 검토       — 지우기 전에 사람이 본다
+--   ⑤ DELETE EXPIRED          — 기록만 지운다. 파일은 이미 없다
+--   ⑥ REPORT OBSOLETE         — 지울 대상을 미리 본다
+--   ⑦ DELETE OBSOLETE         — 기록과 파일을 함께 지운다
+--   ⑧ CATALOG START WITH      — 기록 없는 파일을 되찾는다
+--   ⑨ RESTORE PREVIEW 로 검증 — 지운 뒤에도 복구 가능한지 확인
+--
+--   ②가 이 순서에서 가장 중요하다. 이 단계를 건너뛰면 사고가 난다.
+
+-- 2-3. 안전 원칙
+--
+--   원칙 1. CROSSCHECK 전에 반드시 마운트 상태를 확인한다
+--   원칙 2. DELETE EXPIRED 전에 목록을 사람이 검토한다
+--   원칙 3. DELETE OBSOLETE 는 REPORT OBSOLETE 로 먼저 확인한다
+--   원칙 4. KEEP 이 걸린 백업은 보존 정책의 대상이 아니다 (실습 06)
+--   원칙 5. 작업 후 RESTORE PREVIEW 로 복구 가능성을 재확인한다
+--
+--   지워도 되는 것과 지우면 안 되는 것을 판별하는 기준은
+--   "지금 시점에서 복구 목표 기간까지 되돌아갈 수 있는가"이다.
+
+-- 2-4. 두 저장소의 수명 차이
+--
+--   컨트롤파일 : CONTROL_FILE_RECORD_KEEP_TIME 일 (기본 7)
+--                순환 재사용 영역이므로 오래된 기록이 덮인다
+--   카탈로그   : 명시적으로 지울 때까지 유지
+--
+--   이 차이 때문에 카탈로그가 필요하다.
+--   보존 기간이 7일을 넘는 정책이라면 카탈로그 없이는 성립하지 않는다.
+
+--------------------------------------------------------------------------------
+[3] 환경 준비
+--------------------------------------------------------------------------------
+-- 3-1. 현재 공간 상황
+
+[oracle@oel7v9r1 ~]$ df -h /backup
+
+Filesystem            Size  Used Avail Use% Mounted on
+oel7v9r2:/exports/backup  200G  182G   18G  91% /backup
+
+-- NFS 로 두 서버가 공유한다. 이 구조가 [5]의 사고와 관련된다.
+
+[oracle@oel7v9r1 ~]$ du -sh /backup/*
+
+104G    /backup/ORCL
+58G     /backup/SALES
+2.1G    /backup/RCAT
+
+[oracle@oel7v9r2 ~]$ du -sh /backup/HRDB
+
+18G     /backup/HRDB
+
+-- 3-2. 보존 정책 확인
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> SHOW RETENTION POLICY;
+
+RMAN configuration parameters for database with db_unique_name ORCL are:
+CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS;
+
+RMAN> SHOW CONTROLFILE AUTOBACKUP;
+
+CONFIGURE CONTROLFILE AUTOBACKUP ON;
+
+-- 3-3. 컨트롤파일 기록 수명 확인
+
+SYS@orcl> SHOW PARAMETER control_file_record_keep_time
+
+NAME                            TYPE     VALUE
+------------------------------- -------- ------
+control_file_record_keep_time   integer  7
+
+SYS@orcl> SELECT type, records_total, records_used,
+  2         ROUND(records_used/records_total*100,1) AS pct
+  3  FROM   v$controlfile_record_section
+  4  WHERE  type IN ('BACKUP SET','BACKUP PIECE','BACKUP DATAFILE',
+  5                  'ARCHIVED LOG','DATAFILE COPY')
+  6  ORDER  BY type;
+
+TYPE                RECORDS_TOTAL RECORDS_USED   PCT
+------------------- ------------- ------------ -----
+ARCHIVED LOG                  1264         1264 100.0
+BACKUP DATAFILE               1065          842  79.1
+BACKUP PIECE                  1006          311  30.9
+BACKUP SET                     652          311  47.7
+DATAFILE COPY                 1000            8    0.8
+
+-- ARCHIVED LOG 섹션이 100% 다. 순환 재사용이 시작되었다는 뜻이다.
+-- 보존 정책은 21일인데 컨트롤파일 기록은 7일이다.
+-- 카탈로그가 없다면 8일 전 백업으로 복구할 방법이 없다.
+
+-- 3-4. 카탈로그와 컨트롤파일의 기록 수 비교
+
+[oracle@oel7v9r2 ~]$ sqlplus -s rc_report/oracle_4U@rcat
+
+RC_REPORT@rcat> SELECT d.name, COUNT(*) AS pieces_in_catalog,
+  2         TO_CHAR(MIN(p.completion_time),'YYYY-MM-DD') AS oldest
+  3  FROM   rc_database d JOIN rc_backup_piece p ON d.db_key = p.db_key
+  4  GROUP  BY d.name ORDER BY d.name;
+
+NAME     PIECES_IN_CATALOG OLDEST
+-------- ----------------- ----------
+HRDB                    96 2025-05-05
+ORCL                   418 2025-04-28
+SALES                  221 2025-05-02
+
+SYS@orcl> SELECT COUNT(*) AS pieces_in_controlfile,
+  2         TO_CHAR(MIN(completion_time),'YYYY-MM-DD') AS oldest
+  3  FROM   v$backup_piece WHERE status = 'A';
+
+PIECES_IN_CONTROLFILE OLDEST
+--------------------- ----------
+                  311 2025-05-28
+
+-- 카탈로그 418건, 컨트롤파일 311건.
+-- 5월 28일 이전 기록은 컨트롤파일에서 이미 사라졌다.
+-- 카탈로그에만 남아 있다.
+
+-- 3-5. 실제 파일 수와 대조
+
+[oracle@oel7v9r1 ~]$ ls -1 /backup/ORCL/*.bkp /backup/ORCL/[0-9a-z]* 2>/dev/null \
+>   | wc -l
+
+402
+
+-- 카탈로그 418건, 실제 파일 402개. 16건이 어긋난다.
+-- CROSSCHECK 로 어느 쪽이 문제인지 가려야 한다.
+
+--------------------------------------------------------------------------------
+[4] 구축과 수행
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 4-1. 컨트롤파일 기록 소멸 재현
+-- ────────────────────────────────────────────────
+-- 카탈로그가 왜 필요한지를 눈으로 확인한다.
+
+[oracle@oel7v9r1 ~]$ rman target / nocatalog
+
+connected to target database: ORCL (DBID=1547823901)
+using target database control file instead of recovery catalog
+
+RMAN> LIST BACKUP OF DATABASE COMPLETED BEFORE 'SYSDATE-10' SUMMARY;
+
+specification does not match any backup in the repository
+
+RMAN> EXIT
+
+-- 컨트롤파일에는 10일 이전 백업이 하나도 없다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> LIST BACKUP OF DATABASE COMPLETED BEFORE 'SYSDATE-10' SUMMARY;
+
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+942     B  0  A DISK        2025-05-18 01:04:22       6       1  NO         ORCL_FULL
+988     B  1  A DISK        2025-05-19 02:03:11       2       1  NO         ORCL_INCR
+1011    B  1  A DISK        2025-05-20 02:02:48       2       1  NO         ORCL_INCR
+...
+
+47 rows selected.
+
+-- 카탈로그에는 남아 있다.
+-- 21일 보존 정책이 실제로 성립하려면 카탈로그가 반드시 필요하다.
+--
+-- 참고 : 두 값의 관계
+--   CONTROL_FILE_RECORD_KEEP_TIME >= 보존 기간 + 여유
+--   카탈로그가 있으면 이 조건을 완화할 수 있으나
+--   카탈로그 장애 시를 대비해 최소한의 여유는 두는 편이 좋다.
+
+SYS@orcl> ALTER SYSTEM SET control_file_record_keep_time = 30 SCOPE=both;
+
+System altered.
+
+-- 값을 늘리면 컨트롤파일이 커진다. 무한정 늘릴 수는 없다.
+
+-- ────────────────────────────────────────────────
+-- 4-2. CROSSCHECK 로 대조
+-- ────────────────────────────────────────────────
+-- 원칙 2에 따라 마운트 상태를 먼저 확인한다.
+
+[oracle@oel7v9r1 ~]$ mount | grep backup
+
+oel7v9r2:/exports/backup on /backup type nfs4 (rw,relatime,...)
+
+[oracle@oel7v9r1 ~]$ touch /backup/ORCL/.mount_test && \
+>   rm -f /backup/ORCL/.mount_test && echo "MOUNT OK"
+
+MOUNT OK
+
+-- 읽기만이 아니라 쓰기까지 확인한다.
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> CROSSCHECK BACKUP;
+
+allocated channel: ORA_DISK_1
+allocated channel: ORA_DISK_2
+crosschecked backup piece: found to be 'AVAILABLE'
+backup piece handle=/backup/ORCL/2f3a7n1w_52_1_1 RECID=402 STAMP=1191234522
+crosschecked backup piece: found to be 'EXPIRED'
+backup piece handle=/backup/ORCL/1x2p4k9r_18_1_1 RECID=118 STAMP=1189001122
+crosschecked backup piece: found to be 'EXPIRED'
+backup piece handle=/backup/ORCL/1x2p5m1s_19_1_1 RECID=119 STAMP=1189001188
+...
+Crosschecked 418 objects
+
+RMAN> CROSSCHECK ARCHIVELOG ALL;
+
+validation succeeded for archived log
+archived log file name=/home/oracle/arch1/1_412_1189200011.dbf RECID=412
+validation failed for archived log
+archived log file name=/home/oracle/arch1/1_388_1189200011.dbf RECID=388
+Crosschecked 1264 objects
+
+-- 4-3. EXPIRED 목록 검토 (원칙 2)
+
+RMAN> LIST EXPIRED BACKUP SUMMARY;
+
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+118     B  1  X DISK        2025-04-28 02:01:14       1       1  NO         ORCL_INCR
+119     B  1  X DISK        2025-04-29 02:02:08       1       1  NO         ORCL_INCR
+...
+16 objects
+
+-- S 열이 X 면 EXPIRED 다.
+-- 16건 모두 4월 말 백업이며 담당자가 수동으로 지운 것들이다.
+-- 보존 정책 21일을 넘긴 시점이므로 지워도 되는 대상이었다.
+
+RMAN> LIST EXPIRED BACKUP;
+
+-- 각 조각의 경로를 확인한다.
+
+BP Key: 118   Status: EXPIRED  Compressed: NO  Tag: ORCL_INCR
+Piece Name: /backup/ORCL/1x2p4k9r_18_1_1
+
+[oracle@oel7v9r1 ~]$ ls -l /backup/ORCL/1x2p4k9r_18_1_1
+
+ls: cannot access /backup/ORCL/1x2p4k9r_18_1_1: No such file or directory
+
+-- 확인되었다. 파일이 실제로 없다.
+
+-- 4-4. 기록 정리
+
+RMAN> DELETE NOPROMPT EXPIRED BACKUP;
+
+List of Backup Pieces
+BP Key  BS Key  Pc# Cp# Status      Device Type Piece Name
+------- ------- --- --- ----------- ----------- ----------------------------
+118     118     1   1   EXPIRED     DISK        /backup/ORCL/1x2p4k9r_18_1_1
+119     119     1   1   EXPIRED     DISK        /backup/ORCL/1x2p5m1s_19_1_1
+...
+Deleted 16 objects
+
+RMAN> DELETE NOPROMPT EXPIRED ARCHIVELOG ALL;
+
+Deleted 24 objects
+
+-- DELETE EXPIRED 는 기록만 지운다.
+-- 파일은 이미 없으므로 공간은 회수되지 않는다.
+-- 이것이 "DELETE 했는데 공간이 안 줄었다"의 답이다.
+
+-- ────────────────────────────────────────────────
+-- 4-5. 보존 정책 적용으로 실제 공간 회수
+-- ────────────────────────────────────────────────
+
+RMAN> REPORT OBSOLETE;
+
+RMAN retention policy will be applied to the command
+RMAN retention policy is set to recovery window of 21 days
+Report of obsolete backups and copies
+Type                 Key    Completion Time     Filename/Handle
+-------------------- ------ ------------------- --------------------------------
+Backup Set           942    2025-05-08
+  Backup Piece       942    2025-05-08          /backup/ORCL/1y2q6n2t_24_1_1
+  Backup Piece       943    2025-05-08          /backup/ORCL/1y2q6p3u_25_1_1
+Backup Set           988    2025-05-09
+  Backup Piece       988    2025-05-09          /backup/ORCL/1z2r7q4v_26_1_1
+...
+Archived Log         3021   2025-05-08          /home/oracle/arch1/1_301_...dbf
+
+-- 지울 대상을 눈으로 확인한 뒤 실행한다 (원칙 3).
+
+RMAN> DELETE NOPROMPT OBSOLETE;
+
+RMAN retention policy will be applied to the command
+RMAN retention policy is set to recovery window of 21 days
+Deleted 148 objects
+
+[oracle@oel7v9r1 ~]$ df -h /backup
+
+Filesystem            Size  Used Avail Use% Mounted on
+oel7v9r2:/exports/backup  200G  127G   73G  64% /backup
+
+-- 91% 에서 64% 로 줄었다.
+-- 공간을 회수하는 것은 DELETE OBSOLETE 다.
+
+-- ────────────────────────────────────────────────
+-- 4-6. 기록 없는 파일 되찾기
+-- ────────────────────────────────────────────────
+-- [1]에서 말한 nocatalog 백업 파일을 처리한다.
+
+[oracle@oel7v9r1 ~]$ ls -l /backup/orphan/
+
+-rw-r-----. 1 oracle oinstall 1284900864 May 12 03:11 0m2h4k1a_12_1_1
+-rw-r-----. 1 oracle oinstall  188743680 May 12 03:14 0n2h4m2b_13_1_1
+-rw-r-----. 1 oracle oinstall   18874368 May 12 03:14 c-1547823901-20250512-00
+
+-- 파일 이름의 DBID 로 orcl 의 것임을 알 수 있다.
+
+RMAN> CATALOG START WITH '/backup/orphan/' NOPROMPT;
+
+searching for all files that match the pattern /backup/orphan/
+
+List of Files Unknown to the Database
+=====================================
+File Name: /backup/orphan/0m2h4k1a_12_1_1
+File Name: /backup/orphan/0n2h4m2b_13_1_1
+File Name: /backup/orphan/c-1547823901-20250512-00
+
+cataloging files...
+cataloging done
+
+List of Cataloged Files
+=======================
+File Name: /backup/orphan/0m2h4k1a_12_1_1
+File Name: /backup/orphan/0n2h4m2b_13_1_1
+File Name: /backup/orphan/c-1547823901-20250512-00
+
+RMAN> LIST BACKUP COMPLETED BETWEEN 'SYSDATE-25' AND 'SYSDATE-22' SUMMARY;
+
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+1502    B  0  A DISK        2025-05-12 03:14:22       2       1  NO         MANUAL_0512
+
+-- 되찾았다. 이제 이 백업으로 복원할 수 있다.
+--
+-- CATALOG 명령의 세 가지 형태
+--   CATALOG START WITH '<디렉터리>'         파일을 훑어 자동 판별
+--   CATALOG BACKUPPIECE '<파일>'            조각 하나를 지정
+--   CATALOG DATAFILECOPY '<파일>'           이미지 카피를 지정
+--
+-- START WITH 는 접두어 일치이므로 경로 끝의 / 유무에 주의한다.
+--   '/backup/orphan'  → /backup/orphan* 전부 (다른 디렉터리도 포함될 수 있다)
+--   '/backup/orphan/' → 그 디렉터리 아래만
+
+-- 4-7. 카탈로그 자체의 공간
+
+RC_REPORT@rcat> SELECT segment_name, ROUND(bytes/1024/1024,1) AS mb
+  2  FROM   dba_segments WHERE owner = 'RCATOWNER'
+  3  AND    bytes > 1024*1024 ORDER BY bytes DESC;
+
+SEGMENT_NAME              MB
+------------------------ ----
+AL                       48.0
+BP                       21.0
+BS                       14.0
+BCF                       9.0
+RSR                       8.0
+DF                        4.0
+
+-- AL 은 아카이브 로그 기록이다. 가장 빠르게 늘어난다.
+-- DELETE 로 지운 기록은 카탈로그에서도 제거되므로
+-- 정기 정리를 하면 카탈로그 크기도 함께 관리된다.
+
+RC_REPORT@rcat> SELECT ROUND(SUM(bytes)/1024/1024) AS total_mb
+  2  FROM   dba_segments WHERE owner = 'RCATOWNER';
+
+  TOTAL_MB
+----------
+       118
+
+--------------------------------------------------------------------------------
+[5] 오류 주입과 대응
+--------------------------------------------------------------------------------
+
+-- ────────────────────────────────────────────────
+-- 오류 ① 보존 정책이 없어 아무것도 지워지지 않는다
+-- ────────────────────────────────────────────────
+-- [1]의 "DELETE OBSOLETE 했는데 아무것도 안 나왔다"의 원인을 재현한다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> CONFIGURE RETENTION POLICY TO NONE;
+
+new RMAN configuration parameters:
+CONFIGURE RETENTION POLICY TO NONE;
+
+RMAN> REPORT OBSOLETE;
+
+RMAN retention policy will be applied to the command
+RMAN retention policy is set to none
+no obsolete backups found
+
+RMAN> DELETE NOPROMPT OBSOLETE;
+
+RMAN retention policy will be applied to the command
+RMAN retention policy is set to none
+no obsolete backups found
+
+-- << 원인 파악 >>
+-- 오류 메시지가 나오지 않는다. 정상 종료한다.
+-- 그래서 담당자가 "지울 것이 없다"고 판단했다.
+--
+-- 실제로는 두 번째 줄에 답이 있다.
+--   "RMAN retention policy is set to none"
+--
+-- 보존 정책이 NONE 이면 어떤 백업도 OBSOLETE 가 되지 않는다.
+-- 그래서 백업이 무한정 쌓인다.
+-- 공간 문제의 근본 원인이 여기였다.
+--
+-- 이 상태가 만들어지는 경로
+--   ① CONFIGURE RETENTION POLICY TO NONE 을 누가 실행했다
+--   ② CONFIGURE ... CLEAR 로 초기화한 뒤 다시 설정하지 않았다
+--   ③ 신규 DB 등록 후 표준 설정을 적용하지 않았다
+
+-- << 수정 >>
+
+RMAN> CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS;
+
+new RMAN configuration parameters:
+CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS;
+new RMAN configuration parameters are successfully stored
+starting full resync of recovery catalog
+full resync complete
+
+RMAN> REPORT OBSOLETE;
+
+RMAN retention policy is set to recovery window of 21 days
+Report of obsolete backups and copies
+Type                 Key    Completion Time     Filename/Handle
+-------------------- ------ ------------------- --------------------------------
+Backup Set           1122   2025-05-06
+...
+Backup Set           1180   2025-05-11
+
+RMAN> DELETE NOPROMPT OBSOLETE;
+
+Deleted 62 objects
+
+-- 재발 방지 : 일일 리포트에 보존 정책 점검을 넣는다.
+
+RC_REPORT@rcat> SELECT d.name,
+  2    NVL(MAX(CASE WHEN c.value LIKE 'RETENTION%' THEN c.value END),
+  3        '*** 정책 없음 ***') AS retention
+  4  FROM   rc_database d LEFT JOIN rc_rman_configuration c
+  5         ON d.db_key = c.db_key
+  6  GROUP  BY d.name ORDER BY d.name;
+
+NAME     RETENTION
+-------- ------------------------------------------------
+HRDB     RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS
+ORCL     RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS
+SALES    RETENTION POLICY TO RECOVERY WINDOW OF 21 DAYS
+
+-- ────────────────────────────────────────────────
+-- 오류 ② 마운트 없이 CROSSCHECK — 가장 위험한 사고
+-- ────────────────────────────────────────────────
+-- NFS 가 끊긴 상태에서 정기 작업이 돌면 어떻게 되는지 재현한다.
+
+[oracle@oel7v9r1 ~]$ su -
+[root@oel7v9r1 ~]# umount -l /backup
+[root@oel7v9r1 ~]# exit
+
+[oracle@oel7v9r1 ~]$ ls /backup
+
+-- 비어 있다. 마운트 지점만 남았다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> CROSSCHECK BACKUP;
+
+allocated channel: ORA_DISK_1
+crosschecked backup piece: found to be 'EXPIRED'
+backup piece handle=/backup/ORCL/2f3a7n1w_52_1_1 RECID=402 STAMP=1191234522
+crosschecked backup piece: found to be 'EXPIRED'
+backup piece handle=/backup/ORCL/2g3a7p2x_53_1_1 RECID=403 STAMP=1191234566
+...
+Crosschecked 254 objects
+
+RMAN> LIST EXPIRED BACKUP SUMMARY;
+
+254 objects
+
+-- << 원인 파악 >>
+-- 254건 전부가 EXPIRED 로 표시되었다.
+-- RMAN 은 파일에 접근하지 못했을 뿐인데 "없다"로 판정한다.
+-- 접근 불가와 부재를 구분하지 않는다.
+--
+-- 여기서 정기 작업이 다음 줄로 진행하면 재앙이 된다.
+--   DELETE NOPROMPT EXPIRED BACKUP;
+-- 유효한 백업 254건의 기록이 카탈로그에서 사라진다.
+-- 파일은 NFS 서버에 그대로 있지만 어느 백업인지 알 수 없게 된다.
+--
+-- 실제 현장에서 반복되는 사고 유형이다.
+-- 새벽에 NFS 가 잠깐 끊기고 05시 정기 작업이 그 위를 지나간다.
+
+-- << 수정 >> 마운트를 복구하고 다시 대조한다.
+
+[oracle@oel7v9r1 ~]$ su -
+[root@oel7v9r1 ~]# mount -a
+[root@oel7v9r1 ~]# exit
+
+[oracle@oel7v9r1 ~]$ ls /backup/ORCL | head -3
+
+2f3a7n1w_52_1_1
+2g3a7p2x_53_1_1
+2i3a7r4z_55_1_1
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> CROSSCHECK BACKUP;
+
+crosschecked backup piece: found to be 'AVAILABLE'
+backup piece handle=/backup/ORCL/2f3a7n1w_52_1_1 RECID=402 STAMP=1191234522
+...
+Crosschecked 254 objects
+
+RMAN> LIST EXPIRED BACKUP;
+
+specification does not match any backup in the repository
+
+-- 정상으로 되돌아왔다. CROSSCHECK 는 되돌릴 수 있다.
+-- DELETE EXPIRED 를 실행했다면 되돌릴 수 없었다.
+
+-- 만약 이미 지웠다면 CATALOG START WITH 로 되찾는다.
+
+RMAN> CATALOG START WITH '/backup/ORCL/' NOPROMPT;
+
+-- 되찾을 수는 있으나 태그와 일부 메타데이터가 달라질 수 있다.
+-- 사고를 내지 않는 것이 훨씬 낫다.
+
+-- << 재발 방지 >> 실행기에 마운트 검사를 넣는다. ([7-1] 참조)
+
+-- ────────────────────────────────────────────────
+-- 오류 ③ 지운 백업으로 복원 시도
+-- ────────────────────────────────────────────────
+-- 정리 후 복구 가능성이 유지되는지 확인하지 않으면 이렇게 된다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> RESTORE DATABASE PREVIEW SUMMARY;
+
+Starting restore at 2025-06-05 11:04:22
+using channel ORA_DISK_1
+
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+1288    B  0  A DISK        2025-05-18 01:20:41       4       1  NO         SALES_FULL
+
+RMAN> RESTORE DATABASE UNTIL TIME "TO_DATE('2025-05-04','YYYY-MM-DD')" PREVIEW;
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 06/05/2025 11:06:18
+RMAN-06026: some targets not found - aborting restore
+RMAN-06023: no backup or copy of datafile 4 found to restore
+RMAN-06023: no backup or copy of datafile 3 found to restore
+RMAN-06023: no backup or copy of datafile 2 found to restore
+RMAN-06023: no backup or copy of datafile 1 found to restore
+
+-- << 원인 파악 >>
+-- 5월 4일 시점으로 복원하려 했으나 그 시점의 백업이 없다.
+-- 오류 ①의 수정 과정에서 DELETE OBSOLETE 로 62건을 지웠기 때문이다.
+--
+-- 이것은 잘못된 삭제가 아니다.
+-- 보존 정책이 21일이므로 5월 4일은 보존 대상이 아니다.
+-- 문제는 "21일 정책으로 충분한가"를 사전에 합의하지 않은 것이다.
+--
+-- 정리 작업의 본질은 다음 질문에 답하는 것이다.
+--   "지금 시점에서 며칠 전까지 되돌아갈 수 있어야 하는가"
+-- 이 값이 보존 정책이고 그 밖은 지워도 되는 것이 맞다.
+
+-- << 수정 >> 정책 범위 안에서는 복원 가능한지 확인한다.
+
+RMAN> RESTORE DATABASE UNTIL TIME "SYSDATE-15" PREVIEW SUMMARY;
+
+Starting restore at 2025-06-05 11:09:44
+
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
+1288    B  0  A DISK        2025-05-18 01:20:41       4       1  NO         SALES_FULL
+1301    B  1  A DISK        2025-05-19 02:22:03       2       1  NO         SALES_INCR
+
+List of Archived Logs
+=====================
+Thrd Seq     Low SCN    Next SCN   Name
+---- ------- ---------- ---------- --------------------------------------------
+1    2201    8842011    8851204    /home/oracle/arch_sales/1_2201_1188400221.dbf
+
+Finished restore at 2025-06-05 11:09:51
+
+-- 보존 정책 범위 안에서는 복원 경로가 온전하다.
+-- 정리 작업 뒤에는 반드시 이 확인을 한다 (원칙 5).
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+-- 6-1. 공간 회수 결과
+
+[oracle@oel7v9r1 ~]$ df -h /backup
+
+Filesystem            Size  Used Avail Use% Mounted on
+oel7v9r2:/exports/backup  200G  109G   91G  55% /backup
+
+-- 91% → 55%. 요구 사항 ① 충족.
+
+-- 6-2. 기록과 파일의 일치
+
+[oracle@oel7v9r1 ~]$ rman target / catalog rcatowner@rcat
+
+RMAN> CROSSCHECK BACKUP;
+
+Crosschecked 254 objects
+
+RMAN> LIST EXPIRED BACKUP;
+
+specification does not match any backup in the repository
+
+RMAN> CROSSCHECK ARCHIVELOG ALL;
+
+Crosschecked 1102 objects
+
+RMAN> LIST EXPIRED ARCHIVELOG ALL;
+
+specification does not match any archived log in the repository
+
+-- EXPIRED 가 하나도 없다. 요구 사항 ② 충족.
+
+-- 6-3. 되찾은 백업의 사용 가능 여부
+
+RMAN> RESTORE DATAFILE 4 UNTIL TIME
+2>   "TO_DATE('2025-05-12 04:00:00','YYYY-MM-DD HH24:MI:SS')" VALIDATE;
+
+Starting restore at 2025-06-05 11:22:03
+channel ORA_DISK_1: starting validation of datafile backup set
+channel ORA_DISK_1: reading from backup piece
+  /backup/orphan/0m2h4k1a_12_1_1
+channel ORA_DISK_1: piece handle=/backup/orphan/0m2h4k1a_12_1_1
+  tag=MANUAL_0512
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:18
+Finished restore at 2025-06-05 11:22:21
+
+-- 되찾은 백업이 실제로 읽힌다. 요구 사항 ③ 충족.
+
+-- 6-4. 세 DB 전체 상태 확인
+
+RC_REPORT@rcat> SELECT db_name, type, status, COUNT(*) AS cnt
+  2  FROM   rc_unusable_backupfile_details
+  3  GROUP  BY db_name, type, status ORDER BY db_name;
+
+no rows selected
+
+-- 사용 불가 백업이 하나도 없다.
+-- 고급 실습 02의 일일 리포트에서 WARN 항목이 사라진다.
+
+-- 6-5. 정리 전후 비교
+
+-- 항목                    | 정리 전 | 정리 후
+-- ------------------------|---------|--------
+-- /backup 사용률          | 91%     | 55%
+-- ORCL 카탈로그 조각 수   | 418     | 254
+-- EXPIRED 백업            | 16      | 0
+-- EXPIRED 아카이브        | 24      | 0
+-- 기록 없는 파일          | 3       | 0
+-- 보존 정책 미설정 DB     | 1       | 0
+-- 카탈로그 스키마 크기    | 118MB   | 74MB
+
+--------------------------------------------------------------------------------
+[7] 운영 산출물과 확장 과제
+--------------------------------------------------------------------------------
+-- 7-1. rc_maint_crosscheck.sh — 안전장치가 있는 정기 정리
+--
+-- 고급 실습 03의 gs_maint_obsolete 스크립트를 그대로 돌리면
+-- 오류 ②의 사고를 막지 못한다. 실행기에 검사를 넣는다.
+
+[oracle@oel7v9r1 ~]$ cat /home/oracle/rcadm/rc_maint_crosscheck.sh
+
+#!/bin/bash
+# 정기 정합성 점검과 공간 회수
+# 사용법 : rc_maint_crosscheck.sh <ORACLE_SID>
+set -u
+SID=$1
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export ORACLE_SID=$SID
+export PATH=$ORACLE_HOME/bin:$PATH
+CATALOG="rcatowner/oracle_4U@rcat"
+BKDIR=/backup/$(echo $SID | tr 'a-z' 'A-Z')
+LOG=/home/oracle/rcadm/log/maint_${SID}_$(date +%Y%m%d).log
+MAILTO="dba-team@example.com"
+
+# --- 안전장치 1 : 마운트와 쓰기 가능 여부 (오류 ② 재발 방지)
+if ! mountpoint -q /backup; then
+  echo "[ABORT] /backup is not mounted - skipping crosscheck" | tee -a $LOG
+  mailx -s "[ABORT] maint skipped - /backup not mounted ($SID)" $MAILTO < $LOG
+  exit 2
+fi
+if ! touch $BKDIR/.mnt_$$ 2>/dev/null; then
+  echo "[ABORT] $BKDIR not writable - skipping crosscheck" | tee -a $LOG
+  mailx -s "[ABORT] maint skipped - path not writable ($SID)" $MAILTO < $LOG
+  exit 2
+fi
+rm -f $BKDIR/.mnt_$$
+
+# --- 안전장치 2 : 보존 정책이 설정되어 있는가 (오류 ① 재발 방지)
+POLICY=$(rman target / catalog $CATALOG << EOF 2>/dev/null | grep 'RETENTION POLICY'
+SHOW RETENTION POLICY;
+EXIT
+EOF
+)
+if echo "$POLICY" | grep -q 'TO NONE'; then
+  echo "[ABORT] retention policy is NONE - fix configuration first" | tee -a $LOG
+  mailx -s "[ABORT] retention policy NONE ($SID)" $MAILTO < $LOG
+  exit 2
+fi
+
+# --- 1단계 : 대조와 목록화 (지우지 않는다)
+rman target / catalog $CATALOG >> $LOG 2>&1 << EOF
+CROSSCHECK BACKUP;
+CROSSCHECK ARCHIVELOG ALL;
+LIST EXPIRED BACKUP SUMMARY;
+REPORT OBSOLETE;
+EXIT
+EOF
+
+# --- 안전장치 3 : EXPIRED 가 전체의 50%를 넘으면 멈춘다
+TOTAL=$(grep -c 'crosschecked backup piece' $LOG)
+EXPCNT=$(grep -c "found to be 'EXPIRED'" $LOG)
+if [ $TOTAL -gt 0 ] && [ $((EXPCNT * 100 / TOTAL)) -ge 50 ]; then
+  echo "[ABORT] EXPIRED ratio ${EXPCNT}/${TOTAL} too high - manual review" >> $LOG
+  mailx -s "[ABORT] abnormal EXPIRED ratio ($SID)" $MAILTO < $LOG
+  exit 2
+fi
+
+# --- 2단계 : 실제 삭제
+rman target / catalog $CATALOG >> $LOG 2>&1 << EOF
+DELETE NOPROMPT EXPIRED BACKUP;
+DELETE NOPROMPT EXPIRED ARCHIVELOG ALL;
+DELETE NOPROMPT OBSOLETE;
+EXIT
+EOF
+
+# --- 3단계 : 복구 가능성 재확인 (원칙 5)
+rman target / catalog $CATALOG >> $LOG 2>&1 << EOF
+RESTORE DATABASE PREVIEW SUMMARY;
+REPORT NEED BACKUP;
+EXIT
+EOF
+
+if grep -qE 'RMAN-060(23|26)' $LOG; then
+  echo "[FATAL] restore path broken after cleanup" >> $LOG
+  mailx -s "[FATAL] restore path broken after cleanup ($SID)" $MAILTO < $LOG
+  exit 1
+fi
+
+df -h /backup >> $LOG
+echo "[OK] maintenance completed for $SID"
+exit 0
+
+-- 7-2. 기록 없는 파일 탐지
+
+[oracle@oel7v9r1 ~]$ cat /home/oracle/rcadm/rc_find_orphan.sh
+
+#!/bin/bash
+# 백업 경로에 있으나 카탈로그에 없는 파일을 찾는다.
+DBNAME=$1
+export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
+export PATH=$ORACLE_HOME/bin:$PATH
+
+# 카탈로그에 등록된 조각 목록
+sqlplus -s rc_report/oracle_4U@rcat << 'EOF' | sort > /tmp/in_catalog.txt
+SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
+SELECT handle FROM rc_backup_piece
+WHERE  db_name = UPPER('&1') AND status = 'A';
+EXIT
+EOF
+
+# 실제 파일 목록
+find /backup/$DBNAME -type f | sort > /tmp/on_disk.txt
+
+echo "=== 카탈로그에 없는 파일 ==="
+comm -13 /tmp/in_catalog.txt /tmp/on_disk.txt
+
+echo "=== 파일이 없는 카탈로그 기록 ==="
+comm -23 /tmp/in_catalog.txt /tmp/on_disk.txt
+
+[oracle@oel7v9r1 ~]$ sh /home/oracle/rcadm/rc_find_orphan.sh ORCL
+
+=== 카탈로그에 없는 파일 ===
+/backup/ORCL/manual_test_0530.bkp
+
+=== 파일이 없는 카탈로그 기록 ===
+
+-- 발견된 파일은 CATALOG START WITH 로 등록하거나 판단 후 삭제한다.
+
+-- 7-3. 정기 작업 배치
+--
+--   매일 05시 : rc_maint_crosscheck.sh (DB별)
+--   매주 일요일 : rc_find_orphan.sh (수동 검토 대상 보고)
+--   매월 1일 : 카탈로그 스키마 크기 점검
+--
+[oracle@oel7v9r1 ~]$ crontab -l | grep maint
+
+0 5 * * * /home/oracle/rcadm/rc_maint_crosscheck.sh orcl
+20 5 * * * /home/oracle/rcadm/rc_maint_crosscheck.sh sales
+0 6 * * 0 /home/oracle/rcadm/rc_find_orphan.sh ORCL  | mailx -s "orphan ORCL" dba-team@example.com
+20 6 * * 0 /home/oracle/rcadm/rc_find_orphan.sh SALES | mailx -s "orphan SALES" dba-team@example.com
+
+-- 7-4. 확장 과제
+--
+-- 과제 A. EXPIRED 비율 임계값 정하기
+--   7-1의 안전장치 3은 50%를 기준으로 삼았다.
+--   이 값이 적절한지 검토하고 근거를 제시하시오.
+--   백업 세대가 적은 신규 DB에서는 어떤 문제가 생기는지 함께 고려한다.
+--
+-- 과제 B. 삭제 이력 추적
+--   지난 30일간 어떤 DELETE 작업이 수행되었는지 조회하시오.
+--   rc_rman_status 의 operation 컬럼을 사용한다.
+--   누가 실행했는지까지 추적하려면 무엇이 추가로 필요한지 서술하시오.
+--
+-- 과제 C. 테이프로 옮긴 백업의 처리
+--   디스크의 백업을 테이프로 옮긴 뒤 디스크에서 지웠다.
+--   이때 CROSSCHECK 를 돌리면 EXPIRED 가 되고 DELETE EXPIRED 로 기록이 사라진다.
+--   테이프의 백업을 계속 인식시키려면 어떻게 해야 하는지 설계하시오.
+--   힌트 : SBT 채널 설정과 CHANGE ... UNAVAILABLE 을 비교 검토한다.
+--
+-- 과제 D. 보존 정책 두 종류의 비교
+--   RECOVERY WINDOW 와 REDUNDANCY 를 같은 DB에 번갈아 적용하고
+--   REPORT OBSOLETE 결과가 어떻게 달라지는지 비교하시오.
+--   어떤 상황에서 어느 쪽이 적합한지 판단 기준을 정리한다.
+--
+-- 과제 E. 카탈로그 스키마 증가 예측
+--   AL 세그먼트의 증가 속도를 측정하고 1년 뒤 크기를 예측하시오.
+--   아카이브 로그 생성량과의 상관관계를 확인한다.
+--   테이블스페이스 확장 계획을 제안한다.
+
+-- 7-5. 정리 — 이 실습에서 남는 것
+--
+--   ① rc_maint_crosscheck.sh : 안전장치 3중을 갖춘 정기 정리
+--   ② rc_find_orphan.sh      : 기록 없는 파일 탐지
+--   ③ 상태 구분표            : [2-1]의 네 가지 상태
+--   ④ 처리 순서와 안전 원칙  : [2-2], [2-3]
+--   ⑤ 정리 전후 비교표       : [6-5]
+--
+-- 다음 예제에서는 이 모든 것의 근간인 카탈로그 자체를 보호한다.
+
+-- 실무 포인트
+-- 1) EXPIRED 와 OBSOLETE 는 다른 축이다.
+--    EXPIRED 는 파일 부재, OBSOLETE 는 보존 정책이다.
+--    공간을 회수하는 것은 DELETE OBSOLETE 이고
+--    DELETE EXPIRED 는 기록만 정리한다.
+--
+-- 2) 보존 정책이 NONE 이면 아무것도 지워지지 않는다.
+--    오류 없이 "no obsolete backups found" 로 끝나므로 알아채기 어렵다.
+--    출력의 "retention policy is set to" 줄을 반드시 읽는다.
+--
+-- 3) CROSSCHECK 전에 마운트를 확인한다.
+--    RMAN 은 접근 불가와 파일 부재를 구분하지 못한다.
+--    NFS 가 잠깐 끊긴 상태에서 정기 작업이 돌면 전량이 EXPIRED 가 된다.
+--    CROSSCHECK 는 되돌릴 수 있지만 DELETE EXPIRED 는 되돌릴 수 없다.
+--
+-- 4) 정리 작업은 반드시 두 단계로 나눈다.
+--    1단계에서 대조와 목록화만 하고, 이상 여부를 판정한 뒤 2단계에서 지운다.
+--    한 스크립트에서 CROSSCHECK 와 DELETE 를 연달아 실행하지 않는다.
+--
+-- 5) 정리 후에는 RESTORE PREVIEW 로 복구 경로를 확인한다.
+--    지운 것이 정책상 맞더라도 실제로 복원 가능한지는 별개다.
+--    이 확인이 없으면 장애가 나서야 알게 된다.
+--
+-- 6) 기록 없는 파일은 CATALOG START WITH 로 되찾는다.
+--    경로 끝의 / 유무에 따라 대상 범위가 달라진다.
+--    되찾은 뒤에는 RESTORE ... VALIDATE 로 실제 읽히는지 확인한다.

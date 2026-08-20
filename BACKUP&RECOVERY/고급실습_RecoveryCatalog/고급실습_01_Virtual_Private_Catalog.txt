@@ -1,0 +1,804 @@
+================================================================================
+ 고급 실습 01 : Virtual Private Catalog와 DBA 권한 분리
+ 과정      : Oracle Database 19c Backup & Recovery — Recovery Catalog 고급
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / oel7v9r1(운영계) + oel7v9r2(관리계)
+ 대상 DB   : orcl, sales (oel7v9r1) / hrdb (oel7v9r2)
+ 카탈로그  : rcat @ oel7v9r2
+ 소요 시간 : 약 2시간 30분
+ 선행 조건 : BR 1~19장 이수, 종합 실습 과제 수행
+================================================================================
+
+--------------------------------------------------------------------------------
+[1] 실무 상황
+--------------------------------------------------------------------------------
+-- 데이터베이스 세 대를 DBA 세 명이 나눠 맡고 있다.
+--   orcl  : 코어 업무 시스템
+--   sales : 영업 시스템
+--   hrdb  : 인사 시스템
+--
+-- 세 사람 모두 rcatowner 계정으로 카탈로그에 접속한다.
+-- 그래서 다음이 가능하다.
+--   - 영업 담당자가 코어 시스템의 백업을 DELETE 할 수 있다
+--   - 인사 담당자가 다른 시스템의 백업 이력을 전부 조회할 수 있다
+--   - 누가 무엇을 지웠는지 추적할 수 없다
+--
+-- 실제로 지난 분기 감사에서 지적을 받았다.
+--   "백업 저장소에 대한 접근 권한이 담당 범위와 일치하지 않음"
+--
+-- 요구 사항
+--   ① 각 DBA는 자기 담당 DB의 백업만 보고 다룰 수 있어야 한다
+--   ② 다른 DB의 백업 이력은 조회조차 되지 않아야 한다
+--   ③ 새 DB를 등록할 수 있는 사람은 따로 정한다
+--   ④ 기존 백업 이력과 스크립트는 그대로 유지되어야 한다
+--
+-- 13장에서 만든 카탈로그는 소유자 한 명이 전부를 갖는 구조였다.
+-- 이 실습에서는 그 위에 Virtual Private Catalog를 얹어 범위를 나눈다.
+
+--------------------------------------------------------------------------------
+[2] 사전 설계
+--------------------------------------------------------------------------------
+-- 설계를 먼저 확정하고 명령을 실행한다.
+-- 권한을 나눈 뒤에 되돌리는 것은 가능하지만 혼란이 크다.
+
+-- 2-1. 용어 정리
+--
+--   기본 카탈로그(Base Catalog)
+--     rcatowner 스키마. 실제 데이터가 들어 있는 테이블의 소유자.
+--     등록된 모든 DB의 메타데이터를 갖는다.
+--
+--   가상 사설 카탈로그(Virtual Private Catalog, VPC)
+--     별도 사용자 스키마. 기본 카탈로그의 일부만 보이는 뷰와 동의어의 집합.
+--     자기에게 부여된 DB만 보인다.
+--     데이터를 복제하지 않는다. 접근 범위만 제한한다.
+
+-- 2-2. 권한 매트릭스
+--
+--   사용자        | 담당 DB | CATALOG FOR DATABASE | REGISTER DATABASE
+--   --------------|---------|----------------------|-------------------
+--   rcatowner     | 전체    | (소유자)             | (소유자)
+--   vpc_core      | orcl    | orcl                 | 없음
+--   vpc_sales     | sales   | sales                | 있음
+--   vpc_hr        | hrdb    | hrdb                 | 없음
+--
+--   REGISTER DATABASE 를 vpc_sales 에게만 준 이유
+--     영업 시스템은 분기마다 테스트 DB가 늘어난다.
+--     매번 기본 카탈로그 소유자를 부르는 것이 비효율적이다.
+--     나머지 둘은 DB 수가 고정이므로 등록 권한이 필요 없다.
+
+-- 2-3. 명명 규칙
+--
+--   VPC 사용자명 : vpc_<업무영역>
+--   기본 테이블스페이스 : rcat_data (rcatowner와 동일)
+--   임시 : temp
+--   비밀번호 정책 : 조직 표준을 따르며 이 실습에서는 oracle_4U
+
+-- 2-4. 되돌리기 계획
+--
+--   REVOKE CATALOG FOR DATABASE <db> FROM <vpc사용자>;
+--   DROP CATALOG;                      -- VPC 사용자로 접속해 실행
+--   DROP USER <vpc사용자> CASCADE;
+--
+--   기본 카탈로그의 데이터는 영향을 받지 않는다.
+--   VPC는 뷰와 동의어의 모음이므로 지워도 백업 이력이 사라지지 않는다.
+
+--------------------------------------------------------------------------------
+[3] 환경 준비
+--------------------------------------------------------------------------------
+-- 3-1. 카탈로그 서버 확인
+
+[oracle@oel7v9r2 ~]$ ps -ef | grep pmon | grep -v grep
+
+oracle    3021     1  0 08:12 ?   00:00:03 ora_pmon_rcat
+oracle    3455     1  0 08:14 ?   00:00:02 ora_pmon_hrdb
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=rcat
+[oracle@oel7v9r2 ~]$ sqlplus / as sysdba
+
+SYS@rcat> SELECT banner_full FROM v$version;
+
+BANNER_FULL
+--------------------------------------------------------------------------
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@rcat> SELECT username, default_tablespace, account_status FROM dba_users
+  2  WHERE  username = 'RCATOWNER';
+
+USERNAME    DEFAULT_TABLESPACE  ACCOUNT_STATUS
+----------- ------------------- ---------------
+RCATOWNER   RCAT_DATA           OPEN
+
+-- 3-2. 카탈로그 스키마 버전 확인
+
+SYS@rcat> SELECT * FROM rcatowner.rcver;
+
+VERSION
+------------
+19.03.00.00
+
+-- 3-3. 등록된 대상 DB 확인
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+
+recovery catalog database Password:
+connected to recovery catalog database
+
+RMAN> EXIT
+
+[oracle@oel7v9r2 ~]$ sqlplus rcatowner/oracle_4U@rcat
+
+RCATOWNER@rcat> SELECT db_key, dbid, name, reset_time FROM rc_database
+  2  ORDER BY name;
+
+    DB_KEY       DBID NAME     RESET_TIME
+---------- ---------- -------- -------------------
+         1 1547823901 ORCL     2025-05-22 16:44:11
+        21 2284410077 SALES    2025-05-18 09:02:33
+        41 3391560212 HRDB     2025-05-19 14:20:07
+
+-- 세 대가 모두 등록되어 있다.
+
+-- 3-4. 각 DB의 백업 이력이 실제로 있는지 확인
+
+RCATOWNER@rcat> SELECT d.name, COUNT(*) AS backup_sets,
+  2         MAX(b.completion_time) AS last_backup
+  3  FROM   rc_database d JOIN rc_backup_set b ON d.db_key = b.db_key
+  4  GROUP  BY d.name ORDER BY d.name;
+
+NAME     BACKUP_SETS LAST_BACKUP
+-------- ----------- -------------------
+HRDB              18 2025-06-02 02:14:33
+ORCL              47 2025-06-02 02:05:12
+SALES             26 2025-06-02 02:31:48
+
+-- 3-5. 네트워크 확인 — 운영계에서 카탈로그가 보여야 한다
+
+[oracle@oel7v9r1 ~]$ cat $ORACLE_HOME/network/admin/tnsnames.ora
+
+RCAT =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = oel7v9r2)(PORT = 1521))
+    (CONNECT_DATA = (SERVER = DEDICATED)(SERVICE_NAME = rcat))
+  )
+
+[oracle@oel7v9r1 ~]$ tnsping RCAT | tail -2
+
+OK (1 msec)
+
+--------------------------------------------------------------------------------
+[4] 구축과 수행
+--------------------------------------------------------------------------------
+-- 4-1. VPC 사용자 생성
+--
+-- 필요한 것은 두 가지뿐이다.
+--   CREATE SESSION 권한
+--   RECOVERY_CATALOG_OWNER 롤
+--
+-- RECOVERY_CATALOG_OWNER 롤이 하는 일
+--   CREATE SESSION, ALTER SESSION, CREATE SYNONYM, CREATE VIEW,
+--   CREATE DATABASE LINK, CREATE TABLE, CREATE CLUSTER,
+--   CREATE SEQUENCE, CREATE TRIGGER, CREATE PROCEDURE, CREATE TYPE
+
+SYS@rcat> SELECT privilege FROM dba_sys_privs
+  2  WHERE  grantee = 'RECOVERY_CATALOG_OWNER' ORDER BY privilege;
+
+PRIVILEGE
+------------------------------
+ALTER SESSION
+CREATE CLUSTER
+CREATE DATABASE LINK
+CREATE PROCEDURE
+CREATE SEQUENCE
+CREATE SESSION
+CREATE SYNONYM
+CREATE TABLE
+CREATE TRIGGER
+CREATE TYPE
+CREATE VIEW
+
+11 rows selected.
+
+SYS@rcat> CREATE USER vpc_core IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE rcat_data
+  3    TEMPORARY TABLESPACE temp
+  4    QUOTA UNLIMITED ON rcat_data;
+
+User created.
+
+SYS@rcat> CREATE USER vpc_sales IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE rcat_data
+  3    TEMPORARY TABLESPACE temp
+  4    QUOTA UNLIMITED ON rcat_data;
+
+SYS@rcat> CREATE USER vpc_hr IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE rcat_data
+  3    TEMPORARY TABLESPACE temp
+  4    QUOTA UNLIMITED ON rcat_data;
+
+User created.
+
+SYS@rcat> GRANT RECOVERY_CATALOG_OWNER TO vpc_core, vpc_sales, vpc_hr;
+
+Grant succeeded.
+
+SYS@rcat> SELECT grantee, granted_role FROM dba_role_privs
+  2  WHERE  grantee LIKE 'VPC%' ORDER BY grantee;
+
+GRANTEE     GRANTED_ROLE
+----------- --------------------------
+VPC_CORE    RECOVERY_CATALOG_OWNER
+VPC_HR      RECOVERY_CATALOG_OWNER
+VPC_SALES   RECOVERY_CATALOG_OWNER
+
+-- 4-2. 기본 카탈로그 소유자가 접근 범위를 부여한다
+--
+-- 이 명령은 RMAN 안에서 실행한다. SQL 문이 아니다.
+-- 반드시 기본 카탈로그 소유자로 접속한 상태여야 한다.
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+
+connected to recovery catalog database
+
+RMAN> GRANT CATALOG FOR DATABASE orcl TO vpc_core;
+
+Grant succeeded.
+
+RMAN> GRANT CATALOG FOR DATABASE sales TO vpc_sales;
+
+Grant succeeded.
+
+RMAN> GRANT CATALOG FOR DATABASE hrdb TO vpc_hr;
+
+Grant succeeded.
+
+-- 새 DB를 등록할 권한은 영업 담당자에게만 준다.
+
+RMAN> GRANT REGISTER DATABASE TO vpc_sales;
+
+Grant succeeded.
+
+RMAN> EXIT
+
+-- 4-3. 부여 결과 확인
+--
+-- DBID로 지정할 수도 있다. 이름이 같은 DB가 여럿이면 DBID를 쓴다.
+--   GRANT CATALOG FOR DATABASE 1547823901 TO vpc_core;
+
+[oracle@oel7v9r2 ~]$ sqlplus rcatowner/oracle_4U@rcat
+
+RCATOWNER@rcat> SELECT username, db_name, db_id FROM rc_database
+  2  WHERE 1=0;
+
+-- 부여 현황은 기본 카탈로그의 내부 테이블에서 확인한다.
+
+RCATOWNER@rcat> SELECT u.username, d.name AS granted_db
+  2  FROM   rcatowner.dbinc i, rcatowner.db d, dba_users u
+  3  WHERE  1=0;
+
+-- 실무에서는 아래 조회를 쓴다.
+
+RCATOWNER@rcat> SELECT grantee, table_name, privilege
+  2  FROM   dba_tab_privs
+  3  WHERE  owner = 'RCATOWNER' AND grantee LIKE 'VPC%'
+  4  AND    ROWNUM <= 5;
+
+GRANTEE     TABLE_NAME    PRIVILEGE
+----------- ------------- ----------
+VPC_CORE    RC_DATABASE   SELECT
+VPC_CORE    DB            SELECT
+VPC_CORE    DBINC         SELECT
+VPC_CORE    BS            SELECT
+VPC_CORE    BP            SELECT
+
+-- 4-4. VPC 사용자가 자기 카탈로그를 만든다
+--
+-- 이 단계가 없으면 권한을 받아도 아무것도 보이지 않는다.
+-- CREATE VIRTUAL CATALOG 는 기본 카탈로그를 가리키는 동의어를 만든다.
+
+[oracle@oel7v9r2 ~]$ rman catalog vpc_core@rcat
+
+recovery catalog database Password:
+connected to recovery catalog database
+
+RMAN> CREATE VIRTUAL CATALOG;
+
+found eligible base catalog owned by RCATOWNER
+created virtual catalog against base catalog owned by RCATOWNER
+
+RMAN> EXIT
+
+[oracle@oel7v9r2 ~]$ rman catalog vpc_sales@rcat
+RMAN> CREATE VIRTUAL CATALOG;
+
+found eligible base catalog owned by RCATOWNER
+created virtual catalog against base catalog owned by RCATOWNER
+
+RMAN> EXIT
+
+[oracle@oel7v9r2 ~]$ rman catalog vpc_hr@rcat
+RMAN> CREATE VIRTUAL CATALOG;
+
+created virtual catalog against base catalog owned by RCATOWNER
+
+RMAN> EXIT
+
+-- 만들어진 객체를 확인한다.
+
+SYS@rcat> SELECT object_type, COUNT(*) FROM dba_objects
+  2  WHERE  owner = 'VPC_CORE' GROUP BY object_type;
+
+OBJECT_TYPE    COUNT(*)
+------------- ---------
+SYNONYM             142
+PACKAGE               1
+PACKAGE BODY          1
+
+-- 테이블이 하나도 없다.
+-- 데이터를 복제하지 않고 기본 카탈로그를 가리키기만 한다는 뜻이다.
+
+--------------------------------------------------------------------------------
+[5] 오류 주입과 대응
+--------------------------------------------------------------------------------
+-- 실무에서 반드시 만나게 되는 세 가지를 재현한다.
+
+-- ────────────────────────────────────────────────
+-- 오류 ① 롤을 부여하지 않은 상태에서 접속
+-- ────────────────────────────────────────────────
+
+SYS@rcat> CREATE USER vpc_test IDENTIFIED BY oracle_4U
+  2    DEFAULT TABLESPACE rcat_data QUOTA UNLIMITED ON rcat_data;
+SYS@rcat> GRANT CREATE SESSION TO vpc_test;
+
+Grant succeeded.
+
+[oracle@oel7v9r2 ~]$ rman catalog vpc_test@rcat
+
+recovery catalog database Password:
+connected to recovery catalog database
+
+RMAN> CREATE VIRTUAL CATALOG;
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03009: failure of create virtual catalog command at 06/03/2025 09:22:41
+ORA-01031: insufficient privileges
+
+-- << 원인 파악 >>
+-- CREATE SESSION 만으로는 부족하다.
+-- 가상 카탈로그는 동의어와 패키지를 만들어야 하므로
+-- CREATE SYNONYM, CREATE PROCEDURE 등이 필요하다.
+-- 이 권한들을 개별로 주는 대신 RECOVERY_CATALOG_OWNER 롤을 쓴다.
+--
+-- 접속 자체는 되었다는 점이 함정이다.
+-- "connected to recovery catalog database" 가 출력되므로
+-- 권한이 충분하다고 착각하기 쉽다.
+-- 실제 작업 명령에서야 막힌다.
+
+-- << 수정 >>
+
+SYS@rcat> GRANT RECOVERY_CATALOG_OWNER TO vpc_test;
+
+Grant succeeded.
+
+[oracle@oel7v9r2 ~]$ rman catalog vpc_test@rcat
+RMAN> CREATE VIRTUAL CATALOG;
+
+created virtual catalog against base catalog owned by RCATOWNER
+
+RMAN> EXIT
+
+-- 실습용 계정이므로 정리한다.
+
+[oracle@oel7v9r2 ~]$ rman catalog vpc_test@rcat
+RMAN> DROP CATALOG;
+
+recovery catalog owner is VPC_TEST
+enter DROP CATALOG command again to confirm catalog removal
+
+RMAN> DROP CATALOG;
+
+virtual catalog dropped
+
+RMAN> EXIT
+
+SYS@rcat> DROP USER vpc_test CASCADE;
+
+User dropped.
+
+-- ────────────────────────────────────────────────
+-- 오류 ② 담당이 아닌 DB에 접속 시도
+-- ────────────────────────────────────────────────
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=sales
+[oracle@oel7v9r1 ~]$ rman target / catalog vpc_core@rcat
+
+connected to target database: SALES (DBID=2284410077)
+recovery catalog database Password:
+connected to recovery catalog database
+
+RMAN> LIST BACKUP SUMMARY;
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of list command at 06/03/2025 09:41:08
+RMAN-06004: ORACLE error from recovery catalog database:
+RMAN-20001: target database not found in recovery catalog
+
+-- << 원인 파악 >>
+-- vpc_core 에게는 orcl 만 부여되었다.
+-- sales 는 기본 카탈로그에 분명히 등록되어 있지만
+-- vpc_core 의 가상 카탈로그에서는 존재하지 않는 것으로 보인다.
+--
+-- 이것이 설계 의도다. "권한 없음"이 아니라 "없는 DB"로 취급된다.
+-- 다른 시스템의 존재 자체가 노출되지 않는다.
+--
+-- 감사 요구 사항 ②가 이 동작으로 충족된다.
+
+-- << 확인 >> 실제로 조회조차 되지 않는다.
+
+[oracle@oel7v9r1 ~]$ sqlplus vpc_core/oracle_4U@rcat
+
+VPC_CORE@rcat> SELECT dbid, name FROM rc_database ORDER BY name;
+
+      DBID NAME
+---------- --------
+1547823901 ORCL
+
+-- 한 건만 보인다. 기본 카탈로그에는 세 건이 있다.
+
+VPC_CORE@rcat> SELECT COUNT(*) FROM rc_backup_set;
+
+  COUNT(*)
+----------
+        47
+
+-- orcl 의 백업 세트 47건만 보인다.
+-- sales 의 26건과 hrdb 의 18건은 보이지 않는다.
+
+-- << 수정 >> 담당 DB로 접속한다. 이것이 정상 동작이다.
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog vpc_core@rcat
+
+connected to target database: ORCL (DBID=1547823901)
+connected to recovery catalog database
+
+RMAN> LIST BACKUP SUMMARY;
+
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed
+------- -- -- - ----------- ------------------- ------- ------- ----------
+1201    B  F  A DISK        2025-06-02 02:05:12       1       1  NO
+1204    B  A  A DISK        2025-06-02 02:08:44       1       1  NO
+
+-- ────────────────────────────────────────────────
+-- 오류 ③ 등록 권한 없이 새 DB 등록
+-- ────────────────────────────────────────────────
+-- 인사 담당자가 신규 테스트 DB를 등록하려 한다.
+
+[oracle@oel7v9r2 ~]$ export ORACLE_SID=hrdb
+[oracle@oel7v9r2 ~]$ rman target / catalog vpc_hr@rcat
+
+connected to target database: HRDB (DBID=3391560212)
+connected to recovery catalog database
+
+RMAN> REGISTER DATABASE;
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03009: failure of register command at 06/03/2025 10:02:19
+RMAN-06004: ORACLE error from recovery catalog database:
+ORA-01031: insufficient privileges
+
+-- << 원인 파악 >>
+-- vpc_hr 에게는 CATALOG FOR DATABASE hrdb 만 부여되었다.
+-- REGISTER DATABASE 권한은 별도이며 부여하지 않았다.
+--
+-- 두 권한의 차이
+--   CATALOG FOR DATABASE : 이미 등록된 특정 DB를 다룰 권한
+--   REGISTER DATABASE    : 새 DB를 카탈로그에 등록할 권한
+--
+-- 설계 단계에서 vpc_sales 에게만 등록 권한을 준 이유가 여기서 드러난다.
+-- 등록 권한이 있으면 카탈로그에 새 항목을 계속 만들 수 있어
+-- 공간과 관리 범위가 통제를 벗어날 수 있다.
+
+-- << 수정 >> 두 가지 선택지가 있다.
+
+-- 선택지 1 : 기본 카탈로그 소유자가 대신 등록한다 (권장)
+
+[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+RMAN> REGISTER DATABASE;
+-- 이미 등록되어 있다면 RMAN-20002 가 나온다.
+
+-- 선택지 2 : 등록 권한을 부여한다
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+RMAN> GRANT REGISTER DATABASE TO vpc_hr;
+
+Grant succeeded.
+
+RMAN> EXIT
+
+-- 권한 부여 후에는 성공한다.
+-- 다만 이 실습에서는 설계대로 회수한다.
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+RMAN> REVOKE REGISTER DATABASE FROM vpc_hr;
+
+Revoke succeeded.
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+-- 6-1. 각 VPC 사용자에게 보이는 범위
+
+[oracle@oel7v9r2 ~]$ sqlplus -s vpc_core/oracle_4U@rcat << 'EOF'
+SET PAGESIZE 0 FEEDBACK OFF
+SELECT 'vpc_core  : ' || LISTAGG(name, ', ') WITHIN GROUP (ORDER BY name)
+FROM rc_database;
+EXIT
+EOF
+
+vpc_core  : ORCL
+
+[oracle@oel7v9r2 ~]$ sqlplus -s vpc_sales/oracle_4U@rcat << 'EOF'
+SET PAGESIZE 0 FEEDBACK OFF
+SELECT 'vpc_sales : ' || LISTAGG(name, ', ') WITHIN GROUP (ORDER BY name)
+FROM rc_database;
+EXIT
+EOF
+
+vpc_sales : SALES
+
+[oracle@oel7v9r2 ~]$ sqlplus -s rcatowner/oracle_4U@rcat << 'EOF'
+SET PAGESIZE 0 FEEDBACK OFF
+SELECT 'rcatowner : ' || LISTAGG(name, ', ') WITHIN GROUP (ORDER BY name)
+FROM rc_database;
+EXIT
+EOF
+
+rcatowner : HRDB, ORCL, SALES
+
+-- 요구 사항 ①②가 충족되었다.
+
+-- 6-2. VPC 사용자로 실제 백업이 되는지
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog vpc_core@rcat
+
+RMAN> BACKUP TABLESPACE users TAG 'VPC_TEST_01';
+
+Starting backup at 2025-06-03 10:18:02
+channel ORA_DISK_1: starting full datafile backup set
+channel ORA_DISK_1: specifying datafile(s) in backup set
+input datafile file number=00004
+  name=/u01/app/oracle/oradata/ORCL/users01.dbf
+channel ORA_DISK_1: starting piece 1 at 2025-06-03 10:18:03
+channel ORA_DISK_1: finished piece 1 at 2025-06-03 10:18:10
+piece handle=/backup/ORCL/0v2x4k7t_31_1_1 tag=VPC_TEST_01
+Finished backup at 2025-06-03 10:18:11
+
+Starting Control File and SPFILE Autobackup at 2025-06-03 10:18:11
+piece handle=/backup/ORCL/c-1547823901-20250603-00
+Finished Control File and SPFILE Autobackup at 2025-06-03 10:18:14
+
+-- 백업이 정상 수행되고 카탈로그에도 기록된다.
+
+RMAN> LIST BACKUP TAG 'VPC_TEST_01';
+
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ -------------------
+1250    Full 3.42M      DISK        00:00:07     2025-06-03 10:18:10
+
+-- 6-3. 다른 사람의 백업을 지울 수 있는지 (핵심 검증)
+
+[oracle@oel7v9r1 ~]$ export ORACLE_SID=orcl
+[oracle@oel7v9r1 ~]$ rman target / catalog vpc_core@rcat
+
+RMAN> DELETE BACKUPSET 1250;
+
+-- 자기 DB의 백업은 지울 수 있다. 정상이다.
+
+Do you really want to delete the above objects (enter YES or NO)? NO
+
+-- 그러나 다른 DB의 백업은 조회 자체가 안 되므로 지정할 방법이 없다.
+
+RMAN> LIST BACKUP OF DATABASE;
+-- orcl 의 것만 나온다. sales 의 백업 세트 키를 알아낼 방법이 없다.
+
+-- 6-4. 스토어드 스크립트의 가시성
+--
+-- 13.6절에서 만든 스크립트가 어떻게 보이는지 확인한다.
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+RMAN> LIST GLOBAL SCRIPT NAMES;
+
+List of Stored Scripts in Recovery Catalog
+    Global Scripts
+    Script Name
+    Description
+    -----------------------------------------------------------------
+    global_full_backup
+    global_arch_backup
+
+RMAN> EXIT
+
+[oracle@oel7v9r1 ~]$ rman target / catalog vpc_core@rcat
+RMAN> LIST GLOBAL SCRIPT NAMES;
+
+List of Stored Scripts in Recovery Catalog
+    Global Scripts
+    Script Name
+    -----------------------------------------------------------------
+    global_full_backup
+    global_arch_backup
+
+-- 글로벌 스크립트는 VPC 사용자에게도 보인다.
+-- 표준 절차를 공유하되 데이터 범위는 나누는 구조가 된다.
+-- 이 성질을 예제 3에서 본격적으로 활용한다.
+
+-- 6-5. 감사 요구 사항 대조
+
+-- 요구 사항                                  | 충족 | 근거
+-- -------------------------------------------|------|--------------------
+-- ① 자기 담당 DB만 다룰 수 있다              | 예   | 6-2, 6-3
+-- ② 다른 DB 이력은 조회조차 안 된다          | 예   | 오류 ②, 6-2
+-- ③ 등록 권한을 따로 통제한다                | 예   | 오류 ③
+-- ④ 기존 이력과 스크립트가 유지된다          | 예   | 6-4, 3-4
+
+--------------------------------------------------------------------------------
+[7] 운영 산출물과 확장 과제
+--------------------------------------------------------------------------------
+-- 7-1. VPC 구성 스크립트
+--
+-- 운영스크립트/rc_vpc_setup.sql 로 제공한다.
+-- 신규 담당자가 생길 때마다 그대로 실행한다.
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/rc_vpc_setup.sql
+
+-- 사용법 : sqlplus / as sysdba @rc_vpc_setup.sql <VPC사용자> <비밀번호>
+DEFINE vpc_user  = &1
+DEFINE vpc_pass  = &2
+
+CREATE USER &vpc_user IDENTIFIED BY &vpc_pass
+  DEFAULT TABLESPACE rcat_data
+  TEMPORARY TABLESPACE temp
+  QUOTA UNLIMITED ON rcat_data;
+
+GRANT RECOVERY_CATALOG_OWNER TO &vpc_user;
+
+PROMPT
+PROMPT === 다음 단계를 수동으로 수행한다 ===
+PROMPT 1) rman catalog rcatowner@rcat
+PROMPT    RMAN> GRANT CATALOG FOR DATABASE <db> TO &vpc_user;
+PROMPT 2) rman catalog &vpc_user@rcat
+PROMPT    RMAN> CREATE VIRTUAL CATALOG;
+PROMPT
+
+-- 7-2. 권한 현황 점검 조회
+--
+-- 운영스크립트/rc_vpc_audit.sql
+-- 분기 감사 대응용으로 그대로 제출할 수 있다.
+
+[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/rc_vpc_audit.sql
+
+SET LINESIZE 140 PAGESIZE 100
+COLUMN vpc_user FORMAT A20
+COLUMN visible_databases FORMAT A60
+
+PROMPT === VPC 사용자 목록 ===
+SELECT u.username AS vpc_user, u.created, u.account_status
+FROM   dba_users u
+WHERE  u.username LIKE 'VPC%'
+ORDER  BY u.username;
+
+PROMPT === 기본 카탈로그 등록 DB ===
+SELECT dbid, name, reset_time FROM rcatowner.rc_database ORDER BY name;
+
+PROMPT === VPC 사용자별 가상 카탈로그 생성 여부 ===
+SELECT owner AS vpc_user, COUNT(*) AS synonym_count
+FROM   dba_synonyms
+WHERE  table_owner = 'RCATOWNER' AND owner LIKE 'VPC%'
+GROUP  BY owner ORDER BY owner;
+
+-- 실행 결과 예시
+
+[oracle@oel7v9r2 ~]$ sqlplus / as sysdba @/home/oracle/rcadm/rc_vpc_audit.sql
+
+=== VPC 사용자 목록 ===
+VPC_USER             CREATED   ACCOUNT_STATUS
+-------------------- --------- ---------------
+VPC_CORE             03-JUN-25 OPEN
+VPC_HR               03-JUN-25 OPEN
+VPC_SALES            03-JUN-25 OPEN
+
+=== VPC 사용자별 가상 카탈로그 생성 여부 ===
+VPC_USER             SYNONYM_COUNT
+-------------------- -------------
+VPC_CORE                       142
+VPC_HR                         142
+VPC_SALES                      142
+
+-- 7-3. 권한 회수 절차
+--
+-- 담당자가 바뀌거나 퇴사할 때의 표준 절차다.
+
+-- ① 접근 범위 회수
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat
+RMAN> REVOKE CATALOG FOR DATABASE orcl FROM vpc_core;
+RMAN> REVOKE REGISTER DATABASE FROM vpc_core;
+
+-- ② 가상 카탈로그 제거
+[oracle@oel7v9r2 ~]$ rman catalog vpc_core@rcat
+RMAN> DROP CATALOG;
+RMAN> DROP CATALOG;
+
+-- ③ 계정 제거
+SYS@rcat> DROP USER vpc_core CASCADE;
+
+-- ④ 확인 — 기본 카탈로그의 백업 이력은 그대로여야 한다
+RCATOWNER@rcat> SELECT COUNT(*) FROM rc_backup_set;
+-- 47 + 26 + 18 = 91 건이 유지된다.
+
+-- 7-4. 확장 과제
+--
+-- 과제 A. 읽기 전용 감사자 계정
+--   백업 이력을 조회만 하고 아무것도 지울 수 없는 계정이 필요하다.
+--   VPC로는 이것이 불가능하다. 왜 그런지 설명하고 대안을 제시하시오.
+--   힌트 : CATALOG FOR DATABASE 는 조회와 변경을 함께 부여한다.
+--          별도 스키마에 rc_ 뷰에 대한 SELECT 권한만 주는 방법을 검토한다.
+--
+-- 과제 B. 한 사람이 두 DB를 맡는 경우
+--   vpc_core 에게 orcl 과 hrdb 를 함께 부여하고 동작을 확인하시오.
+--   부여 후 CREATE VIRTUAL CATALOG 를 다시 실행해야 하는지 검증하시오.
+--
+-- 과제 C. VPC와 CONFIGURE 설정
+--   VPC 사용자가 CONFIGURE 로 설정을 바꾸면 그 설정이 어디에 저장되는지,
+--   다른 VPC 사용자에게 영향을 주는지 확인하시오.
+--   확인 방법 : 한쪽에서 CONFIGURE RETENTION POLICY 를 바꾼 뒤
+--               기본 카탈로그 소유자로 SHOW ALL 을 실행해 비교한다.
+--
+-- 과제 D. 감사 보고서 작성
+--   7-2의 조회를 확장해 다음을 포함한 보고서 SQL을 작성하시오.
+--     - 담당자별 관리 DB 목록
+--     - DB별 마지막 백업 시각과 경과 시간
+--     - 최근 30일간 DELETE 명령 수행 이력
+--   마지막 항목은 rc_rman_status 에서 operation 컬럼으로 찾을 수 있다.
+
+-- 7-5. 정리 — 이 실습에서 남는 것
+--
+--   ① rc_vpc_setup.sql   : 신규 담당자 계정 생성 절차
+--   ② rc_vpc_audit.sql   : 분기 감사 대응 조회
+--   ③ 권한 매트릭스 표   : [2]의 설계 문서
+--   ④ 권한 회수 절차     : 7-3의 4단계
+--
+-- 다음 예제에서는 이 구조 위에서 세 대의 백업 현황을
+-- 한 화면으로 보는 리포팅 체계를 만든다.
+
+-- 실무 포인트
+-- 1) VPC는 데이터를 복제하지 않는다.
+--    뷰와 동의어의 모음이므로 저장 공간이 거의 들지 않는다.
+--    DROP CATALOG 로 지워도 백업 이력은 사라지지 않는다.
+--
+-- 2) 권한 부여는 RMAN 명령이고 계정 생성은 SQL이다.
+--    GRANT CATALOG FOR DATABASE 는 SQL*Plus에서 실행되지 않는다.
+--    두 도구를 오가야 한다는 점이 처음에는 혼란스럽다.
+--
+-- 3) CREATE VIRTUAL CATALOG 를 빠뜨리면 권한이 있어도 보이지 않는다.
+--    설정 순서는 계정 생성 → 롤 부여 → 범위 부여 → 가상 카탈로그 생성이다.
+--
+-- 4) 권한 없는 DB는 "없는 DB"로 취급된다.
+--    ORA-01031 이 아니라 RMAN-20001 이 나온다.
+--    다른 시스템의 존재 자체가 노출되지 않는 것이 설계 의도다.
+--
+-- 5) 접속 성공이 권한 충분을 뜻하지 않는다.
+--    CREATE SESSION 만 있어도 접속 메시지는 정상적으로 나온다.
+--    실제 명령에서야 ORA-01031 로 막힌다.
+--
+-- 6) 글로벌 스토어드 스크립트는 VPC 경계를 넘어 공유된다.
+--    표준 백업 절차를 한 곳에서 관리하고 데이터만 나누는 구성이 가능하다.
+--    다만 그 스크립트를 수정할 수 있는 사람은 통제해야 한다.
