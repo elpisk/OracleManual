@@ -1,0 +1,121 @@
+================================================================================
+ 5장 실습 06 — 누적값 오판 재현과 델타 방식 교정
+ 목표: 누적 통계를 그대로 읽어 잘못 판정하는 상황(밤사이 I/O 병목 오판)을 직접
+       만든 뒤, 델타 방식으로 교정하는 전 과정을 캡처한다. 이 장의 대표 오판을
+       손으로 겪어 '측정 없이 판단하지 않는다'는 태도를 각인한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 주의: 개인 실습 환경 전용. 이 실습은 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (이상 징후 재현) 누적값을 그대로 읽어 병목을 단정한다.
+--     상황: 아침에 출근한 DBA가 대기 클래스 누적 집계를 보고 보고서를 쓴다.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN wait_class FORMAT A22
+SYS@orcl> SELECT wait_class, total_waits, ROUND(time_waited/100) sec
+  2       FROM  v$system_wait_class
+  3       WHERE wait_class <> 'Idle'
+  4       ORDER BY time_waited DESC;
+
+WAIT_CLASS             TOTAL_WAITS        SEC
+---------------------- ----------- ----------
+Network                       8583        358
+System I/O                   81525         77
+User I/O                     13860         52
+Other                        19811         27
+Application                    128          7
+Commit                         109          5
+Concurrency                     75          2
+Administrative                 109          1
+
+SYS@orcl> -- (오판) "User I/O 52초, System I/O 77초로 크다. 밤사이 I/O 병목이 있었다.
+SYS@orcl> --        스토리지를 증설해야 한다."  ← 이 결론이 왜 틀렸는지 아래에서 본다.
+
+--------------------------------------------------------------------------------
+-- [2] (원인 파악) 이 값은 무엇의 값인가?
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT TO_CHAR(startup_time,'YYYY-MM-DD HH24:MI') startup,
+  2         ROUND((SYSDATE - startup_time)*24,1) up_hours
+  3       FROM v$instance;
+
+STARTUP            UP_HOURS
+---------------- ----------
+<환경값>          <환경값>
+
+-- 원인 확정: V$SYSTEM_WAIT_CLASS의 sec는 인스턴스 기동 이후 '누적'이다.
+--   가동 시간이 길면 정상 운영으로도 User I/O 52초, System I/O 77초는 충분히 쌓인다.
+--   '밤 2~3시 구간'의 값이 아니라 '기동 이후 전체'의 합계다. 절대값으로 판정 불가.
+--   → 특정 구간의 병목은 그 구간의 '델타'로만 지목할 수 있다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치) 델타 방식으로 교정한다 — 관심 구간의 시작·끝을 빼서 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 관심 구간(T0~T1)을 감싸 두 번 집계한다. (AWR이 있으면 그 구간 스냅샷,
+SYS@orcl> --  없으면 아래처럼 V$를 두 번 조회하거나 Statspack 스냅샷 쌍을 쓴다.)
+SYS@orcl> -- T0: 구간 시작 집계
+SYS@orcl> SELECT wait_class, ROUND(time_waited/100) sec_t0
+  2       FROM v$system_wait_class WHERE wait_class <> 'Idle'
+  3       ORDER BY time_waited DESC FETCH FIRST 4 ROWS ONLY;
+
+WAIT_CLASS             SEC_T0
+---------------------- ----------
+Network                <환경값>
+System I/O             <환경값>
+User I/O               <환경값>
+Other                  <환경값>
+
+SYS@orcl> -- (관심 구간의 부하가 흐른다 — 예: WL_06_mixed.sql)
+SYS@orcl> -- T1: 구간 끝 집계
+SYS@orcl> SELECT wait_class, ROUND(time_waited/100) sec_t1
+  2       FROM v$system_wait_class WHERE wait_class <> 'Idle'
+  3       ORDER BY time_waited DESC FETCH FIRST 4 ROWS ONLY;
+
+WAIT_CLASS             SEC_T1
+---------------------- ----------
+Network                <환경값>
+System I/O             <환경값>
+User I/O               <환경값>
+Other                  <환경값>
+
+-- 델타(= T1 - T0)와 같은 구간 DB Time 델타를 함께 본다:
+--   그 구간 DB Time 델타 대비 각 클래스 델타의 '비중'이 병목 판정의 기준이다.
+--   누적으로 1위였던 Network가 구간 델타에서는 상위가 아닐 수 있다.
+
+--------------------------------------------------------------------------------
+-- [4] (재확인) 대기의 실체는 세션 이벤트로, 원시 카운트로 교차 검증한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 구간에 물리 I/O가 정말 병목이었다면 db file scattered read 같은 이벤트와
+SYS@orcl> -- physical reads 통계가 함께 커야 앞뒤가 맞는다(교차 검증).
+SYS@orcl> COLUMN event FORMAT A30
+SYS@orcl> SELECT event, total_waits, ROUND(time_waited_micro/1000) ms
+  2       FROM  v$session_event
+  3       WHERE sid = <내SID> AND wait_class <> 'Idle'
+  4       ORDER BY time_waited_micro DESC;
+
+EVENT                          TOTAL_WAITS         MS
+------------------------------ ----------- ----------
+db file scattered read                 120         65
+db file sequential read                 12         17
+log file sync                            1          0
+SQL*Net message to client               12          0
+
+-- 재확인: 이 세션 구간에서는 db file scattered read 120회·65ms가 실체다. 이처럼
+--   델타 + 이벤트 + 원시 카운트를 함께 봐야 '진짜 그 구간의 병목'을 지목할 수 있다.
+--   누적 절대값 하나로 내린 [1]의 '밤사이 I/O 병목'은 근거 없는 조치였다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 누적값을 그대로 읽는 것은 이 장의 대표 오판이다(예: 밤사이 I/O 병목 단정).
+-- 2) V$SYSTEM_WAIT_CLASS의 sec는 기동 이후 누적 — 가동 시간이 길면 정상도 크다.
+-- 3) 교정: 관심 구간의 T0·T1을 빼 델타로, DB Time 비중과 함께 병목을 지목한다.
+-- 4) 델타 + 대기 이벤트 + 원시 카운트로 교차 검증한다. '측정 없이 판단하지 않는다'.
+-- ※ 이 실습의 V$ 조회는 라이선스가 필요 없다. AWR로 구간을 뜨려면 🔒 Diagnostics Pack(6장).
+
+SYS@orcl> EXIT
+================================================================================

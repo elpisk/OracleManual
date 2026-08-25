@@ -1,0 +1,148 @@
+================================================================================
+ 4장 실습 04 — 전용 서버 vs 공유 서버 접속 방식 비교
+ 목표: 현재 접속이 전용 서버인지 확인하고(V$SESSION.SERVER), 접속마다 서버
+       프로세스가 붙는 구조를 관찰한다. 공유 서버를 임시로 구성해 디스패처·
+       공유 서버 프로세스가 생기는 것과 진단 뷰(V$DISPATCHER_RATE·V$QUEUE·
+       V$SHARED_SERVER)를 확인한 뒤 원복한다. 프로세스·메모리(UGA) 차이를 이해.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA)
+ 주의: 개인 실습 환경 전용. SHARED_SERVERS·DISPATCHERS 파라미터 변경이
+       포함된다. 마지막에 전용 서버 구성으로 원복한다. 공용 DB에서 수행 금지.
+================================================================================
+
+$ sqlplus / as sysdba
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 현재 접속 방식과 관련 파라미터를 캡처한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sid, username, server, program
+  2       FROM  v$session
+  3       WHERE username IS NOT NULL AND type='USER'
+  4       ORDER BY sid;
+   SID USERNAME  SERVER     PROGRAM
+------ --------- ---------- --------------------------
+    23 SYS       DEDICATED  sqlplus.exe
+   145 SQLT      DEDICATED  JDBC Thin Client
+   201 SQLT      DEDICATED  JDBC Thin Client
+
+-- 해석: 모든 사용자 세션의 SERVER=DEDICATED. 이 인스턴스는 전용 서버 구성이다.
+--   즉 접속 하나마다 전용 서버 프로세스가 하나씩 붙어 있다.
+
+SYS@orcl> SELECT name, value FROM v$parameter
+  2       WHERE name IN ('shared_servers','dispatchers','max_shared_servers',
+  3              'max_dispatchers','large_pool_size');
+NAME                 VALUE
+-------------------- --------------------------
+dispatchers          (PROTOCOL=TCP) (DISPATCHERS=0)
+large_pool_size      0
+max_dispatchers
+max_shared_servers
+shared_servers       0
+
+-- 조치 전 요약: shared_servers=0, dispatchers 실효 0 → 공유 서버 미구성.
+--   large_pool_size=0 → 공유 서버를 켜면 UGA가 갈 라지 풀을 확보해야 한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 전용 서버에서 '접속 = 프로세스'임을 프로세스 수로 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) server_procs
+  2       FROM  v$process p
+  3       WHERE EXISTS (SELECT 1 FROM v$session s WHERE s.paddr = p.addr
+  4                       AND s.type='USER' AND s.username IS NOT NULL);
+SERVER_PROCS
+------------
+           3
+
+-- 해석: 사용자 세션 3개에 서버 프로세스 3개. 전용 서버는 접속 수에 비례해
+--   프로세스가 늘어난다. 접속이 수천이면 그만큼 프로세스·메모리가 든다.
+
+SYS@orcl> -- 공유 서버 큐(V$QUEUE)는 아직 COMMON 행이 없거나 TOTALQ=0이다.
+SYS@orcl> SELECT type, queued, totalq, wait FROM v$queue;
+TYPE          QUEUED     TOTALQ       WAIT
+---------- --------- ---------- ----------
+COMMON             0          0          0
+DISPATCHER         0          0          0
+
+--------------------------------------------------------------------------------
+-- [3] (구성 변경) 공유 서버를 임시로 켠다. 라지 풀부터 확보한다.
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET large_pool_size=128M SCOPE=MEMORY;
+System altered.
+SYS@orcl> ALTER SYSTEM SET dispatchers='(PROTOCOL=TCP)(DISPATCHERS=2)' SCOPE=MEMORY;
+System altered.
+SYS@orcl> ALTER SYSTEM SET shared_servers=2 SCOPE=MEMORY;
+System altered.
+
+--------------------------------------------------------------------------------
+-- [4] (조치 후 상태) 디스패처·공유 서버 프로세스가 생겼는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, status, (SELECT COUNT(*) FROM v$dispatcher) disp_cnt
+  2       FROM  v$dispatcher WHERE ROWNUM=1;
+NAME   STATUS       DISP_CNT
+------ ------------ --------
+D000   WAIT                2
+
+SYS@orcl> SELECT COUNT(*) "Shared Server Processes"
+  2       FROM  v$shared_server WHERE status != 'QUIT';
+Shared Server Processes
+-----------------------
+                      2
+
+-- 해석: 디스패처 2개, 공유 서버 프로세스 2개가 떴다. 이제 새 공유 접속은
+--   디스패처를 거쳐 소수의 공유 서버가 나눠 처리한다(전용처럼 1:1이 아니다).
+
+--------------------------------------------------------------------------------
+-- [5] (진단 뷰) 공유 서버 경합을 어떻게 보는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT DECODE(totalq, 0, 'No Requests',
+  2         wait/totalq || ' HUNDREDTHS OF SECONDS')
+  3         "AVERAGE WAIT TIME PER REQUEST"
+  4       FROM v$queue WHERE type='COMMON';
+AVERAGE WAIT TIME PER REQUEST
+-----------------------------
+No Requests
+
+-- 해석: 아직 공유 접속 요청이 없어 'No Requests'. 부하가 있으면 요청당 평균
+--   대기시간(1/100초)이 나온다. 이 값이 꾸준히 커지면 공유 서버 경합이다.
+--   디스패처 부하는 V$DISPATCHER_RATE의 CUR_/AVG_/MAX_를 비교해 판정한다:
+--     현재값이 MAX 근처 → 디스패처 추가 / 한참 낮으면 과다.
+
+--------------------------------------------------------------------------------
+-- [6] (이상/오류 흐름) 공유 서버로 접속하려다 나는 흔한 오류 재현.
+--     라지 풀이 부족하면 공유 서버 세션 메모리(UGA)를 확보하지 못한다.
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET large_pool_size=4M SCOPE=MEMORY;   -- 일부러 축소
+System altered.
+-- (공유 서버로 다수 세션이 큰 작업을 시도하면)
+   ... ORA-04031: unable to allocate ... bytes of shared memory
+       ("large pool","...","...")
+
+-- 원인 파악: 공유 서버는 UGA를 라지 풀(없으면 공유 풀)에 둔다. 라지 풀이
+--   너무 작아 세션 메모리를 할당하지 못해 ORA-04031이 났다.
+-- 조치: 라지 풀을 충분히 키운다(공유 서버 세션 수 × UGA 추정치 이상).
+SYS@orcl> ALTER SYSTEM SET large_pool_size=128M SCOPE=MEMORY;
+System altered.
+-- 재확인: 같은 작업이 메모리 오류 없이 진행된다(18장에서 ORA-04031 심화).
+
+--------------------------------------------------------------------------------
+-- [7] (원복) 전용 서버 구성으로 되돌린다.
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET shared_servers=0 SCOPE=MEMORY;
+SYS@orcl> ALTER SYSTEM SET dispatchers='(PROTOCOL=TCP)(DISPATCHERS=0)' SCOPE=MEMORY;
+SYS@orcl> ALTER SYSTEM SET large_pool_size=0 SCOPE=MEMORY;
+System altered.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 접속 방식은 V$SESSION.SERVER로 본다: DEDICATED/SHARED/NONE/POOLED.
+-- 2) 전용 서버는 '접속=프로세스'라 접속 수만큼 프로세스·메모리가 든다.
+--    공유 서버는 소수 공유 서버+디스패처로 다중 처리해 자원을 절감한다.
+-- 3) 공유 서버는 UGA가 SGA(라지 풀)로 이동한다 → large_pool_size 확보 필수.
+--    부족하면 ORA-04031이 난다.
+-- 4) 공유 서버 경합 진단: V$QUEUE(요청 큐 대기)·V$DISPATCHER_RATE(CUR/AVG/MAX)·
+--    V$SHARED_SERVER(STATUS!='QUIT' 개수). 늘리기 전 메모리 문제부터 배제한다.
+-- 5) 간헐 OLTP 다수 접속·고접속률 → 공유 서버 / 장시간·배치·관리 작업 → 전용.
+-- ※ 이 조회들은 관리 팩 라이선스가 필요 없다.
+
+SYS@orcl> EXIT
+================================================================================

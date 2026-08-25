@@ -1,0 +1,112 @@
+================================================================================
+ 5장 실습 02 — 세션 시간 모델로 부하 구간의 시간 사용 분해 (V$SESS_TIME_MODEL)
+ 목표: 내 세션의 부하 전후 DB Time을 델타로 재서 '이 구간이 DB Time을 얼마나
+       썼는가'를 분해한다. 짧은 구간(0.3초)에서 CPU/대기 분해가 불안정해지는
+       이상 징후를 재현하고, 대기의 실체는 V$SESSION_EVENT로 확인함을 익힌다.
+ 환경: non-CDB=orcl 19.3 (업무 계정 SQLT로 수행 — 자기 세션 측정)
+ 주의: 개인 실습 환경 전용. 아래 [2]에서 버퍼 캐시를 비운다(FLUSH BUFFER_CACHE).
+       ★ 이 명령은 운영 DB 절대 금지 ★ — 전체 응답시간이 급락한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 내 세션의 SID와 부하 전 시간 모델 누적값을 캡처한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT sys_context('USERENV','SID') my_sid FROM dual;
+
+MY_SID
+----------
+<환경값>
+
+SQLT@orcl> -- 부하 전(T0) DB time / DB CPU 누적값 (V$SESS_TIME_MODEL, 내 세션)
+SQLT@orcl> COLUMN stat_name FORMAT A12
+SQLT@orcl> SELECT stat_name, value
+  2       FROM  v$sess_time_model
+  3       WHERE sid = sys_context('USERENV','SID')
+  4         AND stat_name IN ('DB time','DB CPU');
+
+STAT_NAME       VALUE
+------------ ----------
+DB time      <환경값>
+DB CPU       <환경값>
+
+--------------------------------------------------------------------------------
+-- [2] (조치) 물리 I/O가 DB time에 잡히도록 캐시를 비운 뒤 대량 스캔을 돌린다.
+--     ★ 개인 실습 환경 전용 ★  운영 DB에서는 절대 실행하지 않는다.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- (SYSDBA 세션에서 1회) ALTER SYSTEM FLUSH BUFFER_CACHE;
+SQLT@orcl> -- 이후 조회는 디스크부터 다시 읽어 db file scattered read가 발생한다.
+SQLT@orcl> ALTER SESSION SET "_serial_direct_read" = NEVER;
+
+Session altered.
+
+SQLT@orcl> -- 약 0.3초짜리 대량 스캔(WL_06 축약). 벽시계 약 0.3초.
+SQLT@orcl> SELECT /*+ FULL(d) NO_PARALLEL(d) */ SUM(d.amt)
+  2       FROM claim_details d WHERE d.qty >= 0;
+
+  SUM(AMT)
+----------
+<환경값>
+
+--------------------------------------------------------------------------------
+-- [3] (결과) 부하 후(T1) 시간 모델을 다시 캡처해 델타를 계산한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT stat_name, value FROM v$sess_time_model
+  2       WHERE sid = sys_context('USERENV','SID')
+  3         AND stat_name IN ('DB time','DB CPU');
+
+STAT_NAME       VALUE
+------------ ----------
+DB time      <환경값>
+DB CPU       <환경값>
+
+-- 이번 캡처의 부하 구간 델타(실측):
+--   이 세션 DB time 델타 : 275,636 us  (약 0.28초)
+--   이 세션 DB CPU  델타 : 297,047 us  (약 0.30초)
+--   → DB time 대비 CPU 107.8% ,  대기 -7.8%
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: DB CPU 델타(297,047)가 DB time 델타(275,636)보다 크다.
+--       'DB time - DB CPU = 대기'가 음수(-7.8%)가 된다. 물리적으로 불가능해 보인다.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 원인 파악: 버그가 아니다. 구간이 0.3초로 너무 짧아 DB time과 DB CPU
+SQLT@orcl> --   카운터의 갱신 시점이 미세하게 어긋나고 반올림이 겹쳐 분해가 불안정한 것.
+SQLT@orcl> --   짧은 순간에는 시간 모델의 CPU/대기 쪼개기를 곧이곧대로 믿으면 안 된다.
+SQLT@orcl> -- 조치: 대기의 실체는 시간 모델 비율이 아니라 V$SESSION_EVENT에서 확인한다.
+SQLT@orcl> COLUMN event FORMAT A30
+SQLT@orcl> SELECT event, total_waits, ROUND(time_waited_micro/1000) ms
+  2       FROM  v$session_event
+  3       WHERE sid = sys_context('USERENV','SID')
+  4         AND wait_class <> 'Idle'
+  5       ORDER BY time_waited_micro DESC;
+
+EVENT                          TOTAL_WAITS         MS
+------------------------------ ----------- ----------
+db file scattered read                 120         65
+db file sequential read                 12         17
+log file sync                            1          0
+SQL*Net message to client               12          0
+
+-- 재확인: db file scattered read를 120회·65ms 기다렸다 → 물리 I/O 대기가
+--   분명히 있었다. 짧은 구간의 -7.8%는 노이즈였고, 65ms가 대기의 실체다.
+--   scattered read(다중 블록)가 sequential read(단일 블록)보다 압도적으로 많은 것은
+--   이 부하가 대량 전체 스캔 위주였음을 말해 준다.
+-- 결론: 정확한 CPU/대기 비율이 필요하면 순간이 아니라 수 분짜리 AWR 구간으로
+--   봐야 한다(→ 6장). 이것이 5장이 6장으로 이어지는 다리다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 세션 뷰(V$SESS_TIME_MODEL)로 다른 세션 영향을 배제하고 내 구간만 쟀다.
+-- 2) 부하 구간 DB time 델타 275,636us / DB CPU 델타 297,047us (짧은 구간이라 불안정).
+-- 3) 대기의 증거는 V$SESSION_EVENT의 db file scattered read 120회·65ms.
+-- 4) 짧은 구간은 시간 모델 분해가 흔들린다 → 수 분 구간(AWR)이 필요하다.
+-- ※ V$SESS_TIME_MODEL·V$SESSION_EVENT 조회는 라이선스가 필요 없다.
+
+SQLT@orcl> EXIT
+================================================================================

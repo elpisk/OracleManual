@@ -1,0 +1,128 @@
+================================================================================
+ 1장 실습 02 — 성능 도구 지도: 진입점 확인
+ 목표: V$ 뷰 / AWR / ADDM / ASH / Advisor 각각의 진입점을 확인하고,
+       라이선스 유무·권한에 따른 접근 차이를 대조한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행, 일부 일반 계정 대조)
+ 라이선스 주의(🔒): AWR·ADDM·ASH·DBA_HIST_* 및 V$ACTIVE_SESSION_HISTORY는
+       Diagnostics Pack이 필요하다. 이 실습은 '진입점 존재 확인'만 하며,
+       미보유 환경 대안 경로를 마지막에 함께 싣는다.
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 원천 계층 = V$ 동적 성능 뷰. 라이선스가 필요 없다.
+--     성능 관련 V$ 뷰가 얼마나 있는지부터 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) AS v_perf_views
+  2       FROM  v$fixed_table
+  3       WHERE name LIKE 'V$%'
+  4         AND (name LIKE '%STAT%' OR name LIKE '%WAIT%'
+  5              OR name LIKE '%METRIC%' OR name LIKE '%TIME_MODEL%');
+
+V_PERF_VIEWS
+------------
+         143
+
+-- 해석: 진단 원천은 143개의 성능 V$ 뷰다. AWR·ADDM은 이 값을 스냅샷으로 떠
+--   보존·자동분석하는 편의 계층일 뿐, 원천은 언제나 V$다(= 대안 경로의 근거).
+
+--------------------------------------------------------------------------------
+-- [2] (진입점 확인) AWR 계층 🔒 — DBA_HIST_SNAPSHOT로 스냅샷 보유 현황 확인.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) snap_cnt, MIN(snap_id) min_id, MAX(snap_id) max_id,
+  2         TO_CHAR(MIN(begin_interval_time),'YYYY-MM-DD HH24:MI') oldest,
+  3         TO_CHAR(MAX(end_interval_time),'YYYY-MM-DD HH24:MI') newest
+  4       FROM  dba_hist_snapshot;
+
+  SNAP_CNT     MIN_ID     MAX_ID OLDEST            NEWEST
+---------- ---------- ---------- ----------------- -----------------
+       153        141        293 2026-08-14 10:00  2026-08-25 10:32
+
+-- 해석: 스냅샷 153개(snap_id 141~293) 보유. 보존 구간(08-14~08-25) 안의
+--   문제는 AWR로 사후 재구성 가능, 그 밖은 데이터가 없다. AWR 보고서는
+--   awrrpt.sql로 생성한다(8장). 🔒 Diagnostics Pack 필요.
+
+--------------------------------------------------------------------------------
+-- [3] (진입점 확인) Advisor 계층 — DBA_ADVISOR_DEFINITIONS. ADDM도 여기 포함.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN advisor_name FORMAT A30
+SYS@orcl> SELECT advisor_name FROM dba_advisor_definitions ORDER BY advisor_name;
+
+ADVISOR_NAME
+------------------------------
+ADDM
+Compression Advisor
+SPM Evolve Advisor
+SQL Access Advisor
+SQL Performance Analyzer
+SQL Repair Advisor
+SQL Tuning Advisor
+SQL Workload Manager
+Segment Advisor
+Statistics Advisor
+Tune MView
+Undo Advisor
+
+12 rows selected.
+
+-- 해석: ADDM은 진입점이 addmrpt.sql·DBMS_ADDM·DBA_ADDM_* (🔒 Diagnostics Pack).
+--   SQL Tuning/Access Advisor·SQL Performance Analyzer는 🔒 Tuning Pack.
+--   Segment·Undo·Statistics Advisor는 별도 팩 없이 사용 가능.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치)
+--     이상 징후: 업무용 일반 계정(SQLT)으로 ASH·DBA_HIST에 접근을 시도했더니
+--       테이블이 없다는 오류가 난다.
+--------------------------------------------------------------------------------
+SYS@orcl> CONNECT sqlt/sqlt@orcl
+Connected.
+SQLT@orcl> SELECT COUNT(*) FROM v$active_session_history;
+SELECT COUNT(*) FROM v$active_session_history
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+SQLT@orcl> -- 원인 파악: V$/DBA_HIST 성능 뷰는 기본적으로 일반 계정에 권한이 없다.
+SQLT@orcl> --   진단 작업은 SYSDBA(또는 적절한 권한을 부여받은 진단 계정)로 해야 한다.
+SQLT@orcl> -- 조치: 진단 권한이 있는 계정으로 다시 접속한다.
+SQLT@orcl> CONNECT / as sysdba
+Connected.
+SYS@orcl> SELECT COUNT(*) FROM v$active_session_history;   -- 🔒 Diagnostics Pack
+
+  COUNT(*)
+----------
+     <환경값>
+
+-- 재확인: SYSDBA에서는 접근된다. (건수는 환경마다 다르므로 <환경값>)
+--   ※ 12장에서 최소 권한 관찰 계정(MON, SELECT ANY DICTIONARY)으로
+--     '무엇이 보이고 안 보이는지'를 별도로 대조한다.
+
+--------------------------------------------------------------------------------
+-- [5] (라이선스 대안 경로) Diagnostics Pack이 없다면?
+--------------------------------------------------------------------------------
+-- * AWR 구간 요약 → Statspack 보고서 또는 V$SYSSTAT/V$SYS_TIME_MODEL 델타
+-- * ADDM 자동 진단 → V$SYSTEM_WAIT_CLASS + 시간 모델을 사람이 직접 분해
+-- * ASH 순간 상태 → V$SESSION + V$SESSION_WAIT를 짧은 주기로 반복 폴링
+SYS@orcl> -- (예: ASH 대신 활성 세션 순간 조회 — 라이선스 불필요)
+SYS@orcl> SELECT sid, event, sql_id
+  2       FROM  v$session
+  3       WHERE status='ACTIVE' AND type='USER' AND sid <> USERENV('SID');
+
+-- 부하가 없으면 행이 없을 수 있다(정상). 부하 구간에서 반복 실행해 ASH를 흉내 낸다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 도구는 층위가 다른 협력 관계다: V$(원천) → AWR(보존) → ADDM(자동분석)
+--    → ASH(초 단위) → Advisor(조치). 문제 성격에 맞춰 고른다.
+-- 2) V$·Statspack·Segment/Undo/Statistics Advisor는 팩이 필요 없다.
+-- 3) AWR·ADDM·ASH·DBA_HIST_*·V$ACTIVE_SESSION_HISTORY는 Diagnostics Pack,
+--    SQL Tuning/Access Advisor·SPA는 Tuning Pack이 필요하다.
+-- 4) 진단은 SYSDBA(또는 권한 있는 진단 계정)로 수행한다.
+
+SYS@orcl> EXIT
+================================================================================

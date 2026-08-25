@@ -1,0 +1,188 @@
+================================================================================
+ 3장 실습 04 — 블로킹 세션 추적과 해소 (V$SESSION.BLOCKING_SESSION / DBA_BLOCKERS)
+ 목표: 행 잠금 경합을 재현해 대기자와 블로커를 세 겹의 뷰
+       (V$SESSION → V$LOCK → DBA_WAITERS/BLOCKERS)로 추적하고,
+       근거를 캡처한 뒤에만 세션을 해소하는 절차를 익힌다.
+       이 실습이 3장의 핵심이다.
+ 환경: non-CDB=orcl 19.3. 관찰은 SYS@orcl>, 부하 유발은 SQLT@orcl>.
+       부하 스크립트: 공용 WL_04_lock.sql (터미널 A/B/C).
+ 주의: 개인 실습 환경 전용. 커밋하지 않은 트랜잭션을 일부러 유지한다.
+       원본 REVIEW_LOG 은 건드리지 않고 복제본 REVIEW_LOG_WL 에서만 갱신한다.
+================================================================================
+
+--------------------------------------------------------------------------------
+-- [0] (부하 준비) 복제 테이블 생성 — 아무 터미널에서 1회.
+--     원본 REVIEW_LOG(50만 행)은 SELECT 대상으로만 쓴다.
+--------------------------------------------------------------------------------
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> DEFINE wl_role = SETUP
+SQLT@orcl> @WL_04_lock.sql
+[준비] REVIEW_LOG_WL 생성 완료 (1000행 이하).
+[준비] REVIEW_LOG_WL 현재 행수 = 1000
+>>> 준비 완료. 이제 터미널 A 에서 다음을 실행한다.
+
+--------------------------------------------------------------------------------
+-- [1] (부하 유발) 터미널 A — 잠금 보유자.
+--     대상 행을 UPDATE 하고 커밋하지 않은 채 60초 대기한다.
+--------------------------------------------------------------------------------
+-- (터미널 A) SQLT@orcl>
+SQLT@orcl> DEFINE wl_role = A
+SQLT@orcl> @WL_04_lock.sql
+================================================================================
+[세션 A] 나의 SID = 596 , SERIAL# = <환경값>
+[세션 A] 잠글 대상 : REVIEW_LOG_WL.LOG_ID = <환경값>
+================================================================================
+[세션 A] UPDATE 1 행 완료. 커밋하지 않는다 (TX 잠금 보유 중).
+[세션 A] 60 초 동안 잠금을 유지한다...
+
+-- (터미널 B) SQLT@orcl>  ※ A가 대기에 들어간 직후 실행
+SQLT@orcl> DEFINE wl_role = B
+SQLT@orcl> @WL_04_lock.sql
+-- 화면이 멈춘 것처럼 보인다. 같은 행을 UPDATE 하려다 블로킹된 것이다(정상).
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태 · 1차 식별) 터미널 C — 관찰자.
+--     V$SESSION.BLOCKING_SESSION 으로 대기자와 블로커를 한눈에 본다.
+--------------------------------------------------------------------------------
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COLUMN username FORMAT A8
+SYS@orcl> COLUMN event    FORMAT A32
+SYS@orcl> SELECT sid, username, event, blocking_session blk, wait_class
+  2       FROM  v$session
+  3       WHERE username = 'SQLT'
+  4       ORDER BY sid;
+
+       SID USERNAME EVENT                            BLK WAIT_CLASS
+---------- -------- -------------------------------- --- -----------
+       596 SQLT     SQL*Net message from client          Idle
+       597 SQLT     enq: TX - row lock contention    596 Application
+
+-- 해석(핵심): SID 597 이 대기자다. EVENT 가 'enq: TX - row lock contention',
+--   WAIT_CLASS 가 Application 이며 BLK(blocking_session)에 596 이 찍혔다.
+--   즉 597 은 596 에 막혀 있다.
+-- ★ 오판 주의 ★ 블로커 596 의 EVENT 는 'SQL*Net message from client',
+--   WAIT_CLASS 는 Idle 이다. 진짜 범인(596)은 지금 아무 일도 안 하고
+--   유휴 상태로 잠금만 쥐고 있다. '가장 바쁜 세션(597)'을 범인으로 지목하면
+--   정작 유휴 블로커 596 을 놓친다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 전 상태 · 2차 확인) V$LOCK — 누가 보유하고 누가 요청하나.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sid, type, lmode, request, block
+  2       FROM  v$lock
+  3       WHERE type = 'TX'
+  4       ORDER BY sid;
+
+       SID TYPE      LMODE    REQUEST      BLOCK
+---------- ---- ---------- ---------- ----------
+       596 TX            6          0          1
+       597 TX            0          6          0
+
+-- 해석: 596 은 LMODE=6(배타) 보유 + BLOCK=1(다른 세션을 막는 중), REQUEST=0.
+--   597 은 LMODE=0(보유 없음), REQUEST=6(배타 요청), BLOCK=0(대기자).
+--   V$SESSION 의 BLOCKING_SESSION=596 과 V$LOCK 의 block=1(596)/request=6(597)이
+--   같은 사실을 두 각도에서 확인해 준다 → 진단 확신.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인) DBA_WAITERS 가 오류를 낸다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT holding_session blocker, waiting_session waiter
+  2       FROM  dba_waiters;
+FROM  dba_waiters
+      *
+ERROR at line 2:
+ORA-00942: table or view does not exist
+
+-- 이상 징후: DBA_WAITERS/DBA_BLOCKERS 조회가 ORA-00942 로 실패한다.
+-- 원인: 이 요약 뷰는 기본 설치가 아니라 잠금 카탈로그 스크립트(catblock.sql)로
+--   미리 생성해 두어야 한다. 뷰가 없으면 조회 자체가 안 된다.
+-- 조치: SYS 로 1회 생성한다(이후 계속 사용 가능).
+SYS@orcl> @?/rdbms/admin/catblock.sql
+-- (뷰·시노님 생성 완료)
+-- 재확인: 같은 조회를 다시 실행한다.
+SYS@orcl> SELECT holding_session blocker, waiting_session waiter
+  2       FROM  dba_waiters;
+
+   BLOCKER     WAITER
+---------- ----------
+       596        597
+
+SYS@orcl> SELECT holding_session FROM dba_blockers;
+
+HOLDING_SESSION
+---------------
+            596
+
+-- 해석: 세 겹(V$SESSION / V$LOCK / DBA_WAITERS)이 모두 '596 이 597 을 막는다'로
+--   일관된다. 결론이 어긋나면 조회 시점 차로 상태가 변한 것이니 다시 캡처한다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치 전 상태 · 대상 식별) 어느 세그먼트의 어느 행인가.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT s.sid, o.object_name, s.row_wait_obj#, s.row_wait_file#,
+  2         s.row_wait_block#, s.row_wait_row#
+  3       FROM  v$session s JOIN dba_objects o ON o.object_id = s.row_wait_obj#
+  4       WHERE s.blocking_session IS NOT NULL;
+
+       SID OBJECT_NAME     ROW_WAIT_OBJ# ROW_WAIT_FILE# ROW_WAIT_BLOCK# ROW_WAIT_ROW#
+---------- --------------- ------------- -------------- --------------- -------------
+       597 REVIEW_LOG_WL       <환경값>       <환경값>        <환경값>      <환경값>
+
+-- 해석: 대기자 597 이 REVIEW_LOG_WL 의 특정 행을 기다린다. 어느 테이블의 행인지
+--   알면 관련 업무 트랜잭션을 좁힐 수 있다. object_id·파일·블록·행 번호는
+--   환경마다 다르므로 <환경값>.
+
+--------------------------------------------------------------------------------
+-- [6] (근거 캡처) 종료 전에 위 [2]~[5]를 파일로 남긴다.
+--------------------------------------------------------------------------------
+SYS@orcl> SPOOL /tmp/block_before_<환경값>.txt
+SYS@orcl> -- (위 [2]~[5]의 조회를 다시 실행해 파일에 기록)
+SYS@orcl> SPOOL OFF
+-- ★ 세션을 죽이는 순간 V$SESSION/V$LOCK 의 해당 행이 사라진다.
+--   조치 전에 캡처하지 않으면 '무엇이 왜 막혀 있었는가'라는 증거가 함께 사라진다.
+
+--------------------------------------------------------------------------------
+-- [7] (조치) 해소 — 정상 경로가 우선, KILL 은 비상 수단.
+--------------------------------------------------------------------------------
+-- 정상 경로: 블로커(터미널 A)가 스크립트 끝에서 자동 ROLLBACK 하면 잠금이 풀린다.
+--   실습에서는 A가 60초 뒤 ROLLBACK 하자 대기자 597 의 UPDATE 가 즉시 성공했다.
+-- (터미널 B) 화면이 풀리며 아래가 출력된다.
+[세션 B] 블로킹 해소됨. UPDATE 1 행 완료. 대기했던 시간(초) = <환경값>
+
+-- 비상 경로(세션이 방치되어 계속 막을 때만):
+SYS@orcl> -- ALTER SYSTEM KILL SESSION '596,<SERIAL#>' IMMEDIATE;
+-- ★ 반드시 [6] 캡처를 끝낸 뒤에만 실행한다.
+
+--------------------------------------------------------------------------------
+-- [8] (조치 후 상태 · 재확인) 블로킹이 풀렸는지 확인.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sid, event, blocking_session blk, wait_class
+  2       FROM  v$session
+  3       WHERE username = 'SQLT'
+  4       ORDER BY sid;
+
+       SID EVENT                            BLK WAIT_CLASS
+---------- -------------------------------- --- -----------
+       596 SQL*Net message from client          Idle
+       597 SQL*Net message from client          Idle
+
+-- 해석: 597 의 BLK 가 비었고 EVENT 가 Idle 로 바뀌었다. 블로킹 해소 확인.
+--   '조치 전(597→596 블로킹) → 조치(롤백/종료) → 조치 후(BLK 비움)'의 3단이 완성됐다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 1차 식별은 V$SESSION.BLOCKING_SESSION (대기자 597 의 BLK=596).
+-- 2) 잠금 모드·종류는 V$LOCK (596 block=1 보유, 597 request=6 대기).
+-- 3) 요약은 DBA_WAITERS/DBA_BLOCKERS. 세 겹이 일관돼야 확신한다.
+-- 4) 유휴(Idle) 블로커(596)를 놓치지 않는다. 바쁜 세션(597)이 범인이 아니다.
+-- 5) 종료 전에 근거를 캡처한다. 종료하면 증거가 사라진다.
+-- 6) 정리 확인: REVIEW_LOG_WL 잔재 정리.
+SQLT@orcl> DEFINE wl_role = CLEANUP
+SQLT@orcl> @WL_04_lock.sql
+[정리] REVIEW_LOG_WL 을 삭제했다. 잔재 = 0개.
+SQLT@orcl> EXIT
+================================================================================

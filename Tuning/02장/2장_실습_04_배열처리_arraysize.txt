@@ -1,0 +1,127 @@
+================================================================================
+ 2장 실습 04 — 배열 처리(arraysize) 변경에 따른 왕복·논리 읽기 변화 확인
+ 목표: SET ARRAYSIZE 값을 바꿔 가며 SQL*Net 왕복 횟수(roundtrips)와
+       논리 읽기(consistent gets)가 어떻게 달라지는지 autotrace로 대조한다.
+       'SQL*Net 대기 = 네트워크 문제'라는 오해를 교정한다.
+ 환경: non-CDB=orcl 19.3. 업무 계정 SQLT로 수행.
+       autotrace에는 PLUSTRACE 롤과 PLAN_TABLE이 필요하다.
+ 주의: 개인 실습 환경 전용. CLAIM_DETAILS(약 90만 건) 대량 조회를 수행한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (이상 → 원인 → 조치 → 재확인) 대상 테이블 조회부터 확인한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT COUNT(*) FROM claim_detail;
+SELECT COUNT(*) FROM claim_detail
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- 이상 징후: 조회가 ORA-00942로 실패한다.
+-- 원인 파악: 테이블명 오타다. 진료비 스키마의 대량 테이블은 CLAIM_DETAILS(복수형)다.
+-- 조치: 올바른 테이블명으로 정정한다.
+
+SQLT@orcl> SELECT COUNT(*) FROM claim_details;
+
+  COUNT(*)
+----------
+    899894
+
+-- 재확인: CLAIM_DETAILS(약 90만 건) 조회 성공. ORA-00942 해소.
+-- (건수 899,894는 진료비 스키마의 실제 CLAIM_DETAILS 건수)
+
+--------------------------------------------------------------------------------
+-- [1-b] autotrace 통계를 켠다. PLUSTRACE 롤이 없으면 SP2 오류가 난다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT * FROM claim_details FETCH FIRST 10 ROWS ONLY;
+SP2-0618: Cannot find the Session Identifier. Check PLUSTRACE role is enabled
+SP2-0611: Error enabling STATISTICS report
+-- → SYS로 @?/sqlplus/admin/plustrce.sql 실행 후 GRANT PLUSTRACE TO SQLT; 하면 해소.
+
+$ sqlplus / as sysdba
+SYS@orcl> @?/sqlplus/admin/plustrce.sql
+SYS@orcl> GRANT PLUSTRACE TO SQLT;
+Grant succeeded.
+SYS@orcl> EXIT
+
+$ sqlplus sqlt/sqlt@orcl
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT * FROM claim_details FETCH FIRST 10 ROWS ONLY;
+
+Statistics
+----------------------------------------------------------
+   <환경값>  consistent gets
+   <환경값>  SQL*Net roundtrips to/from client
+-- (통계 리포트가 정상 출력됨)
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) arraysize 기본값(15)에서 대량 조회 통계를 캡처한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SHOW ARRAYSIZE
+arraysize 15
+
+SQLT@orcl> SELECT * FROM claim_details;      -- 약 90만 건 반환
+
+Statistics
+----------------------------------------------------------
+   <환경값>  consistent gets
+   <환경값>  SQL*Net roundtrips to/from client
+
+-- 해석: arraysize=15이면 한 번에 15행씩 가져오므로 왕복 횟수가 많다.
+--   왕복 = 대략 (반환 행 수 / arraysize) + 1 → 90만 / 15 ≈ 6만 회 수준.
+--   (실제 값은 환경마다 다르므로 <환경값>으로 표기)
+
+--------------------------------------------------------------------------------
+-- [3] (조치/조회) arraysize를 키워(1000) 같은 조회를 재실행한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SET ARRAYSIZE 1000
+SQLT@orcl> SELECT * FROM claim_details;      -- 동일 조회
+
+Statistics
+----------------------------------------------------------
+   <환경값>  consistent gets            -- [2]보다 감소
+   <환경값>  SQL*Net roundtrips to/from client  -- [2]보다 크게 감소
+
+-- 해석: arraysize=1000이면 왕복 = 90만 / 1000 ≈ 900회 수준으로 급감한다.
+--   왕복이 줄면 SQL*Net 대기가 줄고, 같은 블록을 여러 페치에 나눠 방문하며
+--   생기던 consistent gets(논리 읽기)도 함께 줄어든다.
+
+--------------------------------------------------------------------------------
+-- [4] (계산으로 대조) 10,000행 조회 기준 왕복 횟수 (행수/arraysize + 1)
+--------------------------------------------------------------------------------
+--   arraysize    1  → 약 10,001회 (한 행씩, 극단적 비효율)
+--   arraysize   15  → 약   667회 (SQL*Plus 기본)
+--   arraysize  100  → 약   101회 (6분의 1)
+--   arraysize 1000  → 약    11회
+-- (위 표는 측정값이 아니라 공식에 따른 산술 계산이다)
+
+--------------------------------------------------------------------------------
+-- [5] (결과 해석) 'SQL*Net 대기 = 네트워크 문제'라는 오해 교정.
+--------------------------------------------------------------------------------
+-- * 상위 대기에 SQL*Net message from client가 크게 보여도, 회선이 아니라
+--   arraysize가 작아 왕복을 과도하게 한 것이 원인일 수 있다.
+-- * 이때 해법은 회선 점검이 아니라 arraysize(페치 크기)를 키우는 것이다.
+-- * 단, 무한정 키우지 않는다: 값이 크면 페치 버퍼 메모리를 더 쓰고 OLTP
+--   첫 화면 응답이 늦어질 수 있다 → 배치·리포트는 크게, OLTP는 작게.
+
+--------------------------------------------------------------------------------
+-- [6] (되돌리기) 기본값으로 원복한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SET ARRAYSIZE 15
+SQLT@orcl> SET AUTOTRACE OFF
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) arraysize를 키우면 SQL*Net 왕복이 줄고 consistent gets도 줄어든다.
+-- 2) SQL*Net 대기가 크다고 곧 네트워크 문제가 아니다(왕복 과다가 원인일 수 있음).
+-- 3) 워크로드 성격에 맞춰 arraysize를 정한다(배치 크게, OLTP 작게).
+-- 4) autotrace 통계는 라이선스가 아니라 PLUSTRACE 롤만 있으면 된다.
+
+SQLT@orcl> EXIT
+================================================================================
