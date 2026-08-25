@@ -1,0 +1,189 @@
+================================================================================
+ 7장 실습 01 — 편중 컬럼 히스토그램 유무별 카디널리티 추정 차이
+ 목표: HOSP_ID(1~50 대형병원 집중) 컬럼에서 히스토그램이 있을 때와 없을 때
+       옵티마이저의 카디널리티 추정이 어떻게 달라지는지 확인한다.
+       균등 가정 300 vs 실제 3,100(약 10배)을 실행계획으로 대조한다.
+ 환경: non-CDB=orcl 19.3 (업무 계정 SQLT로 수행)
+ 주의: ★개인 실습 환경 전용★. HOSP_ID에는 이미 HYBRID(254버킷) 히스토그램이
+       있으므로, 이를 지웠다가 재수집하며 비교한 뒤 반드시 원복(재수집)한다.
+       통계 상태를 바꾸는 작업이니 실습 끝의 원복 절차를 생략하지 않는다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 균등 가정 추정치와 실제 건수를 먼저 수치로 확보한다.
+--     히스토그램이 없다면 옵티마이저는 num_rows/NDV로 추정한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN est_per_value FORMAT 999,999
+SQLT@orcl> SELECT num_rows,
+  2         (SELECT num_distinct FROM user_tab_col_statistics
+  3           WHERE table_name='MEDICAL_CLAIMS' AND column_name='HOSP_ID') ndv,
+  4         ROUND(num_rows /
+  5           (SELECT num_distinct FROM user_tab_col_statistics
+  6             WHERE table_name='MEDICAL_CLAIMS' AND column_name='HOSP_ID'))
+  7           AS est_per_value
+  8       FROM user_tables WHERE table_name='MEDICAL_CLAIMS';
+
+  NUM_ROWS        NDV EST_PER_VALUE
+---------- ---------- -------------
+    300000       1000           300
+
+SQLT@orcl> -- 실제 대형병원(HOSP_ID=36)의 청구 건수를 센다.
+SQLT@orcl> SELECT COUNT(*) actual_rows FROM medical_claims WHERE hosp_id=36;
+
+ACTUAL_ROWS
+-----------
+       3100
+
+-- 해석: 균등 가정 추정 300건, 실제 3,100건. 약 10배 차이다.
+--   옵티마이저가 300건으로 오판하면 3,100건을 반환하는 조건에 인덱스 스캔을
+--   골라 3,100번의 랜덤 액세스를 하게 되어 전체 스캔보다 느려질 수 있다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) HOSP_ID의 현재 히스토그램을 확인한다. (Before 보존용)
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN column_name FORMAT A12
+SQLT@orcl> SELECT column_name, num_distinct, histogram, num_buckets,
+  2         TO_CHAR(last_analyzed,'YYYY-MM-DD HH24:MI') last_analyzed
+  3       FROM user_tab_col_statistics
+  4       WHERE table_name='MEDICAL_CLAIMS' AND column_name='HOSP_ID';
+
+COLUMN_NAME  NUM_DISTINCT HISTOGRAM  NUM_BUCKETS LAST_ANALYZED
+------------ ------------ ---------- ----------- ----------------
+HOSP_ID              1000 HYBRID             254 <환경값>
+
+-- 해석: 지금은 HYBRID 254버킷이 있다. 즉 옵티마이저는 이미 편중을 안다.
+--   이 값이 Before 상태이며, 실습 끝에 이 상태로 원복해야 한다.
+
+--------------------------------------------------------------------------------
+-- [3] (히스토그램 있음) 실행계획의 카디널리티 추정(E-Rows)을 본다.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims WHERE hosp_id=36;
+
+Explained.
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'BASIC ROWS'));
+
+-------------------------------------------------------------------
+| Id  | Operation         | Name           | Rows  |
+-------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |  3100 |
+|   1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS |  3100 |
+-------------------------------------------------------------------
+
+-- 해석: 히스토그램이 있으니 E-Rows가 3,100으로 실제와 거의 일치한다.
+--   추정이 정확하므로 옵티마이저의 접근 경로 선택이 신뢰할 만하다.
+
+--------------------------------------------------------------------------------
+-- [4] (조치) 히스토그램을 지운다. DELETE_COLUMN_STATS로 HOSP_ID 통계 제거.
+--     ※ 통계 상태를 바꾸는 작업 — 실습 후 원복 필수.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXEC DBMS_STATS.DELETE_COLUMN_STATS(USER,'MEDICAL_CLAIMS','HOSP_ID');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> -- 재확인: 히스토그램이 사라졌는지 본다.
+SQLT@orcl> SELECT column_name, num_distinct, histogram, num_buckets
+  2       FROM user_tab_col_statistics
+  3       WHERE table_name='MEDICAL_CLAIMS' AND column_name='HOSP_ID';
+
+COLUMN_NAME  NUM_DISTINCT HISTOGRAM  NUM_BUCKETS
+------------ ------------ ---------- -----------
+HOSP_ID                            NONE            0
+
+-- 해석: HISTOGRAM=NONE, num_distinct까지 비었다. DELETE_COLUMN_STATS는
+--   컬럼 통계 전체(기본 통계+히스토그램)를 지운다. 이제 옵티마이저는
+--   이 컬럼의 편중은 물론 NDV도 모른다.
+
+--------------------------------------------------------------------------------
+-- [5] (히스토그램 없음) 같은 쿼리의 E-Rows가 어떻게 바뀌는지 본다.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims WHERE hosp_id=36;
+
+Explained.
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'BASIC ROWS'));
+
+-------------------------------------------------------------------
+| Id  | Operation         | Name           | Rows  |
+-------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |   300 |
+|   1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS |   300 |
+-------------------------------------------------------------------
+
+-- 해석(핵심 대조): 히스토그램을 지우자 E-Rows가 300으로 떨어졌다.
+--   이것이 균등 가정(num_rows/NDV 방식) 추정치다. 실제 3,100의 1/10.
+--   편중 컬럼에서 히스토그램이 없으면 옵티마이저가 10배 과소추정함을 확인.
+
+--------------------------------------------------------------------------------
+-- [6] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 인덱스가 있었다면 300 추정 탓에 잘못된 인덱스 스캔을
+--       택했을 것이다. 실제 실행의 A-Rows와 추정 E-Rows를 대조해 확인한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*)
+  2       FROM medical_claims WHERE hosp_id=36;
+
+  COUNT(*)
+----------
+      3100
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(
+  2       FORMAT=>'ALLSTATS LAST'));
+
+------------------------------------------------------------------------
+| Id  | Operation          | Name           | E-Rows | A-Rows |
+------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                |        |      1 |
+|   1 |  SORT AGGREGATE    |                |      1 |      1 |
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |    300 |   3100 |
+------------------------------------------------------------------------
+
+-- 이상 징후: E-Rows 300 vs A-Rows 3100 — 추정이 실제의 1/10로 어긋난다.
+-- 원인: HOSP_ID 히스토그램(및 컬럼 통계) 부재로 균등 가정이 적용됐다.
+-- 조치: 통계를 재수집해 히스토그램을 복원한다(원복 겸 교정).
+SQLT@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'MEDICAL_CLAIMS', -
+>            method_opt=>'FOR ALL COLUMNS SIZE AUTO', cascade=>TRUE);
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> -- 재확인: 히스토그램이 HYBRID 254버킷으로 되돌아왔는지 본다.
+SQLT@orcl> SELECT column_name, num_distinct, histogram, num_buckets
+  2       FROM user_tab_col_statistics
+  3       WHERE table_name='MEDICAL_CLAIMS' AND column_name='HOSP_ID';
+
+COLUMN_NAME  NUM_DISTINCT HISTOGRAM  NUM_BUCKETS
+------------ ------------ ---------- -----------
+HOSP_ID              1000 HYBRID             254
+
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims WHERE hosp_id=36;
+Explained.
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'BASIC ROWS'));
+
+-------------------------------------------------------------------
+| Id  | Operation         | Name           | Rows  |
+-------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |  3100 |
+|   1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS |  3100 |
+-------------------------------------------------------------------
+
+-- 재확인 완료: E-Rows가 다시 3,100으로 회복됐다. Before 상태로 원복됨.
+--   (last_analyzed는 재수집으로 현재 시각이 되므로 <환경값>이다.)
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 균등 가정 추정 = num_rows/NDV = 300000/1000 = 300건.
+-- 2) 실제 HOSP_ID=36 = 3,100건 → 히스토그램 없으면 약 10배 과소추정.
+-- 3) 히스토그램 있음 E-Rows=3100, 없음 E-Rows=300으로 실행계획에서 확인.
+-- 4) DELETE_COLUMN_STATS로 지우고 GATHER_TABLE_STATS로 재수집·원복.
+-- ※ 원복 완료: HOSP_ID는 다시 HYBRID 254버킷. 이후 챕터 실습에 영향 없음.
+
+SQLT@orcl> EXIT
+================================================================================

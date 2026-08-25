@@ -1,0 +1,144 @@
+================================================================================
+ 10장 실습 03 — 특정 10분 구간의 상위 세션·SQL·대기 이벤트 도출
+ 목표: 부하 구간을 잘라 상위 대기 이벤트(ON CPU 90.7%), 상위 SQL, 상위 세션을
+       직접 조회로 도출한다. 대기 목록만 보고 log file sync를 병목으로 지목하는
+       오판을 재현하고, SESSION_STATE 기준으로 교정한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 라이선스: 🔒 Diagnostics Pack 필요. 미보유 시 대안은 실습 후반 [6] 참조.
+ 전제: 8·9장과 같은 공용 부하가 걸린 직후의 구간을 분석한다.
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 상위 대기 이벤트 — ON CPU를 포함해 순위를 매긴다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS samples,
+  2         ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS pct
+  3       FROM  v$active_session_history
+  4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
+  5       GROUP BY NVL(event,'ON CPU') ORDER BY samples DESC;
+
+EVENT                              SAMPLES   PCT
+--------------------------------- -------- -----
+ON CPU                                 529  90.7
+log file sync                           17   2.9
+log file parallel write                 14   2.4
+db file sequential read                 10   1.7
+kksfbc child completion                  6   1.0
+latch: shared pool                       1   0.2
+db file scattered read                   1   0.2
+cursor: pin S wait on X                  1   0.2
+
+-- 해석: 활성 시간의 90.7%가 ON CPU. 세션들이 기다린 게 아니라 CPU를 태웠다.
+--   이것이 이 구간의 성격을 규정한다(CPU 지배형).
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 신입 DBA가 대기 이벤트만 훑고 "1위 대기 log file sync가
+--       병목"이라며 커밋을 줄이자고 제안한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: SESSION_STATE로 나눠 본다. 대기와 CPU를 구분해야 한다.
+SYS@orcl> SELECT session_state, COUNT(*) AS samples,
+  2         ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS pct
+  3       FROM  v$active_session_history
+  4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
+  5       GROUP BY session_state;
+
+SESSION_STATE   SAMPLES   PCT
+--------------- -------- -----
+ON CPU               529  90.7
+WAITING               54   9.3
+
+-- 원인 확정: 대기(WAITING)는 전부 합쳐도 9.3%다. log file sync는 그 안의
+--   2.9%에 불과하다. 병목은 '기다림'이 아니라 'CPU 소비'다.
+-- 조치: 커밋을 줄이는 방향이 아니라, CPU를 태우는 상위 SQL을 찾아야 한다.
+
+SYS@orcl> -- 재확인: 상위 SQL_ID를 도출해 CPU를 실제로 태운 문장을 지목한다.
+SYS@orcl> SELECT sql_id, COUNT(*) AS samples,
+  2         ROUND(100*RATIO_TO_REPORT(COUNT(*)) OVER (),1) AS pct
+  3       FROM  v$active_session_history
+  4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
+  5         AND sql_id IS NOT NULL
+  6       GROUP BY sql_id ORDER BY samples DESC FETCH FIRST 6 ROWS ONLY;
+
+SQL_ID          SAMPLES   PCT
+------------- --------- -----
+9vmszgd1ft9x0       186  52.1
+43fd4b2pxfzvm       154  43.1
+b2137zvr4j20n         2   0.6
+4x06v8tdxd92z         2   0.6
+07bcfwj32kctq         2   0.6
+50kad7809jyj8         2   0.6
+
+-- 재확인 완료: 상위 두 SQL(9vmszgd1ft9x0, 43fd4b2pxfzvm)이 SQL 샘플의 대부분.
+--   이 둘이 CPU를 태운 주범이다. 커밋이 아니라 이 SQL을 튜닝 대상으로 삼는다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 상위 세션 — 어느 세션이 활성 시간을 많이 썼나.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT session_id, COUNT(*) AS samples
+  2       FROM  v$active_session_history
+  3       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
+  4       GROUP BY session_id ORDER BY samples DESC FETCH FIRST 5 ROWS ONLY;
+
+SESSION_ID   SAMPLES
+---------- ----------
+        45        128
+        52        121
+        48         99
+        60         92
+        57         88
+
+-- 해석: 상위 세션들이 고르게 부하를 나눠 가졌다(7세션 종합 부하와 정합적).
+--   특정 세션 하나로 쏠리지 않았다 → 단일 세션 폭주가 아니라 워크로드 자체.
+
+--------------------------------------------------------------------------------
+-- [4] (조회) 상위 SQL의 횟수·비용은 V$SQL로 보강(시간 vs 횟수 분리).
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sql_id, executions, buffer_gets
+  2       FROM  v$sql
+  3       WHERE sql_id IN ('9vmszgd1ft9x0','43fd4b2pxfzvm');
+
+SQL_ID          EXECUTIONS  BUFFER_GETS
+------------- ----------- ------------
+9vmszgd1ft9x0        <환경값>     <환경값>
+43fd4b2pxfzvm        <환경값>     <환경값>
+
+-- 해석: executions·buffer_gets는 누적값이라 환경마다 다르다(<환경값>).
+--   ASH가 '시간으로 지목한' SQL을 V$SQL이 '횟수·비용으로' 뒷받침한다.
+
+--------------------------------------------------------------------------------
+-- [5] (정리)
+--------------------------------------------------------------------------------
+-- 1) 상위 대기 도출 시 ON CPU를 반드시 포함해 순위를 매긴다.
+-- 2) 대기 목록만 보고 병목을 지목하면 오판한다 → SESSION_STATE로 먼저 가른다.
+-- 3) ON CPU 90.7% = CPU 지배형 → 상위 SQL을 찾는 것이 정답.
+-- 4) ASH(시간)와 V$SQL(횟수)을 겹쳐 읽어 튜닝 방향을 정한다.
+
+--------------------------------------------------------------------------------
+-- [6] (라이선스 대안 경로) V$SESSION 폴링 적재로 같은 상위 도출.
+--------------------------------------------------------------------------------
+SYS@orcl> -- Diagnostics Pack이 없으면, 아래를 주기적으로 적재한 테이블에서
+SYS@orcl> -- 같은 GROUP BY로 상위 이벤트·SQL·세션을 뽑는다. 원리는 동일.
+SYS@orcl> SELECT NVL(event,'ON CPU') AS event, sql_id, COUNT(*) AS active_now
+  2       FROM  v$session
+  3       WHERE status='ACTIVE' AND wait_class<>'Idle'
+  4       GROUP BY NVL(event,'ON CPU'), sql_id
+  5       ORDER BY active_now DESC FETCH FIRST 3 ROWS ONLY;
+
+EVENT                     SQL_ID          ACTIVE_NOW
+------------------------- ------------- ----------
+ON CPU                    9vmszgd1ft9x0          3
+ON CPU                    43fd4b2pxfzvm          2
+log file sync             50kad7809jyj8          1
+
+-- 대안 해석: 순간값이라 표본이 작지만, 상위가 같은 SQL을 가리킨다. 폴링을
+--   촘촘히·오래 적재할수록 ASH에 가까워진다(자동화·정밀도만 다르다).
+
+SYS@orcl> EXIT
+================================================================================

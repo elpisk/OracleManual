@@ -1,0 +1,138 @@
+================================================================================
+ 6장 실습 01 — AWR 스냅샷 주기·보존 확인과 변경
+ 목표: DBA_HIST_WR_CONTROL로 현재 스냅샷 주기·보존을 확인하고,
+       DBMS_WORKLOAD_REPOSITORY.MODIFY_SNAPSHOT_SETTINGS로 변경한 뒤 원복한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 라이선스 주의(🔒): AWR·DBMS_WORKLOAD_REPOSITORY는 Diagnostics Pack 필요.
+       미보유 시 이 실습 대신 Statspack(실습 06)·V$ 델타로 대체한다.
+ 주의: 개인 실습 환경 전용. 설정을 잠시 바꾸므로 반드시 원복한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [0] (전제 확인) AWR이 켜져 있는가 — 두 파라미터부터 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SHOW PARAMETER statistics_level
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+statistics_level                     string      TYPICAL
+
+SYS@orcl> SHOW PARAMETER control_management_pack_access
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+control_management_pack_access       string      DIAGNOSTIC+TUNING
+
+-- 해석: STATISTICS_LEVEL=TYPICAL, PACK_ACCESS=DIAGNOSTIC+TUNING.
+--   두 조건이 만족되어야 AWR 자동 수집과 이 실습의 프로시저가 동작한다.
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 현재 주기·보존·topnsql을 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT snap_interval, retention, topnsql
+  2       FROM  dba_hist_wr_control;
+
+SNAP_INTERVAL         RETENTION             TOPNSQL
+--------------------  --------------------  ----------
++00000 01:00:00.0     +00008 00:00:00.0     DEFAULT
+
+-- 해석: +00000 01:00:00.0 = 60분 주기, +00008 00:00:00.0 = 8일 보존.
+--   이 환경은 기본값 그대로다. (조회는 인터벌 형식, 변경은 분 단위)
+
+--------------------------------------------------------------------------------
+-- [2] (조치) 보존만 30일(43200분)로 늘려 본다. 주기·topnsql은 그대로 둔다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.MODIFY_SNAPSHOT_SETTINGS(
+  3        retention => 43200);   -- 분 단위. 30일. 다른 인자는 생략(불변)
+  4  END;
+  5  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT snap_interval, retention FROM dba_hist_wr_control;
+
+SNAP_INTERVAL         RETENTION
+--------------------  --------------------
++00000 01:00:00.0     +00030 00:00:00.0
+
+-- 결과: 보존이 +00030(30일)로 바뀌었고, 주기는 60분 그대로다.
+--   인자는 필요한 것만 넘길 수 있음을 확인했다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: "이동 윈도우를 60일로 키우자"며 아래를 실행하니 오류가 난다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.MODIFY_BASELINE_WINDOW_SIZE(window_size => 60);
+  3  END;
+  4  /
+BEGIN
+*
+ERROR at line 1:
+ORA-13541: system moving window baseline size (5184000) greater than retention
+          (2592000)
+ORA-06512: at "SYS.DBMS_WORKLOAD_REPOSITORY", line ...
+
+SYS@orcl> -- 원인 파악: 이동 윈도우 크기는 보존 기간을 넘을 수 없다.
+SYS@orcl> --   지금 보존은 30일(2,592,000초)인데 윈도우를 60일로 요청해 초과됐다.
+SYS@orcl> -- 조치: 윈도우를 키우려면 보존부터 60일 이상으로 늘려야 한다.
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.MODIFY_SNAPSHOT_SETTINGS(retention => 86400); -- 60일
+  3  END;
+  4  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.MODIFY_BASELINE_WINDOW_SIZE(window_size => 60);
+  3  END;
+  4  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 재확인: 보존을 먼저 늘리니 윈도우 60일 설정이 성공했다.
+SYS@orcl> SELECT moving_window_size FROM dba_hist_baseline
+  2       WHERE baseline_name = 'SYSTEM_MOVING_WINDOW';
+
+MOVING_WINDOW_SIZE
+------------------
+                60
+
+--------------------------------------------------------------------------------
+-- [4] (조치 후 상태 → 원복 → 재확인) 학습 환경이므로 기본값으로 되돌린다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.MODIFY_BASELINE_WINDOW_SIZE(window_size => 8);
+  3    DBMS_WORKLOAD_REPOSITORY.MODIFY_SNAPSHOT_SETTINGS(
+  4        retention => 11520,    -- 8일
+  5        interval  => 60);      -- 60분
+  6  END;
+  7  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT snap_interval, retention FROM dba_hist_wr_control;
+
+SNAP_INTERVAL         RETENTION
+--------------------  --------------------
++00000 01:00:00.0     +00008 00:00:00.0
+
+-- 재확인: 주기 60분·보존 8일로 원복 완료. 이동 윈도우도 8일로 되돌렸다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 현재 설정은 DBA_HIST_WR_CONTROL로 본다(조회=인터벌 형식).
+-- 2) 변경은 MODIFY_SNAPSHOT_SETTINGS(retention/interval/topnsql, 분 단위).
+--    필요한 인자만 넘길 수 있고, 변경 후 반드시 재조회로 확인한다.
+-- 3) 이동 윈도우 크기 ≤ 보존 기간. 윈도우를 키우려면 보존부터 늘린다.
+-- 4) 실측 기본값: 60분 주기 · 8일 보존. 학습 후 반드시 원복한다.
+-- 5) 라이선스 미보유 시: 이 설정은 존재하지 않으며 Statspack(실습 06)으로 대체.
+
+SYS@orcl> EXIT
+================================================================================

@@ -1,0 +1,122 @@
+================================================================================
+ 9장 실습 04 — ADDM 뷰 직접 조회 (DBA_ADDM_FINDINGS, DBA_ADVISOR_*)  🔒
+ 목표: 텍스트 보고서 대신 딕셔너리 뷰로 Finding·Recommendation·Action·Rationale을
+       직접 조회한다. 잘못된 task_name으로 0건이 나오는 이상을 재현·교정하고,
+       라이선스 없이 같은 병목을 보는 V$ 대안 경로를 실행한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA). 단일 인스턴스.
+ 참조: 실습 01의 태스크 TUNING_CH9_ADDM_296 (스냅샷 295~296)
+ 라이선스: 🔒 DBA_ADVISOR_*·DBA_ADDM_* 조회도 Diagnostics Pack 필요.
+ 주의: 개인 실습 환경 전용.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200 PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 최근 ADDM 태스크 목록을 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT task_name, status
+  2       FROM dba_advisor_tasks
+  3       WHERE advisor_name='ADDM'
+  4       ORDER BY created DESC FETCH FIRST 5 ROWS ONLY;
+
+TASK_NAME                 STATUS
+------------------------- -----------
+TUNING_CH9_ADDM_296       COMPLETED
+ADDM:1767674490_1_296     COMPLETED     -- (스냅샷 296 자동 생성 결과)
+ADDM:1767674490_1_295     COMPLETED
+
+-- TUNING_CH9_ADDM_296 이 실습 01에서 만든 수동 태스크다.
+-- ADDM:... 형태는 스냅샷마다 자동 생성된 결과다(손대지 않는다).
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 재현) task_name 철자를 틀려 0건이 나온다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT finding_name, type
+  2       FROM dba_advisor_findings f JOIN dba_advisor_tasks t USING (task_id)
+  3       WHERE t.task_name='TUNING_CH9_ADDM_269';   -- 296을 269로 오타
+
+선택된 레코드가 없습니다.
+
+--    → 이상: Finding이 하나도 없다? ADDM이 실패한 걸까?
+--    → 원인: task_name을 '...269'로 잘못 적었다. 그런 태스크가 없어 0건이다.
+--    → 조치: [1]에서 확인한 정확한 이름('...296')으로 다시 조회한다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치) 올바른 task_name으로 Finding을 영향도 순으로 조회한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT f.finding_name, f.type,
+  2         ROUND(f.impact/1000000,2) AS impact_sec
+  3       FROM dba_advisor_findings f JOIN dba_advisor_tasks t USING (task_id)
+  4       WHERE t.task_name='TUNING_CH9_ADDM_296'
+  5       ORDER BY f.impact DESC;
+
+FINDING_NAME                     TYPE         IMPACT_SEC
+-------------------------------- ------------ ----------
+Top SQL Statements               PROBLEM          348.72
+Hard Parse                       SYMPTOM           35.28
+Hard Parse Due to Literal Usage  PROBLEM           33.38
+Commits and Rollbacks            PROBLEM           21.15
+Commits and Rollbacks            SYMPTOM           21.15
+Soft Parse                       PROBLEM           13.65
+normal, successful completion    INFORMATION            0
+
+--------------------------------------------------------------------------------
+-- [4] DBA_ADDM_FINDINGS로 ADDM Finding만 추린다(부분집합).
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT finding_name, type
+  2       FROM dba_addm_findings
+  3       WHERE task_name='TUNING_CH9_ADDM_296'
+  4       ORDER BY finding_name;
+
+FINDING_NAME                     TYPE
+-------------------------------- ------------
+Commits and Rollbacks            PROBLEM
+Hard Parse                       SYMPTOM
+Hard Parse Due to Literal Usage  PROBLEM
+Soft Parse                       PROBLEM
+Top SQL Statements               PROBLEM
+
+--------------------------------------------------------------------------------
+-- [5] 권고와 그 근거를 연결해 본다(RANK·BENEFIT / Action / Rationale).
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT r.rank, ROUND(r.benefit/1000000,2) benefit_sec,
+  2         a.message AS action
+  3       FROM dba_advisor_recommendations r
+  4       JOIN dba_advisor_tasks t USING (task_id)
+  5       JOIN dba_advisor_actions  a ON a.task_id=r.task_id AND a.rec_id=r.rec_id
+  6       WHERE t.task_name='TUNING_CH9_ADDM_296'
+  7       ORDER BY r.rank FETCH FIRST 3 ROWS ONLY;
+
+      RANK BENEFIT_SEC ACTION
+---------- ----------- --------------------------------------------------
+         1      180.06 Run SQL Tuning Advisor on SQL_ID "9vmszgd1ft9x0"
+         1      168.81 Run SQL Tuning Advisor on the second high-load SQL
+         2       19.20 Consider bind variables / cursor_sharing for literals
+
+-- 해석: RANK가 낮을수록(=1) 먼저 검토할 권고다. BENEFIT은 전체 DB Time 기준
+--       기대 이득이다. RANK 1의 두 권고 이득(180.06+168.81≈348.9초)이 Top SQL
+--       Finding 영향도(348.72초)와 사실상 일치한다 → 둘 다 처리 대상.
+
+--------------------------------------------------------------------------------
+-- [6] (재확인) 정리 — 실습용 수동 태스크는 남겨 실습 05에서 계속 쓴다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) findings
+  2       FROM dba_advisor_findings f JOIN dba_advisor_tasks t USING (task_id)
+  3       WHERE t.task_name='TUNING_CH9_ADDM_296';
+
+  FINDINGS
+----------
+         7
+
+================================================================================
+ 라이선스 없이 같은 것을 보는 대안 경로 (Diagnostics Pack 미보유 시)
+ - DBA_ADVISOR_*·DBA_ADDM_* 조회 자체가 불가하다. V$로 손수 재구성한다.
+   · Top SQL   : SELECT sql_id, elapsed_time, buffer_gets, executions FROM v$sql
+                 ORDER BY elapsed_time DESC;
+   · 하드 파싱 : V$SYSSTAT의 parse count(hard)/parse count(total) 델타, V$LIBRARYCACHE
+   · 커밋 부하 : V$SYSSTAT의 user commits 델타, V$SYSTEM_EVENT의 log file sync
+ - 구간 요약 보고서가 필요하면 6장의 Statspack(spreport.sql)을 쓴다.
+ 판정 기준은 ADDM과 동일: DB Time 비중이 큰 것부터. (수치는 <환경값>)
+================================================================================

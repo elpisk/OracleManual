@@ -1,0 +1,147 @@
+================================================================================
+ 7장 실습 02 — METHOD_OPT 지정 방식별 히스토그램 생성 결과 비교
+ 목표: METHOD_OPT의 SIZE 1 / SIZE 254 / FOR ALL COLUMNS SIZE AUTO + FOR COLUMNS
+       지정에 따라 HOSP_ID의 히스토그램이 어떻게 달라지는지 확인한다.
+ 환경: non-CDB=orcl 19.3 (업무 계정 SQLT로 수행)
+ 주의: ★개인 실습 환경 전용★. GATHER로 히스토그램을 반복 변경하므로,
+       실습 끝에 기본값(FOR ALL COLUMNS SIZE AUTO)으로 재수집해 원복한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+SQLT@orcl> COLUMN column_name FORMAT A12
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 현재 METHOD_OPT Preference와 HOSP_ID 히스토그램 확인.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT DBMS_STATS.GET_PREFS('METHOD_OPT',USER,'MEDICAL_CLAIMS')
+  2       AS method_opt FROM dual;
+
+METHOD_OPT
+--------------------------------------------------
+FOR ALL COLUMNS SIZE AUTO
+
+SQLT@orcl> SELECT column_name, histogram, num_buckets
+  2       FROM user_tab_col_statistics
+  3       WHERE table_name='MEDICAL_CLAIMS' AND column_name='HOSP_ID';
+
+COLUMN_NAME  HISTOGRAM  NUM_BUCKETS
+------------ ---------- -----------
+HOSP_ID      HYBRID             254
+
+-- 해석: 기본 정책은 SIZE AUTO이고, 현재 HOSP_ID는 HYBRID 254버킷이다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 A) SIZE 1 — HOSP_ID 히스토그램을 사실상 제거한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'MEDICAL_CLAIMS', -
+>            method_opt=>'FOR COLUMNS SIZE 1 HOSP_ID');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> SELECT column_name, num_distinct, histogram, num_buckets
+  2       FROM user_tab_col_statistics
+  3       WHERE table_name='MEDICAL_CLAIMS' AND column_name='HOSP_ID';
+
+COLUMN_NAME  NUM_DISTINCT HISTOGRAM  NUM_BUCKETS
+------------ ------------ ---------- -----------
+HOSP_ID              1000 NONE                 1
+
+-- 해석: SIZE 1은 버킷 1개 = 히스토그램 없음. num_distinct(1000)는 유지되지만
+--   값별 분포 정보는 사라져, 옵티마이저는 균등 가정(300)으로 되돌아간다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 B) SIZE 254 — HOSP_ID에 254버킷 히스토그램을 강제 생성.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'MEDICAL_CLAIMS', -
+>            method_opt=>'FOR COLUMNS SIZE 254 HOSP_ID');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> SELECT column_name, histogram, num_buckets
+  2       FROM user_tab_col_statistics
+  3       WHERE table_name='MEDICAL_CLAIMS' AND column_name='HOSP_ID';
+
+COLUMN_NAME  HISTOGRAM  NUM_BUCKETS
+------------ ---------- -----------
+HOSP_ID      HYBRID             254
+
+-- 해석: 254버킷 HYBRID가 생성됐다. NDV(1000)가 254를 넘으므로 FREQUENCY가
+--   아니라 HYBRID가 만들어진다. 값을 254로 줘도 종류는 데이터가 결정한다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: [3]에서 HOSP_ID만 지정했더니, 다른 컬럼 히스토그램은
+--       이번 호출에서 갱신되지 않았을까? FOR COLUMNS만 준 영향을 확인한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT column_name, histogram, num_buckets,
+  2         TO_CHAR(last_analyzed,'HH24:MI:SS') t
+  3       FROM user_tab_col_statistics
+  4       WHERE table_name='MEDICAL_CLAIMS'
+  5         AND column_name IN ('HOSP_ID','TOTAL_AMT','CLAIM_TYPE')
+  6       ORDER BY column_name;
+
+COLUMN_NAME  HISTOGRAM  NUM_BUCKETS T
+------------ ---------- ----------- --------
+CLAIM_TYPE   FREQUENCY            2 <환경값>
+HOSP_ID      HYBRID             254 <환경값>
+TOTAL_AMT    HYBRID             254 <환경값>
+
+-- 이상 징후: 'FOR COLUMNS SIZE 254 HOSP_ID'만 주면 지정 컬럼 위주로 처리되어,
+--   전체 컬럼의 히스토그램 정책 일관성이 흔들릴 수 있다(원치 않는 편차).
+-- 원인: FOR COLUMNS 절만 주면 그 컬럼에 집중하고, 나머지의 자동 판단이
+--   함께 유지된다는 보장을 명시하지 않은 호출이었다.
+-- 조치: 전체 기본(AUTO)과 특정 컬럼 보완을 함께 지정한다.
+SQLT@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'MEDICAL_CLAIMS', -
+>            method_opt=>'FOR ALL COLUMNS SIZE AUTO FOR COLUMNS SIZE 254 HOSP_ID');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> -- 재확인: 앞 절(AUTO)이 전체 기본을, 뒤 절이 HOSP_ID 예외를 지정.
+SQLT@orcl> SELECT column_name, histogram, num_buckets
+  2       FROM user_tab_col_statistics
+  3       WHERE table_name='MEDICAL_CLAIMS'
+  4         AND column_name IN ('HOSP_ID','TOTAL_AMT','PAT_ID','VISIT_DATE')
+  5       ORDER BY column_name;
+
+COLUMN_NAME  HISTOGRAM  NUM_BUCKETS
+------------ ---------- -----------
+HOSP_ID      HYBRID             254
+PAT_ID       NONE                 1
+TOTAL_AMT    HYBRID             254
+VISIT_DATE   NONE                 1
+
+-- 재확인 완료: HOSP_ID·TOTAL_AMT는 HYBRID, 사용 이력 없는 PAT_ID·VISIT_DATE는
+--   AUTO 판단대로 NONE. 앞 절(AUTO)+뒤 절(FOR COLUMNS)의 조합이 의도대로 동작.
+
+--------------------------------------------------------------------------------
+-- [5] (조치) 실습 원복 — 기본 정책(SIZE AUTO)으로 재수집한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'MEDICAL_CLAIMS', -
+>            method_opt=>'FOR ALL COLUMNS SIZE AUTO', cascade=>TRUE);
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> SELECT column_name, histogram, num_buckets
+  2       FROM user_tab_col_statistics
+  3       WHERE table_name='MEDICAL_CLAIMS' AND column_name='HOSP_ID';
+
+COLUMN_NAME  HISTOGRAM  NUM_BUCKETS
+------------ ---------- -----------
+HOSP_ID      HYBRID             254
+
+-- 재확인: Before 상태(HYBRID 254)로 원복됨.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) SIZE 1 → 히스토그램 제거(NONE, 버킷 1), 균등 가정으로 회귀.
+-- 2) SIZE 254 → 254버킷 생성. 종류(HYBRID/FREQUENCY)는 데이터가 결정.
+-- 3) 'FOR ALL COLUMNS SIZE AUTO FOR COLUMNS ...' → 전체 기본+특정 컬럼 보완.
+-- 4) FOR COLUMNS만 주면 전체 정책 일관성이 흔들릴 수 있어 AUTO 절과 병행.
+-- ※ 원복 완료: 기본 SIZE AUTO로 재수집. 이후 챕터 실습에 영향 없음.
+
+SQLT@orcl> EXIT
+================================================================================

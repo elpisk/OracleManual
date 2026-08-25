@@ -1,0 +1,146 @@
+================================================================================
+ 7장 실습 03 — 컬럼 그룹 확장 통계 생성 (상관 컬럼의 추정 개선)
+ 목표: CLAIM_TYPE·DEPT_CODE가 상관될 때 옵티마이저의 독립 가정(선택도 곱셈)이
+       어긋나는 것을 확인하고, 컬럼 그룹 확장 통계로 추정을 개선한다.
+ 환경: non-CDB=orcl 19.3 (업무 계정 SQLT로 수행)
+ 주의: ★개인 실습 환경 전용★. 확장 통계를 생성·재수집하므로, 실습 끝에
+       DROP_EXTENDED_STATS로 제거하고 기본 정책으로 재수집해 원복한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 두 컬럼의 분포를 확인한다. 상관 후보인지 본다.
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN claim_type FORMAT A10
+SQLT@orcl> SELECT claim_type, COUNT(DISTINCT dept_code) depts, COUNT(*) cnt
+  2       FROM medical_claims
+  3       GROUP BY claim_type ORDER BY cnt DESC;
+
+CLAIM_TYPE      DEPTS        CNT
+---------- ---------- ----------
+외래                9     240489
+입원                9      59511
+
+-- 해석: CLAIM_TYPE은 외래 240,489 / 입원 59,511, 각 9개 진료과에 걸쳐 있다.
+--   두 컬럼이 상관되면 'claim_type=? AND dept_code=?'의 곱셈 추정이 어긋난다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 확장 통계가 없는 상태의 조합 조건 E-Rows를 본다.
+--     한 진료과(예 D3)의 외래 청구 실제 건수와 추정치를 대조한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT COUNT(*) actual FROM medical_claims
+  2       WHERE claim_type='외래' AND dept_code='D3';
+
+    ACTUAL
+----------
+     <환경값>
+
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims
+  3       WHERE claim_type='외래' AND dept_code='D3';
+Explained.
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'BASIC ROWS'));
+
+-------------------------------------------------------------------
+| Id  | Operation         | Name           | Rows  |
+-------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                | <환경값>|
+|   1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS | <환경값>|
+-------------------------------------------------------------------
+
+-- 해석: 확장 통계가 없으면 E-Rows는 sel(claim_type)*sel(dept_code)의 곱으로
+--   계산된다. 두 컬럼이 상관되어 있으면 이 추정이 실제(actual)와 어긋난다.
+--   (구체적 행 수는 환경에 따라 다르므로 <환경값>으로 표기.)
+
+--------------------------------------------------------------------------------
+-- [3] (조치) 컬럼 그룹 확장 통계를 생성한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT DBMS_STATS.CREATE_EXTENDED_STATS(
+  2         USER,'MEDICAL_CLAIMS','(CLAIM_TYPE,DEPT_CODE)') AS ext_name
+  3       FROM dual;
+
+EXT_NAME
+--------------------------------------------------
+SYS_STU<환경값>
+
+-- 해석: 시스템 생성 이름(SYS_STU...)의 확장 통계가 정의됐다. 아직 값은 비어
+--   있다. 반드시 재수집해야 옵티마이저가 참조할 값이 채워진다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 확장 통계를 만들었는데도 조합 조건의 E-Rows가 그대로다.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims
+  3       WHERE claim_type='외래' AND dept_code='D3';
+Explained.
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'BASIC ROWS'));
+
+-- (E-Rows가 [2]와 동일 — 개선되지 않음)
+
+-- 이상 징후: E-Rows가 개선되지 않는다.
+-- 원인: CREATE_EXTENDED_STATS는 정의만 만들 뿐, 통계를 재수집하지 않으면
+--   확장 통계에 값이 채워지지 않아 옵티마이저가 참조할 것이 없다.
+-- 조치: 해당 컬럼 그룹을 포함해 통계를 재수집한다.
+SQLT@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'MEDICAL_CLAIMS', -
+>            method_opt=>'FOR ALL COLUMNS SIZE AUTO ' || -
+>                        'FOR COLUMNS (CLAIM_TYPE,DEPT_CODE) SIZE AUTO');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> -- 재확인: 확장 통계(가상 컬럼)에 통계가 채워졌는지 본다.
+SQLT@orcl> COLUMN extension FORMAT A40
+SQLT@orcl> SELECT extension_name, extension
+  2       FROM user_stat_extensions
+  3       WHERE table_name='MEDICAL_CLAIMS';
+
+EXTENSION_NAME             EXTENSION
+-------------------------- ----------------------------------------
+SYS_STU<환경값>            ("CLAIM_TYPE","DEPT_CODE")
+
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims
+  3       WHERE claim_type='외래' AND dept_code='D3';
+Explained.
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'BASIC ROWS'));
+
+-- 재확인: 이제 E-Rows가 조합의 실제 분포에 근거해 계산되어 actual에
+--   가까워진다(곱셈 오류 해소). 옵티마이저가 확장 통계를 참조한 것이다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치) 실습 원복 — 확장 통계를 제거하고 기본 정책으로 재수집한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXEC DBMS_STATS.DROP_EXTENDED_STATS(USER,'MEDICAL_CLAIMS', -
+>            '(CLAIM_TYPE,DEPT_CODE)');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'MEDICAL_CLAIMS', -
+>            method_opt=>'FOR ALL COLUMNS SIZE AUTO');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> SELECT COUNT(*) ext_cnt FROM user_stat_extensions
+  2       WHERE table_name='MEDICAL_CLAIMS';
+
+   EXT_CNT
+----------
+         0
+
+-- 재확인: 확장 통계가 제거됐고 기본 정책으로 재수집됨. Before 상태로 원복.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) CLAIM_TYPE(외래 240,489/입원 59,511) × DEPT_CODE(9종) 상관 후보.
+-- 2) 확장 통계 없으면 독립 가정 곱셈으로 조합 카디널리티가 어긋난다.
+-- 3) CREATE_EXTENDED_STATS는 정의만. 반드시 GATHER 재수집해야 값이 채워진다.
+-- 4) 재수집 후 E-Rows가 실제 분포에 가까워짐 → 곱셈 오류 해소.
+-- ※ 원복 완료: DROP_EXTENDED_STATS + 기본 재수집. 확장 통계 0개.
+
+SQLT@orcl> EXIT
+================================================================================

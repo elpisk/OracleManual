@@ -1,0 +1,110 @@
+================================================================================
+ 8장 실습 03 — Top 10 Foreground Events 판독 (상위 대기와 DB Time 비중 지목)
+ 목표: Top 10 Foreground Events를 % DB time 기준으로 읽어 병목을 지목한다.
+       'DB CPU가 1위'의 의미를 이해하고, log file sync를 주범으로 오판하는
+       상황을 재현·교정한다. 작은 Concurrency 대기들을 하드파싱 경합으로 묶는다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA)
+ 부하: WL_06_mixed.sql (7세션). 보고서 awrrpt_1_295_296.txt 사용.
+ 라이선스: 🔒 Diagnostics Pack. 미보유 시 V$SYSTEM_EVENT/V$SYSTEM_WAIT_CLASS 델타(하단).
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 보고서의 Top 10 Foreground Events를 발췌한다.
+--------------------------------------------------------------------------------
+SYS@orcl> HOST sed -n '95,108p' awrrpt_1_295_296.txt
+
+Top 10 Foreground Events by Total Wait Time
+                                           Total Wait       Avg   % DB Wait
+Event                                Waits Time (sec)      Wait   time Class
+------------------------------ ----------- ---------- --------- ------ --------
+DB CPU                                            549             95.7
+log file sync                       21,405       21.1     .99ms    3.7 Commit
+kksfbc child completion                130        6.4   49.58ms    1.1 Other
+db file sequential read              1,681        3.2    1.93ms     .6 User I/O
+cursor: pin S wait on X                609         .9    1.40ms     .1 Concurre
+library cache: mutex X                 180         .4    2.33ms     .1 Concurre
+latch: shared pool                   3,506         .3   91.94us     .1 Concurre
+SQL*Net message to client          125,937         .3    2.26us     .0 Network
+
+--------------------------------------------------------------------------------
+-- [2] (해석 1) 맨 윗줄부터 읽는다 — DB CPU 95.7%.
+--------------------------------------------------------------------------------
+-- DB CPU는 대기가 아니라 '실제로 쓴 CPU 시간'이다. % DB time 95.7%는 전체
+--   DB Time의 대부분이 CPU라는 뜻 → 이 구간의 병목은 어떤 대기도 아닌 CPU다.
+-- 실습 02의 Load Profile(DB CPU≈DB Time)이 여기서 확증된다.
+
+--------------------------------------------------------------------------------
+-- [3] (해석 2) 작은 대기들을 '방향'으로 묶는다.
+--------------------------------------------------------------------------------
+-- kksfbc child completion(1.1%) + cursor: pin S wait on X(.1%)
+--   + library cache: mutex X(.1%) + latch: shared pool(.1%)
+--   → 모두 공유 풀/라이브러리 캐시 커서 경합이다. 각각은 작지만 한 방향을
+--     가리킨다: 초당 319번의 하드 파싱(실습 02)이 만든 경합이다.
+-- Avg Wait도 본다: kksfbc는 49.58ms(드물지만 길다), log file sync는 0.99ms
+--   (짧지만 21,405회로 잦다). 총시간=횟수×평균 → 처방이 다르다.
+
+--------------------------------------------------------------------------------
+-- [4] (조회) 대기 클래스별 집계로 '경합(Concurrency)'의 크기를 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT wait_class, ROUND(SUM(time_waited_micro)/1e6,1) sec
+  2       FROM  v$system_event e JOIN v$event_name n USING (event)
+  3       WHERE wait_class IN ('Concurrency','Commit','User I/O')
+  4       GROUP BY wait_class ORDER BY sec DESC;
+
+WAIT_CLASS               SEC
+-------------------- --------
+Commit               <환경값>
+Concurrency          <환경값>
+User I/O             <환경값>
+
+-- 해석: V$SYSTEM_EVENT는 누적값이라 절대값은 <환경값>이다. 중요한 것은
+--   보고서의 % DB time 구조다 — Concurrency 대기들의 합조차 log file sync보다
+--   작지만, 그 원인(하드파싱)은 DB CPU를 끌어올린 리터럴 SQL과 같은 뿌리다.
+
+--------------------------------------------------------------------------------
+-- [5] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 동료가 "log file sync가 21.1초로 두 번째이니 커밋/리두를
+--       먼저 튜닝하자"고 주장한다.
+--------------------------------------------------------------------------------
+-- 원인 파악: Total Wait Time(sec)의 절대값에 현혹된 오판이다. 판정은
+--   % DB time으로 해야 한다.
+SYS@orcl> SELECT 3.7 AS lfs_pct_dbtime, 95.7 AS dbcpu_pct_dbtime,
+  2         ROUND(95.7/3.7,1) AS ratio FROM dual;
+
+LFS_PCT_DBTIME DBCPU_PCT_DBTIME  RATIO
+-------------- ---------------- ------
+           3.7             95.7   25.9
+
+-- 원인 확정: log file sync는 % DB time 3.7%뿐이고 DB CPU는 95.7%로 약 26배다.
+--   log file sync를 완전히 없애도 전체 DB Time의 3.7%만 줄어 응답시간은 거의
+--   그대로다. 커밋/리두 튜닝은 이 구간의 주범이 아니다.
+-- 조치: 우선순위를 CPU로 되돌린다 → 실습 04에서 CPU를 쓰는 상위 SQL을 찾는다.
+--   log file sync는 필요하면 커밋 빈도 조정으로 부차적으로 다룬다(14장).
+-- 재확인: DB CPU 95.7% >> log file sync 3.7% → 병목은 CPU. 판정 교정 완료.
+
+--------------------------------------------------------------------------------
+-- [대안 경로] 🔒 미보유 — V$로 Top Events를 델타로 만든다.
+--------------------------------------------------------------------------------
+-- 부하 전/후로 아래를 두 번 찍어 (후-전)으로 상위 대기를 정렬한다.
+--   SELECT event, total_waits, time_waited_micro, wait_class
+--     FROM v$system_event ORDER BY time_waited_micro DESC;
+-- DB CPU 상당량은 V$SYS_TIME_MODEL의 'DB CPU' 델타로 확인한다. 이렇게
+-- 만든 목록을 보고서 Top Events와 동일하게 % 기준으로 판독한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) Top Events는 % DB time으로 읽는다. 절대 Total 시간이 아니다.
+-- 2) DB CPU 95.7% = 병목은 대기가 아니라 CPU.
+-- 3) 작은 Concurrency 대기(kksfbc/cursor pin S/mutex/latch)는 하드파싱 경합으로
+--    묶어 하나의 원인으로 수렴시킨다.
+-- 4) log file sync 3.7%를 주범으로 지목하면 오판 → CPU 우선.
+-- 5) 라이선스 없으면 V$SYSTEM_EVENT 델타 + V$SYS_TIME_MODEL로 동일 판독.
+
+SYS@orcl> EXIT
+================================================================================

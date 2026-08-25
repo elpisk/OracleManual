@@ -1,0 +1,135 @@
+================================================================================
+ 9장 실습 01 — ADDM 태스크 실행과 보고서 생성 (addmrpt.sql / DBMS_ADDM)  🔒
+ 목표: 종합 부하 구간(스냅샷 295~296)에 대해 ADDM 태스크를 수동으로 만들어
+       실행하고, DBMS_ADDM.GET_REPORT와 addmrpt.sql로 텍스트 보고서를 낸다.
+       잘못된 스냅샷 번호로 실행했을 때의 오류를 재현하고 교정한다.
+ 환경: non-CDB=orcl 19.3 (진단은 SYS AS SYSDBA). 단일 인스턴스.
+ 참조: 부하는 공용 스크립트 부하스크립트\WL_06_mixed.sql (5·6·8·9·10·11장 공용)
+ 라이선스: 🔒 ADDM은 Diagnostics Pack 필요. 미보유 환경 대안은 실습 04·05 참조.
+ 주의: 개인 실습 환경 전용. 부하 스크립트는 CPU·I/O·리두를 동시에 소모한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) ADDM 전제 파라미터부터 확인한다.
+--     STATISTICS_LEVEL=TYPICAL/ALL, CONTROL_MANAGEMENT_PACK_ACCESS=DIAGNOSTIC(+TUNING)
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value FROM v$parameter
+  2       WHERE name IN ('statistics_level','control_management_pack_access');
+
+NAME                             VALUE
+-------------------------------- --------------------
+statistics_level                 TYPICAL
+control_management_pack_access   DIAGNOSTIC+TUNING
+
+-- 두 값이 위와 같아야 ADDM이 동작한다. BASIC 또는 NONE이면 결과가 빈다.
+
+--------------------------------------------------------------------------------
+-- [2] 분석할 스냅샷 구간을 확인한다. 부하는 295~296 사이에 걸려 있다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT snap_id,
+  2         TO_CHAR(begin_interval_time,'MM-DD HH24:MI') begin_t,
+  3         TO_CHAR(end_interval_time,'MM-DD HH24:MI')   end_t
+  4       FROM dba_hist_snapshot
+  5       WHERE snap_id BETWEEN 294 AND 297 ORDER BY snap_id;
+
+   SNAP_ID BEGIN_T       END_T
+---------- ------------- -------------
+       294 08-25 12:00   08-25 12:15
+       295 08-25 12:15   08-25 12:15
+       296 08-25 12:15   08-25 12:17
+
+-- 부하 구간(12:15~12:17)은 스냅샷 295~296 이다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 재현) 존재하지 않는 스냅샷 번호로 태스크를 실행해 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> VAR tname VARCHAR2(40);
+SYS@orcl> BEGIN
+  2         :tname := 'CH9_ADDM_BAD';
+  3         DBMS_ADDM.ANALYZE_DB(:tname, 999, 1000);
+  4       END;
+  5       /
+BEGIN
+*
+1행에 오류:
+ORA-13629: The snapshot pair [999, 1000] specified is not valid.
+ORA-06512: at "SYS.DBMS_ADDM", line ...
+ORA-06512: at line 3
+
+--    → 원인: ADDM은 실재하며 purge되지 않은 두 스냅샷만 분석할 수 있다.
+--            999·1000은 존재하지 않아 유효한 구간을 잡지 못했다.
+--    → 조치: [2]에서 확인한 유효 번호(295, 296)로 다시 실행한다.
+
+--------------------------------------------------------------------------------
+-- [4] (조치) 올바른 스냅샷 번호로 ADDM 태스크를 생성·실행한다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2         :tname := 'TUNING_CH9_ADDM_296';
+  3         DBMS_ADDM.ANALYZE_DB(:tname, 295, 296);
+  4       END;
+  5       /
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치 후 상태) 텍스트 보고서를 출력한다. 보고서는 CLOB이고 80자 라인에
+--     맞춰 포맷되므로 LINESIZE 80으로 맞춘다.
+--------------------------------------------------------------------------------
+SYS@orcl> SET LONG 1000000 PAGESIZE 0 LINESIZE 80
+SYS@orcl> SELECT DBMS_ADDM.GET_REPORT(:tname) FROM dual;
+
+          ADDM Report for Task 'TUNING_CH9_ADDM_296'
+          ------------------------------------------
+Analysis Period : AWR snapshot range from 295 to 296.
+Total database time was 574 seconds.
+The average number of active sessions was 5.52.
+
+Summary of Findings
+   Description                      Active Sessions   Recommendations
+   -------------------------------  ----------------  ---------------
+1  Top SQL Statements               3.35 | 60.78      2
+2  Hard Parse Due to Literal Usage   .32 |  5.82      1
+3  Commits and Rollbacks             .2  |  3.69      2
+4  Soft Parse                        .13 |  2.38      2
+... (이하 Findings and Recommendations 상세, 실습 02에서 해석)
+
+-- 해석: 총 DB Time 574초, AAS 5.52. Top SQL이 전체의 60.78%로 압도적이다.
+--       구체 수치(574·5.52·60.78 등)는 이 부하·하드웨어의 실측이므로
+--       학습자 환경에서는 <환경값>으로 다르게 나온다. 절대값이 아니라
+--       "무엇이 상위로 잡혔고 그 근거가 무엇인가"를 읽는 것이 핵심이다.
+
+--------------------------------------------------------------------------------
+-- [6] (대안) 대화식 스크립트로 같은 보고서를 파일로 저장할 수도 있다.
+--     addmrpt.sql은 내부적으로 ANALYZE_DB + GET_REPORT를 부르는 래퍼다.
+--------------------------------------------------------------------------------
+SYS@orcl> @?/rdbms/admin/addmrpt.sql
+-- (최근 스냅샷 목록이 출력된다)
+Enter value for begin_snap: 295
+Enter value for end_snap: 296
+Enter value for report_name: addm_295_296.txt
+-- → 지정한 파일로 동일한 텍스트 보고서가 저장된다.
+
+--------------------------------------------------------------------------------
+-- [7] (재확인) 태스크가 정상 생성·완료됐는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT task_name, status
+  2       FROM dba_advisor_tasks
+  3       WHERE task_name = 'TUNING_CH9_ADDM_296';
+
+TASK_NAME                 STATUS
+------------------------- -----------
+TUNING_CH9_ADDM_296       COMPLETED
+
+================================================================================
+ 라이선스 없이 같은 것을 보는 대안 경로 (Diagnostics Pack 미보유 시)
+ - ADDM/addmrpt.sql/GET_REPORT는 쓸 수 없다.
+ - 구간 요약은 6장의 Statspack 보고서(spreport.sql)로 대신한다.
+ - 상위 SQL은 V$SQL을 elapsed_time/buffer_gets 기준 정렬로 직접 본다.
+ 정리: 실습용 태스크는 아래로 삭제한다(자동 ADDM 결과는 손대지 않는다).
+   SYS@orcl> EXEC DBMS_ADVISOR.DELETE_TASK('TUNING_CH9_ADDM_296');
+================================================================================

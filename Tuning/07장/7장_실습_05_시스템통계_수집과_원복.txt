@@ -1,0 +1,147 @@
+================================================================================
+ 7장 실습 05 — 시스템 통계 수집과 수집 전후 계획 변화 관찰
+ 목표: 현재 NOWORKLOAD 상태를 확인하고, WORKLOAD 시스템 통계를 수집한 뒤
+       비용/계획이 어떻게 달라지는지 관찰한다. 실습 후 NOWORKLOAD로 원복한다.
+ 환경: non-CDB=orcl 19.3 (SYS로 수행 — AUX_STATS$·시스템 통계는 관리자 권한)
+ 주의: ★개인 실습 환경 전용★. 시스템 통계는 인스턴스 전역 비용 계산에
+       영향을 준다. 수집하면 모든 SQL 계획이 바뀔 수 있으므로, 실습 끝에
+       DELETE_SYSTEM_STATS + GATHER_SYSTEM_STATS('NOWORKLOAD')로 반드시 원복.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 현재 시스템 통계를 확인한다. NOWORKLOAD 여부 판정.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN sname FORMAT A14
+SYS@orcl> COLUMN pname FORMAT A12
+SYS@orcl> SELECT sname, pname, pval1
+  2       FROM sys.aux_stats$
+  3       WHERE pname IN ('CPUSPEEDNW','IOSEEKTIM','IOTFRSPEED',
+  4                       'MBRC','SREADTIM','MREADTIM')
+  5       ORDER BY pname;
+
+SNAME          PNAME              PVAL1
+-------------- ------------ -----------
+SYSSTATS_MAIN  CPUSPEEDNW   3106.95187
+SYSSTATS_MAIN  IOSEEKTIM            10
+SYSSTATS_MAIN  IOTFRSPEED         4096
+SYSSTATS_MAIN  MBRC
+SYSSTATS_MAIN  MREADTIM
+SYSSTATS_MAIN  SREADTIM
+
+-- 해석: MBRC·SREADTIM·MREADTIM이 비어(NULL) 있고 CPUSPEEDNW·IOSEEKTIM·
+--   IOTFRSPEED만 값이 있다 → NOWORKLOAD 상태. 옵티마이저는 IOSEEKTIM(10ms)과
+--   IOTFRSPEED(4096)로 읽기 시간을 유도하고, MBRC 자리엔 초기화 파라미터를 쓴다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 전체 스캔 대상 쿼리의 비용을 기록해 둔다. (Before)
+--------------------------------------------------------------------------------
+SYS@orcl> EXPLAIN PLAN FOR
+  2       SELECT /*+ FULL(m) */ COUNT(*) FROM sqlt.medical_claims m
+  3       WHERE total_amt > 500000;
+Explained.
+SYS@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'TYPICAL'));
+
+-- Plan hash / Cost 등 표시. 여기서 전체 스캔의 Cost 값을 Before로 기록한다.
+-- (구체적 Cost는 환경에 따라 다르므로 <환경값>으로 표기.)
+
+--------------------------------------------------------------------------------
+-- [3] (조치) WORKLOAD 시스템 통계를 수집한다.
+--     대표 부하 구간을 START ~ STOP으로 감싸 실제 I/O 특성을 측정한다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_STATS.GATHER_SYSTEM_STATS('START');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 이 사이에 대표 워크로드를 흘린다(실습에선 대량 스캔/조인 실행).
+SYS@orcl> SELECT /*+ FULL(m) */ COUNT(*) FROM sqlt.medical_claims m
+  2       WHERE total_amt > 500000;
+
+  COUNT(*)
+----------
+    <환경값>
+
+SYS@orcl> SELECT COUNT(*) FROM sqlt.claim_details;   -- 약 90만 건 대량 스캔
+
+  COUNT(*)
+----------
+    899894
+
+SYS@orcl> EXEC DBMS_STATS.GATHER_SYSTEM_STATS('STOP');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 재확인: WORKLOAD 값(MBRC·SREADTIM·MREADTIM)이 채워졌는지 본다.
+SYS@orcl> SELECT sname, pname, pval1
+  2       FROM sys.aux_stats$
+  3       WHERE pname IN ('MBRC','SREADTIM','MREADTIM','CPUSPEED')
+  4       ORDER BY pname;
+
+SNAME          PNAME              PVAL1
+-------------- ------------ -----------
+SYSSTATS_MAIN  CPUSPEED         <환경값>
+SYSSTATS_MAIN  MBRC             <환경값>
+SYSSTATS_MAIN  MREADTIM         <환경값>
+SYSSTATS_MAIN  SREADTIM         <환경값>
+
+-- 해석: 이제 실측 MBRC·SREADTIM·MREADTIM이 채워졌다. 옵티마이저는 유도값
+--   대신 이 실측값으로 전체 스캔/인덱스 스캔 비용을 계산한다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 수집 후 어떤 쿼리의 계획/비용이 Before와 달라졌다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXPLAIN PLAN FOR
+  2       SELECT /*+ FULL(m) */ COUNT(*) FROM sqlt.medical_claims m
+  3       WHERE total_amt > 500000;
+Explained.
+SYS@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'TYPICAL'));
+
+-- 이상 징후: 전체 스캔의 Cost가 [2]의 Before와 달라졌다(개선일 수도, 악화일 수도).
+-- 원인: WORKLOAD 시스템 통계로 MBRC·읽기 시간이 바뀌어 비용 모델이 달라졌다.
+--   만약 이 구간이 대표성이 없었다면(예: 한산한 시간대) 실제 업무와 동떨어진
+--   특성이 박혀 계획이 나빠질 수 있다.
+-- 조치: 실습 목적이 끝났으므로 안전하게 NOWORKLOAD로 원복한다.
+SYS@orcl> EXEC DBMS_STATS.DELETE_SYSTEM_STATS;
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC DBMS_STATS.GATHER_SYSTEM_STATS('NOWORKLOAD');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 재확인: MBRC·SREADTIM·MREADTIM이 다시 비었는지(NOWORKLOAD) 본다.
+SYS@orcl> SELECT sname, pname, pval1
+  2       FROM sys.aux_stats$
+  3       WHERE pname IN ('CPUSPEEDNW','IOSEEKTIM','IOTFRSPEED',
+  4                       'MBRC','SREADTIM','MREADTIM')
+  5       ORDER BY pname;
+
+SNAME          PNAME              PVAL1
+-------------- ------------ -----------
+SYSSTATS_MAIN  CPUSPEEDNW   <환경값>
+SYSSTATS_MAIN  IOSEEKTIM    <환경값>
+SYSSTATS_MAIN  IOTFRSPEED   <환경값>
+SYSSTATS_MAIN  MBRC
+SYSSTATS_MAIN  MREADTIM
+SYSSTATS_MAIN  SREADTIM
+
+-- 재확인 완료: MBRC·SREADTIM·MREADTIM이 다시 NULL → NOWORKLOAD로 원복됨.
+--   (NOWORKLOAD 재측정으로 CPUSPEEDNW 등 값은 환경마다 다르므로 <환경값>.)
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 현재 상태는 NOWORKLOAD(MBRC·SREADTIM·MREADTIM이 NULL).
+-- 2) GATHER_SYSTEM_STATS('START'/'STOP')로 WORKLOAD 통계를 수집하면 실측
+--    MBRC·읽기 시간이 채워지고 전체/인덱스 스캔 비용이 달라진다.
+-- 3) 시스템 통계는 인스턴스 전역에 영향 → 계획이 바뀔 수 있다(개선/회귀).
+-- 4) 대표성 없는 구간 수집은 위험. 운영에선 실제 부하 구간을 골라야 한다.
+-- ※ 원복 완료: DELETE_SYSTEM_STATS + GATHER_SYSTEM_STATS('NOWORKLOAD').
+
+SYS@orcl> EXIT
+================================================================================

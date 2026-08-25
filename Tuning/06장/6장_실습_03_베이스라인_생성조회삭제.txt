@@ -1,0 +1,135 @@
+================================================================================
+ 6장 실습 03 — AWR 베이스라인 생성·조회·삭제
+ 목표: 부하 구간(295~296)을 TUNING_CH6_DEMO 베이스라인으로 보호하고,
+       DBA_HIST_BASELINE으로 확인한 뒤 실습 후 정리한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 라이선스 주의(🔒): CREATE/DROP_BASELINE·DBA_HIST_BASELINE은 Diagnostics Pack 필요.
+       미보유 시 Statspack에는 동등 기능이 없으므로 보존 확대로 대체(정리 참조).
+ 전제: 실습 02에서 스냅샷 295~296을 확보한 상태.
+ 주의: 개인 실습 환경 전용.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 베이스라인으로 넣을 구간을 먼저 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT snap_id,
+  2         TO_CHAR(end_interval_time,'MM-DD HH24:MI') end_t
+  3       FROM dba_hist_snapshot WHERE snap_id IN (295,296) ORDER BY snap_id;
+
+   SNAP_ID END_T
+---------- -----------
+       295 08-25 12:15
+       296 08-25 12:17
+
+-- 해석: 부하 구간 295~296이 존재한다. 이 번호로 베이스라인을 만든다.
+--   (start/end는 이미 존재하는 스냅샷 번호여야 한다)
+
+SYS@orcl> COLUMN baseline_name FORMAT A24
+SYS@orcl> SELECT baseline_id, baseline_name, baseline_type
+  2       FROM dba_hist_baseline ORDER BY baseline_id;
+
+BASELINE_ID BASELINE_NAME         BASELINE_TYPE
+----------- --------------------  ---------------
+          0 SYSTEM_MOVING_WINDOW  MOVING_WINDOW
+
+-- 해석: 지금은 시스템 이동 윈도우 하나뿐이다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) 부하 구간을 고정 베이스라인으로 생성한다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.CREATE_BASELINE(
+  3        start_snap_id => 295,
+  4        end_snap_id   => 296,
+  5        baseline_name => 'TUNING_CH6_DEMO',
+  6        expiration    => 30);   -- 30일 뒤 자동 만료
+  7  END;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 후 상태) 생성 결과를 조회한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT baseline_name, baseline_type, start_snap_id, end_snap_id
+  2       FROM dba_hist_baseline ORDER BY baseline_id;
+
+BASELINE_NAME         BASELINE_TYPE    START_SNAP_ID END_SNAP_ID
+--------------------  ---------------  ------------- -----------
+SYSTEM_MOVING_WINDOW  MOVING_WINDOW              288         296
+TUNING_CH6_DEMO       STATIC                     295         296
+
+-- 해석: STATIC 베이스라인이 생겼다. 이제 295~296 스냅샷은 8일이 지나도
+--   자동 퍼지되지 않는다. (SYSTEM_MOVING_WINDOW의 end가 296인 것은
+--   이동 윈도우가 항상 최신 스냅샷까지 따라오기 때문)
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 같은 이름으로 하나 더 만들려 하니 오류가 난다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.CREATE_BASELINE(295,296,'TUNING_CH6_DEMO');
+  3  END;
+  4  /
+BEGIN
+*
+ERROR at line 1:
+ORA-13539: ... baseline (TUNING_CH6_DEMO) already exists
+ORA-06512: at "SYS.DBMS_WORKLOAD_REPOSITORY", line ...
+
+SYS@orcl> -- 원인 파악: 베이스라인 이름은 유일해야 한다. 이미 존재한다.
+SYS@orcl> -- 조치: 이름을 바꾸거나(RENAME) 기존을 지운 뒤 다시 만든다.
+SYS@orcl> --   여기서는 이름 변경으로 대응한다.
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.RENAME_BASELINE(
+  3        old_baseline_name => 'TUNING_CH6_DEMO',
+  4        new_baseline_name => 'TUNING_CH6_PEAK');
+  5  END;
+  6  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 재확인: 이름이 바뀌었는지 본다.
+SYS@orcl> SELECT baseline_name FROM dba_hist_baseline
+  2       WHERE baseline_type='STATIC';
+
+BASELINE_NAME
+--------------------
+TUNING_CH6_PEAK
+
+--------------------------------------------------------------------------------
+-- [5] (정리) 실습 후 고정 베이스라인을 삭제한다. 스냅샷은 보존한다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.DROP_BASELINE(
+  3        baseline_name => 'TUNING_CH6_PEAK',
+  4        cascade       => FALSE);   -- 딸린 스냅샷은 보존
+  5  END;
+  6  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_hist_baseline WHERE baseline_type='STATIC';
+
+  COUNT(*)
+----------
+         0
+
+-- 재확인: STATIC 베이스라인이 0건. 정리 완료.
+--   cascade FALSE라 스냅샷 295~296은 (자동 퍼지 규칙에 따라) 그대로 남는다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) CREATE_BASELINE(start,end,name[,expiration]) — 구간을 보호(퍼지 제외).
+-- 2) DBA_HIST_BASELINE — MOVING_WINDOW와 STATIC을 baseline_type으로 구분.
+-- 3) RENAME_BASELINE — 이름 변경. 이름은 유일해야 한다(중복 시 ORA-13539).
+-- 4) DROP_BASELINE(name, cascade) — FALSE=스냅샷 보존, TRUE=스냅샷까지 삭제.
+-- 5) 라이선스 미보유 시: 베이스라인 개념이 없으므로 보존을 늘려 대체 보호한다.
+
+SYS@orcl> EXIT
+================================================================================

@@ -1,0 +1,117 @@
+================================================================================
+ 6장 실습 05 — SYSAUX 사용량 추적: AWR이 차지하는 공간 확인과 정리
+ 목표: V$SYSAUX_OCCUPANTS로 AWR(SM/AWR) 점유를 확인하고, 커진 원인을 좁힌 뒤
+       DROP_SNAPSHOT_RANGE로 정리하는 절차를 익힌다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 라이선스 주의(🔒): V$SYSAUX_OCCUPANTS 조회 자체는 사전점검이나, 이 공간을
+       만드는 AWR 수집은 Diagnostics Pack 대상이다.
+ 주의: 개인 실습 환경 전용. DROP_SNAPSHOT_RANGE는 되돌릴 수 없다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) SYSAUX 안에서 AWR 점유를 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN occupant_name FORMAT A16
+SYS@orcl> SELECT occupant_name,
+  2         ROUND(space_usage_kbytes/1024,1) mb
+  3       FROM v$sysaux_occupants
+  4       WHERE occupant_name = 'SM/AWR';
+
+OCCUPANT_NAME          MB
+---------------- ----------
+SM/AWR              281.9
+
+-- 해석: AWR(SM/AWR)이 SYSAUX에서 281.9MB를 쓴다.
+--   오라클 기준(평균 10 활성세션 ≈ 200~300MB) 범위 안이다.
+--   이 값은 절대 기준이 아니라 "전보다 커졌는가"를 보는 추이 지표다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) SYSAUX 전체 점유 상위와 대조 — AWR만의 문제인지 가른다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT occupant_name,
+  2         ROUND(space_usage_kbytes/1024,1) mb
+  3       FROM v$sysaux_occupants
+  4       WHERE space_usage_kbytes > 0
+  5       ORDER BY space_usage_kbytes DESC FETCH FIRST 5 ROWS ONLY;
+
+OCCUPANT_NAME          MB
+---------------- ----------
+SM/AWR              281.9
+SM/OPTSTAT          <환경값>
+...
+
+-- 해석: SYSAUX가 커도 범인이 꼭 AWR은 아니다. SM/OPTSTAT(옵티마이저 통계
+--   이력) 등 다른 점유자와 대조해 원인을 정확히 지목한다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: SM/AWR이 평소보다 유난히 커졌다고 가정한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: 주기·보존·topnsql·활성 세션 수를 순서대로 확인한다.
+SYS@orcl> SELECT snap_interval, retention, topnsql FROM dba_hist_wr_control;
+
+SNAP_INTERVAL         RETENTION             TOPNSQL
+--------------------  --------------------  ----------
++00000 00:10:00.0     +00030 00:00:00.0     MAXIMUM
+
+-- 해석: 주기가 10분(기본 60분보다 6배 촘촘), 보존 30일, topnsql=MAXIMUM.
+--   세 가지가 모두 공간을 키우는 방향이다. 이것이 점유 증가의 원인이다.
+
+SYS@orcl> -- 조치(1): 설정을 정상화한다(주기 60분·보존 8일·topnsql DEFAULT).
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.MODIFY_SNAPSHOT_SETTINGS(
+  3        interval  => 60, retention => 11520, topnsql => 'DEFAULT');
+  4  END;
+  5  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 조치(2): 오래된 스냅샷 구간을 수동 삭제해 공간을 회수한다.
+SYS@orcl> SELECT MIN(snap_id) oldest FROM dba_hist_snapshot;
+
+    OLDEST
+----------
+       230
+
+SYS@orcl> BEGIN
+  2    DBMS_WORKLOAD_REPOSITORY.DROP_SNAPSHOT_RANGE(
+  3        low_snap_id => 230, high_snap_id => 260);
+  4  END;
+  5  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 재확인: 점유가 줄었는지 다시 본다(자동 정리도 시차가 있으므로
+SYS@orcl> --   추이로 판단한다. 절대값 단정 금지).
+SYS@orcl> SELECT ROUND(space_usage_kbytes/1024,1) mb
+  2       FROM v$sysaux_occupants WHERE occupant_name='SM/AWR';
+
+        MB
+----------
+    <환경값>   -- 삭제·설정 정상화 후 감소 방향이어야 한다
+
+--------------------------------------------------------------------------------
+-- [4] (검증) 지정 구간이 안 지워지면 베이스라인 보호를 의심한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 만약 특정 구간이 남아 있다면:
+SYS@orcl> SELECT baseline_name, start_snap_id, end_snap_id FROM dba_hist_baseline
+  2       WHERE baseline_type='STATIC';
+-- (있다면) 그 베이스라인이 해당 구간을 보호 중이다.
+--   필요 없으면 DROP_BASELINE(name, cascade=>TRUE)로 스냅샷까지 정리한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) AWR 점유는 V$SYSAUX_OCCUPANTS의 SM/AWR로 본다(실측 281.9MB).
+-- 2) SYSAUX가 큼 ≠ AWR이 큼. 다른 점유자(SM/OPTSTAT 등)와 대조한다.
+-- 3) 커진 원인: 주기↓·보존↑·topnsql↑·바쁜 시스템. 설정으로 좁힌다.
+-- 4) 공간 회수: 설정 정상화 + DROP_SNAPSHOT_RANGE(오래된 구간).
+-- 5) 안 지워지면 베이스라인 보호를 의심(보호=삭제 면제).
+-- 6) 라이선스 미보유 시: Statspack은 PERFSTAT 스키마 크기를 보고 sppurge로 정리.
+
+SYS@orcl> EXIT
+================================================================================

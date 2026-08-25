@@ -1,0 +1,119 @@
+================================================================================
+ 10장 실습 05 — DBA_HIST_ACTIVE_SESS_HISTORY로 보존 구간 분석
+ 목표: 메모리 ASH(V$)와 디스크 ASH(DBA_HIST_)의 샘플 간격·보존·해상도 차이를
+       실측으로 대조한다. 메모리 ASH에서 사라진 과거 구간을 디스크 ASH로
+       복원하는 절차를 익힌다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 라이선스: 🔒 Diagnostics Pack 필요. 미보유 시 대안은 실습 후반 [5] 참조.
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 메모리 ASH가 지금 몇 분 치를 담고 있는지 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT MIN(sample_time) AS oldest, MAX(sample_time) AS newest
+  2       FROM  v$active_session_history;
+
+OLDEST                    NEWEST
+------------------------- -------------------------
+25-AUG-26 11.42.10.***    25-AUG-26 12.17.30.***
+
+-- 해석: oldest~newest 간격이 메모리 ASH로 되짚을 수 있는 최대 구간이다. 부하가
+--   높을수록 버퍼가 빨리 회전해 이 간격이 좁아진다(ASH Buffer Size 16.0M).
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 같은 부하 구간을 메모리 ASH로 집계한다(기준값).
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS samples
+  2       FROM  v$active_session_history
+  3       WHERE sample_time BETWEEN TIMESTAMP '2026-08-25 12:15:00'
+  4                             AND TIMESTAMP '2026-08-25 12:17:30'
+  5       GROUP BY NVL(event,'ON CPU') ORDER BY samples DESC;
+
+EVENT                              SAMPLES
+--------------------------------- --------
+ON CPU                                 529
+log file sync                           17
+log file parallel write                 14
+db file sequential read                 10
+
+-- 해석: 1초 간격이라 ON CPU가 529 샘플. 이 값을 디스크 ASH와 비교할 기준으로 둔다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 같은 구간을 디스크 ASH(DBA_HIST_)로 집계한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS samples
+  2       FROM  dba_hist_active_sess_history
+  3       WHERE sample_time BETWEEN TIMESTAMP '2026-08-25 12:15:00'
+  4                             AND TIMESTAMP '2026-08-25 12:17:30'
+  5       GROUP BY NVL(event,'ON CPU') ORDER BY samples DESC;
+
+EVENT                              SAMPLES
+--------------------------------- --------
+ON CPU                                  53
+log file sync                            2
+db file sequential read                  1
+
+-- 해석: 같은 구간인데 샘플이 메모리(529)의 약 1/10(53)이다. MMON이 메모리
+--   샘플의 약 10분의 1만 SYSAUX에 저장하기(10초 간격) 때문이다. 비율(ON CPU
+--   압도적)은 같지만 세밀함이 줄었다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: "어제 오후 문제를 보려고 V$ACTIVE_SESSION_HISTORY를 그 시각
+--       으로 조회했더니 한 행도 안 나온다. ASH가 고장 났나?"
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) AS cnt
+  2       FROM  v$active_session_history
+  3       WHERE sample_time BETWEEN TIMESTAMP '2026-08-24 14:00:00'
+  4                             AND TIMESTAMP '2026-08-24 14:10:00';
+
+       CNT
+----------
+         0
+
+SYS@orcl> -- 원인 파악: 메모리 ASH의 oldest([1])보다 과거다. 순환 버퍼가 이미
+SYS@orcl> --   덮어써서 어제 데이터는 메모리에 없다. 고장이 아니라 정상 회전이다.
+SYS@orcl> -- 조치: 디스크 ASH(DBA_HIST_)로 같은 구간을 조회한다(보존 8일 이내면 남음).
+SYS@orcl> SELECT COUNT(*) AS cnt
+  2       FROM  dba_hist_active_sess_history
+  3       WHERE sample_time BETWEEN TIMESTAMP '2026-08-24 14:00:00'
+  4                             AND TIMESTAMP '2026-08-24 14:10:00';
+
+       CNT
+----------
+       <환경값>
+
+-- 원인 확정 + 재확인: 메모리엔 없지만 디스크 ASH에는 어제 구간이 남아 있다
+--   (AWR 보존기간 기본 8일 이내). 해상도(10초)는 낮지만 큰 그림은 복원된다.
+-- 교훈: '최근·정밀'은 V$로, '지나간 날'은 DBA_HIST_로 본다. 사고 직후에는
+--   메모리 ASH가 살아 있을 때 별도 테이블로 캡처해 두는 습관이 안전하다.
+
+--------------------------------------------------------------------------------
+-- [5] (라이선스 대안 경로) DBA_HIST_도 Diagnostics Pack이다.
+--------------------------------------------------------------------------------
+-- * DBA_HIST_ACTIVE_SESS_HISTORY 역시 Diagnostics Pack 유상 옵션이다.
+-- * 라이선스가 없으면 과거 이력을 오라클이 자동 보존하지 않으므로, V$SESSION을
+--   주기적으로 폴링해 직접 만든 이력 테이블(예: MY_ASH)에 적재해 두어야 한다.
+--   그 테이블을 여기서처럼 구간·이벤트로 GROUP BY 하면 같은 분석이 가능하다.
+SYS@orcl> -- (원리 확인) 지금 활성 세션을 이력 테이블에 한 줄 적재하는 형태:
+SYS@orcl> --   INSERT INTO my_ash SELECT SYSTIMESTAMP, sid, status,
+SYS@orcl> --     NVL(event,'ON CPU'), sql_id FROM v$session
+SYS@orcl> --     WHERE status='ACTIVE' AND wait_class<>'Idle';
+SYS@orcl> --   → 이 INSERT를 1초마다 반복(스케줄러/외부 스크립트)해 이력을 쌓는다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 메모리 ASH(V$): 1초 간격, SGA 순환 버퍼, 수십 분~ 보존, 최근 정밀 분석.
+-- 2) 디스크 ASH(DBA_HIST_): 10초 간격(약 1/10), SYSAUX, 기본 8일, 지난 날 분석.
+-- 3) 메모리에 없는 과거는 버그가 아니라 정상 회전 → DBA_HIST_로 복원한다.
+-- 4) 라이선스가 없으면 V$SESSION 폴링을 직접 이력 테이블에 적재해 대체한다.
+
+SYS@orcl> EXIT
+================================================================================
