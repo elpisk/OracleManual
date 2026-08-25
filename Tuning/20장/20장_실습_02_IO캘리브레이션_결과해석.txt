@@ -1,0 +1,157 @@
+================================================================================
+ 20장 실습 02 — I/O 캘리브레이션과 결과 해석
+ 목표: 시스템 통계가 NOWORKLOAD(캘리브레이션 미수행) 상태임을 확인하고,
+       CALIBRATE_IO의 전제조건 점검 → 실행 절차 → 결과 확인(V$IO_CALIBRATION_STATUS,
+       DBA_RSRC_IO_CALIBRATE)을 익힌다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 주의: 개인 실습 환경 전용. CALIBRATE_IO는 무거운 I/O를 유발하므로 유휴 시간에만
+       실제 수행한다. 여기서는 '미수행 상태 확인 + 실행 절차'까지 다룬다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 시스템 통계가 NOWORKLOAD인지 먼저 확인한다.
+--     MBRC·SREADTIM·MREADTIM이 NULL이면 워크로드/캘리브레이션 미수행.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT pname, pval1 FROM sys.aux_stats$
+  2    WHERE pname IN ('IOSEEKTIM','IOTFRSPEED','MBRC','SREADTIM',
+  3                    'MREADTIM','MAXTHR','SLAVETHR')
+  4    ORDER BY pname;
+
+PNAME            PVAL1
+---------------- ----------
+IOSEEKTIM        10
+IOTFRSPEED       4096
+MAXTHR
+MBRC
+MREADTIM
+SLAVETHR
+SREADTIM
+
+-- 해석: IOSEEKTIM(10)·IOTFRSPEED(4096)만 값이 있고 나머지는 NULL.
+--   → NOWORKLOAD 상태. 옵티마이저는 스토리지 실제 성능을 모른 채
+--     기본값으로 비용을 계산 중이다. 캘리브레이션이 필요한 상태다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 캘리브레이션 상태·결과 뷰도 비어 있는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT status, calibration_time FROM v$io_calibration_status;
+
+STATUS         CALIBRATION_TIME
+-------------- --------------------
+NOT AVAILABLE
+
+SYS@orcl> SELECT max_iops, max_mbps, max_pmbps, latency
+  2    FROM  dba_rsrc_io_calibrate;
+
+no rows selected
+
+-- 해석: STATUS=NOT AVAILABLE, 결과 테이블에 행 없음 → 한 번도 수행한 적 없음.
+--   ([1]의 NULL과 일치한다. 두 근거가 같은 결론을 가리킨다.)
+
+--------------------------------------------------------------------------------
+-- [3] (조치 전 전제조건 점검) CALIBRATE_IO 3대 전제조건을 확인한다.
+--     (1) SYSDBA (2) TIMED_STATISTICS=TRUE (3) 데이터파일 비동기 I/O 활성
+--------------------------------------------------------------------------------
+SYS@orcl> SHOW USER
+USER is "SYS"
+
+SYS@orcl> SELECT value FROM v$parameter WHERE name='timed_statistics';
+VALUE
+--------
+TRUE
+
+SYS@orcl> COL name FORMAT A50
+SYS@orcl> SELECT f.name, i.asynch_io
+  2    FROM  v$datafile f, v$iostat_file i
+  3    WHERE f.file# = i.file_no
+  4      AND i.filetype_name = 'Data File';
+
+NAME                                               ASYNCH_IO
+-------------------------------------------------- ---------
+/u02/oradata/orcl/system01.dbf                     ASYNC_ON
+/u02/oradata/orcl/sysaux01.dbf                     ASYNC_ON
+/u02/oradata/orcl/users01.dbf                      ASYNC_ON
+...
+
+-- 해석: SYS 접속·TIMED_STATISTICS=TRUE·데이터파일 ASYNC_ON → 전제조건 충족.
+--   (DISK_ASYNCH_IO=TRUE이면 raw/ASM·플랫폼에 따라 파일 시스템 none이어도
+--    데이터파일 비동기 I/O가 켜질 수 있다. ASYNC_ON으로 최종 확인한다.)
+
+--------------------------------------------------------------------------------
+-- [4] (조치) CALIBRATE_IO 실행 — 유휴 시간에만. 인자(디스크수, 최대지연ms).
+--------------------------------------------------------------------------------
+SYS@orcl> SET SERVEROUTPUT ON
+SYS@orcl> DECLARE
+  2    lat  NUMBER;
+  3    iops INTEGER;
+  4    mbps INTEGER;
+  5  BEGIN
+  6    DBMS_RESOURCE_MANAGER.CALIBRATE_IO(2, 10, iops, mbps, lat);
+  7    DBMS_OUTPUT.PUT_LINE('max_iops = ' || iops);
+  8    DBMS_OUTPUT.PUT_LINE('max_mbps = ' || mbps);
+  9    DBMS_OUTPUT.PUT_LINE('latency  = ' || lat);
+ 10  END;
+ 11  /
+
+max_iops = <환경값>
+max_mbps = <환경값>
+latency  = <환경값>
+
+PL/SQL procedure successfully completed.
+
+-- 해석: 결과값은 스토리지에 전적으로 의존 → <환경값>. 각자 유휴 시각에 실행해 채운다.
+--   max_iops = 8KB 랜덤 IOPS(OLTP 상한), max_mbps = 1MB 순차 MBPS(DW 상한),
+--   latency = 측정된 평균 지연.
+
+--------------------------------------------------------------------------------
+-- [5] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 두 번째 세션에서 CALIBRATE_IO를 또 실행하니 오류가 난다.
+--       ORA-56708: Could not find any datafiles with asynchronous i/o capability
+--       (또는) 이미 캘리브레이션이 진행 중이라는 오류.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: (a) 한 인스턴스에서 캘리브레이션은 한 번에 하나만 가능하다.
+SYS@orcl> --   (b) 같은 스토리지를 공유하는 여러 DB에서 동시에 돌리면 실패한다.
+SYS@orcl> --   (c) 비동기 I/O 미활성이면 ORA-56708이 난다.
+SYS@orcl> -- 진행 상태를 확인해 무엇이 원인인지 가른다.
+SYS@orcl> SELECT status FROM v$io_calibration_status;
+
+STATUS
+--------------
+IN PROGRESS
+
+-- 원인 확정: STATUS=IN PROGRESS → 이미 다른 캘리브레이션이 돌고 있다.
+SYS@orcl> -- 조치: 진행 중 작업이 끝날 때까지 기다린 뒤 하나만 실행한다.
+SYS@orcl> --   (비동기 미활성이 원인이면 FILESYSTEMIO_OPTIONS=SETALL 후 재기동.)
+
+SYS@orcl> -- 재확인: 완료 후 상태와 결과를 다시 조회한다.
+SYS@orcl> SELECT status, TO_CHAR(calibration_time,'YYYY-MM-DD HH24:MI') done
+  2    FROM  v$io_calibration_status;
+
+STATUS      DONE
+----------- ----------------
+READY       <환경값>
+
+SYS@orcl> SELECT max_iops, max_mbps, latency FROM dba_rsrc_io_calibrate;
+
+  MAX_IOPS  MAX_MBPS  LATENCY
+---------- --------- --------
+  <환경값>   <환경값>  <환경값>
+
+-- 재확인 완료: STATUS=READY, 결과 테이블에 값이 채워졌다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) MBRC·SREADTIM·MREADTIM NULL → NOWORKLOAD. 실측이 그러했다.
+-- 2) 전제조건 3종(SYSDBA·TIMED_STATISTICS·비동기 I/O)을 먼저 점검한다.
+-- 3) CALIBRATE_IO(디스크수, 최대지연ms)로 max_iops·max_mbps·latency 실측.
+-- 4) 상태는 V$IO_CALIBRATION_STATUS, 결과는 DBA_RSRC_IO_CALIBRATE.
+-- 5) 한 번에 하나만·유휴 시간에만. 결과는 대기 이벤트와 대조해 해석한다.
+-- ※ Orion은 설치 전 예측 도구로 소개만. DB 내부 CALIBRATE_IO가 중심이다.
+
+SYS@orcl> EXIT
+================================================================================

@@ -1,0 +1,113 @@
+================================================================================
+ 17장 실습 05 - RECYCLE 풀 구성과 대량 스캔 대상 분리
+ 목표: 대량 스캔 대상 대형 세그먼트를 RECYCLE 풀로 격리해, 그 스캔이
+       DEFAULT 풀의 '따뜻한' 블록을 밀어내는 오염을 막는다. 조치 전.후로
+       DEFAULT 풀 히트율과 상위 SQL 물리 읽기를 비교해 효과를 판정한다.
+ 환경: non-CDB=orcl 19.3. RECYCLE 풀 생성이 필요할 수 있다(개인 환경).
+ 주의: 개인 실습 환경 전용. 인스턴스 파라미터 변경(RECYCLE 풀 생성)은
+       개인 환경에서만 수행한다. 절대값은 <환경값>으로 읽는다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) RECYCLE 풀이 없는지, 대상 세그먼트가 어느 풀인지 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, display_value FROM v$parameter
+  2       WHERE name='db_recycle_cache_size';
+NAME                     DISPLAY_VALUE
+----------------------- --------------
+db_recycle_cache_size   0
+
+SYS@orcl> SELECT table_name, buffer_pool FROM dba_tables
+  2       WHERE owner='SQLT' AND table_name='CLAIM_DETAIL_ARCHIVE';
+TABLE_NAME             BUFFER_POOL
+--------------------- -----------
+CLAIM_DETAIL_ARCHIVE   DEFAULT
+
+-- 해석: RECYCLE 풀은 0(미구성). 대형 이력 테이블은 DEFAULT 풀에 있어,
+--   이 테이블의 넓은 스캔이 DEFAULT의 다른 블록을 밀어낼 수 있다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) RECYCLE 풀을 만들고, 대형 세그먼트를 그 풀로 옮긴다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- (개인 환경 전용) RECYCLE 풀 생성. DEFAULT보다 작게 잡는다.
+SYS@orcl> ALTER SYSTEM SET db_recycle_cache_size=32M SCOPE=BOTH;
+System altered.
+
+SYS@orcl> ALTER TABLE sqlt.claim_detail_archive
+  2         STORAGE (BUFFER_POOL RECYCLE);
+Table altered.
+
+SYS@orcl> -- 관련 인덱스도 대량 스캔 대상이면 함께 옮긴다.
+SYS@orcl> ALTER INDEX sqlt.ix_claim_arch_dt
+  2         STORAGE (BUFFER_POOL RECYCLE);
+Index altered.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 후 상태) 대량 스캔을 유발하고 풀별 통계를 비교한다.
+--------------------------------------------------------------------------------
+-- (다른 세션) SQLT에서 대형 이력 테이블 대량 스캔 유발
+SQLT@orcl> SELECT /*+ FULL(a) */ COUNT(*) FROM claim_detail_archive a;
+  COUNT(*)
+----------
+   <환경값>
+
+SYS@orcl> SELECT name, set_msize buf_cnt,
+  2         ROUND(100*(1-physical_reads/
+  3               GREATEST(db_block_gets+consistent_gets,1)),2) hit_pct
+  4       FROM  v$buffer_pool_statistics
+  5       WHERE set_msize>0 ORDER BY name;
+
+NAME         BUF_CNT    HIT_PCT
+-------- ----------- ----------
+DEFAULT       <환경값>   <환경값>   -- 대량 스캔에 오염되지 않아 유지
+KEEP             5874        100
+RECYCLE       <환경값>   <환경값>   -- 대량 스캔이 여기서 소화됨
+
+-- 관찰 포인트: 대량 스캔이 RECYCLE에서 처리되므로, DEFAULT 풀 히트율과
+--   온라인 상위 SQL의 물리 읽기가 배치 중에도 크게 나빠지지 않는지 본다.
+
+--------------------------------------------------------------------------------
+-- [3-1] (이상 징후 -> 원인 -> 조치 -> 재확인)
+--     RECYCLE 풀 히트율이 낮게 나와 '분리가 실패했다'고 오판한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 이상 징후: RECYCLE 풀 히트율이 DEFAULT보다 훨씬 낮다.
+SYS@orcl> --   담당자가 "풀 분리가 잘못됐다"고 오판할 수 있다.
+SYS@orcl> -- 원인: RECYCLE 풀은 한 번 읽고 빨리 버리는 것이 '설계 목적'이다.
+SYS@orcl> --   낮은 히트율은 실패가 아니라 의도된 정상 동작이다.
+SYS@orcl> -- 조치: 성공 여부는 RECYCLE 히트율이 아니라 'DEFAULT 풀이 대량 스캔에
+SYS@orcl> --   오염되지 않았는가'로 판정한다. 조치 전.후 DEFAULT 히트율을 비교한다.
+SYS@orcl> SELECT name,
+  2         ROUND(100*(1-physical_reads/
+  3               GREATEST(db_block_gets+consistent_gets,1)),2) hit_pct
+  4       FROM  v$buffer_pool_statistics
+  5       WHERE name='DEFAULT' AND set_msize>0;
+
+NAME       HIT_PCT
+-------- ----------
+DEFAULT    <환경값>   -- 조치 전과 비슷하게 유지되면 격리 성공
+
+-- 재확인: 배치 중에도 DEFAULT 풀 히트율이 조치 전 수준을 유지하면, 대량
+--   스캔이 RECYCLE에서 소화돼 DEFAULT 오염을 막은 것이다. 오판 정정 완료.
+
+--------------------------------------------------------------------------------
+-- [4] (해석) 격리의 목적은 '오염 방지'이지 히트율 자랑이 아니다.
+--------------------------------------------------------------------------------
+-- * RECYCLE 풀 히트율은 낮을 수 있다(한 번 읽고 버리므로) - 이것이 정상.
+-- * 중요한 것은 DEFAULT 풀의 따뜻한 블록이 대량 스캔에 밀려나지 않는 것.
+-- * 판정: 조치 전 대비 배치 중 DEFAULT 풀 히트율.온라인 SQL 물리 읽기가
+--   안정적으로 유지되면 격리가 효과를 낸 것이다.
+-- * 순서 주의: SQL 튜닝(선택적 인덱스)이 먼저다. 풀 분리는 그다음 수단이다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 대량 스캔 대형 세그먼트는 RECYCLE 풀로 격리해 DEFAULT 오염을 막는다.
+-- 2) RECYCLE 풀은 DEFAULT보다 작게 잡아 버퍼를 빨리 재사용한다.
+-- 3) RECYCLE 히트율이 낮은 것은 정상(설계 목적이 빠른 재사용).
+-- 4) 판정은 DEFAULT 풀 히트율.온라인 SQL 물리 읽기의 안정성으로 한다.
+-- 5) 원복: ALTER SYSTEM SET db_recycle_cache_size=0, STORAGE ... DEFAULT.
+
+SYS@orcl> EXIT
+================================================================================

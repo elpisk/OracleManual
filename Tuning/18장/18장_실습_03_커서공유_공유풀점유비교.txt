@@ -1,0 +1,140 @@
+================================================================================
+ 18장 실습 03 — 커서 공유(CURSOR_SHARING) 설정별 공유 풀 점유 비교
+ 목표: 같은 리터럴 부하를 EXACT와 FORCE에서 각각 돌려, 공유 풀 점유(SQLA)와
+       커서 개수(V$SQLAREA)를 조치 전후로 대조한다. FORCE가 공유 풀 압박을
+       어떻게 더는지, 그리고 편중 컬럼에서의 계획 품질 함정을 확인한다.
+ 환경: non-CDB=orcl 19.3, ASMM. 부하는 SQLT, 관찰은 SYS/SQLT.
+ 주의: 개인 실습 환경 전용. CURSOR_SHARING은 세션 수준(ALTER SESSION)으로만
+       바꾼다 — 접속을 끊으면 자동 원복된다. 시스템 수준 변경은 하지 않는다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) EXACT에서 리터럴 부하 — 커서가 리터럴마다 갈라진다.
+--------------------------------------------------------------------------------
+SQLT@orcl> ALTER SESSION SET cursor_sharing=EXACT;
+Session altered.
+
+SQLT@orcl> -- 리터럴을 바꿔 가며 조회(WL_01 리터럴 모드와 동일 패턴).
+SQLT@orcl> BEGIN
+  2         FOR i IN 1..2000 LOOP
+  3           EXECUTE IMMEDIATE
+  4             'SELECT /*WL01_LIT*/ COUNT(*) FROM patients WHERE patient_id='||i
+  5             INTO :n;
+  6         END LOOP;
+  7       END;
+  8       /
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> -- EXACT에서 만들어진 리터럴 커서 개수·점유를 센다.
+SQLT@orcl> SELECT COUNT(*) cursors,
+  2         ROUND(SUM(sharable_mem)/1024/1024,2) shared_mb
+  3       FROM v$sqlarea WHERE sql_text LIKE '%WL01_LIT%';
+
+   CURSORS  SHARED_MB
+---------- ----------
+      <환경값>    <환경값>   -- (리터럴 2000개 → 커서 수천 개로 갈라짐)
+
+-- 해석(EXACT): patient_id 값마다 SQL 텍스트가 달라 각각 별도 커서가 생겼다.
+--   커서 개수가 리터럴 수만큼 늘고 공유 풀 점유가 커진다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) 커서를 비우고 FORCE로 바꿔 같은 부하를 반복.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 공정한 비교를 위해 공유 풀의 해당 커서만 비운다(개인 환경 전용).
+SQLT@orcl> -- (권한이 있으면 SYS에서) ALTER SYSTEM FLUSH SHARED_POOL;
+SYS@orcl>  ALTER SYSTEM FLUSH SHARED_POOL;
+System altered.
+
+SQLT@orcl> ALTER SESSION SET cursor_sharing=FORCE;
+Session altered.
+
+SQLT@orcl> BEGIN
+  2         FOR i IN 1..2000 LOOP
+  3           EXECUTE IMMEDIATE
+  4             'SELECT /*WL01_LIT*/ COUNT(*) FROM patients WHERE patient_id='||i
+  5             INTO :n;
+  6         END LOOP;
+  7       END;
+  8       /
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 후 상태) FORCE에서 커서 개수·점유를 다시 센다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT COUNT(*) cursors,
+  2         ROUND(SUM(sharable_mem)/1024/1024,2) shared_mb
+  3       FROM v$sqlarea WHERE sql_text LIKE '%WL01_LIT%';
+
+   CURSORS  SHARED_MB
+---------- ----------
+        <환경값>       <환경값>   -- (FORCE: 커서 1~소수 개로 급감)
+
+SQLT@orcl> -- 리터럴이 시스템 바인드로 치환됐는지 확인.
+SQLT@orcl> SELECT sql_text FROM v$sql
+  2       WHERE sql_text LIKE '%WL01_LIT%' AND ROWNUM<=1;
+
+SQL_TEXT
+----------------------------------------------------------
+SELECT /*WL01_LIT*/ COUNT(*) FROM patients WHERE patient_id=:"SYS_B_0"
+
+-- 해석(비교): EXACT는 커서 수천 개, FORCE는 커서 1~소수 개다. FORCE가
+--   리터럴을 :SYS_B_0로 치환해 하나의 커서를 공유시켜 공유 풀 점유를 크게
+--   줄였다. '커서 공유가 공유 풀 압박을 어떻게 더는가'가 수치로 확인된다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: FORCE로 바꾼 뒤, 편중 컬럼을 조건으로 한 리포트 SQL의
+--       실행계획이 바뀌어 일부가 느려졌다.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- HOSP_ID는 값마다 건수가 크게 다른 편중(skew) 컬럼이다.
+SQLT@orcl> SELECT hosp_id, COUNT(*) FROM medical_claims
+  2       GROUP BY hosp_id ORDER BY COUNT(*) DESC FETCH FIRST 3 ROWS ONLY;
+
+   HOSP_ID   COUNT(*)
+---------- ----------
+        36       3100
+        35       3097
+        41       3091
+
+SQLT@orcl> -- FORCE에서 hosp_id 리터럴이 바인드로 뭉쳐져, 값별 최적 계획을 잃는다.
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims WHERE hosp_id=36;   -- 대량 값
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(format=>'BASIC'));
+-- (FORCE 하에서 바인드 하나로 공유된 계획: 소량 값에 맞춘 인덱스 스캔이
+--  대량 값 36에도 적용돼 비효율 → <환경값>)
+
+-- 원인: FORCE는 리터럴을 하나의 바인드로 치환해 '하나의 계획'을 공유시킨다.
+--   편중 컬럼은 값마다 최적 계획이 다른데(히스토그램 기반), FORCE가 이를
+--   뭉갠다 → 특정 값에서 계획 품질이 떨어진다.
+-- 조치: FORCE를 전면 롤백하지 않고, 문제 SQL만 개별 최적화한다. 세션을
+--   EXACT로 되돌리거나(문제 세션), 애플리케이션에서 해당 SQL은 명시적 바인드/
+--   힌트로 관리한다. 여기서는 세션을 EXACT로 원복해 확인한다.
+SQLT@orcl> ALTER SESSION SET cursor_sharing=EXACT;
+Session altered.
+
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims WHERE hosp_id=36;
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(format=>'BASIC'));
+-- (EXACT: 대량 값 36에는 전체 스캔 등 값에 맞는 계획이 선택됨 → <환경값>)
+
+-- 재확인: EXACT에서 편중 값에 맞는 계획이 회복됐다. 즉 FORCE는 공유 풀
+--   압박을 더는 강력한 임시방편이지만, 편중 컬럼 계획은 재검증해야 한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 공유 풀 점유 비교: EXACT(커서 수천) vs FORCE(커서 1~소수) → FORCE가
+--    하드 파싱·점유를 급감시킨다.
+-- 2) FORCE 흔적: 리터럴이 :SYS_B_0로 치환(V$SQL로 확인).
+-- 3) 이상 흐름: FORCE가 편중 컬럼 계획을 뭉갬 → 문제 SQL만 개별 최적화·재검증.
+-- 4) 원칙: FORCE는 앱 수정 전 임시 완화, 근본은 바인드 변수. 세션 수준으로만
+--    실습해 접속 종료 시 자동 원복.
+-- ※ 라이선스: V$SQLAREA·V$SQL·DBMS_XPLAN 무관. ALTER SYSTEM FLUSH SHARED_POOL은
+--    개인 환경 전용(운영 DB에서 금지).
+
+SQLT@orcl> EXIT
+================================================================================

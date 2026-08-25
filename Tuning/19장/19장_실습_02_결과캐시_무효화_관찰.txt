@@ -1,0 +1,117 @@
+================================================================================
+ 19장 실습 02 — 결과 캐시 무효화 관찰(기반 테이블 변경 시 동작)
+ 목표: 결과 캐시를 만든 뒤 기반 테이블(DRUG_MASTER)을 변경·커밋해
+       Invalidation Count 증가와 캐시 재생성을 관찰한다. 무효화가 '커밋 기준'
+       임을 확인하고, 이 무효화가 잦으면 손해가 됨을 통계로 예감한다.
+ 환경: non-CDB=orcl 19.3 (SQLT 계정, 일부 V$는 SYS)
+ 주의: 개인 실습 환경 전용. DRUG_MASTER를 변경하지만 실습 끝에 원복한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 캐시를 생성하고 STATUS=Published 를 확인한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ RESULT_CACHE */ category, COUNT(*) cnt
+  2         FROM  drug_master
+  3         GROUP BY category;
+-- (결과 반환. 캐시 생성)
+
+SYS@orcl> SELECT type, status, row_count, block_count
+  2         FROM  v$result_cache_objects
+  3         WHERE type='Result'
+  4         ORDER BY creation_timestamp DESC
+  5         FETCH FIRST 3 ROWS ONLY;
+
+TYPE     STATUS      ROW_COUNT   BLOCK_COUNT
+-------- ----------- ----------- -----------
+Result   Published   <환경값>    <환경값>
+
+-- 해석: STATUS=Published는 이 결과가 유효하게 캐시되어 재사용 가능함을 뜻한다.
+--   이 상태에서 같은 질의는 캐시 히트(Find Count↑)로 응답한다.
+
+SYS@orcl> SELECT name, value FROM v$result_cache_statistics
+  2         WHERE name IN ('Find Count','Invalidation Count','Create Count Success');
+NAME                     VALUE
+------------------------ ----------
+Create Count Success     <환경값>
+Find Count               <환경값>
+Invalidation Count       <환경값>   -- 출발점(대개 0 부근)
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 재실행으로 캐시 히트를 한 번 확인한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ RESULT_CACHE */ category, COUNT(*) cnt
+  2         FROM  drug_master GROUP BY category;
+SYS@orcl> SELECT name, value FROM v$result_cache_statistics WHERE name='Find Count';
+NAME             VALUE
+---------------- ----------
+Find Count       <환경값>    -- [1] 대비 +1 (히트)
+
+--------------------------------------------------------------------------------
+-- [3] (이상/변경 → 원인 → 조치 → 재확인)
+--     기반 테이블을 변경·커밋하면 캐시가 무효화되는지 관찰한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- (변경 전) 아직 커밋 안 한 UPDATE는 다른 세션 캐시를 무효화하지 않는다.
+SQLT@orcl> UPDATE drug_master
+  2         SET    price = price
+  3         WHERE  ROWNUM = 1;
+1 row updated.
+
+SYS@orcl> SELECT status FROM v$result_cache_objects
+  2         WHERE type='Result' ORDER BY creation_timestamp DESC FETCH FIRST 1 ROWS ONLY;
+STATUS
+-----------
+Published    -- 아직 커밋 전이라 유효 (무효화는 커밋 기준)
+
+SQLT@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> SELECT status FROM v$result_cache_objects
+  2         WHERE type='Result' ORDER BY creation_timestamp DESC FETCH FIRST 1 ROWS ONLY;
+STATUS
+-----------
+Invalid      -- 커밋 후 무효화됨
+
+SYS@orcl> SELECT name, value FROM v$result_cache_statistics WHERE name='Invalidation Count';
+NAME                 VALUE
+-------------------- ----------
+Invalidation Count   <환경값>    -- [1] 대비 증가 (무효화 발생)
+
+-- 원인: 캐시된 결과가 의존하는 DRUG_MASTER가 변경·커밋되어, 그 결과가 무효가
+--   되었다. 무효화 단위는 '결과 하나'이고, 계기는 '커밋'이다.
+
+SQLT@orcl> -- 조치(관찰): 무효화 후 같은 질의를 다시 실행하면 캐시 히트가 아니라
+SQLT@orcl> --   재계산 → 재생성이 일어난다.
+SQLT@orcl> SELECT /*+ RESULT_CACHE */ category, COUNT(*) cnt
+  2         FROM  drug_master GROUP BY category;
+
+SYS@orcl> SELECT name, value FROM v$result_cache_statistics
+  2         WHERE name IN ('Create Count Success','Find Count');
+NAME                     VALUE
+------------------------ ----------
+Create Count Success     <환경값>   -- 다시 +1 (재생성)
+Find Count               <환경값>   -- 이번 실행은 히트가 아님
+
+-- 재확인: 무효화 → 재생성이 확인된다. 이 왕복이 '가끔'이면 문제없지만,
+--   기반 테이블이 자주 바뀌면 매 실행이 재생성이 되어 이득이 사라진다(실습 03).
+
+--------------------------------------------------------------------------------
+-- [4] (원복) 실습으로 바꾼 값을 되돌린다.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- price=price로 갱신했으므로 값 자체는 그대로다. 명시적 원복이 필요하면
+SQLT@orcl> --   변경 전 값을 캡처해 두었다가 되돌린다. (이 실습은 값 불변)
+SQLT@orcl> ROLLBACK;   -- 미커밋 변경이 없으므로 무해
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 무효화 계기는 '기반 객체의 커밋된 변경'이다. 미커밋 변경은 무효화 안 함.
+-- 2) 무효화되면 STATUS=Invalid, Invalidation Count↑, 다음 실행은 재생성.
+-- 3) 무효화가 잦을수록 Find는 안 쌓이고 Create만 반복 → 부적합 신호.
+-- 4) 그래서 결과 캐시는 '거의 안 바뀌는 참조 테이블'에 붙여야 한다.
+
+SQLT@orcl> EXIT
+================================================================================

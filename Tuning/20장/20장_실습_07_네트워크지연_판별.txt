@@ -1,0 +1,105 @@
+================================================================================
+ 20장 실습 07 — 네트워크 지연 판별 (SQL*Net message from client 오해 교정)
+ 목표: 대기 상위에 SQL*Net message from client가 크게 보이는 상황을 재현하고,
+       이를 Idle로 올바르게 해석해 '네트워크 병목' 오판을 교정한다. 진짜 네트워크를
+       의심할 근거(전송 이벤트·전송량 대비 시간)를 확인한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 대기 관찰)
+ 주의: 개인 실습 환경 전용. 조회 중심.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COLUMN event FORMAT A34
+SYS@orcl> COLUMN wait_class FORMAT A12
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 시스템 대기 상위를 캡처한다. SQL*Net 계열의 클래스를 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT e.event, n.wait_class, e.total_waits, e.time_waited
+  2    FROM  v$system_event e JOIN v$event_name n ON e.event=n.name
+  3    WHERE e.event LIKE 'SQL*Net%'
+  4    ORDER BY e.time_waited DESC;
+
+EVENT                              WAIT_CLASS   TOTAL_WAITS  TIME_WAITED
+---------------------------------- ------------ -----------  -----------
+SQL*Net message from client        Idle            <환경값>     <환경값>
+SQL*Net message to client          Idle            <환경값>     <환경값>
+SQL*Net more data to client        Network         <환경값>     <환경값>
+
+-- 해석(핵심): SQL*Net message from client 의 wait_class = Idle 이다.
+--   이것은 DB가 클라이언트의 '다음 요청'을 기다리는 유휴 시간이다.
+--   반면 more data to/from client 는 wait_class=Network(실제 전송).
+
+--------------------------------------------------------------------------------
+-- [부하 재현] '생각하는 시간'이 긴 클라이언트를 흉내 낸다.
+--   업무 세션에서 한 행씩 뽑고 사이에 지연을 두면 message from client가 쌓인다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- (다른 세션) SQLT@orcl> 커서를 열고 FETCH 사이에 대기(예: 애플리케이션
+SYS@orcl> --   처리·사용자 입력 대기). DB는 그동안 message from client로 기다린다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 지금 그 세션이 무엇을 기다리는지 실시간으로 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sid, event, wait_class, state, seconds_in_wait secs
+  2    FROM  v$session
+  3    WHERE username='SQLT' AND type='USER';
+
+ SID  EVENT                          WAIT_CLASS  STATE            SECS
+----  ------------------------------ ----------- ---------------  ----
+ <환경값> SQL*Net message from client  Idle       WAITING       <환경값>
+
+-- 해석: 그 세션은 SQL*Net message from client(Idle)로 대기 중이다.
+--   즉 DB는 아무 일도 하지 않고 클라이언트의 다음 요청을 기다릴 뿐이다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 개발팀이 "SQL*Net message from client가 대기 1위다.
+--       네트워크 장애다. 네트워크 팀에 조사 요청하자"고 결론 내린다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: 이 이벤트는 Idle 클래스([1]에서 확인). 네트워크 병목이 아니라
+SYS@orcl> --   'DB가 클라이언트를 기다린 유휴 시간'이다. 한가한 시스템일수록 크게 보인다.
+SYS@orcl> --   병목으로 세면 한가할수록 네트워크 탓이라는 오판이 난다.
+
+SYS@orcl> -- 조치: 병목 계산에서 Idle을 제외하고, 같은 세션의 '비유휴' 대기를 본다.
+SYS@orcl> SELECT e.event, n.wait_class, e.total_waits, e.time_waited
+  2    FROM  v$system_event e JOIN v$event_name n ON e.event=n.name
+  3    WHERE n.wait_class NOT IN ('Idle')
+  4    ORDER BY e.time_waited DESC FETCH FIRST 5 ROWS ONLY;
+
+EVENT                              WAIT_CLASS   TOTAL_WAITS  TIME_WAITED
+---------------------------------- ------------ -----------  -----------
+db file sequential read            User I/O        <환경값>     <환경값>
+db file scattered read             User I/O        <환경값>     <환경값>
+log file sync                      Commit          <환경값>     <환경값>
+...
+
+-- 원인 확정: 진짜 시간은 비유휴 대기(User I/O 등)에 있다. 네트워크가 아니다.
+
+SYS@orcl> -- 재확인(진짜 네트워크 의심 근거): 전송 이벤트와 전송량 대비 시간을 본다.
+SYS@orcl> SELECT e.event, e.total_waits, e.time_waited
+  2    FROM  v$system_event e
+  3    WHERE e.event IN ('SQL*Net more data to client',
+  4                      'SQL*Net more data from client',
+  5                      'SQL*Net message from dblink');
+
+EVENT                              TOTAL_WAITS  TIME_WAITED
+---------------------------------- -----------  -----------
+SQL*Net more data to client           <환경값>     <환경값>
+SQL*Net message from dblink           <환경값>     <환경값>
+
+-- 재확인: more data 계열이 크고 전송량 대비 시간이 길거나 from dblink가 크면
+--   그때 비로소 네트워크를 의심한다. 이번 상황은 그렇지 않았다 → 오판 교정 완료.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) SQL*Net message from client 는 Idle. DB가 클라이언트 요청을 기다린 유휴 시간.
+-- 2) 한가한 시스템일수록 상위에 크게 보인다 → 병목으로 세면 오판.
+-- 3) 병목 계산에서 Idle을 제외하고 비유휴 대기(User I/O·Commit 등)를 본다.
+-- 4) 진짜 네트워크는 more data to/from client·message from dblink와
+--    전송량 대비 시간으로 판단한다.
+-- ※ V$SYSTEM_EVENT·V$SESSION·V$EVENT_NAME 조회는 라이선스 무관.
+
+SYS@orcl> EXIT
+================================================================================

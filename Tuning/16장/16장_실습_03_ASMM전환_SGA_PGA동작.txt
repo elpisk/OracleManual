@@ -1,0 +1,107 @@
+================================================================================
+ 16장 실습 03 — ASMM으로 전환하고 SGA_TARGET·PGA_AGGREGATE_TARGET 동작 확인
+ 목표: MEMORY_TARGET=0으로 두고 SGA_TARGET·PGA_AGGREGATE_TARGET을 설정해
+       SGA는 SGA_TARGET로, PGA는 PGA_AGGREGATE_TARGET로 각각 자동 관리됨을 확인한다.
+       SGA_TARGET을 SGA_MAX_SIZE보다 크게 주는 오류를 재현하고 원인·조치를 본다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ ⚠ 주의: 파라미터 변경을 포함한다. 반드시 개인 실습 DB에서만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) ASMM으로 만들기 위해 AMM을 끈다(MEMORY_TARGET=0).
+--------------------------------------------------------------------------------
+-- (실습 02에서 AMM으로 갔다면) MEMORY_TARGET을 0으로 되돌려 ASMM 기반을 만든다.
+SYS@orcl> SELECT name, display_value FROM v$parameter
+  2       WHERE name IN ('memory_target','sga_target','sga_max_size',
+  3         'pga_aggregate_target');
+
+NAME                   DISPLAY_VALUE
+---------------------- --------------
+memory_target          0
+pga_aggregate_target   700M
+sga_max_size           2G
+sga_target             1504M
+
+-- 조치 전: memory_target=0, sga_target=1504M → 이미 ASMM. SGA_MAX_SIZE=2G(상한).
+
+--------------------------------------------------------------------------------
+-- [2] (조치 → 이상/오류 재현) SGA_TARGET을 상한(SGA_MAX_SIZE)보다 크게 줘 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET sga_target=2560M SCOPE=BOTH;
+ALTER SYSTEM SET sga_target=2560M SCOPE=BOTH
+*
+ERROR at line 1:
+ORA-02097: parameter cannot be modified because specified value is invalid
+ORA-00823: Specified value of sga_target greater than sga_max_size
+
+-- * 이상/오류: ORA-00823으로 거부된다.
+-- * 원인: 목표(SGA_TARGET)는 상한(SGA_MAX_SIZE=2G=2048M)을 넘을 수 없다. 2560M는 상한
+--     초과라 오라클이 거부한다. '목표 ≤ 상한'이라는 파라미터 체계의 기본 규칙이다.
+-- * 조치: 상한 이하의 값으로 다시 설정한다(또는 상한 자체를 재기동으로 키운다).
+
+SYS@orcl> ALTER SYSTEM SET sga_target=1600M SCOPE=BOTH;
+System altered.
+
+-- * 재확인: 상한(2048M) 이하인 1600M는 정상 반영된다. 동적(SCOPE=BOTH)이라 재기동 불필요.
+SYS@orcl> SELECT display_value FROM v$parameter WHERE name='sga_target';
+DISPLAY_VALUE
+--------------
+1600M
+
+--------------------------------------------------------------------------------
+-- [3] (조회) SGA_TARGET을 키웠을 때 SGA 여유가 실제로 늘었는지 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, ROUND(bytes/1024/1024,1) mb FROM v$sgainfo
+  2       WHERE name IN ('Maximum SGA Size','Free SGA Memory Available',
+  3         'Buffer Cache Size','Shared Pool Size');
+
+NAME                        MB
+-------------------------- ------
+Maximum SGA Size           2048
+Buffer Cache Size          <환경값>   -- SGA_TARGET 상향에 따라 자동 재분배
+Free SGA Memory Available  <환경값>
+Shared Pool Size           <환경값>
+
+-- SGA_TARGET을 1504M→1600M로 올리면 자동 조정 풀들이 그 여유를 나눠 받는다.
+-- 어느 풀이 얼마나 커지는지는 부하와 어드바이저에 따라 오라클이 정한다(자동).
+
+--------------------------------------------------------------------------------
+-- [4] (해석) PGA는 SGA와 별개로 PGA_AGGREGATE_TARGET로 자동 관리됨을 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, ROUND(value/1024/1024,1) mb FROM v$pgastat
+  2       WHERE name IN ('aggregate PGA target parameter',
+  3         'total PGA allocated','total PGA inuse');
+
+NAME                              MB
+-------------------------------- ------
+aggregate PGA target parameter   700
+total PGA allocated              <환경값>
+total PGA inuse                  <환경값>
+
+-- 해석: ASMM에서 SGA(SGA_TARGET)와 PGA(PGA_AGGREGATE_TARGET)는 서로 독립적으로 자동
+--   관리된다. SGA_TARGET을 바꿔도 PGA target(700M)은 그대로다. AMM과 달리 SGA↔PGA
+--   사이 자동 이동은 없다. 이것이 '자동 공유 메모리 관리'가 SGA에만 국한된다는 뜻이다.
+
+--------------------------------------------------------------------------------
+-- [5] (원복) 실습 값을 원래대로 되돌린다.
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET sga_target=1504M SCOPE=BOTH;
+System altered.
+-- pga_aggregate_target은 변경하지 않았다(700M 유지).
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) ASMM = MEMORY_TARGET 0 + SGA_TARGET>0. SGA는 SGA_TARGET, PGA는
+--    PGA_AGGREGATE_TARGET로 각각 자동 관리되며 둘은 독립적이다.
+-- 2) 목표(SGA_TARGET)는 상한(SGA_MAX_SIZE)을 넘을 수 없다 → 초과 시 ORA-00823.
+-- 3) SGA_TARGET은 동적(SCOPE=BOTH)이라 재기동 없이 조정 가능, SGA_MAX_SIZE는 정적.
+-- 4) SGA_TARGET을 키우면 자동 조정 풀들이 여유를 나눠 받는다(배분은 오라클이 결정).
+-- ※ 절대값은 환경 의존 <환경값>. 파라미터 변경은 개인 환경 전용, 실습 후 원복.
+
+SYS@orcl> EXIT
+================================================================================

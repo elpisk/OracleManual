@@ -1,0 +1,156 @@
+================================================================================
+ 18장 실습 02 — WL_01_parse.sql로 하드 파싱 유발 후 공유 풀 사용량 변화 관찰
+ 목표: 조치 전 스냅샷 → WL_01_parse(리터럴 모드) 실행 → 조치 후 스냅샷의
+       3단 캡처로, 하드 파싱이 공유 풀(SQLA)과 라이브러리 캐시를 어떻게
+       부풀리는지 정량 확인한다. 바인드 모드와 대조해 원인을 확정한다.
+ 환경: non-CDB=orcl 19.3, ASMM. 부하는 SQLT, 관찰 스냅샷은 SYS.
+ 부하: 공용 부하 스크립트 WL_01_parse.sql (하드 파싱 폭증). CURSOR_SHARING=
+       EXACT여야 리터럴이 그대로 파싱된다. 스크립트가 세션 EXACT를 설정한다.
+ 주의: 개인 실습 환경 전용. WL_01은 SELECT만 수행하며 객체를 만들지 않는다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 하드 파싱 누적과 공유 풀 SQLA·리터럴 커서 개수를 기록.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value FROM v$sysstat
+  2       WHERE name IN ('parse count (total)','parse count (hard)');
+
+NAME                              VALUE
+----------------------------- ---------
+parse count (total)              218056
+parse count (hard)               134042
+
+SYS@orcl> SELECT ROUND(bytes/1024/1024,2) sqla_mb
+  2       FROM v$sgastat WHERE pool='shared pool' AND name='SQLA';
+
+  SQLA_MB
+---------
+    30.71
+
+SYS@orcl> SELECT COUNT(*) lit_cursors
+  2       FROM v$sqlarea WHERE sql_text LIKE '%WL01_LIT%';
+
+LIT_CURSORS
+-----------
+          0
+
+-- 해석(Before): 하드 파싱 누적 134042, SQLA 30.71MB, 리터럴 커서 0개.
+--   이 셋을 부하 후와 비교할 기준선으로 삼는다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) 다른 세션에서 WL_01_parse.sql을 리터럴 모드로 실행.
+--------------------------------------------------------------------------------
+-- (별도 터미널) SQLT 계정에서 부하 스크립트 실행:
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> -- 스크립트가 세션 수준으로 EXACT를 강제(리터럴 그대로 파싱).
+SQLT@orcl> ALTER SESSION SET cursor_sharing=EXACT;
+Session altered.
+
+SQLT@orcl> -- WL_01_parse: 리터럴을 바꿔 가며 PATIENTS를 5,000회 조회.
+SQLT@orcl> @WL_01_parse.sql
+-- (wl_mode=LITERAL, wl_loops=5000 로 실행)
+...
+WL_01_parse 완료: 리터럴 모드 5000회 실행 (하드 파싱 델타 ≈ <환경값>)
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> EXIT
+
+--------------------------------------------------------------------------------
+-- [3] (조치 후 상태) 같은 항목을 다시 찍어 델타를 계산.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value FROM v$sysstat
+  2       WHERE name IN ('parse count (total)','parse count (hard)');
+
+NAME                              VALUE
+----------------------------- ---------
+parse count (total)              223200
+parse count (hard)               139100
+
+-- 해석: parse count(hard) 델타 = 139100 - 134042 = 5058 ≈ 리터럴 5000회.
+--   리터럴마다 새 커서를 만들었다는 직접 증거다(값은 환경마다 다름 <환경값>).
+
+SYS@orcl> SELECT ROUND(bytes/1024/1024,2) sqla_mb
+  2       FROM v$sgastat WHERE pool='shared pool' AND name='SQLA';
+
+  SQLA_MB
+---------
+    <환경값>   -- (Before 30.71 대비 증가: 리터럴 커서가 SQLA를 부풀림)
+
+SYS@orcl> SELECT COUNT(*) lit_cursors,
+  2         ROUND(SUM(sharable_mem)/1024/1024,2) shared_mb
+  3       FROM v$sqlarea WHERE sql_text LIKE '%WL01_LIT%';
+
+LIT_CURSORS  SHARED_MB
+----------- ----------
+      <환경값>    <환경값>   -- (수천 개의 리터럴 커서가 공유 풀을 점유)
+
+-- 해석(After): 하드 파싱 델타 ≈ 5000, SQLA 증가, 리터럴 커서 수천 개.
+--   하드 파싱이 공유 풀을 어떻게 채우는지 수치로 확인됐다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 처음 실행에서 하드 파싱 델타가 거의 늘지 않았다(≈ 0).
+--       리터럴을 5,000번 돌렸는데 하드 파싱이 안 생긴다?
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 세션의 CURSOR_SHARING을 확인해 보니:
+SQLT@orcl> SHOW PARAMETER cursor_sharing
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+cursor_sharing                       string      FORCE
+
+-- 원인: 세션(또는 시스템)이 CURSOR_SHARING=FORCE로 설정돼 있어, 오라클이
+--   리터럴을 시스템 바인드(:SYS_B_0)로 치환해 버렸다. 그래서 리터럴 5,000개가
+--   커서 1개를 공유해 하드 파싱이 거의 안 생겼다. '유발 실습'이 성립하지 않는다.
+-- 조치: 리터럴이 그대로 파싱되도록 세션을 EXACT로 되돌린 뒤 재실행한다.
+SQLT@orcl> ALTER SESSION SET cursor_sharing=EXACT;
+Session altered.
+
+SQLT@orcl> @WL_01_parse.sql
+-- (재실행: 이번엔 하드 파싱 델타가 리터럴 횟수만큼 증가)
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 재확인: 하드 파싱 델타가 리터럴 횟수만큼 증가했는지 확인.
+SYS@orcl> SELECT value FROM v$sysstat WHERE name='parse count (hard)';
+
+     VALUE
+----------
+    <환경값>   -- (직전 값 대비 ≈ +5000 → 유발 성공)
+
+-- 재확인 결과: EXACT에서만 리터럴이 하드 파싱된다. FORCE/SIMILAR이면 하드
+--   파싱이 거의 안 생겨 이 실습이 성립하지 않는다(WL_01 전제 4와 일치).
+
+--------------------------------------------------------------------------------
+-- [5] (대조) 같은 부하를 바인드 모드로 — 하드 파싱이 안 늘어난다.
+--------------------------------------------------------------------------------
+SQLT@orcl> @WL_01_parse.sql
+-- (wl_mode=BIND: 바인드 변수로 5,000회 실행)
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT value FROM v$sysstat WHERE name='parse count (hard)';
+
+     VALUE
+----------
+    <환경값>   -- (바인드 모드 델타 ≈ 1 → 첫 파싱만 하드, 나머지 소프트)
+
+-- 해석: 바인드 모드는 커서 1개를 재사용하므로 하드 파싱 델타가 1 부근이다.
+--   리터럴 모드(≈5000)와 대조하면, 공유 풀 압박의 원인이 '크기'가 아니라
+--   '리터럴(바인드 미사용)'임이 정량적으로 확정된다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 3단 캡처: Before(하드 134042/SQLA 30.71/커서 0) → WL_01 리터럴 →
+--    After(하드 델타 ≈5000/SQLA 증가/리터럴 커서 수천).
+-- 2) 리터럴 모드 델타 ≈5000 vs 바인드 모드 델타 ≈1 → 원인은 리터럴.
+-- 3) 이상 흐름: FORCE면 유발 실패 → EXACT로 원복 후 재현(WL_01 전제 확인).
+-- 4) 결론: 공유 풀을 부풀린 것은 크기가 아니라 하드 파싱이다 → 조치는 바인드.
+-- ※ 라이선스: V$SYSSTAT·V$SGASTAT·V$SQLAREA 모두 무관. 원복: 세션 종료 시
+--    ALTER SESSION 설정은 자동 원복된다(영구 객체 생성 없음).
+
+SYS@orcl> EXIT
+================================================================================

@@ -1,0 +1,152 @@
+================================================================================
+ 18장 실습 06 — 라지 풀 구성: 병렬·RMAN 버퍼가 공유 풀을 침범하지 않게 분리
+ 목표: 라지 풀 사용 현황(V$SGASTAT)을 확인하고, 병렬 실행 메시지 버퍼가
+       라지 풀에 분리돼 있음을 관찰한다. 라지 풀이 없을 때 큰 버퍼가 공유 풀을
+       침범하는 문제를 재현·해소하고, 조치 전후 공유 풀 지표를 비교한다.
+ 환경: non-CDB=orcl 19.3, ASMM. SYS로 수행. 병렬 부하는 SQLT.
+ 주의: 개인 실습 환경 전용. 파라미터 변경은 SCOPE=MEMORY로 하고 [원복]에서 되돌린다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 라지 풀 현황 — 무엇이 라지 풀에 들어 있나.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, ROUND(bytes/1024/1024,2) mb
+  2       FROM v$sgastat WHERE pool='large pool' ORDER BY bytes DESC;
+
+NAME               MB
+-------------- ------
+PX msg pool     15.00
+free memory      0.69
+session heap     0.31
+miscellaneous    0.06
+
+-- 해석: PX msg pool(15MB)은 병렬 실행이 세션 간 데이터를 주고받는 메시지
+--   버퍼다. 이것이 '라지 풀'에 있다는 것 자체가, 병렬 메시지 버퍼가 공유 풀을
+--   침범하지 않고 라지 풀에 분리돼 있다는 증거다. free memory 0.69MB는 라지
+--   풀 여유로, 병렬 부하가 커지면 이 영역이 함께 커진다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 라지 풀 크기 파라미터와 병렬 설정 확인.
+--------------------------------------------------------------------------------
+SYS@orcl> SHOW PARAMETER large_pool_size
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+large_pool_size                      big integer <환경값>
+
+SYS@orcl> SHOW PARAMETER parallel_execution_message_size
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+parallel_execution_message_size      integer     16384
+
+-- 해석: ASMM에서 large_pool_size가 0이면 자동 조정이 라지 풀을 관리한다.
+--   병렬 메시지 크기 × 버퍼 수만큼 PX msg pool이 라지 풀에서 나온다.
+
+--------------------------------------------------------------------------------
+-- [3] (관찰) 병렬 부하를 주면 라지 풀 PX msg pool이 커진다.
+--------------------------------------------------------------------------------
+-- (별도 터미널) 병렬 스캔으로 PX 버퍼 사용:
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SELECT /*+ PARALLEL(cd, 4) */ COUNT(*)
+  2       FROM claim_details cd;   -- 약 90만 행, 병렬도 4
+
+  COUNT(*)
+----------
+    899894
+
+SYS@orcl> -- 병렬 실행 후 라지 풀 PX msg pool을 다시 확인.
+SYS@orcl> SELECT name, ROUND(bytes/1024/1024,2) mb
+  2       FROM v$sgastat WHERE pool='large pool' AND name='PX msg pool';
+
+NAME             MB
+------------ ------
+PX msg pool   <환경값>   -- (병렬 부하 후 유지/증가 — 공유 풀이 아니라 라지 풀에서)
+
+-- 해석: 병렬 메시지 버퍼가 라지 풀에서 할당·유지된다. 공유 풀의 SQLA·커서는
+--   병렬 부하의 영향을 받지 않는다 → 라지 풀이 방벽 역할을 한다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 라지 풀을 끈(또는 없는) 환경에서 대형 RMAN/병렬을 돌리자
+--       공유 풀 RELOADS와 하드 파싱이 치솟았다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- (재현) 라지 풀을 매우 작게 강제해 큰 버퍼가 공유 풀로 몰리게 한다.
+SYS@orcl> ALTER SYSTEM SET large_pool_size=0 SCOPE=MEMORY;   -- 자동 축소 유도
+System altered.
+
+SYS@orcl> -- 조치 전 공유 풀 RELOADS 기록.
+SYS@orcl> SELECT reloads FROM v$librarycache WHERE namespace='SQL AREA';
+
+   RELOADS
+----------
+      2441
+
+-- (별도 터미널) 병렬 부하를 반복 → 라지 풀이 없어 PX 버퍼가 공유 풀 침범.
+SQLT@orcl> SELECT /*+ PARALLEL(cd, 8) */ COUNT(*) FROM claim_details cd;
+...
+
+SYS@orcl> -- 조치 후 공유 풀 RELOADS를 다시 본다.
+SYS@orcl> SELECT reloads FROM v$librarycache WHERE namespace='SQL AREA';
+
+   RELOADS
+----------
+      <환경값>   -- (증가: 큰 버퍼가 커서를 밀어내 재적재가 늘어남)
+
+SYS@orcl> SELECT name, ROUND(bytes/1024/1024,2) mb
+  2       FROM v$sgastat WHERE pool='shared pool' AND name LIKE 'PX%';
+-- (라지 풀이 없어 PX 관련 할당이 공유 풀에 나타나는지 확인 → <환경값>)
+
+-- 원인: 라지 풀이 없거나 너무 작으면 병렬·RMAN의 큰 버퍼가 공유 풀에서
+--   할당돼 커서를 밀어낸다. 그 결과 RELOADS·하드 파싱이 치솟고 심하면 ORA-04031.
+-- 조치: LARGE_POOL_SIZE를 명시적으로 잡아(ASMM이면 하한) 큰 버퍼를 라지 풀로 보낸다.
+SYS@orcl> ALTER SYSTEM SET large_pool_size=64M SCOPE=MEMORY;
+System altered.
+
+--------------------------------------------------------------------------------
+-- [5] (재확인) 라지 풀 분리 후 병렬 부하에도 공유 풀이 안정된지 확인.
+--------------------------------------------------------------------------------
+-- (별도 터미널) 같은 병렬 부하 반복:
+SQLT@orcl> SELECT /*+ PARALLEL(cd, 8) */ COUNT(*) FROM claim_details cd;
+...
+
+SYS@orcl> SELECT name, ROUND(bytes/1024/1024,2) mb
+  2       FROM v$sgastat WHERE pool='large pool' AND name='PX msg pool';
+
+NAME             MB
+------------ ------
+PX msg pool   <환경값>   -- (라지 풀에서 커짐 → 공유 풀 대신 라지 풀이 흡수)
+
+SYS@orcl> SELECT reloads FROM v$librarycache WHERE namespace='SQL AREA';
+
+   RELOADS
+----------
+      <환경값>   -- (분리 전 대비 증가폭이 작아짐 → 공유 풀 안정)
+
+-- 재확인 결과: LARGE_POOL_SIZE를 잡으니 병렬 버퍼가 라지 풀에서 나와 공유
+--   풀 RELOADS 증가폭이 줄었다. '성격이 다른 큰 할당'을 공유 풀과 섞지 않는
+--   것이 라지 풀 분리의 핵심이다(라지 풀은 LRU가 없어 큰 할당에 적합).
+
+--------------------------------------------------------------------------------
+-- [원복] 변경한 파라미터를 되돌린다(개인 환경 전용).
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET large_pool_size=<환경값> SCOPE=MEMORY;  -- 원래 값(0=자동)
+System altered.
+-- SPFILE로 강제했다면 원래 값으로 복구한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 라지 풀 현황: PX msg pool 15MB가 라지 풀에 분리 → 공유 풀 보호 중.
+-- 2) 라지 풀 용도: 병렬 메시지·RMAN I/O 버퍼·공유 서버 UGA(크고 수명 짧은 할당).
+-- 3) 이상 흐름: 라지 풀 없음 → 큰 버퍼가 공유 풀 침범 → RELOADS·하드파싱↑ →
+--    LARGE_POOL_SIZE 명시로 해소 → 재확인.
+-- 4) 원리: 라지 풀엔 LRU가 없어 큰 할당에 적합. 성격이 다른 메모리를 섞지 않는다.
+-- ※ 라이선스: V$SGASTAT·V$LIBRARYCACHE 무관. 병렬 힌트·LARGE_POOL_SIZE도 무관.
+
+SQLT@orcl> EXIT
+SYS@orcl> EXIT
+================================================================================

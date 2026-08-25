@@ -1,0 +1,123 @@
+================================================================================
+ 19장 실습 05 — 1-pass·multi-pass 정렬 재현(세션 축소 · 임시 테이블스페이스 관찰)
+ 목표: 건강한 상태(디스크 정렬 0)에서 세션 하나의 작업 영역만 축소해 대량 정렬을
+       디스크로 넘긴다. sorts(disk) 증가·히스토그램 onepass 증가·임시 테이블스페이스
+       사용을 관찰한다. WL_03_sort.sql 방식(세션 수준, 인스턴스 무영향)을 따른다.
+ 환경: non-CDB=orcl 19.3 (SQLT, 일부 V$는 SYS). CLAIM_DETAILS 100만+ 존재.
+ 주의: ★개인 실습 환경 전용★ 작업 영역 축소는 '세션 수준'이며 접속 종료로 자동 원복.
+       인스턴스 파라미터(PGA_AGGREGATE_TARGET)는 절대 건드리지 않는다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 디스크 정렬이 0임을 먼저 확인한다(출발점).
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value FROM v$sysstat
+  2         WHERE name IN ('sorts (memory)','sorts (disk)');
+NAME             VALUE
+---------------- ----------
+sorts (disk)     0            -- 출발점: 디스크 정렬 0 (건강)
+sorts (memory)   67163
+
+SQLT@orcl> -- 현재 세션의 작업 영역 정책을 확인한다(자동 관리 상태).
+SQLT@orcl> SHOW PARAMETER workarea_size_policy
+NAME                    TYPE     VALUE
+----------------------- -------- --------
+workarea_size_policy    string   AUTO
+
+--------------------------------------------------------------------------------
+-- [2] (조치) 이 세션만 작업 영역을 수동·소형으로 바꾼다. 인스턴스 무영향.
+--------------------------------------------------------------------------------
+SQLT@orcl> ALTER SESSION SET WORKAREA_SIZE_POLICY = MANUAL;
+Session altered.
+SQLT@orcl> ALTER SESSION SET SORT_AREA_SIZE = 65536;    -- 64KB로 축소
+Session altered.
+SQLT@orcl> ALTER SESSION SET HASH_AREA_SIZE = 65536;
+Session altered.
+
+-- 해석: 정렬 데이터가 64KB 작업 영역의 수십~수백 배가 되므로, 정렬이 반드시
+--   임시 테이블스페이스(디스크)로 넘어간다. 이 설정은 이 세션에만 적용되고,
+--   접속을 끊으면 자동으로 AUTO로 돌아간다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 대량 정렬을 실행하고, 디스크 정렬을 관찰한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT drug_code, COUNT(*) cnt, SUM(claim_amount) tot
+  2         FROM  claim_details
+  3         GROUP BY drug_code
+  4         ORDER BY tot DESC;
+-- (100만+ 행 정렬·그룹핑. 실행 중 다른 세션에서 아래를 관찰한다.)
+
+SYS@orcl> -- (실행 중) 활성 작업 영역이 디스크로 넘쳤는지 실시간 확인.
+SYS@orcl> SELECT sid, operation_type oper, number_passes pass,
+  2                TRUNC(actual_mem_used/1024) mem_kb,
+  3                TRUNC(tempseg_size/1024) tseg_kb
+  4         FROM  v$sql_workarea_active
+  5         ORDER BY 1;
+   SID OPER              PASS    MEM_KB   TSEG_KB
+------ ----------------- ----- --------- ---------
+ <환경값> GROUP BY (SORT)     1   <환경값>   <환경값>   -- pass=1(one-pass), 임시 세그먼트 사용
+
+-- 해석: NUMBER_PASSES=1 → one-pass(디스크 1회 경유). TEMPSEG_SIZE가 잡힌다 →
+--   작업 영역이 임시 테이블스페이스로 넘쳤다는 직접 증거다.
+
+SYS@orcl> -- (실행 후) 누적 정렬 통계로 디스크 정렬 발생을 확인한다.
+SYS@orcl> SELECT name, value FROM v$sysstat
+  2         WHERE name IN ('sorts (memory)','sorts (disk)');
+NAME             VALUE
+---------------- ----------
+sorts (disk)     <환경값>     -- 0에서 증가 (디스크 정렬 발생!)
+sorts (memory)   <환경값>
+
+SYS@orcl> SELECT low_optimal_size/1024 low_kb, onepass_executions onepass,
+  2                multipasses_executions multi
+  3         FROM  v$sql_workarea_histogram
+  4         WHERE onepass_executions>0 OR multipasses_executions>0;
+  LOW_KB   ONEPASS   MULTI
+-------- --------- -------
+ <환경값>   <환경값>       0     -- 해당 버킷에 onepass가 잡힘
+
+-- 해석: 실습 04에서 전부 0이던 onepass가 이제 잡힌다. 전후 대비가 핵심이다 —
+--   이 정상값(0)과 이상값(>0)의 차이를 익혀 두면, 운영에서 sorts(disk)나
+--   onepass가 오를 때 '작업 영역 부족'을 즉시 읽어 낼 수 있다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상/오류 → 원인 → 조치 → 재확인) 임시 공간 부족 상황.
+--------------------------------------------------------------------------------
+-- * 만약 작업 영역을 더 줄이거나 정렬 대상이 크면 multi-pass가 되고, 임시
+--   테이블스페이스 여유가 부족하면 아래 오류가 난다.
+SQLT@orcl> SELECT drug_code, quantity, claim_amount
+  2         FROM  claim_details ORDER BY claim_amount, quantity, drug_code;
+ERROR at line 1:
+ORA-01652: unable to extend temp segment by 128 in tablespace TEMP
+
+-- 원인: 정렬이 디스크로 넘쳤는데 임시 테이블스페이스에 세그먼트를 확장할
+--   여유가 없다. 이는 PGA 한도(ORA-04036)와 다른, '임시 공간' 문제다.
+SQLT@orcl> -- 조치: 임시 테이블스페이스에 공간을 확보하거나 정렬 대상을 줄인다.
+SYS@orcl> SELECT tablespace_name, SUM(bytes_used)/1024/1024 used_mb
+  2         FROM  v$temp_extent_pool GROUP BY tablespace_name;
+-- (여유 확인 후) ALTER TABLESPACE temp ADD TEMPFILE ... 또는 AUTOEXTEND ON.
+
+SQLT@orcl> -- 재확인: 공간 확보 후 같은 정렬을 다시 실행하면 ORA-01652 없이 완료된다.
+
+--------------------------------------------------------------------------------
+-- [5] (원복) 세션 설정을 자동으로 되돌린다.
+--------------------------------------------------------------------------------
+SQLT@orcl> ALTER SESSION SET WORKAREA_SIZE_POLICY = AUTO;   -- 명시적 원복
+Session altered.
+-- (또는 그냥 EXIT 하면 세션 종료로 자동 원복된다. 인스턴스에는 영향 없음.)
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 작업 영역 축소는 '세션 수준'(WORKAREA_SIZE_POLICY=MANUAL)으로만 한다.
+-- 2) 축소 후 대량 정렬 → sorts(disk)↑, 히스토그램 onepass↑, TEMPSEG 사용.
+-- 3) NUMBER_PASSES>0·TEMPSEG_SIZE로 디스크 넘침을 실시간 확인(WORKAREA_ACTIVE).
+-- 4) 임시 공간 부족은 ORA-01652(≠ORA-04036). 공간 확보 또는 대상 축소로 조치.
+-- 5) 인스턴스 파라미터는 건드리지 않는다. 접속 종료로 세션 설정 자동 원복.
+
+SQLT@orcl> EXIT
+================================================================================

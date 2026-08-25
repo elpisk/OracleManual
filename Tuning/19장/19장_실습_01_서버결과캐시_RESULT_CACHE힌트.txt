@@ -1,0 +1,135 @@
+================================================================================
+ 19장 실습 01 — 서버 결과 캐시 활성화와 RESULT_CACHE 힌트 적용 효과
+ 목표: DRUG_MASTER(소형 참조 테이블) 집계에 /*+ RESULT_CACHE */ 힌트를 붙여
+       실행계획의 RESULT CACHE 단계와, 첫 실행 대비 재실행의 캐시 통계 변화를
+       확인한다. 결과 캐시가 '완성된 결과'를 저장해 재계산을 없앰을 관찰한다.
+ 환경: non-CDB=orcl 19.3 (SQLT 계정으로 수행, 일부 V$는 SYS 조회)
+ 주의: 개인 실습 환경 전용. 읽기 위주 조회이며 DRUG_MASTER를 변경하지 않는다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 결과 캐시 파라미터와 현재 통계를 먼저 캡처한다.
+--     result_cache_mode=MANUAL 이면 힌트로 명시한 결과만 캐시된다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT name, display_value
+  2         FROM  v$parameter
+  3         WHERE name LIKE 'result_cache%'
+  4         ORDER BY name;
+
+NAME                             DISPLAY_VALUE
+-------------------------------- ---------------
+result_cache_max_result          5
+result_cache_max_size            7712K
+result_cache_mode                MANUAL
+result_cache_remote_expiration   0
+
+-- 해석: mode=MANUAL(기본·권장) → /*+ RESULT_CACHE */ 힌트나 테이블 주석으로
+--   명시한 결과만 캐시된다. max_result=5(%) → 단일 결과는 캐시의 5%를 넘으면
+--   캐시되지 않는다. 소량 반환 집계라면 문제없다.
+
+SYS@orcl> -- (조치 전 통계) 생성·조회·무효화 카운트의 출발점을 기록한다.
+SYS@orcl> SELECT name, value
+  2         FROM  v$result_cache_statistics
+  3         WHERE name IN ('Create Count Success','Find Count','Invalidation Count');
+
+NAME                     VALUE
+------------------------ ----------
+Create Count Success     <환경값>
+Find Count               <환경값>
+Invalidation Count       <환경값>
+
+-- 해석: 절대값은 인스턴스 기동 이후 누적이라 환경마다 다르다(<환경값>).
+--   중요한 것은 '이 실습 동안의 델타(증가분)'다. 아래에서 전후로 비교한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) DRUG_MASTER 분류별 집계에 RESULT_CACHE 힌트를 붙여 첫 실행.
+--     많이 읽고 적게 반환하는 전형적 캐시 후보다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ RESULT_CACHE */ category, COUNT(*) cnt, ROUND(AVG(price),1) avg_price
+  2         FROM  drug_master
+  3         GROUP BY category
+  4         ORDER BY category;
+
+CATEGORY        CNT   AVG_PRICE
+--------------- ----- ----------
+내복약          <환경값> <환경값>
+주사제          <환경값> <환경값>
+처치            <환경값> <환경값>
+수술            <환경값> <환경값>
+
+SQLT@orcl> -- 방금 문장의 실행계획을 본다. RESULT CACHE 연산이 있어야 한다.
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL,NULL,'BASIC'));
+
+-----------------------------------------------------------
+| Id | Operation            | Name                        |
+-----------------------------------------------------------
+|  0 | SELECT STATEMENT     |                             |
+|  1 |  RESULT CACHE        | <환경값: 캐시ID 26자리>     |
+|  2 |   HASH GROUP BY      |                             |
+|  3 |    TABLE ACCESS FULL | DRUG_MASTER                 |
+-----------------------------------------------------------
+
+-- 해석: Id 1의 RESULT CACHE 연산과 Name 열의 캐시 ID가 핵심이다. 첫 실행이라
+--   아래 단계(HASH GROUP BY, TABLE ACCESS FULL)가 실제로 수행되어 결과를 만들고
+--   그 결과를 캐시에 저장했다. Create Count Success가 1 늘었을 것이다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회·해석) 같은 질의를 재실행하고, 통계 델타로 '재사용'을 확인한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ RESULT_CACHE */ category, COUNT(*) cnt, ROUND(AVG(price),1) avg_price
+  2         FROM  drug_master
+  3         GROUP BY category
+  4         ORDER BY category;
+-- (같은 결과. 이번에는 캐시에서 바로 나온다)
+
+SYS@orcl> SELECT name, value
+  2         FROM  v$result_cache_statistics
+  3         WHERE name IN ('Create Count Success','Find Count','Invalidation Count');
+
+NAME                     VALUE
+------------------------ ----------
+Create Count Success     <환경값>   -- [1] 대비 +1 (첫 실행에서 생성)
+Find Count               <환경값>   -- 재실행마다 +1 (캐시 히트)
+Invalidation Count       <환경값>   -- 변화 없음 (기반 테이블 안 바뀜)
+
+-- 해석: 첫 실행에서 Create +1, 재실행에서 Find +1이 확인된다. Invalidation은
+--   0 그대로다 — DRUG_MASTER를 건드리지 않았기 때문이다. 이것이 '한 번 계산해
+--   여러 번 재사용'하는 결과 캐시의 이득이다. 실측 캡처본에서는 이 상태가
+--   Create 1 / Find 5 / Invalidation 0 으로 관찰되었다(건강한 캐시).
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 힌트를 붙였는데 실행계획에 RESULT CACHE가 안 보이는 질의가 있다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ RESULT_CACHE */ category, COUNT(*), SYSDATE
+  2         FROM  drug_master
+  3         GROUP BY category;
+-- (결과는 나오지만) 실행계획에 RESULT CACHE 단계가 없다.
+
+SQLT@orcl> -- 원인 파악: 질의에 SYSDATE가 있다. SYSDATE는 매 실행마다 값이 달라지는
+SQLT@orcl> --   함수라 오라클이 캐시를 '금지'한다(시퀀스·SYS_GUID·임시 테이블도 동일).
+SQLT@orcl> --   힌트를 붙여도 캐시되지 않는 것이 정상이다.
+
+SQLT@orcl> -- 조치: 캐시가 필요하면 매번 달라지는 요소를 질의에서 제거한다.
+SQLT@orcl> SELECT /*+ RESULT_CACHE */ category, COUNT(*)
+  2         FROM  drug_master
+  3         GROUP BY category;
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL,NULL,'BASIC'));
+-- 재확인: 이번에는 실행계획에 RESULT CACHE 연산이 다시 나타난다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) MANUAL 모드에서 /*+ RESULT_CACHE */로 명시한 결과만 캐시된다.
+-- 2) 첫 실행=Create Count Success↑, 재실행=Find Count↑(캐시 히트).
+-- 3) SYSDATE·시퀀스 등 매번 달라지는 요소가 있으면 캐시가 금지된다(정상).
+-- 4) DRUG_MASTER처럼 읽기 위주·소량 반환·반복 조회 질의가 이상적 후보다.
+-- ※ 결과 캐시·V$RESULT_CACHE_* 조회는 관리 팩 라이선스와 무관하다.
+
+SQLT@orcl> EXIT
+================================================================================

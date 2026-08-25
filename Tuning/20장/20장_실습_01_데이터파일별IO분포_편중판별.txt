@@ -1,0 +1,137 @@
+================================================================================
+ 20장 실습 01 — 데이터파일별 I/O 분포와 편중 판별
+ 목표: V$FILESTAT를 DBA_DATA_FILES와 조인해 파일별 읽기·쓰기·평균 지연을 보고,
+       '용도로 설명되는 편중'과 '조사 대상 편중'을 가른다. 절대값이 아니라
+       상대 비교와 델타로 판정하는 습관을 익힌다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 부하: 편중 관찰을 위해 WL_02_io.sql(대량 전체 스캔·랜덤 읽기)을 잠시 사용.
+ 주의: 개인 실습 환경 전용. 조회 중심이며 부하 스크립트는 짧게만 돌린다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+SYS@orcl> COLUMN file_name FORMAT A48
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 파일별 I/O 분포를 읽기 횟수 내림차순으로 캡처한다.
+--     이 값은 인스턴스 기동 이후의 누적이다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT d.file_name, f.phyrds reads, f.phywrts writes,
+  2         ROUND(f.readtim/GREATEST(f.phyrds,1),2) avg_rd_ms
+  3    FROM  v$filestat f JOIN dba_data_files d ON f.file#=d.file_id
+  4    ORDER BY f.phyrds DESC;
+
+FILE_NAME                                        READS  WRITES  AVG_RD_MS
+------------------------------------------------ ------ ------- ---------
+/u02/oradata/orcl/system01.dbf                   13917    1344      0.34
+/u02/oradata/orcl/sysaux01.dbf                    7222    7584      0.47
+/u02/oradata/orcl/users01.dbf                     2340       0      0.97
+/u02/oradata/orcl/ORCL/datafile/o1_mf_users_..     619      41      0.51
+/u02/oradata/orcl/ts_stg01.dbf                     404       0      0.54
+/u02/oradata/orcl/undotbs01.dbf                     68    2007      0.38
+/u02/oradata/orcl/rtbs01.dbf                        52       0      0.50
+
+-- 해석(편중의 성격):
+--   system01  : 읽기 13,917 압도 → 딕셔너리 조회가 잦은 SYSTEM. 읽기 편중 정상.
+--   sysaux01  : 읽기 7,222 / 쓰기 7,584 → AWR·통계 저장소. 균형. 정상.
+--   undotbs01 : 읽기 68 / 쓰기 2,007 → Undo는 전 이미지 기록. 쓰기 편중 정상.
+--   users01   : 평균 읽기 지연 0.97ms → 다른 파일(0.34~0.54)의 약 2배. 상대 신호로 기억.
+--   ※ 편중 자체가 문제가 아니다. '용도로 설명되는 편중'은 건강한 편중이다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 파일 유형별로 크게 본다 — V$IOSTAT_FILE.
+--     소량 읽기=단일 블록 랜덤, 대량 읽기=다중 블록 순차.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT filetype_name,
+  2         ROUND(small_read_megabytes,1) sm_rd_mb,
+  3         ROUND(large_read_megabytes,1) lg_rd_mb,
+  4         small_read_reqs, large_read_reqs
+  5    FROM  v$iostat_file
+  6    WHERE filetype_name IN ('Data File','Temp File','Log File',
+  7                            'Control File','Archive Log')
+  8    ORDER BY small_read_megabytes DESC;
+
+FILETYPE_NAME   SM_RD_MB  LG_RD_MB  SMALL_READ_REQS  LARGE_READ_REQS
+--------------- --------  --------  ---------------  ---------------
+Control File        1776        40           113662               48
+Data File            113       988            12940             1023
+Data File             92       888             6356              913
+Temp File              1        10               53               12
+Log File               0       122              107              124
+
+-- 해석: Control File 소량 읽기 요청 113,662 → 체크포인트·로그 스위치로 잦은 접근(정상).
+--   Data File은 대량 읽기(LG_RD_MB)가 소량보다 큼 → 순차 대량 I/O(전체 스캔) 상당.
+--   → 다중 블록 읽기 설정(실습 04)이 성능에 직접 영향을 준다는 근거.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 전 델타 준비) 특정 구간 편중을 보려면 두 시점의 차가 필요하다.
+--     지금 스냅샷을 임시 테이블에 저장한다.
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE GLOBAL TEMPORARY TABLE fs_snap
+  2    ON COMMIT PRESERVE ROWS
+  3    AS SELECT file#, phyrds, phywrts FROM v$filestat;
+
+Table created.
+
+--------------------------------------------------------------------------------
+-- [부하 유발] 업무 계정에서 WL_02_io.sql 을 약 30초간 돌려 전체 스캔을 유발.
+--------------------------------------------------------------------------------
+SYS@orcl> -- (다른 세션) SQLT@orcl> @WL_02_io.sql   -- 약 30초 후 중단
+SYS@orcl> -- 부하 종료 후 델타를 계산한다.
+
+SYS@orcl> SELECT d.file_name,
+  2         f.phyrds - s.phyrds AS d_reads,
+  3         f.phywrts - s.phywrts AS d_writes
+  4    FROM  v$filestat f JOIN fs_snap s ON f.file#=s.file#
+  5          JOIN dba_data_files d ON f.file#=d.file_id
+  6    WHERE f.phyrds - s.phyrds > 0
+  7    ORDER BY d_reads DESC;
+
+FILE_NAME                                        D_READS  D_WRITES
+------------------------------------------------ -------  --------
+/u02/oradata/orcl/ts_stg01.dbf                   <환경값>         0
+/u02/oradata/orcl/users01.dbf                    <환경값>         0
+
+-- 해석: 부하 구간 동안 읽기가 급증한 파일이 델타로 드러난다(값은 환경 의존).
+--   전체 스캔이 특정 업무 파일에 집중됐다면, 그 세그먼트를 다음 단계로 지목한다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 신입 DBA가 "users01 평균 지연 0.97ms니 디스크가 느리다.
+--       스토리지를 교체하자"고 절대값만 보고 주장한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: 0.97ms는 SSD·캐시 환경에서 문제 수준이 아니다.
+SYS@orcl> --   판정은 절대 임계값이 아니라 '같은 인스턴스 다른 파일 대비 배수'로 한다.
+SYS@orcl> --   또 누적 평균이라 특정 구간의 실제 부하는 델타로 봐야 한다([3] 참조).
+
+SYS@orcl> -- 조치: 스토리지 교체 결정을 미루고, 델타에서 급증한 파일의 세그먼트를
+SYS@orcl> --   V$SEGMENT_STATISTICS로 지목한 뒤 그 SQL의 실행계획을 먼저 본다.
+SYS@orcl> SELECT object_name, statistic_name, value
+  2    FROM  v$segment_statistics
+  3    WHERE statistic_name='physical reads'
+  4    ORDER BY value DESC FETCH FIRST 5 ROWS ONLY;
+
+OBJECT_NAME              STATISTIC_NAME    VALUE
+------------------------ ----------------- --------
+<환경값 상위 세그먼트>    physical reads    <환경값>
+
+-- 재확인: 상위 세그먼트가 인덱스를 못 타는 SQL의 전체 스캔 대상이면,
+--   고칠 곳은 디스크가 아니라 SQL이다. 스토리지가 진짜 병목인지는
+--   실습 02(CALIBRATE_IO)로 실측한 뒤 판단한다. → 절대값 오판 교정 완료.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) V$FILESTAT는 파일별 읽기·쓰기·지연 누적. 편중은 상대 비교·델타로 판정한다.
+-- 2) 용도로 설명되는 편중(undo=쓰기, system=읽기)은 정상. 아닌 편중만 조사.
+-- 3) 특정 구간 편중은 두 시점 델타로 계산한다(누적값 함정).
+-- 4) 절대 지연값만으로 '디스크가 느리다'고 단정하지 않는다 → 세그먼트·SQL·실측으로.
+-- ※ V$FILESTAT·V$IOSTAT_FILE·V$SEGMENT_STATISTICS 조회는 라이선스 무관.
+
+SYS@orcl> DROP TABLE fs_snap PURGE;
+Table dropped.
+
+SYS@orcl> EXIT
+================================================================================

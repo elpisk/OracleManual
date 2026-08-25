@@ -1,0 +1,118 @@
+================================================================================
+ 19장 실습 04 — PGA 작업 영역 확인(V$PGASTAT, V$SQL_WORKAREA_HISTOGRAM)
+ 목표: 인스턴스 PGA 상태를 조회해 target·over allocation·cache hit를 읽고,
+       작업 영역 히스토그램으로 optimal/one-pass/multi-pass 분포를 확인한다.
+       '건강한 기본 상태'의 정상값을 몸에 익힌다(나쁜 상태는 실습 05에서 재현).
+ 환경: non-CDB=orcl 19.3 (SYS), 메모리 관리=ASMM
+ 주의: 개인 실습 환경 전용. 이 실습은 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태·조회) V$PGASTAT — 인스턴스 전체 PGA 상태.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, ROUND(value/1024/1024,2) mb
+  2         FROM  v$pgastat
+  3         WHERE name IN ('aggregate PGA target parameter','total PGA inuse',
+  4                'total PGA allocated','maximum PGA allocated')
+  5         ORDER BY 2 DESC;
+
+NAME                              MB
+-------------------------------- --------
+aggregate PGA target parameter   700
+maximum PGA allocated            510.74
+total PGA allocated              487.82
+total PGA inuse                  297.41
+
+SYS@orcl> SELECT name, value
+  2         FROM  v$pgastat
+  3         WHERE name IN ('over allocation count','cache hit percentage');
+
+NAME                     VALUE
+------------------------ ----------
+over allocation count    0
+cache hit percentage     100
+
+-- 해석: 핵심은 두 줄이다. over allocation count=0 → target 700M이 워크로드를
+--   감당해 목표를 넘겨 억지로 더 할당한 적이 없다. cache hit percentage=100 →
+--   기동 이후 모든 작업 영역이 optimal로 돌았다(추가 패스 없음). total PGA
+--   allocated(487.82)가 target(700) 이내다. target은 '목표'이지 '한도'가 아니다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) V$SQL_WORKAREA_HISTOGRAM — 작업 영역 크기별 실행 분포.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT low_optimal_size/1024 low_kb,
+  2                (high_optimal_size+1)/1024 high_kb,
+  3                optimal_executions opt, onepass_executions onepass,
+  4                multipasses_executions multi
+  5         FROM  v$sql_workarea_histogram
+  6         WHERE total_executions > 0
+  7         ORDER BY low_optimal_size;
+
+  LOW_KB   HIGH_KB     OPT   ONEPASS   MULTI
+-------- --------- ------- --------- -------
+       2         4   25677         0       0
+      64       128   20190         0       0
+     128       256      84         0       0
+     256       512     180         0       0
+     512      1024   10872         0       0
+    1024      2048   10690         0       0
+    2048      4096       9         0       0
+    4096      8192       1         0       0
+   32768     65536       2         0       0
+
+-- 해석: 모든 버킷에서 ONEPASS·MULTI가 0이다. 즉 크기와 무관하게 모든 작업
+--   영역이 optimal로 돌았다. 32768~65536KB(32~64MB)의 큰 작업 영역 2건마저
+--   optimal이다. 이는 [1]의 cache hit 100%·over allocation 0과 정확히 일치한다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 정렬 통계로 같은 상태를 교차 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value
+  2         FROM  v$sysstat
+  3         WHERE name IN ('sorts (memory)','sorts (disk)','sorts (rows)')
+  4         ORDER BY name;
+
+NAME             VALUE
+---------------- ----------
+sorts (disk)     0
+sorts (memory)   67163
+sorts (rows)     12508490
+
+-- 해석: sorts (disk)=0 → 디스크 정렬이 한 번도 없었다. 6만 7천여 정렬이 전부
+--   메모리에서 끝났다. 세 지표(over allocation·cache hit·히스토그램)와 여기
+--   sorts(disk)=0까지, 네 신호가 같은 이야기를 한다 → 이 PGA는 건강하다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 가정 → 원인 → 조치 → 재확인) 만약 지표가 나빴다면?
+--------------------------------------------------------------------------------
+-- * 이상 징후 가정: over allocation count가 계속 증가하거나 히스토그램에
+--     onepass/multipass가 잡힌다.
+-- * 원인: PGA_AGGREGATE_TARGET이 현재 워크로드에 비해 작아, 작업 영역이
+--     optimal을 못 채우고 디스크로 넘치고 있다는 신호다.
+SYS@orcl> -- 조치: 추측하지 말고 V$PGA_TARGET_ADVICE로 근거를 확보한다.
+SYS@orcl> SELECT ROUND(pga_target_for_estimate/1024/1024) target_mb,
+  2                estd_pga_cache_hit_percentage cache_hit_perc,
+  3                estd_overalloc_count
+  4         FROM  v$pga_target_advice
+  5         ORDER BY target_mb;
+-- (over allocation=0이 되는 지점 이상으로 target을 올리고, 그 안에서 cache hit를
+--  최대화한다. 지금은 지표가 건강하므로 조정이 필요 없다.)
+
+-- 재확인: 실측은 건강한 상태이므로 여기서 어떤 파라미터도 바꾸지 않는다.
+--   '지표가 건강한데 PGA부터 키우는 것'은 근거 없는 조치다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) V$PGASTAT: over allocation 0 + cache hit 100% = 작업 영역이 전부 optimal.
+-- 2) V$SQL_WORKAREA_HISTOGRAM: 모든 버킷 onepass/multipass 0 (교과서적 건강).
+-- 3) V$SYSSTAT: sorts (disk) 0 으로 교차 확인.
+-- 4) target은 목표이지 한도가 아니다. 조정은 V$PGA_TARGET_ADVICE 근거로.
+-- ※ 이 V$ 조회들은 관리 팩 라이선스와 무관하다.
+
+SYS@orcl> EXIT
+================================================================================
