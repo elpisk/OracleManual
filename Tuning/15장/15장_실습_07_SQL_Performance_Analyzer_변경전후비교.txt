@@ -1,0 +1,154 @@
+================================================================================
+ 15장 실습 07 — SQL Performance Analyzer(SPA): 변경 전후 비교
+ 목표: DBMS_SQLPA로 SPA 분석 태스크를 만들어, 환경 변경(옵티마이저 파라미터)
+       전후의 SQL 성능을 before/after로 측정하고 비교 보고서를 확인한다.
+       회귀 SQL을 어떻게 골라 대응하는지(SQL Plan Baseline) 정리한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 라이선스(🔒): SPA는 Tuning Pack이 필요하다(Diagnostics 선행).
+ 주의: 개인 실습 환경 전용. 세션 파라미터 변경만 하며 인스턴스에 영향 없음.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LONG 200000 LINESIZE 140 PAGESIZE 0
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전) 분석에 쓸 STS가 있는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, statement_count FROM dba_sqlset WHERE owner='SYS';
+
+NAME         STATEMENT_COUNT
+------------ ---------------
+CLAIMS_STS              <환경값>
+
+-- 해석: SPA는 'SQL 집합(STS)'을 대상으로 before/after를 잰다. 건수는 환경 의존.
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 조치) 존재하지 않는 STS 이름으로 태스크를 만들어 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> DECLARE t VARCHAR2(64);
+  2  BEGIN
+  3    t := DBMS_SQLPA.CREATE_ANALYSIS_TASK(
+  4           sqlset_name => 'CLAIMS_STSS',   -- 오타: 존재하지 않는 STS
+  5           task_name   => 'SPA_PARAM');
+  6  END;
+  7  /
+DECLARE t VARCHAR2(64);
+*
+ERROR at line 1:
+ORA-13757: "SQL Tuning Set" "CLAIMS_STSS" owned by user "SYS" does not exist.
+ORA-06512: at "SYS.DBMS_SQLPA", line 1024
+ORA-06512: at line 3
+
+SYS@orcl> -- 원인 파악: STS 이름 오타. DBA_SQLSET에서 실제 이름을 확인한다.
+SYS@orcl> SELECT name FROM dba_sqlset WHERE owner='SYS' AND name LIKE 'CLAIMS%';
+
+NAME
+------------
+CLAIMS_STS
+
+SYS@orcl> -- 조치: 올바른 이름 'CLAIMS_STS'로 다시 생성한다.
+SYS@orcl> DECLARE t VARCHAR2(64);
+  2  BEGIN
+  3    t := DBMS_SQLPA.CREATE_ANALYSIS_TASK(
+  4           sqlset_name => 'CLAIMS_STS',
+  5           task_name   => 'SPA_PARAM');
+  6  END;
+  7  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 재확인: 태스크가 정상 생성됐는지 확인한다.
+SYS@orcl> SELECT status FROM dba_advisor_tasks WHERE task_name='SPA_PARAM';
+
+STATUS
+-----------
+INITIAL
+
+-- 재확인: 올바른 STS 이름으로 태스크가 생성됐다(status=INITIAL). 이름 오타가 원인이었다.
+
+--------------------------------------------------------------------------------
+-- [3] 변경 전(before) 성능을 측정한다(TEST EXECUTE: 실제 실행 후 통계 수집).
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_SQLPA.EXECUTE_ANALYSIS_TASK( -
+>   task_name      => 'SPA_PARAM', -
+>   execution_type => 'TEST EXECUTE', -
+>   execution_name => 'before');
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [4] 환경을 변경한다(예: 세션 옵티마이저 파라미터 조정).
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SESSION SET optimizer_index_cost_adj = 20;
+
+Session altered.
+
+--------------------------------------------------------------------------------
+-- [5] 변경 후(after) 성능을 측정한다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_SQLPA.EXECUTE_ANALYSIS_TASK( -
+>   task_name      => 'SPA_PARAM', -
+>   execution_type => 'TEST EXECUTE', -
+>   execution_name => 'after');
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [6] 두 실행을 비교한다(COMPARE PERFORMANCE, 지표 = ELAPSED_TIME).
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_SQLPA.EXECUTE_ANALYSIS_TASK( -
+>   task_name        => 'SPA_PARAM', -
+>   execution_type   => 'COMPARE PERFORMANCE', -
+>   execution_params => DBMS_ADVISOR.ARGLIST('comparison_metric','elapsed_time'));
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [7] (조회) 요약 보고서 — 개선/회귀/불변 집계.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT DBMS_SQLPA.REPORT_ANALYSIS_TASK('SPA_PARAM', -
+>   type=>'TEXT', section=>'SUMMARY') FROM dual;
+
+General Information
+-------------------------------------------------------------------------------
+ Task Name : SPA_PARAM        Compare : before -> after
+-------------------------------------------------------------------------------
+Overall Impact
+  SQL Tuning Set SQL Count  : <환경값>
+  Plan Change Count         : <환경값>
+  Overall Impact on Workload: <환경값>
+  Improved  : <환경값>
+  Regressed : <환경값>      <-- 회귀 SQL은 별도 대응(SQL Plan Baseline 고정)
+  Unchanged : <환경값>
+-------------------------------------------------------------------------------
+
+-- 해석: 절대값은 환경 의존이므로 <환경값>. 요점은 '회귀 SQL을 변경 적용 전에
+--   미리 골라낸다'는 것이다. 전체가 이득이어도 회귀 SQL이 있으면 그것만 대응한다.
+
+--------------------------------------------------------------------------------
+-- [8] (회귀 대응) 회귀 SQL만 SQL Plan Baseline으로 기존 계획에 고정한다(개념).
+--------------------------------------------------------------------------------
+-- * 변경을 통째로 포기하지 않는다. 전체 이득은 취하고 회귀만 막는다.
+-- * SQL Plan Baseline은 SQL Plan Management 기능으로 Tuning Pack이 아니다(팩 불필요).
+--   DBMS_SPM.LOAD_PLANS_FROM_CURSOR_CACHE 등으로 좋은 계획을 고정한다.
+
+--------------------------------------------------------------------------------
+-- [9] (원복·정리) 세션 파라미터를 되돌리고 태스크를 삭제한다.
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SESSION SET optimizer_index_cost_adj = 100;   -- 기본값 원복
+Session altered.
+SYS@orcl> EXEC DBMS_SQLPA.DROP_ANALYSIS_TASK('SPA_PARAM');
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) SPA는 DBMS_SQLPA로 STS 기반 before/after를 측정·비교한다(프로덕션 무영향, 🔒).
+-- 2) 실행 유형: EXPLAIN PLAN(계획만) / TEST EXECUTE(실제 실행 통계).
+-- 3) 존재하지 않는 STS 참조는 ORA-13757. DBA_SQLSET에서 실제 이름을 확인한다.
+-- 4) 보고서는 개선/회귀/불변을 집계 → 회귀 SQL만 SQL Plan Baseline으로 부분 대응한다.
+
+SYS@orcl> EXIT
+================================================================================

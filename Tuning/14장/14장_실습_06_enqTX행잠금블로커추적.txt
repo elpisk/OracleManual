@@ -1,0 +1,130 @@
+================================================================================
+ 14장 실습 06 — enq: TX - row lock contention 재현과 블로커 추적 (WL_04_lock.sql)
+ 목표: 세션 A가 특정 행을 UPDATE 후 커밋하지 않고 붙잡고, 세션 B가 같은 행을
+       UPDATE 하다 블로킹되는 고전 구성으로 enq: TX - row lock contention을
+       재현한다. 세션 C에서 blocking_session으로 최종 블로커를 역추적한다.
+ 환경: non-CDB=orcl 19.3 (진단·관찰 SYS AS SYSDBA / 부하 SQLT@orcl 2세션)
+ 라이선스: V$ 실시간 조회는 라이선스 무관.
+ 부하: WL_04_lock.sql — 복제 테이블 REVIEW_LOG_WL에서만 UPDATE(원본 불변).
+ 주의: 개인 실습 환경 전용. 원본 REVIEW_LOG은 절대 갱신하지 않는다.
+================================================================================
+
+-- [터미널 B = 세션 A] 같은 행을 UPDATE 후 커밋하지 않고 붙잡는다(블로커).
+$ sqlplus sqlt/****@orcl
+SQLT@orcl> @?/../부하스크립트/WL_04_lock.sql   -- 세션 A 역할(wl_hold_sec 동안 보유)
+SQLT@orcl> UPDATE review_log_wl SET review_status='H' WHERE log_id=100001;
+1 row updated.        -- 커밋하지 않는다. 행 잠금을 계속 쥔다.
+
+-- [터미널 D = 세션 B] 같은 행을 UPDATE 하려다 블로킹된다(대기자).
+$ sqlplus sqlt/****@orcl
+SQLT@orcl> UPDATE review_log_wl SET review_status='R' WHERE log_id=100001;
+   ... (응답이 돌아오지 않고 멈춘다 — enq: TX 대기) ...
+
+-- [터미널 A = 세션 C] 진단 계정으로 관찰·추적한다.
+$ sqlplus / as sysdba
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 지금 enq: TX로 대기 중인 세션이 있는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT event, wait_class, COUNT(*) sessions
+  2       FROM  v$session
+  3       WHERE event = 'enq: TX - row lock contention'
+  4       GROUP BY event, wait_class;
+
+EVENT                          WAIT_CLASS   SESSIONS
+------------------------------ ------------ --------
+enq: TX - row lock contention  Application         1
+
+-- 해석: Application 클래스다. 디스크·메모리가 아니라 애플리케이션의 잠금 설계
+--   문제다. 행 잠금은 읽기를 막지 않으므로 이 대기는 '쓰기 대 쓰기'에서만 생긴다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 대기자와 그를 막은 블로커를 함께 본다 — blocking_session.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT s.sid, s.event, s.blocking_session blocker,
+  2         s.row_wait_obj# obj#, s.seconds_in_wait wait_s
+  3       FROM  v$session s
+  4       WHERE s.event = 'enq: TX - row lock contention';
+
+       SID  EVENT                          BLOCKER  OBJ#  WAIT_S
+---------- ------------------------------ ------- ------ ------
+       596  enq: TX - row lock contention     597  74198     46
+
+-- 해석: 대기자 596은 블로커 597에 막혀 46초째 기다린다. obj#(74198)로 어느
+--   세그먼트인지도 잡힌다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 블로커(597)가 지금 무엇을 하고 있나 — 대기 사슬의 맨 끝.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sid, status, event, sql_id, state
+  2       FROM  v$session WHERE sid = 597;
+
+       SID  STATUS   EVENT                       SQL_ID         STATE
+---------- -------- --------------------------- -------------- -------
+       597  INACTIVE SQL*Net message from client 8g2j1x5k9q0z1  WAITING
+
+SYS@orcl> -- 어느 세그먼트에서 막혔나(대기자의 obj# 해석)
+SYS@orcl> SELECT owner, object_name, object_type
+  2       FROM  dba_objects WHERE data_object_id = 74198;
+
+OWNER  OBJECT_NAME    OBJECT_TYPE
+------ -------------- -----------
+SQLT   REVIEW_LOG_WL  TABLE
+
+-- 해석: 결정적 대목이다. 대기자 596은 실제로 시간을 쓰며 기다리는데, 그를 막은
+--   블로커 597은 status=INACTIVE이고 SQL*Net message from client(Idle)를 대기
+--   중이다. 즉 597은 행을 잠근 채 커밋도 롤백도 없이 사용자 입력을 기다리며
+--   '놀고 있다'. 전형적인 '커밋을 잊은 트랜잭션'이다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 여러 사용자가 "수정이 안 된다"고 신고한다. 대기자가 늘어난다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 확정: 누적 관점도 함께 확인한다(이 부하 구간의 enq: TX 대기).
+SYS@orcl> SELECT SUBSTR(event,1,34) event, total_waits,
+  2         ROUND(time_waited/100) sec, wait_class
+  3       FROM  v$system_event
+  4       WHERE event = 'enq: TX - row lock contention';
+
+EVENT                          TOTAL_WAITS  SEC  WAIT_CLASS
+------------------------------ ----------- ---- -----------
+enq: TX - row lock contention          105    8  Application
+
+-- 해석: 누적 105회·8초. 횟수는 적어도 Application 클래스에 뜬다는 것 자체가
+--   세션들이 서로의 커밋을 기다리며 직렬화됐다는 신호다.
+SYS@orcl> -- 엔큐 종류별 누적도 본다.
+SYS@orcl> SELECT eq_type, total_req#, total_wait#, succ_req#
+  2       FROM  v$enqueue_stat WHERE eq_type = 'TX';
+
+EQ  TOTAL_REQ# TOTAL_WAIT# SUCC_REQ#
+--- ---------- ----------- ---------
+TX     <환경값>    <환경값>  <환경값>
+
+-- 조치: 최종 블로커 597의 사용자에게 커밋/롤백을 유도한다(방치 세션이면 정책에
+--   따라 정리). 근본 처방은 애플리케이션이 트랜잭션을 짧게 유지하고 커밋을
+--   미루지 않도록 고치는 것이다. 대기자가 아니라 '사슬의 맨 끝'을 손댄다.
+SQLT@orcl> ROLLBACK;   -- (세션 A=597) 잠금 해제
+SYS@orcl> -- 재확인: 블로커가 잠금을 풀면 대기자 596의 UPDATE가 즉시 완료되고,
+SYS@orcl> --   enq: TX 대기 세션이 사라지는지 다시 조회한다.
+SYS@orcl> SELECT COUNT(*) waiting FROM v$session
+  2       WHERE event='enq: TX - row lock contention';
+
+   WAITING
+----------
+         0
+
+-- 재확인 완료: 블로커 커밋/롤백으로 대기가 즉시 해소됐다. 데드락이 아니라
+--   방치형 블로킹이었음이 확인된다(데드락이면 오라클이 ORA-00060으로 자동 해소).
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) enq: TX - row lock contention = Application 클래스, '쓰기 대 쓰기' 경합.
+-- 2) blocking_session을 타고 대기 사슬의 맨 끝(최종 블로커)을 찾는다.
+-- 3) 블로커는 대개 바쁜 게 아니라 커밋을 미룬 채 놀고 있다(INACTIVE).
+-- 4) 3장(누가 막았나)의 심화 — 이 대기가 어느 세그먼트·SQL에서 났나까지 본다.
+-- 5) 원본 불변, 복제본 REVIEW_LOG_WL에서만 재현했다.
+
+SYS@orcl> EXIT
+================================================================================

@@ -1,0 +1,146 @@
+================================================================================
+ 12장 실습 05 — WL_04_lock 경합 유발 → 알림 대응 절차 ★
+ 목표: WL_04_lock.sql로 잠금 경합을 유발해 활성 세션·대기가 치솟는 상황을 만들고,
+       알림이 울렸을 때 '무엇부터 보는가'의 대응 절차(증상→원인)를 손에 익힌다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 관찰, SQLT 세션으로 부하 유발)
+ 라이선스: V$ 조회·알림은 기본 기능(라이선스 무관).
+ 주의: 개인 실습 환경 전용. 부하 유발이 포함된다. 마지막에 반드시 원복한다.
+================================================================================
+
+--------------------------------------------------------------------------------
+-- [0] (부하 유발) 두 개의 SQLT 세션으로 같은 행을 두고 잠금 경합을 만든다.
+--     세션 A: 행을 갱신하고 커밋하지 않는다(블로커).
+--     세션 B(여러 개): 같은 행을 갱신하려다 enq: TX 대기에 걸린다.
+--------------------------------------------------------------------------------
+-- [세션 A]
+$ sqlplus sqlt/sqlt@orcl
+SQLT@orcl> UPDATE billing SET amount = amount + 1 WHERE bill_id = 1001;
+1 row updated.
+SQLT@orcl> -- 커밋하지 않고 그대로 둔다. (블로커 확정)
+
+-- [세션 B, WL_04_lock.sql — 같은 행을 갱신하려는 다중 세션]
+$ sqlplus sqlt/sqlt@orcl @WL_04_lock.sql
+SQLT@orcl> UPDATE billing SET amount = amount + 1 WHERE bill_id = 1001;
+-- (응답 없이 대기 상태 — enq: TX - row lock contention)
+
+--------------------------------------------------------------------------------
+-- 이하 [1]~[6]은 관찰용 SYS 세션에서 수행한다.
+--------------------------------------------------------------------------------
+$ sqlplus / as sysdba
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태 · 이상 징후 감지 → 대응 1단계) 알림 유형·심각도 확인.
+--     이상 징후: 잠금 대기 관련 알림이 울렸다. 곧바로 SQL부터 보지 않는다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT reason, message_level,
+  2         TO_CHAR(creation_time,'HH24:MI') created
+  3       FROM  dba_outstanding_alerts
+  4       WHERE reason LIKE '%response%' OR reason LIKE '%Blocked%'
+  5          OR reason LIKE '%session%';
+
+REASON                                        MESSAGE_LEVEL CREATED
+--------------------------------------------- ------------- -------
+Metrics "Average Users Waiting on Locks" ...              5 11:20
+
+-- 해석: 잠금 대기 관련 경고(MESSAGE_LEVEL=5) 알림이 진행 중이다(Stateful).
+--   이제 곧바로 SQL부터 보지 말고, 위에서 아래로 좁혀 간다.
+
+--------------------------------------------------------------------------------
+-- [2] (대응 2단계) 전체 부하 수준 — 인스턴스 전반인가 국소인가?
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT metric_name, ROUND(value,2) value
+  2       FROM  v$sysmetric
+  3       WHERE metric_name IN ('Average Active Sessions',
+  4         'Database Wait Time Ratio','Database CPU Time Ratio')
+  5         AND intsize_csec BETWEEN 5900 AND 6100
+  6       ORDER BY metric_name;
+
+METRIC_NAME               VALUE
+------------------------- -------
+Average Active Sessions   <환경값>
+Database CPU Time Ratio   <환경값>
+Database Wait Time Ratio   <환경값>
+
+-- 해석: 평시(실습 03의 CPU 96.8% / Wait 3.2%)와 달리 Wait Ratio가 크게 올랐다.
+--   CPU가 아니라 '기다림'이 지배한다 = 경합성 문제 신호. 국소 원인일 가능성.
+
+--------------------------------------------------------------------------------
+-- [3] (대응 3단계) 활성 세션을 대기 이벤트로 묶어 병목의 성격을 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT event, COUNT(*) sessions
+  2       FROM  v$session
+  3       WHERE status='ACTIVE' AND type='USER'
+  4         AND sid <> USERENV('SID')
+  5       GROUP BY event ORDER BY sessions DESC;
+
+EVENT                                    SESSIONS
+---------------------------------------- --------
+enq: TX - row lock contention                <환경값>
+SQL*Net message from client                  <환경값>
+
+-- 해석: 활성 세션이 'enq: TX - row lock contention'에 몰려 있다 = 잠금 경합이다.
+--   여기서 SQL 실행계획을 보는 것은 헛수고다. SQL이 느린 게 아니라 막혀 있다.
+
+--------------------------------------------------------------------------------
+-- [4] (대응 4단계) 대기·블로커 추적 — 누가 누구를 막는가.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT s.sid, s.username, s.blocking_session, s.event
+  2       FROM  v$session s
+  3       WHERE s.blocking_session IS NOT NULL;
+
+  SID USERNAME BLOCKING_SESSION EVENT
+----- -------- ---------------- --------------------------------
+ <환경값> SQLT              <블로커SID>  enq: TX - row lock contention
+
+SYS@orcl> -- 블로커 세션이 무엇을 하고 있는지 확인한다.
+SYS@orcl> SELECT sid, username, status, event, last_call_et
+  2       FROM  v$session WHERE sid = <블로커SID>;
+
+  SID USERNAME STATUS   EVENT                     LAST_CALL_ET
+----- -------- -------- ------------------------- ------------
+ <블로커SID> SQLT   INACTIVE SQL*Net message from client        <환경값>
+
+-- 원인 파악: 블로커는 INACTIVE(커밋 안 하고 놀고 있음)다. 갱신 후 방치된 트랜잭션이
+--   근본 원인이다. SQL이 느린 게 아니라 이 세션에 막혀 대기 중이었다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치) 블로커에 커밋·롤백을 유도한다. 응급 시에만 세션을 종료한다.
+--------------------------------------------------------------------------------
+-- 정상 조치: [세션 A]에서
+SQLT@orcl> COMMIT;   -- 또는 ROLLBACK
+Commit complete.
+
+-- 응급 조치(블로커에 접근 불가 시): SYS에서 세션 종료
+-- SYS@orcl> ALTER SYSTEM KILL SESSION '<블로커SID>,<serial#>' IMMEDIATE;
+
+--------------------------------------------------------------------------------
+-- [6] (대응 6단계 · 재확인) 대기 세션 해소·알림 자동 clear·지표 정상화 확인.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) waiters FROM v$session
+  2       WHERE event='enq: TX - row lock contention';
+
+   WAITERS
+----------
+         0
+
+SYS@orcl> SELECT COUNT(*) open_alert FROM dba_outstanding_alerts
+  2       WHERE reason LIKE '%Lock%' OR reason LIKE '%session%';
+
+ OPEN_ALERT
+----------
+         0
+
+-- 재확인: 대기 세션 0, 미해소 알림 0. 블로커 해소로 대기가 풀리고 Stateful 알림이
+--   자동 해소됐다. 증상(느림)이 아니라 원인(방치된 잠금)을 제거해 해결했다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 알림은 증상만 알려 준다. 절차: 유형→전체부하→활성세션→블로커→SQL→재확인.
+-- 2) Wait Ratio 급등 + enq:TX 몰림 = 잠금 경합. SQL 계획부터 보면 원인이 안 나온다.
+-- 3) 블로커는 커밋/롤백 유도로 해소. 세션 종료는 응급 수단.
+-- 4) 원인을 제거하면 Stateful 알림은 자동으로 사라진다.
+
+SYS@orcl> EXIT
+================================================================================

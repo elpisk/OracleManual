@@ -1,0 +1,108 @@
+================================================================================
+ 14장 실습 02 — db file sequential / scattered read 유발과 구분 (WL_02_io.sql)
+ 목표: 인덱스 경유 단일 블록 읽기(sequential)와 대량 풀스캔의 다중 블록
+       읽기(scattered)를 각각 유발해, 같은 'physical reads'라도 어떤 대기
+       이벤트로 나타나는지, 한 번에 몇 블록을 읽는지를 수치로 구분한다.
+ 환경: non-CDB=orcl 19.3 (진단 SYS AS SYSDBA / 부하 SQLT@orcl)
+ 라이선스: V$ 실시간 조회는 라이선스 무관.
+ 부하: 공용 부하 스크립트 WL_02_io.sql (SELECT만 수행, 원본 불변).
+ 주의: 개인 실습 환경 전용. WL_02는 원본 데이터를 변경하지 않는다.
+================================================================================
+
+-- [터미널 B] 업무 계정으로 I/O 부하를 건다(약 40초~2분).
+$ sqlplus sqlt/****@orcl
+SQLT@orcl> -- 구획1: PK 경유 랜덤 단일 블록 읽기, 구획2: CLAIM_DETAILS 대량 스캔
+SQLT@orcl> @?/../부하스크립트/WL_02_io.sql
+... (인덱스 랜덤 읽기 + 전체 스캔 반복 수행) ...
+
+-- [터미널 A] 진단 계정으로 관찰한다.
+$ sqlplus / as sysdba
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 부하 전 두 I/O 이벤트의 누적 대기를 적어 둔다(기준선).
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT event, total_waits, ROUND(time_waited/100) sec
+  2       FROM  v$system_event
+  3       WHERE event IN ('db file sequential read','db file scattered read');
+
+EVENT                     TOTAL_WAITS   SEC
+------------------------- ----------- -----
+db file sequential read       <환경값> <환경값>   -- 부하 전 기준선
+db file scattered read        <환경값> <환경값>
+
+-- 해석: 절대값은 환경마다 다르다. 중요한 것은 부하 후 '증가분(델타)'이다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 부하 후 누적을 다시 읽어 두 이벤트를 비교한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT SUBSTR(event,1,34) event, total_waits,
+  2         ROUND(time_waited/100) sec, wait_class
+  3       FROM  v$system_event
+  4       WHERE event IN ('db file sequential read','db file scattered read')
+  5       ORDER BY time_waited DESC;
+
+EVENT                          TOTAL_WAITS   SEC  WAIT_CLASS
+------------------------------ ----------- ----- -----------
+db file sequential read              17097    52  User I/O
+db file scattered read                1675    13  User I/O
+
+-- 해석: 이 부하 구간 누적에서 sequential read(17097회·52초)가 scattered
+--   read(1675회·13초)보다 크다. 둘 다 User I/O지만 성격이 다르다 —
+--   sequential=단일 블록=인덱스 경유, scattered=다중 블록=대량 스캔.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 한 번의 요청이 몇 블록을 읽었나 — 이름이 반대인 근거를 확인.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT n.name, s.value blocks
+  2       FROM  v$sysstat s JOIN v$statname n ON n.statistic#=s.statistic#
+  3       WHERE n.name IN ('physical reads','physical reads direct',
+  4                        'physical read total multi block requests',
+  5                        'table scan blocks gotten');
+
+NAME                                      BLOCKS
+----------------------------------------- ----------
+physical reads                              <환경값>
+physical reads direct                       <환경값>
+physical read total multi block requests    <환경값>
+table scan blocks gotten                    <환경값>
+
+-- 해석: scattered read는 multiblock 요청 1회에 DB_FILE_MULTIBLOCK_READ_COUNT
+--   만큼의 블록을 한꺼번에 읽어 버퍼의 흩어진 빈 자리에 담는다(그래서 scattered).
+--   sequential read는 요청 1회에 블록 1개다. '순차'는 버퍼 배치를 뜻하지
+--   디스크를 순차로 훑는다는 뜻이 아니다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 담당자가 "db file scattered read가 보이니 I/O가 느리다,
+--       디스크를 늘리자"고 한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: 이벤트가 아니라 그 읽기를 유발한 SQL로 내려간다.
+SYS@orcl> SELECT sql_id, disk_reads, buffer_gets,
+  2         SUBSTR(sql_text,1,40) txt
+  3       FROM  v$sql
+  4       WHERE disk_reads > 0
+  5       ORDER BY disk_reads DESC FETCH FIRST 3 ROWS ONLY;
+
+SQL_ID          DISK_READS BUFFER_GETS  TXT
+--------------- ---------- ----------- ----------------------------------------
+7wux9<환경값>       <환경값>    <환경값>  SELECT ... FROM CLAIM_DETAILS ...
+...
+
+-- 원인 확정: 상위 SQL이 CLAIM_DETAILS를 반복 풀스캔한다. 디스크가 느린 게 아니라
+--   '풀스캔을 부르는 SQL'이 원인이다. scattered=다중 블록=풀스캔의 신호였다.
+-- 조치: 조건절에 맞는 인덱스가 있는지/옵티마이저가 외면하는지 실행 계획을 본다.
+--   (결론이 'SQL 한 문장 재작성'이면 SQL 튜닝 과정으로 인계한다.)
+SYS@orcl> -- 재확인: 인덱스 접근이 되면 다음 부하에서 scattered↓ sequential↑ 로
+SYS@orcl> --   대기의 성격이 바뀐다. 델타를 다시 측정해 확인한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) sequential read=단일 블록=인덱스, scattered read=다중 블록=풀스캔.
+-- 2) 어느 쪽이 큰지로 접근 방식(인덱스 vs 풀스캔)을 추론한다.
+-- 3) 이벤트에서 멈추지 않고 V$SQL(disk_reads 순)로 원천 SQL을 지목한다.
+-- 4) 'scattered가 보인다=디스크 교체'가 아니라 'SQL·인덱스 설계부터'.
+
+SQLT@orcl> EXIT
+================================================================================

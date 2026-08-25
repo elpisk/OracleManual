@@ -1,0 +1,105 @@
+================================================================================
+ 12장 실습 01 — 서버 생성 알림 구조 확인
+ 목표: 서버 생성 알림의 두 부류(Stateful/Stateless)를 구분하고,
+       미해소 알림(DBA_OUTSTANDING_ALERTS)과 이력(DBA_ALERT_HISTORY)을 대조한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행, 일부 일반 계정 대조)
+ 라이선스: 서버 생성 알림·딕셔너리 뷰 조회는 기본 기능(라이선스 무관).
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 알림 인프라의 주체 확인 — MMON이 살아 있어야 알림이 뜬다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, description FROM v$bgprocess
+  2       WHERE name = 'MMON';
+
+NAME  DESCRIPTION
+----- ----------------------------------------------------------------
+MMON  Manageability Monitor Process
+
+-- 해석: MMON이 메트릭을 계산해 임계값 초과 시 ALERT_QUE에 알림을 등록한다.
+--   폴링이 아니라 사건 발생 시점의 push 구조다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 지금 진행 중인 문제 = 미해소 알림. Stateful 알림이 여기 남는다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT reason, message_level,
+  2         TO_CHAR(creation_time,'MM-DD HH24:MI') created
+  3       FROM  dba_outstanding_alerts
+  4       WHERE rownum <= 10;
+
+REASON                                    MESSAGE_LEVEL CREATED
+----------------------------------------- ------------- -----------
+Tablespace [RTBS] is [100 percent] full               1 08-10 10:20
+
+-- 해석: RTBS가 100% 찼다는 위험(MESSAGE_LEVEL=1) 알림 하나가 살아 있다.
+--   Stateful 알림이라 RTBS에 공간을 확보하면 다음 감시 주기에 자동 해소된다.
+--   MESSAGE_LEVEL: 1=Critical(위험), 5=Warning(경고).
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 지나간 사건 = 알림 이력. Stateless 알림과 해소된 알림이 여기 쌓인다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT SUBSTR(reason,1,44) reason,
+  2         TO_CHAR(creation_time,'MM-DD HH24:MI') created
+  3       FROM (SELECT reason, creation_time
+  4             FROM dba_alert_history ORDER BY creation_time DESC)
+  5       WHERE rownum <= 10;
+
+REASON                                       CREATED
+-------------------------------------------- -----------
+Instance orcl.orcl. down on node oel7v9.loca 08-24 14:56
+Instance orcl.orcl. up on node oel7v9.localdb 08-24 14:56
+Instance orcl.orcl. down on node oel7v9.loca 08-24 12:32
+Instance orcl.orcl. up on node oel7v9.localdb 08-24 12:32
+Instance orcl.orcl. down on node oel7v9.loca 08-24 11:23
+Instance orcl.orcl. up on node oel7v9.localdb 08-24 11:23
+Operation on resumable session big_load_job  08-20 13:08
+Instance orcl.orcl. down on node oel7v9.loca 08-18 12:52
+Instance orcl.orcl. up on node oel7v9.localdb 08-18 12:52
+Instance orcl.orcl. down on node oel7v9.loca 08-18 12:50
+
+-- 해석: up/down은 인스턴스 기동·정지 이벤트(Stateless), 'Operation on resumable
+--   session big_load_job'은 재개 가능 세션이 일시중단됐다 처리된 Stateless 사건.
+--   성능 알림과 운영 이벤트가 섞여 있으므로 reason으로 걸러 읽는다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 업무용 일반 계정(SQLT)으로 알림 뷰를 조회했더니 결과가 비었다/오류다.
+--------------------------------------------------------------------------------
+SYS@orcl> CONNECT sqlt/sqlt@orcl
+Connected.
+SQLT@orcl> SELECT COUNT(*) FROM dba_outstanding_alerts;
+SELECT COUNT(*) FROM dba_outstanding_alerts
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+SQLT@orcl> -- 원인 파악: DBA_* 알림 뷰는 일반 계정에 권한이 없다.
+SQLT@orcl> --   모니터링은 SYSDBA(또는 권한을 부여받은 관찰 계정)로 수행해야 한다.
+SQLT@orcl> -- 조치: 권한 있는 계정으로 다시 접속한다.
+SQLT@orcl> CONNECT / as sysdba
+Connected.
+SYS@orcl> SELECT COUNT(*) outstanding FROM dba_outstanding_alerts;
+
+OUTSTANDING
+-----------
+          1
+
+-- 재확인: SYSDBA에서는 조회된다. 미해소 알림 1건(= RTBS 위험)과 일치한다.
+--   ※ 운영에서는 SELECT ANY DICTIONARY 권한의 관찰 전용 계정을 별도로 둔다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 알림 주체는 MMON, 큐는 ALERT_QUE(push). EM 없이 딕셔너리 뷰로 완전 관리.
+-- 2) Stateful = 조건 지속 동안 유지·자동 해소 → DBA_OUTSTANDING_ALERTS.
+-- 3) Stateless = 사건, 해소 개념 없음 → DBA_ALERT_HISTORY 직행.
+-- 4) 알림 뷰 조회는 기본 기능. 단 권한 있는 계정으로 해야 한다.
+
+SYS@orcl> EXIT
+================================================================================

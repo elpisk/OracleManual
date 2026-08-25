@@ -1,0 +1,129 @@
+================================================================================
+ 11장 실습 01 — Compare Periods 보고서 생성 (awrddrpt.sql)
+ 목표: 두 구간(가벼운 A vs 무거운 B)의 스냅 범위를 지정해 AWR Compare Periods
+       차이 보고서를 만든다. awrddrpt.sql 대화형 생성과 AWR_DIFF_REPORT_TEXT
+       직접 호출 두 경로를 익히고, 라이선스가 막힌 상황을 재현·해결한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 부하: 공용 스크립트 WL_06_mixed.sql 을 SQLT 세션에서 강도를 달리해 두 번 실행하여
+       구간A(가벼움)와 구간B(무거움)를 만들었다(스냅 303~304 / 305~306).
+ 주의: 개인 실습 환경 전용. 🔒 AWR/Compare Periods 는 Diagnostics Pack 필요.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 비교에 쓸 스냅샷이 실제로 남아 있는지 먼저 확인한다.
+--     보존 기간(기본 8일)이 지났거나 사이에 재기동이 있으면 비교할 수 없다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT snap_id,
+  2         TO_CHAR(begin_interval_time,'MM-DD HH24:MI') beg,
+  3         TO_CHAR(end_interval_time  ,'MM-DD HH24:MI') fin
+  4       FROM  dba_hist_snapshot
+  5       WHERE snap_id BETWEEN 303 AND 306
+  6       ORDER BY snap_id;
+
+   SNAP_ID BEG            FIN
+---------- -------------- --------------
+       303 08-25 13:00    08-25 13:05
+       304 08-25 13:05    08-25 13:10
+       305 08-25 13:20    08-25 13:25
+       306 08-25 13:25    08-25 13:30
+
+-- 해석: 네 스냅이 모두 살아 있고 재기동 흔적(누적 통계 초기화)이 없다.
+--   구간A = 303→304(가벼운 부하), 구간B = 305→306(무거운 부하)로 잡는다.
+--   구간 하나가 스냅 두 개, 두 구간이면 스냅 네 개 → Compare Periods 입력이다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) awrddrpt.sql 로 두 구간 차이 보고서를 만든다(text 형식).
+--------------------------------------------------------------------------------
+SYS@orcl> @?/rdbms/admin/awrddrpt.sql
+Enter value for report_type: text
+Enter value for num_days: 1
+Enter value for begin_snap: 303
+Enter value for end_snap: 304
+Enter value for num_days2: 1
+Enter value for begin_snap2: 305
+Enter value for end_snap2: 306
+Enter value for report_name: awrdiff_303_304_vs_305_306.txt
+
+Report written to awrdiff_303_304_vs_305_306.txt
+
+-- 해석: 스크립트는 형식 → 1구간 일수·시작·끝 → 2구간 일수·시작·끝 → 이름을
+--   차례로 묻는다. 두 구간의 길이가 달라도 되는 이유는 보고서가 초당·트랜잭션당
+--   으로 정규화해 길이 차이를 상쇄하기 때문이다(여기서는 둘 다 10분으로 잡았다).
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 대화형이 번거로우면 AWR_DIFF_REPORT_TEXT 로 SQL에서 바로 뽑는다.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN output FORMAT A120
+SYS@orcl> SELECT dbid FROM v$database;
+
+      DBID
+----------
+<환경값>       -- 이 값(dbid)은 환경마다 다르므로 아래 &dbid 로 넘긴다
+
+SYS@orcl> SELECT output
+  2       FROM  TABLE(
+  3         DBMS_WORKLOAD_REPOSITORY.AWR_DIFF_REPORT_TEXT(
+  4            &dbid, 1, 303, 304,     -- 구간A
+  5            &dbid, 1, 305, 306))    -- 구간B
+  6       WHERE ROWNUM <= 30;
+
+OUTPUT
+------------------------------------------------------------------------
+WORKLOAD REPOSITORY COMPARE PERIODS REPORT
+...
+Snapshot Set   Begin Snap   End Snap   Elapsed(min)   DB time(min)
+1st (구간A)          303         304          ~5.0            1.36
+2nd (구간B)          305         306          ~5.0            5.03
+...
+
+-- 해석: 반환 텍스트의 머리에 두 구간의 Elapsed 와 DB time 이 나온다.
+--   DB time(min) 을 초로 환산하면 구간A 약 81.8초, 구간B 약 302.0초다(약 3.7배).
+--   이 두 값이 이후 모든 판정의 '분자'가 된다(실습 02·05에서 사용).
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 팀 동료가 애플리케이션 계정(SQLT)으로 보고서를 만들려다 실패했다.
+--------------------------------------------------------------------------------
+SQLT@orcl> @?/rdbms/admin/awrddrpt.sql
+ERROR at line 1:
+ORA-20023: Missing start and end values for time model stat ...
+-- (또는 권한 부족으로 스냅 목록 자체가 비어 보인다)
+
+SQLT@orcl> -- 원인 파악: awrddrpt.sql 류는 DBA 롤이 필요하고, AWR 자체가
+SQLT@orcl> --   Diagnostics Pack 기능이다. 일반 업무 계정에는 권한이 없다.
+
+-- 조치: DBA 권한 계정(SYS)으로 실행한다. 그리고 라이선스 설정을 확인한다.
+SYS@orcl> SHOW PARAMETER control_management_pack_access
+NAME                             TYPE    VALUE
+-------------------------------- ------- -----------------------
+control_management_pack_access   string  DIAGNOSTIC+TUNING
+
+-- 재확인: SYS로 [2]를 다시 실행하니 보고서가 정상 생성된다.
+--   ★ 주의: 이 파라미터가 DIAGNOSTIC+TUNING '설정'이라는 것이 곧 라이선스
+--     '보유'를 뜻하지는 않는다. 설정과 계약은 별개다(1장).
+
+--------------------------------------------------------------------------------
+-- [5] (라이선스 대안) Diagnostics Pack 이 없으면 이렇게 대신한다.
+--------------------------------------------------------------------------------
+-- * Statspack: @?/rdbms/admin/spcreate.sql 로 설치 후, 두 구간 각각
+--     EXEC STATSPACK.SNAP; ... 부하 ... EXEC STATSPACK.SNAP; 로 스냅을 뜨고
+--     @?/rdbms/admin/spreport.sql 로 두 보고서를 만들어 Load Profile 을 대조.
+-- * V$ 직접 캡처: V$SYS_TIME_MODEL 을 두 구간 시작·끝에 저장해 델타를 계산.
+--   두 경로 모두 '초당·트랜잭션당으로 나눠 비교'하는 판정 원리는 동일하다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) Compare Periods 는 스냅 네 개(두 구간)를 입력받아 '차이'를 보여 준다.
+-- 2) 생성 경로 두 가지: awrddrpt.sql(대화형) / AWR_DIFF_REPORT_TEXT(SQL 직접).
+-- 3) 실측 두 구간 DB time: 구간A 81.8초 vs 구간B 302.0초(약 3.7배).
+-- 4) 업무 계정 실패는 권한/라이선스 문제 → SYS로 실행, 없으면 Statspack·V$.
+-- ※ 🔒 이 실습의 AWR·Compare Periods·DBA_HIST_* 는 Diagnostics Pack 필요.
+
+SYS@orcl> EXIT
+================================================================================

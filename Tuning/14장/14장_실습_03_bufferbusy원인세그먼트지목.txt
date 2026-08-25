@@ -1,0 +1,117 @@
+================================================================================
+ 14장 실습 03 — buffer busy waits 재현과 원인 세그먼트 지목 (V$SEGMENT_STATISTICS)
+ 목표: 여러 세션이 같은 세그먼트에 동시에 DML을 몰아 buffer busy waits를
+       유발하고, V$WAITSTAT(블록 클래스) → V$SEGMENT_STATISTICS(세그먼트)
+       → ROW_WAIT_OBJ#(지금 막힌 객체) 순으로 진원지를 지목한다.
+ 환경: non-CDB=orcl 19.3 (진단 SYS AS SYSDBA / 부하 SQLT@orcl 여러 세션)
+ 라이선스: V$ 실시간 조회는 라이선스 무관.
+ 부하: 복제 테이블 REVIEW_LOG_WL에 여러 세션이 동시 INSERT/UPDATE.
+ 주의: 개인 실습 환경 전용. 원본 REVIEW_LOG은 건드리지 않는다(복제본만 DML).
+================================================================================
+
+-- [터미널 B, C, D] 업무 계정 여러 세션이 같은 복제 세그먼트에 동시 DML을 몰아친다.
+$ sqlplus sqlt/****@orcl
+SQLT@orcl> -- 복제 테이블에 다중 세션 동시 INSERT (핫 블록 경합 유발)
+SQLT@orcl> @?/../부하스크립트/WL_04_lock.sql   -- REVIEW_LOG_WL 복제·동시 DML
+... (여러 세션이 같은 블록에 몰려 경합 발생) ...
+
+-- [터미널 A] 진단 계정으로 관찰한다.
+$ sqlplus / as sysdba
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 지금 buffer busy waits로 대기 중인 세션이 있는지 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT event, wait_class, COUNT(*) sessions
+  2       FROM  v$session
+  3       WHERE event = 'buffer busy waits'
+  4       GROUP BY event, wait_class;
+
+EVENT               WAIT_CLASS    SESSIONS
+------------------- ------------- --------
+buffer busy waits   Concurrency          1
+
+-- 해석: Concurrency 클래스다. 디스크에서 블록을 못 가져와 기다리는 I/O가 아니라,
+--   이미 메모리에 있는(올라오는 중인) 같은 블록을 놓고 세션들이 줄 선 동시성 문제다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 어느 '블록 클래스'에서 경합했나 — V$WAITSTAT.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT class, count, time
+  2       FROM  v$waitstat
+  3       WHERE count > 0 ORDER BY time DESC;
+
+CLASS                  COUNT    TIME
+------------------ --------- -------
+data block          <환경값> <환경값>   -- (대개 최상위)
+segment header      <환경값> <환경값>
+undo header         <환경값> <환경값>
+
+-- 해석: data block 경합이 크면 같은 데이터 블록에 동시 DML이 몰린 것이다.
+--   segment header면 동시 INSERT의 공간 관리 경합(ASSM 확인), undo면 언두 경합.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 어느 '세그먼트'가 진원지인가 — V$SEGMENT_STATISTICS.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT object_name, statistic_name, value
+  2       FROM  v$segment_statistics
+  3       WHERE owner='SQLT'
+  4         AND statistic_name IN ('logical reads','physical reads',
+  5                                'buffer busy waits')
+  6         AND value > 0
+  7       ORDER BY value DESC FETCH FIRST 8 ROWS ONLY;
+
+OBJECT_NAME          STATISTIC_NAME    VALUE
+-------------------- --------------- ------------
+MEDICAL_CLAIMS       logical reads      225305696
+CLAIM_DETAILS        logical reads      123172432
+REVIEW_LOG_WL        logical reads        2458176
+CLAIM_DETAILS        physical reads         13226
+REVIEW_LOG           physical reads          9058
+MEDICAL_CLAIMS       physical reads          6170
+PK_MEDICAL_CLAIMS    physical reads          1883
+PK_CLAIM_DETAILS     physical reads          1731
+
+-- 해석: 논리 읽기 상위(MEDICAL_CLAIMS·CLAIM_DETAILS)는 상시 핫 세그먼트다.
+--   이번 부하로 동시 DML을 몰아친 복제본 REVIEW_LOG_WL도 상위에 올라 있다 —
+--   경합이 이 세그먼트에서 났다는 정황이다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 통계만으로는 '지금 막힌 그 세션'이 정확히 어느 객체에서
+--       멈췄는지 단정하기 어렵다. 정확히 특정해야 조치가 선다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 확정: 지금 대기 중인 세션의 ROW_WAIT_OBJ#로 객체를 콕 집는다.
+SYS@orcl> SELECT sid, row_wait_obj#
+  2       FROM  v$session
+  3       WHERE event = 'buffer busy waits';
+
+       SID  ROW_WAIT_OBJ#
+---------- --------------
+       596          74213
+
+SYS@orcl> SELECT owner, object_name, subobject_name, object_type
+  2       FROM  dba_objects
+  3       WHERE data_object_id = 74213;
+
+OWNER  OBJECT_NAME     SUBOBJECT_NAME  OBJECT_TYPE
+------ --------------- --------------- -----------
+SQLT   REVIEW_LOG_WL                   TABLE
+
+-- 조치: data block 경합이므로 '경합 분산'이 처방이다 — 순차 증가 PK를 역키
+--   인덱스로, 핫 세그먼트를 해시 파티션으로 쪼개거나 동시 INSERT를 분산한다.
+--   디스크를 빠르게 하는 것은 buffer busy의 처방이 아니다.
+SYS@orcl> -- 재확인: 분산 후 같은 부하를 다시 걸어 V$SEGMENT_STATISTICS의 buffer
+SYS@orcl> --   busy waits와 V$WAITSTAT의 data block count가 줄었는지 확인한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) buffer busy waits는 I/O가 아니라 동시성(Concurrency) 문제다.
+-- 2) 추적 순서: V$WAITSTAT(블록 클래스) → V$SEGMENT_STATISTICS(세그먼트)
+--    → ROW_WAIT_OBJ#(지금 막힌 객체).
+-- 3) 처방은 '디스크'가 아니라 '경합 분산'(역키·해시 파티션·세그먼트 분산).
+-- 4) 원본은 불변, 복제본 REVIEW_LOG_WL에서만 경합을 재현했다.
+
+SYS@orcl> EXIT
+================================================================================

@@ -1,0 +1,124 @@
+================================================================================
+ 12장 실습 03 — 임계값을 얼마로 잡을 것인가 (이력 분포 산정)  🔒
+ 목표: DBA_HIST_* 이력에서 평시 분포(p50·p95·p99·peak)를 뽑아,
+       근거 있는 경고·위험 임계값을 산정한다. (이 장의 핵심)
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA)
+ 라이선스 주의(🔒): DBA_HIST_SYSMETRIC_SUMMARY 등 AWR 이력은 Diagnostics Pack
+       이 필요하다. 미보유 환경 대안 경로(V$SYSMETRIC_HISTORY 자체 적재)를 끝에 싣는다.
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 지금 한 시점의 값만 본다 — 이것만으로는 임계값을 못 정한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT metric_name, ROUND(value,2) value, metric_unit
+  2       FROM  v$sysmetric
+  3       WHERE metric_name IN ('Database CPU Time Ratio',
+  4         'Database Wait Time Ratio','Host CPU Utilization (%)',
+  5         'Average Active Sessions','Executions Per Sec')
+  6         AND intsize_csec BETWEEN 5900 AND 6100
+  7       ORDER BY metric_name;
+
+METRIC_NAME                    VALUE   METRIC_UNIT
+------------------------------ ------- -------------------------
+Average Active Sessions        4.28    Active Sessions
+Database CPU Time Ratio        96.8    % Cpu/DB_Time
+Database Wait Time Ratio       3.2     % Wait/DB_Time
+Executions Per Sec             916.31  Executes Per Second
+Host CPU Utilization (%)       48.77   % Busy/(Idle+Busy)
+
+-- 해석: AAS 4.28이 높은지 낮은지, Executions 916.31이 정상인지 이 한 점으로는
+--   알 수 없다. CPU Ratio 96.8%(대기 3.2%)도 Host CPU 48.77%·이력과 함께 봐야
+--   '건강한 CPU 바운드'인지 '포화 직전'인지 판정된다. 비교 대상 = 평시 분포가 필요.
+
+--------------------------------------------------------------------------------
+-- [2] (조회 🔒) 평시 분포를 뽑는다 — DBA_HIST_SYSMETRIC_SUMMARY의 백분위수.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT metric_name,
+  2         ROUND(PERCENTILE_CONT(0.50)
+  3           WITHIN GROUP (ORDER BY average),2) p50,
+  4         ROUND(PERCENTILE_CONT(0.95)
+  5           WITHIN GROUP (ORDER BY average),2) p95,
+  6         ROUND(PERCENTILE_CONT(0.99)
+  7           WITHIN GROUP (ORDER BY average),2) p99,
+  8         ROUND(MAX(maxval),2) peak
+  9       FROM  dba_hist_sysmetric_summary
+ 10       WHERE metric_name = 'Average Active Sessions'
+ 11       GROUP BY metric_name;
+
+METRIC_NAME               P50    P95    P99    PEAK
+------------------------- ------ ------ ------ ------
+Average Active Sessions   <환경값> <환경값> <환경값> <환경값>
+
+-- 해석: 실제 숫자는 환경 이력마다 다르므로 <환경값>. 요점은 산정 절차다.
+--   현재값 4.28은 이 분포 위의 한 점이다. p50 근처면 평범, p95를 넘으면 이례적.
+--   같은 4.28도 분포에 따라 해석이 정반대가 된다.
+
+--------------------------------------------------------------------------------
+-- [3] (산정 규칙) 분포에서 경고·위험을 도출한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 규칙:
+SYS@orcl> --   경고(Warning)  = p95            (드물게만 넘는 선, 대비 시간 확보)
+SYS@orcl> --   위험(Critical) = p99 ~ peak 사이 (정상에선 거의 안 닿는 선)
+SYS@orcl> --   + consecutive_occurrences 2~3 으로 p95 스침을 흡수
+SYS@orcl> --   + 분기마다 이력 재산정 (평시가 이동하므로)
+SYS@orcl> -- 교차검증: 평균+2*표준편차(경고 후보), 평균+3*표준편차(위험 후보)
+SYS@orcl> SELECT ROUND(AVG(average),2) avg_val,
+  2         ROUND(STDDEV(average),2) sd,
+  3         ROUND(AVG(average)+2*STDDEV(average),2) warn_cand,
+  4         ROUND(AVG(average)+3*STDDEV(average),2) crit_cand
+  5       FROM  dba_hist_sysmetric_summary
+  6       WHERE metric_name='Average Active Sessions';
+
+  AVG_VAL     SD  WARN_CAND CRIT_CAND
+--------- ------ ---------- ---------
+   <환경값>  <환경값>    <환경값>   <환경값>
+
+-- 해석: 백분위수(p95/p99)와 평균±표준편차가 비슷한 값을 가리키면 확신이 커진다.
+--   크게 어긋나면 분포가 치우쳤다는 뜻이라 백분위수를 택한다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 산정한 p95가 평시 중앙값처럼 낮게 나와, 걸면 알림이 상시로 울렸다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: 표본에 야간 배치 시간대와 주간 업무가 섞여 분포가 이봉형이 됐다.
+SYS@orcl> --   낮은 봉우리가 p95를 끌어내려, 배치 부하를 상시 경고로 잡은 것이다.
+SYS@orcl> -- 조치: 표본 구간을 업무 시간대로 분리해 다시 산정한다(주간만).
+SYS@orcl> SELECT ROUND(PERCENTILE_CONT(0.95)
+  2           WITHIN GROUP (ORDER BY average),2) p95_daytime
+  3       FROM  dba_hist_sysmetric_summary s
+  4       JOIN  dba_hist_snapshot n ON s.snap_id=n.snap_id
+  5       WHERE s.metric_name='Average Active Sessions'
+  6         AND TO_CHAR(n.begin_interval_time,'HH24') BETWEEN '09' AND '18';
+
+P95_DAYTIME
+-----------
+      <환경값>
+
+-- 재확인: 주간만으로 산정한 p95는 배치가 섞인 값보다 높고, 이 값으로 걸면
+--   주간 정상 부하에는 울리지 않는다. 배치 감시는 배치 시간대로 따로 산정한다.
+
+--------------------------------------------------------------------------------
+-- [5] (라이선스 대안 경로) Diagnostics Pack이 없다면?
+--------------------------------------------------------------------------------
+-- * DBA_HIST 대신 V$SYSMETRIC_HISTORY(최근 ~1시간, 60초 간격)를 스케줄러 잡으로
+--   자체 테이블에 주기 적재 → 며칠이면 백분위수 산정에 충분한 표본이 된다.
+-- * 또는 Statspack 스냅샷의 메트릭 사용. 표본 밀도만 낮을 뿐 절차는 동일하다.
+SYS@orcl> -- (예: 현재 이력 버퍼를 즉시 적재해 표본 축적을 시작)
+SYS@orcl> -- CREATE TABLE mon_sysmetric_hist AS SELECT * FROM v$sysmetric_history;
+SYS@orcl> -- 이후 잡으로 INSERT ... SELECT 반복.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 임계값에 이식 가능한 정답 숫자는 없다. 그 시스템의 평시 분포에서 나온다.
+-- 2) 경고=p95, 위험=p99~peak, 연속 관측으로 스파이크 흡수, 분기 재산정.
+-- 3) 표본은 업무 시간대로 분리한다(주간/배치를 섞지 않는다).
+-- 4) DBA_HIST는 🔒. 없으면 V$SYSMETRIC_HISTORY 적재로 같은 절차를 수행한다.
+
+SYS@orcl> EXIT
+================================================================================

@@ -1,0 +1,210 @@
+================================================================================
+ 15장 실습 04 — SQL Tuning Advisor 수동 실행과 권고 해석 (두 사례의 대조)
+ 목표: DBMS_SQLTUNE로 튜닝 태스크를 만들어 실행하고, 권고를 해석한다.
+       사례 1) 전체 집계 SQL → '권고 없음'(이미 최적)
+       사례 2) 선택 조건 SQL → 인덱스 권고(estimated benefit 99.64%)
+       두 결과의 대조로 '어드바이저는 항상 권고하지 않는다'를 체득한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행, 대상은 SQLT 스키마)
+ 라이선스(🔒): SQL Tuning Advisor는 Tuning Pack이 필요하다(Diagnostics 선행).
+ 주의: 권고 인덱스는 '확인'만 한다. 실제로 만들지 않아 MEDICAL_CLAIMS는
+       PK만 있는 Before 상태를 유지한다. 만들 경우 마지막 절 원복 안내 참조.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LONG 100000 LINESIZE 100 PAGESIZE 0
+
+================================================================================
+ 사례 1 — 전체를 집계하는 SQL: 권고가 없다
+================================================================================
+--------------------------------------------------------------------------------
+-- [1] (조치 전) 대상 SQL을 커서 캐시에서 확인한다.
+--     select /*+ full(d) */ count(*), sum(d.amt) from claim_details d
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN sql_text FORMAT A52 TRUNCATE
+SYS@orcl> SELECT sql_id, sql_text FROM v$sql
+  2       WHERE sql_id = '9vmszgd1ft9x0';
+
+SQL_ID        SQL_TEXT
+------------- ----------------------------------------------------
+9vmszgd1ft9x0 select /*+ full(d) */ count(*), sum(d.amt) from claim
+
+--------------------------------------------------------------------------------
+-- [2] 튜닝 태스크를 생성·실행한다(COMPREHENSIVE).
+--------------------------------------------------------------------------------
+SYS@orcl> DECLARE
+  2    t VARCHAR2(64);
+  3  BEGIN
+  4    t := DBMS_SQLTUNE.CREATE_TUNING_TASK(
+  5           sql_id     => '9vmszgd1ft9x0',
+  6           task_name  => 'TUNE_CH15_36061',
+  7           scope      => 'COMPREHENSIVE',
+  8           time_limit => 1800);
+  9    DBMS_SQLTUNE.EXECUTE_TUNING_TASK('TUNE_CH15_36061');
+ 10  END;
+ 11  /
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 보고서를 조회한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT DBMS_SQLTUNE.REPORT_TUNING_TASK('TUNE_CH15_36061') FROM dual;
+
+GENERAL INFORMATION SECTION
+-------------------------------------------------------------------------------
+Tuning Task Name   : TUNE_CH15_36061
+Tuning Task Owner  : SYS
+Workload Type      : Single SQL Statement
+Scope              : COMPREHENSIVE
+Time Limit(seconds): 1800
+Completion Status  : COMPLETED
+Started at         : 08/25/2026 14:34:21
+Completed at       : 08/25/2026 14:34:22
+-------------------------------------------------------------------------------
+Schema Name: SQLT
+SQL ID     : 9vmszgd1ft9x0
+SQL Text   : select /*+ full(d) */ count(*), sum(d.amt) from claim_details d
+-------------------------------------------------------------------------------
+
+There are no recommendations to improve the statement.
+
+-------------------------------------------------------------------------------
+
+-- 해석: '권고 없음'. 실패가 아니라 '이미 최적'이라는 결론이다.
+--   이 SQL은 테이블 전체를 집계하므로 어떤 인덱스도 전체 스캔보다 빠를 수 없고,
+--   통계도 최신이라 카디널리티 추정이 정확했다. 어드바이저의 침묵은 유효한 답이다.
+
+--------------------------------------------------------------------------------
+-- [4] (정리) 태스크를 삭제한다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_SQLTUNE.DROP_TUNING_TASK('TUNE_CH15_36061');
+
+PL/SQL procedure successfully completed.
+
+================================================================================
+ 사례 2 — 선택 조건 SQL: 인덱스 권고(benefit 99.64%)
+================================================================================
+--------------------------------------------------------------------------------
+-- [5] (조치 전) 대상 SQL. 특정 병원·특정 접수일로 소수 행만 찾는다.
+--     MEDICAL_CLAIMS에는 PK 외 인덱스가 없어 이 조건은 전체 스캔한다.
+--------------------------------------------------------------------------------
+SYS@orcl> DECLARE
+  2    t VARCHAR2(64);
+  3  BEGIN
+  4    t := DBMS_SQLTUNE.CREATE_TUNING_TASK(
+  5           sql_text  => 'select claim_id, total_amt from sqlt.medical_claims '||
+  6                        'where hosp_id=777 and receipt_date=date ''2024-06-15''',
+  7           task_name => 'TUNE_CH15_SEL',
+  8           scope     => 'COMPREHENSIVE',
+  9           time_limit=> 1800);
+ 10    DBMS_SQLTUNE.EXECUTE_TUNING_TASK('TUNE_CH15_SEL');
+ 11  END;
+ 12  /
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [6] (조회) 보고서를 조회한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT DBMS_SQLTUNE.REPORT_TUNING_TASK('TUNE_CH15_SEL') FROM dual;
+
+FINDINGS SECTION (1 finding)
+-------------------------------------------------------------------------------
+
+1- Index Finding (see explain plans section below)
+--------------------------------------------------
+  The execution plan of this statement can be improved by creating one or more
+  indices.
+
+  Recommendation (estimated benefit: 99.64%)
+  ------------------------------------------
+  - Consider running the Access Advisor to improve the physical schema design
+    or creating the recommended index.
+    create index SQLT.IDX$$_02860001 on SQLT.MEDICAL_CLAIMS
+      ("HOSP_ID","RECEIPT_DATE","CLAIM_ID","TOTAL_AMT");
+
+  Rationale
+  ---------
+    Creating the recommended indices significantly improves the execution plan
+    of this statement. However, it might be preferable to run "Access Advisor"
+    using a representative SQL workload as opposed to a single statement. This
+    will allow to get comprehensive index recommendations which takes into
+    account index maintenance overhead and additional space consumption.
+
+-------------------------------------------------------------------------------
+EXPLAIN PLANS SECTION
+-------------------------------------------------------------------------------
+
+1- Original
+-----------
+Plan hash value: 3132986698
+
+------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |     1 |    34 |   856   (1)| 00:00:01 |
+|*  1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS |     1 |    34 |   856   (1)| 00:00:01 |
+------------------------------------------------------------------------------------
+
+-- 해석: 하나의 Index Finding, 예상 이득 99.64%.
+--   원본 계획은 MEDICAL_CLAIMS를 TABLE ACCESS FULL(cost 856)로 읽는다.
+--   권고 인덱스 (HOSP_ID, RECEIPT_DATE, CLAIM_ID, TOTAL_AMT):
+--     앞 두 컬럼 = WHERE 조건(탐색), 뒤 두 컬럼 = SELECT 대상(테이블 재방문 제거).
+--     → 커버링 인덱스.
+
+--------------------------------------------------------------------------------
+-- [7] (판단 — 권고 맹신 경계)
+--------------------------------------------------------------------------------
+-- * benefit 99.64%는 '이 한 문장'에 대한 예상일 뿐이다.
+-- * 이 인덱스는 MEDICAL_CLAIMS에 INSERT/UPDATE가 있을 때마다 유지 비용을 발생시키고
+--   저장 공간을 차지한다. 조회 이득만 보고 쓰기 비용을 못 보면 배치가 느려질 수 있다.
+-- * 어드바이저 스스로 rationale에서 '단일 문장보다 대표 워크로드로 Access Advisor를
+--   돌리라'고 조언한다(→ 실습 06). 권고는 결론이 아니라 검증할 가설이다.
+-- * 따라서 이 실습에서는 인덱스를 '만들지 않고' 권고를 확인만 한다.
+
+--------------------------------------------------------------------------------
+-- [8] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 태스크 이름을 오타로 넣어 보고서를 조회하니 오류가 난다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT DBMS_SQLTUNE.REPORT_TUNING_TASK('TUNE_CH15_SELL') FROM dual;
+SELECT DBMS_SQLTUNE.REPORT_TUNING_TASK('TUNE_CH15_SELL') FROM dual
+       *
+ERROR at line 1:
+ORA-13780: SQL statement does not exist.
+ORA-06512: at "SYS.DBMS_SQLTUNE", line 8224
+
+SYS@orcl> -- 원인 파악: 'TUNE_CH15_SELL'은 존재하지 않는다(실제는 TUNE_CH15_SEL).
+SYS@orcl> SELECT task_name, status FROM dba_advisor_tasks
+  2       WHERE task_name LIKE 'TUNE_CH15%';
+
+TASK_NAME            STATUS
+-------------------- ----------
+TUNE_CH15_SEL        COMPLETED
+
+SYS@orcl> -- 조치: 올바른 이름으로 다시 조회하면 정상이다(위 [6]).
+SYS@orcl> -- 재확인 완료.
+
+--------------------------------------------------------------------------------
+-- [9] (정리) 태스크를 삭제한다. 인덱스는 만들지 않았으므로 Before 상태 그대로다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_SQLTUNE.DROP_TUNING_TASK('TUNE_CH15_SEL');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- (참고) 권고 인덱스를 실제로 만들어 볼 학습자는 아래처럼 하고 반드시 원복한다.
+SYS@orcl> --   create index SQLT.IDX_MC_TEST on sqlt.medical_claims
+SYS@orcl> --     (hosp_id, receipt_date, claim_id, total_amt);
+SYS@orcl> --   ... 확인 후 ...  drop index SQLT.IDX_MC_TEST;
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 같은 어드바이저·같은 방식인데 결과가 정반대다 — 차이는 SQL의 성격.
+-- 2) 전체 집계 SQL: '권고 없음'(이미 최적). 침묵도 유효한 진단 결과다.
+-- 3) 선택 조건 SQL: 인덱스 권고 benefit 99.64%. 그러나 단일 문장 기준일 뿐.
+-- 4) 인덱스는 워크로드 전체(읽기+쓰기 비용)로 판단한다 → 실습 06(Access Advisor).
+-- 5) 태스크 이름 오타는 ORA-13780. DBA_ADVISOR_TASKS에서 실제 이름을 확인한다.
+
+SYS@orcl> EXIT
+================================================================================

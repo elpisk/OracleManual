@@ -1,0 +1,140 @@
+================================================================================
+ 15장 실습 01 — 자동 유지관리 작업 구성 확인
+ 목표: 세 가지 자동 유지관리 작업이 무엇이며, 언제(어느 윈도우) 도는지 확인한다.
+       DBA_AUTOTASK_CLIENT / DBA_AUTOTASK_WINDOW_CLIENTS / JOB_HISTORY를 읽는다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 라이선스: 이 실습의 자동 유지관리 작업 '조회'는 관리 팩과 무관하다.
+       (자동 SQL 튜닝 어드바이저 '작업' 자체는 🔒 Tuning Pack이지만, 여기서는
+        구성 상태만 확인한다.)
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200 PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 세 자동 유지관리 작업이 켜져 있는지 먼저 확인한다.
+--     ADMIN 29·30장에서 '무슨 작업이 있는가'를 다뤘다. 여기서는 그것을
+--     '성능에 영향을 주는 부하'로 보고 상태·성격을 읽는다.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN client_name FORMAT A34
+SYS@orcl> COLUMN attributes  FORMAT A44
+SYS@orcl> SELECT client_name, status, attributes
+  2       FROM  dba_autotask_client
+  3       ORDER BY client_name;
+
+CLIENT_NAME                        STATUS    ATTRIBUTES
+---------------------------------- --------- --------------------------------------------
+auto optimizer stats collection    ENABLED   ON BY DEFAULT, VOLATILE, SAFE TO KILL
+auto space advisor                 ENABLED   ON BY DEFAULT, VOLATILE, SAFE TO KILL
+sql tuning advisor                 ENABLED   ONCE PER WINDOW, ON BY DEFAULT, VOLATILE,
+                                             SAFE TO KILL
+
+-- 해석: 세 작업 모두 ENABLED.
+--   * auto optimizer stats collection : 통계 자동 수집(계획 품질의 토대, 가장 중요)
+--   * auto space advisor              : 세그먼트 공간 낭비 분석(권고만)
+--   * sql tuning advisor              : 고부하 SQL 자동 튜닝 분석 (🔒 Tuning Pack)
+--   ATTRIBUTES의 'SAFE TO KILL'=강제 종료해도 안전, 'ONCE PER WINDOW'=윈도우당 1회.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 언제 도는가 — 요일별 유지관리 윈도우에서 무엇이 허용되는지 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN window_name FORMAT A20
+SYS@orcl> SELECT window_name, optimizer_stats, sql_tune_advisor, autotask_status
+  2       FROM  dba_autotask_window_clients
+  3       WHERE rownum <= 8;
+
+WINDOW_NAME          OPTIMIZER_STATS   SQL_TUNE_ADVISOR   AUTOTASK_STATUS
+-------------------- ----------------- ------------------ ---------------
+MONDAY_WINDOW        ENABLED           ENABLED            ENABLED
+TUESDAY_WINDOW       ENABLED           ENABLED            ENABLED
+WEDNESDAY_WINDOW     ENABLED           ENABLED            ENABLED
+THURSDAY_WINDOW      ENABLED           ENABLED            ENABLED
+FRIDAY_WINDOW        ENABLED           ENABLED            ENABLED
+SATURDAY_WINDOW      ENABLED           ENABLED            ENABLED
+SUNDAY_WINDOW        ENABLED           ENABLED            ENABLED
+
+-- 해석: 일곱 요일 윈도우 모두에서 통계 수집·SQL 튜닝 어드바이저가 허용되어 있다.
+--   평일 윈도우는 밤 10시 4시간, 주말은 오전 6시 20시간이 기본이다(요일별 상세는 [3]).
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 윈도우가 실제로 언제 열리는지 스케줄을 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN window_name   FORMAT A18
+SYS@orcl> COLUMN repeat_interval FORMAT A44
+SYS@orcl> SELECT window_name, TO_CHAR(next_start_date,'DY HH24:MI') next_start,
+  2         duration
+  3       FROM  dba_scheduler_windows
+  4       WHERE window_name LIKE '%_WINDOW'
+  5       ORDER BY window_name;
+
+WINDOW_NAME        NEXT_START      DURATION
+------------------ --------------- ---------------
+FRIDAY_WINDOW      <환경값>        +000 04:00:00
+MONDAY_WINDOW      <환경값>        +000 04:00:00
+SATURDAY_WINDOW    <환경값>        +000 20:00:00
+SUNDAY_WINDOW      <환경값>        +000 20:00:00
+...
+
+-- 해석: 평일 DURATION=4시간, 주말=20시간. NEXT_START는 실행 시점마다 달라
+--   환경 의존이므로 <환경값>. 요점은 '업무·배치 시간과 이 구간이 겹치는가'다.
+
+--------------------------------------------------------------------------------
+-- [4] (조회) 실제 실행 이력 — 언제, 얼마나 걸려 돌았는가.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN job_status FORMAT A12
+SYS@orcl> SELECT client_name,
+  2         TO_CHAR(window_start_time,'MM-DD HH24:MI') started,
+  3         job_status, job_duration
+  4       FROM  dba_autotask_job_history
+  5       WHERE window_start_time > SYSTIMESTAMP - 7
+  6       ORDER BY window_start_time DESC
+  7       FETCH FIRST 5 ROWS ONLY;
+
+CLIENT_NAME                        STARTED       JOB_STATUS   JOB_DURATION
+---------------------------------- ------------- ------------ ---------------
+auto optimizer stats collection    <환경값>      SUCCEEDED    +000 00:0<환경값>
+auto space advisor                 <환경값>      SUCCEEDED    +000 00:0<환경값>
+sql tuning advisor                 <환경값>      SUCCEEDED    +000 00:0<환경값>
+
+-- 해석: 최근 7일 이력. 시각·소요는 환경마다 다르므로 <환경값>.
+--   성능 신고가 특정 시간대에 몰린다면, 그 시각이 이 실행 구간과 겹치는지 대조한다.
+
+--------------------------------------------------------------------------------
+-- [5] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 업무 계정(SQLT)으로 자동 작업 구성을 조회하려니 오류가 난다.
+--------------------------------------------------------------------------------
+SYS@orcl> CONNECT sqlt/sqlt@orcl
+Connected.
+SQLT@orcl> SELECT client_name, status FROM dba_autotask_client;
+SELECT client_name, status FROM dba_autotask_client
+                                *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+SQLT@orcl> -- 원인 파악: DBA_* 딕셔너리 뷰는 일반 업무 계정에 권한이 없다.
+SQLT@orcl> --   자동 유지관리 작업 구성은 관리자(SYSDBA) 또는 권한을 받은 계정으로 본다.
+SQLT@orcl> -- 조치: 진단 권한이 있는 계정으로 다시 접속한다.
+SQLT@orcl> CONNECT / as sysdba
+Connected.
+SYS@orcl> SELECT COUNT(*) client_cnt FROM dba_autotask_client;   -- 재확인
+
+CLIENT_CNT
+----------
+         3
+
+-- 재확인: SYSDBA에서는 세 클라이언트가 정상 조회된다. 접근 계정이 문제였다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 자동 유지관리 작업은 3개: 통계 수집 / 세그먼트 어드바이저 / SQL 튜닝 어드바이저.
+-- 2) 무엇이 켜져 있나(DBA_AUTOTASK_CLIENT) → 언제 허용되나(WINDOW_CLIENTS)
+--    → 언제 얼마나 돌았나(JOB_HISTORY) 순으로 읽는다.
+-- 3) 자동 SQL 튜닝 어드바이저 '작업'은 🔒 Tuning Pack. 구성 '조회'는 팩 무관.
+-- 4) 구성 조회는 SYSDBA(또는 권한 있는 계정)로 수행한다.
+-- 5) 다음 실습(02)에서 이 작업이 업무 시간과 겹치는 상황을 재현·해소한다.
+
+SYS@orcl> EXIT
+================================================================================
