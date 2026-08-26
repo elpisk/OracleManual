@@ -12,7 +12,7 @@
 | **PTG** | Oracle Database *Database Performance Tuning Guide* **19c** (E96347-06, 2022-09), 381쪽 4부 18챕터 | `OracleManual\Tuning\database-performance-tuning-guide.pdf` | **1순위 근거.** 전 챕터 골격 |
 | **ADMIN** | 기존 ADMIN 과정 29~33장 (자동 유지관리 2개 + 모니터링·튜닝 3개) | `OracleManual\ADMIN\29장`~`33장` | **2순위 근거.** 이 과정에 흡수(아래 2장) |
 | DBA-GUIDE | *Database Administrator's Guide* | `Downloads\database-administrators-guide.pdf` | 파라미터·구조 확인 보강 |
-| SQLT | SQL 튜닝 과정 14챕터 | `elpisk/oracle-medical-claims-practice` | 경계 대조 (아래 2장) |
+| SQLT | SQL 튜닝 과정 14챕터 | `OracleManual\SQLTUNING\` | 경계 대조 (아래 2장) |
 
 PTG는 Oracle이 무료 배포하는 공식 문서다. 유료 교재(BR1~3, PLSQL1~2)와 달리 저장소 커밋 금지 대상이 아니지만, 현재는 다른 공식 문서와 마찬가지로 미추적 상태로 두었다.
 
@@ -94,7 +94,7 @@ PTG는 Oracle이 무료 배포하는 공식 문서다. 유료 교재(BR1~3, PLSQ
 | 항목 | 내용 |
 |---|---|
 | 권한 | SYSDBA. 대부분의 실습이 인스턴스 파라미터와 V$/DBA_HIST 뷰를 다룬다 |
-| 실습 데이터 | **진료비청구심사 스키마를 재사용한다**(HOSPITALS 1,000 / PATIENTS 50,000 / DRUG_MASTER 10,000 / MEDICAL_CLAIMS 300,000 / CLAIM_DETAILS 899,894 / DISEASES 399,551 / REVIEW_LOG 500,000). 생성 스크립트는 `elpisk/oracle-medical-claims-practice`에 있다 |
+| 실습 데이터 | **진료비청구심사 스키마를 재사용한다**(HOSPITALS 1,000 / PATIENTS 50,000 / DRUG_MASTER 10,000 / MEDICAL_CLAIMS 300,000 / CLAIM_DETAILS 899,894 / DISEASES 399,551 / REVIEW_LOG 500,000). 생성 스크립트는 `SQLTUNING/진료비청구심사_스키마_생성스크립트_수정본.md` 에 있다 |
 | 부하 생성 | **과정 공용 부하 스크립트 `WL_01`~`WL_06`을 만든다**(아래 4-1) |
 | 메모리 실습 | SGA·PGA 파라미터를 바꾸고 재기동하는 실습이 있다. 개인 실습 환경 전용임을 각 트랜스크립트 머리에 경고로 넣는다 |
 

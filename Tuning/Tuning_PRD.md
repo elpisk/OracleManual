@@ -114,7 +114,7 @@ SQL 한 문장을 고치는 법은 알지만 "왜 어제는 빨랐는데 오늘 
 | DISEASES | 399,551 | 조인 대상 |
 | REVIEW_LOG | 500,000 | 대량 삽입·잠금 경합 대상 |
 
-생성 스크립트: `elpisk/oracle-medical-claims-practice`의 `진료비청구심사_스키마_생성스크립트_수정본.md`
+생성 스크립트: `SQLTUNING/진료비청구심사_스키마_생성스크립트_수정본.md` (2026-08-26 저장소 흡수 전에는 `elpisk/oracle-medical-claims-practice`)
 
 ## 4.3 라이선스 (중요)
 
