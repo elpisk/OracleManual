@@ -1,0 +1,192 @@
+-- ================================================================
+-- 진료비 청구 및 심사 시스템 - erwin 리버스 엔지니어링용 DDL
+-- ================================================================
+-- 사용법 (erwin Data Modeler, 9.x / 2020 / 2021 공통):
+--   1. File > Reverse Engineer...
+--   2. Source Type: "Script" 선택
+--   3. Target Database: ORACLE (10g 이상 아무 버전이나 무방 — 문법 호환)
+--   4. 이 파일을 Script로 지정 후 진행
+--   5. 완료되면 7개 엔터티, 6개 관계(FK)가 생성되고, 아래 3부의
+--      COMMENT ON TABLE/COLUMN 내용이 각 엔터티·속성의 Definition
+--      탭에 자동으로 채워집니다.
+--   6. Model Properties에서 표기법(Notation)을 IDEF1X 또는
+--      IE(정보공학)로 선택해 보기 좋게 정리하세요.
+--
+-- 설계 메모: 이 모델의 FK는 전부 별도 컬럼(ALTER TABLE로 분리 정의)이며
+-- 자식 테이블의 PK에 포함되지 않습니다. 즉 6개 관계 모두
+-- **비식별(non-identifying) 관계**로 해석되어야 정확합니다
+-- (예: CLAIM_DETAILS의 PK는 DETAIL_ID 단독이며 CLAIM_ID/DRUG_CODE는
+--  포함되지 않음). erwin이 다르게 추론하면 관계선을 우클릭해
+--  "Non-Identifying"으로 직접 지정해 주세요.
+--
+-- 원본 PDF(진료비 청구 및 심사 시스템.pdf)의 DDL을 검토해 발견한
+-- REVIEW_LOG의 PK/FK 누락을 이 스크립트에서 보강했습니다
+-- (아래 [수정] 표시 참고). 원본 그대로 리버스 엔지니어링하고 싶다면
+-- REVIEW_LOG의 PK/FK 관련 두 줄을 지우면 됩니다.
+-- ================================================================
+
+
+-- ----------------------------------------------------------------
+-- 1. CREATE TABLE (PK 포함)
+-- ----------------------------------------------------------------
+
+CREATE TABLE HOSPITALS (
+    HOSP_ID     NUMBER(10)    NOT NULL,
+    HOSP_NAME   VARCHAR2(100),
+    HOSP_TYPE   VARCHAR2(20),
+    CITY        VARCHAR2(50),
+    EST_DATE    DATE,
+    STATUS      VARCHAR2(10),
+    CONSTRAINT PK_HOSPITALS PRIMARY KEY (HOSP_ID)
+);
+
+CREATE TABLE PATIENTS (
+    PAT_ID      NUMBER(10)   NOT NULL,
+    PAT_NAME    VARCHAR2(50),
+    GENDER      CHAR(1),
+    BIRTH_DATE  VARCHAR2(8),
+    CITY        VARCHAR2(50),
+    INS_TYPE    VARCHAR2(20),
+    PHONE       VARCHAR2(20),
+    CONSTRAINT PK_PATIENTS PRIMARY KEY (PAT_ID)
+);
+
+CREATE TABLE DRUG_MASTER (
+    DRUG_CODE      VARCHAR2(20)  NOT NULL,
+    DRUG_NAME      VARCHAR2(200),
+    CATEGORY       VARCHAR2(50),
+    PRICE          NUMBER(10),
+    PHARM_COMPANY  VARCHAR2(100),
+    APPLY_DATE     DATE,
+    CONSTRAINT PK_DRUG_MASTER PRIMARY KEY (DRUG_CODE)
+);
+
+CREATE TABLE MEDICAL_CLAIMS (
+    CLAIM_ID       VARCHAR2(20)  NOT NULL,
+    HOSP_ID        NUMBER(10)    NOT NULL,
+    PAT_ID         NUMBER(10)    NOT NULL,
+    RECEIPT_DATE   DATE,
+    VISIT_DATE     DATE,
+    DEPT_CODE      VARCHAR2(10),
+    CLAIM_TYPE     VARCHAR2(20),
+    TOTAL_AMT      NUMBER(12),
+    REVIEW_STATUS  VARCHAR2(20),
+    CONSTRAINT PK_MEDICAL_CLAIMS PRIMARY KEY (CLAIM_ID)
+);
+
+CREATE TABLE CLAIM_DETAILS (
+    DETAIL_ID   NUMBER(15)    NOT NULL,
+    CLAIM_ID    VARCHAR2(20)  NOT NULL,
+    DRUG_CODE   VARCHAR2(20)  NOT NULL,
+    QTY         NUMBER(5,2),
+    DAYS        NUMBER(3),
+    UNIT_PRICE  NUMBER(10),
+    AMT         NUMBER(12),
+    CONSTRAINT PK_CLAIM_DETAILS PRIMARY KEY (DETAIL_ID)
+);
+
+CREATE TABLE DISEASES (
+    DIS_SEQ    NUMBER(15)    NOT NULL,
+    CLAIM_ID   VARCHAR2(20)  NOT NULL,
+    DIS_CODE   VARCHAR2(10),
+    DIS_TYPE   CHAR(1),
+    CONSTRAINT PK_DISEASES PRIMARY KEY (DIS_SEQ)
+);
+
+CREATE TABLE REVIEW_LOG (
+    LOG_ID         NUMBER(15)    NOT NULL,
+    CLAIM_ID       VARCHAR2(20),
+    REVIEWER_ID    VARCHAR2(20),
+    PROCESS_DATE   DATE DEFAULT SYSDATE,
+    ACTION_MSG     VARCHAR2(500),
+    ERROR_CODE     VARCHAR2(10),
+    CONSTRAINT PK_REVIEW_LOG PRIMARY KEY (LOG_ID)          -- [수정] 원본엔 없던 PK
+);
+
+
+-- ----------------------------------------------------------------
+-- 2. FOREIGN KEY (모두 비식별 관계로 분리 정의)
+-- ----------------------------------------------------------------
+
+ALTER TABLE MEDICAL_CLAIMS ADD CONSTRAINT FK_CLAIM_HOSP
+    FOREIGN KEY (HOSP_ID) REFERENCES HOSPITALS(HOSP_ID);
+
+ALTER TABLE MEDICAL_CLAIMS ADD CONSTRAINT FK_CLAIM_PAT
+    FOREIGN KEY (PAT_ID) REFERENCES PATIENTS(PAT_ID);
+
+ALTER TABLE CLAIM_DETAILS ADD CONSTRAINT FK_DETAIL_CLAIM
+    FOREIGN KEY (CLAIM_ID) REFERENCES MEDICAL_CLAIMS(CLAIM_ID);
+
+ALTER TABLE CLAIM_DETAILS ADD CONSTRAINT FK_DETAIL_DRUG
+    FOREIGN KEY (DRUG_CODE) REFERENCES DRUG_MASTER(DRUG_CODE);
+
+ALTER TABLE DISEASES ADD CONSTRAINT FK_DIS_CLAIM
+    FOREIGN KEY (CLAIM_ID) REFERENCES MEDICAL_CLAIMS(CLAIM_ID);
+
+ALTER TABLE REVIEW_LOG ADD CONSTRAINT FK_LOG_CLAIM            -- [수정] 원본엔 없던 FK
+    FOREIGN KEY (CLAIM_ID) REFERENCES MEDICAL_CLAIMS(CLAIM_ID);
+
+
+-- ----------------------------------------------------------------
+-- 3. COMMENT ON TABLE / COLUMN
+--    -> erwin 리버스 엔지니어링 시 엔터티/속성의 Definition으로 반영됨
+-- ----------------------------------------------------------------
+
+COMMENT ON TABLE HOSPITALS IS '요양기관(공급자) - 병원/의원/약국 정보';
+COMMENT ON COLUMN HOSPITALS.HOSP_ID IS '요양기관기호 (PK)';
+COMMENT ON COLUMN HOSPITALS.HOSP_NAME IS '요양기관명';
+COMMENT ON COLUMN HOSPITALS.HOSP_TYPE IS '종별: 상급종합/종합병원/의원/약국';
+COMMENT ON COLUMN HOSPITALS.CITY IS '소재 지역 (서울/경기/부산 등)';
+COMMENT ON COLUMN HOSPITALS.EST_DATE IS '개설일자';
+COMMENT ON COLUMN HOSPITALS.STATUS IS '운영상태: 운영/휴업/폐업';
+
+COMMENT ON TABLE PATIENTS IS '수진자(환자) - 인적사항 및 보험 자격 정보';
+COMMENT ON COLUMN PATIENTS.PAT_ID IS '수진자ID (PK)';
+COMMENT ON COLUMN PATIENTS.PAT_NAME IS '성명';
+COMMENT ON COLUMN PATIENTS.GENDER IS '성별 (M/F)';
+COMMENT ON COLUMN PATIENTS.BIRTH_DATE IS '생년월일 (YYYYMMDD 문자열)';
+COMMENT ON COLUMN PATIENTS.CITY IS '거주지';
+COMMENT ON COLUMN PATIENTS.INS_TYPE IS '보험유형: 건강보험/의료급여/보훈';
+COMMENT ON COLUMN PATIENTS.PHONE IS '연락처';
+
+COMMENT ON TABLE DRUG_MASTER IS '수가/약가 마스터 - 급여 대상 약품 및 행위 코드';
+COMMENT ON COLUMN DRUG_MASTER.DRUG_CODE IS '수가/약품코드 (PK)';
+COMMENT ON COLUMN DRUG_MASTER.DRUG_NAME IS '약품/행위 명칭';
+COMMENT ON COLUMN DRUG_MASTER.CATEGORY IS '분류: 주사제/내복약/처치/수술 등';
+COMMENT ON COLUMN DRUG_MASTER.PRICE IS '상한금액';
+COMMENT ON COLUMN DRUG_MASTER.PHARM_COMPANY IS '제약사/제조사';
+COMMENT ON COLUMN DRUG_MASTER.APPLY_DATE IS '적용시작일';
+
+COMMENT ON TABLE MEDICAL_CLAIMS IS '진료비 청구 명세서(Master) - 핵심 트랜잭션';
+COMMENT ON COLUMN MEDICAL_CLAIMS.CLAIM_ID IS '청구접수번호 YYYYMMDD-SEQ (PK)';
+COMMENT ON COLUMN MEDICAL_CLAIMS.HOSP_ID IS '요양기관기호 (FK -> HOSPITALS)';
+COMMENT ON COLUMN MEDICAL_CLAIMS.PAT_ID IS '수진자ID (FK -> PATIENTS)';
+COMMENT ON COLUMN MEDICAL_CLAIMS.RECEIPT_DATE IS '접수일자';
+COMMENT ON COLUMN MEDICAL_CLAIMS.VISIT_DATE IS '실제 진료일';
+COMMENT ON COLUMN MEDICAL_CLAIMS.DEPT_CODE IS '진료과목 코드 (D1~D9)';
+COMMENT ON COLUMN MEDICAL_CLAIMS.CLAIM_TYPE IS '청구구분: 입원/외래';
+COMMENT ON COLUMN MEDICAL_CLAIMS.TOTAL_AMT IS '요양급여비용총액';
+COMMENT ON COLUMN MEDICAL_CLAIMS.REVIEW_STATUS IS '심사상태: 심사중/심사완료';
+
+COMMENT ON TABLE CLAIM_DETAILS IS '진료 내역 상세(Detail) - 처방 및 처치 상세';
+COMMENT ON COLUMN CLAIM_DETAILS.DETAIL_ID IS '상세ID (PK)';
+COMMENT ON COLUMN CLAIM_DETAILS.CLAIM_ID IS '청구접수번호 (FK -> MEDICAL_CLAIMS)';
+COMMENT ON COLUMN CLAIM_DETAILS.DRUG_CODE IS '수가/약품코드 (FK -> DRUG_MASTER)';
+COMMENT ON COLUMN CLAIM_DETAILS.QTY IS '투여량/횟수';
+COMMENT ON COLUMN CLAIM_DETAILS.DAYS IS '투여일수';
+COMMENT ON COLUMN CLAIM_DETAILS.UNIT_PRICE IS '단가 (청구 시점 기준)';
+COMMENT ON COLUMN CLAIM_DETAILS.AMT IS '금액 (단가*수량*일수)';
+
+COMMENT ON TABLE DISEASES IS '상병 내역 - 청구건별 주상병/부상병 코드 (M:N 해소용)';
+COMMENT ON COLUMN DISEASES.DIS_SEQ IS '일련번호 (PK)';
+COMMENT ON COLUMN DISEASES.CLAIM_ID IS '청구접수번호 (FK -> MEDICAL_CLAIMS)';
+COMMENT ON COLUMN DISEASES.DIS_CODE IS '상병코드 (J00, M** 등)';
+COMMENT ON COLUMN DISEASES.DIS_TYPE IS '상병구분: 1=주상병, 2=부상병';
+
+COMMENT ON TABLE REVIEW_LOG IS '심사 이력 로그 - 심사 단계별 처리 이력';
+COMMENT ON COLUMN REVIEW_LOG.LOG_ID IS '로그ID (PK, [수정] 신설)';
+COMMENT ON COLUMN REVIEW_LOG.CLAIM_ID IS '청구접수번호 (FK -> MEDICAL_CLAIMS, [수정] 신설, NULL 허용)';
+COMMENT ON COLUMN REVIEW_LOG.REVIEWER_ID IS '심사직원 사번 또는 SYSTEM';
+COMMENT ON COLUMN REVIEW_LOG.PROCESS_DATE IS '처리일시';
+COMMENT ON COLUMN REVIEW_LOG.ACTION_MSG IS '심사 메시지 (조정 내역 등)';
+COMMENT ON COLUMN REVIEW_LOG.ERROR_CODE IS '심사삭감 사유코드';
