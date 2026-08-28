@@ -1,0 +1,220 @@
+================================================================================
+ 제1장 실습 01 — 현재 구성 파악
+ 대상   : chicago-srv(172.16.225.60) Primary / boston-srv(172.16.225.61) Standby
+ 목표   : V$DATABASE 로 두 노드의 역할·열림 모드·보호 모드·DBID 를 확인하고
+          무엇이 같아야 하고 무엇이 달라야 하는지 정리한다
+ 소요   : 약 20분
+ 선행   : 두 노드의 인스턴스와 리스너가 기동되어 있을 것
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] Primary 접속과 환경 확인
+--------------------------------------------------------------------------------
+
+[oracle@chicago-srv ~]$ echo $ORACLE_SID
+chicago
+
+[oracle@chicago-srv ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+-- 접속한 인스턴스가 맞는지부터 확인한다. Data Guard 실습에서 가장 흔한 실수는
+-- 조회 자체가 아니라 "어느 노드에 접속했는지"를 착각하는 것이다.
+SYS@chicago> SELECT instance_name, host_name, status FROM v$instance;
+
+INSTANCE_NAME    HOST_NAME                      STATUS
+---------------- ------------------------------ ------------
+chicago          chicago-srv                    OPEN
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [2] Primary 의 구성 확인
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a10
+SYS@chicago> COL db_unique_name FOR a12
+SYS@chicago> SELECT name, db_unique_name, database_role, open_mode,
+  2                 protection_mode, protection_level
+  3            FROM v$database;
+
+NAME       DB_UNIQUE_NA DATABASE_ROLE    OPEN_MODE            PROTECTION_MODE      PROTECTION_LEVEL
+---------- ------------ ---------------- -------------------- -------------------- --------------------
+CHICAGO    chicago      PRIMARY          READ WRITE           MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+-- DATABASE_ROLE = PRIMARY : 리두를 생성해 내보내는 쪽이다.
+-- OPEN_MODE = READ WRITE  : 일반 운영 데이터베이스와 같다.
+-- PROTECTION_MODE 와 PROTECTION_LEVEL 이 둘 다 MAXIMUM PERFORMANCE 로 일치한다.
+--   전자는 "설정한 모드", 후자는 "지금 실제로 달성 중인 수준"이다.
+--   전송이 끊기면 LEVEL 만 떨어져 두 값이 어긋난다(2장에서 재현한다).
+
+SYS@chicago> SELECT dbid, log_mode, force_logging, flashback_on,
+  2                 switchover_status, controlfile_type
+  3            FROM v$database;
+
+      DBID LOG_MODE     FORCE_LOGGING   FLASHBACK_ON       SWITCHOVER_STATUS    CONTROL
+---------- ------------ --------------- ------------------ -------------------- -------
+1852041610 ARCHIVELOG   YES             NO                 TO STANDBY           CURRENT
+
+1 row selected.
+
+-- DBID 1852041610 을 적어 둔다. 잠시 뒤 Standby 에서 같은 값이 나와야 한다.
+-- LOG_MODE = ARCHIVELOG      : Data Guard 의 전제 조건이다(4장).
+-- FORCE_LOGGING = YES        : NOLOGGING 작업도 리두를 남기게 강제한다(4장).
+-- SWITCHOVER_STATUS = TO STANDBY : Primary 역할을 넘겨줄 준비가 되어 있다는 뜻이다.
+-- CONTROLFILE_TYPE = CURRENT : 일반 컨트롤 파일이다.
+
+--------------------------------------------------------------------------------
+ [3] Standby 의 구성 확인
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ echo $ORACLE_SID
+boston
+
+[oracle@boston-srv ~]$ sqlplus / as sysdba
+
+SYS@boston> SELECT instance_name, host_name, status FROM v$instance;
+
+INSTANCE_NAME    HOST_NAME                      STATUS
+---------------- ------------------------------ ------------
+boston           boston-srv                     OPEN
+
+1 row selected.
+
+SYS@boston> COL name FOR a10
+SYS@boston> COL db_unique_name FOR a12
+SYS@boston> SELECT name, db_unique_name, database_role, open_mode,
+  2                protection_mode, protection_level
+  3           FROM v$database;
+
+NAME       DB_UNIQUE_NA DATABASE_ROLE    OPEN_MODE            PROTECTION_MODE      PROTECTION_LEVEL
+---------- ------------ ---------------- -------------------- -------------------- --------------------
+CHICAGO    boston       PHYSICAL STANDBY READ ONLY WITH APPLY MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+-- NAME 은 여전히 CHICAGO 다. DB_NAME 파라미터의 값이며 물리 복제본이므로 같다.
+-- DB_UNIQUE_NAME 만 boston 으로 다르다. 두 데이터베이스를 구별하는 유일한 이름이다.
+-- OPEN_MODE = READ ONLY WITH APPLY
+--   열려 있으면서 동시에 리두를 적용받는 상태. Active Data Guard 옵션이 필요하다.
+--   옵션이 없으면 이 자리는 MOUNTED 가 된다.
+
+SYS@boston> SELECT dbid, log_mode, force_logging, flashback_on,
+  2                switchover_status, controlfile_type
+  3           FROM v$database;
+
+      DBID LOG_MODE     FORCE_LOGGING   FLASHBACK_ON       SWITCHOVER_STATUS    CONTROL
+---------- ------------ --------------- ------------------ -------------------- -------
+1852041610 ARCHIVELOG   YES             NO                 NOT ALLOWED          STANDBY
+
+1 row selected.
+
+-- DBID 가 1852041610 으로 Primary 와 정확히 같다.
+--   이것이 Standby 와 "그냥 복제한 DB" 를 가르는 결정적 차이다.
+--   BR 17장의 DUPLICATE TARGET DATABASE TO <새이름> 은 새 DBID 를 부여해
+--   원본과 관계가 끊긴 독립 DB 를 만든다. Standby 는 DBID 를 물려받아
+--   원본의 리두를 계속 받아들일 자격을 유지한다.
+-- CONTROLFILE_TYPE = STANDBY  : standby 컨트롤 파일이다.
+-- SWITCHOVER_STATUS = NOT ALLOWED : Standby 쪽에서는 이 값이 정상이다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — Standby 에 DDL 을 시도한다
+--------------------------------------------------------------------------------
+
+-- Standby 가 "열려 있다"는 사실 때문에 일반 DB 처럼 쓸 수 있다고 착각하기 쉽다.
+-- 실제로 해 본다.
+
+SYS@boston> CREATE TABLE system.t_dg_err(c1 NUMBER);
+CREATE TABLE system.t_dg_err(c1 NUMBER)
+*
+ERROR at line 1:
+ORA-16000: database or pluggable database open for read-only access
+
+
+>>> 원인 파악
+    ORA-16000 은 "읽기 전용으로 열린 데이터베이스에 변경을 시도했다" 는 뜻이다.
+    READ ONLY WITH APPLY 의 앞부분이 READ ONLY 라는 점을 놓친 것이 원인이다.
+    Standby 를 조회 용도로 여는 것과 갱신 가능한 상태로 만드는 것은 전혀 다르다.
+
+>>> 참고 — 다른 오류가 나는 경우
+    이미 열려 있는 상태에서 ALTER DATABASE OPEN READ WRITE 를 시도하면
+    ORA-16000 이 아니라 다음이 먼저 나온다.
+
+SYS@boston> ALTER DATABASE OPEN READ WRITE;
+ALTER DATABASE OPEN READ WRITE
+*
+ERROR at line 1:
+ORA-01531: a database already open by the instance
+
+    ORA-01531 은 "이미 열려 있다" 는 상태 오류이므로 원인 진단에 도움이 안 된다.
+    Standby 의 갱신 가능 여부를 확인하려면 DML/DDL 을 직접 시도해
+    ORA-16000 을 보는 편이 분명하다.
+
+>>> 조치
+    Standby 에서 데이터를 바꾸고 싶다면 두 가지 길뿐이다.
+      (1) snapshot standby 로 변환한다 — 임시이며 되돌리면 폐기된다(실습 04, 11장)
+      (2) Active Data Guard 의 DML 리다이렉션을 쓴다 — 변경은 Primary 로 넘어간다(9장)
+    지금은 아무 조치도 하지 않는다. 읽기 전용이 정상 상태다.
+
+>>> 재확인
+
+SYS@boston> SELECT open_mode, database_role FROM v$database;
+
+OPEN_MODE            DATABASE_ROLE
+-------------------- ----------------
+READ ONLY WITH APPLY PHYSICAL STANDBY
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [5] 구성 전체를 한눈에 — V$DATAGUARD_CONFIG
+--------------------------------------------------------------------------------
+
+-- 이 뷰는 예외적으로 양쪽 노드 어디에서 조회해도 구성 전체를 보여 준다.
+-- 접속한 노드가 헷갈릴 때 먼저 확인하면 좋다.
+
+SYS@chicago> COL db_unique_name FOR a20
+SYS@chicago> SELECT db_unique_name, parent_dbun, dest_role FROM v$dataguard_config;
+
+DB_UNIQUE_NAME       PARENT_DBUN                    DEST_ROLE
+-------------------- ------------------------------ -----------------
+chicago              NONE                           PRIMARY DATABASE
+boston               chicago                        PHYSICAL STANDBY
+
+2 rows selected.
+
+-- PARENT_DBUN 이 리두를 어디서 받는지 알려 준다.
+-- chicago 는 NONE(최상위 Primary), boston 은 chicago 로부터 받는다.
+-- 캐스케이딩 구성(10장)에서는 이 열이 여러 단계로 이어진다.
+
+--------------------------------------------------------------------------------
+ [6] 정리 — 같아야 하는 것과 달라야 하는 것
+--------------------------------------------------------------------------------
+
+  같아야 한다                       chicago          boston
+  --------------------------------- ---------------- ----------------
+  NAME (DB_NAME)                    CHICAGO          CHICAGO
+  DBID                              1852041610       1852041610
+  LOG_MODE                          ARCHIVELOG       ARCHIVELOG
+  FORCE_LOGGING                     YES              YES
+  PROTECTION_MODE                   MAXIMUM PERF.    MAXIMUM PERF.
+
+  달라야 한다                       chicago          boston
+  --------------------------------- ---------------- ----------------
+  DB_UNIQUE_NAME                    chicago          boston
+  DATABASE_ROLE                     PRIMARY          PHYSICAL STANDBY
+  OPEN_MODE                         READ WRITE       READ ONLY WITH APPLY
+  CONTROLFILE_TYPE                  CURRENT          STANDBY
+  SWITCHOVER_STATUS                 TO STANDBY       NOT ALLOWED
+
+SYS@chicago> EXIT
+SYS@boston> EXIT
+
+================================================================================
+ 실습 01 종료 — 환경 변경 없음. 오류 재현으로 만든 객체도 없다(생성 자체가 실패했다).
+================================================================================

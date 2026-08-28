@@ -1,0 +1,303 @@
+================================================================================
+ 제4장 실습 03 — FORCE LOGGING 실증 (리두 발생량 측정)
+ 대상   : chicago-srv Primary
+ 목표   : 같은 작업을 세 조건에서 실행해 리두 발생량을 비교하고,
+          FORCE LOGGING 이 NOLOGGING 을 무력화한다는 사실을 수치로 확인한다
+ 소요   : 약 30분
+ 되돌리기 : 실습 끝에 반드시 FORCE LOGGING 을 다시 켜고 테스트 테이블을 지운다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 측정 방법
+--------------------------------------------------------------------------------
+
+-- V$SYSSTAT 의 'redo size' 통계를 작업 전후로 재서 차이를 구한다.
+-- 이 값은 인스턴스 기동 이후의 누적이므로 차이만 의미가 있다.
+--
+-- 주의 : 인스턴스 전체의 리두를 재므로 다른 작업이 돌고 있으면 오차가 생긴다.
+--        실습 환경처럼 조용한 상태에서 측정해야 한다.
+
+SYS@chicago> SET SERVEROUTPUT ON
+SYS@chicago> DECLARE
+  2    v1 NUMBER; v2 NUMBER; n NUMBER;
+  3  BEGIN
+  4    SELECT value INTO v1 FROM v$sysstat WHERE name='redo size';
+  5    EXECUTE IMMEDIATE 'create table system.t_nolog nologging tablespace users '||
+  6                      'as select * from all_objects where rownum <= 30000';
+  7    SELECT value INTO v2 FROM v$sysstat WHERE name='redo size';
+  8    EXECUTE IMMEDIATE 'select count(*) from system.t_nolog' INTO n;
+  9    dbms_output.put_line('rows='||n||'   redo = '||(v2-v1)||' bytes = '||
+ 10                          ROUND((v2-v1)/1024/1024,2)||' MB');
+ 11  END;
+ 12  /
+
+--------------------------------------------------------------------------------
+ [1-1] 오류 재현 — 정적 SQL 로 작성했을 때
+--------------------------------------------------------------------------------
+
+-- 처음에는 count 조회를 정적 SQL 로 썼다.
+
+SYS@chicago> DECLARE
+  2    v1 NUMBER; v2 NUMBER; n NUMBER;
+  3  BEGIN
+  4    SELECT value INTO v1 FROM v$sysstat WHERE name='redo size';
+  5    EXECUTE IMMEDIATE 'create table system.t_nolog nologging tablespace users '||
+  6                      'as select * from all_objects where rownum <= 30000';
+  7    SELECT value INTO v2 FROM v$sysstat WHERE name='redo size';
+  8    SELECT COUNT(*) INTO n FROM system.t_nolog;
+  9    dbms_output.put_line('rows='||n);
+ 10  END;
+ 11  /
+  select count(*) into n from system.t_nolog;
+                                     *
+ERROR at line 8:
+ORA-06550: line 8, column 39:
+PL/SQL: ORA-00942: table or view does not exist
+ORA-06550: line 8, column 3:
+PL/SQL: SQL Statement ignored
+
+
+>>> 원인 파악
+    ORA-00942 는 "테이블 또는 뷰가 없다" 는 뜻이지만, 여기서는 실행 오류가 아니다.
+    앞의 ORA-06550 이 단서다. PL/SQL 컴파일 오류라는 뜻이다.
+
+    PL/SQL 은 **컴파일 시점에** 정적 SQL 이 참조하는 객체를 확인한다.
+    system.t_nolog 는 같은 블록의 5번 줄에서 만들어지지만,
+    그것은 실행 시점의 일이다. 컴파일 시점에는 아직 존재하지 않는다.
+
+    즉 블록 전체가 컴파일되지 못했으므로 CTAS 도 실행되지 않았다.
+    "테이블을 만들었는데 없다고 한다" 가 아니라 "아무것도 실행되지 않았다" 다.
+
+>>> 조치
+    동적 SQL(EXECUTE IMMEDIATE)로 바꾼다.
+    동적 SQL 은 실행 시점에 해석하므로 컴파일 시점 확인을 받지 않는다.
+
+      EXECUTE IMMEDIATE 'select count(*) from system.t_nolog' INTO n;
+
+>>> 재확인
+    수정한 블록은 정상적으로 컴파일되고 실행된다. 결과는 [2] 절에서 확인한다.
+
+--------------------------------------------------------------------------------
+ [2] 조건 A — FORCE LOGGING = YES, NOLOGGING 으로 생성
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL force_logging FOR a44
+SYS@chicago> SELECT force_logging FROM v$database;
+
+FORCE_LOGGING
+--------------------------------------------
+YES
+
+1 row selected.
+
+SYS@chicago> (위 PL/SQL 블록 실행)
+
+rows=30000   redo = 4737636 bytes = 4.52 MB
+
+PL/SQL procedure successfully completed.
+
+SYS@chicago> SELECT ROUND(bytes/1024/1024,2) seg_mb FROM dba_segments
+  2            WHERE owner='SYSTEM' AND segment_name='T_NOLOG';
+
+    SEG_MB
+----------
+         5
+
+1 row selected.
+
+SYS@chicago> DROP TABLE system.t_nolog PURGE;
+
+Table dropped.
+
+--------------------------------------------------------------------------------
+ [3] 조건 B — FORCE LOGGING = YES, LOGGING 으로 생성 (대조군)
+--------------------------------------------------------------------------------
+
+-- 같은 블록에서 nologging 을 logging 으로만 바꿔 실행한다.
+
+SYS@chicago> (nologging → logging 으로 바꾼 블록 실행)
+
+rows=30000   redo = 4693784 bytes = 4.48 MB
+
+PL/SQL procedure successfully completed.
+
+SYS@chicago> DROP TABLE system.t_nolog PURGE;
+
+Table dropped.
+
+-- ★ A 와 B 가 사실상 같다.
+--   4,737,636 vs 4,693,784 — 차이 43,852 바이트, 약 0.9 퍼센트.
+--   FORCE LOGGING 이 켜져 있으면 NOLOGGING 을 지정하든 하지 않든
+--   리두가 똑같이 발생한다. 지정이 무시된 것이다.
+
+--------------------------------------------------------------------------------
+ [4] 조건 C — FORCE LOGGING = NO, NOLOGGING 으로 생성
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE NO FORCE LOGGING;
+
+Database altered.
+
+SYS@chicago> SELECT force_logging FROM v$database;
+
+FORCE_LOGGING
+---------------------------------------
+NO
+
+1 row selected.
+
+SYS@chicago> (조건 A 와 동일한 블록 실행)
+
+rows=30000   redo = 106456 bytes = .1 MB
+
+PL/SQL procedure successfully completed.
+
+SYS@chicago> SELECT ROUND(bytes/1024/1024,2) seg_mb FROM dba_segments
+  2            WHERE owner='SYSTEM' AND segment_name='T_NOLOG';
+
+    SEG_MB
+----------
+         5
+
+1 row selected.
+
+-- ★ 세 조건 비교
+--
+--   조건  FORCE LOGGING  생성 절     리두 발생량              세그먼트
+--   ----  -------------  ----------  -----------------------  --------
+--   A     YES            NOLOGGING   4,737,636 (4.52 MB)      5 MB
+--   B     YES            LOGGING     4,693,784 (4.48 MB)      5 MB
+--   C     NO             NOLOGGING       106,456 (0.10 MB)    5 MB
+--
+--   4737636 / 106456 = 약 44.5 배
+--
+--   세그먼트 크기는 세 경우 모두 5MB 로 같다.
+--   같은 데이터를 만들었는데 리두만 44배 차이가 난다.
+--   이것이 NOLOGGING 이 실제로 동작했을 때의 모습이며,
+--   동시에 Standby 에 5MB 짜리 구멍이 생겼다는 뜻이다.
+
+--------------------------------------------------------------------------------
+ [5] 구멍의 흔적을 확인한다
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a48
+SYS@chicago> SELECT file#, name, unrecoverable_change#,
+  2                 TO_CHAR(unrecoverable_time,'YYYY-MM-DD HH24:MI') unrec_time
+  3            FROM v$datafile WHERE unrecoverable_change# > 0;
+
+     FILE# NAME                                       UNRECOVERABLE_CHANGE# UNREC_TIME
+---------- ------------------------------------------ --------------------- ----------------
+         7 /u03/app/oracle/oradata/Chicago/users01.dbf               2396261 2026-08-26 20:22
+
+1 row selected.
+
+-- UNRECOVERABLE_CHANGE# = "이 데이터 파일에서 리두 없이 변경된 마지막 SCN"
+--
+-- 값이 0보다 크다는 것은 그 파일에 복구 불가능한 변경이 있었다는 뜻이다.
+-- Standby 쪽에서는 그 시점 이후의 해당 블록을 신뢰할 수 없다.
+--
+-- ★ 이 조회는 사후 점검 도구로 유용하다.
+--   FORCE LOGGING 을 켜 두었는데도 이 값이 올라가 있다면
+--   누군가 잠시 껐거나 테이블스페이스 단위로 예외를 두었다는 뜻이다.
+--   정기 점검 항목으로 삼을 만하다.
+--
+-- 조건 A·B 를 마쳤을 때는 이 조회가 'no rows selected' 였다.
+-- FORCE LOGGING 이 리두를 강제했으므로 복구 불가능한 변경이 없었기 때문이다.
+
+--------------------------------------------------------------------------------
+ [6] 조치 — FORCE LOGGING 을 되돌린다
+--------------------------------------------------------------------------------
+
+SYS@chicago> DROP TABLE system.t_nolog PURGE;
+
+Table dropped.
+
+SYS@chicago> ALTER DATABASE FORCE LOGGING;
+
+Database altered.
+
+SYS@chicago> SELECT force_logging FROM v$database;
+
+FORCE_LOGGING
+---------------------------------------
+YES
+
+1 row selected.
+
+-- ★ 주의: FORCE LOGGING 을 다시 켜도 이미 생긴 구멍은 메워지지 않는다.
+--   UNRECOVERABLE_CHANGE# 값도 그대로 남는다.
+--   실제 운영이었다면 해당 데이터 파일을 Standby 에서 복구해야 한다.
+--   여기서는 테스트 테이블을 지웠으므로 실질적 영향은 없다.
+
+--------------------------------------------------------------------------------
+ [7] 테이블스페이스 단위 FORCE LOGGING
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER TABLESPACE dgdemo FORCE LOGGING;
+
+Tablespace altered.
+
+SYS@chicago> SELECT tablespace_name, force_logging FROM dba_tablespaces
+  2            WHERE tablespace_name='DGDEMO';
+
+TABLESPACE_NAME                FOR
+------------------------------ ---
+DGDEMO                         YES
+
+1 row selected.
+
+SYS@chicago> ALTER TABLESPACE dgdemo NO FORCE LOGGING;
+
+Tablespace altered.
+
+SYS@chicago> SELECT tablespace_name, force_logging FROM dba_tablespaces
+  2            WHERE tablespace_name='DGDEMO';
+
+TABLESPACE_NAME                FOR
+------------------------------ ---
+DGDEMO                         NO
+
+1 row selected.
+
+-- ★ 두 수준의 관계: 데이터베이스 수준이 우선한다.
+--
+--   조건 A 를 다시 보면 이 사실이 확인된다.
+--   그때 사용한 USERS 테이블스페이스도, 별도로 만든 DGDEMO 도
+--   FORCE_LOGGING 이 NO 였다. 그런데도 리두가 4.52MB 발생했다.
+--   데이터베이스 수준이 YES 였기 때문이다.
+--
+-- 그렇다면 테이블스페이스 단위 설정은 언제 쓰는가?
+--   데이터베이스 수준을 끈 상태에서 일부만 보호하고 싶을 때다.
+--   Data Guard 환경에서는 데이터베이스 수준을 켜는 것이 원칙이므로
+--   테이블스페이스 단위 설정은 주로 Data Guard 가 없는 환경에서 쓰인다.
+
+--------------------------------------------------------------------------------
+ [8] 최종 확인
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a10
+SYS@chicago> SELECT name, log_mode, force_logging FROM v$database;
+
+NAME       LOG_MODE     FORCE_LOGGING
+---------- ------------ ---------------
+CHICAGO    ARCHIVELOG   YES
+
+1 row selected.
+
+SYS@chicago> SELECT COUNT(*) AS leftover FROM dba_tables
+  2            WHERE owner='SYSTEM' AND table_name LIKE 'T%NOLOG%';
+
+  LEFTOVER
+----------
+         0
+
+1 row selected.
+
+SYS@chicago> EXIT
+
+================================================================================
+ 실습 03 종료
+ 원복 확인 : FORCE_LOGGING = YES, 테스트 테이블 0건
+ 남은 흔적 : V$DATAFILE.UNRECOVERABLE_CHANGE# 는 그대로 남는다.
+             이 값은 되돌릴 수 없으며, 실제 운영이라면 해당 파일 복구가 필요하다.
+================================================================================

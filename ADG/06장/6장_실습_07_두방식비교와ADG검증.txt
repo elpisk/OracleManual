@@ -1,0 +1,283 @@
+================================================================================
+ 제6장 실습 07 — 두 방식 비교와 ADG 복귀 검증
+ 대상   : chicago-srv / boston-srv
+ 목표   : 가이드의 후속 단계를 검증하고, 5장과 6장의 결과를 열두 항목으로
+          대조한 뒤, Standby 가 기준 상태로 복귀했는지 확인한다
+ 소요   : 약 30분
+ 변경   : 없음 (조회와 실패하는 명령 하나)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 오류 재현 — 가이드의 후속 단계
+--------------------------------------------------------------------------------
+
+-- 설치 가이드(OMF 편)는 복제 후 다음을 지시한다.
+--
+--   alter database open;
+--   create spfile from pfile = '$ORACLE_HOME/dbs/initboston.ora';
+--   shutdown immediate
+--   startup
+--
+-- 두 번째 줄을 그대로 실행해 본다.
+
+SYS@boston> CREATE SPFILE FROM PFILE='/u01/app/oracle/product/19.3.0/dbhome_1/dbs/initboston.ora';
+
+create spfile from pfile='/u01/app/oracle/product/19.3.0/dbhome_1/dbs/initboston.ora'
+*
+ERROR at line 1:
+ORA-32002: cannot create SPFILE already being used by the instance
+
+>>> 원인 파악
+    5장에서 만난 것과 같은 오류다.
+    5장 가이드는 `CREATE SPFILE FROM MEMORY` 였고 이번은 `FROM PFILE` 이지만
+    막히는 이유는 같다. 이미 spfile 로 돌고 있기 때문이다.
+
+SYS@boston> COL value FOR a62
+SYS@boston> SELECT name, value FROM v$parameter WHERE name='spfile';
+
+NAME       VALUE
+---------- --------------------------------------------------------------
+spfile     /u01/app/oracle/product/19.3.0/dbhome_1/dbs/spfileboston.ora
+
+1 row selected.
+
+    ★ 그런데 이번 것은 5장보다 위험하다.
+      **만약 이 명령이 성공했다면 어떻게 되는가.**
+
+      대상 pfile 은 세 줄짜리다.
+
+[oracle@boston-srv ~]$ cat $ORACLE_HOME/dbs/initboston.ora
+db_name=chicago
+enable_pluggable_database=true
+db_create_file_dest=/u03/app/oracle/oradata
+
+      이것으로 spfile 을 만들면 DUPLICATE 가 채워 넣은 값이 전부 사라진다.
+        db_unique_name           → 사라짐 (chicago 로 되돌아간다)
+        fal_server               → 사라짐
+        log_archive_config       → 사라짐
+        log_archive_dest_2       → 사라짐
+        standby_file_management  → 사라짐
+        control_files            → 사라짐
+        db_recovery_file_dest    → 사라짐
+
+      이어지는 `shutdown immediate` / `startup` 까지 실행하면
+      Standby 는 db_unique_name 조차 없는 상태로 뜨려 한다.
+
+      ★ ORA-32002 가 이것을 막아 준 것이다. 오류가 오히려 다행인 경우다.
+
+>>> 조치
+    이 단계를 건너뛴다. spfile 은 이미 있고 필요한 값이 모두 들어 있다.
+    확인만 한다.
+
+SYS@boston> COL name FOR a28
+SYS@boston> COL value FOR a52
+SYS@boston> SELECT name, value FROM v$parameter WHERE name IN
+  2            ('db_unique_name','fal_server','standby_file_management',
+  3             'db_create_file_dest','log_archive_config')
+  4            ORDER BY name;
+
+NAME                         VALUE
+---------------------------- ----------------------------------------------------
+db_create_file_dest          /u03/app/oracle/oradata
+db_unique_name               boston
+fal_server                   chicago
+log_archive_config           dg_config=(chicago,boston)
+standby_file_management      AUTO
+
+5 rows selected.
+
+>>> 재확인
+    다섯 값이 모두 살아 있다. 가이드의 지시를 따르지 않은 것이 옳았다.
+
+-- ★ 가이드의 첫 줄 `alter database open;` 은 어떤가?
+--   Physical Standby 는 READ WRITE 로 열 수 없으므로
+--   오라클이 자동으로 READ ONLY 로 연다. 오류는 나지 않는다.
+--   다만 의도를 명시하려면 `alter database open read only;` 라고 쓰는 편이 낫다.
+--
+-- ★ 그리고 5장과 같은 누락이 여기에도 있다.
+--   `alter pluggable database ... open read only;` 가 없다.
+--   CDB 만 열고 PDB 를 열지 않으면 사용자 데이터를 조회할 수 없다.
+
+--------------------------------------------------------------------------------
+ [2] 두 방식 비교 — 열두 항목
+--------------------------------------------------------------------------------
+
+  항목                    5장 (경로 지정)           6장 (OMF)
+  ----------------------- ------------------------- --------------------------
+  파일 배치 지시          convert 파라미터 2개      db_create_file_dest 1개
+  NOFILENAMECHECK         필요                      불필요
+  사전 mkdir              필요                      데이터·로그는 불필요
+  경로 오류 발견 시점     파일 전송 도중            인스턴스 기동 시점
+  최상위 디렉터리         Boston (사람이 정함)      BOSTON (대문자 자동)
+  PDB 디렉터리            chicago_pdb1              59F053E7... (GUID)
+  파일 이름               system01.dbf              o1_mf_system_1b50qfn7_.dbf
+  파일 번호 식별          이름으로 가능             V$DATAFILE 조회
+  온라인 로그 멤버        그룹당 1                  그룹당 2 (FRA 다중화)
+  컨트롤 파일             SET 으로 지정             상속 — 교정 필요
+  로그 길이               418줄                     390줄
+  PDB 추가 시             디렉터리 생성 필요        자동
+
+  ★ 담긴 내용은 완전히 같다.
+    파일 11개, 번호 1,3,4,5,6,7,8,9,10,11,12, 크기까지 동일하다.
+    차이는 **어디에 어떤 이름으로 두느냐**뿐이다.
+
+--------------------------------------------------------------------------------
+ [3] 어느 쪽을 고를 것인가
+--------------------------------------------------------------------------------
+
+  OMF 가 나은 경우
+    · PDB 를 자주 추가하는 환경 — 디렉터리 관리 부담이 사라진다
+    · Standby 를 여러 개 두는 환경 — DB_UNIQUE_NAME 만 다르면 자동 분리된다
+    · 구축을 자동화하는 환경 — 스크립트가 짧고 환경 의존성이 적다
+    · 경로 오류를 일찍 발견하고 싶은 경우
+
+  경로 지정이 나은 경우
+    · 파일 배치에 대한 조직 표준이 확고한 환경
+    · 스토리지 계층별로 파일을 나눠 두어야 하는 환경
+    · 파일 이름만 보고 무엇인지 알아야 하는 운영 관행이 있는 환경
+    · 백업·모니터링 스크립트가 파일 이름 규칙에 의존하는 환경
+
+  ★ 섞어 쓸 수 있는가
+    db_create_file_dest 와 db_file_name_convert 를 둘 다 주면 OMF 가 이긴다.
+    db_create_file_dest 에 값이 있으면 파일 생성이 OMF 규칙을 따르고
+    convert 규칙은 무시된다.
+    다만 읽는 사람을 혼란스럽게 하므로 권하지 않는다.
+    하나를 골라 일관되게 쓰는 편이 낫다.
+
+--------------------------------------------------------------------------------
+ [4] ADG 복귀 검증 ① — Standby 상태
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a10
+SYS@boston> SELECT dbid, name, db_unique_name, database_role, open_mode,
+  2                controlfile_type FROM v$database;
+
+      DBID NAME       DB_UNIQUE_NAME   DATABASE_ROLE    OPEN_MODE            CONTROLFILE_TYPE
+---------- ---------- ---------------- ---------------- -------------------- ----------------
+1852041610 CHICAGO    boston           PHYSICAL STANDBY READ ONLY WITH APPLY STANDBY
+
+1 row selected.
+
+SYS@boston> SELECT con_id, name, open_mode FROM v$pdbs ORDER BY con_id;
+
+    CON_ID NAME           OPEN_MODE
+---------- -------------- ----------
+         2 PDB$SEED       READ ONLY
+         3 CHICAGO_PDB1   READ ONLY
+
+2 rows selected.
+
+-- ★ DBID 가 여전히 1852041610 이다.
+--   5장에서 만든 것도, 6장에서 다시 만든 것도, 컨트롤 파일을 옮긴 뒤에도 같다.
+--   물리 복제본의 정체성은 파일 배치 방식과 무관하다.
+
+--------------------------------------------------------------------------------
+ [5] ADG 복귀 검증 ② — 동기화
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+-- 20초쯤 기다린 뒤 Standby 를 본다.
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         64
+
+1 row selected.
+
+SYS@chicago> SELECT dest_id, status FROM v$archive_dest_status WHERE dest_id<=2;
+
+   DEST_ID STATUS
+---------- ---------
+         1 VALID
+         2 VALID
+
+2 rows selected.
+
+-- 두 지연 모두 0, MRP0 은 적용 중, 목적지 둘 다 VALID.
+
+--------------------------------------------------------------------------------
+ [6] ADG 복귀 검증 ③ — SRL 이 실제로 쓰이는가
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT group#, bytes/1024/1024 mb, status FROM v$standby_log
+  2            ORDER BY group#;
+
+    GROUP#         MB STATUS
+---------- ---------- ----------
+         4        200 ACTIVE
+         5        200 ACTIVE
+         6        200 ACTIVE
+         7        200 UNASSIGNED
+
+4 rows selected.
+
+-- ★ ACTIVE 가 세 개다.
+--   실시간 적용이 SRL 을 실제로 쓰고 있다는 뜻이다.
+--   UNASSIGNED 는 아직 배정되지 않은 여유 그룹이며 정상이다.
+--
+-- ★ 4장에서 Primary 에 만든 SRL 이 여기까지 왔다.
+--   5장에서도, 6장에서도 DUPLICATE 가 그대로 복제해 왔다.
+--   방식이 달라도 SRL 은 따라온다.
+
+--------------------------------------------------------------------------------
+ [7] 이 장을 마친 시점의 기준 상태
+--------------------------------------------------------------------------------
+
+  chicago (Primary)
+    DATABASE_ROLE       PRIMARY
+    OPEN_MODE           READ WRITE
+    PROTECTION_MODE     MAXIMUM PERFORMANCE
+    db_create_file_dest 비어 있음 (경로 지정 방식 유지)
+    데이터 파일         /u03/app/oracle/oradata/Chicago/*.dbf
+
+  boston (Standby)
+    DATABASE_ROLE       PHYSICAL STANDBY
+    OPEN_MODE           READ ONLY WITH APPLY
+    db_create_file_dest /u03/app/oracle/oradata
+    데이터 파일         /u03/app/oracle/oradata/BOSTON/**/o1_mf_*.dbf
+    컨트롤 파일         /u03/app/oracle/oradata/BOSTON/controlfile/control01.ctl
+                        /u03/app/oracle/fast_recovery_area/BOSTON/controlfile/control02.ctl
+    로그                7그룹 x 2멤버 (oradata + FRA)
+
+  ★ **7장 이후의 실습은 이 상태를 기준으로 한다.**
+    Standby 파일 경로가 o1_mf_ 형태로 나오는 것은 그 때문이며 오류가 아니다.
+    5장 트랜스크립트와 경로가 다른 것도 같은 이유다.
+
+  ★ 이 상태가 아니면 6장 실습 02~06 을 다시 수행하거나
+    VM 스냅샷 adg-configured 로 되돌린 뒤 6장을 다시 진행한다.
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+  · 가이드의 create spfile from pfile 은 ORA-32002 로 막힌다. 다행한 일이다
+  · 성공했다면 DUPLICATE 가 채운 파라미터 일곱 개가 세 줄로 되돌아갔을 것이다
+  · 두 방식의 차이는 배치와 이름뿐이다. 담긴 내용은 완전히 같다
+  · OMF 는 자동화·다중 Standby·잦은 PDB 추가에 유리하다
+  · 경로 지정은 배치 표준과 이름 규칙 의존이 있는 환경에 유리하다
+  · 둘 다 주면 OMF 가 이긴다. 하나를 골라 일관되게 쓴다
+  · 이 장을 마친 시점의 Standby 구성이 7장 이후의 기준이다
+
+SYS@boston> EXIT
+SYS@chicago> EXIT
+
+================================================================================
+ 실습 07 종료 — 6장 완료. 기준 상태 복귀 확인.
+================================================================================

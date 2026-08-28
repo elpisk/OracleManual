@@ -1,0 +1,230 @@
+================================================================================
+ 제4장 실습 06 — 19c STANDBY NOLOGGING 모드
+ 대상   : chicago-srv Primary
+ 목표   : FORCE LOGGING 과 NOLOGGING 사이의 절충안인 두 모드를 설정해 보고,
+          V$DATABASE.FORCE_LOGGING 열이 어떻게 바뀌는지 확인한다
+ 소요   : 약 20분
+ 되돌리기 : 실습 끝에 반드시 FORCE LOGGING 으로 되돌린다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 문제 상황 — 실습 03 이 남긴 딜레마
+--------------------------------------------------------------------------------
+
+-- 실습 03 에서 확인한 것
+--   FORCE LOGGING = YES  → 리두 4.52MB, Standby 안전, 적재 느림
+--   FORCE LOGGING = NO   → 리두 0.10MB, 적재 44배 빠름, Standby 에 구멍
+--
+-- 둘 중 하나만 골라야 하는가?
+-- 19c 는 세 번째 길을 제공한다.
+
+SYS@chicago> COL name FOR a10
+SYS@chicago> SELECT name, force_logging FROM v$database;
+
+NAME       FORCE_LOGGING
+---------- ---------------------------------------
+CHICAGO    YES
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [2] STANDBY NOLOGGING FOR DATA AVAILABILITY
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE SET STANDBY NOLOGGING FOR DATA AVAILABILITY;
+
+Database altered.
+
+SYS@chicago> SELECT force_logging FROM v$database;
+
+FORCE_LOGGING
+---------------------------------------
+STANDBY NOLOGGING FOR DATA AVAILABILITY
+
+1 row selected.
+
+-- ★ 첫 번째 관찰: FORCE_LOGGING 열이 YES/NO 가 아니라
+--   모드 이름 전체를 담는다.
+--
+--   이 열을 YES/NO 로만 판정하는 모니터링 스크립트가 있다면
+--   19c 에서 오작동한다. 예를 들어
+--     WHERE force_logging = 'NO'  →  이 모드를 잡아내지 못한다
+--     WHERE force_logging != 'YES' →  잡아낸다
+--   기존 점검 스크립트를 19c 로 올릴 때 확인해야 할 항목이다.
+--
+-- 동작 : 리두 대신 **적재된 블록을 Standby 로 직접 보낸다.**
+--        Standby 가 그 블록을 받을 때까지 적재 작업이 기다린다.
+--        보호는 유지되고 리두량은 줄어든다.
+
+--------------------------------------------------------------------------------
+ [3] STANDBY NOLOGGING FOR LOAD PERFORMANCE
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE SET STANDBY NOLOGGING FOR LOAD PERFORMANCE;
+
+Database altered.
+
+SYS@chicago> SELECT force_logging FROM v$database;
+
+FORCE_LOGGING
+---------------------------------------
+STANDBY NOLOGGING FOR LOAD PERFORMANCE
+
+1 row selected.
+
+-- 동작 : 같은 방식으로 블록을 보내되,
+--        Standby 가 느리면 **기다리지 않고 넘어간다.**
+--        적재는 빠르지만 Standby 가 못 받은 블록은 구멍으로 남는다.
+--
+-- 두 모드의 차이는 딱 하나 — "Standby 를 기다릴 것인가".
+-- 이름 그대로 무엇을 우선하느냐의 선택이다.
+
+--------------------------------------------------------------------------------
+ [4] 네 가지 선택지 비교
+--------------------------------------------------------------------------------
+
+  설정                                    리두량  Standby 보호  적재 성능
+  --------------------------------------- ------- ------------- ----------
+  FORCE LOGGING                           많음    완전          느림
+  STANDBY NOLOGGING FOR DATA AVAILABILITY 적음    유지          중간
+  STANDBY NOLOGGING FOR LOAD PERFORMANCE  적음    부분          빠름
+  NO FORCE LOGGING                        가장적음 없음          가장 빠름
+
+  판단 기준을 한 문장으로 줄이면
+    "Standby 가 못 따라올 때 적재를 기다리게 할 것인가, 그냥 진행할 것인가."
+
+    기다리게 하겠다  → FOR DATA AVAILABILITY
+    진행하겠다       → FOR LOAD PERFORMANCE
+    그런 상황을 아예 만들지 않겠다 → FORCE LOGGING
+
+  ★ 주의 : 두 STANDBY NOLOGGING 모드는 **모든 작업에 적용되지 않는다.**
+    직접 경로 적재(direct path load)처럼 블록을 통째로 만드는 작업에 해당하며,
+    일반 DML 은 원래대로 리두를 남긴다.
+    따라서 이 모드로 바꿔도 일반 트랜잭션의 리두량은 줄지 않는다.
+    "리두가 너무 많다" 는 문제가 일반 DML 때문이라면 이 모드는 답이 아니다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — 모드 이름을 잘못 쓰면
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE SET STANDBY NOLOGGING FOR PERFORMANCE;
+alter database set standby nologging for performance
+                                         *
+ERROR at line 1:
+ORA-02231: missing or invalid option to ALTER DATABASE
+
+
+>>> 원인 파악
+    정확한 키워드는 두 가지뿐이다.
+      SET STANDBY NOLOGGING FOR DATA AVAILABILITY
+      SET STANDBY NOLOGGING FOR LOAD PERFORMANCE
+
+    'PERFORMANCE' 만 쓰면 파서가 인식하지 못해 ORA-02231 이 난다.
+    "ALTER DATABASE 에 없거나 잘못된 옵션" 이라는 뜻이며,
+    별표(*)가 어느 위치에서 막혔는지 알려 주므로 오타를 찾기 쉽다.
+    여기서는 'performance' 앞에 붙어 있어야 할 'load' 가 빠진 것이 원인이다.
+
+    비슷한 실수로 'DATA AVAILABILITY' 를 'AVAILABILITY' 로만 쓰는 경우도 있다.
+    두 단어가 모두 필요하다.
+
+    ★ 이 오류가 났을 때 기존 설정은 그대로 유지된다.
+      실패한 ALTER 는 아무것도 바꾸지 않는다.
+
+>>> 조치 — 정확한 키워드로 다시 실행한다
+
+SYS@chicago> ALTER DATABASE SET STANDBY NOLOGGING FOR LOAD PERFORMANCE;
+
+Database altered.
+
+>>> 재확인
+
+SYS@chicago> SELECT force_logging FROM v$database;
+
+FORCE_LOGGING
+---------------------------------------
+STANDBY NOLOGGING FOR LOAD PERFORMANCE
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [6] 원복 — FORCE LOGGING 으로 되돌린다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE FORCE LOGGING;
+
+Database altered.
+
+SYS@chicago> SELECT force_logging FROM v$database;
+
+FORCE_LOGGING
+---------------------------------------
+YES
+
+1 row selected.
+
+-- 실습 환경은 FORCE LOGGING 을 기본으로 둔다.
+-- 이후 장들의 실습이 이 상태를 전제하기 때문이다.
+
+--------------------------------------------------------------------------------
+ [7] 최종 확인
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a10
+SYS@chicago> SELECT name, database_role, open_mode, log_mode, force_logging,
+  2                 protection_mode, protection_level FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE   LOG_MODE     FORCE_LOGGING  PROTECTION_MODE      PROTECTION_LEVEL
+---------- ---------------- ----------- ------------ -------------- -------------------- --------------------
+CHICAGO    PRIMARY          READ WRITE  ARCHIVELOG   YES            MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@chicago> SELECT group#, bytes/1024/1024 mb FROM v$standby_log ORDER BY group#;
+
+    GROUP#         MB
+---------- ----------
+         4        200
+         5        200
+         6        200
+         7        200
+
+4 rows selected.
+
+SYS@chicago> COL error FOR a30
+SYS@chicago> SELECT dest_id, status, error FROM v$archive_dest_status
+  2            WHERE dest_id <= 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ------------------------------
+         1 VALID
+         2 VALID
+
+2 rows selected.
+
+--------------------------------------------------------------------------------
+ [8] 4장 전체 점검표
+--------------------------------------------------------------------------------
+
+  이 장에서 세운 조건 + 앞 장들의 조건을 합치면
+  5장 RMAN DUPLICATE 로 넘어가기 전 점검표가 된다.
+
+  항목                    확인 방법                              기대값
+  ----------------------- -------------------------------------- ----------------
+  ARCHIVELOG 모드         V$DATABASE.LOG_MODE                    ARCHIVELOG
+  FORCE LOGGING           V$DATABASE.FORCE_LOGGING               YES
+  FRA 여유                V$RECOVERY_FILE_DEST                   여유 있음
+  SRL 개수                COUNT(*) FROM V$STANDBY_LOG            온라인 + 1 이상
+  SRL 크기                V$STANDBY_LOG vs V$LOG                 동일
+  패스워드 파일 (3장)     원격 SYS 접속                          성공
+  정적 등록 (3장)         lsnrctl status                         UNKNOWN 광고
+  DG_CONFIG (3장)         V$PARAMETER                            두 이름 포함
+  전송 목적지 (2장)       V$ARCHIVE_DEST.VALID_NOW               YES
+
+  아홉 항목이 모두 통과하면 5장으로 넘어갈 준비가 된 것이다.
+
+SYS@chicago> EXIT
+
+================================================================================
+ 실습 06 종료
+ 원복 확인 : FORCE_LOGGING = YES, SRL 4개 × 200MB, dest_1/dest_2 VALID
+================================================================================

@@ -1,0 +1,184 @@
+================================================================================
+ 제9장 실습 01 — Active Data Guard 상태 확인
+ 대상   : boston-srv Standby (일부 chicago-srv)
+ 목표   : ADG 가 켜져 있음을 두 표식으로 확인하고, 사용 기록을 어디서 조회하는지
+          안다. 세션이 어디에 붙었는지 확인하는 방법도 익힌다
+ 소요   : 약 25분
+ 변경   : 없음 (전부 조회)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 표식 두 가지
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a10
+SYS@boston> SELECT name, database_role, open_mode, protection_mode FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            PROTECTION_MODE
+---------- ---------------- -------------------- --------------------
+CHICAGO    PHYSICAL STANDBY READ ONLY WITH APPLY MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@boston> COL recovery_mode FOR a34
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ----------------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+
+1 row selected.
+
+-- ★ ADG 가 동작 중임을 알려 주는 값은 둘이다.
+--
+--   ① OPEN_MODE     = READ ONLY WITH APPLY
+--   ② RECOVERY_MODE = MANAGED REAL TIME APPLY
+--
+--   ①은 "조회할 수 있고 동시에 적용 중"이라는 뜻이고,
+--   ②는 "그 적용이 실시간"이라는 뜻이다.
+--
+-- ★ 7장에서 배운 주의사항이 여기서도 적용된다.
+--   ②는 STATUS 가 VALID 일 때만 의미가 있다.
+--   BAD PARAM 이면 실제로 적용 중이어도 IDLE 로 나온다.
+--   그래서 두 열을 함께 조회한다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 사용 기록을 엉뚱한 뷰에서 찾으면
+--------------------------------------------------------------------------------
+
+-- ADG 는 별도 라이선스가 필요한 옵션이다.
+-- 사용 여부가 기능 사용 통계에 남는다고 알려져 있으므로 조회해 본다.
+
+SYS@boston> COL name FOR a56
+SYS@boston> SELECT name, detected_usages FROM dba_feature_usage_statistics
+  2            WHERE lower(name) LIKE '%guard%'
+  3               OR lower(name) LIKE '%real-time%';
+
+no rows selected
+
+>>> 원인 파악
+    아무것도 나오지 않는다. 두 가지를 의심할 수 있다.
+      ① 기능 이름이 다르다
+      ② 조회한 뷰가 잘못됐다
+
+    ★ 이 환경은 CDB 다. DBA_ 뷰는 **현재 컨테이너**만 보여 준다.
+      SYS 로 접속하면 CDB$ROOT 이므로 루트 컨테이너의 통계만 조회된다.
+      ADG 관련 항목은 다른 컨테이너에 있을 수 있다.
+
+    ★ 1장에서 같은 상황을 겪었다.
+      그때도 CDB_ 뷰로 바꾸어 CON_ID 3 에서 찾았다.
+
+>>> 조치
+    CDB_ 뷰로 조회한다.
+
+SYS@boston> COL name FOR a50
+SYS@boston> SELECT con_id, name, detected_usages
+  2            FROM cdb_feature_usage_statistics
+  3            WHERE lower(name) LIKE '%guard%' ORDER BY con_id, name;
+
+    CON_ID NAME                                               DETECTED_USAGES
+---------- -------------------------------------------------- ---------------
+         3 Active Data Guard - Real-Time Query on Physical St                0
+           andby
+         3 Data Guard                                                        0
+
+2 rows selected.
+
+>>> 재확인
+    두 항목이 나왔다. CON_ID 3, 즉 CHICAGO_PDB1 에만 있다.
+
+    ★ 그런데 DETECTED_USAGES 가 0 이다.
+      지금 이 순간 ADG 로 조회하고 있는데도 0 이다.
+
+      이 통계는 주기적으로 수집되며 Standby 에서는 갱신이 제한적이다.
+      **따라서 이 값이 0 이라고 해서 ADG 를 쓰지 않은 것은 아니다.**
+
+      라이선스 판단의 근거로 삼기에는 부족하다.
+      실제 사용 여부는 [1] 의 OPEN_MODE 로 판단하는 편이 정확하다.
+
+--------------------------------------------------------------------------------
+ [3] 라이선스 관점 정리
+--------------------------------------------------------------------------------
+
+  ★ Standby 를 **MOUNTED** 로만 두면 ADG 옵션이 필요 없다.
+    리두는 적용되지만 조회할 수 없기 때문이다.
+
+  ★ READ ONLY 로 여는 순간, 그리고 그 상태에서 적용을 계속하는 순간
+    ADG 의 영역이 된다.
+
+  ★ 그러므로 라이선스가 없는 환경에서는
+    **Standby 를 열지 않도록 절차서에 명시해야 한다.**
+    실수로 다음을 실행하면 그 자체로 옵션을 사용한 것이 된다.
+
+      ALTER DATABASE OPEN READ ONLY;
+      ALTER DATABASE RECOVER MANAGED STANDBY DATABASE ... ;
+
+  ★ 이 과정의 실습 환경은 학습 목적이다.
+    실제 도입 시에는 라이선스 조건을 먼저 확인한다.
+
+--------------------------------------------------------------------------------
+ [4] 세션이 어디에 붙었는지 확인하기
+--------------------------------------------------------------------------------
+
+-- 읽기를 Standby 로 분산하면 세션이 어느 쪽에 붙었는지 헷갈린다.
+-- 접속 문자열만 믿지 말고 세션 스스로 확인하게 한다.
+
+[oracle@boston-srv ~]$ sqlplus -s adgu/oracle@boston-srv:1521/chicago_pdb1
+
+SQL> SELECT sys_context('userenv','db_unique_name') db,
+  2         sys_context('userenv','database_role') role FROM dual;
+
+DB       ROLE
+-------- ----------------
+boston   PHYSICAL STANDBY
+
+-- ★ USERENV 컨텍스트의 두 항목이 답을 준다.
+--     DB_UNIQUE_NAME  어느 데이터베이스인가
+--     DATABASE_ROLE   그것이 Primary 인가 Standby 인가
+--
+-- ★ 역할 전환이 있는 환경에서는 두 번째가 특히 중요하다.
+--   접속 대상은 그대로인데 역할이 바뀔 수 있기 때문이다.
+--   "지금 붙은 곳이 읽기 전용인가"를 판단해야 한다면
+--   **이름이 아니라 역할로 판단해야 한다.**
+
+--------------------------------------------------------------------------------
+ [5] PDB 서비스가 등록되어 있는가
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ lsnrctl status | grep -A2 'chicago_pdb1'
+
+Service "chicago_pdb1" has 1 instance(s).
+  Instance "boston", status READY, has 1 handler(s) for this service...
+
+[oracle@chicago-srv ~]$ lsnrctl status | grep -A2 'chicago_pdb1'
+
+Service "chicago_pdb1" has 1 instance(s).
+  Instance "chicago", status READY, has 1 handler(s) for this service...
+
+-- ★ 양쪽 모두 status READY 다. 3장에서 다룬 동적 등록이다.
+--
+-- ★ Standby 쪽 서비스는 **PDB 가 READ ONLY 로 열려 있어야** 등록된다.
+--   PDB 를 닫으면 이 서비스도 사라지고 애플리케이션이 접속할 수 없다.
+--
+--   8장에서 새 PDB 를 열어야 한다고 강조한 이유가 여기서 확인된다.
+--   열지 않으면 서비스가 없고, 서비스가 없으면 접속이 안 된다.
+--
+-- ★ 기동 스크립트에 다음을 넣어 두는 이유도 같다.
+--     ALTER PLUGGABLE DATABASE ALL OPEN READ ONLY;
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+  · ADG 의 표식은 OPEN_MODE 와 RECOVERY_MODE 두 가지다
+  · RECOVERY_MODE 는 목적지 STATUS 가 VALID 일 때만 의미가 있다
+  · 기능 사용 통계는 CDB_ 뷰의 CON_ID 3 에만 있다. DBA_ 뷰에는 없다
+  · DETECTED_USAGES 가 0 이어도 사용하지 않은 것이 아니다
+  · MOUNTED 로만 두면 ADG 옵션이 필요 없다. 여는 순간부터 옵션이다
+  · 세션 위치는 SYS_CONTEXT 의 db_unique_name·database_role 로 확인한다
+  · Standby PDB 서비스는 PDB 가 열려 있어야 등록된다
+
+================================================================================
+ 실습 01 종료 — 환경 변경 없음.
+================================================================================

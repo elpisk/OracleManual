@@ -1,0 +1,174 @@
+================================================================================
+ 제2장 실습 01 — 현재 보호 모드 확인과 세 모드의 요건 비교
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : PROTECTION_MODE 와 PROTECTION_LEVEL 두 열의 차이를 이해하고,
+          각 보호 모드가 요구하는 전제 조건을 조회로 확인한다
+ 소요   : 약 20분
+ 변경   : 없음 (전부 조회)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 양쪽 노드의 보호 모드
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a10
+SYS@chicago> SELECT name, database_role, open_mode,
+  2                 protection_mode, protection_level FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            PROTECTION_MODE      PROTECTION_LEVEL
+---------- ---------------- -------------------- -------------------- --------------------
+CHICAGO    PRIMARY          READ WRITE           MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@boston> COL name FOR a10
+SYS@boston> SELECT name, database_role, open_mode,
+  2                protection_mode, protection_level FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            PROTECTION_MODE      PROTECTION_LEVEL
+---------- ---------------- -------------------- -------------------- --------------------
+CHICAGO    PHYSICAL STANDBY READ ONLY WITH APPLY MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+-- 두 노드가 같은 보호 모드를 보고한다. 보호 모드는 구성 전체의 속성이며
+-- 한쪽만 다르게 설정할 수 있는 값이 아니다.
+--
+-- 두 열의 의미를 구분한다.
+--   PROTECTION_MODE  : 설정한 모드. "이렇게 운영하겠다"
+--   PROTECTION_LEVEL : 지금 실제로 달성 중인 수준. "실제로는 이렇다"
+--
+-- 정상이면 두 값이 같다. 어긋나 있으면 설정한 수준을 달성하지 못하고 있다는 뜻이며,
+-- 실습 05 에서 그 상황을 만들어 본다.
+
+--------------------------------------------------------------------------------
+ [2] 세 모드의 요건 — Standby Redo Log
+--------------------------------------------------------------------------------
+
+-- Maximum Protection 과 Maximum Availability 는 동기 전송을 요구하고,
+-- 동기 전송은 Standby 에 SRL 이 있어야 성립한다. 먼저 확인한다.
+
+SYS@boston> SELECT group#, thread#, sequence#, bytes/1024/1024 mb, status
+  2             FROM v$standby_log;
+
+    GROUP#    THREAD#  SEQUENCE#         MB STATUS
+---------- ---------- ---------- ---------- ----------
+         4          1         20        200 ACTIVE
+         5          1          0        200 UNASSIGNED
+         6          1          0        200 UNASSIGNED
+         7          1          0        200 UNASSIGNED
+
+4 rows selected.
+
+-- group 4 가 ACTIVE 다. 지금 시퀀스 20 의 리두를 받고 있다는 뜻이다.
+-- 나머지 셋은 UNASSIGNED 로 대기 중이다.
+-- SRL 이 여러 개인 이유는 하나가 아카이브되는 동안 다른 하나가 받아야 하기 때문이다.
+
+SYS@boston> SELECT group#, bytes/1024/1024 mb, members, status
+  2             FROM v$log ORDER BY group#;
+
+    GROUP#         MB    MEMBERS STATUS
+---------- ---------- ---------- ----------------
+         1        200          1 UNUSED
+         2        200          1 UNUSED
+         3        200          1 UNUSED
+
+3 rows selected.
+
+-- 온라인 리두는 3그룹, 각 200MB.
+-- 규칙 : SRL 개수 >= 온라인 리두 그룹 수 + 1  →  3 + 1 = 4  →  충족
+--        SRL 크기 == 온라인 리두 크기          →  200MB == 200MB  →  충족
+--
+-- Standby 의 온라인 리두가 전부 UNUSED 인 것은 정상이다.
+-- physical standby 는 자기 온라인 리두에 리두를 쓰지 않으며,
+-- 역할 전환으로 Primary 가 될 때를 대비해 자리만 잡고 있다.
+-- 받은 리두가 들어가는 곳은 온라인 리두가 아니라 standby 리두(SRL)다.
+
+--------------------------------------------------------------------------------
+ [3] Primary 에도 SRL 이 있어야 한다
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT group#, thread#, bytes/1024/1024 mb, status
+  2            FROM v$standby_log;
+
+    GROUP#    THREAD#         MB STATUS
+---------- ---------- ---------- ----------
+         4          1        200 UNASSIGNED
+         5          1        200 UNASSIGNED
+         6          1        200 UNASSIGNED
+         7          1        200 UNASSIGNED
+
+4 rows selected.
+
+-- Primary 의 SRL 은 전부 UNASSIGNED 다. 지금은 쓰이지 않는다.
+-- 그런데도 만들어 두는 이유는 역할 전환이다.
+-- Switchover 로 chicago 가 Standby 가 되는 순간 이 SRL 이 필요해진다.
+-- 미리 만들어 두지 않으면 전환 직후 실시간 적용이 되지 않는다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 요건을 확인하지 않고 모드를 올린다
+--------------------------------------------------------------------------------
+
+-- SRL 은 갖춰졌지만 전송 방식은 아직 ASYNC 다.
+-- 이 상태에서 Maximum Protection 으로 올려 본다.
+
+SYS@chicago> SELECT value FROM v$parameter WHERE name='log_archive_dest_2';
+
+VALUE
+------------------------------------------------------------------------------
+service=boston async valid_for=(online_logfiles,primary_role) db_unique_name=boston
+
+1 row selected.
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PROTECTION;
+ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PROTECTION
+*
+ERROR at line 1:
+ORA-01126: database must be mounted in this instance and not open in any instance
+
+
+>>> 원인 파악
+    메시지는 "데이터베이스를 마운트하라" 지만, 이 문면을 그대로 믿으면 안 된다.
+    실제 원인은 지금 구성이 Maximum Protection 의 요건을 충족하지 못한다는 것이다.
+    구체적으로는 목적지가 ASYNC 이기 때문이다.
+    Maximum Protection 은 동기 전송(SYNC AFFIRM)을 요구한다.
+
+    마운트 상태에서 설정하면 통과하는 이유는, 그 상태에서는 커밋이 발생하지 않아
+    요건 검사가 느슨해지기 때문이다. 즉 "마운트하라"는 우회로일 뿐 해결책이 아니다.
+
+>>> 조치
+    이 실습에서는 모드를 바꾸지 않는다. 요건을 갖추고 올리는 절차는 실습 03 에서 한다.
+    여기서는 "요건을 확인하지 않고 올리면 거부된다" 는 사실만 확인한다.
+
+>>> 재확인 — 모드가 바뀌지 않았음을 확인한다
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+-- 실패한 명령은 아무것도 바꾸지 않았다. 원래 모드 그대로다.
+
+--------------------------------------------------------------------------------
+ [5] 세 모드 요건 정리
+--------------------------------------------------------------------------------
+
+  모드                  전송 방식      SRL   커밋 조건                    장애 시 Primary
+  --------------------- -------------- ----- ---------------------------- ----------------
+  Maximum Protection    SYNC AFFIRM    필수  로컬 + 원격 SRL 기록         인스턴스 종료
+  Maximum Availability  SYNC AFFIRM    필수  로컬 + 원격 SRL 기록         계속 운영
+  Maximum Performance   ASYNC 가능     권장  로컬 기록만                  영향 없음
+
+  * Maximum Performance 에서도 SRL 을 만들어 두는 것이 좋다.
+    실시간 적용(real-time apply)이 SRL 을 요구하기 때문이다.
+    실습 환경도 Maximum Performance 이면서 SRL 을 갖추고 있다.
+
+SYS@chicago> EXIT
+SYS@boston> EXIT
+
+================================================================================
+ 실습 01 종료 — 환경 변경 없음. 실패한 ALTER 는 아무것도 바꾸지 않았다.
+================================================================================

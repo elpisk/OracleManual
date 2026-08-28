@@ -1,0 +1,394 @@
+================================================================================
+ 제2장 실습 04 — 보호 모드별 Primary 동작 차이 (Maximum Protection 의 위험 실증)
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : Standby 를 잃었을 때 Maximum Availability 와 Maximum Protection 의
+          Primary 가 어떻게 다르게 반응하는지 실증한다
+ 소요   : 약 40분
+ 경고   : 이 실습은 **Primary 인스턴스를 실제로 종료시킨다.**
+          개인 실습 환경에서만 수행하고, 다른 실습과 동시에 진행하지 않는다.
+ 되돌리기 : 실습 끝에 Maximum Performance + ASYNC 로 원복하고 양쪽을 정상 기동한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 준비 — Maximum Availability 로 올린다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston SYNC AFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE AVAILABILITY;
+
+Database altered.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM AVAILABILITY MAXIMUM AVAILABILITY
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [2] Maximum Availability — Standby 를 정상 종료한다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+-- 종료가 그대로 된다. 막히지 않는다.
+
+SYS@chicago> SELECT instance_name, status FROM v$instance;
+
+INSTANCE_NAME    STATUS
+---------------- ------------
+chicago          OPEN
+
+1 row selected.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM AVAILABILITY RESYNCHRONIZATION
+
+1 row selected.
+
+-- Primary 는 OPEN 그대로다. PROTECTION_LEVEL 만 떨어졌다.
+-- 이것이 Maximum Availability 의 성격이다 — 조건을 못 지키게 되면
+-- Primary 를 멈추는 대신 보호 수준을 낮추고 계속 운영한다.
+
+SYS@chicago> CREATE TABLE system.t_dg2(c1 NUMBER);
+
+Table created.
+
+SYS@chicago> INSERT INTO system.t_dg2 VALUES(1);
+
+1 row created.
+
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+SYS@chicago> SELECT COUNT(*) FROM system.t_dg2;
+
+  COUNT(*)
+----------
+         1
+
+1 row selected.
+
+-- 갱신도 정상이다. 서비스에 아무 영향이 없다.
+
+SYS@chicago> COL error FOR a52
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id = 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ----------------------------------------------------
+         2 ERROR     ORA-03113: end-of-file on communication channel
+
+1 row selected.
+
+-- 목적지에는 오류가 기록된다.
+-- ORA-03113 은 "연결이 끊겼다" 는 뜻이며, 네트워크 문제일 수도
+-- Standby 인스턴스 다운일 수도 있다. 여기서는 후자다.
+
+--------------------------------------------------------------------------------
+ [3] 회복 — Standby 를 다시 올린다
+--------------------------------------------------------------------------------
+
+SYS@boston> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@boston> ALTER DATABASE OPEN READ ONLY;
+Database altered.
+
+SYS@boston> ALTER PLUGGABLE DATABASE chicago_pdb1 OPEN READ ONLY;
+Pluggable database altered.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+Database altered.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM AVAILABILITY MAXIMUM AVAILABILITY
+
+1 row selected.
+
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id = 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ----------------------------------------------------
+         2 VALID
+
+1 row selected.
+
+-- 사람이 한 일은 Standby 를 켠 것뿐이다. 나머지는 자동으로 따라잡았다.
+
+--------------------------------------------------------------------------------
+ [4] Maximum Protection 으로 올린다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PROTECTION;
+
+Database altered.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM PROTECTION   MAXIMUM PROTECTION
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — Standby 를 정상 종료하려 한다
+--------------------------------------------------------------------------------
+
+SYS@boston> SHUTDOWN IMMEDIATE
+ORA-01154: database busy. Open, close, mount, and dismount not allowed now
+
+
+>>> 원인 파악
+    ORA-01154 는 "데이터베이스가 사용 중이라 열기·닫기·마운트·언마운트를
+    지금 할 수 없다" 는 뜻이다.
+
+    Maximum Protection 에서는 Primary 가 이 Standby 없이는 커밋할 수 없다.
+    오라클이 그 의존 관계를 알고 있어 정상 종료를 막은 것이다.
+    이 거부 자체가 Maximum Protection 의 성격을 잘 보여 준다 —
+    Standby 가 더 이상 "있으면 좋은 것" 이 아니라 "없으면 안 되는 것" 이 됐다.
+
+>>> 조치
+    운영 중이라면 이 거부가 정답이다. 종료하면 안 되는 상태이므로 막는 것이 맞다.
+    Standby 를 내려야 한다면 먼저 Primary 에서 보호 모드를 낮춰야 한다.
+      SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE AVAILABILITY;
+    Standby 가 둘 이상이라면 한 대를 내려도 다른 한 대가 조건을 충족하므로
+    모드를 낮출 필요가 없다.
+
+>>> 재확인
+    Standby 가 여전히 살아 있는지 확인한다. 종료가 거부됐으므로 그대로 있어야 한다.
+
+SYS@boston> SELECT instance_name, status FROM v$instance;
+
+INSTANCE_NAME    STATUS
+---------------- ------------
+boston           OPEN
+
+1 row selected.
+
+-- 종료 명령이 거부됐을 뿐 인스턴스는 무사하다.
+-- 다만 이 실습에서는 "강제로 죽으면 어떻게 되는가" 를 확인하는 것이 목적이므로
+-- 여기서는 모드를 낮추지 않고 일부러 강제 종료한다.
+
+--------------------------------------------------------------------------------
+ [6] Standby 강제 종료 — Primary 는 어떻게 되는가
+--------------------------------------------------------------------------------
+
+SYS@boston> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+-- 30초쯤 기다린 뒤 Primary 를 확인한다.
+
+SYS@chicago> SELECT instance_name, status FROM v$instance;
+SELECT instance_name, status FROM v$instance
+*
+ERROR at line 1:
+ORA-01034: ORACLE not available
+Process ID: 0
+Session ID: 0 Serial number: 0
+
+[oracle@chicago-srv ~]$ ps -ef | grep ora_pmon_chicago | grep -v grep | wc -l
+0
+
+-- Primary 가 사라졌다.
+
+--------------------------------------------------------------------------------
+ [7] 알림 로그로 원인을 확인한다
+--------------------------------------------------------------------------------
+
+[oracle@chicago-srv ~]$ tail -22 \
+> /u01/app/oracle/diag/rdbms/chicago/chicago/trace/alert_chicago.log
+
+LGWR (PID:7843): Attempting LAD:2 network reconnect (3113)
+LGWR (PID:7843): LAD:2 network reconnect abandoned
+Errors in file /u01/app/oracle/diag/rdbms/chicago/chicago/trace/chicago_lgwr_7843.trc:
+ORA-03113: end-of-file on communication channel
+LGWR (PID:7843): Error 3113 for LNO:2 to 'boston'
+LGWR (PID:7843): LAD:2 is UNSYNCHRONIZED
+LGWR (PID:7843): All standby destinations have failed
+LGWR (PID:7843): *************************************************************
+LGWR (PID:7843): WARN: All standby database destinations have failed
+LGWR (PID:7843): WARN: Instance shutdown required to protect primary
+LGWR (PID:7843): *************************************************************
+LGWR (ospid: ): terminating the instance due to ORA error
+System state dump requested by (instance=1, osid=7843 (LGWR)),
+                                summary=[abnormal instance termination].
+Dumping diagnostic data in directory=[cdmp_20260826192215],
+                          requested by (instance=1, osid=7843 (LGWR)),
+                          summary=[abnormal instance termination].
+Instance terminated by LGWR, pid = 7843
+
+-- 흐름이 그대로 드러난다.
+--   ① LAD:2 재연결 시도 → 실패 (ORA-03113)
+--   ② LAD:2 is UNSYNCHRONIZED
+--   ③ All standby destinations have failed
+--   ④ "WARN: Instance shutdown required to protect primary"
+--   ⑤ LGWR 이 인스턴스를 종료
+--
+-- 데이터 무손실을 지키기 위해 서비스를 포기한 것이며, 설계된 동작이다.
+-- 종료를 수행한 것이 SMON 이나 PMON 이 아니라 LGWR 이라는 점도 눈여겨볼 만하다.
+-- 커밋을 책임지는 프로세스가 "더 이상 약속을 지킬 수 없다" 고 판단한 것이다.
+
+--------------------------------------------------------------------------------
+ [8] 복구 — 두 가지 선택지
+--------------------------------------------------------------------------------
+
+-- 선택 A : Standby 를 먼저 살린다  → 보호 수준을 유지한 채 재개
+-- 선택 B : 보호 모드를 낮춘다      → 서비스를 먼저 살리고 무손실은 포기
+--
+-- 여기서는 B 로 복구한 뒤 Standby 를 올린다.
+-- Primary 는 MOUNT 상태로만 올라온다는 점에 주의한다.
+
+SYS@chicago> STARTUP MOUNT
+ORACLE instance started.
+
+Total System Global Area 3221223192 bytes
+Fixed Size                  9139992 bytes
+Variable Size             687865856 bytes
+Database Buffers         2516582400 bytes
+Redo Buffers                7634944 bytes
+Database mounted.
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PERFORMANCE;
+
+Database altered.
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston ASYNC NOAFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> ALTER DATABASE OPEN;
+
+Database altered.
+
+-- 순서가 중요하다. 보호 모드를 낮추기 전에 OPEN 을 시도하면 다시 막힌다.
+-- MOUNT → 모드 하향 → OPEN 이 정해진 순서다.
+
+SYS@chicago> DROP TABLE system.t_dg2 PURGE;
+
+Table dropped.
+
+--------------------------------------------------------------------------------
+ [9] Standby 복구와 최종 확인
+--------------------------------------------------------------------------------
+
+SYS@boston> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+Database altered.
+
+-- shutdown abort 로 죽인 Standby 는 복구가 필요하다.
+-- MRP 를 먼저 돌려 따라잡게 한 뒤에 열어야 한다.
+-- 곧바로 열려고 하면 다음이 난다.
+--
+--   SYS@boston> ALTER DATABASE OPEN READ ONLY;
+--   ERROR at line 1:
+--   ORA-10458: standby database requires recovery
+--   ORA-01196: file 1 is inconsistent due to a failed media recovery session
+--   ORA-01110: data file 1: '/u03/app/oracle/oradata/Boston/datafile/system01.dbf'
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+Database altered.
+
+SYS@boston> ALTER DATABASE OPEN READ ONLY;
+Database altered.
+
+SYS@boston> ALTER PLUGGABLE DATABASE chicago_pdb1 OPEN READ ONLY;
+Pluggable database altered.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+Database altered.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@chicago> COL name FOR a10
+SYS@chicago> SELECT name, database_role, open_mode,
+  2                 protection_mode, protection_level FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            PROTECTION_MODE      PROTECTION_LEVEL
+---------- ---------------- -------------------- -------------------- --------------------
+CHICAGO    PRIMARY          READ WRITE           MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@boston> SELECT name, database_role, open_mode,
+  2                protection_mode, protection_level FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            PROTECTION_MODE      PROTECTION_LEVEL
+---------- ---------------- -------------------- -------------------- --------------------
+CHICAGO    PHYSICAL STANDBY READ ONLY WITH APPLY MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@boston> COL name FOR a16
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+--------------------------------------------------------------------------------
+ [10] 두 모드의 대비 정리
+--------------------------------------------------------------------------------
+
+  항목                          Maximum Availability      Maximum Protection
+  ----------------------------- ------------------------- -------------------------
+  Standby 정상 종료             된다                      ORA-01154 로 거부
+  Standby 강제 종료 시 Primary  계속 운영                 LGWR 이 인스턴스 종료
+  PROTECTION_LEVEL              RESYNCHRONIZATION 로 하락 (Primary 가 없어짐)
+  Primary 에서 DML              가능                      불가 (인스턴스 없음)
+  복구                          Standby 켜면 자동 회복    Primary 를 MOUNT 로 올려
+                                                          모드를 낮추거나 Standby 복구
+  Standby 1대 구성에서          쓸 수 있다                **쓰면 안 된다**
+
+SYS@chicago> EXIT
+SYS@boston> EXIT
+
+================================================================================
+ 실습 04 종료
+ 원복 확인 : 양쪽 MAXIMUM PERFORMANCE / MAXIMUM PERFORMANCE
+             dest_2 ASYNC NOAFFIRM, transport·apply lag 0, 테스트 테이블 삭제 완료
+================================================================================

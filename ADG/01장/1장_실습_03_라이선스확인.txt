@@ -1,0 +1,269 @@
+================================================================================
+ 제1장 실습 03 — 라이선스 확인
+ 대상   : chicago-srv Primary (일부 boston-srv)
+ 목표   : Active Data Guard 옵션 사용 여부를 확인하는 방법과 그 한계를 익힌다
+ 소요   : 약 20분
+ 주의   : 이 실습은 라이선스 "판정" 이 아니라 "확인 경로" 를 배우는 것이 목적이다.
+          실제 계약 준수 여부는 오라클과의 계약서로 판단한다.
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 무엇이 옵션인지 먼저 정리한다
+--------------------------------------------------------------------------------
+
+  기능                                       EE 기본   ADG 옵션   이 과정
+  ------------------------------------------ --------  ---------  --------
+  Physical standby 생성, Redo Apply          O                    4~8장
+  MOUNT 상태 standby 운영, 역할 전환         O                    16장
+  Logical standby, SQL Apply                 O                    12장
+  Snapshot standby                           O                    11장
+  Data Guard Broker, DGMGRL                  O                    13~15장
+  Real-Time Query (standby 를 열고 조회)               O          9장
+  DML 리다이렉션                                       O          9장
+  Far Sync 인스턴스                                    O          10장
+  Standby In-Memory Column Store                       O          9장
+
+--------------------------------------------------------------------------------
+ [2] 에디션과 옵션 링크 여부 확인
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL banner FOR a70
+SYS@chicago> SELECT banner FROM v$version;
+
+BANNER
+----------------------------------------------------------------------
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+1 row selected.
+
+-- Data Guard 는 Enterprise Edition 전용이다. Standard Edition 에서는 쓸 수 없다.
+-- 배너에 'Enterprise Edition' 이 있는지가 첫 관문이다.
+
+SYS@chicago> COL parameter FOR a34
+SYS@chicago> COL value FOR a10
+SYS@chicago> SELECT parameter, value FROM v$option
+  2             WHERE parameter IN ('Oracle Data Guard','Managed Standby',
+  3                                 'Real Application Clusters','Flashback Database',
+  4                                 'Oracle Database Vault');
+
+PARAMETER                          VALUE
+---------------------------------- ----------
+Real Application Clusters          FALSE
+Managed Standby                    TRUE
+Oracle Data Guard                  TRUE
+Flashback Database                 TRUE
+Oracle Database Vault              FALSE
+
+5 rows selected.
+
+-- 주의 : V$OPTION 의 TRUE 는 "바이너리에 링크되어 있다" 는 뜻일 뿐이다.
+--        "라이선스를 보유했다" 는 뜻이 아니다.
+--        Enterprise Edition 을 설치하면 대부분의 옵션이 TRUE 로 나온다.
+--        기술적 가용성과 계약상 사용 권한은 별개다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — 사용 이력을 조회했는데 아무것도 안 나온다
+--------------------------------------------------------------------------------
+
+-- 어떤 기능을 실제로 썼는지는 DBA_FEATURE_USAGE_STATISTICS 로 확인한다.
+
+SYS@chicago> COL name FOR a48
+SYS@chicago> SELECT name, detected_usages, currently_used
+  2              FROM dba_feature_usage_statistics
+  3             WHERE name LIKE '%Data Guard%' OR name LIKE '%Active Data%'
+  4                OR name LIKE '%Far Sync%' OR name LIKE '%Standby%'
+  5             ORDER BY name;
+
+no rows selected
+
+-- 조건이 잘못됐나 싶어 조건을 아예 뺀다.
+
+SYS@chicago> SELECT COUNT(*) AS total_rows FROM dba_feature_usage_statistics;
+
+TOTAL_ROWS
+----------
+         0
+
+1 row selected.
+
+-- 뷰 전체가 비어 있다. 조건 문제가 아니다.
+
+-- MMON 의 주간 샘플링이 아직 안 돌았나 싶어 강제로 실행해 본다.
+-- 먼저 SYSDBA 가 아닌 일반 관리 계정으로 시도해 본다.
+
+[oracle@chicago-srv ~]$ sqlplus -s system/oracle@chicago
+
+SYSTEM@chicago> EXEC dbms_feature_usage_internal.exec_db_usage_sampling(SYSDATE);
+BEGIN dbms_feature_usage_internal.exec_db_usage_sampling(sysdate); END;
+      *
+ERROR at line 1:
+ORA-06550: line 1, column 7:
+PLS-00201: identifier 'DBMS_FEATURE_USAGE_INTERNAL.EXEC_DB_USAGE_SAMPLING' must
+be declared
+ORA-06550: line 1, column 7:
+PL/SQL: Statement ignored
+
+-- PLS-00201 은 "식별자를 찾을 수 없다" 는 뜻이지만, 실제 원인은 오타가 아니라 권한이다.
+-- DBMS_FEATURE_USAGE_INTERNAL 은 SYS 소유의 내부 패키지이며 PUBLIC 에 실행 권한이
+-- 부여되어 있지 않다. 권한이 없으면 오라클은 "권한 없음" 대신 "그런 것이 없다" 로 답한다.
+-- 객체의 존재 자체를 숨기는 설계다.
+--
+-- 반면 조회 뷰는 SYSTEM 으로도 볼 수 있다.
+--
+--   SYSTEM@chicago> SELECT COUNT(*) FROM cdb_feature_usage_statistics;
+--     COUNT(*)
+--   ----------
+--          243
+--
+-- 즉 "읽기는 되지만 수집을 돌리는 것은 SYS 전용" 이다. SYSDBA 로 다시 시도한다.
+
+SYS@chicago> SET SERVEROUTPUT ON
+SYS@chicago> EXEC dbms_feature_usage_internal.exec_db_usage_sampling(SYSDATE);
+
+PL/SQL procedure successfully completed.
+
+SYS@chicago> SELECT COUNT(*) AS total_rows FROM dba_feature_usage_statistics;
+
+TOTAL_ROWS
+----------
+         0
+
+1 row selected.
+
+-- 여전히 0 이다.
+
+
+>>> 원인 파악
+    이 데이터베이스는 CDB 다. 기능 사용 통계는 컨테이너별로 수집되는데,
+    CDB$ROOT 에서 DBA_ 뷰를 보면 "현재 컨테이너의 행" 만 보인다.
+    수집 결과는 루트가 아니라 PDB 쪽에 쌓여 있었던 것이다.
+    멀티테넌트 환경에서 DBA_ 뷰가 비어 있으면 CDB_ 뷰를 의심한다.
+
+>>> 조치 — CDB_ 뷰로 조회한다
+
+SYS@chicago> SELECT COUNT(*) FROM cdb_feature_usage_statistics;
+
+  COUNT(*)
+----------
+       243
+
+1 row selected.
+
+SYS@chicago> SELECT con_id, COUNT(*) FROM cdb_feature_usage_statistics GROUP BY con_id;
+
+    CON_ID   COUNT(*)
+---------- ----------
+         3        243
+
+1 row selected.
+
+-- 243개 행이 전부 CON_ID = 3 에 있다. 3번은 PDB chicago_pdb1 이다.
+
+SYS@chicago> SELECT con_id, name FROM v$containers ORDER BY con_id;
+
+    CON_ID NAME
+---------- ------------------------------
+         1 CDB$ROOT
+         2 PDB$SEED
+         3 CHICAGO_PDB1
+
+3 rows selected.
+
+>>> 재확인
+
+SYS@chicago> COL name FOR a50
+SYS@chicago> SET LINES 160
+SYS@chicago> SELECT con_id, name, detected_usages, currently_used
+  2              FROM cdb_feature_usage_statistics
+  3             WHERE LOWER(name) LIKE '%guard%' OR LOWER(name) LIKE '%standby%'
+  4                OR LOWER(name) LIKE '%far sync%' OR LOWER(name) LIKE '%flashback%'
+  5             ORDER BY name;
+
+    CON_ID NAME                                               DETECTED_USAGES CURRE
+---------- -------------------------------------------------- --------------- -----
+         3 Active Data Guard - Real-Time Query on Physical St                0 FALSE
+           andby
+         3 Data Guard                                                        0 FALSE
+         3 Flashback Data Archive                                            0 FALSE
+         3 Flashback Database                                                0 FALSE
+
+4 rows selected.
+
+-- 이제 이름은 확인된다. 정확한 기능명은 다음 둘이다.
+--   'Data Guard'
+--   'Active Data Guard - Real-Time Query on Physical Standby'
+
+--------------------------------------------------------------------------------
+ [4] 두 번째 교훈 — 이 뷰만으로는 ADG 사용을 판정할 수 없다
+--------------------------------------------------------------------------------
+
+-- 위 결과에서 DETECTED_USAGES 가 전부 0 이다.
+-- 그런데 지금 이 환경은 Standby 를 READ ONLY WITH APPLY 로 열어 두고
+-- 실제로 조회까지 하고 있다. 즉 ADG 기능을 쓰는 중인데 0 으로 나온다.
+
+>>> 왜 0 인가
+    (1) 사용 이력 수집은 MMON 이 주 단위로 수행하는 샘플링에 의존한다.
+        방금 강제 실행했지만, 샘플링이 보는 대상은 "이 데이터베이스에서
+        일어난 일" 이다.
+    (2) Real-Time Query 는 Standby 쪽에서 일어나는 사건이다.
+        그런데 읽기 전용으로 열린 Standby 는 자기 딕셔너리에 기록을 쓸 수 없다.
+        따라서 Standby 에서도 이 값이 올라가지 않는다.
+
+SYS@boston> COL name FOR a56
+SYS@boston> SELECT name, detected_usages FROM cdb_feature_usage_statistics
+  2             WHERE name LIKE '%Active Data%';
+
+NAME                                                     DETECTED_USAGES
+-------------------------------------------------------- ---------------
+Active Data Guard - Real-Time Query on Physical Standby                 0
+
+1 row selected.
+
+-- Standby 에도 행 자체는 있다. 값이 0 일 뿐이다.
+-- RMAN DUPLICATE 로 복제될 때 Primary 의 딕셔너리를 그대로 물려받았기 때문이며,
+-- 읽기 전용이라 그 뒤로 갱신되지 못한 채 0 에 머물러 있다.
+-- 즉 Primary 에서 봐도 0, Standby 에서 봐도 0 이다.
+-- ADG 를 실제로 쓰고 있는데도 그렇다는 점이 이 실습의 요지다.
+
+>>> 그렇다면 무엇으로 판정하는가
+    Standby 의 OPEN_MODE 가 가장 확실한 근거다.
+
+SYS@boston> SELECT db_unique_name, database_role, open_mode FROM v$database;
+
+DB_UNIQUE_NAME                 DATABASE_ROLE    OPEN_MODE
+------------------------------ ---------------- --------------------
+boston                         PHYSICAL STANDBY READ ONLY WITH APPLY
+
+1 row selected.
+
+-- READ ONLY WITH APPLY 라면 Active Data Guard 를 쓰고 있는 것이다.
+-- 옵션이 없는 환경이라면 이 값이 MOUNTED 여야 한다.
+--
+-- 라이선스 실사에 대비한다면 다음 세 가지를 함께 기록해 둔다.
+--   (1) Standby 의 V$DATABASE.OPEN_MODE
+--   (2) 양쪽의 V$VERSION 배너 (Enterprise Edition 인지)
+--   (3) CDB_FEATURE_USAGE_STATISTICS 의 해당 행 (보조 근거)
+
+--------------------------------------------------------------------------------
+ [5] 옵션이 없는 환경으로 되돌리는 방법 (참고)
+--------------------------------------------------------------------------------
+
+-- ADG 옵션을 쓰지 않기로 했다면 Standby 를 MOUNT 상태로 되돌린다.
+-- 이 과정의 9·10장을 제외한 모든 실습은 MOUNT 상태에서도 수행할 수 있다.
+--
+--   SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+--   SYS@boston> SHUTDOWN IMMEDIATE
+--   SYS@boston> STARTUP MOUNT
+--   SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+--     2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+--
+-- 이 실습에서는 실제로 되돌리지 않는다. 이후 장들이 현재 구성을 그대로 쓴다.
+
+SYS@chicago> EXIT
+SYS@boston> EXIT
+
+================================================================================
+ 실습 03 종료
+ 남긴 변경 : dbms_feature_usage_internal.exec_db_usage_sampling 을 한 번 실행했다.
+             이 프로시저는 통계를 갱신할 뿐 구성이나 데이터를 바꾸지 않는다.
+================================================================================

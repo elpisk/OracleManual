@@ -1,0 +1,327 @@
+================================================================================
+ 제13장 실습 05 — 상태 제어와 속성
+ 대상   : chicago-srv (dgmgrl), boston-srv
+ 목표   : Broker 명령으로 적용을 끄고 켜며, 속성으로 전송 방식을 바꾼다.
+          매번 SQL 로 교차 확인해 Broker 명령이 무엇으로 번역되는지 본다
+ 소요   : 약 30분
+ 변경   : 상태·속성을 바꾸고 되돌린다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 적용을 끈다
+--------------------------------------------------------------------------------
+
+DGMGRL> edit database 'boston' set state='APPLY-OFF';
+
+-- 20초 뒤 SQL 로 확인
+
+SYS@boston> SELECT open_mode FROM v$database;
+
+OPEN_MODE
+--------------------
+READ ONLY
+
+1 row selected.
+
+SYS@boston> COL recovery_mode FOR a28
+SYS@boston> SELECT dest_id, recovery_mode FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID RECOVERY_MODE
+---------- ----------------------------
+         1 IDLE
+
+1 row selected.
+
+SYS@boston> SELECT count(*) mrp FROM v$managed_standby WHERE process='MRP0';
+
+       MRP
+----------
+         0
+
+1 row selected.
+
+-- ★ 7장에서 배운 값들이 그대로 움직인다.
+--
+--   READ ONLY WITH APPLY  →  READ ONLY
+--   MANAGED REAL TIME APPLY → IDLE
+--   MRP0 1개              →  0개
+--
+-- ★ Broker 명령이 결국 SQL 로 번역된다는 것을 여기서 확인할 수 있다.
+--   우리가 7장에서
+--   ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL 을
+--   실행했던 것과 같은 결과다.
+
+DGMGRL> show database 'boston'
+
+Database - boston
+
+  Role:               PHYSICAL STANDBY
+  Intended State:     APPLY-OFF
+  Transport Lag:      0 seconds (computed 0 seconds ago)
+  Apply Lag:          0 seconds (computed 0 seconds ago)
+  Average Apply Rate: (unknown)
+  Real Time Query:    OFF
+  Instance(s):
+    boston
+
+Database Status:
+SUCCESS
+
+-- ★ Database Status 가 SUCCESS 다. 오류가 아니다.
+--
+--   Intended State 도 APPLY-OFF 로 함께 바뀌었기 때문이다.
+--   Broker 는 "의도한 상태" 와 "실제" 가 일치하면 정상으로 판정한다.
+--
+-- ★ 이것이 SQL 로 멈추는 것과의 차이다.
+--   SQL 로 MRP 를 멈추면 Intended State 는 APPLY-ON 인 채로 남으므로
+--   Broker 는 목표를 달성하지 못한 것으로 보고 경고한다.
+--
+-- ★ Real Time Query 가 OFF 로 바뀐 것도 확인한다.
+--   적용이 멈췄으므로 9장의 ADG 조건이 깨졌다.
+
+--------------------------------------------------------------------------------
+ [2] 다시 켠다
+--------------------------------------------------------------------------------
+
+DGMGRL> edit database 'boston' set state='APPLY-ON';
+
+-- 30초 뒤
+
+SYS@boston> SELECT open_mode FROM v$database;
+
+OPEN_MODE
+--------------------
+READ ONLY WITH APPLY
+
+1 row selected.
+
+SYS@boston> SELECT dest_id, recovery_mode FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID RECOVERY_MODE
+---------- ----------------------------
+         1 MANAGED REAL TIME APPLY
+
+1 row selected.
+
+SYS@boston> SELECT process, status FROM v$managed_standby WHERE process='MRP0';
+
+PROCESS   STATUS
+--------- ------------
+MRP0      APPLYING_LOG
+
+1 row selected.
+
+-- ★ 되돌아왔다.
+--   7장에서 배운 대로 열려 있는 상태에서 MRP 를 띄웠으므로
+--   READ ONLY WITH APPLY 가 된다.
+--
+-- ★ 11장에서 만난 ORA-10456 을 Broker 는 만들지 않는다.
+--   Broker 가 순서를 알고 있기 때문이다.
+--   이것이 Broker 를 쓰는 실질적 이점 중 하나다.
+
+--------------------------------------------------------------------------------
+ [3] 속성으로 전송 방식을 바꾼다
+--------------------------------------------------------------------------------
+
+DGMGRL> show database 'boston' 'LogXptMode'
+
+  LogXptMode = 'ASYNC'
+
+DGMGRL> edit database 'boston' set property 'LogXptMode'='SYNC';
+
+Property "LogXptMode" updated
+
+-- ★ 이번에는 출력이 있다. 속성 변경은 확인 메시지를 준다.
+
+SYS@chicago> COL value FOR a76
+SYS@chicago> COL name FOR a20
+SYS@chicago> SELECT name, value FROM v$parameter WHERE name='log_archive_dest_2';
+
+NAME                 VALUE
+-------------------- ------------------------------------------------------------
+log_archive_dest_2   service="boston", SYNC AFFIRM delay=0 optional
+                     compression=disable max_failure=0 reopen=300
+                     db_unique_name="boston" net_timeout=30,
+                     valid_for=(online_logfile,all_roles)
+
+1 row selected.
+
+-- ★ ASYNC NOAFFIRM 이 SYNC AFFIRM 으로 바뀌었다.
+--   속성 하나를 바꾸면 Broker 가 문자열 전체를 다시 만든다.
+--
+-- ★ 10장에서 Far Sync 를 구성할 때 이 문자열을 손으로 적었던 것과 비교된다.
+--   그때는 SYNC AFFIRM 을 정확히 적어야 했고
+--   빠뜨린 속성은 기본값이 되었다.
+--   Broker 는 속성 이름만 알면 된다.
+--
+-- ★ LogXptMode 가 SYNC 이면 AFFIRM 도 함께 켜진다.
+--   2장에서 배운 대로 둘은 짝이지만 Broker 에서는 하나의 속성으로 다룬다.
+--   FASTSYNC 를 주면 SYNC NOAFFIRM 이 된다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 전제를 갖추지 않고 보호 모드를 올리면
+--------------------------------------------------------------------------------
+
+-- ★ 앞 단계에서 LogXptMode 를 SYNC 로 바꿨다.
+--   만약 그것을 건너뛰고 바로 보호 모드를 올리면 어떻게 될까.
+--   먼저 ASYNC 로 되돌린 뒤 시도한다.
+
+DGMGRL> edit database 'boston' set property 'LogXptMode'='ASYNC';
+
+Property "LogXptMode" updated
+
+DGMGRL> edit configuration set protection mode as maxavailability;
+
+Error: ORA-16627: operation disallowed since no member would remain to
+       support protection mode
+
+Failed.
+
+>>> 원인 파악
+
+-- ★ ORA-16627 은 "이 보호 모드를 지탱할 멤버가 남지 않는다" 는 뜻이다.
+--
+--   MaxAvailability 는 동기 전송을 요구한다.
+--   구성 안에 SYNC 로 설정된 Standby 가 하나도 없으면
+--   올려 봐야 지탱할 수 없으므로 거부한다.
+--
+-- ★ 2장에서 배운 전제가 그대로 살아 있다.
+--   Broker 는 순서를 대신해 줄 뿐 물리 법칙을 바꾸지 않는다.
+--
+-- ★ 손으로 할 때와 비교하면 오히려 친절하다.
+--   10장에서는 동기 전송 없이 보호 모드를 올려도 명령이 통과했고
+--   PROTECTION_LEVEL 이 RESYNCHRONIZATION 에 머무는 것으로 나타났다.
+--   Broker 는 아예 시작하지 못하게 막는다.
+
+>>> 조치
+
+DGMGRL> edit database 'boston' set property 'LogXptMode'='SYNC';
+
+Property "LogXptMode" updated
+
+>>> 재확인
+
+DGMGRL> edit configuration set protection mode as maxavailability;
+
+DGMGRL> show configuration
+
+Configuration - dg_chicago
+
+  Protection Mode: MaxAvailability
+  Members:
+  chicago - Primary database
+    boston  - Physical standby database
+
+Fast-Start Failover:  Disabled
+
+Configuration Status:
+SUCCESS   (status updated 22 seconds ago)
+
+-- ★ 순서를 지키니 통과했다.
+
+--------------------------------------------------------------------------------
+ [5] 손으로 할 때와 비교
+--------------------------------------------------------------------------------
+
+-- ★ 10장에서 했던 일과 비교한다.
+--
+--   손으로 할 때
+--     ① log_archive_dest_2 를 sync affirm 으로 바꾼다
+--     ② log_archive_config 를 맞춘다
+--     ③ ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE AVAILABILITY
+--     ④ RESYNCHRONIZATION 이 사라질 때까지 기다린다
+--
+--   Broker
+--     ① EDIT DATABASE ... SET PROPERTY 'LogXptMode'='SYNC'
+--     ② EDIT CONFIGURATION SET PROTECTION MODE AS MAXAVAILABILITY
+--
+-- ★ 다만 전제는 같다.
+--   LogXptMode 가 SYNC 가 아니면 MaxAvailability 로 올라가지 않는다.
+--   Broker 는 순서를 대신해 줄 뿐 물리 법칙을 바꾸지는 않는다.
+
+--------------------------------------------------------------------------------
+ [6] 되돌린다 — 순서를 지킨다
+--------------------------------------------------------------------------------
+
+DGMGRL> edit configuration set protection mode as maxperformance;
+
+DGMGRL> edit database 'boston' set property 'LogXptMode'='ASYNC';
+
+Property "LogXptMode" updated
+
+-- ★ 보호 모드를 먼저 내리고 전송 방식을 바꾼다.
+--   11장에서 배운 순서 그대로다.
+--
+--   반대로 하면 MaxAvailability 인데 동기 대상이 없는 상태가 된다.
+--   Broker 를 써도 이 순서는 사람이 지켜야 한다.
+
+DGMGRL> show configuration
+
+Configuration - dg_chicago
+
+  Protection Mode: MaxPerformance
+  Members:
+  chicago - Primary database
+    boston  - Physical standby database
+
+Fast-Start Failover:  Disabled
+
+Configuration Status:
+SUCCESS   (status updated 54 seconds ago)
+
+SYS@chicago> SELECT value FROM v$parameter WHERE name='log_archive_dest_2';
+
+service="boston", ASYNC NOAFFIRM delay=0 optional compression=disable
+max_failure=0 reopen=300 db_unique_name="boston" net_timeout=30,
+valid_for=(online_logfile,all_roles)
+
+1 row selected.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+-- ★ 원래대로 돌아왔다.
+
+--------------------------------------------------------------------------------
+ [7] 자주 쓰는 속성
+--------------------------------------------------------------------------------
+
+-- ★ SHOW DATABASE VERBOSE 로 전체 목록을 볼 수 있다.
+--   실무에서 자주 손대는 것은 다음이다.
+--
+--   LogXptMode              SYNC / ASYNC / FASTSYNC — 전송 방식
+--   LogShipping             ON / OFF — LOG_ARCHIVE_DEST_STATE_n
+--   DelayMins               적용 지연 (14장)
+--   ApplyLagThreshold       경고 임계값 (기본 30초)
+--   TransportLagThreshold   전송 지연 임계값 (기본 30초)
+--   NetTimeout              네트워크 시간 초과 (기본 30초)
+--   ReopenSecs              재시도 간격 (기본 300초)
+--   StandbyFileManagement   8장의 그 파라미터
+--   DbFileNameConvert       5장의 그 파라미터
+--   LogFileNameConvert      10장의 그 파라미터
+--
+-- ★ 판단 기준은 간단하다.
+--   SHOW DATABASE VERBOSE 의 속성 목록에 있으면 Broker 의 것이다.
+--   그것은 SQL 로 바꾸지 않는다.
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① EDIT DATABASE ... SET STATE 로 적용을 끄고 켠다
+--   ② SQL 값들이 그대로 움직인다 — Broker 명령은 SQL 로 번역된다
+--   ③ Intended State 가 함께 바뀌므로 Database Status 는 SUCCESS
+--   ④ Broker 는 여는 순서를 알고 있어 ORA-10456 을 만들지 않는다
+--   ⑤ SET PROPERTY 로 목적지 문자열 전체가 다시 만들어진다
+--   ⑥ 보호 모드는 EDIT CONFIGURATION SET PROTECTION MODE
+--   ⑦ 전제와 순서는 그대로다 — SYNC 없이 올리면 ORA-16627
+--   ⑧ Broker 는 손으로 할 때보다 오히려 엄격하게 막는다
+--
+-- ★ 다음 실습에서 Broker 가 관리하는 것을 SQL 로 바꿔 본다.

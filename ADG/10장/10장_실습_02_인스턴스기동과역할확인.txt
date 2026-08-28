@@ -1,0 +1,215 @@
+================================================================================
+ 제10장 실습 02 — 인스턴스 기동과 역할 확인
+ 대상   : farsync-srv
+ 목표   : Far Sync 용 파라미터 파일을 작성하고 MOUNT 로 기동한다.
+          DATABASE_ROLE 과 CONTROLFILE_TYPE 으로 정체를 확인한다
+ 소요   : 약 35분
+ 변경   : farsync 인스턴스 기동 (실습 07 에서 정리)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 파라미터 파일
+--------------------------------------------------------------------------------
+
+[oracle@farsync-srv ~]$ cat $ORACLE_HOME/dbs/initfarsync.ora
+db_name=chicago
+db_unique_name=farsync
+control_files='/u01/app/oracle/oradata/FARSYNC/control01.ctl'
+sga_target=800m
+pga_aggregate_target=200m
+audit_file_dest='/u01/app/oracle/admin/farsync/adump'
+diagnostic_dest='/u01/app/oracle'
+enable_pluggable_database=true
+remote_login_passwordfile=exclusive
+log_archive_config='dg_config=(chicago,boston,farsync)'
+log_archive_dest_1='location=/u01/app/oracle/fast_recovery_area/FARSYNC valid_for=(all_logfiles,all_roles) db_unique_name=farsync'
+log_archive_dest_2='service=boston async noaffirm valid_for=(standby_logfiles,standby_role) db_unique_name=boston'
+log_archive_format='%t_%s_%r.dbf'
+fal_server=chicago
+standby_file_management=auto
+db_file_name_convert='/u03/app/oracle/oradata/Chicago/','/u01/app/oracle/oradata/FARSYNC/'
+log_file_name_convert='/u03/app/oracle/oradata/Chicago/','/u01/app/oracle/oradata/FARSYNC/'
+
+-- ★ 항목마다 이유가 있다.
+--
+--   db_name=chicago         같은 데이터베이스의 일부다. 5장의 규칙과 같다
+--   db_unique_name=farsync  구성 안에서 나를 구별하는 이름
+--   sga_target=800m         작아도 된다. 적용을 안 하므로 버퍼가 필요 없다
+--   log_archive_config      세 노드를 모두 나열한다
+--   log_archive_dest_1      받은 리두를 로컬에 아카이브
+--   log_archive_dest_2      다음 목적지(boston)로 전달
+--   fal_server=chicago      갭이 생기면 Primary 에게 요청
+--   log_file_name_convert   SRL 경로를 Far Sync 쪽으로 바꾼다
+--
+-- ★ log_archive_dest_2 의 VALID_FOR 를 특히 눈여겨본다.
+--
+--   VALID_FOR=(STANDBY_LOGFILES, STANDBY_ROLE)
+--
+--   Primary 의 목적지는 (ONLINE_LOGFILES, PRIMARY_ROLE) 이었다.
+--   Far Sync 는 자기가 만든 리두가 없다. 받은 것을 넘길 뿐이므로
+--   출처가 온라인 리두가 아니라 SRL 이다.
+--
+-- ★ 없는 것도 의미가 있다.
+--   db_create_file_dest 가 없다. 만들 데이터 파일이 없기 때문이다.
+--   6장에서 OMF 를 쓸 때 필수였던 것이 여기서는 불필요하다.
+
+--------------------------------------------------------------------------------
+ [2] 기동
+--------------------------------------------------------------------------------
+
+[oracle@farsync-srv ~]$ export ORACLE_SID=farsync
+[oracle@farsync-srv ~]$ sqlplus / as sysdba
+
+SQL> STARTUP MOUNT pfile='/u01/app/oracle/product/19.3.0/dbhome_1/dbs/initfarsync.ora'
+
+ORACLE instance started.
+
+Total System Global Area  838858664 bytes
+Fixed Size                  9140136 bytes
+Variable Size             222298112 bytes
+Database Buffers          599785472 bytes
+Redo Buffers                7634944 bytes
+Database mounted.
+
+-- ★ STARTUP MOUNT 한 번으로 끝났다.
+--
+--   3장에서 Standby 를 만들 때는 STARTUP NOMOUNT 후
+--   RMAN DUPLICATE 가 마운트까지 해 주었다.
+--   Far Sync 는 컨트롤 파일이 이미 완성된 상태로 왔으므로
+--   바로 마운트된다.
+--
+-- ★ ALTER DATABASE MOUNT STANDBY DATABASE 를 따로 하지 않는다.
+--   컨트롤 파일 자체가 Far Sync 용이라 역할이 이미 정해져 있다.
+
+--------------------------------------------------------------------------------
+ [3] 정체 확인
+--------------------------------------------------------------------------------
+
+SYS@farsync> COL name FOR a10
+SYS@farsync> COL db_unique_name FOR a16
+SYS@farsync> SELECT name, db_unique_name, database_role, open_mode,
+  2                  controlfile_type, protection_mode FROM v$database;
+
+NAME       DB_UNIQUE_NAME   DATABASE_ROLE    OPEN_MODE   CONTROLFILE_TYPE  PROTECTION_MODE
+---------- ---------------- ---------------- ----------- ----------------- --------------------
+CHICAGO    farsync          FAR SYNC         MOUNTED     FARSYNC           MAXIMUM PERFORMANCE
+
+1 row selected.
+
+-- ★ 두 값이 결정적이다.
+--
+--   DATABASE_ROLE    = FAR SYNC
+--   CONTROLFILE_TYPE = FARSYNC
+--
+--   1장에서 Primary 는 PRIMARY / CURRENT 였고
+--   3장에서 Standby 는 PHYSICAL STANDBY / STANDBY 였다.
+--   세 번째 조합이 여기 있다.
+
+SYS@farsync> SELECT instance_name, status, database_status FROM v$instance;
+
+INSTANCE_NAME    STATUS       DATABASE_STATUS
+---------------- ------------ -----------------
+farsync          MOUNTED      ACTIVE
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 열려고 하면
+--------------------------------------------------------------------------------
+
+-- 9장에서 Standby 를 READ ONLY 로 열었다. Far Sync 도 될까.
+
+SYS@farsync> ALTER DATABASE OPEN READ ONLY;
+
+alter database open read only
+*
+ERROR at line 1:
+ORA-16476: far sync instance does not allow Open operation
+
+>>> 원인 파악
+
+-- ORA-16476 은 이름 그대로다. "far sync 인스턴스는 Open 을 허용하지 않는다."
+-- 이보다 분명할 수 없는 오류 메시지다.
+--
+-- 이유는 단순하다. 열려면 데이터 파일이 있어야 하는데 없다.
+-- 9장의 ADG 는 Standby 에 데이터가 있었기 때문에 가능했던 것이다.
+--
+-- ★ 여기서 Far Sync 의 성격이 하나 더 드러난다.
+--   조회 서비스를 제공하지 못한다.
+--   보고서용 사본이 필요하면 Standby 를 써야 한다.
+
+>>> 조치
+
+-- READ ONLY 없이 그냥 열어도 마찬가지다.
+
+SYS@farsync> ALTER DATABASE OPEN;
+
+alter database open
+*
+ERROR at line 1:
+ORA-16476: far sync instance does not allow Open operation
+
+-- 열 수 없는 것이 정상이므로 조치할 것이 없다.
+-- MOUNTED 상태 그대로가 Far Sync 의 정상 상태다.
+
+>>> 재확인
+
+SYS@farsync> SELECT open_mode, database_role FROM v$database;
+
+OPEN_MODE   DATABASE_ROLE
+----------- ----------------
+MOUNTED     FAR SYNC
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [5] 알림 로그
+--------------------------------------------------------------------------------
+
+[oracle@farsync-srv ~]$ ls /u01/app/oracle/diag/rdbms/chicago/farsync/trace/alert_farsync.log
+ls: cannot access /u01/app/oracle/diag/rdbms/chicago/farsync/trace/alert_farsync.log: No such file or directory
+
+-- ★ 없다. 7장에서 boston 의 알림 로그가
+--   diag/rdbms/chicago/boston/ 에 있었으므로 같은 규칙을 예상했는데 다르다.
+--   추측하지 말고 인스턴스에게 직접 묻는다.
+
+SYS@farsync> COL value FOR a62
+SYS@farsync> SELECT name, value FROM v$diag_info
+  2            WHERE name IN ('ADR Home','Diag Trace');
+
+NAME                 VALUE
+-------------------- --------------------------------------------------------------
+ADR Home             /u01/app/oracle/diag/rdbms/farsync/farsync
+Diag Trace           /u01/app/oracle/diag/rdbms/farsync/farsync/trace
+
+2 rows selected.
+
+[oracle@farsync-srv ~]$ ls /u01/app/oracle/diag/rdbms/farsync/farsync/trace/alert_farsync.log
+/u01/app/oracle/diag/rdbms/farsync/farsync/trace/alert_farsync.log
+
+-- ★ 중간 디렉터리가 farsync 다. chicago 가 아니다.
+--
+--   boston   diag/rdbms/chicago/boston/    <db_name>/<db_unique_name>
+--   farsync  diag/rdbms/farsync/farsync/   <db_unique_name>/<db_unique_name>
+--
+--   Far Sync 는 데이터 딕셔너리가 없어 DB_NAME 을 그런 용도로 쓰지 않는다.
+--
+-- ★ 실무 교훈은 경로 자체보다 방법에 있다.
+--   알림 로그 위치가 궁금하면 V$DIAG_INFO 를 조회한다.
+--   경로 규칙을 외워서 추측하면 이렇게 틀린다.
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① pfile 은 짧다. 데이터 파일 관련 설정이 통째로 빠진다
+--   ② STARTUP MOUNT 한 번으로 기동한다
+--   ③ DATABASE_ROLE = FAR SYNC, CONTROLFILE_TYPE = FARSYNC
+--   ④ 열 수 없다 — ORA-16476 (READ ONLY 도 안 된다)
+--   ⑤ MOUNTED 가 Far Sync 의 정상 상태다
+--   ⑥ 알림 로그는 diag/rdbms/farsync/farsync/ 아래. V$DIAG_INFO 로 찾는다
+--
+-- ★ 아직 리두를 받을 준비가 안 되어 있다.
+--   SRL 이 필요하다. 다음 실습에서 만든다.

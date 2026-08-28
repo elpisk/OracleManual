@@ -1,0 +1,290 @@
+================================================================================
+ 제15장 실습 01 — 로그 파일과 SRL 의 상태를 읽는다
+ 대상   : chicago-srv, boston-srv
+ 목표   : V$LOG · V$LOGFILE · V$STANDBY_LOG 의 STATUS 를 역할별로 해석한다.
+          "리두가 흐르고 있는가" 를 다섯 줄의 SQL 로 판정한다
+ 소요   : 약 30분
+ 변경   : 없음 (전부 조회)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 출발점
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT database_role, open_mode, protection_mode FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE            PROTECTION_MODE
+---------------- -------------------- --------------------
+PRIMARY          READ WRITE           MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@boston> SELECT database_role, open_mode FROM v$database;
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby WHERE process='MRP0';
+
+DATABASE_ROLE    OPEN_MODE
+---------------- --------------------
+PHYSICAL STANDBY READ ONLY WITH APPLY
+
+PROCESS   STATUS         SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         74
+
+1 row selected.
+
+-- ★ 14장을 마친 상태 그대로다. Broker 구성도 그대로 쓴다.
+
+--------------------------------------------------------------------------------
+ [2] Primary 의 온라인 리두
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT group#, thread#, sequence#, bytes/1024/1024 mb, archived, status
+  2            FROM v$log ORDER BY group#;
+
+    GROUP#    THREAD#  SEQUENCE#         MB ARC STATUS
+---------- ---------- ---------- ---------- --- ----------------
+         1          1         73        200 YES INACTIVE
+         2          1         74        200 NO  CURRENT
+         3          1         72        200 YES INACTIVE
+
+3 rows selected.
+
+-- ★ 3장에서 본 그대로다.
+--
+--   CURRENT   지금 쓰고 있다. 하나뿐이어야 한다
+--   ACTIVE    인스턴스 복구에 아직 필요하다
+--   INACTIVE  복구에 필요 없다. 재사용할 수 있다
+--   UNUSED    한 번도 쓰이지 않았다
+--
+-- ★ ARCHIVED 열을 함께 본다.
+--   CURRENT 인 그룹만 NO 다. 아직 쓰는 중이니 당연하다.
+--
+-- ★ 이상 신호는 이렇게 읽는다.
+--   ACTIVE 이면서 ARCHIVED=NO 인 그룹이 여러 개 쌓이면
+--   아카이버가 밀리고 있다는 뜻이다.
+--   그대로 두면 쓸 그룹이 없어 로그 전환이 멈춘다.
+--
+-- ★ SEQUENCE# 74 를 기억해 둔다. 아래에서 계속 쓴다.
+
+--------------------------------------------------------------------------------
+ [3] Standby 의 온라인 리두는 쓰이지 않는다
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT group#, thread#, sequence#, bytes/1024/1024 mb, archived, status
+  2            FROM v$log ORDER BY group#;
+
+    GROUP#    THREAD#  SEQUENCE#         MB ARC STATUS
+---------- ---------- ---------- ---------- --- ----------------
+         1          1          0        200 NO  CURRENT
+         2          1          0        200 YES UNUSED
+         3          1          0        200 YES UNUSED
+
+3 rows selected.
+
+-- ★ SEQUENCE# 가 전부 0 이다.
+--   Standby 는 자기 온라인 리두에 아무것도 쓰지 않는다.
+--   리두는 Primary 가 만들고 Standby 는 받기만 한다.
+--
+-- ★ 그러면 왜 있는가. 역할이 바뀐 뒤에 쓰기 위해서다.
+--   14장의 VALIDATE VERBOSE 가 Future 구성에서 계산한 것이
+--   바로 이 그룹들이다.
+--
+-- ★ 14장에서 본 boston Online Redo Log Files: Not Cleared 도
+--   같은 맥락이다. 쓰이지 않았으니 정리할 것도 없다.
+--
+-- ★ 여기서 오해가 자주 생긴다.
+--   "Standby 의 CURRENT 시퀀스가 0인데 괜찮은가" 라고 묻는 경우다.
+--   괜찮다. 이 뷰가 아니라 V$STANDBY_LOG 를 봐야 한다.
+
+--------------------------------------------------------------------------------
+ [4] 파일 목록 — 양쪽 구성이 다르다
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL member FOR a56
+SYS@chicago> SELECT group#, type, status, member FROM v$logfile ORDER BY type, group#;
+
+    GROUP# TYPE    STATUS  MEMBER
+---------- ------- ------- ------------------------------------------
+         1 ONLINE          /u03/app/oracle/oradata/Chicago/redo01.log
+         2 ONLINE          /u03/app/oracle/oradata/Chicago/redo02.log
+         3 ONLINE          /u03/app/oracle/oradata/Chicago/redo03.log
+         4 STANDBY         /u03/app/oracle/oradata/Chicago/stdbyredo04.log
+         5 STANDBY         /u03/app/oracle/oradata/Chicago/stdbyredo05.log
+         6 STANDBY         /u03/app/oracle/oradata/Chicago/stdbyredo06.log
+         7 STANDBY         /u03/app/oracle/oradata/Chicago/stdbyredo07.log
+
+7 rows selected.
+
+SYS@boston> SELECT group#, type, status, member FROM v$logfile ORDER BY type, group#;
+
+    GROUP# TYPE    STATUS  MEMBER
+---------- ------- ------- ------------------------------------------
+         1 ONLINE          /u03/app/oracle/oradata/BOSTON/onlinelog/o1_mf_1_...
+         1 ONLINE          /u03/app/oracle/fast_recovery_area/BOSTON/onlinelog/...
+         2 ONLINE          /u03/app/oracle/fast_recovery_area/BOSTON/onlinelog/...
+         2 ONLINE          /u03/app/oracle/oradata/BOSTON/onlinelog/o1_mf_2_...
+         ...
+        7 STANDBY         /u03/app/oracle/oradata/BOSTON/onlinelog/o1_mf_7_...
+
+14 rows selected.
+
+-- ★ 행 수가 다르다. chicago 7개, boston 14개.
+--
+-- ★ boston 은 그룹마다 멤버가 둘이다.
+--   6장에서 OMF 로 복제할 때
+--   DB_CREATE_ONLINE_LOG_DEST_1 과 _2 를 지정했기 때문이며
+--   오라클이 자동으로 다중화했다.
+--
+-- ★ chicago 는 손으로 만들었고 boston 은 OMF 가 만들었다.
+--   동작에는 지장이 없지만 알아 둬야 한다.
+--   역할이 바뀌면 다중화 수준도 함께 바뀐다.
+--
+-- ★ STATUS 열이 비어 있는 것이 정상이다.
+--   값이 들어가는 경우는 셋뿐이다.
+--
+--   INVALID  파일에 접근할 수 없다
+--   STALE    내용이 불완전하다
+--   DELETED  더 이상 쓰지 않는다
+--
+-- ★ 감시 스크립트에 쓰기 좋은 성질이다.
+--   WHERE status IS NOT NULL 인 행이 하나라도 나오면 확인 대상이다.
+
+--------------------------------------------------------------------------------
+ [5] SRL 이 진짜 정보다
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT group#, thread#, sequence#, bytes/1024/1024 mb,
+  2                 used/1024 used_kb, archived, status
+  3            FROM v$standby_log ORDER BY group#;
+
+    GROUP#    THREAD#  SEQUENCE#         MB    USED_KB ARC STATUS
+---------- ---------- ---------- ---------- ---------- --- ----------
+         4          1         74        200       8977 YES ACTIVE
+         5          1          0        200          0 NO  UNASSIGNED
+         6          1          0        200          0 YES UNASSIGNED
+         7          1          0        200          0 YES UNASSIGNED
+
+4 rows selected.
+
+-- ★ 넷 중 하나만 ACTIVE 다.
+--
+-- ★ SEQUENCE# 74 다. [2] 에서 본 Primary 의 CURRENT 와 같다.
+--   지금 만들어지는 리두를 실시간으로 받고 있다는 뜻이다.
+--
+-- ★ USED 8,977KB.
+--   200MB 중 약 9MB 를 썼다.
+--   14장의 SendQEntries 가 보여 준 SIZE (KBs) 6911 과 같은 성격이다.
+--
+-- ★ 판정 기준
+--
+--   ACTIVE 가 정확히 1개      정상
+--   ACTIVE 가 2개 이상        앞의 것이 아직 아카이브되지 않았다
+--   ACTIVE 가 0개             리두가 오지 않고 있다
+--
+-- ★ 마지막 경우가 실습 03 에서 만들 상황이다.
+
+--------------------------------------------------------------------------------
+ [6] Primary 의 SRL 은 놀고 있다
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT group#, thread#, sequence#, archived, status
+  2            FROM v$standby_log ORDER BY group#;
+
+    GROUP#    THREAD#  SEQUENCE#     ARC STATUS
+---------- ---------- ---------- ------- ----------
+         4          1          0     YES UNASSIGNED
+         5          1          0     YES UNASSIGNED
+         6          1          0     YES UNASSIGNED
+         7          1          0     YES UNASSIGNED
+
+4 rows selected.
+
+-- ★ 넷 다 UNASSIGNED 다. Primary 는 SRL 을 쓰지 않는다.
+--   전환 후를 대비해 만들어 둔 것이며 4장에서 그렇게 배웠다.
+--
+-- ★ 여기서 요령이 하나 나온다.
+--   V$STANDBY_LOG 는 Primary 에서도 오류 없이 조회된다.
+--   뷰가 있다는 것과 값이 있다는 것은 다르다.
+--
+-- ★ 감시 스크립트에서 이 뷰를 조회했는데 전부 UNASSIGNED 라면
+--   Standby 가 리두를 못 받는 것이 아니라
+--   Primary 에서 조회했을 가능성을 먼저 의심한다.
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 — 열 이름을 틀리면
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT group#, statuss FROM v$standby_log;
+
+select group#, statuss from v$standby_log
+               *
+ERROR at line 1:
+ORA-00904: "STATUSS": invalid identifier
+
+>>> 원인 파악
+
+-- ★ 열 이름이 틀렸다.
+--
+-- ★ 두 번호를 구별한다.
+--
+--   ORA-00904  열 이름이 틀렸다
+--   ORA-00942  뷰 이름이 틀렸거나 권한이 없다
+--
+--   어디를 고쳐야 하는지가 번호로 정해진다.
+--
+-- ★ V$ 뷰는 열이 많아 이름을 잘못 쓰기 쉽다.
+--   V$ARCHIVE_DEST 는 열이 40개가 넘는다.
+
+>>> 조치
+
+SYS@chicago> DESC v$standby_log
+
+-- 열 목록을 먼저 확인한다.
+
+>>> 재확인
+
+SYS@chicago> SELECT group#, status FROM v$standby_log WHERE rownum<=2;
+
+    GROUP# STATUS
+---------- ----------
+         4 UNASSIGNED
+         5 UNASSIGNED
+
+2 rows selected.
+
+--------------------------------------------------------------------------------
+ [8] 다섯 줄로 판정한다
+--------------------------------------------------------------------------------
+
+-- ★ 지금까지 본 것을 순서로 묶는다.
+--
+--   ① [Primary] V$LOG 에서 CURRENT 가 정확히 하나인가
+--   ② [Primary] ACTIVE 이면서 ARCHIVED=NO 인 그룹이 쌓이지 않았는가
+--   ③ [Standby] V$STANDBY_LOG 에서 ACTIVE 가 정확히 하나인가
+--   ④ [Standby] 그 그룹의 SEQUENCE# 가 ① 의 시퀀스와 같은가
+--   ⑤ [양쪽]   V$LOGFILE 에서 STATUS 가 비어 있지 않은 행이 있는가
+--
+-- ★ 다섯 가지 모두 SQL 한 줄씩이며
+--   이것만으로 "리두가 흐르고 있는가" 에 답할 수 있다.
+--
+-- ★ Broker 의 SHOW CONFIGURATION 한 줄보다 손이 많이 간다.
+--   그러나 각 항목이 무엇을 뜻하는지 알고 보므로
+--   문제가 생겼을 때 어디를 볼지 바로 안다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① V$LOG 의 CURRENT 는 하나여야 한다
+--   ② ARCHIVED=NO 는 CURRENT 인 그룹에만 정상이다
+--   ③ Standby 의 온라인 리두는 SEQUENCE# 가 0 — 쓰이지 않는다
+--   ④ boston 은 OMF 다중화로 멤버가 둘씩 (14행)
+--   ⑤ V$LOGFILE 의 STATUS 는 비어 있는 것이 정상이다
+--   ⑥ SRL 은 ACTIVE 가 정확히 하나여야 한다
+--   ⑦ ACTIVE 인 SRL 의 SEQUENCE# 는 Primary 의 CURRENT 와 같다
+--   ⑧ Primary 의 SRL 은 전부 UNASSIGNED — 조회는 되지만 값이 없다
+--   ⑨ 열 이름 오류는 ORA-00904, 뷰 이름은 ORA-00942
+--
+-- ★ 다음 실습에서 아카이브 목적지를 읽는다.

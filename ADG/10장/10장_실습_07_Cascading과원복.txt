@@ -1,0 +1,403 @@
+================================================================================
+ 제10장 실습 07 — Cascading 규칙과 원복
+ 대상   : boston-srv, chicago-srv
+ 목표   : Standby 가 다른 Standby 로 전달하는 계단식 구성의 설정 규칙을
+          확인하고, 실습 환경을 원래 상태로 되돌린다
+ 소요   : 약 35분
+ 변경   : 없음 (모두 원복한다)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] Far Sync 의 전달 목적지를 다시 본다
+--------------------------------------------------------------------------------
+
+SYS@farsync> COL name FOR a20
+SYS@farsync> COL value FOR a74
+SYS@farsync> SELECT name, value FROM v$parameter WHERE name='log_archive_dest_2';
+
+NAME                 VALUE
+-------------------- --------------------------------------------------------------------------
+log_archive_dest_2   service=boston async noaffirm valid_for=(standby_logfiles,standby_role) db
+                     _unique_name=boston
+
+1 row selected.
+
+SYS@farsync> COL destination FOR a12
+SYS@farsync> SELECT dest_id, destination, status, valid_now, valid_role
+  2            FROM v$archive_dest WHERE dest_id=2;
+
+   DEST_ID DESTINATION  STATUS    VALID_NOW        VALID_ROLE
+---------- ------------ --------- ---------------- ------------
+         2 boston       VALID     YES              STANDBY_ROLE
+
+1 row selected.
+
+-- ★ Cascading 도 이것과 같은 형태다.
+--   차이는 전달하는 주체다.
+--
+--   Far Sync            데이터 없는 전용 인스턴스가 전달한다
+--   Cascading Standby   데이터를 가진 진짜 Standby 가 전달까지 겸한다
+--
+--   용도도 다르다.
+--   Far Sync 는 원거리 무손실이 목적이고
+--   Cascading 은 계층적 배포가 목적이다.
+
+--------------------------------------------------------------------------------
+ [2] boston 에 계단식 목적지를 만든다
+--------------------------------------------------------------------------------
+
+-- 계단식 전달은 비동기로 이뤄진다고 알려져 있다.
+-- 그렇다면 SYNC 를 주면 거부될까. 확인해 본다.
+
+SYS@boston> ALTER SYSTEM SET log_archive_dest_3=
+  2    'service=farsync sync affirm valid_for=(standby_logfiles,standby_role)
+  3     db_unique_name=farsync' SCOPE=MEMORY;
+
+System altered.
+
+SYS@boston> COL destination FOR a12
+SYS@boston> COL error FOR a44
+SYS@boston> SELECT dest_id, destination, status, error
+  2            FROM v$archive_dest_status WHERE dest_id=3;
+
+   DEST_ID DESTINATION  STATUS    ERROR
+---------- ------------ --------- --------------------------------------------
+         3 farsync      VALID
+
+1 row selected.
+
+SYS@boston> SELECT dest_id, transmit_mode, affirm, valid_now, valid_role
+  2            FROM v$archive_dest WHERE dest_id=3;
+
+   DEST_ID TRANSMIT_MOD AFF VALID_NOW        VALID_ROLE
+---------- ------------ --- ---------------- ------------
+         3 PARALLELSYNC YES YES              STANDBY_ROLE
+
+1 row selected.
+
+-- ★ 받아들여졌다. 오류가 없다.
+--
+--   STATUS = VALID
+--   TRANSMIT_MODE = PARALLELSYNC
+--   AFFIRM = YES
+--   VALID_NOW = YES
+--
+-- ★ 예상과 다르다.
+--   문서는 계단식 전달이 비동기로 이뤄진다고 설명한다.
+--   그런데 파라미터 수준에서는 SYNC 를 거부하지 않는다.
+--
+-- ★ 여기서 얻는 교훈이 있다.
+--   "설정이 받아들여졌다" 와 "의도대로 동작한다" 는 다른 말이다.
+--   오라클은 문법과 역할 조건만 검사한다.
+--   그 뒤의 동작은 별개의 규칙을 따른다.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+-- 20초 뒤
+
+SYS@boston> COL error FOR a54
+SYS@boston> SELECT dest_id, status, error FROM v$archive_dest_status WHERE dest_id=3;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ------------------------------------------------------
+         3 VALID
+
+1 row selected.
+
+-- ★ 리두를 실제로 전환해도 오류가 나지 않는다.
+--   그래도 계단식 구성에서는 ASYNC 를 명시하는 것이 옳다.
+--   의도가 분명해지고, 문서가 보장하는 동작과 설정이 일치한다.
+
+--------------------------------------------------------------------------------
+ [3] ASYNC 로 바꾸면
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER SYSTEM SET log_archive_dest_3=
+  2    'service=farsync async noaffirm valid_for=(standby_logfiles,standby_role)
+  3     db_unique_name=farsync' SCOPE=MEMORY;
+
+System altered.
+
+SYS@boston> SELECT dest_id, transmit_mode, affirm, valid_now, valid_role
+  2            FROM v$archive_dest WHERE dest_id=3;
+
+   DEST_ID TRANSMIT_MOD AFF VALID_NOW        VALID_ROLE
+---------- ------------ --- ---------------- ------------
+         3 ASYNCHRONOUS NO  YES              STANDBY_ROLE
+
+1 row selected.
+
+-- ★ TRANSMIT_MODE 가 ASYNCHRONOUS 로, AFFIRM 이 NO 로 바뀌었다.
+--   설정한 대로 표시된다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — VALID_FOR 를 잘못 주면
+--------------------------------------------------------------------------------
+
+-- 계단식 구성이 동작하지 않을 때 가장 흔한 원인이다.
+-- 일부러 틀리게 준다.
+
+SYS@boston> ALTER SYSTEM SET log_archive_dest_3=
+  2    'service=farsync async valid_for=(online_logfiles,primary_role)
+  3     db_unique_name=farsync' SCOPE=MEMORY;
+
+System altered.
+
+-- ★ 오류 없이 받아들여진다. 여기가 함정이다.
+
+SYS@boston> SELECT dest_id, status, valid_now, valid_role, valid_type
+  2            FROM v$archive_dest WHERE dest_id=3;
+
+   DEST_ID STATUS    VALID_NOW        VALID_ROLE   VALID_TYPE
+---------- --------- ---------------- ------------ ---------------
+         3 VALID     WRONG VALID_TYPE PRIMARY_ROLE ONLINE_LOGFILE
+
+1 row selected.
+
+>>> 원인 파악
+
+-- ★ STATUS 는 VALID 인데 VALID_NOW 가 WRONG VALID_TYPE 이다.
+--
+--   7장에서 boston 의 2번 목적지를 볼 때 만난 그 값이다. 뜻도 같다.
+--   "설정은 유효하지만 지금 역할에는 해당하지 않는다."
+--
+-- ★ 두 가지가 함께 어긋났다.
+--
+--   PRIMARY_ROLE 인데 boston 은 Standby 다
+--   ONLINE_LOGFILE 인데 Standby 가 전달할 리두는 SRL 에서 나온다
+--
+-- ★ 두 열이 다른 질문에 답한다는 것을 기억한다.
+--
+--   STATUS      이 목적지 설정이 해석 가능한가   → BAD PARAM, ERROR
+--   VALID_NOW   지금 이 역할에서 쓰이는가        → WRONG VALID_TYPE
+--
+--   STATUS 만 보면 정상으로 보인다.
+--   조용히 아무 일도 하지 않는다는 점이 발견을 어렵게 만든다.
+
+>>> 조치
+
+SYS@boston> ALTER SYSTEM SET log_archive_dest_3=
+  2    'service=farsync async noaffirm valid_for=(standby_logfiles,standby_role)
+  3     db_unique_name=farsync' SCOPE=MEMORY;
+
+System altered.
+
+>>> 재확인
+
+SYS@boston> SELECT dest_id, valid_now, valid_role, valid_type
+  2            FROM v$archive_dest WHERE dest_id=3;
+
+   DEST_ID VALID_NOW        VALID_ROLE   VALID_TYPE
+---------- ---------------- ------------ ---------------
+         3 UNKNOWN          STANDBY_ROLE STANDBY_LOGFILE
+
+1 row selected.
+
+-- ★ VALID_ROLE 과 VALID_TYPE 이 바로잡혔다.
+--   STANDBY_ROLE / STANDBY_LOGFILE 이면 Standby 가 전달하는 데 맞는 조합이다.
+--
+-- ★ 그런데 VALID_NOW 가 YES 가 아니라 UNKNOWN 이다.
+--
+--   설정한 직후라 아직 이 목적지를 한 번도 쓰지 않았기 때문이다.
+--   "지금 유효한지 판단할 근거가 없다" 는 뜻이며 오류가 아니다.
+--   리두가 한 번 오가면 YES 로 바뀐다. [2] 에서 본 값이 그것이다.
+--
+-- ★ VALID_NOW 가 가질 수 있는 값을 이 장에서 셋 다 봤다.
+--
+--   YES                 지금 이 역할에서 쓰인다
+--   WRONG VALID_TYPE    설정이 지금 역할과 맞지 않는다
+--   UNKNOWN             아직 판단할 근거가 없다
+
+--------------------------------------------------------------------------------
+ [5] 원복 ① — 계단식 목적지 해제
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER SYSTEM SET log_archive_dest_state_3='DEFER' SCOPE=MEMORY;
+
+System altered.
+
+SYS@boston> ALTER SYSTEM SET log_archive_dest_3='' SCOPE=MEMORY;
+
+System altered.
+
+SYS@boston> SELECT dest_id, status FROM v$archive_dest_status WHERE dest_id=3;
+
+   DEST_ID STATUS
+---------- ---------
+         3 INACTIVE
+
+1 row selected.
+
+-- ★ INACTIVE 는 "설정되지 않은 목적지" 라는 뜻이다.
+--   7장에서 3~10번 목적지가 모두 INACTIVE 였던 것과 같은 상태로 돌아갔다.
+--
+-- ★ SCOPE=MEMORY 로 설정했으므로 SPFILE 에는 흔적이 없다.
+--   실습용 설정을 남기지 않는 방법이다.
+
+--------------------------------------------------------------------------------
+ [6] 원복 ② — 보호 모드와 리두 경로
+--------------------------------------------------------------------------------
+
+-- ★ 순서가 중요하다. 보호 모드를 먼저 내린다.
+--
+--   MAXIMUM AVAILABILITY 인 상태에서 동기 목적지를 먼저 없애면
+--   Primary 는 동기 대상이 사라진 채로 남는다.
+--   2장에서 다룬 규칙이다.
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PERFORMANCE;
+
+Database altered.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2=
+  2    'service=boston async noaffirm valid_for=(online_logfiles,primary_role)
+  3     db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> ALTER SYSTEM SET log_archive_config='dg_config=(chicago,boston,farsync)' SCOPE=BOTH;
+
+System altered.
+
+-- ★ log_archive_config 는 세 이름을 그대로 둔다.
+--   Far Sync 를 다시 쓸 때 바로 연결할 수 있고
+--   목록에 이름이 남아 있는 것 자체는 부담이 없다.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+--------------------------------------------------------------------------------
+ [7] 원복 확인
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL destination FOR a12
+SYS@chicago> COL error FOR a30
+SYS@chicago> SELECT dest_id, destination, status, error
+  2            FROM v$archive_dest_status WHERE dest_id<=2;
+
+   DEST_ID DESTINATION  STATUS    ERROR
+---------- ------------ --------- ------------------------------
+         1              VALID
+         2 boston       VALID
+
+2 rows selected.
+
+SYS@boston> COL recovery_mode FOR a28
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id<=2;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ----------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+         2 VALID     IDLE
+
+2 rows selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         37
+
+1 row selected.
+
+SYS@boston> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@boston> COL name FOR a16
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:50
+apply lag        +00 00:00:50
+
+2 rows selected.
+
+-- ★ 지연이 50초로 나온다. 놀라지 않아도 된다.
+--   목적지를 바꾼 직후라 전송 경로가 새로 자리를 잡는 중이다.
+--   로그가 한두 번 더 오가면 0 으로 돌아온다.
+--
+-- ★ 7장에서 배운 대로 V$DATAGUARD_STATS 는
+--   "마지막으로 확인된 시점" 을 기준으로 계산한다.
+--   순간값 하나로 판단하지 않고 추세를 본다.
+
+SYS@chicago> DROP TABLE system.fs_t PURGE;
+
+Table dropped.
+
+-- ★ 실습에서 만든 테이블을 지운다.
+--   원상 복구 원칙이다. 다음 장의 실습이 깨끗한 상태에서 시작하도록 한다.
+
+--------------------------------------------------------------------------------
+ [8] Far Sync 노드는 어떻게 하는가
+--------------------------------------------------------------------------------
+
+-- 11장 이후는 chicago → boston 직결을 전제로 한다.
+-- farsync 인스턴스는 더 이상 리두를 받지 않으므로 내려도 된다.
+
+SYS@farsync> SHUTDOWN IMMEDIATE
+ORA-01109: database not open
+
+Database dismounted.
+ORACLE instance shut down.
+
+-- ★ ORA-01109 가 나오지만 정상이다.
+--
+--   SHUTDOWN IMMEDIATE 는 먼저 데이터베이스를 닫으려 한다.
+--   Far Sync 는 애초에 열린 적이 없으므로 "열려 있지 않다" 고 알린 뒤
+--   마운트 해제와 인스턴스 종료를 이어서 수행한다.
+--
+--   마지막 두 줄이 정상 종료의 증거다.
+--   Database dismounted. / ORACLE instance shut down.
+--
+-- ★ 실습 02 에서 본 ORA-16476 과 짝을 이루는 메시지다.
+--   열 수 없는 인스턴스이므로 닫을 것도 없다.
+
+-- ★ 남겨 두는 것과 지우는 것
+--
+--   남긴다  listener.ora / tnsnames.ora 의 farsync 항목
+--           log_archive_config 의 farsync 이름
+--           → 다시 쓸 때 바로 연결할 수 있다
+--
+--   내린다  farsync 인스턴스
+--           → 실습 환경의 메모리를 아낀다
+--
+-- ★ VM 자체를 지우지 않는 이유는 13장 때문이다.
+--   Broker 구성에서 Far Sync 를 다시 다룰 수 있다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① Cascading 은 데이터를 가진 Standby 가 전달까지 겸하는 구성이다
+--   ② 계단식 목적지에 SYNC 를 줘도 파라미터 수준에서는 거부되지 않는다
+--   ③ 그래도 ASYNC 를 명시하는 것이 옳다
+--   ④ VALID_FOR 를 잘못 주면 STATUS 는 VALID 인데 VALID_NOW 가
+--      WRONG VALID_TYPE 이 된다 — 조용히 동작하지 않는다
+--   ⑤ 해제하면 INACTIVE 로 돌아간다
+--   ⑥ 원복 순서 — 보호 모드를 먼저 내리고 목적지를 바꾼다
+--   ⑦ 목적지 변경 직후의 지연 50초는 과도 상태다
+--   ⑧ VALID_NOW 의 세 가지 값 — YES / WRONG VALID_TYPE / UNKNOWN
+--   ⑨ Far Sync 종료 시 ORA-01109 는 정상이다
+--
+-- ★ 10장을 마친다.
+--   환경은 chicago → boston 직결, MAXIMUM PERFORMANCE 로 돌아왔다.
+--   11장은 이 상태에서 시작한다.

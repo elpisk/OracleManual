@@ -1,0 +1,359 @@
+================================================================================
+ 제13장 실습 04 — 활성화와 인수 확인
+ 대상   : chicago-srv (dgmgrl), boston-srv
+ 목표   : 구성을 활성화하고 Broker 가 무엇을 인수했는지 파라미터의 변화로
+          확인한다. 구성 파일과 Broker 로그를 읽는다
+ 소요   : 약 30분
+ 변경   : 구성 활성화. Broker 가 파라미터를 재작성
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 활성화
+--------------------------------------------------------------------------------
+
+DGMGRL> enable configuration
+
+-- ★ 출력이 없으면 성공이다.
+--   Broker 명령은 대개 조용하다. 결과는 SHOW 로 확인한다.
+
+-- 1분쯤 기다린 뒤
+
+DGMGRL> show configuration
+
+Configuration - dg_chicago
+
+  Protection Mode: MaxPerformance
+  Members:
+  chicago - Primary database
+    boston  - Physical standby database
+
+Fast-Start Failover:  Disabled
+
+Configuration Status:
+SUCCESS   (status updated 14 seconds ago)
+
+-- ★ (disabled) 표시가 사라졌고 ORA-16905 도 없다.
+--
+-- ★ status updated 14 seconds ago 를 눈여겨본다.
+--   Broker 의 상태 판정은 주기적으로 갱신된다.
+--   방금 바꾼 것이 아직 반영되지 않았을 수 있으므로
+--   명령 직후에 이전 상태가 보이는 것은 오류가 아니다.
+
+--------------------------------------------------------------------------------
+ [2] 멤버 상세
+--------------------------------------------------------------------------------
+
+DGMGRL> show database 'boston'
+
+Database - boston
+
+  Role:               PHYSICAL STANDBY
+  Intended State:     APPLY-ON
+  Transport Lag:      0 seconds (computed 0 seconds ago)
+  Apply Lag:          0 seconds (computed 0 seconds ago)
+  Average Apply Rate: 0 Byte/s
+  Real Time Query:    ON
+  Instance(s):
+    boston
+
+Database Status:
+SUCCESS
+
+-- ★ Intended State 라는 표현을 눈여겨본다. "의도한 상태" 다.
+--   Broker 는 목표 상태를 기억하고 실제를 거기에 맞추려 한다.
+--
+--   Primary  TRANSPORT-ON / TRANSPORT-OFF
+--   Standby  APPLY-ON / APPLY-OFF
+--
+-- ★ 두 지연은 7장의 V$DATAGUARD_STATS 와 같은 값이다.
+--   (computed N seconds ago) 가 붙는 것도 같은 성격이다.
+--   순간값이 아니라 계산 시점이 있다.
+--
+-- ★ Real Time Query 가 ON 이다. 9장의 ADG 가 동작한다는 뜻이다.
+--   Standby 가 MOUNTED 이거나 적용이 꺼져 있으면 OFF 가 된다.
+
+DGMGRL> show database 'chicago'
+
+Database - chicago
+
+  Role:               PRIMARY
+  Intended State:     TRANSPORT-ON
+  Instance(s):
+    chicago
+
+Database Status:
+SUCCESS
+
+-- ★ Primary 는 정보가 적다. 지연이라는 개념이 없기 때문이다.
+
+--------------------------------------------------------------------------------
+ [3] SQL 로 교차 확인
+--------------------------------------------------------------------------------
+
+SYS@boston> COL recovery_mode FOR a28
+SYS@boston> SELECT database_role, open_mode FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE
+---------------- --------------------
+PHYSICAL STANDBY READ ONLY WITH APPLY
+
+1 row selected.
+
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ----------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+
+1 row selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         59
+
+1 row selected.
+
+-- ★ Broker 가 MRP 를 띄웠다.
+--   우리가 SQL 로 기동한 적이 없는데 돌고 있다.
+--   Intended State 가 APPLY-ON 이므로 Broker 가 그렇게 만든 것이다.
+--
+-- ★ 두 도구를 함께 쓰는 것이 실무의 방식이다.
+--   구성 조작은 DGMGRL 로, 세부 진단은 SQL*Plus 의 V$ 뷰로 한다.
+
+--------------------------------------------------------------------------------
+ [4] Broker 가 파라미터를 다시 썼다
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL value FOR a76
+SYS@chicago> COL name FOR a24
+SYS@chicago> SELECT name, value FROM v$parameter
+  2            WHERE name IN ('log_archive_config','log_archive_dest_2',
+  3                           'log_archive_dest_state_2','fal_server',
+  4                           'standby_file_management') ORDER BY name;
+
+NAME                     VALUE
+------------------------ ----------------------------------------------------------
+fal_server
+log_archive_config       dg_config=(chicago,farsync,boston)
+log_archive_dest_2       service="boston", ASYNC NOAFFIRM delay=0 optional
+                         compression=disable max_failure=0 reopen=300
+                         db_unique_name="boston" net_timeout=30,
+                         valid_for=(online_logfile,all_roles)
+log_archive_dest_state_2 ENABLE
+standby_file_management  AUTO
+
+5 rows selected.
+
+-- ★ 세 가지가 인상적이다.
+--
+-- ① 목적지 문자열이 훨씬 길다.
+--
+--   사람이 적을 때는 필요한 것만 적었지만 Broker 는 모든 속성을 명시한다.
+--   delay=0, optional, compression=disable, max_failure=0,
+--   reopen=300, net_timeout=30 이 전부 기본값인데도 적혀 있다.
+--
+--   이유가 있다. Broker 의 속성 하나하나가 이 문자열의 한 조각에 대응한다.
+--   나중에 EDIT DATABASE ... SET PROPERTY 'ReopenSecs'='60' 을 실행하면
+--   reopen=60 으로 바뀐다. 명시해 두어야 바꿀 자리가 생긴다.
+--
+-- ② FAL_SERVER 가 비었다.
+--
+--   사람이 boston 으로 설정해 두었던 값을 Broker 가 지웠다.
+--   Broker 는 갭이 생겼을 때 어디서 가져올지를 구성 정보로 알고 있으므로
+--   FAL_SERVER 에 의존하지 않는다.
+--   파라미터가 비어 있다고 해서 기능이 없어진 것이 아니다.
+--
+-- ③ VALID_FOR 가 all_roles 다.
+--
+--   사람이 적은 것은 (online_logfiles,primary_role) 이었는데
+--   Broker 는 (online_logfile,all_roles) 로 썼다.
+--
+--   역할 전환을 염두에 둔 설정이다.
+--   chicago 가 Standby 가 되어도 이 목적지가 유효하도록 미리 잡아 둔 것이며
+--   16장의 Switchover 가 명령 한 줄로 끝나는 이유가 여기 있다.
+--
+--   손으로 관리한다면 역할 전환 때마다 양쪽의 VALID_FOR 를 바꿔야 한다.
+--
+-- ★ log_archive_config 도 Broker 가 관리한다.
+--   실습 03 에서 boston 을 구성에서 뺐을 때 목록에서 사라졌다가
+--   다시 추가하니 dg_config=(chicago,farsync,boston) 으로 돌아왔다.
+--   순서가 바뀐 것은 Broker 가 자기 방식으로 다시 썼기 때문이다.
+
+--------------------------------------------------------------------------------
+ [5] 구성 파일이 생겼다
+--------------------------------------------------------------------------------
+
+[oracle@chicago-srv ~]$ ls -l $ORACLE_HOME/dbs/dr*chicago.dat
+-rw-r-----. 1 oracle dba 8192 Aug 27 18:17 .../dbs/dr1chicago.dat
+-rw-r-----. 1 oracle dba 8192 Aug 27 18:16 .../dbs/dr2chicago.dat
+
+[oracle@boston-srv ~]$ ls -l $ORACLE_HOME/dbs/dr*boston.dat
+-rw-r-----. 1 oracle dba 8192 Aug 27 18:16 .../dbs/dr1boston.dat
+-rw-r-----. 1 oracle dba 8192 Aug 27 18:16 .../dbs/dr2boston.dat
+
+-- ★ 각 노드에 두 벌씩, 8KB 다.
+--
+-- ★ 구성이 양쪽에 복제되어 있다는 점이 중요하다.
+--   Primary 를 잃어도 Standby 가 구성 정보를 갖고 있으므로
+--   역할 전환이 가능하다.
+--
+-- ★ 두 파일의 갱신 시각이 다른 것도 정상이다.
+--   Broker 는 번갈아 쓰면서 하나가 손상돼도 다른 하나를 쓸 수 있게 한다.
+
+--------------------------------------------------------------------------------
+ [6] Broker 로그를 읽는다
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ tail -20 \
+>   /u01/app/oracle/diag/rdbms/boston/boston/trace/drcboston.log
+
+DMON: Verifying configuration service chicago_CFG
+DMON: Configuration service not registered
+DMON: Adding configuration service... chicago_CFG
+DMON: Registering 1 service/s with listener(s)
+DMON: Executing SQL [ALTER SYSTEM REGISTER]
+SQL [ALTER SYSTEM REGISTER] Executed successfully
+DMON: SCI harvested (DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=boston-srv)
+      (PORT=1521))(CONNECT_DATA=(SERVICE_NAME=boston_DGMGRL)
+      (INSTANCE_NAME=boston)(SERVER=DEDICATED)))
+Starting redo apply services...
+Apply Instance for Database boston set to boston
+
+-- ★ 세 가지를 읽을 수 있다.
+--
+-- ① DMON 이 실제로 SQL 을 실행한다.
+--   ALTER SYSTEM REGISTER 를 스스로 실행하고 결과를 기록했다.
+--   Broker 의 명령이 결국 SQL 로 번역된다는 사실이 로그에 드러난다.
+--
+-- ② SCI harvested 의 SCI 는 StaticConnectIdentifier 다.
+--   DMON 이 리스너에서 그것을 알아냈다는 뜻이며
+--   SERVICE_NAME=boston_DGMGRL 이 그대로 들어 있다.
+--   실습 01 에서 확인한 정적 등록이 여기서 쓰인다.
+--
+-- ③ chicago_CFG 서비스를 Broker 가 스스로 만들었다.
+--   우리가 listener.ora 에 적지 않았는데 생겼다.
+--   구성 전체를 가리키는 서비스이며 실습 06 에서 다시 본다.
+--
+-- ★ Starting redo apply services... 도 보인다.
+--   Broker 가 MRP 를 띄운 흔적이다.
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 — Broker 가 바꾼 값을 되돌리려 하면
+--------------------------------------------------------------------------------
+
+-- ★ FAL_SERVER 가 비어 있는 것을 보고 "설정이 지워졌다" 고 오해하기 쉽다.
+--   되돌리고 싶어지는 것이 자연스러운 반응이다.
+
+SYS@chicago> SELECT name, value FROM v$parameter WHERE name='fal_server';
+
+NAME                 VALUE
+-------------------- ------------------------------------------------------------
+fal_server
+
+1 row selected.
+
+-- 손으로 다시 설정해 본다.
+
+SYS@chicago> ALTER SYSTEM SET fal_server='boston' SCOPE=BOTH;
+
+System altered.
+
+>>> 원인 파악
+
+-- ★ 명령은 성공한다. Broker 가 SQL 을 막지 않는다.
+--   그러나 이것은 잘못된 조치다.
+--
+-- ★ FAL_SERVER 가 빈 것은 결함이 아니다.
+--
+--   Broker 는 갭이 생겼을 때 어디서 가져올지를 구성 정보로 알고 있다.
+--   그래서 이 파라미터에 의존하지 않으며 인수 시점에 비운다.
+--   파라미터가 비어 있다고 해서 기능이 없어진 것이 아니다.
+--
+-- ★ 손으로 채워 넣으면 Broker 의 구성 정보와 어긋난 값이 하나 생긴다.
+--   지금 당장은 문제가 없지만 역할 전환에서 예상치 못한 동작을 만든다.
+--
+-- ★ 판단 기준은 하나다.
+--   SHOW DATABASE VERBOSE 의 속성 목록에 있으면 Broker 의 것이다.
+--   FAL_SERVER 에 대응하는 Broker 속성은 없다.
+--   Broker 가 구성 정보로 처리하기 때문이며, 그래서 손댈 필요가 없다.
+
+>>> 조치
+
+SYS@chicago> ALTER SYSTEM SET fal_server='' SCOPE=BOTH;
+
+System altered.
+
+-- ★ 원래대로 비운다. Broker 가 관리하도록 둔다.
+
+>>> 재확인
+
+SYS@chicago> SELECT name, value FROM v$parameter WHERE name='fal_server';
+
+NAME                 VALUE
+-------------------- ------------------------------------------------------------
+fal_server
+
+1 row selected.
+
+DGMGRL> show configuration
+
+Configuration - dg_chicago
+
+  Protection Mode: MaxPerformance
+  Members:
+  chicago - Primary database
+    boston  - Physical standby database
+
+Fast-Start Failover:  Disabled
+
+Configuration Status:
+SUCCESS   (status updated 15 seconds ago)
+
+-- ★ 구성은 정상이다.
+
+--------------------------------------------------------------------------------
+ [8] 데이터로 종단 검증
+--------------------------------------------------------------------------------
+
+SYS@chicago> CREATE TABLE system.bk_t(id NUMBER, tag VARCHAR2(20));
+SYS@chicago> INSERT INTO system.bk_t VALUES(1,'broker-managed');
+SYS@chicago> COMMIT;
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+-- 35초 뒤
+
+SYS@boston> COL tag FOR a18
+SYS@boston> SELECT id, tag FROM system.bk_t ORDER BY id;
+
+        ID TAG
+---------- ------------------
+         1 broker-managed
+
+1 row selected.
+
+-- ★ Broker 가 만든 목적지로 리두가 흐르고 있다.
+--   뷰가 모두 정상이어도 마지막 확인은 데이터로 한다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① ENABLE CONFIGURATION 은 출력이 없다. SHOW 로 확인한다
+--   ② status updated N seconds ago — 판정은 주기적이다
+--   ③ Intended State 는 목표 상태다
+--   ④ Real Time Query: ON — 9장의 ADG 가 동작 중
+--   ⑤ Broker 가 MRP 를 스스로 띄웠다
+--   ⑥ 목적지 문자열을 모든 속성을 명시한 형태로 다시 썼다
+--   ⑦ FAL_SERVER 를 비웠다 — 구성 정보로 대체
+--   ⑧ VALID_FOR 를 all_roles 로 — 역할 전환 대비
+--   ⑨ 구성 파일이 노드당 두 벌씩 생겼다
+--   ⑩ Broker 로그에 DMON 이 실행한 SQL 이 남는다
+--   ⑪ FAL_SERVER 가 빈 것을 되돌리면 안 된다
+--
+-- ★ 다음 실습에서 상태와 속성을 다룬다.

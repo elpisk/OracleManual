@@ -1,0 +1,441 @@
+================================================================================
+ 제15장 실습 03 — 전송 중단 재현과 진단
+ 대상   : chicago-srv, boston-srv
+ 목표   : Standby 리스너를 내려 실제 장애를 만들고 각 층에서 무엇이 보이는지 본다.
+          복구가 즉시 되지 않는 이유를 확인한다
+ 소요   : 약 45분 (복구 대기 포함)
+ 변경   : boston 리스너를 내렸다가 올린다. 데이터에는 영향이 없다
+ 주의   : 복구까지 ReopenSecs(실측 300초) 만큼 기다려야 한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 출발점과 계획
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL error FOR a44
+SYS@chicago> SELECT dest_id, destination, status, valid_now, error
+  2            FROM v$archive_dest WHERE dest_id=2;
+
+   DEST_ID DESTINATION  STATUS    VALID_NOW    ERROR
+---------- ------------ --------- ------------ ----------------------------
+         2 boston       VALID     YES
+
+1 row selected.
+
+-- ★ 정상이다. 이것이 기준선이다.
+--
+-- ★ 14장에서는 Broker 속성으로 전송을 껐다.
+--   그것은 의도한 중단이었고 SHOW 가 SUCCESS 를 냈다.
+--
+-- ★ 이번에는 의도하지 않은 중단을 만든다.
+--   Standby 의 리스너를 내린다. 실제 장애와 같은 상황이다.
+
+--------------------------------------------------------------------------------
+ [2] 끊는다
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ lsnrctl stop
+
+The command completed successfully
+
+[oracle@boston-srv ~]$ lsnrctl status
+
+TNS-12541: TNS:no listener
+ TNS-12560: TNS:protocol adapter error
+  TNS-00511: No listener
+   Linux Error: 111: Connection refused
+
+-- ★ 3장에서 본 오류다.
+--   Linux Error 111 (Connection refused) 까지 나오므로
+--   포트가 열려 있지 않다는 것이 분명하다.
+--
+-- ★ boston 데이터베이스 자체는 살아 있다.
+--   접속만 안 될 뿐이다.
+
+SYS@chicago> INSERT INTO system.bk_t VALUES(92,'listener-down');
+SYS@chicago> COMMIT;
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+-- ★ 변경을 만들고 로그를 두 번 전환했다.
+--   보낼 것이 생겼는데 보낼 수 없는 상황이다.
+
+--------------------------------------------------------------------------------
+ [3] Primary 쪽 — 목적지
+--------------------------------------------------------------------------------
+
+-- 약 45초 뒤
+
+SYS@chicago> SELECT dest_id, destination, status, valid_now, error
+  2            FROM v$archive_dest WHERE dest_id=2;
+
+   DEST_ID DESTINATION  STATUS    VALID_NOW    ERROR
+---------- ------------ --------- ------------ ----------------------------
+         2 boston       ERROR     INACTIVE     ORA-12541: TNS:no listener
+
+1 row selected.
+
+>>> 원인 파악
+
+-- ★ 세 열이 한꺼번에 바뀌었다.
+--
+--   STATUS      VALID → ERROR
+--   VALID_NOW   YES   → INACTIVE
+--   ERROR       (빈값) → ORA-12541: TNS:no listener
+--
+-- ★ ERROR 열에 실제 원인이 그대로 들어 있다.
+--   이것이 이 뷰의 값어치다.
+--   Broker 의 SHOW 는 "문제가 있다" 까지만 말한다.
+--
+-- ★ VALID_NOW=INACTIVE 는 실습 02 에서 본 값이다.
+--   설정은 유효한데 지금 동작하지 않는다는 뜻이다.
+
+SYS@chicago> COL value FOR a20
+SYS@chicago> SELECT name, value FROM v$parameter
+  2            WHERE name='log_archive_dest_state_2';
+
+NAME                     VALUE
+------------------------ --------------------
+log_archive_dest_state_2 ENABLE
+
+1 row selected.
+
+-- ★ 파라미터는 ENABLE 그대로다.
+--   14장에서 Broker 로 껐을 때는 RESET 이었다.
+--
+-- ★ 두 열의 조합이 진단의 열쇠다.
+--
+--   STATE_2   V$ARCHIVE_DEST.STATUS   해석
+--   --------  ----------------------  ------------------------
+--   ENABLE    VALID                   정상
+--   ENABLE    ERROR                   장애다. ERROR 열을 읽는다
+--   RESET     DEFERRED                Broker 가 껐다
+--   DEFER     DEFERRED                사람이 SQL 로 껐다
+--
+-- ★ 이 표만으로 "장애인가 설정인가" 가 갈린다.
+
+--------------------------------------------------------------------------------
+ [4] Primary 쪽 — 사건과 알림 로그
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL message FOR a80
+SYS@chicago> SELECT severity, error_code, to_char(timestamp,'HH24:MI:SS') ts, message
+  2            FROM v$dataguard_status WHERE error_code <> 0
+  3            ORDER BY timestamp DESC FETCH FIRST 5 ROWS ONLY;
+
+SEVERITY      ERROR_CODE TS       MESSAGE
+------------- ---------- -------- ---------------------------------------------
+Error              12541 09:17:13 Error 12541 received logging on to the standby
+Warning            12541 09:17:13 Check whether the listener is up and running.
+Error              12541 09:17:13 FAL: Error 12541 creating remote archived redo log file 'boston'
+
+3 rows selected.
+
+-- ★ 14장에서 정한 ERROR_CODE <> 0 조건이
+--   이번에는 실제로 무언가를 잡아냈다.
+--
+-- ★ 두 번째 행이 인상적이다.
+--   "Check whether the listener is up and running."
+--   오라클이 조치까지 알려 준다.
+--
+-- ★ 그런데 SEVERITY 가 Warning 이고 ERROR_CODE 는 12541 이다.
+--   14장에서는 Warning 인데 ERROR_CODE 가 0 인 경우를 봤다.
+--   이번에는 반대다. Warning 인데 봐야 하는 행이다.
+--
+-- ★ 결론 — 판정 기준은 SEVERITY 가 아니라 ERROR_CODE 다.
+
+[oracle@chicago-srv ~]$ tail -40 .../trace/alert_chicago.log
+
+Fatal NI connect error 12541, connecting to:
+ (DESCRIPTION=(ADDRESS_LIST=(ADDRESS=(PROTOCOL=TCP)(HOST=boston-srv.localdomain)
+  (PORT=1521)))(CONNECT_DATA=(SERVICE_NAME=boston)...))
+ARC1 (PID:2482): Error 12541 received logging on to the standby
+Errors in file .../trace/chicago_arc1_2482.trc:
+ORA-12541: TNS:no listener
+ARC1 (PID:2482): FAL: Error 12541 creating remote archived redo log file 'boston'
+ORACLE Instance chicago, archival error, archiver continuing
+ORA-16055: FAL request rejected
+
+-- ★ 알림 로그에는 뷰에 없는 것이 넷 있다.
+--
+--   ① 접속 문자열 전체
+--      HOST · PORT · SERVICE_NAME 이 그대로 나온다.
+--      tnsnames 설정 오류라면 여기서 드러난다.
+--
+--   ② 어느 프로세스인가
+--      ARC1 (PID:2482). 트레이스 파일 이름과 연결된다.
+--
+--   ③ ORA-16055: FAL request rejected
+--      8장에서 갭을 다룰 때 본 메커니즘이다.
+--
+--   ④ archiver continuing
+--      아카이버가 멈추지 않았다.
+--
+-- ★ ④ 가 중요하다.
+--   Standby 로 못 보내도 Primary 는 멈추지 않는다.
+--   MaxPerformance 이기 때문이며
+--   MaxProtection 이었다면 Primary 가 멈췄을 것이다.
+
+--------------------------------------------------------------------------------
+ [5] Standby 쪽
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process IN ('MRP0','RFS') ORDER BY process;
+
+PROCESS   STATUS         SEQUENCE#
+--------- ------------ ----------
+MRP0      WAIT_FOR_LOG         75
+RFS       IDLE                  0
+
+2 rows selected.
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+-- ★ 또 0 이다.
+--   14장에서 확인한 성질이 실제 장애에서도 그대로다.
+--   오지 않으니 늦지도 않는다.
+--
+-- ★ 대신 두 가지가 달라졌다.
+--
+--   ① MRP0 가 APPLYING_LOG → WAIT_FOR_LOG.
+--      75번을 기다리는데 오지 않는다.
+--
+--   ② RFS 가 하나만 남았고 SEQUENCE# 가 0.
+--      실습 01 에서 봤던 CLIENT_PROCESS=LGWR 인 RFS 가 사라졌다.
+--      연결이 끊겼다는 직접적인 증거다.
+--
+-- ★ 그러므로 Standby 쪽 판정은 지연이 아니라 프로세스를 본다.
+--
+--   확인                        정상            지금
+--   --------------------------  --------------  --------------
+--   MRP0 STATUS                 APPLYING_LOG    WAIT_FOR_LOG
+--   MRP0 SEQUENCE#              Primary 와 같음  뒤짐
+--   RFS (CLIENT_PROCESS=LGWR)   있음            없음
+--   V$STANDBY_LOG 의 ACTIVE     1개             0개
+--   두 지연                     0               0 (변하지 않는다)
+
+--------------------------------------------------------------------------------
+ [6] Broker 는 뭐라고 하는가
+--------------------------------------------------------------------------------
+
+DGMGRL> show configuration
+
+Configuration - dg_chicago
+
+  Protection Mode: MaxPerformance
+  Members:
+  chicago - Primary database
+    boston  - Physical standby database
+      Warning: ORA-16857: member disconnected from redo source for longer
+               than specified threshold
+
+Fast-Start Failover:  Disabled
+
+Configuration Status:
+WARNING   (status updated 56 seconds ago)
+
+-- ★ 이번에는 경보가 떴다.
+--   14장에서 속성으로 껐을 때는 SUCCESS 였다.
+--
+-- ★ 차이가 둘이다.
+--   ① 이번 중단은 의도한 상태가 아니다
+--   ② TransportDisconnectedThreshold 라는 임계값이 있다
+--
+--   14장에서 정리한 규칙 그대로다.
+--   임계값이 있는 항목만 경보한다.
+--
+-- ★ ORA-16857 은 14장에서 정리한 셋 중 세 번째다.
+--   기본값 30초가 지나 경보가 떴다.
+
+DGMGRL> show database 'boston'
+
+  Transport Lag:      0 seconds (computed 56 seconds ago)
+  Apply Lag:          0 seconds (computed 56 seconds ago)
+  Average Apply Rate: 0 Byte/s
+  Database Warning(s):
+    ORA-16857: member disconnected from redo source ...
+
+DGMGRL> validate database 'boston'
+
+  Ready for Switchover:  No
+  Ready for Failover:    Yes (Primary Running)
+
+-- ★ 두 지연은 0 인데 경보가 있다.
+--   Average Apply Rate 가 0 Byte/s 인 것이 유일한 숫자 신호다.
+--
+-- ★ 층별로 알려 주는 것이 다르다.
+--
+--   SHOW CONFIGURATION   WARNING + ORA-16857   문제가 있다
+--   VALIDATE DATABASE    Ready for SW: No      전환할 수 없다
+--   V$ARCHIVE_DEST       ERROR + ORA-12541     왜 그런지
+--   알림 로그            접속 문자열·프로세스   어디를 고칠지
+--
+-- ★ 층을 내려갈수록 구체적이 된다.
+
+--------------------------------------------------------------------------------
+ [7] 갭이 생겼는가
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT dest_id, sequence#, applied, to_char(completion_time,'HH24:MI:SS') ct
+  2            FROM v$archived_log ORDER BY sequence# DESC, dest_id
+  3            FETCH FIRST 5 ROWS ONLY;
+
+   DEST_ID  SEQUENCE# APPLIED   CT
+---------- ---------- --------- --------
+         1         75 NO        09:17:13
+         1         74 NO        09:17:13
+         2         74 NO        09:17:13
+         1         73 NO        19:59:48
+         2         73 YES       19:59:48
+
+5 rows selected.
+
+-- ★ dest_id=2 만 본다. (실습 04 에서 이유를 다룬다)
+--
+--   73번  APPLIED=YES   끊기기 전에 보냈고 적용됐다
+--   74번  APPLIED=NO    행은 있는데 가지 못했다
+--   75번  행 자체가 없다 만들 시도조차 못 했다
+--
+-- ★ 이것이 갭이 만들어지는 과정이다.
+--   8장에서 개념으로 배운 것을 시퀀스 번호로 확인했다.
+
+SYS@boston> SELECT * FROM v$archive_gap;
+
+no rows selected
+
+-- ★ 갭 뷰는 비어 있다.
+--   이 뷰는 Standby 가 "받아야 하는데 못 받은 구간" 을 인식해야 채워지는데
+--   지금은 연락 자체를 못 받고 있다.
+--
+-- ★ 갭 뷰가 비어 있다고 갭이 없는 것이 아니다.
+
+--------------------------------------------------------------------------------
+ [8] 조치 — 리스너를 올린다
+--------------------------------------------------------------------------------
+
+>>> 조치
+
+[oracle@boston-srv ~]$ lsnrctl start
+
+Service "boston" has 1 instance(s).
+  Instance "boston", status UNKNOWN, has 1 handler(s) for this service...
+Service "boston_DGMGRL" has 1 instance(s).
+  Instance "boston", status UNKNOWN, has 1 handler(s) for this service...
+The command completed successfully
+
+-- ★ 13장에서 등록한 boston_DGMGRL 이 함께 올라온다.
+--   정적 등록이므로 인스턴스 상태와 무관하다.
+
+>>> 재확인
+
+-- 70초 뒤
+         2 boston  ERROR  INACTIVE  ORA-12541: TNS:no listener
+-- 120초 뒤
+         2 boston  ERROR  INACTIVE  ORA-12541: TNS:no listener
+-- 170초 뒤
+         2 boston  ERROR  INACTIVE  ORA-12541: TNS:no listener
+-- 220초 뒤
+         2 boston  ERROR  INACTIVE  ORA-12541: TNS:no listener
+-- 270초 뒤
+         2 boston  VALID  YES
+
+-- ★ 약 4~5분이 걸렸다.
+--   그동안 오류 메시지는 ORA-12541 그대로였다.
+--   리스너는 이미 살아 있는데도 그렇다.
+--
+-- ★ 이유는 ReopenSecs 다. 13장 실측값이 300 이었다.
+--   실패한 목적지를 즉시 다시 시도하지 않고 그만큼 기다린다.
+--   죽은 목적지에 계속 접속하면 아카이버가 붙잡히기 때문이다.
+--
+-- ★ 여기서 오판하기 쉽다.
+--   오류가 그대로이면 다른 문제라고 생각하게 된다.
+--   실제로는 기다리면 된다.
+--
+-- ★ 급하면 재촉할 수 있다.
+--   Broker 환경 : LogShipping 을 OFF → ON
+--   Broker 없음 : LOG_ARCHIVE_DEST_STATE_2 를 DEFER → ENABLE
+--
+--   Broker 환경에서 뒤의 SQL 을 쓰면 안 된다. 13장에서 확인했다.
+
+SYS@boston> COL tag FOR a16
+SYS@boston> SELECT id, tag FROM system.bk_t WHERE id=92;
+
+        ID TAG
+---------- ----------------
+        92 listener-down
+
+1 row selected.
+
+-- ★ 끊겨 있던 동안의 변경이 따라왔다. 데이터는 잃지 않았다.
+--   그러나 그동안 재해 복구 능력이 없었다는 사실은 남는다.
+
+--------------------------------------------------------------------------------
+ [9] 조치 직후의 함정
+--------------------------------------------------------------------------------
+
+DGMGRL> show configuration
+
+  chicago - Primary database
+    Error: ORA-16778: redo transport error for one or more members
+
+    boston  - Physical standby database
+      Warning: ORA-16857: member disconnected from redo source ...
+
+Configuration Status:
+ERROR   (status updated 58 seconds ago)
+
+-- ★ 전송이 재개된 직후인데 오히려 ERROR 로 나빠졌다.
+--   새로 ORA-16778 까지 붙었다.
+--
+-- ★ 판정의 시차다.
+--   Broker 상태는 주기적으로 다시 계산되며
+--   이 출력은 문제가 있던 구간을 반영한 것이다.
+--   status updated 58 seconds ago 가 그 증거다.
+
+-- 잠시 후
+
+DGMGRL> show configuration
+
+  chicago - Primary database
+    boston  - Physical standby database
+
+Configuration Status:
+SUCCESS   (status updated 32 seconds ago)
+
+-- ★ 고친 직후의 화면을 결론으로 삼지 않는다.
+--   한 주기를 기다리고 다시 본다.
+--
+-- ★ 그리고 SQL 뷰는 이미 VALID 를 보여 주고 있었다.
+--   아래층이 먼저 회복되고 요약이 나중에 따라온다.
+
+--------------------------------------------------------------------------------
+ [10] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① 리스너를 내리면 STATUS=ERROR, VALID_NOW=INACTIVE
+--   ② ERROR 열에 ORA-12541 이 그대로 들어온다
+--   ③ 파라미터는 ENABLE 그대로 — RESET·DEFER 와 구별된다
+--   ④ V$DATAGUARD_STATUS 에 Warning 인데 봐야 하는 행이 있었다
+--   ⑤ 알림 로그에는 접속 문자열과 프로세스가 있다
+--   ⑥ archiver continuing — MaxPerformance 이므로 Primary 는 멈추지 않는다
+--   ⑦ Standby 에서는 MRP0 가 WAIT_FOR_LOG, RFS(LGWR) 가 사라진다
+--   ⑧ 그때도 두 지연은 0 이었다
+--   ⑨ Broker 는 ORA-16857 로 경보했다
+--   ⑩ 복구에 ReopenSecs 300 만큼 걸렸다
+--   ⑪ 조치 직후 Broker 가 ERROR 로 보인 것은 판정 시차다
+--
+-- ★ 다음 실습에서 적용의 진행을 자세히 본다.

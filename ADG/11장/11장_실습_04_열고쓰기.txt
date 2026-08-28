@@ -1,0 +1,247 @@
+================================================================================
+ 제11장 실습 04 — 열고 쓰기
+ 대상   : boston-srv (SNAPSHOT STANDBY 상태)
+ 목표   : CDB 와 PDB 를 열고 양쪽에 실제로 쓴다. Snapshot Standby 의 목적이
+          여기 있다. PDB 가 따라오지 않는다는 점도 확인한다
+ 소요   : 약 25분
+ 변경   : Snapshot 쪽에만 테이블 생성 (되돌리면 사라진다)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] CDB 를 연다
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT database_role, open_mode FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE
+---------------- --------------------
+SNAPSHOT STANDBY MOUNTED
+
+1 row selected.
+
+SYS@boston> ALTER DATABASE OPEN;
+
+Database altered.
+
+SYS@boston> COL name FOR a10
+SYS@boston> SELECT name, database_role, open_mode, flashback_on FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE   FLASHBACK_ON
+---------- ---------------- ----------- ------------------
+CHICAGO    SNAPSHOT STANDBY READ WRITE  RESTORE POINT ONLY
+
+1 row selected.
+
+-- ★ READ WRITE 다.
+--
+--   9장에서 그토록 READ ONLY 였던 Standby 가 쓰기 가능해졌다.
+--   이것이 이 장의 목적이다.
+--
+-- ★ ALTER DATABASE OPEN 이지 OPEN READ ONLY 가 아니다.
+--   Physical Standby 를 열 때와 명령이 다르다.
+--   Snapshot Standby 는 사실상 독립된 데이터베이스처럼 동작한다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — PDB 는 따라오지 않는다
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT name, open_mode FROM v$pdbs;
+
+NAME         OPEN_MODE
+------------ ----------
+PDB$SEED     READ ONLY
+CHICAGO_PDB1 MOUNTED
+
+2 rows selected.
+
+-- ★ CDB 는 READ WRITE 인데 PDB 는 MOUNTED 다.
+--   이 상태에서 PDB 안을 조회하면 어떻게 되는지 확인한다.
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+
+Session altered.
+
+SYS@boston> SELECT count(*) FROM system.ss_base;
+
+select count(*) from system.ss_base
+                     *
+ERROR at line 1:
+ORA-01219: database or pluggable database not open: queries allowed on fixed
+tables or views only
+
+>>> 원인 파악
+
+-- PDB 가 MOUNTED 다.
+--
+-- ★ 8장에서 같은 오류를 만난 적이 있다. 이유도 같다.
+--   MOUNTED 인 컨테이너에서는 고정 뷰(V$ 로 시작하는 것)만 조회된다.
+--   딕셔너리를 읽어야 하는 조회는 열려 있어야 한다.
+--
+-- ★ CDB 를 여는 것과 PDB 를 여는 것은 별개의 동작이다.
+--   Snapshot Standby 로 전환하면서 PDB 는 마운트 상태로 남았다.
+
+>>> 조치
+
+SYS@boston> ALTER SESSION SET container=cdb$root;
+SYS@boston> ALTER PLUGGABLE DATABASE chicago_pdb1 OPEN;
+
+Pluggable database altered.
+
+>>> 재확인
+
+SYS@boston> SELECT name, open_mode, restricted FROM v$pdbs;
+
+NAME         OPEN_MODE  RES
+------------ ---------- ---
+PDB$SEED     READ ONLY  NO
+CHICAGO_PDB1 READ WRITE NO
+
+2 rows selected.
+
+-- ★ READ WRITE 로 열렸다. RESTRICTED 도 NO 다.
+--
+-- ★ ALTER PLUGGABLE DATABASE ... OPEN 이지
+--   OPEN READ ONLY 가 아니다. CDB 와 마찬가지다.
+--
+-- ★ PDB$SEED 는 READ ONLY 로 남는다. 원래 그런 컨테이너다.
+
+--------------------------------------------------------------------------------
+ [3] CDB 에 쓴다
+--------------------------------------------------------------------------------
+
+SYS@boston> CREATE TABLE system.ss_test(id NUMBER, tag VARCHAR2(30));
+
+Table created.
+
+SYS@boston> INSERT INTO system.ss_test VALUES(1,'written-on-snapshot');
+
+1 row created.
+
+SYS@boston> COMMIT;
+
+Commit complete.
+
+SYS@boston> SELECT id, tag FROM system.ss_test;
+
+        ID TAG
+---------- ------------------------------
+         1 written-on-snapshot
+
+1 row selected.
+
+-- ★ DDL 도 되고 DML 도 되고 커밋도 된다.
+--   9장에서 같은 명령이 ORA-16000 을 냈던 것과 대조된다.
+
+--------------------------------------------------------------------------------
+ [4] 기존 데이터도 고친다
+--------------------------------------------------------------------------------
+
+SYS@boston> UPDATE system.ss_base SET tag='modified-on-snapshot' WHERE id=1;
+
+1 row updated.
+
+SYS@boston> COMMIT;
+
+Commit complete.
+
+SYS@boston> COL tag FOR a26
+SYS@boston> SELECT id, tag FROM system.ss_base;
+
+        ID TAG
+---------- --------------------------
+         1 modified-on-snapshot
+
+1 row selected.
+
+-- ★ 실습 01 에서 Primary 가 만든 'before-snapshot' 을 고쳤다.
+--   Primary 쪽에는 여전히 'before-snapshot' 이다.
+--   두 데이터베이스가 갈라지기 시작했다.
+--
+-- ★ 실습 07 에서 이 행이 'before-snapshot' 으로 복귀하는지 본다.
+--   그것이 되돌리기가 동작했다는 증거가 된다.
+
+--------------------------------------------------------------------------------
+ [5] PDB 안에서도
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+
+Session altered.
+
+SYS@boston> CREATE TABLE system.ss_pdb(id NUMBER, tag VARCHAR2(24));
+
+Table created.
+
+SYS@boston> INSERT INTO system.ss_pdb VALUES(1,'pdb-write');
+
+1 row created.
+
+SYS@boston> COMMIT;
+
+Commit complete.
+
+SYS@boston> SELECT id, tag FROM system.ss_pdb;
+
+        ID TAG
+---------- ------------------------
+         1 pdb-write
+
+1 row selected.
+
+SYS@boston> SELECT name, open_mode FROM v$pdbs WHERE name='CHICAGO_PDB1';
+
+NAME         OPEN_MODE
+------------ ----------
+CHICAGO_PDB1 READ WRITE
+
+1 row selected.
+
+-- ★ PDB 안에서도 똑같이 쓸 수 있다.
+--   Snapshot Standby 는 CDB 전체를 쓰기 가능하게 만든다.
+
+--------------------------------------------------------------------------------
+ [6] SCN 이 앞으로 나아간다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER SESSION SET container=cdb$root;
+SYS@boston> COL name FOR a46
+SYS@boston> SELECT name, scn FROM v$restore_point;
+
+NAME                                                  SCN
+---------------------------------------------- ----------
+SNAPSHOT_STANDBY_REQUIRED_08/27/2026 16:33:55     2255344
+
+1 row selected.
+
+SYS@boston> SELECT current_scn FROM v$database;
+
+CURRENT_SCN
+-----------
+    2256351
+
+1 row selected.
+
+-- ★ 실습 03 에서 MOUNTED 상태라 0 이었던 값이 이제 나온다.
+--
+--   복원 지점 SCN   2255344   전환 시점에 고정
+--   CURRENT_SCN     2256351   지금
+--   차이               1007   되돌릴 양
+--
+-- ★ 시험을 오래 할수록 이 차이가 벌어진다.
+--   되돌리기는 이 구간을 되감는 작업이다.
+
+--------------------------------------------------------------------------------
+ [7] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① ALTER DATABASE OPEN → READ WRITE
+--   ② CDB 를 열어도 PDB 는 MOUNTED 로 남는다
+--   ③ MOUNTED 인 PDB 를 조회하면 ORA-01219
+--   ④ ALTER PLUGGABLE DATABASE ... OPEN 으로 따로 연다
+--   ⑤ CDB·PDB 양쪽에 DDL·DML·COMMIT 모두 가능
+--   ⑥ 기존 데이터를 고치면 Primary 와 갈라진다
+--   ⑦ CURRENT_SCN 이 복원 지점 SCN 보다 앞서 나간다 (차이 1,007)
+--
+-- ★ 다음 실습에서 전환 중에 무슨 일이 일어나는지 관찰한다.

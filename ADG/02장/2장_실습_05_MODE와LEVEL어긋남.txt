@@ -1,0 +1,274 @@
+================================================================================
+ 제2장 실습 05 — PROTECTION_MODE 와 PROTECTION_LEVEL 이 어긋나는 상황
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : 두 열이 어긋나는 상황을 두 가지 경로로 재현하고 각각 해소한다.
+          RESYNCHRONIZATION 이 언제 정상이고 언제 문제인지 판별 기준을 세운다
+ 소요   : 약 25분
+ 되돌리기 : 실습 끝에 Maximum Performance + ASYNC 로 원복
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 두 열의 정의를 다시 확인한다
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+--   PROTECTION_MODE  = 설정한 모드          "이렇게 운영하겠다"
+--   PROTECTION_LEVEL = 지금 달성 중인 수준  "실제로는 이렇다"
+--
+-- 지금은 일치한다. 이제 어긋나게 만들어 본다.
+
+--------------------------------------------------------------------------------
+ [2] 경로 ① — 요건 없이 모드만 올린다
+--------------------------------------------------------------------------------
+
+-- 목적지가 ASYNC 인 상태를 확인한다.
+
+SYS@chicago> COL destination FOR a12
+SYS@chicago> SELECT dest_id, destination, transmit_mode, affirm
+  2            FROM v$archive_dest WHERE dest_id = 2;
+
+   DEST_ID DESTINATION  TRANSMIT_MOD AFF
+---------- ------------ ------------ ---
+         2 boston       ASYNCHRONOUS NO
+
+1 row selected.
+
+-- 이 상태에서 Maximum Availability 를 설정한다.
+-- Maximum Availability 는 동기 전송을 요구하므로 요건 불충족이다.
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE AVAILABILITY;
+
+Database altered.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM AVAILABILITY RESYNCHRONIZATION
+
+1 row selected.
+
+
+>>> 원인 파악
+    명령은 "Database altered" 로 성공했다.
+    그런데 PROTECTION_LEVEL 은 RESYNCHRONIZATION 이다.
+
+    이것이 이 실습의 핵심이다.
+    **명령 성공은 "설정이 받아들여졌다" 는 뜻이지 "그 수준으로 운영된다" 는 뜻이 아니다.**
+
+    지금 이 데이터베이스는 Maximum Availability 로 설정되어 있지만
+    실제 보호 수준은 그에 못 미친다. 목적지가 비동기이기 때문이다.
+    운영자가 "우리는 무손실 구성" 이라 믿는 동안 실제로는 아닌 상태다.
+
+>>> 조치 — 요건을 갖춘다
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston SYNC AFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE AVAILABILITY;
+
+Database altered.
+
+>>> 재확인
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM AVAILABILITY MAXIMUM AVAILABILITY
+
+1 row selected.
+
+-- 두 값이 일치했다. 이제 실제로 Maximum Availability 로 운영된다.
+
+--------------------------------------------------------------------------------
+ [3] 경로 ② — 전송이 끊겨 수준이 떨어진다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@chicago> SELECT instance_name, status FROM v$instance;
+
+INSTANCE_NAME    STATUS
+---------------- ------------
+chicago          OPEN
+
+1 row selected.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM AVAILABILITY RESYNCHRONIZATION
+
+1 row selected.
+
+-- 같은 RESYNCHRONIZATION 이지만 원인이 다르다.
+--   경로 ① : 요건(동기 전송)을 갖추지 못했다 — 설정 문제
+--   경로 ② : 요건은 갖췄으나 상대가 사라졌다 — 장애
+--
+-- 두 열만 봐서는 구분되지 않는다. 목적지 상태를 함께 봐야 한다.
+
+SYS@chicago> COL error FOR a52
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id = 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ----------------------------------------------------
+         2 ERROR     ORA-03113: end-of-file on communication channel
+
+1 row selected.
+
+-- STATUS 가 ERROR 이고 ORA-03113 이 기록됐다 → 장애다.
+-- 경로 ① 에서는 STATUS 가 VALID 이고 ERROR 가 비어 있었다 → 설정 문제다.
+--
+-- 판별 기준
+--   RESYNCHRONIZATION + STATUS=VALID + ERROR 없음  → 설정 요건 미충족
+--   RESYNCHRONIZATION + STATUS=ERROR + ORA- 번호   → 전송 장애
+--   RESYNCHRONIZATION 이 잠깐 나타났다 사라짐      → 정상 과도 상태
+
+-- 이 상태에서도 Primary 는 정상 동작한다.
+
+SYS@chicago> CREATE TABLE system.t_dg2(c1 NUMBER);
+Table created.
+
+SYS@chicago> INSERT INTO system.t_dg2 VALUES(1);
+1 row created.
+
+SYS@chicago> COMMIT;
+Commit complete.
+
+--------------------------------------------------------------------------------
+ [4] 해소 — Standby 복구
+--------------------------------------------------------------------------------
+
+SYS@boston> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@boston> ALTER DATABASE OPEN READ ONLY;
+Database altered.
+
+SYS@boston> ALTER PLUGGABLE DATABASE chicago_pdb1 OPEN READ ONLY;
+Pluggable database altered.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+Database altered.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+>>> 재확인
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM AVAILABILITY MAXIMUM AVAILABILITY
+
+1 row selected.
+
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id = 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ----------------------------------------------------
+         2 VALID
+
+1 row selected.
+
+-- 사람이 한 일은 Standby 를 켠 것뿐이다.
+-- PROTECTION_LEVEL 회복도, dest_2 상태 회복도 자동이다.
+-- 이것이 RESYNCHRONIZATION 이 "오류" 가 아니라 "따라잡는 중" 인 이유다.
+
+--------------------------------------------------------------------------------
+ [5] 모니터링에 어떻게 반영할 것인가
+--------------------------------------------------------------------------------
+
+-- 순간값으로 경보를 걸면 오탐이 잦다. 로그 스위치마다 잠깐 나타날 수 있기 때문이다.
+-- 지속 시간을 조건에 넣는 편이 실용적이다.
+--
+-- 확인용 조회 예시 (스케줄러에 걸어 두는 형태)
+
+SYS@chicago> SELECT CASE
+  2                   WHEN protection_mode = protection_level THEN 'OK'
+  3                   ELSE 'MISMATCH: ' || protection_mode || ' vs ' || protection_level
+  4                 END AS dg_protection_check
+  5            FROM v$database;
+
+DG_PROTECTION_CHECK
+--------------------------------------------------------------------------------
+OK
+
+1 row selected.
+
+-- 이 값이 MISMATCH 로 N분 이상 지속되면 경보를 낸다.
+-- N 은 로그 스위치 주기보다 넉넉히 잡는다. 실습 환경 기준으로는 5분이면 충분하다.
+
+--------------------------------------------------------------------------------
+ [6] 원복
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PERFORMANCE;
+
+Database altered.
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston ASYNC NOAFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> DROP TABLE system.t_dg2 PURGE;
+
+Table dropped.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@boston> COL name FOR a16
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+SYS@chicago> EXIT
+SYS@boston> EXIT
+
+================================================================================
+ 실습 05 종료
+ 원복 확인 : MAXIMUM PERFORMANCE / MAXIMUM PERFORMANCE, dest_2 ASYNC NOAFFIRM,
+             지연 0, 테스트 테이블 삭제 완료
+================================================================================

@@ -1,0 +1,318 @@
+================================================================================
+ 제7장 실습 03 — BAD PARAM 진단과 교정
+ 대상   : boston-srv Standby
+ 목표   : Standby 의 LOG_ARCHIVE_DEST_1 이 BAD PARAM 인 원인을 찾아 고치고,
+          RECOVERY_MODE 열이 되살아나는 것을 확인한다. FAL_CLIENT 도 함께 본다
+ 소요   : 약 35분
+ 변경   : LOG_ARCHIVE_DEST_1 과 FAL_CLIENT 를 바로잡는다 (되돌리지 않는다)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 문제 발견
+--------------------------------------------------------------------------------
+
+SYS@boston> SET LINES 200
+SYS@boston> COL dest_name FOR a20
+SYS@boston> COL destination FOR a16
+SYS@boston> COL recovery_mode FOR a26
+SYS@boston> COL error FOR a24
+SYS@boston> SELECT dest_id, dest_name, destination, status, recovery_mode, error
+  2            FROM v$archive_dest_status WHERE dest_id<=3;
+
+   DEST_ID DEST_NAME          DESTINATION   STATUS    RECOVERY_MODE   ERROR
+---------- ------------------ ------------- --------- --------------- -------
+         1 LOG_ARCHIVE_DEST_1                BAD PARAM IDLE
+         2 LOG_ARCHIVE_DEST_2 chicago        VALID     IDLE
+         3 LOG_ARCHIVE_DEST_3                INACTIVE  IDLE
+
+3 rows selected.
+
+-- ★ 1번이 **BAD PARAM** 이다.
+--   목적지 이름은 있는데 DESTINATION 열이 비어 있다.
+--   오라클이 파라미터 값을 해석하지 못했다는 뜻이다.
+--
+-- ★ 3번의 INACTIVE 는 정상이다. 설정하지 않은 목적지다.
+--   BAD PARAM 과 INACTIVE 를 혼동하지 않는다.
+--     INACTIVE   설정이 없다. 정상
+--     BAD PARAM  설정이 있는데 해석할 수 없다. 문제
+
+--------------------------------------------------------------------------------
+ [2] 파라미터를 직접 본다
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a28
+SYS@boston> COL value FOR a56
+SYS@boston> SELECT name, value FROM v$parameter WHERE name='log_archive_dest_1';
+
+NAME                 VALUE
+-------------------- --------------------------------------------------------
+log_archive_dest_1   location=use_db_recovery_file_dest
+                     valid_for=(all_logfiles,all_roles) db_unique_name=chicago
+
+1 row selected.
+
+>>> 원인 파악
+    ★ 마지막 항목이 문제다. **db_unique_name=chicago**
+
+    이 데이터베이스의 DB_UNIQUE_NAME 을 확인한다.
+
+SYS@boston> SELECT db_unique_name FROM v$database;
+
+DB_UNIQUE_NAME
+------------------------------
+boston
+
+    ★ 값이 다르다.
+      DB_UNIQUE_NAME 속성은 "이 목적지는 이 이름을 가진 데이터베이스를
+      위한 것"이라는 선언이다. 자신의 이름과 다르면 그 목적지는
+      자신에게 해당하지 않으므로 오라클은 해석을 거부한다.
+
+    ★ 왜 이렇게 되었는가 — **파라미터 상속**이다.
+      DUPLICATE 의 SPFILE 절이 Primary spfile 을 가져오는데,
+      스크립트에 set log_archive_dest_1 이 없었다.
+      그래서 Primary 의 값이 db_unique_name=chicago 인 채로 넘어왔다.
+
+      6장의 CONTROL_FILES 와 완전히 같은 구조다.
+
+--------------------------------------------------------------------------------
+ [3] 그런데 왜 아무 문제가 없어 보였는가
+--------------------------------------------------------------------------------
+
+-- 5장·6장을 마치며 확인한 항목은 모두 정상이었다.
+-- READ ONLY WITH APPLY, 지연 0, MRP0 동작.
+-- 아카이브도 정상적으로 만들어지고 있었다.
+
+[oracle@boston-srv ~]$ find /u03/app/oracle/fast_recovery_area -name '*.arc' \
+>   -newermt '2026-08-27' | sort | tail -2
+
+/u03/app/oracle/fast_recovery_area/BOSTON/archivelog/2026_08_27/o1_mf_1_66_o8z5hnvh_.arc
+/u03/app/oracle/fast_recovery_area/BOSTON/archivelog/2026_08_27/o1_mf_1_67_o8z5homs_.arc
+
+-- ★ 파일이 정상 경로에 있다.
+--   DB_RECOVERY_FILE_DEST 가 별도로 설정되어 있어서
+--   오라클이 아카이브를 그리로 보냈기 때문이다.
+--
+--   즉 **기능은 우회로로 동작하고 상태 열만 비정상**이었다.
+--
+-- ★ 이런 결함이 가장 다루기 어렵다. 소리를 내지 않기 때문이다.
+--   진짜 문제는 역할 전환 후에 드러난다.
+--   boston 이 Primary 가 되면 목적지 1번이 로컬 아카이브를 담당해야 하는데
+--   BAD PARAM 이면 그때 멈춘다.
+--   평상시에는 보이지 않다가 가장 급한 순간에 터진다.
+
+--------------------------------------------------------------------------------
+ [4] 또 하나의 신호 — WRONG VALID_TYPE
+--------------------------------------------------------------------------------
+
+SYS@boston> COL valid_now FOR a18
+SYS@boston> SELECT dest_id, status, binding, target, valid_now, error
+  2            FROM v$archive_dest WHERE dest_id<=3;
+
+   DEST_ID STATUS    BINDING   TARGET   VALID_NOW          ERROR
+---------- --------- --------- -------- ------------------ -----
+         1 BAD PARAM OPTIONAL  LOCAL    UNKNOWN
+         2 VALID     OPTIONAL  REMOTE   WRONG VALID_TYPE
+         3 INACTIVE  OPTIONAL  LOCAL    UNKNOWN
+
+3 rows selected.
+
+-- ★ 2번의 VALID_NOW 가 WRONG VALID_TYPE 이다.
+--   이것은 **정상이다.** 고치면 안 된다.
+--
+--   boston 의 목적지 2번 설정을 보면 이유가 분명하다.
+--     service=chicago async valid_for=(online_logfile,primary_role)
+--                                                     ^^^^^^^^^^^^
+--   primary_role 이라고 되어 있는데 boston 은 지금 Standby 다.
+--   역할이 맞지 않으므로 지금은 유효하지 않다는 뜻이다.
+--
+--   이 목적지는 역할 전환 후 boston 이 Primary 가 되었을 때
+--   chicago 로 리두를 보내기 위한 것이다. 2장에서 배운 VALID_FOR 다.
+--
+-- ★ 두 열을 구분해 읽는다.
+--     STATUS = BAD PARAM          → 고쳐야 한다
+--     VALID_NOW = WRONG VALID_TYPE → 그대로 둔다
+--
+-- ★ 1번의 VALID_NOW 가 UNKNOWN 인 것도 BAD PARAM 의 결과다.
+--   해석할 수 없는 목적지는 유효 여부도 판단할 수 없다.
+
+--------------------------------------------------------------------------------
+ [5] 교정
+--------------------------------------------------------------------------------
+
+>>> 조치
+    DB_UNIQUE_NAME 만 자신의 값으로 바꾼다.
+
+SYS@boston> ALTER SYSTEM SET log_archive_dest_1 =
+  2    'location=use_db_recovery_file_dest valid_for=(all_logfiles,all_roles)
+  3     db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+-- ★ SCOPE=BOTH 를 썼다.
+--   LOG_ARCHIVE_DEST_n 은 동적 파라미터이므로 재기동 없이 즉시 반영된다.
+--   6장의 CONTROL_FILES 가 SCOPE=SPFILE 만 가능했던 것과 대조된다.
+--   같은 성격의 문제라도 고치는 비용이 다르다.
+
+>>> 재확인
+
+SYS@boston> SELECT dest_id, dest_name, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id<=2;
+
+   DEST_ID DEST_NAME          STATUS    RECOVERY_MODE
+---------- ------------------ --------- --------------------------
+         1 LOG_ARCHIVE_DEST_1 VALID     MANAGED REAL TIME APPLY
+         2 LOG_ARCHIVE_DEST_2 VALID     IDLE
+
+2 rows selected.
+
+    ★★ 두 가지가 한꺼번에 바뀌었다.
+      ① STATUS 가 BAD PARAM → VALID
+      ② RECOVERY_MODE 가 IDLE → **MANAGED REAL TIME APPLY**
+
+    두 번째가 더 중요하다.
+    적용은 그전에도 돌고 있었지만 RECOVERY_MODE 열은 IDLE 을 보여 주었다.
+    목적지가 BAD PARAM 이면 이 열이 의미 있는 값을 갖지 못하기 때문이다.
+
+    ★ 즉 목적지를 고치기 전에는 **실시간 적용 여부를 이 열로 판단할 수 없었다.**
+      진단 도구 자체가 고장 나 있던 셈이다.
+      이것이 BAD PARAM 을 방치하면 안 되는 두 번째 이유다.
+
+    ★ 남은 BAD PARAM 이 없는지 전수 확인한다.
+
+SYS@boston> COL dest_name FOR a20
+SYS@boston> SELECT dest_id, dest_name, status FROM v$archive_dest_status
+  2            WHERE status='BAD PARAM';
+
+no rows selected
+
+      **no rows selected** 가 원하는 결과다.
+      목적지는 1~31번까지 있을 수 있으므로 dest_id<=2 만 보고 끝내지 않는다.
+      운영 환경에서 목적지를 여러 개 쓰는 구성이라면 이 조회를 점검 목록에 넣는다.
+
+--------------------------------------------------------------------------------
+ [6] 같은 성격의 문제 하나 더 — FAL_CLIENT
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a14
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$parameter
+  2            WHERE name IN ('fal_server','fal_client');
+
+NAME           VALUE
+-------------- --------------------
+fal_client     chicago
+fal_server     chicago
+
+2 rows selected.
+
+-- ★ FAL_SERVER 가 chicago 인 것은 옳다.
+--   갭이 생기면 Primary 에게 요청한다는 뜻이다.
+--
+-- ★ 그런데 FAL_CLIENT 도 chicago 다. **네 번째 상속 사례다.**
+--   FAL_CLIENT 는 "요청을 보낼 때 나를 이렇게 소개하라"는 값이다.
+--   boston 이 자신을 chicago 라고 소개하는 셈이다.
+--
+--   5장에서 확인한 Primary 값이 fal_client=chicago, fal_server=boston 이었다.
+--   DUPLICATE 스크립트가 set fal_server 만 지정하고
+--   set fal_client 는 지정하지 않아 그대로 넘어왔다.
+
+>>> 원인 파악
+    LOG_ARCHIVE_DEST_1 과 같은 원인이다. 스크립트가 SET 하지 않은 파라미터는
+    Primary 값을 그대로 상속받는다.
+
+    ★ 다만 이쪽은 **오류조차 내지 않는다.**
+      11g 이후로는 FAL_CLIENT 가 없거나 틀려도 동작한다.
+      요청을 보낼 때 실제로는 자신의 DB_UNIQUE_NAME 과 서비스 정보를 쓴다.
+      실측에서도 갭이 정상적으로 해소되었다 (실습 05).
+
+      BAD PARAM 같은 신호가 없으므로 더 조용한 결함이다.
+
+>>> 조치
+
+SYS@boston> ALTER SYSTEM SET fal_client='boston' SCOPE=BOTH;
+
+System altered.
+
+>>> 재확인
+
+SYS@boston> SELECT name, value FROM v$parameter
+  2            WHERE name IN ('fal_server','fal_client');
+
+NAME           VALUE
+-------------- --------------------
+fal_client     boston
+fal_server     chicago
+
+2 rows selected.
+
+    이제 방향이 분명하다. boston 이 chicago 에게 요청한다.
+
+--------------------------------------------------------------------------------
+ [7] 상속 사례 정리
+--------------------------------------------------------------------------------
+
+  이 과정에서 발견한 파라미터 상속 사례가 넷이다.
+
+  파라미터              증상                          발견한 장
+  --------------------- ----------------------------- ----------
+  CONTROL_FILES         Standby 에 Chicago 디렉터리   6장
+  LOG_ARCHIVE_DEST_1    STATUS = BAD PARAM            7장
+  FAL_CLIENT            증상 없음 (조용한 결함)       7장
+  DB_NAME               스크립트가 막아 냈다          5장
+
+  ★ 앞의 셋은 스크립트가 SET 하지 않아 생긴 문제이고,
+    마지막 하나는 스크립트가 set db_name='chicago' 로 명시적으로 막아 낸 경우다.
+
+  ★ 교훈은 하나다.
+    **DUPLICATE 의 SPFILE 절은 Primary 의 파라미터를 통째로 가져온다.**
+    Standby 에서 값이 달라야 하는 파라미터는 빠짐없이 SET 으로 지정해야 한다.
+    지정하지 않은 것은 조용히 상속되며, 그중 일부만 오류를 낸다.
+
+  ★ 구축 직후 점검 목록에 넣을 조회
+    Standby 인데 Primary 이름이 들어 있는 파라미터를 한 번에 훑는다.
+
+SYS@boston> SET LINES 160
+SYS@boston> COL name FOR a26
+SYS@boston> COL value FOR a70
+SYS@boston> SELECT name, value FROM v$parameter
+  2            WHERE value LIKE '%chicago%'
+  3              AND name NOT IN ('db_name','fal_server')
+  4            ORDER BY name;
+
+NAME                       VALUE
+-------------------------- ----------------------------------------------------------
+dispatchers                (PROTOCOL=TCP) (SERVICE=chicagoXDB)
+log_archive_config         dg_config=(chicago,boston)
+log_archive_dest_2         service=chicago async valid_for=(online_logfile,primary_role)
+                             db_unique_name=chicago
+
+3 rows selected.
+
+    교정을 마친 뒤의 결과다. 세 건이 남았는데 **셋 다 정상이다.**
+
+      dispatchers          DB_NAME 기반 XDB 서비스 이름. chicago 가 맞다
+      log_archive_config   구성 목록이므로 양쪽 이름이 다 들어간다
+      log_archive_dest_2   역할 전환 후 chicago 로 보내기 위한 목적지
+
+    ★ 이 조회의 값은 "걸러 내는 것"이 아니라 "설명할 수 있는가"다.
+      나온 항목마다 왜 chicago 여야 하는지 답할 수 있으면 정상이다.
+      답할 수 없는 항목이 있으면 그것이 상속 사고다.
+      교정 전이었다면 여기에 log_archive_dest_1 과 fal_client 가 함께 나왔고,
+      두 항목은 설명할 수 없었을 것이다.
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+  · BAD PARAM 은 설정이 있는데 해석할 수 없다는 뜻이다. INACTIVE 와 다르다
+  · 원인은 db_unique_name=chicago 상속이었다
+  · FRA 가 있어 기능은 우회로로 동작했다. 소리 없는 결함이다
+  · 교정하면 STATUS 가 VALID 가 되고 RECOVERY_MODE 가 되살아난다
+  · LOG_ARCHIVE_DEST_n 은 SCOPE=BOTH 로 즉시 반영된다
+  · VALID_NOW 의 WRONG VALID_TYPE 은 정상이다. 고치지 않는다
+  · FAL_CLIENT 도 같은 상속 문제이며 오류조차 내지 않는다
+  · 상속 사례가 넷. SET 하지 않은 파라미터는 조용히 넘어온다
+
+================================================================================
+ 실습 03 종료 — 두 파라미터를 바로잡았다. 이후 실습의 기준 상태다.
+================================================================================

@@ -1,0 +1,341 @@
+================================================================================
+ 제12장 실습 06 — 데이터베이스 가드와 SYS 사고
+ 대상   : boston-srv
+ 목표   : 가드 세 값이 누구를 막는지 실측하고, SYS 가 예외라는 사실이
+          어떤 사고로 이어지는지 직접 만든다
+ 소요   : 약 35분
+ 변경   : 복제가 깨진다 (실습 07 에서 복구)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 가드는 무엇인가
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT guard_status FROM v$database;
+
+GUARD_STATUS
+------------
+ALL
+
+1 row selected.
+
+-- ★ 전환과 함께 자동으로 켜졌다. Primary 는 NONE 이다.
+--
+-- ★ 왜 필요한가.
+--   Logical Standby 는 열려 있고 쓰기가 가능하다.
+--   복제 대상 테이블을 누가 고쳐 버리면 Primary 에서 온 변경과 어긋나
+--   적용이 깨진다. 가드가 그것을 막는다.
+--
+-- ★ 값은 셋이다. NONE, STANDBY, ALL.
+--   실제로 어떻게 다른지 세 가지 주체로 시험한다.
+--
+--   LGU  Primary 에서 복제된 테이블 lgu.t1 의 소유자
+--   RPT  Logical Standby 에서만 만든 테이블 rpt.own 의 소유자
+--   SYS  관리자
+
+--------------------------------------------------------------------------------
+ [2] 가드 = NONE
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE GUARD NONE;
+
+Database altered.
+
+SYS@boston> SELECT guard_status FROM v$database;
+
+GUARD_STATUS
+------------
+NONE
+
+1 row selected.
+
+[oracle@boston-srv ~]$ sqlplus -s lgu/lgu@//boston-srv:1521/chicago_pdb1
+SQL> update lgu.t1 set tag='probe' where id=1;
+
+1 row updated.
+
+SQL> rollback;
+
+[oracle@boston-srv ~]$ sqlplus -s rpt/rpt@//boston-srv:1521/chicago_pdb1
+SQL> insert into rpt.own values(9,'probe');
+
+1 row created.
+
+SQL> rollback;
+
+-- ★ 아무도 막지 않는다. 보호가 없는 상태다.
+
+--------------------------------------------------------------------------------
+ [3] 가드 = STANDBY
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE GUARD STANDBY;
+
+Database altered.
+
+SQL> -- LGU 로
+SQL> update lgu.t1 set tag='probe' where id=1;
+
+update lgu.t1 set tag='probe' where id=1
+           *
+ERROR at line 1:
+ORA-16224: Database Guard is enabled
+
+SQL> -- RPT 로
+SQL> insert into rpt.own values(9,'probe');
+
+insert into rpt.own values(9,'probe')
+            *
+ERROR at line 1:
+ORA-16224: Database Guard is enabled
+
+-- ★ 예상과 달랐다.
+--
+--   문서상 STANDBY 는 SQL Apply 가 관리하는 객체만 보호하고
+--   ALL 은 전부 보호한다고 되어 있다.
+--
+--   그런데 실측에서는 STANDBY 에서도 RPT 가 자기 테이블에 쓰지 못했다.
+--   rpt.own 은 Standby 에서만 만든 테이블이고 SQL Apply 가 관리하지 않는다.
+--
+-- ★ 환경과 객체의 성격에 따라 달라질 수 있다.
+--   문서의 설명을 그대로 믿기보다 자기 환경에서 확인하는 편이 안전하다.
+--   이 교재가 매번 실측하는 이유다.
+
+--------------------------------------------------------------------------------
+ [4] 가드 = ALL, 그리고 SYS
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE GUARD ALL;
+
+Database altered.
+
+SQL> -- LGU 로
+SQL> update lgu.t1 set tag='probe' where id=1;
+ERROR at line 1:
+ORA-16224: Database Guard is enabled
+
+SQL> -- RPT 로
+SQL> insert into rpt.own values(9,'probe');
+ERROR at line 1:
+ORA-16224: Database Guard is enabled
+
+-- 이번에는 SYS 로
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> UPDATE lgu.t1 SET tag='probe-sys' WHERE id=1;
+
+1 row updated.
+
+SYS@boston> ROLLBACK;
+
+Rollback complete.
+
+-- ★ SYS 는 통과했다.
+--
+-- ★ 세 값을 표로 정리하면 이렇다.
+--
+--   가드       LGU → 복제 테이블   RPT → 자기 테이블   SYS → 복제 테이블
+--   --------   -----------------   -----------------   -----------------
+--   NONE       허용                허용                허용
+--   STANDBY    ORA-16224           ORA-16224           허용
+--   ALL        ORA-16224           ORA-16224           허용
+--
+-- ★ SYS 는 세 값 모두에서 통과한다. 이것이 가장 중요하다.
+
+--------------------------------------------------------------------------------
+ [5] 세션 단위로 푸는 방법
+--------------------------------------------------------------------------------
+
+-- 가드를 데이터베이스 전체에서 끄지 않고 세션에서만 풀 수 있다.
+
+[oracle@boston-srv ~]$ sqlplus -s rpt/rpt@//boston-srv:1521/chicago_pdb1
+SQL> alter session disable guard;
+ERROR:
+ORA-01031: insufficient privileges
+
+>>> 원인 파악
+
+-- 아무나 되는 것이 아니다. 권한이 필요하다.
+
+>>> 조치
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> GRANT alter database TO rpt;
+
+Grant succeeded.
+
+>>> 재확인
+
+SQL> alter session disable guard;
+
+Session altered.
+
+SQL> insert into rpt.own values(9,'session-guard-off');
+
+1 row created.
+
+SQL> commit;
+SQL> select id, note from rpt.own order by id;
+
+        ID NOTE
+---------- --------------------
+         1 standby-only
+         9 session-guard-off
+
+2 rows selected.
+
+-- ★ 가드가 ALL 인 채로 그 세션만 통과했다.
+--   데이터베이스 전체의 보호를 유지하면서 특정 작업만 허용하는 방법이다.
+--
+-- ★ 세 가지 방법의 위험을 비교한다.
+--
+--   방법                            범위                  위험
+--   ------------------------------  --------------------  ------------------
+--   ALTER DATABASE GUARD NONE       전체, 다시 켤 때까지   크다
+--   ALTER SESSION DISABLE GUARD     그 세션만              작다
+--   SYS 로 접속                     항상 열려 있다         가장 크다
+--
+--   SYS 가 가장 위험한 이유는 "의식하지 못한다" 는 데 있다.
+--   앞의 둘은 명시적으로 푸는 행위가 있지만 SYS 는 그냥 열려 있다.
+
+SYS@boston> REVOKE alter database FROM rpt;
+
+Revoke succeeded.
+
+--------------------------------------------------------------------------------
+ [6] 사고를 만든다 — SYS 로 복제 테이블을 건드린다
+--------------------------------------------------------------------------------
+
+-- ★ 실무에서 흔히 일어나는 상황을 재현한다.
+--   보고서용으로 컬럼을 하나 추가하고 싶었다고 하자.
+--   가드가 켜져 있으니 안 될 것 같지만 SYS 로 접속해 있다.
+
+SYS@boston> SELECT guard_status FROM v$database;
+
+GUARD_STATUS
+------------
+ALL
+
+1 row selected.
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> UPDATE lgu.t1 SET tag='hacked' WHERE id=1;
+
+1 row updated.
+
+SYS@boston> ALTER TABLE lgu.t1 ADD (memo VARCHAR2(10));
+
+Table altered.
+
+-- ★ 가드가 ALL 인데 데이터도 고치고 구조도 바꿨다.
+--   오류도 경고도 없다. 이 순간에는 아무 일도 없어 보인다.
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 — 다음 리두가 도착하면
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SESSION SET container=chicago_pdb1;
+SYS@chicago> UPDATE lgu.t1 SET tag='primary-update' WHERE id=1;
+SYS@chicago> COMMIT;
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+-- 45초 뒤 Standby 에서
+
+SYS@boston> ALTER SESSION SET container=cdb$root;
+SYS@boston> SET LONG 4000
+SYS@boston> COL status FOR a92
+SYS@boston> SELECT status_code, status FROM dba_logstdby_events
+  2            WHERE status_code <> 0 ORDER BY event_time DESC FETCH FIRST 3 ROWS ONLY;
+
+STATUS_CODE STATUS
+----------- ------------------------------------------------------------------------
+      16222 ORA-16222: automatic Logical Standby retry of last action
+      16111 ORA-16111: log mining and apply setting up
+      26676 ORA-26676: Table 'LGU.T1' has 2 columns in the LCR and 3 columns in the
+            replicated site
+
+3 rows selected.
+
+>>> 원인 파악
+
+-- ★ ORA-26676 이 핵심이다.
+--
+--   Primary 에서 온 변경 레코드(LCR)는 컬럼이 2개인데
+--   Standby 의 테이블은 3개다.
+--   SQL Apply 가 어느 컬럼에 무엇을 넣어야 할지 알 수 없어 멈췄다.
+--
+-- ★ ORA-16222 는 자동 재시도를 뜻한다.
+--   원인이 사라지지 않으므로 재시도해도 같은 오류가 반복되다 결국 멈춘다.
+
+SYS@boston> SELECT state FROM v$logstdby_state;
+
+STATE
+----------------
+SQL APPLY NOT ON
+
+1 row selected.
+
+SYS@boston> SELECT applied_scn, newest_scn FROM dba_logstdby_progress;
+
+APPLIED_SCN NEWEST_SCN
+----------- ----------
+    2266130    2266453
+
+1 row selected.
+
+-- ★ 복제가 죽었다.
+--   받기는 계속하지만(NEWEST_SCN 증가) 적용은 멈췄다(APPLIED_SCN 고정).
+
+-- ★ 시간 간격에 주목한다.
+--
+--   SYS 로 ALTER TABLE 한 시점        아무 일 없음
+--   다음 리두가 도착한 시점            ORA-26676
+--
+--   원인과 결과 사이에 간격이 있으므로 연결하기 어렵다.
+--   "어제 오후에 누가 무엇을 했는가" 를 되짚어야 한다.
+
+>>> 조치
+
+-- 실습 07 에서 복구한다. 한 단계로 끝나지 않는다.
+
+--------------------------------------------------------------------------------
+ [8] 왜 SYS 를 예외로 두었나
+--------------------------------------------------------------------------------
+
+-- ★ 오라클이 실수한 것이 아니다. 의도된 설계다.
+--
+--   Logical Standby 에는 관리자가 손을 대야 하는 상황이 있다.
+--   어긋난 테이블을 다시 적재하고, 스킵 규칙을 넣고,
+--   실패한 트랜잭션을 건너뛴다.
+--   가드가 SYS 까지 막으면 그 작업을 할 수 없다.
+--
+-- ★ 문제는 그 권한이 조용하다는 것이다.
+--
+-- ★ 실무 대책은 습관에 있다.
+--
+--   ① 복제 대상 스키마에는 SYS 로 접속해 들어가지 않는다
+--   ② 보고서용 인덱스나 뷰를 만들 때도 어느 스키마인지 먼저 본다
+--   ③ 정기적으로 DBA_LOGSTDBY_EVENTS 를 확인한다
+--      조용히 멈춘 것을 일찍 발견할 수 있다
+--   ④ 인덱스 추가처럼 안전해 보이는 작업도 복제 대상 테이블이면
+--      구조 변경이 아닌지 확인한다 (인덱스는 안전, 컬럼 추가는 위험)
+--
+-- ★ 9장에서 "SYS 라는 함정" 을 다뤘다. 여기서 다시 만났고
+--   이번에는 결과가 훨씬 무겁다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① 가드는 전환과 함께 자동으로 ALL 이 된다
+--   ② NONE 은 아무도 막지 않는다
+--   ③ STANDBY 와 ALL 이 같게 동작했다 (문서 설명과 달랐다)
+--   ④ SYS 는 세 값 모두에서 통과한다
+--   ⑤ ALTER SESSION DISABLE GUARD 로 세션만 풀 수 있다
+--      권한이 없으면 ORA-01031
+--   ⑥ SYS 로 복제 테이블 구조를 바꾸면 ORA-26676 으로 복제가 멈춘다
+--   ⑦ 원인과 결과 사이에 시간 간격이 있다
+--
+-- ★ 다음 실습에서 되살린다.

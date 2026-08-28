@@ -1,0 +1,315 @@
+================================================================================
+ 제7장 실습 06 — 지연 읽기
+ 대상   : boston-srv Standby
+ 목표   : V$DATAGUARD_STATS 네 행의 뜻을 알고, TIME_COMPUTED 와 DATUM_TIME 의
+          차이가 진단에 주는 함의를 이해한다. 통합 점검 조회를 만든다
+ 소요   : 약 30분
+ 변경   : 없음 (적용을 잠시 멈췄다가 되돌린다)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 네 행 전체
+--------------------------------------------------------------------------------
+
+SYS@boston> SET LINES 200
+SYS@boston> COL name FOR a26
+SYS@boston> COL value FOR a20
+SYS@boston> COL unit FOR a34
+SYS@boston> COL time_computed FOR a22
+SYS@boston> COL datum_time FOR a22
+SYS@boston> SELECT name, value, unit, time_computed, datum_time
+  2            FROM v$dataguard_stats;
+
+NAME                   VALUE              UNIT                          TIME_COMPUTED          DATUM_TIME
+---------------------- ------------------ ----------------------------- ---------------------- ----------------------
+transport lag          +00 00:00:59       day(2) to second(0) interval  08/27/2026 10:43:24    08/27/2026 10:43:12
+apply lag              +00 00:01:04       day(2) to second(0) interval  08/27/2026 10:43:24    08/27/2026 10:43:12
+apply finish time      +00 00:00:00.100   day(2) to second(3) interval  08/27/2026 10:43:24
+estimated startup time 8                  second                        08/27/2026 10:43:24
+
+4 rows selected.
+
+-- 네 행이 각각 다른 질문에 답한다.
+--
+--   transport lag          Primary 가 만든 리두 중 아직 오지 않은 분량의 시간
+--   apply lag              받은 리두 중 아직 적용하지 않은 분량의 시간
+--   apply finish time      지금 밀린 것을 다 적용하는 데 걸릴 예상 시간
+--   estimated startup time Standby 를 열어 서비스하기까지 걸릴 예상 시간
+--
+-- ★ 앞의 둘은 **과거**를, 뒤의 둘은 **미래**를 말한다.
+--   그래서 뒤의 둘에는 DATUM_TIME 이 없다. 근거가 될 과거 정보가 없다.
+--
+-- ★ UNIT 열을 보면 정밀도가 다르다.
+--     transport lag / apply lag  second(0) — 초 단위
+--     apply finish time          second(3) — 밀리초 단위
+--   앞의 둘은 초보다 세밀하게 볼 필요가 없다는 오라클의 판단이다.
+--
+-- ★ estimated startup time 8초.
+--   지금 Standby 를 Primary 로 전환한다면 서비스 개시까지
+--   8초쯤 걸린다는 예측이다. 16장의 역할 전환에서 다시 본다.
+
+--------------------------------------------------------------------------------
+ [2] 두 지연의 관계
+--------------------------------------------------------------------------------
+
+-- 위 실측에서 apply lag(64초)이 transport lag(59초)보다 크다.
+--
+-- ★ 이것이 정상 관계다.
+--     받아야 적용할 수 있다 → 적용은 전송보다 뒤처진다
+--     transport lag <= apply lag
+--
+--   반대로 나오면 두 값의 계산 시점이 어긋난 것이며,
+--   몇 초 뒤 다시 조회하면 정상 관계로 돌아온다.
+--
+-- ★ 두 값의 차이(5초)가 곧 "받아 놓고 아직 적용하지 못한 분량"이다.
+--   이 차이가 계속 벌어지면 적용 성능이 병목이라는 뜻이다.
+
+--------------------------------------------------------------------------------
+ [3] TIME_COMPUTED 와 DATUM_TIME
+--------------------------------------------------------------------------------
+
+--   TIME_COMPUTED  이 값을 계산한 시각. 조회한 시점이다
+--   DATUM_TIME     계산의 근거가 된 마지막 정보의 시각
+--
+-- 실측에서 두 값이 **12초** 차이 났다.
+--   10:43:24 에 조회했지만 그 값은 10:43:12 시점의 정보로 계산된 것이다.
+--
+-- ★★ 즉 **지연 값 자체에 최대 십수 초의 지연이 있다.**
+--
+--   이것이 뜻하는 바가 중요하다.
+--     "apply lag 이 0 이다" = "십수 초 전에는 0 이었다"
+--   지금 이 순간 0 이라는 보장이 아니다.
+--
+-- ★ 그래서 지연은 **한 번의 조회로 단정하지 않는다.**
+--   몇 초 간격으로 두세 번 조회해 추세를 본다.
+--     줄어들고 있으면 → 따라잡는 중. 기다린다
+--     늘어나고 있으면 → 문제. 원인을 찾는다
+--     제자리이면     → 정상이거나 완전히 멈춘 것. 다른 지표로 확인한다
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 지연 0 인데 적용이 멈춰 있는 상태
+--------------------------------------------------------------------------------
+
+-- 가장 위험한 함정을 재현한다.
+
+SYS@boston> SELECT open_mode FROM v$database;
+
+OPEN_MODE
+--------------------
+READ ONLY WITH APPLY
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+>>> 원인 파악
+    ★★ **적용이 멈춰 있는데 두 지연이 모두 0 이다.**
+
+    적용할 것이 없으니 뒤처질 것도 없다는 계산이다.
+    지연 값만 보고 "정상"이라고 판단하면 정확히 이 함정에 빠진다.
+
+    ★ 같은 시점의 다른 지표는 문제를 그대로 보여 준다.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+no rows selected
+
+SYS@boston> SELECT COUNT(*) mrp FROM v$managed_standby WHERE process='MRP0';
+
+       MRP
+----------
+         0
+
+SYS@boston> SELECT open_mode FROM v$database;
+
+OPEN_MODE
+--------------------
+READ ONLY
+
+      MRP0 이 0 개이고 OPEN_MODE 에서 WITH APPLY 가 사라졌다.
+      **지연보다 이 두 지표를 먼저 봐야 하는 이유다.**
+
+    ★ 같은 사실을 두 형태로 확인했다.
+      `no rows selected` 와 `COUNT(*)=0` 이다.
+      모니터링 스크립트에서는 COUNT(*) 쪽이 다루기 쉽다.
+      행이 없어도 결과가 한 줄 나오기 때문이다.
+
+    ★ 세 번째 확인 방법도 있다. CANCEL 을 한 번 더 내 보는 것이다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+alter database recover managed standby database cancel
+*
+ERROR at line 1:
+ORA-16136: Managed Standby Recovery not active
+
+      ORA-16136 이 "이미 멈춰 있다"는 것을 확인해 준다.
+      지연 값 두 개가 0 이라는 사실보다 이 오류 하나가 더 많은 것을 말해 준다.
+      다만 진단 목적으로 상태를 바꾸는 명령을 내리는 것은 권하지 않는다.
+      조회로 확인할 수 있으면 조회로 한다.
+
+    ★ 시간이 더 지나면 지연 값도 올라간다.
+      Primary 가 리두를 만들면 transport lag 부터 벌어진다.
+      그러나 그때까지 몇 분이 그냥 지나간다.
+      멈춘 직후에 알아채려면 MRP0 을 봐야 한다.
+
+>>> 조치
+    적용을 다시 기동한다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+>>> 재확인
+
+SYS@boston> SELECT open_mode FROM v$database;
+
+OPEN_MODE
+--------------------
+READ ONLY WITH APPLY
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         73
+
+--------------------------------------------------------------------------------
+ [5] 지연이 커질 때 — 원인 분류
+--------------------------------------------------------------------------------
+
+  증상                        병목 위치        확인할 것
+  --------------------------- ---------------- ------------------------------
+  transport lag 만 크다       네트워크·전송    대역폭, 목적지 ERROR, LNS
+  apply lag 만 크다           Standby 적용     Standby I/O, MRP0 상태
+  둘 다 크고 비슷하다         전송이 막혔다    전송 경로를 먼저 본다
+  둘 다 0 인데 데이터가 없다  적용이 멈췄다    MRP0 존재 여부
+
+  ★ 마지막 행이 [4] 에서 재현한 함정이다.
+    지연 값만으로는 이 상태를 구분할 수 없다.
+
+  ★ 두 번째 행은 야간 배치 뒤에 흔히 나타난다.
+    배치가 만든 리두량이 Standby 의 적용 능력을 넘어선 것이며,
+    시간이 지나며 값이 줄어들면 조치가 필요 없다.
+
+--------------------------------------------------------------------------------
+ [6] 통합 점검 조회
+--------------------------------------------------------------------------------
+
+-- 지금까지의 항목을 한 번에 보는 조회를 만들어 둔다. Standby 에서 실행한다.
+
+SYS@boston> SET LINES 200 PAGES 100
+SYS@boston> COL item FOR a22
+SYS@boston> COL val FOR a46
+SYS@boston> SELECT 'role/open' item,
+  2                database_role || ' / ' || open_mode val FROM v$database
+  3          UNION ALL
+  4          SELECT 'protection',
+  5                protection_mode || ' / ' || protection_level FROM v$database
+  6          UNION ALL
+  7          SELECT 'mrp',
+  8                NVL(MAX(status || ' seq=' || sequence#), '*** NOT RUNNING ***')
+  9            FROM v$managed_standby WHERE process = 'MRP0'
+ 10          UNION ALL
+ 11          SELECT 'recovery_mode',
+ 12                MAX(recovery_mode) FROM v$archive_dest_status WHERE dest_id = 1
+ 13          UNION ALL
+ 14          SELECT 'dest status',
+ 15                LISTAGG(dest_id || ':' || status, ' ') WITHIN GROUP (ORDER BY dest_id)
+ 16            FROM v$archive_dest_status WHERE dest_id <= 2
+ 17          UNION ALL
+ 18          SELECT 'gaps', TO_CHAR(COUNT(*)) FROM v$archive_gap
+ 19          UNION ALL
+ 20          SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag'
+ 21          UNION ALL
+ 22          SELECT 'srl',
+ 23                COUNT(*) || ' groups, ' || COUNT(CASE WHEN status='ACTIVE' THEN 1 END)
+ 24                || ' active' FROM v$standby_log;
+
+ITEM                   VAL
+---------------------- ----------------------------------------------
+role/open              PHYSICAL STANDBY / READ ONLY WITH APPLY
+protection             MAXIMUM PERFORMANCE / MAXIMUM PERFORMANCE
+mrp                    APPLYING_LOG seq=73
+recovery_mode          MANAGED REAL TIME APPLY
+dest status            1:VALID 2:VALID
+gaps                   0
+transport lag          +00 00:00:00
+apply lag              +00 00:00:00
+srl                    4 groups, 1 active
+
+9 rows selected.
+
+-- ★ 아홉 줄로 이 장의 모든 점검 항목이 한눈에 들어온다.
+--
+-- ★ mrp 행에 NVL 을 쓴 이유
+--   MRP0 이 없으면 집계 함수가 NULL 을 돌려주는데,
+--   그대로 두면 빈 칸으로 보여 놓치기 쉽다.
+--   *** NOT RUNNING *** 으로 눈에 띄게 만든다.
+--   [4] 의 함정을 이 한 줄이 막아 준다.
+--
+-- ★ srl 행의 '1 active' 도 정상이다.
+--   지금 리두를 받고 있는 그룹이 하나라는 뜻이다.
+--     0 이면      리두가 오고 있지 않다
+--     여러 개면   아직 아카이브되지 않은 그룹이 쌓이고 있다
+--
+-- ★ protection 행의 두 값이 일치해야 한다는 것은 2장에서 배웠다.
+--   다르면 실제 보호 수준이 설정보다 낮아진 것이다.
+
+--------------------------------------------------------------------------------
+ [7] Primary 쪽 점검
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL item FOR a22
+SYS@chicago> COL val FOR a46
+SYS@chicago> SELECT 'role/open' item,
+  2                database_role || ' / ' || open_mode val FROM v$database
+  3          UNION ALL
+  4          SELECT 'dest status',
+  5                LISTAGG(dest_id || ':' || status, ' ') WITHIN GROUP (ORDER BY dest_id)
+  6            FROM v$archive_dest_status WHERE dest_id <= 2
+  7          UNION ALL
+  8          SELECT 'applied_seq',
+  9                TO_CHAR(MAX(applied_seq#)) FROM v$archive_dest_status WHERE dest_id=2;
+
+ITEM                   VAL
+---------------------- ----------------------------------------------
+role/open              PRIMARY / READ WRITE
+dest status            1:VALID 2:VALID
+applied_seq            71
+
+3 rows selected.
+
+-- Primary 쪽은 세 항목이면 충분하다.
+-- applied_seq 는 참고용이다. 정확한 값은 Standby 에서 본다 (실습 05).
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+  · V$DATAGUARD_STATS 는 네 행이다. 앞의 둘은 과거, 뒤의 둘은 미래
+  · apply lag >= transport lag 이 정상 관계다
+  · TIME_COMPUTED 와 DATUM_TIME 이 실측 12초 차이 났다
+  · 지연 값 자체가 십수 초 전 정보다. 두세 번 조회해 추세를 본다
+  · **적용이 멈춰도 두 지연은 0 으로 보인다** — 가장 위험한 함정
+  · 지연보다 MRP0 존재와 OPEN_MODE 를 먼저 확인한다
+  · 통합 점검 조회 아홉 줄로 모든 항목을 한눈에 본다
+  · NVL 로 NOT RUNNING 을 눈에 띄게 만드는 것이 요령이다
+
+================================================================================
+ 실습 06 종료 — 환경 변경 없음. 적용은 실시간 모드로 돌고 있다.
+================================================================================

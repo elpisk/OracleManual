@@ -1,0 +1,418 @@
+================================================================================
+ 제8장 실습 06 — 반영되지 않는 것: 온라인 리두 로그
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : 온라인 리두 로그 그룹 추가가 Standby 에 반영되지 않는 것을 확인하고,
+          로그 파일 작업에서 만나는 오류 세 가지를 구분한다
+ 소요   : 약 35분
+ 경고   : 로그 그룹을 추가·삭제한다. 순서를 반드시 지킨다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 시작 상태 — 양쪽 로그 구성
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT group#, members, bytes/1024/1024 mb, status FROM v$log
+  2            ORDER BY group#;
+
+    GROUP#    MEMBERS         MB STATUS
+---------- ---------- ---------- ----------------
+         1          1        200 CURRENT
+         2          1        200 INACTIVE
+         3          1        200 INACTIVE
+
+3 rows selected.
+
+SYS@chicago> SELECT COUNT(*) online_files FROM v$logfile WHERE type='ONLINE';
+
+ONLINE_FILES
+------------
+           3
+
+SYS@chicago> SELECT COUNT(*) srl FROM v$standby_log;
+
+       SRL
+----------
+         4
+
+SYS@boston> SELECT group#, members, bytes/1024/1024 mb, status FROM v$log
+  2            ORDER BY group#;
+
+    GROUP#    MEMBERS         MB STATUS
+---------- ---------- ---------- ----------------
+         1          2        200 UNUSED
+         2          2        200 UNUSED
+         3          2        200 CURRENT
+
+3 rows selected.
+
+SYS@boston> SELECT COUNT(*) online_files FROM v$logfile WHERE type='ONLINE';
+
+ONLINE_FILES
+------------
+           6
+
+-- ★ 그룹 수는 양쪽 3으로 같은데 멤버 수가 다르다 (3 vs 6).
+--   Standby 는 OMF 로 만들어져 그룹당 두 곳에 다중화되었기 때문이다 (6장).
+--   구성이 이미 대칭이 아니라는 것을 확인하고 시작한다.
+
+--------------------------------------------------------------------------------
+ [2] Primary 에 온라인 리두 그룹 추가
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE ADD LOGFILE GROUP 8
+  2            '/u03/app/oracle/oradata/Chicago/redo08.log' SIZE 200M;
+
+Database altered.
+
+SYS@chicago> SELECT group#, members, bytes/1024/1024 mb, status FROM v$log
+  2            ORDER BY group#;
+
+    GROUP#    MEMBERS         MB STATUS
+---------- ---------- ---------- ----------------
+         1          1        200 INACTIVE
+         2          1        200 CURRENT
+         3          1        200 INACTIVE
+         8          1        200 UNUSED
+
+4 rows selected.
+
+-- 네 그룹이 되었다. 새 그룹은 아직 쓰이지 않아 UNUSED 다.
+-- 그룹 번호를 8로 준 것은 SRL 이 4~7을 쓰고 있기 때문이다.
+
+--------------------------------------------------------------------------------
+ [3] 리두를 흘리고 Standby 확인
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+-- 45초 뒤
+
+SYS@boston> SELECT group#, members, bytes/1024/1024 mb, status FROM v$log
+  2            ORDER BY group#;
+
+    GROUP#    MEMBERS         MB STATUS
+---------- ---------- ---------- ----------------
+         1          2        200 UNUSED
+         2          2        200 UNUSED
+         3          2        200 CURRENT
+
+3 rows selected.
+
+SYS@boston> SELECT COUNT(*) online_members FROM v$logfile WHERE type='ONLINE';
+
+ONLINE_MEMBERS
+--------------
+             6
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+[oracle@boston-srv ~]$ ls -1 /u03/app/oracle/oradata/BOSTON/onlinelog/ | sort
+
+o1_mf_1_o8z3jhxn_.log
+o1_mf_2_o8z3jj92_.log
+o1_mf_3_o8z3jl7n_.log
+o1_mf_4_o8z636ks_.log
+o1_mf_5_o8z3jwn7_.log
+o1_mf_6_o8z636x2_.log
+o1_mf_7_o8z638v0_.log
+
+-- ★★ **세 그룹 그대로다.** 그룹 8이 생기지 않았다.
+--
+--   지연은 0 이다. 리두는 정상 적용되고 있다.
+--   즉 밀려서 안 보이는 것이 아니라 **애초에 반영되지 않는다.**
+--   오류도 경고도 없다. 조용히 반영되지 않는다.
+--
+--   파일 목록의 4~7은 SRL 이다 (7장에서 재생성한 것).
+--   온라인 로그는 1~3 셋뿐이다.
+
+--------------------------------------------------------------------------------
+ [4] 왜 반영되지 않는가
+--------------------------------------------------------------------------------
+
+  온라인 리두 로그는 **그 데이터베이스가 Primary 로서 쓰는 자원**이다.
+  Standby 는 자신의 온라인 리두를 쓰지 않는다. 받은 리두는 SRL 에 쓴다.
+  지금 당장 필요가 없으므로 오라클은 미리 만들지 않는다.
+
+  반영 여부를 정리하면 이렇다.
+
+    Primary 변경                     Standby 반영
+    -------------------------------- ------------------
+    테이블스페이스 추가·삭제         자동
+    데이터 파일 추가·크기 변경       자동
+    PDB 추가·삭제                    자동 (디렉터리까지)
+    **온라인 리두 로그 그룹 추가**   **되지 않음**
+    **Standby Redo Log 추가**        **되지 않음**
+
+  ★ 문제는 나중이다.
+    역할 전환으로 boston 이 Primary 가 되면 그때 온라인 리두가 필요해진다.
+    구성이 다르면 로그 그룹 수와 크기가 어긋난 채로 운영이 시작된다.
+
+    실습 환경을 예로 들면, chicago 를 네 그룹으로 운영하다 역할이 바뀌면
+    boston 은 세 그룹으로 시작한다.
+    리두 생성량이 많은 시스템에서는 로그 전환이 잦아져 성능에 영향을 준다.
+
+  ★★ 그러므로 **Primary 의 온라인 리두 구성을 바꿀 때는
+    Standby 에도 같은 변경을 사람이 직접 해 주어야 한다.**
+    자동화되지 않는 몇 안 되는 항목이므로 절차서에 명시해 둔다.
+
+  ★ SRL 도 함께 검토한다.
+    4장의 규칙은 SRL 개수 = 온라인 그룹 + 1 이었다.
+    온라인을 네 그룹으로 늘렸다면 SRL 도 다섯으로 늘려야 한다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 ① — ORA-01623: CURRENT 그룹은 지울 수 없다
+--------------------------------------------------------------------------------
+
+-- 그룹 8을 지우려 한다. 그런데 로그 전환이 몇 번 일어나 그룹 8이 CURRENT 가
+-- 되어 있는 상태에서 시도하면 다음과 같다.
+
+SYS@chicago> ALTER DATABASE DROP LOGFILE GROUP 8;
+
+alter database drop logfile group 8
+*
+ERROR at line 1:
+ORA-01623: log 8 is current log for instance chicago (thread 1) - cannot drop
+ORA-00312: online log 8 thread 1: '/u03/app/oracle/oradata/Chicago/redo08.log'
+
+>>> 원인 파악
+    지금 LGWR 이 쓰고 있는 그룹이다.
+    7장의 SRL ORA-00261 과 성격이 같다 — **쓰이고 있는 로그는 지울 수 없다.**
+
+    ★ ORA-00312 가 함께 나와 어느 파일인지 알려 준다.
+      여기서는 한 줄이다. Primary 는 그룹당 멤버가 하나이기 때문이다.
+      7장의 Standby 에서는 OMF 다중화 때문에 두 줄이었다.
+      **줄 수가 구성 방식을 드러낸다.**
+
+>>> 조치
+    다른 그룹으로 넘긴 뒤 지운다.
+
+SYS@chicago> ALTER SYSTEM SWITCH LOGFILE;
+SYS@chicago> ALTER SYSTEM SWITCH LOGFILE;
+SYS@chicago> ALTER SYSTEM SWITCH LOGFILE;
+SYS@chicago> ALTER SYSTEM CHECKPOINT;
+
+System altered.
+
+    ★ 전환 한 번으로 부족할 수 있다.
+      전환 직후 그룹은 ACTIVE(아카이브 대기) 상태이며 이때도 지울 수 없다.
+      INACTIVE 가 될 때까지 기다리거나 체크포인트를 강제한다.
+      상태를 확인하고 진행하는 것이 확실하다.
+
+SYS@chicago> SELECT group#, status, archived FROM v$log ORDER BY group#;
+
+    GROUP#    STATUS           ARC
+---------- ---------------- ---
+         1 INACTIVE         YES
+         2 CURRENT          NO
+         3 INACTIVE         YES
+         8 INACTIVE         YES
+
+>>> 재확인
+    상태가 INACTIVE 이고 ARC 가 YES 이면 지울 수 있다.
+
+SYS@chicago> ALTER DATABASE DROP LOGFILE GROUP 8;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 ② — ORA-00359: 그룹이 없다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE DROP LOGFILE GROUP 8;
+
+alter database drop logfile group 8
+*
+ERROR at line 1:
+ORA-00359: logfile group 8 does not exist
+
+>>> 원인 파악
+    이미 지웠다. 4장에서도 만난 오류이며 무해하다.
+
+    ★ 스크립트를 두 번 실행했을 때 흔히 나온다.
+      7장의 ORA-16136 과 같은 성격이다 — "이미 그 상태다"라는 알림이다.
+
+>>> 조치
+    아무것도 하지 않는다. 의도한 상태에 이미 도달했다.
+
+>>> 재확인
+
+SYS@chicago> SELECT group#, members, status FROM v$log ORDER BY group#;
+
+    GROUP#    MEMBERS STATUS
+---------- ---------- ----------------
+         1          1 INACTIVE
+         2          1 CURRENT
+         3          1 INACTIVE
+
+3 rows selected.
+
+    세 그룹으로 돌아왔다.
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 ③ — ORA-00301: 파일이 이미 있다
+--------------------------------------------------------------------------------
+
+-- 그룹을 지운 뒤 같은 경로로 다시 만들어 본다.
+
+SYS@chicago> ALTER DATABASE ADD LOGFILE GROUP 8
+  2            '/u03/app/oracle/oradata/Chicago/redo08.log' SIZE 200M;
+
+alter database add logfile group 8
+*
+ERROR at line 1:
+ORA-00301: error in adding log file '/u03/app/oracle/oradata/Chicago/redo08.log'
+           - file cannot be created
+ORA-27038: created file already exists
+Additional information: 1
+
+>>> 원인 파악
+    ★ **오라클은 로그 그룹을 지울 때 운영체제 파일을 지우지 않는다.**
+      데이터 파일과 다른 점이다.
+      DROP TABLESPACE ... INCLUDING DATAFILES 는 파일까지 지우지만
+      DROP LOGFILE 에는 그런 옵션이 없다.
+
+[oracle@chicago-srv ~]$ ls -l /u03/app/oracle/oradata/Chicago/redo08.log
+-rw-r-----. 1 oracle dba 209715712 Aug 27 11:30 /u03/app/oracle/oradata/Chicago/redo08.log
+
+      파일이 그대로 있다. 4장에서 SRL 을 다룰 때 만난 것과 같은 상황이다.
+
+>>> 조치
+    두 가지 길이 있다.
+
+    ① REUSE 키워드를 쓴다
+
+       ALTER DATABASE ADD LOGFILE GROUP 8
+         '/u03/app/oracle/oradata/Chicago/redo08.log' SIZE 200M REUSE;
+
+    ② 데이터베이스에서 그 파일이 쓰이지 않는 것을 확인한 뒤 운영체제에서 지운다
+
+       SYS@chicago> SELECT member FROM v$logfile
+                      WHERE member LIKE '%redo08%';
+       no rows selected          ← 쓰이지 않는다는 확인
+
+       [oracle@chicago-srv ~]$ mv /u03/app/oracle/oradata/Chicago/redo08.log \
+         /u03/app/oracle/oradata/Chicago/redo08.log.old
+
+    ★★ **②에서 rm 이 아니라 mv 를 썼다.**
+      데이터베이스가 쓰지 않는다는 것을 조회로 확인했더라도
+      바로 지우지 않는다. 옮겨 두었다가 나중에 지운다.
+      **mv 는 되돌릴 수 있지만 rm 은 되돌릴 수 없다.**
+
+      이 원칙을 어겼을 때 무슨 일이 일어나는지는 실습 07 에서 다룬다.
+
+>>> 재확인
+
+SYS@chicago> ALTER DATABASE ADD LOGFILE GROUP 8
+  2            '/u03/app/oracle/oradata/Chicago/redo08.log' SIZE 200M;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+ [8] 오류 재현 ④ — ORA-00904: V$LOG 에는 TYPE 열이 없다
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT group#, type FROM v$log ORDER BY group#;
+
+select group#, type from v$log order by group#
+               *
+ERROR at line 1:
+ORA-00904: "TYPE": invalid identifier
+
+>>> 원인 파악
+    세 뷰의 단위와 열을 구분해야 한다.
+
+      V$LOG          로그 **그룹**   GROUP#, MEMBERS, BYTES, STATUS, ARCHIVED
+      V$LOGFILE      로그 **멤버**   GROUP#, TYPE, MEMBER, STATUS
+      V$STANDBY_LOG  SRL 그룹        GROUP#, SEQUENCE#, BYTES, STATUS, ARCHIVED
+
+    ★ V$LOG 는 온라인 그룹만 보여 준다. SRL 은 나오지 않는다.
+      그래서 TYPE 으로 구분할 필요가 없고 열도 없다.
+
+>>> 조치와 재확인
+    목적에 맞는 뷰를 쓴다. 온라인과 SRL 을 함께 세려면 다음과 같이 한다.
+
+SYS@boston> SELECT type, COUNT(DISTINCT group#) groups, COUNT(*) members
+  2            FROM v$logfile GROUP BY type;
+
+TYPE        GROUPS    MEMBERS
+------- ---------- ----------
+ONLINE           3          6
+STANDBY          4          8
+
+    Standby 의 구성이 한눈에 들어온다. 온라인 3그룹 6멤버, SRL 4그룹 8멤버다.
+
+--------------------------------------------------------------------------------
+ [9] 원복
+--------------------------------------------------------------------------------
+
+-- 그룹 8을 안전하게 제거한다. **순서를 반드시 지킨다.**
+
+SYS@chicago> ALTER SYSTEM SWITCH LOGFILE;
+SYS@chicago> ALTER SYSTEM CHECKPOINT;
+SYS@chicago> SELECT group#, status, archived FROM v$log ORDER BY group#;
+
+    GROUP#    STATUS           ARC
+---------- ---------------- ---
+         1 INACTIVE         YES
+         2 CURRENT          NO
+         3 INACTIVE         YES
+         8 INACTIVE         YES
+
+-- ① 상태가 INACTIVE 인지 확인한다  ← 건너뛰지 않는다
+
+SYS@chicago> ALTER DATABASE DROP LOGFILE GROUP 8;
+
+Database altered.
+
+-- ② 데이터베이스에서 사라졌는지 확인한다
+
+SYS@chicago> SELECT member FROM v$logfile WHERE member LIKE '%redo08%';
+
+no rows selected
+
+-- ③ 그 다음에 파일을 옮긴다 (지우지 않는다)
+
+[oracle@chicago-srv ~]$ mv /u03/app/oracle/oradata/Chicago/redo08.log /tmp/
+
+-- ★ 이 세 단계가 이 실습의 결론이다.
+--   ①을 건너뛰면 ORA-01623 을 만난다.
+--   ②를 건너뛰고 ③을 하면 실습 07 의 사고가 일어난다.
+
+SYS@chicago> SELECT group#, members, status FROM v$log ORDER BY group#;
+
+    GROUP#    MEMBERS STATUS
+---------- ---------- ----------------
+         1          1 INACTIVE
+         2          1 CURRENT
+         3          1 INACTIVE
+
+3 rows selected.
+
+--------------------------------------------------------------------------------
+ [10] 정리
+--------------------------------------------------------------------------------
+
+  · 온라인 리두 그룹 추가는 Standby 에 **반영되지 않는다.** 오류도 없다
+  · Standby 는 자신의 온라인 리두를 쓰지 않기 때문이다
+  · 역할 전환 후에 구성 차이로 드러난다. 사람이 양쪽에 같이 적용해야 한다
+  · ORA-01623: CURRENT 그룹은 지울 수 없다. 전환 후 INACTIVE 를 확인한다
+  · ORA-00359: 이미 없는 그룹. 무해하다
+  · ORA-00301 + ORA-27038: 파일이 남아 있다. DROP LOGFILE 은 파일을 지우지 않는다
+  · ORA-00904: TYPE 열은 V$LOGFILE 에 있다. V$LOG 에는 없다
+  · 제거 순서: 상태 확인 → DROP → 조회로 확인 → 파일은 mv
+
+================================================================================
+ 실습 06 종료 — 양쪽 온라인 3그룹, SRL 4그룹. 기준 상태로 복귀했다.
+================================================================================

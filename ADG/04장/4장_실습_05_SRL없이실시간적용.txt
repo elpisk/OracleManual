@@ -1,0 +1,253 @@
+================================================================================
+ 제4장 실습 05 — SRL 을 지우고 실시간 적용을 시도한다
+ 대상   : boston-srv Standby
+ 목표   : SRL 삭제가 거부되는 조건(ORA-00261)과 적용 방식 충돌(ORA-01153),
+          그룹 추가 실패(ORA-01184)를 재현하고 복구한다
+ 소요   : 약 30분
+ 경고   : Standby 의 SRL 을 실제로 삭제한다. 반드시 복구까지 마쳐야 완료다.
+ 되돌리기 : SRL 4개(200MB) 재생성 + 실시간 적용 재기동
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 준비 — MRP 를 멈춘다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> SELECT group#, sequence#, status, archived FROM v$standby_log
+  2             ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS     ARC
+---------- ---------- ---------- ---
+         4         50 ACTIVE     YES
+         5          0 UNASSIGNED NO
+         6          0 UNASSIGNED NO
+         7          0 UNASSIGNED YES
+
+4 rows selected.
+
+-- MRP 를 멈췄는데도 group 4 는 여전히 ACTIVE 다.
+-- 적용을 멈춘 것과 수신을 멈춘 것은 다르기 때문이다.
+-- Primary 는 계속 리두를 보내고 있고 RFS 는 계속 받고 있다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 ① — ACTIVE 인 SRL 은 지울 수 없다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE DROP STANDBY LOGFILE GROUP 4;
+ALTER DATABASE DROP STANDBY LOGFILE GROUP 4
+*
+ERROR at line 1:
+ORA-00261: log 4 of thread 1 is being archived or modified
+ORA-00312: online log 4 thread 1:
+'/u03/app/oracle/oradata/Boston/onlinelog/stdbyredo04.log'
+
+
+>>> 원인 파악
+    ORA-00261 = "이 로그가 아카이브되거나 변경되는 중이다"
+    ORA-00312 는 어느 파일인지 알려 주는 보조 메시지다.
+
+    앞의 조회에서 group 4 가 ACTIVE 였던 것이 그대로 걸린 것이다.
+    MRP 를 멈춰도 RFS 는 계속 리두를 받으므로 ACTIVE 상태가 유지된다.
+
+    ★ 적용(MRP)과 수신(RFS)은 별개의 흐름이다.
+      SRL 을 지우려면 수신도 멈춰야 하며, 그러려면 Primary 쪽에서
+      해당 목적지를 DEFER 하거나 Standby 를 마운트로 내려야 한다.
+
+>>> 조치 — 다른 그룹부터 지운다
+
+SYS@boston> ALTER DATABASE DROP STANDBY LOGFILE GROUP 5;
+Database altered.
+
+SYS@boston> ALTER DATABASE DROP STANDBY LOGFILE GROUP 6;
+Database altered.
+
+SYS@boston> ALTER DATABASE DROP STANDBY LOGFILE GROUP 7;
+Database altered.
+
+SYS@boston> SELECT COUNT(*) AS srl_left FROM v$standby_log;
+
+  SRL_LEFT
+----------
+         1
+
+1 row selected.
+
+-- UNASSIGNED 였던 5·6·7 은 문제없이 지워졌다.
+-- ACTIVE 인 4 만 남았다.
+
+--------------------------------------------------------------------------------
+ [3] SRL 이 하나뿐일 때 실시간 적용은 되는가
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+-- ★ 성공했다.
+--
+-- 여기서 알 수 있는 것 : 개수 규칙(그룹 수 + 1)은
+-- "동작의 최소 요건" 이 아니라 "성능과 안정을 위한 권장" 이다.
+-- SRL 이 하나라도 있으면 실시간 적용 자체는 시작된다.
+--
+-- 다만 하나뿐이면 그것이 아카이브되는 동안 리두를 받을 곳이 없어
+-- 전송이 대기하게 되므로 지연이 커진다.
+-- 부하가 있는 환경에서는 이 차이가 크게 나타난다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 ② — 적용 방식을 겹쳐 실행하면
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            DISCONNECT FROM SESSION;
+ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION
+*
+ERROR at line 1:
+ORA-01153: an incompatible media recovery is active
+
+
+>>> 원인 파악
+    ORA-01153 = "다른 종류의 미디어 복구가 이미 돌고 있다"
+
+    바로 앞에서 USING CURRENT LOGFILE(실시간 적용)을 시작했는데,
+    이번에는 그 절 없이(일반 적용) 다시 시작하려 했기 때문이다.
+    두 방식은 동시에 돌 수 없다.
+
+    ★ 적용 방식을 바꾸려면 반드시 먼저 CANCEL 해야 한다.
+      실무에서 흔히 하는 실수이며, 오류 메시지가 원인을 직접
+      말해 주지 않아 당황하기 쉽다.
+
+>>> 조치
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 ③ — 여러 그룹을 한 문장으로 추가하면
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1
+  2    GROUP 4 ('/u03/app/oracle/oradata/Boston/onlinelog/stdbyredo04.log') SIZE 200m REUSE,
+  3    GROUP 5 ('/u03/app/oracle/oradata/Boston/onlinelog/stdbyredo05.log') SIZE 200m REUSE,
+  4    GROUP 6 ('/u03/app/oracle/oradata/Boston/onlinelog/stdbyredo06.log') SIZE 200m REUSE,
+  5    GROUP 7 ('/u03/app/oracle/oradata/Boston/onlinelog/stdbyredo07.log') SIZE 200m REUSE;
+ALTER DATABASE ADD STANDBY LOGFILE THREAD 1
+*
+ERROR at line 1:
+ORA-01184: logfile group 4 already exists
+
+SYS@boston> SELECT group#, bytes/1024/1024 mb, status FROM v$standby_log
+  2             ORDER BY group#;
+
+    GROUP#         MB STATUS
+---------- ---------- ----------
+         4        200 ACTIVE
+
+1 row selected.
+
+
+>>> 원인 파악
+    group 4 는 [2] 에서 지우지 못하고 남아 있었다.
+    그래서 ORA-01184 가 났고, **그 때문에 5·6·7 도 추가되지 않았다.**
+
+    ★ 한 문장 안의 여러 그룹은 하나의 트랜잭션처럼 처리된다.
+      하나가 실패하면 전체가 실패한다.
+      복구 상황에서 이 성질을 모르면 "분명히 실행했는데 안 만들어졌다"
+      로 헤매게 된다.
+
+>>> 조치 — 그룹별로 나누어 실행한다
+
+SYS@boston> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1
+  2    GROUP 5 ('/u03/app/oracle/oradata/Boston/onlinelog/stdbyredo05.log') SIZE 200m REUSE;
+Database altered.
+
+SYS@boston> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1
+  2    GROUP 6 ('/u03/app/oracle/oradata/Boston/onlinelog/stdbyredo06.log') SIZE 200m REUSE;
+Database altered.
+
+SYS@boston> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1
+  2    GROUP 7 ('/u03/app/oracle/oradata/Boston/onlinelog/stdbyredo07.log') SIZE 200m REUSE;
+Database altered.
+
+-- REUSE 를 준 것이 중요하다.
+-- [2] 에서 딕셔너리에서만 지워졌고 파일은 디스크에 남아 있기 때문이다.
+-- REUSE 가 없으면 "파일이 이미 존재한다" 는 오류가 난다.
+
+>>> 재확인
+
+SYS@boston> SELECT group#, bytes/1024/1024 mb, status FROM v$standby_log
+  2             ORDER BY group#;
+
+    GROUP#         MB STATUS
+---------- ---------- ----------
+         4        200 UNASSIGNED
+         5        200 UNASSIGNED
+         6        200 UNASSIGNED
+         7        200 UNASSIGNED
+
+4 rows selected.
+
+-- 네 개 모두 200MB 로 복구됐다.
+-- group 4 가 ACTIVE 에서 UNASSIGNED 로 바뀐 것은 그 사이에 적용이 진행돼
+-- 해당 SRL 이 아카이브를 마쳤기 때문이다.
+
+--------------------------------------------------------------------------------
+ [6] 실시간 적용 재기동
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2             WHERE process='MRP0';
+
+PROCESS   STATUS       SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         53
+
+1 row selected.
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+-- 두 lag 가 0 이다. SRL 을 지웠다 복구한 사이에 밀렸던 리두까지 모두 따라잡았다.
+
+--------------------------------------------------------------------------------
+ [7] 정리 — 이 실습에서 만난 세 오류
+--------------------------------------------------------------------------------
+
+  오류         상황                              원인                     조치
+  ------------ --------------------------------- ------------------------ ------------------
+  ORA-00261    ACTIVE 인 SRL 삭제 시도           수신(RFS)이 계속 진행 중  다른 그룹부터,
+                                                                          또는 수신을 멈춘다
+  ORA-01153    적용 방식을 겹쳐 실행             이미 다른 복구가 진행 중  먼저 CANCEL
+  ORA-01184    여러 그룹 추가 중 하나가 중복     한 문장이 통째로 실패     그룹별로 나눠 실행
+
+  SRL 작업 안전 수칙
+    ① MRP 를 멈춘다 (그래도 수신은 계속된다는 점을 기억)
+    ② ACTIVE 상태의 SRL 은 UNASSIGNED 가 될 때까지 기다린다
+    ③ 여러 그룹을 한 문장으로 추가하지 않는다
+    ④ 지운 뒤에도 파일은 남으므로 REUSE 를 주거나 파일을 먼저 지운다
+    ⑤ 적용 방식을 바꾸려면 먼저 CANCEL 한다
+    ⑥ 작업 후 두 lag 가 0 으로 수렴하는지 확인해야 완료다
+
+SYS@boston> EXIT
+
+================================================================================
+ 실습 05 종료
+ 원복 확인 : SRL 4개 × 200MB, MRP0 APPLYING_LOG, transport·apply lag 모두 0
+================================================================================

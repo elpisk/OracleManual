@@ -1,0 +1,232 @@
+================================================================================
+ 제11장 실습 06 — 되돌리기
+ 대상   : boston-srv
+ 목표   : Physical Standby 로 되돌리고 다시 ADG 상태로 만든다. 여는 순서를
+          어기면 나오는 ORA-10456 을 재현하고 바로잡는다
+ 소요   : 약 30분
+ 변경   : boston 이 PHYSICAL STANDBY 로 복귀
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] MOUNT 로 내린다
+--------------------------------------------------------------------------------
+
+SYS@boston> SHUTDOWN IMMEDIATE
+
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@boston> STARTUP MOUNT
+
+ORACLE instance started.
+
+Total System Global Area 3221223192 bytes
+Fixed Size                  9139992 bytes
+Variable Size             654311424 bytes
+Database Buffers         2550136832 bytes
+Redo Buffers                7634944 bytes
+Database mounted.
+
+-- ★ 전환할 때는 열린 채로도 됐는데 복귀는 MOUNT 여야 한다.
+--
+--   이유는 하는 일이 다르기 때문이다.
+--   전환은 복원 지점을 만들고 표시를 바꾸는 일이지만
+--   복귀는 데이터 파일을 복원 지점 시점으로 되감는 일이다.
+--   되감으려면 아무도 그 파일을 쓰고 있지 않아야 한다.
+--
+-- ★ SHUTDOWN IMMEDIATE 가 Database closed. 부터 시작하는 것도 확인한다.
+--   READ WRITE 로 열려 있었으므로 닫는 단계가 있다.
+--   10장의 Far Sync 는 열린 적이 없어 ORA-01109 가 나왔던 것과 대비된다.
+
+--------------------------------------------------------------------------------
+ [2] 되돌린다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE CONVERT TO PHYSICAL STANDBY;
+
+Database altered.
+
+SYS@boston> SELECT database_role, open_mode, controlfile_type, flashback_on
+  2            FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE   CONTROLFILE_TYPE  FLASHBACK_ON
+---------------- ----------- ----------------- ------------------
+PHYSICAL STANDBY MOUNTED     STANDBY           NO
+
+1 row selected.
+
+SYS@boston> SELECT count(*) rp FROM v$restore_point;
+
+        RP
+----------
+         0
+
+1 row selected.
+
+-- ★ 세 값이 모두 원래대로 돌아왔다.
+--
+--   항목                전(Snapshot)        후(복귀)
+--   ------------------  ------------------  ----------------
+--   DATABASE_ROLE       SNAPSHOT STANDBY    PHYSICAL STANDBY
+--   CONTROLFILE_TYPE    CURRENT             STANDBY
+--   FLASHBACK_ON        RESTORE POINT ONLY  NO
+--
+-- ★ 복원 지점이 사라졌다.
+--   지우라고 한 적이 없는데 없어졌다.
+--   임무를 마쳤으므로 오라클이 정리한 것이다.
+--
+--   실습 03 에서 "지울 필요가 없다. 되돌릴 때 알아서 쓰고 지운다" 고
+--   했던 것이 여기서 확인된다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — 여는 순서를 어기면
+--------------------------------------------------------------------------------
+
+-- 컨트롤 파일 유형이 바뀌었으므로 한 번 더 내렸다 올린다.
+
+SYS@boston> SHUTDOWN IMMEDIATE
+
+ORA-01109: database not open
+
+Database dismounted.
+ORACLE instance shut down.
+
+-- ★ ORA-01109 는 정상이다. MOUNTED 였으므로 닫을 것이 없다.
+--   10장에서 Far Sync 를 내릴 때 본 것과 같다.
+
+SYS@boston> STARTUP MOUNT
+
+ORACLE instance started.
+Database mounted.
+
+-- 이제 ADG 상태로 만든다. MRP 를 먼저 띄워 본다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION;
+
+Database altered.
+
+SYS@boston> ALTER DATABASE OPEN;
+
+alter database open
+*
+ERROR at line 1:
+ORA-10456: cannot open standby database; media recovery session may be in progress
+
+>>> 원인 파악
+
+-- ★ ORA-10456 은 "미디어 복구 세션이 진행 중일 수 있어 열 수 없다" 는 뜻이다.
+--   MRP 가 이미 돌고 있으면 열 수 없다.
+--
+-- ★ 헷갈리기 쉬운 이유가 있다.
+--   MOUNT 상태에서도 MRP 는 잘 뜬다. 오류 없이 Database altered. 가 나온다.
+--   그런데 그러면 열 수가 없게 된다.
+--
+-- ★ 7장에서 ADG 를 처음 켤 때 배운 순서 그대로다.
+--   열고 나서 MRP 를 띄운다.
+--
+-- ★ ADG 를 쓰지 않는다면 이 오류를 만날 일이 없다.
+--   MOUNT 상태에서 MRP 만 돌려도 복제는 정상이다.
+--   조회가 안 될 뿐이다.
+
+>>> 조치
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> ALTER DATABASE OPEN READ ONLY;
+
+Database altered.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION;
+
+Database altered.
+
+>>> 재확인
+
+SYS@boston> COL name FOR a10
+SYS@boston> SELECT name, database_role, open_mode, flashback_on FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            FLASHBACK_ON
+---------- ---------------- -------------------- ------------------
+CHICAGO    PHYSICAL STANDBY READ ONLY WITH APPLY NO
+
+1 row selected.
+
+-- ★ READ ONLY WITH APPLY 로 돌아왔다.
+--   9장에서 배운 ADG 의 표식이다.
+
+--------------------------------------------------------------------------------
+ [4] PDB 도 연다
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT name, open_mode FROM v$pdbs;
+
+NAME         OPEN_MODE
+------------ ----------
+PDB$SEED     READ ONLY
+CHICAGO_PDB1 MOUNTED
+
+2 rows selected.
+
+-- ★ 또 MOUNTED 다. 실습 04 에서와 같다.
+--   CDB 를 열어도 PDB 는 따라오지 않는다.
+
+SYS@boston> ALTER PLUGGABLE DATABASE chicago_pdb1 OPEN READ ONLY;
+
+Pluggable database altered.
+
+SYS@boston> SELECT name, open_mode FROM v$pdbs;
+
+NAME         OPEN_MODE
+------------ ----------
+PDB$SEED     READ ONLY
+CHICAGO_PDB1 READ ONLY
+
+2 rows selected.
+
+-- ★ 이번에는 OPEN READ ONLY 다.
+--   실습 04 에서는 그냥 OPEN 이었다.
+--   Physical Standby 는 읽기 전용이므로 명령도 그에 맞춰야 한다.
+
+--------------------------------------------------------------------------------
+ [5] 복귀 절차 요약
+--------------------------------------------------------------------------------
+
+-- ★ 순서를 외우기보다 이유로 기억한다.
+--
+--   ① SHUTDOWN IMMEDIATE → STARTUP MOUNT
+--      되감으려면 아무도 파일을 쓰고 있지 않아야 한다
+--
+--   ② ALTER DATABASE CONVERT TO PHYSICAL STANDBY
+--      복원 지점으로 되감고 컨트롤 파일 유형을 되돌린다
+--
+--   ③ SHUTDOWN IMMEDIATE → STARTUP MOUNT
+--      컨트롤 파일 유형이 바뀌었으므로 한 번 더 내렸다 올린다
+--
+--   ④ ALTER DATABASE OPEN READ ONLY
+--      먼저 연다. MRP 가 돌고 있으면 못 연다 (ORA-10456)
+--
+--   ⑤ ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION
+--      열린 뒤에 띄운다. 그래야 READ ONLY WITH APPLY 가 된다
+--
+--   ⑥ ALTER PLUGGABLE DATABASE ... OPEN READ ONLY
+--      CDB 를 열어도 PDB 는 따라오지 않는다
+--
+-- ★ ADG 를 쓰지 않는다면 ④를 건너뛰고 MOUNT 에서 ⑤만 해도 된다.
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① 복귀는 MOUNT 상태에서 한다 (전환은 열린 채로도 됐다)
+--   ② CONVERT TO PHYSICAL STANDBY 로 세 값이 원래대로
+--   ③ 복원 지점이 자동으로 사라진다
+--   ④ 재기동 후 MRP 를 먼저 띄우면 ORA-10456
+--   ⑤ 순서는 열기 → MRP
+--   ⑥ PDB 는 OPEN READ ONLY 로 따로 연다
+--
+-- ★ 다음 실습에서 되돌리기가 정말 되었는지 데이터로 검증한다.

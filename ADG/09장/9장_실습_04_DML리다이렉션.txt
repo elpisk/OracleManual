@@ -1,0 +1,273 @@
+================================================================================
+ 제9장 실습 04 — DML 리다이렉션
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : 읽기 전용 Standby 에서 INSERT·UPDATE·DELETE 가 성공하는 것을 확인하고,
+          실제로 어디서 실행되는지 검증한다
+ 소요   : 약 35분
+ 변경   : PDB 에 테스트 사용자와 테이블을 만들었다가 지운다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 기능의 성격
+--------------------------------------------------------------------------------
+
+  19c 에서 들어온 기능이다.
+  Standby 세션에서 실행한 DML 을 **Standby 가 Primary 로 넘겨 실행시키고,
+  그 결과를 다시 받아** 마치 Standby 에서 성공한 것처럼 보이게 한다.
+
+  ★ 목적은 편의성이다.
+    조회는 Standby 로 보내고 싶은데 애플리케이션이 가끔 작은 갱신을 한다면,
+    그 한두 문장 때문에 접속을 나누는 것이 번거롭다.
+    리다이렉션이 그 간격을 메워 준다.
+
+--------------------------------------------------------------------------------
+ [2] 파라미터 확인
+--------------------------------------------------------------------------------
+
+SYS@boston> SHOW PARAMETER adg_redirect_dml
+
+NAME                  TYPE      VALUE
+--------------------- --------- ------------------------------
+adg_redirect_dml      boolean   FALSE
+
+SYS@boston> SHOW PARAMETER adg_account_info_tracking
+
+NAME                        TYPE     VALUE
+--------------------------- -------- ------------------------------
+adg_account_info_tracking   string   LOCAL
+
+-- ★ 기본값은 FALSE 다. 켜는 방법이 둘이다.
+--
+--   시스템 수준 : ALTER SYSTEM SET ADG_REDIRECT_DML=TRUE;
+--                 그 Standby 의 모든 세션에 적용된다
+--   세션 수준   : ALTER SESSION ENABLE ADG_REDIRECT_DML;
+--                 필요한 세션만 켠다
+--
+-- ★ 실습에서는 세션 수준을 쓴다.
+--   시스템 수준으로 켜면 의도하지 않은 DML 까지 Primary 로 넘어간다.
+--   어떤 세션이 쓰는지 분명할 때만 시스템 수준을 쓰는 편이 안전하다.
+--
+-- ★ ADG_ACCOUNT_INFO_TRACKING 은 다른 기능이다.
+--   Standby 에서 발생한 로그인 실패 횟수 같은 계정 정보를
+--   로컬에만 둘지(LOCAL) Primary 와 공유할지(GLOBAL) 정한다.
+
+--------------------------------------------------------------------------------
+ [3] 준비 — PDB 에 사용자와 테이블
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SESSION SET CONTAINER=chicago_pdb1;
+
+Session altered.
+
+SYS@chicago> CREATE USER adgu IDENTIFIED BY oracle;
+
+User created.
+
+SYS@chicago> GRANT connect, resource, unlimited tablespace TO adgu;
+
+Grant succeeded.
+
+SYS@chicago> CREATE TABLE adgu.t(id NUMBER, tag VARCHAR2(20));
+
+Table created.
+
+SYS@chicago> INSERT INTO adgu.t VALUES(1,'from-primary');
+
+1 row created.
+
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+-- ★ PDB 안에서 만든다.
+--   CDB 루트에서 CREATE USER 를 하면 ORA-65096 이 난다 (4장에서 확인).
+--   공통 사용자는 C## 접두어가 필요하기 때문이다.
+--
+-- ★ 그리고 일반 사용자여야 한다.
+--   SYS 로는 리다이렉션이 동작하지 않는다 (실습 05).
+
+--------------------------------------------------------------------------------
+ [4] Standby PDB 에 접속
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ sqlplus -s adgu/oracle@boston-srv:1521/chicago_pdb1
+
+SQL> SELECT sys_context('userenv','db_unique_name') db,
+  2         sys_context('userenv','database_role') role FROM dual;
+
+DB       ROLE
+-------- ----------------
+boston   PHYSICAL STANDBY
+
+SQL> COL tag FOR a16
+SQL> SELECT id, tag FROM t ORDER BY id;
+
+        ID TAG
+---------- ----------------
+         1 from-primary
+
+-- ★ 접속한 곳이 Standby 임을 세션 컨텍스트로 확인했다.
+--   Primary 에서 넣은 행도 정상적으로 보인다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — 리다이렉션 없이 DML
+--------------------------------------------------------------------------------
+
+SQL> INSERT INTO t VALUES(2,'no-redirect');
+
+insert into t values(2,'no-redirect')
+            *
+ERROR at line 1:
+ORA-16000: database or pluggable database open for read-only access
+
+>>> 원인 파악
+    ADG_REDIRECT_DML 이 FALSE 이므로 일반적인 읽기 전용 규칙이 적용된다.
+    실습 03 에서 본 것과 같은 오류다.
+
+    ★ 이 오류가 나온다는 것은 **리다이렉션이 시도되지도 않았다**는 뜻이다.
+      시도했다가 실패했다면 다른 오류(ORA-16397)가 난다.
+      오류 번호가 처리 경로를 알려 준다.
+
+>>> 조치
+    세션 수준으로 리다이렉션을 켠다.
+
+>>> 재확인
+    [6] 에서 확인한다.
+
+--------------------------------------------------------------------------------
+ [6] 리다이렉션을 켜고 다시
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION ENABLE ADG_REDIRECT_DML;
+
+Session altered.
+
+SQL> INSERT INTO t VALUES(3,'redirected');
+
+1 row created.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> SELECT id, tag FROM t ORDER BY id;
+
+        ID TAG
+---------- ----------------
+         1 from-primary
+         3 redirected
+
+-- ★★ **성공했다.** 읽기 전용 Standby 에서 INSERT 가 됐다.
+--
+--   그리고 방금 넣은 행이 같은 세션에서 조회된다.
+--   Primary 에서 실행되고 커밋된 뒤, 그 리두가 Standby 로 돌아와
+--   적용되었기 때문이다.
+
+--------------------------------------------------------------------------------
+ [7] 실제로 어디서 실행됐는가
+--------------------------------------------------------------------------------
+
+-- Primary 에서 확인한다. 15초 뒤.
+
+SYS@chicago> ALTER SESSION SET CONTAINER=chicago_pdb1;
+SYS@chicago> COL tag FOR a16
+SYS@chicago> SELECT id, tag FROM adgu.t ORDER BY id;
+
+        ID TAG
+---------- ----------------
+         1 from-primary
+         3 redirected
+
+2 rows selected.
+
+-- ★★ Primary 에도 있다.
+--   **실제로 실행된 곳은 Primary 다.**
+--   Standby 는 문장을 넘기고 결과를 받아 돌려주는 역할만 했다.
+--
+-- ★ 2번 행이 없는 것에 주목한다.
+--   [5] 에서 실패한 INSERT 는 어디에도 반영되지 않았다.
+
+--------------------------------------------------------------------------------
+ [8] UPDATE 와 DELETE 도 된다
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ sqlplus -s adgu/oracle@boston-srv:1521/chicago_pdb1
+
+SQL> ALTER SESSION ENABLE ADG_REDIRECT_DML;
+
+Session altered.
+
+SQL> UPDATE t SET tag='updated' WHERE id=1;
+
+1 row updated.
+
+SQL> DELETE FROM t WHERE id=3;
+
+1 row deleted.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> SELECT id, tag FROM t ORDER BY id;
+
+        ID TAG
+---------- ----------------
+         1 updated
+
+-- Primary 에서 확인
+
+SYS@chicago> SELECT id, tag FROM adgu.t ORDER BY id;
+
+        ID TAG
+---------- ----------------
+         1 updated
+
+1 row selected.
+
+-- ★ 세 가지 DML 이 모두 리다이렉트된다.
+--   UPDATE 와 DELETE 는 영향받은 행 수도 정확히 돌려준다.
+
+--------------------------------------------------------------------------------
+ [9] 비용을 이해한다
+--------------------------------------------------------------------------------
+
+  ★ 문장 하나가 **두 번의 네트워크 왕복**을 만든다.
+    Standby 가 Primary 로 문장을 보내고, Primary 가 실행하고,
+    결과를 돌려받는다. 커밋도 마찬가지다.
+
+  ★ 그래서 **대량 DML 에는 쓰지 않는다.**
+    수십만 행을 갱신하는 배치를 리다이렉션으로 돌리면
+    Standby 가 중계기 노릇을 하며 지연만 늘어난다.
+    그런 작업은 처음부터 Primary 에 접속해 실행한다.
+
+  ★ 적합한 용도는 조회 위주 세션에서 발생하는
+    **간헐적이고 작은 갱신**이다.
+      · 마지막 접속 시각 기록
+      · 조회 이력 한 줄 남기기
+      · 사용자 설정 저장
+
+  ★ 트랜잭션의 소유자도 유의한다.
+    리다이렉트된 DML 의 트랜잭션은 **Primary 에 존재한다.**
+    Standby 세션이 비정상 종료되면 Primary 쪽 트랜잭션도 정리되지만,
+    그 사이 Primary 에 잠금이 남을 수 있다.
+    **긴 트랜잭션을 리다이렉션으로 열어 두지 않는다.**
+
+--------------------------------------------------------------------------------
+ [10] 정리
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SESSION SET CONTAINER=chicago_pdb1;
+SYS@chicago> DROP TABLE adgu.t PURGE;
+SYS@chicago> DROP USER adgu CASCADE;
+
+  · 기본값은 FALSE. 세션 수준으로 켜는 편이 안전하다
+  · 일반 사용자로 INSERT·UPDATE·DELETE 가 모두 성공한다
+  · 실제 실행은 Primary 에서 일어나고 결과가 리두로 돌아온다
+  · 리다이렉션 없이 시도하면 ORA-16000 — 시도조차 되지 않았다는 뜻
+  · 문장마다 네트워크 왕복이 생긴다. 작고 간헐적인 갱신에만 쓴다
+  · 트랜잭션은 Primary 에 있다. 길게 열어 두지 않는다
+
+================================================================================
+ 실습 04 종료 — 테스트 사용자 제거 완료.
+================================================================================

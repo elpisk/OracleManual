@@ -1,0 +1,241 @@
+================================================================================
+ 제1장 실습 02 — Data Guard 프로세스 식별
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : V$MANAGED_STANDBY 와 V$DATAGUARD_PROCESS 로 양쪽 프로세스를 확인하고,
+          CLIENT_ROLE 로 Primary 와 Standby 의 프로세스 짝을 맞춘다
+ 소요   : 약 25분
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] Primary 측 — 리두를 내보내는 프로세스
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a8
+SYS@chicago> COL role FOR a26
+SYS@chicago> COL action FOR a10
+SYS@chicago> SELECT name, pid, role, action, sequence#
+  2              FROM v$dataguard_process ORDER BY name;
+
+NAME     PID                       ROLE                       ACTION      SEQUENCE#
+-------- ------------------------- -------------------------- ---------- ----------
+ARC0     2511                      archive local              IDLE                0
+ARC1     2515                      archive redo               IDLE                0
+ARC2     2517                      archive redo               IDLE                0
+ARC3     2519                      archive redo               IDLE                0
+LGWR     2464                      log writer                 IDLE                0
+TMON     2496                      redo transport monitor     IDLE                0
+TT00     2509                      gap manager                IDLE               19
+TT01     2513                      redo transport timer       IDLE                0
+TT02     2521                      async ORL multi            OPENING            19
+TT03     2523                      heartbeat redo informer    IDLE                0
+TT04     2525                      async ORL single           WRITING            19
+
+11 rows selected.
+
+-- 읽는 법
+--   ARC0 'archive local'  : 로컬 아카이브 전담. 온라인 리두를 FRA 에 아카이브한다.
+--   ARC1~3 'archive redo' : 원격 전송에 동원되는 아카이버. 기본 4개(ARC0~ARC3)다.
+--   TT04 'async ORL single' ACTION=WRITING
+--        온라인 리두 로그(ORL)에서 읽어 비동기로 보내는 프로세스.
+--        지금 시퀀스 19 의 리두를 boston 으로 쓰고 있다는 뜻이다.
+--   TT00 'gap manager'     : 갭 탐지 담당. 끊겼다 붙었을 때 빠진 로그를 찾아낸다.
+--   TT03 'heartbeat redo informer' : 주기 신호로 연결 생존을 확인한다.
+--   TMON 'redo transport monitor'  : 전송 전반을 감시한다.
+--
+-- 이 구성은 ASYNC 전송이라 NSSn(Network Server SYNC)이 보이지 않는다.
+-- SYNC 로 바꾸면 NSSn 이 나타난다(2장에서 확인한다).
+
+-- 예전부터 쓰던 V$MANAGED_STANDBY 로도 볼 수 있지만 분류가 굵다.
+
+SYS@chicago> SELECT process, pid, status, sequence#
+  2              FROM v$managed_standby ORDER BY process;
+
+PROCESS   PID                        STATUS       SEQUENCE#
+--------- -------------------------- ------------ ----------
+ARCH      2517                       CONNECTED             0
+ARCH      2519                       CLOSING              18
+ARCH      2515                       OPENING              18
+ARCH      2511                       CONNECTED             0
+DGRD      2513                       ALLOCATED             0
+DGRD      2523                       ALLOCATED             0
+DGRD      2509                       ALLOCATED             0
+LNS       2525                       WRITING              19
+LNS       2521                       OPENING              19
+
+9 rows selected.
+
+-- 같은 PID 2525 가 V$DATAGUARD_PROCESS 에서는 TT04 'async ORL single' 인데
+-- 여기서는 LNS 로 뭉뚱그려진다. 19c 에서는 V$DATAGUARD_PROCESS 를 쓴다.
+
+--------------------------------------------------------------------------------
+ [2] Standby 측 — 리두를 받아 적용하는 프로세스
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT process, pid, status, sequence#, block#
+  2             FROM v$managed_standby ORDER BY process;
+
+PROCESS   PID                        STATUS       SEQUENCE#     BLOCK#
+--------- -------------------------- ------------ ---------- ----------
+ARCH      2586                       CONNECTED             0          0
+ARCH      2589                       CONNECTED             0          0
+ARCH      2584                       CONNECTED             0          0
+ARCH      2580                       CLOSING              18          1
+DGRD      2582                       ALLOCATED             0          0
+DGRD      2578                       ALLOCATED             0          0
+MRP0      2624                       APPLYING_LOG         19       3881
+RFS       2639                       IDLE                  0          0
+RFS       2637                       IDLE                 19       3866
+RFS       2635                       IDLE                  0          0
+
+10 rows selected.
+
+-- 여기서 가장 중요한 두 줄을 나란히 놓고 본다.
+--   RFS  시퀀스 19 / 블록 3866  ← 지금 받고 있는 위치
+--   MRP0 시퀀스 19 / 블록 3881  ← 지금 적용한 위치
+-- 두 숫자가 붙어 있다는 것이 실시간 적용(real-time apply)이 동작 중이라는 증거다.
+-- 적용이 밀리면 MRP0 의 시퀀스가 RFS 보다 뒤처진다(7장에서 재현한다).
+--
+-- RFS 가 세 개인 이유: Primary 의 전송 프로세스마다 짝이 하나씩 생기기 때문이다.
+
+SYS@boston> COL name FOR a8
+SYS@boston> COL role FOR a26
+SYS@boston> COL client_role FOR a18
+SYS@boston> SELECT name, pid, role, action, client_role, sequence#
+  2             FROM v$dataguard_process ORDER BY name;
+
+NAME     PID                       ROLE                       ACTION      CLIENT_ROLE       SEQUENCE#
+-------- ------------------------- -------------------------- ---------- ---------------- ----------
+ARC0     2580                      archive local              IDLE       none                      0
+ARC1     2584                      archive redo               IDLE       none                      0
+ARC2     2586                      archive redo               IDLE       none                      0
+ARC3     2589                      archive redo               IDLE       none                      0
+LGWR     2534                      log writer                 IDLE       none                      0
+MRP0     2624                      managed recovery           IDLE       none                      0
+PR00     2646                      recovery logmerger         APPLYING_L none                     19
+                                                              OG
+PR01     2648                      recovery apply slave       IDLE       none                      0
+PR02     2650                      recovery apply slave       IDLE       none                      0
+PR03     2652                      recovery apply slave       IDLE       none                      0
+PR04     2654                      recovery apply slave       IDLE       none                      0
+TMON     2566                      redo transport monitor     IDLE       none                      0
+TT00     2578                      gap manager                IDLE       none                      0
+TT01     2582                      redo transport timer       IDLE       none                      0
+rfs      2637                      RFS async                  IDLE       async ORL single         19
+rfs      2635                      RFS ping                   IDLE       gap manager              19
+rfs      2639                      RFS archive                IDLE       archive gap               0
+
+17 rows selected.
+
+-- CLIENT_ROLE 열이 이 실습의 핵심이다.
+-- Standby 의 각 rfs 가 Primary 의 어느 프로세스와 짝인지 알려 준다.
+--
+--   boston : rfs 2637 'RFS async'   ← CLIENT_ROLE 'async ORL single'
+--   chicago: TT04 2525 'async ORL single' ACTION=WRITING
+--   → 이 둘이 리두 본류를 나르는 한 쌍이다.
+--
+--   boston : rfs 2635 'RFS ping'    ← CLIENT_ROLE 'gap manager'
+--   chicago: TT00 2509 'gap manager'
+--   → 갭 탐지용 신호 경로다.
+--
+--   boston : rfs 2639 'RFS archive' ← CLIENT_ROLE 'archive gap'
+--   → 갭이 발견됐을 때 아카이브 로그를 받는 경로. 지금은 시퀀스 0(대기 중).
+--
+-- MRP0 자체는 IDLE 이고 실제 적용은 PR00 이 하고 있다는 점도 눈여겨본다.
+-- MRP0 은 조율자이고, PR00 'recovery logmerger' 가 리두를 병합해 읽으며
+-- PR01~PR04 'recovery apply slave' 가 병렬 적용을 담당한다.
+
+--------------------------------------------------------------------------------
+ [3] OS 수준에서 같은 구조 확인
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ ps -ef | grep -E 'ora_(mrp|pr0)' | grep -v grep
+oracle    2624     1  0 18:20 ?        00:00:00 ora_mrp0_boston
+oracle    2646     1  0 18:20 ?        00:00:00 ora_pr00_boston
+oracle    2648     1  0 18:20 ?        00:00:00 ora_pr01_boston
+oracle    2650     1  0 18:20 ?        00:00:00 ora_pr02_boston
+oracle    2652     1  0 18:20 ?        00:00:00 ora_pr03_boston
+oracle    2654     1  0 18:20 ?        00:00:00 ora_pr04_boston
+
+-- V$ 뷰의 PID 열이 OS 프로세스 ID 와 그대로 대응한다(2624, 2646, ...).
+-- MRP 가 멈췄는지 확인할 때 ps 로도 빠르게 볼 수 있다는 뜻이다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — Primary 에서 MRP 를 찾는다
+--------------------------------------------------------------------------------
+
+-- 실무에서 "MRP 가 안 보인다" 는 신고가 자주 들어온다. 재현해 본다.
+
+SYS@chicago> SELECT process, status FROM v$managed_standby WHERE process='MRP0';
+
+no rows selected
+
+-- 놀라서 MRP 를 다시 띄우려 하면 이렇게 된다.
+
+SYS@chicago> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION;
+ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION
+*
+ERROR at line 1:
+ORA-01665: control file is not a standby control file
+
+
+>>> 원인 파악
+    MRP 는 Standby 에만 존재하는 프로세스다. Primary 에서 조회하면
+    'no rows selected' 가 나오는 것이 정상이며 장애가 아니다.
+    ORA-01665 는 그 상태에서 억지로 복구를 시작하려다 난 2차 오류이며,
+    "이 데이터베이스의 컨트롤 파일은 standby 컨트롤 파일이 아니다" 라는 뜻이다.
+    실습 01 에서 확인한 CONTROLFILE_TYPE 값(Primary=CURRENT, Standby=STANDBY)이
+    여기서 그대로 걸린 것이다. 오라클이 노드를 잘못 짚었다고 알려 주는 셈이다.
+    진단의 첫 질문은 언제나 "지금 어느 노드에 접속해 있는가" 여야 한다.
+
+>>> 조치
+    접속 노드를 확인하고 Standby 에서 다시 조회한다.
+
+SYS@chicago> SELECT database_role FROM v$database;
+
+DATABASE_ROLE
+----------------
+PRIMARY
+
+1 row selected.
+
+-- PRIMARY 다. MRP 를 찾을 곳이 아니다. boston 으로 옮긴다.
+
+>>> 재확인
+
+SYS@boston> SELECT database_role FROM v$database;
+
+DATABASE_ROLE
+----------------
+PHYSICAL STANDBY
+
+1 row selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby WHERE process='MRP0';
+
+PROCESS   STATUS       SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         19
+
+1 row selected.
+
+-- 정상 동작 중이었다. 문제는 조회한 노드였다.
+
+--------------------------------------------------------------------------------
+ [5] 정리 — 어느 노드에서 무엇을 보는가
+--------------------------------------------------------------------------------
+
+  보고 싶은 것                          조회할 노드    뷰
+  ------------------------------------- -------------- -------------------------
+  리두를 보내고 있는가(전송)            Primary        V$DATAGUARD_PROCESS
+  전송 목적지 상태·오류                 Primary        V$ARCHIVE_DEST_STATUS
+  리두를 받고 있는가(수신)              Standby        V$MANAGED_STANDBY (RFS)
+  리두를 적용하고 있는가(적용)          Standby        V$MANAGED_STANDBY (MRP0)
+  전송·적용 지연                        Standby        V$DATAGUARD_STATS
+  구성 전체 모양                        아무 쪽이나    V$DATAGUARD_CONFIG
+
+SYS@chicago> EXIT
+SYS@boston> EXIT
+
+================================================================================
+ 실습 02 종료 — 환경 변경 없음. 조회와 실패한 명령뿐이다.
+================================================================================

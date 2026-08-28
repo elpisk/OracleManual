@@ -1,0 +1,313 @@
+================================================================================
+ 제15장 실습 06 — 상시 점검 스크립트
+ 대상   : chicago-srv, boston-srv
+ 목표   : 이 장에서 본 지표를 한 번에 수집하고 판정 규칙을 적용한다.
+          역할별로 다른 스크립트가 필요한 이유를 확인한다
+ 소요   : 약 30분
+ 변경   : 없음 (전부 조회)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 설계 원칙
+--------------------------------------------------------------------------------
+
+-- ★ ① 역할에 따라 다른 것을 본다.
+--      V$DATAGUARD_STATS 는 Primary 에서 no rows 다 (14장 실측).
+--      V$MANAGED_STANDBY 는 Standby 에서만 의미가 있다.
+--
+-- ★ ② 판정 가능한 숫자로 만든다.
+--      사람이 표를 읽는 것이 아니라 스크립트가 비교해야 한다.
+--      count(*) 로 뽑는다.
+--
+-- ★ ③ 정상값을 미리 정한다.
+--      기댓값을 알아야 이상을 판정할 수 있다.
+--
+-- ★ ④ 시간 조건을 넣는다.
+--      V$DATAGUARD_STATUS 는 과거 기록을 그대로 들고 있다.
+--
+-- ★ ⑤ 조회 대상을 최소로 한다.
+--      자주 돌리므로 무거우면 안 된다.
+
+--------------------------------------------------------------------------------
+ [2] Primary 쪽 스크립트
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT database_role||' / '||open_mode||' / '||protection_mode info
+  2            FROM v$database;
+
+INFO
+--------------------------------------------------------------
+PRIMARY / READ WRITE / MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@chicago> COL error FOR a30
+SYS@chicago> COL destination FOR a14
+SYS@chicago> SELECT dest_id, destination, status, error
+  2            FROM v$archive_dest_status WHERE dest_id IN (1,2);
+
+   DEST_ID DESTINATION  STATUS    ERROR
+---------- ------------ --------- --------
+         1              VALID
+         2 boston       VALID
+
+2 rows selected.
+
+SYS@chicago> SELECT count(*) log_abnormal FROM v$logfile WHERE status IS NOT NULL;
+SYS@chicago> SELECT count(*) dg_err FROM v$dataguard_status
+  2            WHERE error_code<>0 AND timestamp>sysdate-1/24;
+SYS@chicago> SELECT max(sequence#) cur_seq FROM v$log WHERE status='CURRENT';
+
+LOG_ABNORMAL      DG_ERR     CUR_SEQ
+------------  ----------  ----------
+           0           3          83
+
+-- ★ 기댓값과 대조한다.
+--
+--   INFO           PRIMARY / READ WRITE     역할이 바뀌었으면 이상
+--   STATUS         두 목적지 모두 VALID     ERROR 면 ERROR 열을 읽는다
+--   LOG_ABNORMAL   0                        로그 파일 이상
+--   DG_ERR         0                        최근 1시간 오류
+--   CUR_SEQ        (Standby 와 비교)         차이가 크면 전송 지연
+--
+-- ★ DG_ERR 가 3 으로 나왔다.
+--   실습 03 에서 리스너를 내렸던 흔적이며 ORA-12541 세 건이다.
+--   시간 조건이 있으므로 한 시간 뒤 자동으로 0 이 된다.
+--
+-- ★ 이 값이 "지금 봐야 할 일이 있는가" 를 숫자 하나로 답한다.
+--   0 이 아니면 그때 상세 조회로 내려간다.
+
+--------------------------------------------------------------------------------
+ [3] Standby 쪽 스크립트
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT database_role||' / '||open_mode info FROM v$database;
+
+INFO
+---------------------------------------
+PHYSICAL STANDBY / READ ONLY WITH APPLY
+
+1 row selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS         SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         83
+
+1 row selected.
+
+SYS@boston> COL recovery_mode FOR a26
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- --------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+
+1 row selected.
+
+SYS@boston> COL name FOR a24
+SYS@boston> COL value FOR a22
+SYS@boston> SELECT name, value FROM v$dataguard_stats;
+
+NAME                     VALUE
+------------------------ ----------------------
+transport lag            +00 00:00:00
+apply lag                +00 00:00:00
+apply finish time        +00 00:00:00.000
+estimated startup time   11
+
+4 rows selected.
+
+SYS@boston> SELECT count(*) srl_active FROM v$standby_log WHERE status='ACTIVE';
+SYS@boston> SELECT count(*) gap_cnt FROM v$archive_gap;
+SYS@boston> SELECT count(*) dg_err FROM v$dataguard_status
+  2            WHERE error_code<>0 AND timestamp>sysdate-1/24;
+
+SRL_ACTIVE     GAP_CNT      DG_ERR
+----------  ----------  ----------
+         1           0           0
+
+-- ★ 기댓값과 대조한다.
+--
+--   MRP0            행이 있고 APPLYING_LOG   없으면 적용 정지
+--   SEQUENCE#       Primary 의 CUR_SEQ 와 같음  뒤지면 밀린 것
+--   RECOVERY_MODE   MANAGED REAL TIME APPLY  실시간이 아니다
+--   SRL_ACTIVE      1                        0 이면 리두가 안 온다
+--   GAP_CNT         0                        갭이 있다
+--   DG_ERR          0                        최근 오류
+--
+-- ★ SEQUENCE# 83 이 Primary 의 CUR_SEQ 83 과 같다. 정상이다.
+--
+-- ★ boston 의 DG_ERR 는 0 이다.
+--   실습 03 의 오류는 Primary 쪽에만 기록됐다.
+--   보내는 쪽이 실패를 알고 받는 쪽은 모르기 때문이다.
+--   양쪽을 다 봐야 하는 이유가 여기 있다.
+
+--------------------------------------------------------------------------------
+ [4] SRL_ACTIVE 가 핵심이다
+--------------------------------------------------------------------------------
+
+-- ★ 이 장에서 세 번 확인했다.
+--
+--   14장 속성으로 껐을 때      두 지연 0
+--   15장 리스너를 내렸을 때    두 지연 0
+--   두 경우 모두 지연으로는 못 잡는다
+--
+-- ★ 그때 SRL_ACTIVE 는 어떻게 되는가.
+--   리두가 오지 않으므로 ACTIVE 인 SRL 이 없어진다. 0 이 된다.
+--
+-- ★ 그러므로 지표를 두 종류로 나눈다.
+--
+--   주 지표 (흐름이 있는가)
+--     SRL_ACTIVE 가 1 인가
+--     MRP0 가 있는가
+--     두 SEQUENCE# 가 같은가
+--     목적지 STATUS 가 VALID 인가
+--
+--   보조 지표 (느린가)
+--     transport lag
+--     apply lag
+--
+-- ★ 두 종류를 함께 두면 "끊겼다" 와 "느리다" 를 구별할 수 있다.
+--   주 지표가 정상인데 보조 지표가 나쁘면 느린 것이고,
+--   주 지표가 무너지면 끊긴 것이다.
+
+--------------------------------------------------------------------------------
+ [5] 판정 규칙
+--------------------------------------------------------------------------------
+
+-- ★ 수집한 값으로 상태를 결정한다.
+--
+--   판정    조건
+--   ------  --------------------------------------------------
+--   정상    모든 기댓값과 일치
+--   주의    지연이 임계값을 넘음 (SRL_ACTIVE=1 인 상태에서)
+--   경고    DG_ERR > 0 또는 SEQUENCE# 차이가 2 이상
+--   심각    SRL_ACTIVE=0 또는 MRP0 없음 또는 STATUS='ERROR'
+--
+-- ★ 층을 나누는 이유가 있다.
+--   모든 이상을 같은 무게로 알리면 아무도 보지 않는다.
+--   14장에서 임계값을 다루며 확인한 것과 같은 원칙이다.
+--
+--   심각 → 즉시 사람을 부른다
+--   경고 → 근무 시간에 확인한다
+--   주의 → 추세만 기록한다
+--
+-- ★ 지금 값으로 판정하면
+--
+--   chicago  DG_ERR=3 이므로 "경고"
+--   boston   전부 기댓값과 일치하므로 "정상"
+--
+--   실습 03 의 흔적이 아직 한 시간 안에 있기 때문이다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — 스크립트를 반대쪽에 돌리면
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT name, value FROM v$dataguard_stats;
+
+no rows selected
+
+SYS@chicago> SELECT count(*) srl_active FROM v$standby_log WHERE status='ACTIVE';
+
+SRL_ACTIVE
+----------
+         0
+
+>>> 원인 파악
+
+-- ★ 오류는 나지 않았다. 그것이 더 위험하다.
+--
+-- ★ 두 결과가 모두 "이상" 처럼 보인다.
+--
+--   V$DATAGUARD_STATS 가 비었다  → 조회 실패로 오인
+--   SRL_ACTIVE 가 0 이다         → 심각으로 오판
+--
+-- ★ 그러나 둘 다 Primary 에서는 정상이다.
+--   지연은 받는 쪽의 개념이고
+--   Primary 의 SRL 은 실습 01 에서 본 대로 전부 UNASSIGNED 다.
+--
+-- ★ 같은 스크립트를 양쪽에 돌리면 Primary 에서 "심각" 이 뜬다.
+--   상시 오경보가 되고, 결국 아무도 보지 않게 된다.
+
+>>> 조치
+
+-- ★ 역할을 먼저 판정하고 분기한다.
+
+SYS@chicago> SELECT database_role FROM v$database;
+
+DATABASE_ROLE
+----------------
+PRIMARY
+
+1 row selected.
+
+-- 스크립트 골격
+--   ① V$DATABASE 로 역할을 판정한다
+--   ② PRIMARY 면 [2] 의 묶음을, PHYSICAL STANDBY 면 [3] 의 묶음을 실행한다
+--   ③ 결과가 비는 것과 오류를 구별해 처리한다
+
+>>> 재확인
+
+SYS@boston> SELECT count(*) srl_active FROM v$standby_log WHERE status='ACTIVE';
+
+SRL_ACTIVE
+----------
+         1
+
+1 row selected.
+
+-- ★ 올바른 쪽에서 조회하면 1 이다.
+
+--------------------------------------------------------------------------------
+ [7] 어디까지 자동화할 것인가
+--------------------------------------------------------------------------------
+
+-- ★ 자동화하기 쉬운 것
+--   이 실습의 SQL 은 전부 숫자나 짧은 문자열을 낸다.
+--   5분마다 돌리고 판정 규칙을 적용하면 된다.
+--
+-- ★ 자동화하기 어려운 것
+--   14장의 VALIDATE DATABASE 다.
+--   출력이 문장과 표라 파싱이 번거로워 자주 빠진다.
+--
+-- ★ 타협안
+--   dgmgrl ... | grep 'Ready for Switchover'
+--   한 줄이면 14장에서 실측한 함정을 잡을 수 있다.
+--
+-- ★ 세 층으로 짠다.
+--   5분마다  SQL 점검
+--   하루 1회 VALIDATE
+--   주 1회   사람이 전체 출력을 읽는다
+--
+-- ★ 기록의 가치
+--   값을 기록하면 기준선이 생긴다.
+--   apply finish time 의 30일 최댓값을 알면 RTO 를 숫자로 말할 수 있다.
+--   점검의 목적은 이상을 잡는 것만이 아니라 정상을 아는 것이다.
+--
+-- ★ 하지 말 것
+--   점검 계정에 과한 권한을 주는 것이다.
+--   개별 V_$ 뷰 권한으로 충분하며 SYSDBA 상시 접속은 위험하다.
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① 역할별로 다른 스크립트가 필요하다
+--   ② count(*) 로 판정 가능한 숫자를 만든다
+--   ③ V$DATAGUARD_STATUS 에는 시간 조건을 넣는다
+--   ④ DG_ERR 하나로 "봐야 할 일이 있는가" 에 답한다
+--   ⑤ 두 SEQUENCE# 를 비교하는 것이 지연보다 확실하다
+--   ⑥ SRL_ACTIVE 가 점검표의 핵심 — 지연이 못 잡는 것을 잡는다
+--   ⑦ 지표를 주 지표와 보조 지표로 나눈다
+--   ⑧ 판정을 정상·주의·경고·심각 네 층으로 나눈다
+--   ⑨ Primary 에서 Standby 스크립트를 돌리면 오류 없이 오판한다
+--   ⑩ 오류가 나지 않는 잘못이 더 위험하다
+--
+-- ★ 15장의 실습이 끝났다.
+--   16장에서 실제로 역할을 바꾼다.

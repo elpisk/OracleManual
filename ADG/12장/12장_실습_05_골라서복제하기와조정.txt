@@ -1,0 +1,319 @@
+================================================================================
+ 제12장 실습 05 — 골라서 복제하기와 조정
+ 대상   : boston-srv, chicago-srv
+ 목표   : SKIP 규칙으로 일부를 제외하고, 지원되지 않는 타입이 어떻게 처리되는지
+          확인한다. SQL Apply 파라미터를 바꾸고 되돌린다
+ 소요   : 약 35분
+ 변경   : SKIP 규칙 2개 추가, 파라미터 임시 변경 후 원복
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] Standby 에만 있는 객체를 만든다
+--------------------------------------------------------------------------------
+
+-- Logical Standby 의 장점 중 하나가 자기 객체를 둘 수 있다는 것이다.
+-- 보고서 전용 스키마를 만든다.
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> CREATE USER rpt IDENTIFIED BY rpt QUOTA UNLIMITED ON users;
+SYS@boston> GRANT create session, create table TO rpt;
+SYS@boston> CREATE TABLE rpt.own(id NUMBER, note VARCHAR2(20));
+SYS@boston> INSERT INTO rpt.own VALUES(1,'standby-only');
+SYS@boston> COMMIT;
+
+Commit complete.
+
+SYS@boston> SELECT id, note FROM rpt.own;
+
+        ID NOTE
+---------- --------------------
+         1 standby-only
+
+1 row selected.
+
+-- ★ Primary 에는 없는 스키마와 테이블이다.
+--   Physical Standby 에서는 불가능한 일이다.
+
+SYS@boston> CREATE INDEX lgu.t1_tag_ix ON lgu.t1(tag);
+
+Index created.
+
+SYS@boston> COL index_name FOR a16
+SYS@boston> SELECT index_name, table_name, status FROM all_indexes
+  2            WHERE owner='LGU' ORDER BY 1;
+
+INDEX_NAME       TABLE_NAME STATUS
+---------------- ---------- --------
+SYS_C007553      T1         VALID
+T1_TAG_IX        T1         VALID
+
+2 rows selected.
+
+-- ★ 복제 대상 테이블에 Standby 전용 인덱스를 추가했다.
+--   SYS_C007553 은 기본 키 인덱스로 Primary 에서 복제된 것이고
+--   T1_TAG_IX 는 여기서만 만든 것이다.
+--
+-- ★ 이것이 Logical Standby 의 가장 분명한 용도다.
+--   운영 스키마를 건드리지 않고 보고서 조회 성능을 높인다.
+--
+-- ★ 주의 — SYS 로 실행했기 때문에 가능했다.
+--   가드가 ALL 이므로 일반 사용자는 못 한다. 실습 06 에서 확인한다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 적용 중에 SKIP 규칙을 넣으면
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER SESSION SET container=cdb$root;
+SYS@boston> EXEC dbms_logstdby.skip(stmt=>'SCHEMA_DDL', -
+  2            schema_name=>'RPT', object_name=>'%');
+
+PL/SQL procedure successfully completed.
+
+>>> 원인 파악
+
+-- ★ 오류가 나지 않았다. 그런데 이것이 함정이다.
+--
+--   명령은 성공했지만 적용이 돌고 있는 상태에서는 반영되지 않는다.
+--   "성공했다" 와 "반영됐다" 가 다르다.
+--
+-- ★ 10장의 계단식 목적지에서 본 것과 같은 종류의 문제다.
+--   설정이 받아들여졌다고 해서 의도대로 동작한다고 단정할 수 없다.
+
+>>> 조치
+
+SYS@boston> ALTER DATABASE STOP LOGICAL STANDBY APPLY;
+
+Database altered.
+
+SYS@boston> EXEC dbms_logstdby.skip(stmt=>'SCHEMA_DDL', schema_name=>'RPT', object_name=>'%');
+SYS@boston> EXEC dbms_logstdby.skip(stmt=>'DML', schema_name=>'RPT', object_name=>'%');
+
+PL/SQL procedure successfully completed.
+
+>>> 재확인
+
+SYS@boston> COL statement_opt FOR a16
+SYS@boston> COL owner FOR a10
+SYS@boston> SELECT error, statement_opt, owner, name FROM dba_logstdby_skip
+  2            WHERE owner='RPT';
+
+ERROR STATEMENT_OPT    OWNER      NAME
+----- ---------------- ---------- ------
+N     SCHEMA_DDL       RPT        %
+N     DML              RPT        %
+
+2 rows selected.
+
+SYS@boston> SELECT count(*) total FROM dba_logstdby_skip;
+
+     TOTAL
+----------
+        37
+
+1 row selected.
+
+-- ★ 기본 35개에 둘이 더해져 37개가 됐다.
+--
+-- ★ STATEMENT_OPT 로 대상을 정한다.
+--
+--   DML               데이터 변경
+--   SCHEMA_DDL        스키마 객체의 DDL
+--   INTERNAL SCHEMA   내부 스키마 전체 (기본 규칙)
+--   DBLINK, SEQUENCE  개별 객체 종류
+--
+-- ★ 규칙을 뺄 때는 DBMS_LOGSTDBY.UNSKIP 을 같은 형태로 쓴다.
+--
+-- ★ 왜 유용한가.
+--   Primary 에 변경량이 많은 임시 작업 스키마가 있다면
+--   그것을 빼는 것만으로 Logical Standby 의 부하가 크게 준다.
+--   Physical Standby 에는 이런 선택지가 없다.
+
+SYS@boston> ALTER DATABASE START LOGICAL STANDBY APPLY IMMEDIATE;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+ [3] 지원되지 않는 타입은 조용히 빠진다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SESSION SET container=chicago_pdb1;
+SYS@chicago> CREATE TABLE lgu.t_bad(id NUMBER PRIMARY KEY, r ROWID);
+SYS@chicago> INSERT INTO lgu.t_bad VALUES(1, NULL);
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+SYS@chicago> COL table_name FOR a10
+SYS@chicago> COL column_name FOR a12
+SYS@chicago> COL data_type FOR a12
+SYS@chicago> SELECT owner, table_name, column_name, data_type
+  2            FROM dba_logstdby_unsupported WHERE owner='LGU';
+
+OWNER  TABLE_NAME COLUMN_NAME  DATA_TYPE
+------ ---------- ------------ ---------
+LGU    T_BAD      R            ROWID
+
+1 row selected.
+
+-- ★ 실습 01 에서 0행이던 뷰가 채워졌다.
+--   ROWID 컬럼 때문에 이 테이블이 목록에 올랐다.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+-- 50초 뒤
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> SELECT count(*) FROM lgu.t_bad;
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+-- ★ 테이블은 만들어졌는데 데이터가 없다.
+--   DDL 은 복제되고 DML 은 건너뛴 것이다.
+--
+-- ★ 이 동작이 위험한 이유가 여기 있다.
+--
+--   테이블이 없으면          → ORA-00942 로 금방 알아챈다
+--   테이블은 있는데 비어 있으면 → 0행. 오류가 아니다. 정상으로 착각한다
+--
+-- ★ 그래서 도입 전에 DBA_LOGSTDBY_UNSUPPORTED 를 반드시 확인해야 한다.
+--   기록을 남기고 싶다면 파라미터를 켠다.
+
+SYS@boston> ALTER SESSION SET container=cdb$root;
+SYS@boston> EXEC dbms_logstdby.apply_set('RECORD_UNSUPPORTED_OPERATIONS', 'TRUE');
+
+-- ★ 기본값이 FALSE 이므로 아무것도 남지 않는다.
+--   TRUE 로 두면 건너뛴 작업이 DBA_LOGSTDBY_EVENTS 에 기록된다.
+
+--------------------------------------------------------------------------------
+ [4] SQL Apply 파라미터
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a30
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value, unit FROM dba_logstdby_parameters ORDER BY name;
+
+NAME                           VALUE               UNIT
+------------------------------ ------------------- --------
+ALLOW_TRANSFORMATION           FALSE
+APPLY_SERVERS                  5
+EVENT_LOG_DEST                 DEST_EVENTS_TABLE
+LOG_AUTO_DELETE                TRUE
+LOG_AUTO_DEL_RETENTION_TARGET  1440                MINUTE
+MAX_EVENTS_RECORDED            10000
+MAX_SERVERS                    9
+MAX_SGA                        100                 MEGABYTE
+PREPARE_SERVERS                1
+PRESERVE_COMMIT_ORDER          TRUE
+RECORD_APPLIED_DDL             FALSE
+RECORD_APPLIED_PLSQL           FALSE
+RECORD_SKIP_DDL                TRUE
+RECORD_SKIP_ERRORS             TRUE
+RECORD_SKIP_PLSQL              FALSE
+RECORD_UNSUPPORTED_OPERATIONS  FALSE
+
+16 rows selected.
+
+-- ★ 자주 손대는 것은 셋이다.
+--
+--   MAX_SERVERS    9      SQL Apply 가 쓸 프로세스 총수
+--   APPLY_SERVERS  5      그중 실제로 SQL 을 실행하는 수
+--   MAX_SGA        100MB  LCR 캐시 크기
+
+SYS@boston> ALTER DATABASE STOP LOGICAL STANDBY APPLY;
+SYS@boston> EXEC dbms_logstdby.apply_set('MAX_SERVERS', 12);
+SYS@boston> EXEC dbms_logstdby.apply_set('APPLY_SERVERS', 6);
+
+PL/SQL procedure successfully completed.
+
+SYS@boston> SELECT name, value FROM dba_logstdby_parameters
+  2            WHERE name IN ('MAX_SERVERS','APPLY_SERVERS');
+
+NAME            VALUE
+--------------- -----
+MAX_SERVERS     12
+APPLY_SERVERS   6
+
+2 rows selected.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — 되돌리는 순서
+--------------------------------------------------------------------------------
+
+SYS@boston> EXEC dbms_logstdby.apply_unset('MAX_SERVERS');
+
+BEGIN dbms_logstdby.apply_unset('MAX_SERVERS'); END;
+
+*
+ERROR at line 1:
+ORA-16081: insufficient number of processes for APPLY
+ORA-06512: at "SYS.DBMS_LOGSTDBY", line 153
+ORA-06512: at "SYS.DBMS_INTERNAL_LOGSTDBY", line 1977
+ORA-06512: at "SYS.DBMS_LOGSTDBY", line 136
+ORA-06512: at line 1
+
+>>> 원인 파악
+
+-- ★ MAX_SERVERS 를 기본값 9 로 되돌리려는데 APPLY_SERVERS 가 아직 6이다.
+--
+--   적용 서버 6개
+--   + READER 1 + PREPARER 1 + BUILDER 1 + ANALYZER 1 + COORDINATOR 1
+--   = 11 > 9
+--
+--   그릇이 내용물보다 작아지므로 거부한다.
+--
+-- ★ 규칙 — 줄일 때는 안쪽부터, 늘릴 때는 바깥쪽부터.
+--
+--   MAX_SERVERS 가 그릇이고 APPLY_SERVERS 가 내용물이다.
+--   그릇을 줄이려면 내용물을 먼저 줄인다.
+--   그릇을 늘릴 때는 그릇을 먼저 늘린다.
+--
+-- ★ 이 장에서 만난 순서 문제가 이것으로 세 번째다.
+--   ① 전환할 때의 BUILD 순서 (실습 03)
+--   ② SKIP 규칙을 넣을 때의 적용 중지 (이 실습 [2])
+--   ③ 파라미터를 되돌릴 때의 순서 (여기)
+
+>>> 조치
+
+SYS@boston> EXEC dbms_logstdby.apply_unset('APPLY_SERVERS');
+
+PL/SQL procedure successfully completed.
+
+SYS@boston> EXEC dbms_logstdby.apply_unset('MAX_SERVERS');
+
+PL/SQL procedure successfully completed.
+
+>>> 재확인
+
+SYS@boston> SELECT name, value FROM dba_logstdby_parameters
+  2            WHERE name IN ('MAX_SERVERS','APPLY_SERVERS');
+
+NAME            VALUE
+--------------- -----
+MAX_SERVERS     9
+APPLY_SERVERS   5
+
+2 rows selected.
+
+SYS@boston> ALTER DATABASE START LOGICAL STANDBY APPLY IMMEDIATE;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① Standby 에만 있는 스키마와 인덱스를 만들 수 있다
+--   ② SKIP 규칙은 적용을 멈춘 뒤에 넣는다 — 돌고 있으면 반영되지 않는다
+--   ③ 기본 35개 + 2 = 37개
+--   ④ 지원되지 않는 타입은 DDL 만 복제되고 데이터는 빠진다 (0행)
+--   ⑤ 그것이 오류가 아니라서 더 위험하다
+--   ⑥ RECORD_UNSUPPORTED_OPERATIONS 를 TRUE 로 두면 기록이 남는다
+--   ⑦ 파라미터 16개. 줄일 때는 APPLY_SERVERS 를 먼저 — 아니면 ORA-16081
+--
+-- ★ 다음 실습에서 데이터베이스 가드를 다룬다. 사고가 일어난다.

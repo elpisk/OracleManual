@@ -1,0 +1,212 @@
+================================================================================
+ 제8장 실습 01 — 테이블스페이스 추가의 자동 반영
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : STANDBY_FILE_MANAGEMENT=AUTO 에서 Primary 의 테이블스페이스 추가가
+          Standby 에 어떻게 반영되는지 확인한다
+ 소요   : 약 25분
+ 변경   : 테이블스페이스를 만들었다가 실습 02 에서 지운다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 시작 상태 확인
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a26
+SYS@chicago> COL value FOR a40
+SYS@chicago> SELECT name, value FROM v$parameter
+  2            WHERE name IN ('standby_file_management','db_create_file_dest')
+  3            ORDER BY name;
+
+NAME                       VALUE
+-------------------------- ----------------------------------------
+db_create_file_dest
+standby_file_management    AUTO
+
+2 rows selected.
+
+SYS@boston> SELECT name, value FROM v$parameter
+  2            WHERE name IN ('standby_file_management','db_create_file_dest')
+  3            ORDER BY name;
+
+NAME                       VALUE
+-------------------------- ----------------------------------------
+db_create_file_dest        /u03/app/oracle/oradata
+standby_file_management    AUTO
+
+2 rows selected.
+
+-- ★ 두 가지를 확인한다.
+--
+-- ① STANDBY_FILE_MANAGEMENT 가 양쪽 모두 AUTO 다.
+--    실제 동작을 정하는 것은 **Standby 쪽 값**이다.
+--    파일을 따라 만드는 주체가 Standby 의 MRP 이기 때문이다.
+--    Primary 쪽 값은 역할 전환에 대비한 준비다.
+--
+--    ★★ 그러므로 값을 확인할 때는 반드시 Standby 에서 조회한다.
+--       Primary 에서 AUTO 를 보고 안심하는 것이 흔한 실수다.
+--
+-- ② DB_CREATE_FILE_DEST 가 **비대칭**이다.
+--    Primary 는 비어 있고(비OMF) Standby 는 OMF 다. 6장에서 만든 구성이다.
+--    이 비대칭이 [3] 에서 흥미로운 결과를 낳는다.
+
+SYS@chicago> SELECT COUNT(*) files FROM v$datafile;
+
+     FILES
+----------
+        11
+
+SYS@boston> SELECT COUNT(*) files FROM v$datafile;
+
+     FILES
+----------
+        11
+
+-- 양쪽 11개로 같다. 이 숫자를 기준으로 삼는다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — Standby 에서 만들려고 하면
+--------------------------------------------------------------------------------
+
+-- 자동 반영을 확인하기 전에, 왜 Primary 에서 해야 하는지부터 짚는다.
+-- Standby 에서 직접 만들어 본다.
+
+SYS@boston> ALTER TABLESPACE users ADD DATAFILE '/u03/x.dbf' SIZE 10M;
+
+alter tablespace users add datafile '/u03/x.dbf' size 10m
+                                    *
+ERROR at line 1:
+ORA-16000: database or pluggable database open for read-only access
+
+-- 크기 변경도 마찬가지다.
+
+SYS@boston> ALTER DATABASE DATAFILE 7 RESIZE 20M;
+
+alter database datafile 7 resize 20m
+*
+ERROR at line 1:
+ORA-16000: database or pluggable database open for read-only access
+
+>>> 원인 파악
+    Standby 는 READ ONLY 다. 구조 변경을 포함해 어떤 쓰기도 할 수 없다.
+    1장에서 확인한 Active Data Guard 의 근본 성질이다.
+
+    ★ STANDBY_FILE_MANAGEMENT 값과 무관하다.
+      AUTO 든 MANUAL 든 Standby 에서 직접 만드는 것은 불가능하다.
+      그 파라미터는 "리두를 적용하다 파일 추가 지시를 만났을 때
+      따라 만들 것인가"를 정할 뿐이다.
+
+    ★ 즉 Standby 의 파일은 **오직 리두를 통해서만** 생긴다.
+      이것이 물리 복제본의 정의이기도 하다.
+
+>>> 조치
+    Primary 에서 만든다. [3] 에서 수행한다.
+
+>>> 재확인
+    Primary 에서 만든 뒤 Standby 를 조회해 자동으로 생겼는지 본다.
+
+--------------------------------------------------------------------------------
+ [3] Primary 에 테이블스페이스 생성
+--------------------------------------------------------------------------------
+
+SYS@chicago> CREATE TABLESPACE dg_ts1 DATAFILE
+  2            '/u03/app/oracle/oradata/Chicago/dg_ts1_01.dbf'
+  3            SIZE 20M AUTOEXTEND OFF;
+
+Tablespace created.
+
+SYS@chicago> COL name FOR a50
+SYS@chicago> SELECT file#, name, bytes/1024/1024 mb FROM v$datafile
+  2            WHERE file#>12 ORDER BY file#;
+
+     FILE# NAME                                                MB
+---------- --------------------------------------------- ----------
+        14 /u03/app/oracle/oradata/Chicago/dg_ts1_01.dbf         20
+
+1 row selected.
+
+-- ★ 파일 번호가 14 다. 13이 아니다.
+--   12번까지 쓰이고 있었지만 13번은 건너뛰었다.
+--   파일 번호는 연속을 보장하지 않는다. 이전에 쓰였다 지워진 번호가 있을 수 있다.
+
+--------------------------------------------------------------------------------
+ [4] Standby 확인 — 25초 뒤
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a70
+SYS@boston> SELECT file#, name, bytes/1024/1024 mb FROM v$datafile
+  2            WHERE file#>12 ORDER BY file#;
+
+     FILE# NAME                                                                    MB
+---------- --------------------------------------------------------------- ----------
+        14 /u03/app/oracle/oradata/BOSTON/datafile/o1_mf_dg_ts1_o8z7v7lh_.dbf      20
+
+1 row selected.
+
+SYS@boston> SELECT COUNT(*) files FROM v$datafile;
+
+     FILES
+----------
+        12
+
+1 row selected.
+
+-- ★★ 자동으로 만들어졌다. mkdir 도, 명령도 없었다.
+--
+--   파일 번호  14   Primary 와 같다
+--   크기       20MB Primary 와 같다
+--   **이름     다르다**
+--
+-- ★ 이름이 다른 이유는 [1] 에서 본 비대칭 때문이다.
+--     Primary 비OMF → 사람이 지정한 dg_ts1_01.dbf
+--     Standby OMF   → 오라클이 붙인 o1_mf_dg_ts1_o8z7v7lh_.dbf
+--
+-- ★ 이름 규칙은 6장에서 배운 그대로다.
+--     o1_mf  + dg_ts1 + o8z7v7lh + .dbf
+--     접두어   테이블스페이스  유일문자열  확장자
+--
+--   **테이블스페이스 이름이 들어가므로 어느 것의 파일인지 알아볼 수 있다.**
+
+[oracle@boston-srv ~]$ find /u03/app/oracle/oradata/BOSTON -name '*dg_ts1*'
+
+/u03/app/oracle/oradata/BOSTON/datafile/o1_mf_dg_ts1_o8z7v7lh_.dbf
+
+-- 운영체제에도 실제로 존재한다.
+
+--------------------------------------------------------------------------------
+ [5] 이름이 달라도 되는 이유
+--------------------------------------------------------------------------------
+
+-- 양쪽 이름이 다른 것이 불안하게 느껴질 수 있다. 근거를 확인해 둔다.
+--
+-- ★ Data Guard 가 파일을 짝지을 때 쓰는 것은 **이름이 아니라 파일 번호**다.
+--   실측에서 양쪽 모두 14번이었다.
+--
+--   DB_FILE_NAME_CONVERT 나 DB_CREATE_FILE_DEST 는
+--   "새 파일을 어디에 어떤 이름으로 둘 것인가"만 정한다.
+--   대응 관계는 번호가 유지한다.
+--
+-- ★ 실무에서는 오히려 이름이 다른 편이 나을 때가 있다.
+--   두 노드의 파일 목록을 나란히 놓고 볼 때
+--   어느 쪽 것인지 바로 구분되기 때문이다.
+--
+-- ★ 대조는 번호로 한다.
+
+SYS@chicago> SELECT file#, bytes/1024/1024 mb FROM v$datafile ORDER BY file#;
+SYS@boston>  SELECT file#, bytes/1024/1024 mb FROM v$datafile ORDER BY file#;
+
+--   두 결과의 번호와 크기가 같으면 정상이다. 이름은 볼 필요가 없다.
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+  · STANDBY_FILE_MANAGEMENT 는 Standby 쪽 값이 동작을 정한다
+  · Standby 에서 직접 파일을 만들 수 없다 — ORA-16000
+  · Standby 의 파일은 오직 리두를 통해서만 생긴다
+  · AUTO 이면 테이블스페이스 추가가 자동 반영된다 (실측 25초)
+  · 파일 번호와 크기는 같고 이름은 각자 규칙을 따른다
+  · 대응 관계는 파일 번호가 유지한다. 대조도 번호로 한다
+
+================================================================================
+ 실습 01 종료 — dg_ts1 이 남아 있다. 실습 02 로 이어진다.
+================================================================================

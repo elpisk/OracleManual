@@ -1,0 +1,348 @@
+================================================================================
+ 제8장 실습 07 — 사고 분석: CURRENT 리두 파일을 지웠을 때
+ 대상   : 읽기 자료 (재현하지 않는다)
+ 목표   : 실제 사고의 오류 스택을 읽고, 복구가 왜 불가능했는지 이해한다.
+          보호 모드가 복구 가능성을 어떻게 결정하는지 확인한다
+ 소요   : 약 30분 (읽기)
+ 경고   : **이 실습은 재현하지 않는다.** Primary 가 죽고 복구가 불가능해진다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 이 문서에 대하여
+--------------------------------------------------------------------------------
+
+  이 장의 실측을 진행하던 중 실제로 일어난 사고의 기록이다.
+  교재용으로 꾸민 것이 아니라 그대로 남긴 것이다.
+
+  다른 실습과 달리 재현을 권하지 않는다. 결과가 되돌릴 수 없기 때문이다.
+  대신 오류 스택을 읽는 연습과, 왜 복구가 불가능했는지를 따라간다.
+
+--------------------------------------------------------------------------------
+ [1] 경위
+--------------------------------------------------------------------------------
+
+  실습 06 의 시험을 마치고 그룹 8을 지우려 했다.
+
+SYS@chicago> ALTER DATABASE DROP LOGFILE GROUP 8;
+
+alter database drop logfile group 8
+*
+ERROR at line 1:
+ORA-01623: log 8 is current log for instance chicago (thread 1) - cannot drop
+ORA-00312: online log 8 thread 1: '/u03/app/oracle/oradata/Chicago/redo08.log'
+
+  거부됐다. 여기까지는 실습 06 에서 본 정상적인 오류다.
+  **올바른 대응은 로그를 전환해 INACTIVE 로 만든 뒤 다시 시도하는 것이었다.**
+
+  그런데 실제로 한 것은 이것이었다.
+
+[oracle@chicago-srv ~]$ rm -f /u03/app/oracle/oradata/Chicago/redo08.log
+
+  그룹이 아직 데이터베이스에 등록되어 있고 CURRENT 인 상태에서
+  운영체제 파일을 지웠다.
+
+  ★ 그리고 **아무 일도 일어나지 않았다.**
+    이것이 이 사고를 위험하게 만든 첫 번째 요소다.
+    리눅스는 열려 있는 파일을 지워도 그 파일을 연 프로세스가 계속 쓸 수 있게 한다.
+    LGWR 은 이미 열어 둔 파일 기술자로 계속 기록했다.
+
+--------------------------------------------------------------------------------
+ [2] 다음 전환에서 터진다
+--------------------------------------------------------------------------------
+
+  잠시 뒤 로그 전환이 일어나자 alert 로그에 다음이 남았다.
+
+2026-08-27T11:35:25 Errors in file .../trace/chicago_lg01_10146.trc:
+ORA-27041: unable to open file
+Linux-x86_64 Error: 2: No such file or directory
+Additional information: 3
+
+2026-08-27T11:35:25 Errors in file .../trace/chicago_lg01_10146.trc:
+ORA-00313: open failed for members of log group 8 of thread 1
+
+2026-08-27T11:35:28 PMON (ospid: ): terminating the instance due to ORA error
+
+2026-08-27T11:35:28 Cause - 'Instance is being terminated due to fatal process
+                    death (pid: 24, ospid: 10146, LG01)'
+
+2026-08-27T11:35:31 System state dump requested by (instance=1, osid=10101 (PMON)),
+                    summary=[abnormal instance termination].
+
+2026-08-27T11:35:34 Instance terminated by PMON, pid = 10101
+
+>>> 원인 파악
+    아래에서 위로 읽는 것이 아니라 **위에서 아래로 사건 순서대로** 읽는다.
+    alert 로그는 시간 순 기록이기 때문이다.
+
+    ① ORA-27041: unable to open file
+       운영체제 수준의 원인이다. Linux Error 2 = ENOENT, 파일이 없다.
+       파일 기술자로는 쓸 수 있었지만 **다시 열려고 하자 실패했다.**
+
+    ② ORA-00313: open failed for members of log group 8 of thread 1
+       오라클이 그것을 로그 그룹의 문제로 번역했다.
+
+    ③ LG01 프로세스 사망
+       로그 기록 보조 프로세스다. 리두를 쓸 수 없으면 존재 이유가 없다.
+
+    ④ PMON 이 인스턴스를 종료
+       필수 백그라운드 프로세스가 죽으면 PMON 이 인스턴스를 내린다.
+       **데이터베이스가 죽는 것이 아니라 PMON 이 죽인다.**
+
+    ★ 세션에서는 이렇게 보인다.
+
+SYS@chicago> ALTER SYSTEM SWITCH LOGFILE;
+
+alter system switch logfile
+*
+ERROR at line 1:
+ORA-03113: end-of-file on communication channel
+Process ID: 10824
+Session ID: 401 Serial number: 19356
+
+      ORA-03113 은 "서버 프로세스와의 연결이 끊겼다"는 뜻이다.
+      인스턴스가 죽으면 이 오류로 나타난다.
+      이후 모든 접속은 ORA-01034 가 된다.
+
+SYS@chicago> SELECT open_mode FROM v$database;
+
+ERROR at line 1:
+ORA-01034: ORACLE not available
+Process ID: 0
+Session ID: 0 Serial number: 0
+
+--------------------------------------------------------------------------------
+ [3] 복구 시도 ① — 마운트까지는 된다
+--------------------------------------------------------------------------------
+
+SYS@chicago> STARTUP MOUNT
+
+ORACLE instance started.
+
+Total System Global Area 3221223192 bytes
+Fixed Size                  9139992 bytes
+Variable Size             687865856 bytes
+Database Buffers         2516582400 bytes
+Redo Buffers                7634944 bytes
+Database mounted.
+
+SYS@chicago> SELECT group#, members, status, archived FROM v$log ORDER BY group#;
+
+    GROUP#    MEMBERS STATUS           ARC
+---------- ---------- ---------------- ---
+         1          1 INACTIVE         YES
+         2          1 INACTIVE         YES
+         3          1 INACTIVE         YES
+         8          1 CURRENT          NO
+
+4 rows selected.
+
+-- ★ 그룹 8이 CURRENT 이고 ARC 가 NO 다.
+--   **아직 아카이브되지 않은 현재 로그**라는 뜻이다.
+--   그 안에 마지막 리두가 들어 있고, 그 파일은 없다.
+
+--------------------------------------------------------------------------------
+ [4] 복구 시도 ② — 지울 수도 없다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 8;
+
+alter database clear unarchived logfile group 8
+*
+ERROR at line 1:
+ORA-01624: log 8 needed for crash recovery of instance chicago (thread 1)
+ORA-00312: online log 8 thread 1: '/u03/app/oracle/oradata/Chicago/redo08.log'
+
+>>> 원인 파악
+    **ORA-01624** — 그 로그가 크래시 복구에 필요하다.
+
+    인스턴스가 비정상 종료됐으므로 마지막 체크포인트 이후의 변경이
+    그 파일에만 있다. 그것을 적용해야 데이터 파일이 일관된 상태가 된다.
+
+    ★ CLEAR UNARCHIVED LOGFILE 은 "아카이브되지 않은 로그를 비운다"는 명령이다.
+      평소에는 손상된 로그를 정리하는 데 쓴다.
+      그러나 크래시 복구에 필요한 로그는 비울 수 없다.
+      비우면 복구할 방법이 사라지기 때문이다.
+
+--------------------------------------------------------------------------------
+ [5] 복구 시도 ③ — 무엇이 필요한지 알려 준다
+--------------------------------------------------------------------------------
+
+SYS@chicago> RECOVER DATABASE UNTIL CANCEL;
+
+ORA-00279: change 2513532 generated at 08/27/2026 11:34:29 needed for thread 1
+ORA-00289: suggestion :
+/u03/app/oracle/fast_recovery_area/CHICAGO/archivelog/2026_08_27/o1_mf_1_86_%u_.arc
+ORA-00280: change 2513532 for thread 1 is in sequence #86
+
+ORA-00308: cannot open archived log
+'/u03/app/oracle/fast_recovery_area/CHICAGO/archivelog/2026_08_27/o1_mf_1_86_%u_.arc'
+ORA-27037: unable to obtain file status
+Linux-x86_64 Error: 2: No such file or directory
+
+ORA-01547: warning: RECOVER succeeded but OPEN RESETLOGS would get error below
+ORA-01194: file 1 needs more recovery to be consistent
+ORA-01110: data file 1: '/u03/app/oracle/oradata/Chicago/system01.dbf'
+
+>>> 원인 파악
+    오류 세 묶음을 나눠 읽는다.
+
+    ① ORA-00279 / 00289 / 00280
+       **필요한 것을 정확히 알려 준다.**
+         무엇 : change 2513532
+         어디 : 시퀀스 86
+         제안 : 이 경로의 아카이브 파일
+       진단에 필요한 정보가 다 들어 있다.
+
+    ② ORA-00308 + ORA-27037
+       그 파일이 없다. 시퀀스 86 은 아직 아카이브되지 않았고
+       그 리두는 지워진 redo08.log 안에 있었다.
+
+    ③ ORA-01547 + ORA-01194 + ORA-01110
+       "복구는 됐지만 OPEN RESETLOGS 를 하면 아래 오류가 날 것이다."
+       파일 1번이 아직 일관되지 않다는 뜻이다.
+       **즉 지금 상태로는 열 수 없다.**
+
+--------------------------------------------------------------------------------
+ [6] 복구 시도 ④ — Standby 에서 가져와 본다
+--------------------------------------------------------------------------------
+
+-- 그 리두가 Standby 에는 있지 않을까?
+-- 실시간 적용 중이었으므로 SRL 에 받고 있었다.
+
+SYS@boston> SELECT group#, sequence#, status, archived FROM v$standby_log
+  2            ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS     ARC
+---------- ---------- ---------- ---
+         4         86 ACTIVE     YES
+         5          0 UNASSIGNED NO
+         6          0 UNASSIGNED YES
+         7          0 UNASSIGNED YES
+
+-- ★ 그룹 4가 시퀀스 86 을 갖고 있다. 그 파일을 Primary 로 옮겨 적용해 본다.
+
+[oracle@chicago-srv ~]$ cp /u03/srl86.log /u03/rec/1_86_1242322892.dbf
+
+-- 파일 이름은 LOG_ARCHIVE_FORMAT(%t_%s_%r.dbf)에 맞춘다.
+--   1  = thread
+--   86 = sequence
+--   1242322892 = resetlogs id
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_10='location=/u03/rec' SCOPE=MEMORY;
+SYS@chicago> SET AUTORECOVERY ON
+SYS@chicago> RECOVER AUTOMATIC DATABASE UNTIL CANCEL;
+
+ORA-00279: change 2513652 generated at  needed for thread 1
+ORA-00266: name of archived log file needed
+
+ORA-01547: warning: RECOVER succeeded but OPEN RESETLOGS would get error below
+ORA-01194: file 1 needs more recovery to be consistent
+
+>>> 원인 파악
+    ★★ **필요한 SCN 이 2513532 에서 2513652 로 전진했다.**
+
+    SRL 의 리두가 적용된 것이다. 절반은 성공했다.
+    그러나 여전히 부족하다. 왜인가.
+
+    ★ 답은 **보호 모드**에 있다.
+
+SYS@chicago> -- (사고 전 값) PROTECTION_MODE = MAXIMUM PERFORMANCE
+
+      MAXIMUM PERFORMANCE 는 ASYNC 전송이다.
+      LGWR 이 로그 파일에 쓴 리두와 Standby 로 전송된 리두 사이에 시차가 있다.
+
+      **마지막 순간에 Primary 가 쓰고 아직 보내지 못한 리두는
+      그 파일에만 있었고, 그 파일을 지웠다.**
+
+      2장에서 다룬 보호 모드의 의미가 여기서 구체적인 결과로 나타난다.
+      MAXIMUM PROTECTION 이나 MAXIMUM AVAILABILITY 였다면
+      커밋된 리두는 모두 Standby 에 있었을 것이다.
+
+>>> 조치 — 남는 선택지
+    이 상태에서 가능한 길은 셋이며 어느 쪽이든 비용이 크다.
+
+      선택                  내용                        대가
+      --------------------- --------------------------- ------------------------
+      Standby 로 Failover   boston 을 Primary 로 승격   역할이 바뀐다.
+                                                        chicago 를 새로 만든다
+      백업에서 복원         백업 시점으로 되돌린 뒤     백업이 있어야 한다
+                            복구                        (실습 환경에는 없었다)
+      스냅샷·이미지 복원    가상 머신 수준에서 되돌린다 그 시점 이후 변경 소실
+
+>>> 재확인
+    어느 선택을 하든 복구 후에는 다음을 확인한다.
+      · Primary 가 READ WRITE 로 열리는가
+      · Standby 의 DATABASE_ROLE 과 OPEN_MODE
+      · 두 지연이 0 으로 수렴하는가
+      · 목적지가 모두 VALID 인가
+    7장의 통합 점검 조회를 그대로 쓰면 된다.
+
+--------------------------------------------------------------------------------
+ [7] 교훈 네 가지
+--------------------------------------------------------------------------------
+
+  ① **데이터베이스가 쓰고 있는 파일을 운영체제 명령으로 지우지 않는다.**
+     데이터베이스에서 먼저 제거하고, 제거가 성공한 뒤에 파일을 정리한다.
+
+  ② **오류가 났다면 그 오류를 해결한다.**
+     ORA-01623 은 "지금은 지울 수 없다"는 뜻이지
+     "다른 방법으로 지워라"는 뜻이 아니다.
+     전환 후 다시 시도하는 것이 옳은 대응이었다.
+
+     ★ 이 사고의 본질은 기술 부족이 아니라 **오류를 우회한 것**이다.
+       오류 메시지는 방금 하려던 일이 위험하다고 알려 주고 있었다.
+
+  ③ **CURRENT 로그는 특히 위험하다.**
+     리눅스는 열려 있는 파일을 지워도 프로세스가 계속 쓸 수 있게 해 준다.
+     그래서 지운 직후에는 아무 일도 일어나지 않는다.
+     **다음 전환에서 터진다.**
+     시차가 있어 원인과 결과를 연결하기 어렵다.
+
+  ④ **보호 모드가 복구 가능성을 결정한다.**
+     ASYNC 환경에서는 Standby 에도 마지막 리두가 없을 수 있다.
+     이 사실을 알고 보호 모드를 고른다.
+     2장에서 "성능과 보호의 교환"이라고 했던 것의 실제 대가가 이것이다.
+
+--------------------------------------------------------------------------------
+ [8] 구조 변경 작업의 표준 순서
+--------------------------------------------------------------------------------
+
+  이 사고를 일반화하면 세 단계가 나온다.
+
+  ① **데이터베이스에서 먼저 제거한다**
+     DROP 이 성공했는지 확인한다.
+     실패했다면 원인을 해결하고 다시 시도한다. 우회하지 않는다.
+
+  ② **제거를 조회로 확인한다**
+     V$LOG, V$LOGFILE, V$DATAFILE 등에서 항목이 사라졌는지 본다.
+     "명령이 성공했으니 됐겠지"로 넘어가지 않는다.
+
+     SELECT member FROM v$logfile WHERE member LIKE '%redo08%';
+     no rows selected          ← 이 한 줄을 확인하고 넘어간다
+
+  ③ **그 다음에 파일을 정리한다 — mv 로**
+     바로 지우지 말고 다른 이름이나 위치로 옮겨 둔다.
+     며칠 뒤 문제가 없으면 지운다.
+
+     [oracle@chicago-srv ~]$ mv .../redo08.log /tmp/redo08.log.old
+
+  ★ 세 번째 단계가 특히 중요하다.
+    **mv 는 되돌릴 수 있지만 rm 은 되돌릴 수 없다.**
+    실습 05 에서 빈 디렉터리를 지울 때 rmdir 을 쓴 것도 같은 원칙이다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+  · CURRENT 리두 파일을 지우면 다음 전환에서 터진다. 즉시가 아니다
+  · 순서: ORA-27041 → ORA-00313 → LG01 사망 → PMON 이 인스턴스 종료
+  · 세션에는 ORA-03113 으로 보이고 이후 ORA-01034 가 된다
+  · CLEAR UNARCHIVED LOGFILE 은 ORA-01624 로 거부된다 (크래시 복구에 필요)
+  · RECOVER 는 ORA-00279/00289/00280 으로 필요한 것을 정확히 알려 준다
+  · ASYNC 이면 Standby 에도 마지막 리두가 없다. 완전 복구가 불가능하다
+  · 남는 선택지는 Failover / 백업 복원 / 스냅샷 복원. 모두 비용이 크다
+  · 표준 순서: DB 에서 제거 → 조회로 확인 → mv 로 정리
+
+================================================================================
+ 실습 07 종료 — 읽기 자료. 재현하지 않는다.
+================================================================================

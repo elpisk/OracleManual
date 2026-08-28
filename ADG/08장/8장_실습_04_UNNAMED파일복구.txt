@@ -1,0 +1,281 @@
+================================================================================
+ 제8장 실습 04 — UNNAMED 파일 복구
+ 대상   : boston-srv Standby (검증은 양쪽)
+ 목표   : ALTER DATABASE CREATE DATAFILE ... AS NEW 로 복구하고,
+          데이터까지 맞는지 확인한다
+ 소요   : 약 30분
+ 전제   : 실습 03 을 마쳐 적용이 멈춰 있어야 한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 복구 절차의 뼈대
+--------------------------------------------------------------------------------
+
+  ① STANDBY_FILE_MANAGEMENT 를 MANUAL 로
+  ② ALTER DATABASE CREATE DATAFILE '<UNNAMED 경로>' AS NEW
+  ③ STANDBY_FILE_MANAGEMENT 를 AUTO 로
+  ④ MRP 재기동
+  ⑤ 검증
+
+-- ★ ①이 의아할 수 있다. MANUAL 때문에 생긴 문제인데 다시 MANUAL 로?
+--
+--   이유가 있다. AUTO 상태에서는 파일 생성을 오라클이 관리하므로
+--   사람이 CREATE DATAFILE 로 개입하는 것과 충돌한다.
+--   **작업하는 동안만 MANUAL 로 두고 끝나면 되돌린다.**
+
+--------------------------------------------------------------------------------
+ [2] 복구 실행
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER SYSTEM SET standby_file_management='MANUAL' SCOPE=BOTH;
+
+System altered.
+
+SYS@boston> ALTER DATABASE CREATE DATAFILE
+  2            '/u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00016' AS NEW;
+
+Database altered.
+
+SYS@boston> ALTER SYSTEM SET standby_file_management='AUTO' SCOPE=BOTH;
+
+System altered.
+
+-- ★ AS NEW 가 핵심이다.
+--   DB_CREATE_FILE_DEST 가 설정되어 있으므로(6장)
+--   오라클이 OMF 규칙으로 새 파일을 만든다.
+
+--------------------------------------------------------------------------------
+ [3] 결과 확인
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a70
+SYS@boston> SELECT file#, name, bytes/1024/1024 mb FROM v$datafile
+  2            WHERE file#>=14 ORDER BY file#;
+
+     FILE# NAME                                                                     MB
+---------- --------------------------------------------------------------- ----------
+        14 /u03/app/oracle/oradata/BOSTON/datafile/o1_mf_dg_ts1_o8z7v7lh_.dbf       30
+        15 /u03/app/oracle/oradata/BOSTON/datafile/o1_mf_dg_ts1_o8z7w2ch_.dbf       15
+        16 /u03/app/oracle/oradata/BOSTON/datafile/o1_mf_dg_ts2_o8z81hpl_.dbf       10
+
+3 rows selected.
+
+-- ★★ 이름까지 제대로 붙었다.
+--
+--   o1_mf_**dg_ts2**_o8z81hpl_.dbf
+--
+--   테이블스페이스 이름 dg_ts2 가 들어갔고 크기도 10MB 로 맞다.
+--   **오라클이 리두에서 그 정보를 읽어 만든 것이다.**
+--   사람은 "새로 만들어라"라고만 했고 나머지는 전부 자동이다.
+--
+-- ★ 경로도 UNNAMED 가 있던 $ORACLE_HOME/dbs 가 아니라
+--   정상 위치인 BOSTON/datafile/ 아래로 갔다.
+
+--------------------------------------------------------------------------------
+ [4] 경로 지정 방식이라면
+--------------------------------------------------------------------------------
+
+-- DB_CREATE_FILE_DEST 가 없는 환경(5장 방식)에서는 AS NEW 를 쓸 수 없다.
+-- 경로를 직접 준다.
+
+ALTER DATABASE CREATE DATAFILE
+  '/u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00016'
+  AS '/u03/app/oracle/oradata/Boston/datafile/dg_ts2_01.dbf';
+
+-- ★ 이 경우 두 가지를 사람이 책임져야 한다.
+--   ① 그 디렉터리가 미리 있어야 한다 — 없으면 5장의 ORA-19505 를 만난다
+--   ② 이름을 사람이 정해야 한다 — 규칙을 어기면 나중에 알아보기 어렵다
+--
+--   6장에서 OMF 를 권한 이유가 이런 국면에서 다시 드러난다.
+
+--------------------------------------------------------------------------------
+ [5] 적용 재개
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+-- 30초 뒤
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         75
+
+1 row selected.
+
+SYS@boston> SELECT COUNT(*) files FROM v$datafile;
+
+     FILES
+----------
+        14
+
+SYS@boston> SELECT COUNT(*) FROM v$recover_file;
+
+  COUNT(*)
+----------
+         0
+
+-- ★ 네 가지가 모두 정상이다.
+--   지연 0 / MRP0 동작 / 파일 14개 / 복구 대상 0건
+--
+--   밀렸던 리두도 따라잡았다. 실습 03 에서 30초까지 벌어졌던 apply lag 이
+--   0 으로 돌아왔다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — 복구 순서를 어기면
+--------------------------------------------------------------------------------
+
+-- ①을 건너뛰고 AUTO 상태에서 바로 CREATE DATAFILE 을 하면 어떻게 되는가.
+-- 또는 MRP 가 돌고 있는 상태에서 하면?
+--
+-- MRP 가 살아 있는 상태에서 적용 관련 명령을 겹치면 7장의 오류를 만난다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+alter database recover managed standby database using current logfile disconnect from session
+*
+ERROR at line 1:
+ORA-01153: an incompatible media recovery is active
+
+>>> 원인 파악
+    이미 [5] 에서 기동했으므로 MRP 가 돌고 있다.
+    7장에서 배운 대로 MRP 는 하나만 존재할 수 있다.
+
+    ★ 복구 작업 중에는 이 오류를 자주 만난다.
+      절차를 여러 번 시도하다 보면 어느 시점에 기동했는지 놓치기 때문이다.
+      **명령을 내리기 전에 MRP0 존재를 먼저 조회하는 습관**이 이것을 막는다.
+
+>>> 조치
+    이미 원하는 상태이므로 아무것도 하지 않는다.
+    상태를 확인하고 다음 단계로 넘어간다.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         75
+
+>>> 재확인
+    지연이 0 이고 MRP0 이 APPLYING_LOG 이면 복구가 끝난 것이다.
+
+--------------------------------------------------------------------------------
+ [7] 데이터까지 맞는가 — 기능 검증
+--------------------------------------------------------------------------------
+
+-- 파일을 "새로" 만들었으므로 그 안의 내용이 걱정될 수 있다.
+-- 문제가 있었던 바로 그 테이블스페이스에 데이터를 넣어 확인한다.
+
+SYS@chicago> CREATE TABLE system.dg_ts_test(id NUMBER) TABLESPACE dg_ts2;
+
+Table created.
+
+SYS@chicago> INSERT INTO system.dg_ts_test
+  2            SELECT level FROM dual CONNECT BY level<=100;
+
+100 rows created.
+
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+SYS@chicago> SELECT COUNT(*) FROM system.dg_ts_test;
+
+  COUNT(*)
+----------
+       100
+
+-- 25초 뒤 Standby
+
+SYS@boston> SELECT COUNT(*) FROM system.dg_ts_test;
+
+  COUNT(*)
+----------
+       100
+
+1 row selected.
+
+-- ★★ 100행이 그대로 보인다.
+--
+--   **파일을 새로 만들었지만 그 안의 내용은 리두로 채워진다.**
+--   AS NEW 로 만든 파일은 빈 껍데기이고,
+--   MRP 가 밀렸던 리두를 적용하면서 내용을 채운 것이다.
+--
+--   이것이 물리 복제의 원리다. 파일 자체를 복사하는 것이 아니라
+--   변경 기록(리두)을 적용해 같은 상태를 만든다.
+
+--------------------------------------------------------------------------------
+ [8] 정리와 원복
+--------------------------------------------------------------------------------
+
+SYS@chicago> DROP TABLE system.dg_ts_test PURGE;
+
+Table dropped.
+
+SYS@chicago> DROP TABLESPACE dg_ts2 INCLUDING CONTENTS AND DATAFILES;
+
+Tablespace dropped.
+
+SYS@chicago> DROP TABLESPACE dg_ts1 INCLUDING CONTENTS AND DATAFILES;
+
+Tablespace dropped.
+
+SYS@chicago> SELECT COUNT(*) files FROM v$datafile;
+
+     FILES
+----------
+        11
+
+-- 30초 뒤
+
+SYS@boston> SELECT COUNT(*) files FROM v$datafile;
+
+     FILES
+----------
+        11
+
+SYS@boston> SELECT file#, name FROM v$datafile WHERE file#>12;
+
+no rows selected
+
+[oracle@boston-srv ~]$ find /u03/app/oracle/oradata/BOSTON -name '*dg_ts*'
+(출력 없음)
+
+[oracle@boston-srv ~]$ ls -l /u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED*
+ls: cannot access ...UNNAMED*: No such file or directory
+
+-- ★ UNNAMED 항목도 사라졌다. 그 파일 번호 자체가 없어졌기 때문이다.
+--   양쪽 11개로 기준 상태 복귀.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+  · 복구는 MANUAL → CREATE DATAFILE AS NEW → AUTO → MRP 재기동 순서다
+  · 작업 중에만 MANUAL 로 둔다. 오라클과 사람이 같은 일을 하지 않도록
+  · AS NEW 는 리두에서 정보를 읽어 이름·크기를 맞춰 준다 (실측 dg_ts2 10MB)
+  · 경로 지정 방식이면 AS '<경로>' 로 직접 지정하고 디렉터리를 미리 만든다
+  · 파일은 빈 껍데기로 만들어지고 내용은 리두가 채운다 (실측 100행)
+  · 복구 도중 ORA-01153 을 자주 만난다. 명령 전에 MRP0 을 조회한다
+  · 검증은 지연 0 / MRP0 동작 / 파일 개수 / V$RECOVER_FILE 0건 네 가지
+
+================================================================================
+ 실습 04 종료 — 양쪽 11개 파일, 지연 0. 기준 상태로 복귀했다.
+================================================================================

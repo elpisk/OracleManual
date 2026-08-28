@@ -1,0 +1,225 @@
+================================================================================
+ 제8장 실습 02 — 데이터 파일 추가와 크기 변경
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : 파일 추가와 resize 가 모두 자동 반영되는 것을 확인하고,
+          삭제까지 반영되는지 본다
+ 소요   : 약 25분
+ 변경   : 실습 01 에서 만든 dg_ts1 을 확장했다가 실습 04 이후 정리한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 데이터 파일 추가
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER TABLESPACE dg_ts1 ADD DATAFILE
+  2            '/u03/app/oracle/oradata/Chicago/dg_ts1_02.dbf'
+  3            SIZE 15M AUTOEXTEND OFF;
+
+Tablespace altered.
+
+--------------------------------------------------------------------------------
+ [2] 크기 변경
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE DATAFILE
+  2            '/u03/app/oracle/oradata/Chicago/dg_ts1_01.dbf' RESIZE 30M;
+
+Database altered.
+
+SYS@chicago> SELECT file#, bytes/1024/1024 mb, name FROM v$datafile
+  2            WHERE file#>12 ORDER BY file#;
+
+     FILE#         MB NAME
+---------- ---------- ---------------------------------------------
+        14         30 /u03/app/oracle/oradata/Chicago/dg_ts1_01.dbf
+        15         15 /u03/app/oracle/oradata/Chicago/dg_ts1_02.dbf
+
+2 rows selected.
+
+-- 14번이 20MB 에서 30MB 로 늘었고 15번이 새로 생겼다.
+
+--------------------------------------------------------------------------------
+ [3] Standby 확인 — 25초 뒤
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a70
+SYS@boston> SELECT file#, bytes/1024/1024 mb, name FROM v$datafile
+  2            WHERE file#>12 ORDER BY file#;
+
+     FILE#         MB NAME
+---------- ---------- -----------------------------------------------------------------
+        14         30 /u03/app/oracle/oradata/BOSTON/datafile/o1_mf_dg_ts1_o8z7v7lh_.dbf
+        15         15 /u03/app/oracle/oradata/BOSTON/datafile/o1_mf_dg_ts1_o8z7w2ch_.dbf
+
+2 rows selected.
+
+-- ★ 둘 다 반영됐다.
+--   14번이 30MB 로 늘었다 — **크기 변경도 자동이다**
+--   15번이 생겼다        — **파일 추가도 자동이다**
+--
+-- ★ 15번의 이름에도 dg_ts1 이 들어 있다.
+--   같은 테이블스페이스의 두 번째 파일임을 이름만 보고 알 수 있다.
+--   유일 문자열만 다르다 (o8z7v7lh / o8z7w2ch).
+--
+-- ★ 14번의 파일 이름은 바뀌지 않았다.
+--   크기만 늘었을 뿐 파일을 다시 만든 것이 아니기 때문이다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 확인 조회를 짜다가 만나는 오류
+--------------------------------------------------------------------------------
+
+-- 파일과 로그 상태를 함께 보려고 다음 조회를 짰다.
+
+SYS@chicago> SELECT group#, type, bytes/1024/1024 mb FROM v$log ORDER BY group#;
+
+select group#, type, bytes/1024/1024 mb from v$log order by group#
+               *
+ERROR at line 1:
+ORA-00904: "TYPE": invalid identifier
+
+>>> 원인 파악
+    `TYPE` 열은 V$LOG 에 없다. **V$LOGFILE 에 있다.**
+
+    두 뷰는 단위가 다르다.
+
+      V$LOG          로그 **그룹** 단위
+                     GROUP#, MEMBERS, BYTES, STATUS, ARCHIVED
+      V$LOGFILE      로그 **멤버(파일)** 단위
+                     GROUP#, TYPE, MEMBER, STATUS
+      V$STANDBY_LOG  SRL 그룹 단위
+                     GROUP#, SEQUENCE#, BYTES, STATUS, ARCHIVED
+
+    ★ V$LOG 는 온라인 그룹만 보여 준다. SRL 은 나오지 않는다.
+      그래서 TYPE 으로 구분할 필요가 없고, 열도 없다.
+
+    ★ 6장에서 본 OMF 로그 다중화를 떠올리면 이 구분이 분명해진다.
+      Standby 는 그룹 3개에 멤버 6개였다.
+      그룹을 세려면 V$LOG, 파일을 세려면 V$LOGFILE 을 본다.
+
+>>> 조치
+    목적에 맞는 뷰를 쓴다.
+
+SYS@chicago> SELECT group#, members, bytes/1024/1024 mb, status
+  2            FROM v$log ORDER BY group#;
+
+    GROUP#    MEMBERS         MB STATUS
+---------- ---------- ---------- ----------------
+         1          1        200 CURRENT
+         2          1        200 INACTIVE
+         3          1        200 INACTIVE
+
+3 rows selected.
+
+>>> 재확인
+    멤버까지 보려면 V$LOGFILE 을 쓴다.
+
+SYS@boston> SELECT COUNT(*) online_members FROM v$logfile WHERE type='ONLINE';
+
+ONLINE_MEMBERS
+--------------
+             6
+
+    Standby 는 그룹 3개 × 멤버 2개 = 6이다. 6장의 이중화 결과다.
+
+--------------------------------------------------------------------------------
+ [5] 양쪽 대조 조회
+--------------------------------------------------------------------------------
+
+-- 구조 변경 후에는 양쪽 파일 목록을 대조한다. 이름이 아니라 번호와 크기로 본다.
+
+SYS@chicago> SELECT file#, bytes/1024/1024 mb FROM v$datafile ORDER BY file#;
+
+     FILE#         MB
+---------- ----------
+         1        910
+         3        570
+         4        345
+         5        270
+         6        330
+         7       8.75
+         8        100
+         9        270
+        10        340
+        11        100
+        12          5
+        14         30
+        15         15
+
+13 rows selected.
+
+SYS@boston> SELECT file#, bytes/1024/1024 mb FROM v$datafile ORDER BY file#;
+
+(같은 결과 13행)
+
+-- ★ 번호와 크기가 모두 같으면 정상이다.
+--
+-- ★ 한 줄로 확인하는 방법도 있다. Primary 에서 실행한다.
+
+SYS@chicago> SELECT COUNT(*) cnt, SUM(bytes)/1024/1024 total_mb FROM v$datafile;
+
+       CNT   TOTAL_MB
+---------- ----------
+        13    3293.75
+
+--   Standby 에서 같은 조회를 해 두 값이 일치하는지 본다.
+--   개수와 합계가 같으면 대부분의 불일치는 걸러진다.
+--   다만 파일별 대조가 아니므로 완전하지는 않다.
+
+--------------------------------------------------------------------------------
+ [6] 삭제도 반영되는가
+--------------------------------------------------------------------------------
+
+-- 이 실습에서 만든 것을 지워 확인한다.
+-- (실습 03·04 를 진행할 예정이면 이 단계는 실습 04 이후로 미룬다.)
+
+SYS@chicago> DROP TABLESPACE dg_ts1 INCLUDING CONTENTS AND DATAFILES;
+
+Tablespace dropped.
+
+SYS@chicago> SELECT COUNT(*) files FROM v$datafile;
+
+     FILES
+----------
+        11
+
+-- 30초 뒤 Standby
+
+SYS@boston> SELECT COUNT(*) files FROM v$datafile;
+
+     FILES
+----------
+        11
+
+SYS@boston> SELECT file#, name FROM v$datafile WHERE file#>12 ORDER BY file#;
+
+no rows selected
+
+[oracle@boston-srv ~]$ find /u03/app/oracle/oradata/BOSTON -name '*dg_ts*'
+(출력 없음)
+
+-- ★ 삭제도 자동으로 반영된다.
+--   INCLUDING DATAFILES 를 주었으므로 운영체제 파일까지 사라졌다.
+--
+-- ★ 주의 — INCLUDING DATAFILES 를 생략하면 어떻게 되는가?
+--   Primary 에서는 파일이 남고, Standby 에서도 남는다.
+--   양쪽 모두 사람이 정리해야 한다.
+--   Standby 쪽 파일 이름은 OMF 라 사람이 짐작하기 어려우므로
+--   지우기 전에 V$DATAFILE 에서 이름을 확인해 두어야 한다.
+--   테이블스페이스를 지운 뒤에는 그 조회도 불가능하다.
+--
+--   **그러므로 INCLUDING DATAFILES 를 쓰는 편이 낫다.**
+
+--------------------------------------------------------------------------------
+ [7] 정리
+--------------------------------------------------------------------------------
+
+  · 파일 추가·크기 변경·삭제가 모두 자동 반영된다
+  · resize 는 파일 이름을 바꾸지 않는다
+  · 두 번째 파일도 같은 테이블스페이스 이름을 갖는다 (유일 문자열만 다름)
+  · V$LOG 에는 TYPE 열이 없다. 멤버 정보는 V$LOGFILE 에 있다
+  · 대조는 파일 번호와 크기로 한다. 개수·합계 비교가 빠른 점검이다
+  · DROP TABLESPACE 는 INCLUDING DATAFILES 를 붙이는 편이 낫다
+
+================================================================================
+ 실습 02 종료 — 실습 03 을 이어서 할 경우 [6] 은 실습 04 이후로 미룬다.
+================================================================================

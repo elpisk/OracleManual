@@ -1,0 +1,233 @@
+================================================================================
+ 제11장 실습 01 — 전제 조건 확인
+ 대상   : chicago-srv Primary, boston-srv Standby
+ 목표   : Snapshot Standby 로 전환하기 전에 무엇을 확인해야 하는지 익힌다.
+          FRA·플래시백 상태를 읽고 전환 후와 비교할 기준값을 남긴다
+ 소요   : 약 25분
+ 변경   : 실습용 테이블 1개 생성 (실습 07 에서 삭제)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 출발점 — 11장은 여기서 시작한다
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a10
+SYS@chicago> SELECT name, db_unique_name, database_role, open_mode, protection_mode
+  2            FROM v$database;
+
+NAME       DB_UNIQUE_NAME  DATABASE_ROLE  OPEN_MODE   PROTECTION_MODE
+---------- --------------- -------------- ----------- --------------------
+CHICAGO    chicago         PRIMARY        READ WRITE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@boston> SELECT name, db_unique_name, database_role, open_mode, protection_mode
+  2            FROM v$database;
+
+NAME       DB_UNIQUE_NAME  DATABASE_ROLE     OPEN_MODE             PROTECTION_MODE
+---------- --------------- ----------------- --------------------- --------------------
+CHICAGO    boston          PHYSICAL STANDBY  READ ONLY WITH APPLY  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@boston> COL recovery_mode FOR a28
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ----------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+
+1 row selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         40
+
+1 row selected.
+
+-- ★ 10장을 마친 상태 그대로다.
+--   Far Sync 는 내려가 있고 chicago → boston 직결이다.
+--   이 장의 실습은 2노드만 쓴다.
+
+--------------------------------------------------------------------------------
+ [2] 플래시백 상태 — 의외의 값
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT flashback_on FROM v$database;
+
+FLASHBACK_ON
+------------------
+NO
+
+1 row selected.
+
+-- ★ 꺼져 있다. Primary 도 마찬가지다.
+--
+--   Snapshot Standby 는 "되돌리기" 를 전제로 하는 기능인데
+--   플래시백이 꺼져 있어도 전환이 될까.
+--
+--   답은 실습 02 와 03 에서 확인한다.
+--   미리 말하면 된다. 전체 플래시백 로깅이 아니라
+--   보장 복원 지점(guaranteed restore point)을 쓰기 때문이다.
+
+SYS@boston> COL name FOR a30
+SYS@boston> COL value FOR a44
+SYS@boston> SELECT name, value FROM v$parameter
+  2            WHERE name IN ('db_recovery_file_dest','db_recovery_file_dest_size',
+  3                           'db_flashback_retention_target');
+
+NAME                           VALUE
+------------------------------ --------------------------------------
+db_recovery_file_dest          /u03/app/oracle/fast_recovery_area
+db_recovery_file_dest_size     16106127360
+db_flashback_retention_target  1440
+
+3 rows selected.
+
+-- ★ 세 값의 뜻
+--
+--   db_recovery_file_dest         FRA 위치
+--   db_recovery_file_dest_size    16,106,127,360 바이트 = 15GB
+--   db_flashback_retention_target 1440 분 = 24시간
+--
+-- ★ retention_target 은 전체 플래시백 로깅을 켰을 때 의미가 있다.
+--   보장 복원 지점은 이 값과 무관하게 유지된다.
+--   "보장" 이라는 말의 뜻이 그것이다.
+
+--------------------------------------------------------------------------------
+ [3] FRA 사용량 — 전환 후와 비교할 기준값
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a44
+SYS@boston> SELECT name, space_limit/1024/1024 limit_mb,
+  2                space_used/1024/1024 used_mb, number_of_files
+  3            FROM v$recovery_file_dest;
+
+NAME                                    LIMIT_MB    USED_MB NUMBER_OF_FILES
+------------------------------------- ---------- ---------- ---------------
+/u03/app/oracle/fast_recovery_area         15360 1536.07813              26
+
+1 row selected.
+
+SYS@boston> SELECT file_type, percent_space_used, number_of_files
+  2            FROM v$flash_recovery_area_usage WHERE percent_space_used > 0;
+
+FILE_TYPE               PERCENT_SPACE_USED NUMBER_OF_FILES
+----------------------- ------------------ ---------------
+REDO LOG                              9.11               7
+ARCHIVED LOG                           .77              18
+BACKUP PIECE                           .12               1
+
+3 rows selected.
+
+-- ★ 15,360MB 중 1,536MB 사용. 여유가 충분하다.
+--
+-- ★ FILE_TYPE 에 FLASHBACK LOG 가 없다는 점을 기억한다.
+--   전환하면 이 항목이 새로 생긴다. 실습 05 에서 확인한다.
+--
+-- ★ 이 두 조회가 전환 전 점검의 핵심이다.
+--   시험에서 데이터를 많이 바꿀 계획이라면
+--   여유가 그만큼 있는지 여기서 판단한다.
+--   부족하면 시험 도중에 데이터베이스가 멈춘다.
+
+--------------------------------------------------------------------------------
+ [4] 기준 데이터를 심어 둔다
+--------------------------------------------------------------------------------
+
+-- 되돌리기가 정말 되는지 확인하려면 비교할 대상이 필요하다.
+-- 전환 전에 데이터를 만들어 둔다.
+
+SYS@chicago> DROP TABLE system.ss_base PURGE;
+
+drop table system.ss_base purge
+                  *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+>>> 원인 파악
+
+-- 아직 만든 적이 없으니 당연하다.
+-- 스크립트를 반복 실행할 수 있게 하려고 DROP 을 먼저 넣었을 뿐이다.
+--
+-- ★ 실습 스크립트에서 자주 쓰는 방식이다.
+--   첫 실행에서는 이 오류가 나고 두 번째부터는 나지 않는다.
+--   오류지만 문제가 아닌 경우를 구별할 줄 알아야 한다.
+
+>>> 조치
+
+SYS@chicago> CREATE TABLE system.ss_base(id NUMBER, tag VARCHAR2(30));
+
+Table created.
+
+SYS@chicago> INSERT INTO system.ss_base VALUES(1,'before-snapshot');
+
+1 row created.
+
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+>>> 재확인
+
+SYS@chicago> SELECT id, tag FROM system.ss_base;
+
+        ID TAG
+---------- ------------------------------
+         1 before-snapshot
+
+1 row selected.
+
+-- 20초 뒤 Standby 에서
+
+SYS@boston> COL tag FOR a22
+SYS@boston> SELECT id, tag FROM system.ss_base ORDER BY id;
+
+        ID TAG
+---------- ----------------------
+         1 before-snapshot
+
+1 row selected.
+
+-- ★ 복제가 정상이다. 이 행이 실습 07 의 검증 기준이 된다.
+--
+--   실습 04 에서 이 행을 Snapshot Standby 에서 고칠 것이고
+--   실습 07 에서 되돌린 뒤 'before-snapshot' 으로 복귀했는지 본다.
+
+--------------------------------------------------------------------------------
+ [5] 전환 전 점검표
+--------------------------------------------------------------------------------
+
+-- ★ 실무에서는 다음 다섯 가지를 확인하고 시작한다.
+--
+--   ① FRA 에 여유가 있는가
+--      → V$RECOVERY_FILE_DEST 로 확인. 시험 규모를 가늠해 판단
+--
+--   ② 다른 Standby 가 있는가
+--      → 전환한 Standby 는 재해 복구 대상이 아니다
+--        Standby 가 하나뿐이면 그동안 보호가 없다
+--
+--   ③ 언제까지 쓸 것인가
+--      → 길수록 리두가 쌓이고 복귀 후 따라잡는 시간이 길어진다
+--
+--   ④ 남길 것은 무엇인가
+--      → 되돌리면 전부 사라진다. 결과는 미리 밖으로 뺀다
+--
+--   ⑤ 알림은 했는가
+--      → ADG 조회 서비스를 받던 사용자가 있다면 그동안 쓸 수 없다
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① 출발 상태 — PHYSICAL STANDBY / READ ONLY WITH APPLY / MRP0 APPLYING_LOG
+--   ② FLASHBACK_ON 은 NO 인데도 전환할 수 있다
+--   ③ FRA 15,360MB 중 1,536MB 사용. FLASHBACK LOG 항목은 아직 없다
+--   ④ 비교 기준 데이터 system.ss_base 를 심었다
+--   ⑤ 전환 전 점검 다섯 가지
+--
+-- ★ 다음 실습에서 전환한다. 먼저 실패해 본다.

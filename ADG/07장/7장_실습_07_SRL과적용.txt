@@ -1,0 +1,379 @@
+================================================================================
+ 제7장 실습 07 — SRL 과 적용의 관계
+ 대상   : boston-srv Standby
+ 목표   : SRL 을 지웠다 복구하며 적용과의 관계를 확인하고,
+          ORA-00261 과 ORA-01184 를 재현한다. OMF 이름 변화도 관찰한다
+ 소요   : 약 35분
+ 경고   : SRL 을 실제로 지운다. 개인 실습 환경에서만 수행한다
+ 변경   : SRL 을 지웠다가 복구한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 현재 SRL 상태
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> SELECT group#, thread#, sequence#, status FROM v$standby_log
+  2            ORDER BY group#;
+
+    GROUP#    THREAD#  SEQUENCE# STATUS
+---------- ---------- ---------- ----------
+         4          1          0 UNASSIGNED
+         5          1         71 ACTIVE
+         6          1          0 UNASSIGNED
+         7          1          0 UNASSIGNED
+
+4 rows selected.
+
+-- ★ 5번만 ACTIVE 다. 지금 리두를 받고 있는 자리다.
+--   나머지 셋은 UNASSIGNED — 비어 있는 여유 그룹이다.
+--
+-- ★ 적용을 멈췄는데도 ACTIVE 가 남아 있다.
+--   적용(MRP)과 수신(RFS)은 별개이기 때문이다.
+--   MRP 를 멈춰도 RFS 는 계속 받는다. 받아서 SRL 에 쌓아 둔다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 ① — ACTIVE 인 SRL 을 지우면
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE DROP STANDBY LOGFILE GROUP 4;
+
+Database altered.
+
+SYS@boston> ALTER DATABASE DROP STANDBY LOGFILE GROUP 5;
+
+alter database drop standby logfile group 5
+*
+ERROR at line 1:
+ORA-00261: log 5 of thread 1 is being archived or modified
+ORA-00312: online log 5 thread 1: '/u03/app/oracle/oradata/BOSTON/onlinelog/o1_mf_5_o8z3jwn7_.log'
+ORA-00312: online log 5 thread 1: '/u03/app/oracle/fast_recovery_area/BOSTON/onlinelog/o1_mf_5_o8z3jxfj_.log'
+
+SYS@boston> ALTER DATABASE DROP STANDBY LOGFILE GROUP 6;
+
+Database altered.
+
+SYS@boston> ALTER DATABASE DROP STANDBY LOGFILE GROUP 7;
+
+Database altered.
+
+SYS@boston> SELECT COUNT(*) srl_left FROM v$standby_log;
+
+  SRL_LEFT
+----------
+         1
+
+1 row selected.
+
+>>> 원인 파악
+    ORA-00261 은 "아카이브 중이거나 변경 중인 로그"라는 뜻이다.
+    5번은 [1] 에서 확인한 대로 ACTIVE 상태였다.
+    지금 리두를 받고 있는 자리이므로 지울 수 없다.
+
+    ★ ORA-00312 가 **두 줄**인 것에 주목한다.
+      4장에서 같은 오류를 만났을 때는 한 줄이었다.
+      **OMF 구성이라 그룹당 멤버가 두 개이기 때문이다** (6장).
+        하나는 oradata 아래, 다른 하나는 FRA 아래.
+
+      오류 메시지의 줄 수가 구성 방식을 드러내는 셈이다.
+
+    ★ 나머지 셋은 정상적으로 지워졌다.
+      그룹별로 따로 실행했기 때문에 하나가 실패해도 나머지는 성공했다.
+      4장에서 한 문장에 여러 그룹을 넣었다가 ORA-01184 로
+      전체가 실패한 것과 대조된다.
+
+>>> 조치
+    ACTIVE 인 그룹은 지금 지울 수 없다. 두 가지 길이 있다.
+      ① 그대로 둔다 — 이 실습에서는 이쪽을 택한다
+      ② Primary 에서 로그를 전환해 다른 그룹으로 넘어가기를 기다린 뒤 지운다
+
+>>> 재확인
+    SRL 이 하나만 남았다. 이 상태로 적용을 기동해 본다.
+
+--------------------------------------------------------------------------------
+ [3] SRL 하나로 적용해 보기
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+SYS@boston> COL recovery_mode FOR a30
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ------------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+
+1 row selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         71
+
+1 row selected.
+
+-- ★ SRL 이 하나뿐인데 실시간 적용이 유지된다.
+--   4장에서 확인한 사실과 같다.
+--
+-- 기능 시험으로 확인한다. 로그를 전환하지 않고 커밋한다.
+
+SYS@chicago> CREATE TABLE system.rt_test2(id NUMBER, tag VARCHAR2(30));
+
+Table created.
+
+SYS@chicago> INSERT INTO system.rt_test2 VALUES(1,'srl-none');
+
+1 row created.
+
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+-- 40초 뒤
+
+SYS@boston> SELECT COUNT(*) FROM system.rt_test2;
+
+  COUNT(*)
+----------
+         1
+
+1 row selected.
+
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+-- ★ 보인다. **SRL 이 하나여도 실시간 적용은 동작한다.**
+--
+-- ★ 그렇다면 4장의 "온라인 그룹 + 1" 규칙은 무엇인가?
+--   실시간 적용의 **최소 요건이 아니라 여유를 위한 권장**이다.
+--
+--   하나만으로 운영하면 그 하나가 아카이브되는 동안 받을 자리가 없어져
+--   전송이 대기한다. 부하가 몰리면 그만큼 지연이 쌓인다.
+--   여유 그룹이 있으면 아카이브와 수신이 겹칠 수 있다.
+
+SYS@chicago> SELECT dest_id, status, error FROM v$archive_dest_status WHERE dest_id=2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ------------
+         2 VALID
+
+1 row selected.
+
+-- Primary 쪽 목적지도 정상이다. 실습 환경의 부하가 가벼워
+-- SRL 하나로도 병목이 드러나지 않았다.
+
+--------------------------------------------------------------------------------
+ [4] 로그를 전환하면
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+-- 25초 뒤
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      WAIT_FOR_LOG         72
+
+1 row selected.
+
+-- 72번을 기다린다. 71번까지 적용을 마쳤다.
+-- SRL 이 하나여도 전환과 적용이 정상적으로 이어졌다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 ② — SRL 복구 중 만나는 오류
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1 GROUP 4 SIZE 200M;
+
+Database altered.
+
+SYS@boston> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1 GROUP 5 SIZE 200M;
+
+alter database add standby logfile thread 1 group 5 size 200m
+*
+ERROR at line 1:
+ORA-01184: logfile group 5 already exists
+
+SYS@boston> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1 GROUP 6 SIZE 200M;
+
+Database altered.
+
+SYS@boston> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1 GROUP 7 SIZE 200M;
+
+Database altered.
+
+>>> 원인 파악
+    5번은 [2] 에서 지워지지 않았으므로 그대로 있다.
+    이미 있는 그룹 번호로 추가하려 하니 거부된 것이다.
+
+    ★ 그룹별로 따로 실행한 덕분에 나머지 셋은 성공했다.
+      4장에서 여러 그룹을 한 문장에 넣었다가 이 오류로 **전체가 실패**한 적이 있다.
+      같은 오류가 나도 결과가 다르다.
+
+    ★ 실무 규칙 — **그룹별로 따로 실행한다.**
+      한 문장에 넣으면 부분 실패 시 전부 되돌아간다.
+      스크립트가 길어져도 이쪽이 안전하다.
+
+>>> 조치
+    5번은 이미 있으므로 아무것도 하지 않는다. 나머지 셋만 만들면 된다.
+
+>>> 재확인
+
+SYS@boston> SELECT group#, bytes/1024/1024 mb, status FROM v$standby_log
+  2            ORDER BY group#;
+
+    GROUP#         MB STATUS
+---------- ---------- ----------
+         4        200 UNASSIGNED
+         5        200 UNASSIGNED
+         6        200 UNASSIGNED
+         7        200 UNASSIGNED
+
+4 rows selected.
+
+    네 그룹이 모두 200MB 로 복구되었다.
+
+--------------------------------------------------------------------------------
+ [6] OMF 이름으로 생성 시점을 구분한다
+--------------------------------------------------------------------------------
+
+SYS@boston> COL member FOR a72
+SYS@boston> SELECT group#, member FROM v$logfile WHERE type='STANDBY'
+  2            ORDER BY group#;
+
+    GROUP# MEMBER
+---------- ------------------------------------------------------------------------
+         4 /u03/app/oracle/oradata/BOSTON/onlinelog/o1_mf_4_o8z636ks_.log
+         4 /u03/app/oracle/fast_recovery_area/BOSTON/onlinelog/o1_mf_4_o8z636n4_.log
+         5 /u03/app/oracle/oradata/BOSTON/onlinelog/o1_mf_5_o8z3jwn7_.log
+         5 /u03/app/oracle/fast_recovery_area/BOSTON/onlinelog/o1_mf_5_o8z3jxfj_.log
+         6 /u03/app/oracle/fast_recovery_area/BOSTON/onlinelog/o1_mf_6_o8z63708_.log
+         6 /u03/app/oracle/oradata/BOSTON/onlinelog/o1_mf_6_o8z636x2_.log
+         7 /u03/app/oracle/oradata/BOSTON/onlinelog/o1_mf_7_o8z638v0_.log
+         7 /u03/app/oracle/fast_recovery_area/BOSTON/onlinelog/o1_mf_7_o8z639bt_.log
+
+8 rows selected.
+
+-- ★ 유일 문자열을 보면 생성 시점이 갈린다.
+--
+--   그룹 5 : o8z3jwn7 / o8z3jxfj   ← 6장 DUPLICATE 때 만들어진 것
+--   그룹 4 : o8z636ks / o8z636n4   ← 방금 만든 것
+--   그룹 6 : o8z636x2 / o8z63708   ← 방금
+--   그룹 7 : o8z638v0 / o8z639bt   ← 방금
+--
+--   앞부분 o8z3 과 o8z63 이 다르다. 시간 기반 문자열이기 때문이다.
+--
+-- ★ **이름만 보고도 어느 것이 언제 만들어졌는지 알 수 있다.**
+--   6장에서 OMF 이름의 가독성을 단점으로 꼽았는데,
+--   이런 국면에서는 오히려 도움이 된다.
+--   경로 지정 방식이었다면 이름이 같아 구분할 수 없었을 것이다.
+--
+-- ★ 새로 만든 그룹도 자동으로 두 곳에 다중화되었다.
+--   경로를 주지 않았는데 oradata 와 FRA 양쪽에 만들어졌다.
+--   6장에서 확인한 규칙이 그대로 적용된다.
+
+--------------------------------------------------------------------------------
+ [7] 원상 복구와 최종 확인
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+SYS@chicago> DROP TABLE system.rt_test2 PURGE;
+
+Table dropped.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+-- 25초 뒤
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> COL recovery_mode FOR a30
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id<=2;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ------------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+         2 VALID     IDLE
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         73
+
+SYS@boston> SELECT group#, sequence#, status FROM v$standby_log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------
+         4         73 ACTIVE
+         5          0 UNASSIGNED
+         6          0 UNASSIGNED
+         7          0 UNASSIGNED
+
+4 rows selected.
+
+-- ★ 이번에는 4번이 ACTIVE 다. 새로 만든 그룹이 쓰이기 시작했다.
+--   SRL 은 번호 순서대로 쓰이는 것이 아니라 비어 있는 것을 골라 쓴다.
+
+SYS@chicago> SELECT dest_id, status FROM v$archive_dest_status WHERE dest_id<=2;
+
+   DEST_ID STATUS
+---------- ---------
+         1 VALID
+         2 VALID
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+  · MRP 를 멈춰도 RFS 는 계속 받는다. 적용과 수신은 별개다
+  · ACTIVE 인 SRL 은 지울 수 없다 — ORA-00261 + ORA-00312
+  · OMF 구성이라 ORA-00312 가 두 줄이다. 메시지가 구성을 드러낸다
+  · SRL 이 하나여도 실시간 적용은 동작한다. 개수 규칙은 여유를 위한 권장이다
+  · 이미 있는 그룹 번호로 추가 → ORA-01184
+  · 그룹별로 따로 실행하면 하나가 실패해도 나머지는 성공한다
+  · OMF 유일 문자열로 생성 시점을 구분할 수 있다
+  · SRL 은 번호 순이 아니라 비어 있는 것을 골라 쓴다
+
+================================================================================
+ 실습 07 종료 — SRL 4그룹 복구, 실시간 적용 복귀. 7장 완료.
+================================================================================

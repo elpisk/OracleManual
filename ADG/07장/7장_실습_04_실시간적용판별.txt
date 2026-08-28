@@ -1,0 +1,302 @@
+================================================================================
+ 제7장 실습 04 — 실시간 적용 판별
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : RECOVERY_MODE 열과 기능 시험으로 실시간 적용 여부를 판별하고,
+          19c 에서 USING CURRENT LOGFILE 이 무엇을 바꾸는지 실측한다
+ 소요   : 약 35분
+ 변경   : Primary 에 테스트 테이블을 만들었다가 지운다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 판별 방법 두 가지
+--------------------------------------------------------------------------------
+
+  ① RECOVERY_MODE 열
+       SELECT recovery_mode FROM v$archive_dest_status WHERE dest_id=1;
+
+       MANAGED REAL TIME APPLY   실시간 적용
+       MANAGED                   아카이브 적용
+       IDLE                      적용하지 않음 (또는 목적지가 유효하지 않음)
+
+  ② 기능 시험
+       로그를 전환하지 않고 커밋한 데이터가 Standby 에서 보이는가
+
+  ★ ①만 믿기 어려운 상황을 실습 03 에서 보았다.
+    목적지가 BAD PARAM 이면 실제로 적용 중이어도 IDLE 로 나온다.
+    그래서 ②가 필요하다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 준비 단계에서 만나는 오류
+--------------------------------------------------------------------------------
+
+-- 시험용 테이블을 만든다. 이전 실행의 잔재가 있을 수 있으니 먼저 지운다.
+
+SYS@chicago> DROP TABLE system.rt_test PURGE;
+
+drop table system.rt_test purge
+                  *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+>>> 원인 파악
+    그런 테이블이 없다는 뜻이다. 처음 실행이므로 당연하다.
+
+    ★ 이 오류를 무시해도 되는 경우와 아닌 경우를 구분해야 한다.
+      정리 목적의 DROP 이라면 무시해도 된다.
+      반드시 있어야 할 테이블을 조회하다 나온 것이라면 문제다.
+
+    ★ 스크립트에서 이 오류를 피하려면 두 가지 방법이 있다.
+        ① 예외를 무시하도록 PL/SQL 블록으로 감싼다
+        ② SQL*Plus 에서 WHENEVER SQLERROR CONTINUE 로 그 구간만 넘긴다
+
+>>> 조치
+    테이블을 만든다.
+
+SYS@chicago> CREATE TABLE system.rt_test(id NUMBER, tag VARCHAR2(30), ts TIMESTAMP);
+
+Table created.
+
+SYS@chicago> INSERT INTO system.rt_test VALUES(0,'baseline',SYSTIMESTAMP);
+
+1 row created.
+
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+>>> 재확인
+
+SYS@chicago> SELECT COUNT(*) FROM system.rt_test;
+
+  COUNT(*)
+----------
+         1
+
+-- Standby 에 전달되었는지 확인한다. 로그를 한 번 전환해 확실히 보낸다.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+-- 20초 뒤
+
+SYS@boston> SELECT COUNT(*) FROM system.rt_test;
+
+  COUNT(*)
+----------
+         1
+
+1 row selected.
+
+-- ★ Standby 에서 조회가 된다는 것 자체가 Active Data Guard 의 증거다.
+--   MOUNTED 상태였다면 이 조회가 불가능하다.
+
+--------------------------------------------------------------------------------
+ [3] 시험 A — USING CURRENT LOGFILE 없이 기동
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            DISCONNECT FROM SESSION;
+
+Database altered.
+
+SYS@boston> COL recovery_mode FOR a30
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ------------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+
+1 row selected.
+
+-- ★★ **예상과 다르다.**
+--   USING CURRENT LOGFILE 을 주지 않았는데 MANAGED REAL TIME APPLY 다.
+--   오래된 문서대로라면 그냥 MANAGED 여야 한다.
+--
+--   열 값만으로는 확신할 수 없으니 기능 시험으로 확인한다.
+
+-- Primary 에서 커밋한다. **로그를 전환하지 않는다.**
+
+SYS@chicago> INSERT INTO system.rt_test VALUES(1,'no-switch-archmode',SYSTIMESTAMP);
+
+1 row created.
+
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+SYS@chicago> SELECT COUNT(*) FROM system.rt_test;
+
+  COUNT(*)
+----------
+         2
+
+-- 40초 기다린 뒤 Standby 를 본다.
+
+SYS@boston> SELECT COUNT(*) FROM system.rt_test;
+
+  COUNT(*)
+----------
+         2
+
+1 row selected.
+
+-- ★★ **보인다.** 로그를 전환하지 않았는데 적용되었다.
+--   즉 실제로 실시간 적용이 일어나고 있다.
+--   RECOVERY_MODE 열이 거짓말을 한 것이 아니었다.
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+--------------------------------------------------------------------------------
+ [4] 시험 B — USING CURRENT LOGFILE 로 기동
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ------------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+
+1 row selected.
+
+SYS@chicago> INSERT INTO system.rt_test VALUES(2,'no-switch-rtmode',SYSTIMESTAMP);
+
+1 row created.
+
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+-- 20초 뒤
+
+SYS@boston> SELECT id, tag FROM system.rt_test ORDER BY id;
+
+        ID TAG
+---------- ------------------------------
+         0 baseline
+         1 no-switch-archmode
+         2 no-switch-rtmode
+
+3 rows selected.
+
+SYS@boston> SELECT process, status, sequence#, block# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#     BLOCK#
+--------- ------------ ---------- ----------
+MRP0      APPLYING_LOG         70        150
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [5] 두 시험의 대조
+--------------------------------------------------------------------------------
+
+  기동 명령                        RECOVERY_MODE            전환 없이 커밋한 행
+  -------------------------------- ------------------------ --------------------
+  ... DISCONNECT FROM SESSION      MANAGED REAL TIME APPLY  보인다 (40초 내)
+  ... USING CURRENT LOGFILE ...    MANAGED REAL TIME APPLY  보인다 (20초 내)
+
+  ★★ **두 명령의 결과가 같다.**
+
+  이유는 SRL 이 구성되어 있기 때문이다.
+  12.2 이후 오라클은 SRL 이 있으면 실시간 적용을 기본으로 켠다.
+  USING CURRENT LOGFILE 은 하위 호환을 위해 여전히 받아들여지지만
+  동작을 바꾸지 않는다.
+
+  ★ 실무에서 이것이 뜻하는 두 가지
+    ① 오래된 절차서에서 USING CURRENT LOGFILE 이 빠졌다고 해서
+       아카이브 적용으로 도는 것은 아니다. 확인 없이 단정하지 않는다.
+    ② **그럼에도 명시하는 편이 낫다.**
+       명령을 읽는 사람에게 의도를 알려 주고,
+       SRL 이 없는 환경으로 옮겼을 때 동작이 조용히 달라지는 것을 막는다.
+
+  ★ 4장의 관찰과 이어진다.
+    그때 SRL 이 하나뿐이어도 실시간 적용이 시작되는 것을 확인했다.
+    실습 07 에서 SRL 을 줄여 다시 확인한다.
+
+--------------------------------------------------------------------------------
+ [6] 기능 시험을 쓸 때의 주의
+--------------------------------------------------------------------------------
+
+  ① Primary 에 쓰기가 발생한다
+     운영 데이터베이스에서는 신중해야 한다.
+     전용 스키마에 작은 테이블을 두고 id 와 타임스탬프만 넣는 정도로 최소화한다.
+
+  ② 정리를 잊지 않는다
+     시험이 끝나면 테이블을 지운다. 지우는 것도 리두를 만들어 Standby 에 반영된다.
+
+  ③ 충분히 기다린다
+     실측에서 실시간 적용은 20초, 아카이브 적용으로 기동했을 때도 40초 안에 보였다.
+     5초 만에 확인하고 "안 보인다"고 판단하면 잘못된 결론에 이른다.
+
+  ★ Active Data Guard 가 아니면 이 시험 자체가 불가능하다.
+    MOUNTED 상태에서는 조회할 수 없기 때문이다.
+    그 경우에는 다음을 조합해 간접 판단한다.
+      · V$MANAGED_STANDBY 의 RFS 와 MRP0 시퀀스 비교 (실습 01)
+      · RECOVERY_MODE 열
+      · V$DATAGUARD_STATS 의 추세 (실습 06)
+
+--------------------------------------------------------------------------------
+ [7] 정리
+--------------------------------------------------------------------------------
+
+SYS@chicago> DROP TABLE system.rt_test PURGE;
+
+Table dropped.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+-- 20초 뒤 최종 확인
+
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id<=2;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ------------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+         2 VALID     IDLE
+
+  · 판별은 RECOVERY_MODE 열과 기능 시험 두 가지로 한다
+  · 목적지가 BAD PARAM 이면 열을 믿을 수 없다 (실습 03)
+  · 19c 에서는 SRL 이 있으면 USING CURRENT LOGFILE 없이도 실시간 적용이다
+  · 그럼에도 명시하는 편이 낫다 — 의도 표현과 환경 이동 대비
+  · 기능 시험은 확실하지만 Primary 에 쓰기가 발생한다. 신중히 쓴다
+  · 충분히 기다린다. 실측 20~40초
+
+================================================================================
+ 실습 04 종료 — 테스트 테이블 제거 완료. 기준 상태로 복귀했다.
+================================================================================

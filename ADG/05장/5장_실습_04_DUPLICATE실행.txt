@@ -1,0 +1,291 @@
+================================================================================
+ 제5장 실습 04 — RMAN DUPLICATE 실행
+ 대상   : chicago-srv 에서 실행 (target=chicago, auxiliary=boston)
+ 목표   : DUPLICATE 스크립트를 실행해 Physical Standby 를 만든다.
+          진행 로그를 단계별로 읽는 법을 익힌다
+ 소요   : 약 40분 (복제 자체는 3~5분, 로그 읽기가 대부분)
+ 전제   : 실습 03 이 끝나 boston 이 NOMOUNT 로 떠 있어야 한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 스크립트 확인
+--------------------------------------------------------------------------------
+
+[oracle@chicago-srv ~]$ cat /home/oracle/dup_boston.rman
+
+run
+{
+  allocate channel c1 type disk;
+  allocate channel c2 type disk;
+  allocate auxiliary channel sby type disk;
+
+  duplicate target database for standby from active database
+  DORECOVER
+  spfile
+    parameter_value_convert 'chicago','boston'
+    set db_name           = 'chicago'
+    set db_unique_name    = 'boston'
+    set audit_file_dest   = '/u01/app/oracle/admin/boston/adump'
+    set diagnostic_dest   = '/u01/app/oracle/'
+    set db_file_name_convert =
+      '/u03/app/oracle/oradata/Chicago/',
+      '/u03/app/oracle/oradata/Boston/datafile/'
+    set log_file_name_convert =
+      '/u03/app/oracle/oradata/Chicago/',
+      '/u03/app/oracle/oradata/Boston/onlinelog/'
+    set control_files =
+      '/u03/app/oracle/oradata/Boston/controlfile/control_standby01.ctl'
+    set log_archive_dest_2 =
+      'service=chicago async valid_for=(online_logfile,primary_role)
+       db_unique_name=chicago'
+    set log_archive_max_processes = '4'
+    set fal_server          = 'chicago'
+    set standby_file_management = 'AUTO'
+    set log_archive_config  = 'dg_config=(chicago,boston)'
+    nofilenamecheck;
+
+  sql channel sby
+    "alter database recover managed standby database disconnect from session";
+}
+
+-- 실행 전에 세 곳을 확인한다.
+--   ① nofilenamecheck 가 있는가        — 없으면 실습 05 의 RMAN-05001
+--   ② set db_name = 'chicago' 가 있는가 — 없으면 boston 으로 바뀌어 버린다
+--   ③ 두 convert 의 목적지가 다른가     — datafile/ 과 onlinelog/
+
+--------------------------------------------------------------------------------
+ [2] 실행
+--------------------------------------------------------------------------------
+
+[oracle@chicago-srv ~]$ rman target "'sys/oracle@chicago as sysdba'" \
+>   auxiliary "'sys/oracle@boston as sysdba'" \
+>   cmdfile=/home/oracle/dup_boston.rman > /home/oracle/dup_boston.log 2>&1
+[oracle@chicago-srv ~]$ echo "rc=$?"
+rc=0
+
+-- ★ rc=0 이 첫 번째 성공 신호다.
+--   RMAN 은 오류가 있으면 0 이 아닌 값을 돌려준다.
+--   실습 05 의 실패에서는 rc=1 이었다.
+--
+-- 로그를 파일로 받는 이유는 분량 때문이다. 이번 실행의 로그는 418줄이다.
+-- 화면으로 흘려보내면 나중에 확인할 수 없다.
+
+--------------------------------------------------------------------------------
+ [3] 로그 골격 확인 — 먼저 큰 줄기부터
+--------------------------------------------------------------------------------
+
+[oracle@chicago-srv ~]$ grep -nE 'Starting Duplicate|Finished Duplicate|RMAN-|ORA-|released channel' \
+>   /home/oracle/dup_boston.log
+
+54:Starting Duplicate Db at 27-AUG-26
+413:Finished Duplicate Db at 27-AUG-26
+416:released channel: c1
+417:released channel: c2
+418:released channel: sby
+
+-- ★ 이 다섯 줄이 이 실습의 결론이다.
+--
+--   RMAN- 으로 시작하는 줄이 **하나도 없다.**
+--   ORA- 로 시작하는 줄도 **하나도 없다.**
+--   Starting 과 Finished 가 짝을 이룬다.
+--   채널 세 개가 모두 정상 해제되었다.
+--
+--   실패한 실행에서는 이 grep 이 RMAN-00571, RMAN-03002, ORA-19505 같은
+--   줄을 잔뜩 뱉는다. 실습 05 에서 비교한다.
+--
+-- ★ 로그를 읽는 순서를 익혀 둔다.
+--   ① 먼저 이 grep 으로 오류 유무를 본다 (5초)
+--   ② 오류가 없으면 Finished 줄만 확인하고 끝낸다
+--   ③ 오류가 있으면 그 줄 번호 앞뒤 30줄을 본다
+--   418줄을 처음부터 읽는 것은 마지막 수단이다.
+
+--------------------------------------------------------------------------------
+ [4] 로그의 끝부분
+--------------------------------------------------------------------------------
+
+[oracle@chicago-srv ~]$ tail -12 /home/oracle/dup_boston.log
+
+deleted archived log
+archived log file name=/u01/app/oracle/product/19.3.0/dbhome_1/dbs/arch1_56_1242322892.dbf RECID=1 STAMP=1242379585
+deleted archived log
+archived log file name=/u01/app/oracle/product/19.3.0/dbhome_1/dbs/arch1_57_1242322892.dbf RECID=2 STAMP=1242379585
+Deleted 2 objects
+
+Finished Duplicate Db at 27-AUG-26
+
+sql statement: alter database recover managed standby database disconnect from session
+released channel: c1
+released channel: c2
+released channel: sby
+
+-- 세 가지를 읽는다.
+--
+-- ① deleted archived log ... arch1_56, arch1_57
+--    DORECOVER 를 위해 Primary 에서 두 개의 아카이브 로그를 Standby 로
+--    보내 복구에 쓰고, 다 쓴 뒤 지운 것이다.
+--    경로가 $ORACLE_HOME/dbs 인 것에 주목한다. Standby 쪽에는 아직
+--    아카이브 목적지가 제대로 자리 잡기 전이라 기본 위치로 갔다.
+--    파일 이름의 1242322892 는 이 데이터베이스 incarnation 의 식별자다.
+--
+-- ② Finished Duplicate Db
+--    복제 완료. 이 줄이 없으면 성공이 아니다.
+--
+-- ③ sql statement: alter database recover managed standby database
+--       disconnect from session
+--    스크립트 마지막의 sql channel sby 절이 실행된 것이다.
+--    즉 **DUPLICATE 가 끝나면서 MRP 가 이미 기동되었다.**
+--    별도로 MRP 를 띄울 필요가 없다.
+
+--------------------------------------------------------------------------------
+ [5] 로그의 단계 구분
+--------------------------------------------------------------------------------
+
+  줄 번호   단계                              내용
+  --------- --------------------------------- -----------------------------
+  1~53      접속과 스크립트 해석              채널 할당
+  54        Starting Duplicate Db             복제 시작
+  ~172      Primary 컨트롤 파일 스냅샷        snapcf_chicago.f 생성
+  ~200      Standby spfile 생성               set 절 반영
+  ~230      standby 컨트롤 파일 복원          control_standby01.ctl
+  ~250      alter database mount standby      Standby 마운트
+  276~400   데이터 파일 11개 전송             input/output 쌍이 반복된다
+  ~410      DORECOVER 복구                    아카이브 로그 적용 후 삭제
+  413       Finished Duplicate Db             완료
+  416~418   채널 해제                         c1, c2, sby
+
+-- 데이터 파일 전송 구간이 로그의 30% 를 차지한다.
+-- 파일 하나당 input / output 두 줄이 나온다.
+
+[oracle@chicago-srv ~]$ grep -n 'input datafile file number\|output file name' \
+>   /home/oracle/dup_boston.log | head -6
+
+172:output file name=/u01/app/oracle/product/19.3.0/dbhome_1/dbs/snapcf_chicago.f
+276:input datafile file number=00001 name=/u03/app/oracle/oradata/Chicago/system01.dbf
+278:input datafile file number=00003 name=/u03/app/oracle/oradata/Chicago/sysaux01.dbf
+279:output file name=/u03/app/oracle/oradata/Boston/datafile/sysaux01.dbf
+282:input datafile file number=00004 name=/u03/app/oracle/oradata/Chicago/undotbs01.dbf
+283:output file name=/u03/app/oracle/oradata/Boston/datafile/system01.dbf
+
+-- ★ 여기서 convert 규칙이 실제로 작동하는 것이 보인다.
+--     input  .../Chicago/sysaux01.dbf
+--     output .../Boston/datafile/sysaux01.dbf
+--   앞의 경로만 바뀌고 파일 이름은 그대로다.
+--
+-- ★ 순서가 뒤섞여 있는 것도 정상이다.
+--   276 에서 1번을 읽기 시작했는데 279 에서 3번이 먼저 끝났다.
+--   채널 두 개(c1, c2)가 동시에 도는 병렬 처리이기 때문이다.
+--   input 과 output 이 짝을 이루는지만 확인하면 된다.
+--
+-- 172 번의 snapcf_chicago.f 는 Primary 컨트롤 파일의 스냅샷이다.
+-- 운영 중인 컨트롤 파일을 그대로 읽으면 계속 바뀌므로 사본을 뜬 것이다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — 실행 중 Standby 인스턴스가 사라지면
+--------------------------------------------------------------------------------
+
+-- 복제 도중 Standby 쪽에 문제가 생기는 상황이 어떻게 보이는지 확인한다.
+
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of Duplicate Db command at 08/27/2026 09:21:47
+RMAN-05501: aborting duplication of target database
+RMAN-03015: error occurred in stored script Memory Script
+
+RMAN-03009: failure of backup command on c2 channel at 08/27/2026 09:21:47
+ORA-17628: Oracle error 19505 returned by remote Oracle server
+ORA-19505: failed to identify file ""
+
+>>> 원인 파악
+    오류 스택을 아래에서 위로 읽는다.
+
+      ORA-19505  파일을 식별할 수 없다  ← 가장 안쪽. 진짜 원인
+      ORA-17628  원격 서버가 19505 를 돌려주었다
+      RMAN-03009 c2 채널의 backup 명령이 실패했다
+      RMAN-05501 복제를 중단한다
+      RMAN-03002 Duplicate 명령이 실패했다  ← 가장 바깥. 결과일 뿐
+
+    ★ ORA-17628 의 "remote Oracle server" 가 방향을 알려 준다.
+      Primary 가 아니라 **Standby 쪽에서 난 오류**를 전달받았다는 뜻이다.
+      따라서 Standby 의 alert 로그를 봐야 한다.
+      Primary 로그만 뒤지면 원인을 찾을 수 없다.
+
+    ORA-19505 가 나오는 경우는 크게 둘이다.
+      ① Standby 인스턴스가 사라졌다 (shutdown abort 등)
+      ② Standby 에 파일을 쓸 수 없다 — 실습 05 에서 자세히 다룬다
+
+>>> 조치
+    DUPLICATE 는 중간에 실패하면 아무것도 정리해 주지 않는다.
+    반쯤 복제된 파일이 남아 있으므로 지우고 처음부터 다시 한다.
+
+[oracle@boston-srv ~]$ rm -rf /u03/app/oracle/oradata/Boston/datafile/*.dbf
+[oracle@boston-srv ~]$ rm -rf /u03/app/oracle/oradata/Boston/controlfile/*
+[oracle@boston-srv ~]$ rm -f $ORACLE_HOME/dbs/spfileboston.ora
+
+SYS@boston> STARTUP NOMOUNT PFILE='/u01/app/oracle/product/19.3.0/dbhome_1/dbs/initboston.ora'
+ORACLE instance started.
+
+>>> 재확인
+    다시 DUPLICATE 를 실행해 rc=0 과 Finished Duplicate Db 를 확인한다.
+
+[oracle@chicago-srv ~]$ echo "rc=$?"
+rc=0
+[oracle@chicago-srv ~]$ grep -c 'Finished Duplicate Db' /home/oracle/dup_boston.log
+1
+
+    ★ 재시도가 자유롭다는 것이 이 방식의 장점이다.
+      Primary 는 읽기만 하므로 몇 번을 실패해도 운영에 영향이 없다.
+
+--------------------------------------------------------------------------------
+ [7] 복제 직후 상태
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a10
+SYS@boston> SELECT dbid, name, db_unique_name, database_role, open_mode,
+  2                controlfile_type FROM v$database;
+
+      DBID NAME       DB_UNIQUE_NAME   DATABASE_ROLE    OPEN_MODE  CONTROLFILE_TYPE
+---------- ---------- ---------------- ---------------- ---------- ----------------
+1852041610 CHICAGO    boston           PHYSICAL STANDBY MOUNTED    STANDBY
+
+1 row selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      WAIT_FOR_LOG         58
+
+1 row selected.
+
+-- ★ 다섯 가지를 한 번에 확인한다.
+--
+--   DBID 1852041610          Primary 와 같다. for standby 의 효과다
+--   NAME CHICAGO             DB_NAME 은 그대로
+--   DB_UNIQUE_NAME boston    set 절이 반영되었다
+--   DATABASE_ROLE            PHYSICAL STANDBY
+--   CONTROLFILE_TYPE STANDBY standby 컨트롤 파일로 마운트되었다
+--
+--   MRP0 이 WAIT_FOR_LOG 로 이미 돌고 있다.
+--   스크립트 마지막의 sql channel sby 절 덕분이다.
+--   시퀀스 58 을 기다린다 — 57 번까지는 DORECOVER 로 적용을 마쳤다는 뜻이다.
+--
+-- ★ OPEN_MODE 는 아직 MOUNTED 다.
+--   Active Data Guard 로 만들려면 READ ONLY 로 열어야 한다.
+--   실습 06 에서 수행한다.
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+  · rc=0, RMAN-/ORA- 줄 없음, Finished Duplicate Db — 세 가지가 성공 조건이다
+  · DORECOVER 가 있으면 복제 직후 곧바로 최신 상태에 근접한다
+  · sql channel sby 절 덕분에 MRP 가 자동으로 기동된다
+  · 이 시점의 OPEN_MODE 는 MOUNTED — ADG 는 아직 아니다
+  · 오류 스택은 아래에서 위로 읽는다. ORA- 가 원인, RMAN- 이 결과다
+  · 실패해도 Primary 는 무사하다. 지우고 다시 하면 된다
+
+================================================================================
+ 실습 04 종료 — Standby 가 MOUNTED 상태로 만들어졌다. 실습 06 으로 이어진다.
+================================================================================

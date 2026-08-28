@@ -1,0 +1,282 @@
+================================================================================
+ 제3장 실습 05 — 패스워드 파일 불일치와 ORA-16191
+ 대상   : boston-srv (chicago-srv 에서 접속·전송 시도)
+ 목표   : 패스워드 파일이 어긋났을 때의 증상(ORA-01017 → ORA-16191)을 재현하고,
+          원인을 고쳐도 상태가 저절로 회복되지 않는다는 사실을 확인한다
+ 소요   : 약 30분
+ 경고   : 패스워드 파일을 지웠다 복원한다. 반드시 백업부터 한다.
+ 되돌리기 : 원본 패스워드 파일 복원 + 목적지 DEFER/ENABLE 로 상태 회복
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 현재 상태 확인
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL value FOR a20
+SYS@chicago> SELECT name, value FROM v$parameter
+  2            WHERE name = 'remote_login_passwordfile';
+
+NAME                        VALUE
+--------------------------- --------------------
+remote_login_passwordfile   EXCLUSIVE
+
+1 row selected.
+
+SYS@chicago> SELECT username, sysdba, sysoper, account_status FROM v$pwfile_users;
+
+USERNAME   SYSDB SYSOP ACCOUNT_STATUS
+---------- ----- ----- ------------------------------
+SYS        TRUE  TRUE  OPEN
+
+1 row selected.
+
+-- REMOTE_LOGIN_PASSWORDFILE = EXCLUSIVE 여야 원격 SYS 접속이 허용된다.
+-- NONE 이면 패스워드 파일을 아예 쓰지 않으므로 Data Guard 가 성립하지 않는다.
+
+[oracle@chicago-srv ~]$ ls -l $ORACLE_HOME/dbs/orapwchicago
+-rw-r-----. 1 oracle dba 2048 Aug 26 17:41 .../dbs/orapwchicago
+
+[oracle@boston-srv ~]$ ls -l $ORACLE_HOME/dbs/orapwboston
+-rw-r-----. 1 oracle dba 2048 Aug 26 17:55 .../dbs/orapwboston
+
+-- 파일 이름은 orapw<ORACLE_SID> 형식이라 서로 다르다.
+-- 그러나 안에 담긴 SYS 비밀번호는 같아야 한다.
+-- 그래서 설치 가이드가 Primary 의 파일을 복사해 이름만 바꾸도록 지시한다.
+
+-- 정상 상태에서는 원격 SYS 접속이 된다.
+
+[oracle@chicago-srv ~]$ sqlplus -s "sys/oracle@boston as sysdba"
+
+SQL> SELECT instance_name, status FROM v$instance;
+
+INSTANCE_NAME    STATUS
+---------------- ------------
+boston           OPEN
+
+SQL> EXIT
+
+--------------------------------------------------------------------------------
+ [2] 백업 후 재생성 시도 — 첫 번째 오류
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ cp $ORACLE_HOME/dbs/orapwboston /tmp/orapwboston.bak
+[oracle@boston-srv ~]$ rm -f $ORACLE_HOME/dbs/orapwboston
+[oracle@boston-srv ~]$ orapwd file=$ORACLE_HOME/dbs/orapwboston \
+> password=WrongPass123 force=y
+
+OPW-00029: Password complexity failed for SYS user :
+Password must contain at least 1 special character.
+
+
+>>> 원인 파악
+    OPW-00029 는 19c 의 비밀번호 복잡성 검사에 걸린 것이다.
+    'WrongPass123' 은 대소문자와 숫자를 포함하지만 특수문자가 없다.
+
+    ★ 여기서 더 중요한 것을 알아야 한다.
+      rm 은 이미 성공했고 orapwd 만 실패했다.
+      즉 지금 boston 에는 **패스워드 파일이 없는 상태**다.
+
+[oracle@boston-srv ~]$ ls -l $ORACLE_HOME/dbs/orapwboston
+ls: cannot access '.../dbs/orapwboston': No such file or directory
+
+    실무 교훈: 패스워드 파일을 다시 만들려다 실패하면
+    원래 파일이 이미 지워져 있을 수 있다.
+    작업 전에 반드시 백업해 두어야 하는 이유다. (위 [2] 첫 줄)
+
+    참고: 실습 환경의 SYS 비밀번호인 'oracle' 도 이 규칙을 통과하지 못한다.
+          그럼에도 쓰고 있는 것은 DBCA 로 생성할 때 만들어진 파일을
+          그대로 물려받았기 때문이다. orapwd 로 새로 만들 때만 검사가 걸린다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — ORA-01017
+--------------------------------------------------------------------------------
+
+[oracle@chicago-srv ~]$ sqlplus -s "sys/oracle@boston as sysdba"
+
+ERROR:
+ORA-01017: invalid username/password; logon denied
+
+SP2-0306: Invalid option.
+ERROR:
+ORA-01005: null password given; logon denied
+SP2-0157: unable to CONNECT to ORACLE after 3 attempts, exiting SQL*Plus
+
+-- 실제 원인은 첫 줄의 ORA-01017 이다. 나머지는 재시도 부산물이다.
+--
+-- Data Guard 맥락에서 ORA-01017 은 의미가 다르다.
+-- 사용자가 비밀번호를 틀린 것이 아니라 양쪽 패스워드 파일이 어긋난 것이다.
+-- (여기서는 한쪽 파일이 아예 없다)
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — ORA-16191 (리두 전송 실패)
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@chicago> COL error FOR a48
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id = 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ------------------------------------------------
+         2 VALID
+
+1 row selected.
+
+-- ★ 아직 VALID 다. 놀라지 말자.
+--   전송 시도가 실제로 일어나야 오류가 기록되기 때문이다.
+--   설정을 바꾼 직후에 한 번 조회하고 "문제없다" 고 판단하면 안 되는 이유다.
+
+-- 잠시 뒤 다시 조회한다.
+
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id = 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ------------------------------------------------
+         2 ERROR     ORA-16191: Primary log shipping client not
+                     logged on standby
+
+1 row selected.
+
+
+>>> 원인 파악
+    ORA-16191 = "Primary 의 로그 전송 클라이언트가 standby 에 로그온하지 못했다"
+
+    Data Guard 에서 패스워드 문제를 가리키는 대표 오류이며,
+    문면 자체가 원인을 정확히 말해 준다.
+    이 번호를 보면 네트워크나 리스너가 아니라 인증을 의심해야 한다.
+
+    확인 순서
+      ① tnsping 은 OK 인가          → 네트워크·리스너는 정상
+      ② 수동 SYS 접속은 되는가      → ORA-01017 이면 패스워드 파일
+      ③ 양쪽 파일이 존재하는가      → 이 경우 boston 쪽이 없었다
+
+>>> 조치 — 백업해 둔 원본을 복원한다
+
+[oracle@boston-srv ~]$ cp /tmp/orapwboston.bak $ORACLE_HOME/dbs/orapwboston
+[oracle@boston-srv ~]$ chmod 640 $ORACLE_HOME/dbs/orapwboston
+[oracle@boston-srv ~]$ ls -l $ORACLE_HOME/dbs/orapwboston
+-rw-r-----. 1 oracle dba 2048 Aug 26 19:52 .../dbs/orapwboston
+
+[oracle@chicago-srv ~]$ sqlplus -s "sys/oracle@boston as sysdba"
+
+SQL> SELECT instance_name, status FROM v$instance;
+
+INSTANCE_NAME    STATUS
+---------------- ------------
+boston           OPEN
+
+SQL> EXIT
+
+-- 원격 SYS 접속이 다시 된다. 원인은 제거됐다.
+
+--------------------------------------------------------------------------------
+ [5] 그런데 전송은 여전히 실패한다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id = 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ------------------------------------------------
+         2 ERROR     ORA-16191: Primary log shipping client not
+                     logged on standby
+
+1 row selected.
+
+
+>>> 원인 파악 (2차)
+    원인은 사라졌는데 오류가 남아 있다.
+    목적지가 실패 상태로 굳어 재시도를 하지 않기 때문이다.
+
+    ★ **원인을 제거한 것과 상태가 회복되는 것은 다른 일이다.**
+      Data Guard 문제 해결에서 반복해서 만나게 되는 원칙이며,
+      여기서 처음 부딪힌다.
+
+    REOPEN 속성으로 지정한 시간(기본 300초)이 지나면 자동으로 재시도하기도 하지만,
+    즉시 회복하려면 목적지를 껐다 켜는 편이 확실하다.
+
+>>> 조치 — 목적지를 DEFER 했다가 ENABLE 한다
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_state_2=DEFER SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_state_2=ENABLE SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+>>> 재확인
+
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id <= 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ------------------------------------------------
+         1 VALID
+         2 VALID
+
+2 rows selected.
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2             WHERE process IN ('MRP0','RFS') ORDER BY process;
+
+PROCESS   STATUS       SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         50
+RFS       IDLE                 50
+RFS       IDLE                  0
+RFS       IDLE                  0
+RFS       IDLE                  0
+RFS       IDLE                  0
+
+6 rows selected.
+
+[oracle@boston-srv ~]$ rm -f /tmp/orapwboston.bak
+
+--------------------------------------------------------------------------------
+ [6] 패스워드 파일 점검 목록
+--------------------------------------------------------------------------------
+
+  ① REMOTE_LOGIN_PASSWORDFILE 이 양쪽 모두 EXCLUSIVE 인가
+  ② 파일 이름이 orapw<ORACLE_SID> 형식인가 (boston 노드는 orapwboston)
+  ③ 파일 권한이 640, 소유자가 oracle 인가
+  ④ 실제로 원격 SYS 접속이 되는가  ← 가장 확실한 검증
+  ⑤ SYS 비밀번호를 바꿨다면 **양쪽 파일을 모두** 다시 만들었는가
+  ⑥ sqlnet.ora 의 SQLNET.ALLOWED_LOGON_VERSION_* 이 양쪽에서 같은가
+     — 다르면 파일이 같아도 ORA-01017 이 날 수 있다
+  ⑦ 작업 전 백업했는가 — orapwd 가 실패해도 rm 은 이미 성공한 뒤일 수 있다
+
+  주의: md5sum 대조는 참고용이다. 파일 안에 DB 식별 정보가 들어가므로
+        같은 비밀번호라도 해시가 다를 수 있다. 확실한 검증은 실제 접속이다.
+
+SYS@chicago> EXIT
+SYS@boston> EXIT
+
+================================================================================
+ 실습 05 종료
+ 원복 확인 : orapwboston 원본 복원, 원격 SYS 접속 정상,
+             dest_1/dest_2 모두 VALID, 두 lag 0, 임시 백업 제거 완료
+================================================================================

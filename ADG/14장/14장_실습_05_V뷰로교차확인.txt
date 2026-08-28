@@ -1,0 +1,261 @@
+================================================================================
+ 제14장 실습 05 — V$ 뷰로 교차 확인
+ 대상   : chicago-srv, boston-srv
+ 목표   : Broker 가 보여 주는 요약을 SQL 로 다시 확인한다.
+          뷰마다 어느 쪽에서 조회해야 하는지 구별한다
+ 소요   : 약 30분
+ 변경   : 없음 (전부 조회)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 왜 SQL 로도 봐야 하는가
+--------------------------------------------------------------------------------
+
+-- ★ 이유가 셋이다.
+--
+--   ① DGMGRL 을 쓸 수 없는 환경이 있다.
+--      감시 도구가 JDBC 로만 붙는 경우가 그렇다.
+--
+--   ② Broker 의 요약은 계산된 값이다.
+--      원자료를 보면 왜 그런 값이 나왔는지 알 수 있다.
+--
+--   ③ Broker 가 알려 주지 않는 것이 있다.
+--      실습 02 에서 확인한 대로다.
+--
+-- ★ 이 실습에서 뷰 셋을 본다.
+--
+--   V$DATAGUARD_STATUS   사건의 흐름
+--   V$DATAGUARD_STATS    지연과 시간 추정
+--   V$DG_BROKER_CONFIG   구성 자체
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 뷰 이름을 틀리면
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT name, value FROM v$dataguard_stat;
+
+select name, value from v$dataguard_stat
+                        *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+>>> 원인 파악
+
+-- ★ 끝의 s 를 빠뜨렸다.
+--
+-- ★ 이름이 헷갈리는 이유가 있다. 셋이 비슷하다.
+--
+--   V$DATAGUARD_STATUS   상태 메시지 (단수형 STATUS)
+--   V$DATAGUARD_STATS    통계 (복수형 STATS)
+--   V$DG_BROKER_CONFIG   구성 (DATAGUARD 가 아니라 DG)
+--
+--   STATUS 와 STATS 는 한 글자 차이이고 뜻은 전혀 다르다.
+--
+-- ★ ORA-00942 는 권한이 없을 때도 나온다.
+--   SYSDBA 가 아닌 감시 계정으로 붙었다면 이름이 맞아도 이 오류다.
+--   이름을 의심하기 전에 접속 계정을 먼저 본다.
+
+>>> 조치
+
+SYS@boston> SELECT view_name FROM dba_views WHERE view_name LIKE 'V_$DATAGUARD%';
+
+-- 딕셔너리에서 이름을 확인한다.
+-- V$ 뷰의 실제 이름은 V_$ 로 시작한다는 점에 주의한다.
+
+>>> 재확인
+
+SYS@boston> COL name FOR a24
+SYS@boston> COL value FOR a22
+SYS@boston> COL unit FOR a26
+SYS@boston> SELECT name, value, unit FROM v$dataguard_stats;
+
+NAME                     VALUE                  UNIT
+------------------------ ---------------------- --------------------------
+transport lag            +00 00:00:00           day(2) to second(0) interval
+apply lag                +00 00:00:00           day(2) to second(0) interval
+apply finish time        +00 00:00:00.000       day(2) to second(3) interval
+estimated startup time   11                     second
+
+4 rows selected.
+
+-- ★ 네 개다. 7장부터 두 개만 봐 왔다.
+
+--------------------------------------------------------------------------------
+ [3] 뒤의 두 항목
+--------------------------------------------------------------------------------
+
+-- ★ apply finish time
+--   밀린 리두를 다 적용하는 데 걸릴 예상 시간이다.
+--   지금은 밀린 것이 없으므로 0 이다.
+--   실습 04 에서 지연을 걸었을 때라면 값이 있었을 것이다.
+--
+-- ★ estimated startup time = 11 초
+--   인스턴스를 기동하는 데 걸릴 예상 시간이다.
+--
+-- ★ 두 값을 더하면 Failover 에 걸릴 시간의 근사치가 된다.
+--
+--   밀린 것을 다 적용하고(apply finish time)
+--   Primary 로 열어야 하므로(estimated startup time)
+--
+--   지금 환경이라면 0 + 11 = 약 11초다.
+--
+-- ★ RTO 를 숫자로 이야기할 근거가 여기 있다.
+--   "몇 분 걸립니다" 대신 "지금 값으로 11초입니다" 라고 말할 수 있다.
+--   16장에서 실제 전환 시간과 비교한다.
+
+--------------------------------------------------------------------------------
+ [4] 이 뷰는 어느 쪽에서 조회하는가
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT name, value, unit FROM v$dataguard_stats;
+
+no rows selected
+
+-- ★ Primary 에서는 행이 없다.
+--
+-- ★ 당연하다. 지연은 받는 쪽의 개념이다.
+--   Primary 는 자기가 얼마나 늦었는지 알 수 없다.
+--
+-- ★ 그러나 감시 스크립트를 짤 때 함정이 된다.
+--   같은 SQL 을 양쪽에 돌리면 Primary 쪽 결과가 빈다.
+--   그것을 오류로 처리하면 상시 경보가 뜬다.
+--
+-- ★ 뷰마다 조회할 쪽이 다르다는 것을 표로 정리해 둔다.
+--
+--   뷰                        Primary     Standby
+--   ------------------------  ----------  ----------
+--   V$DATAGUARD_STATS         행 없음     값 있음
+--   V$DATAGUARD_STATUS        전송 기록   적용 기록
+--   V$DG_BROKER_CONFIG        양쪽 같음   양쪽 같음
+--   V$ARCHIVE_DEST_STATUS     dest_id 2   dest_id 1
+--
+-- ★ 마지막 줄은 7장부터 계속 써 온 규칙이다.
+--   Primary 에서는 보내는 목적지(2), Standby 에서는 받는 쪽(1).
+
+--------------------------------------------------------------------------------
+ [5] 사건의 흐름 — V$DATAGUARD_STATUS
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT severity, count(*) cnt FROM v$dataguard_status
+  2            GROUP BY severity ORDER BY 1;
+
+SEVERITY           CNT
+------------- ----------
+Control               25
+Informational         38
+Warning               11
+
+3 rows selected.
+
+-- ★ Warning 이 11건이나 있다. 놀랄 일이 아니다.
+--   실습 02 에서 본 대로 정상 동작도 Warning 으로 분류된다.
+
+SYS@boston> COL message FOR a70
+SYS@boston> SELECT severity, error_code, to_char(timestamp,'HH24:MI:SS') ts, message
+  2            FROM v$dataguard_status WHERE error_code <> 0 ORDER BY timestamp DESC;
+
+SEVERITY      ERROR_CODE TS       MESSAGE
+------------- ---------- -------- ----------------------------------------------
+Warning            16037 19:59:41 MRP0: Background Media Recovery cancelled with status 16037
+Warning            16037 19:57:23 MRP0: Background Media Recovery cancelled with status 16037
+
+2 rows selected.
+
+-- ★ 11건 중 2건만 남았다.
+--
+-- ★ ERROR_CODE <> 0 이 걸러 준다.
+--   이 조건 하나로 "봐야 할 것" 과 "그냥 기록" 이 나뉜다.
+--
+-- ★ 남은 두 건은 ORA-16037 이다.
+--   사용자가 MRP 를 취소했다는 뜻이며 6장에서 본 번호다.
+--   이 실습 준비 과정에서 MRP 를 껐다 켠 흔적이다.
+--
+-- ★ 뷰가 과거의 흔적을 그대로 들고 있다는 점을 기억한다.
+--   인스턴스를 재기동하기 전까지 쌓인다.
+--   "지금 문제인가" 를 보려면 TIMESTAMP 를 함께 봐야 한다.
+
+SYS@chicago> SELECT severity, error_code, to_char(timestamp,'HH24:MI:SS') ts, message
+  2            FROM v$dataguard_status WHERE error_code <> 0 ORDER BY timestamp DESC;
+
+no rows selected
+
+-- ★ Primary 쪽은 깨끗하다. 전송에는 오류가 없었다는 뜻이다.
+--
+-- ★ 감시 SQL 의 기본형이 여기서 나온다.
+--
+--   SELECT count(*) FROM v$dataguard_status
+--    WHERE error_code <> 0 AND timestamp > sysdate - 1/24;
+--
+--   최근 1시간 안에 오류가 있었는가. 이것을 양쪽에 돌린다.
+
+--------------------------------------------------------------------------------
+ [6] 구성 자체 — V$DG_BROKER_CONFIG
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL database FOR a10
+SYS@chicago> COL dataguard_role FOR a18
+SYS@chicago> COL redo_source FOR a12
+SYS@chicago> COL status FOR a10
+SYS@chicago> SELECT database, dataguard_role, redo_source, enabled, status
+  2            FROM v$dg_broker_config;
+
+DATABASE   DATAGUARD_ROLE     REDO_SOURCE  ENABL     STATUS
+---------- ------------------ ------------ ----- ----------
+chicago    PRIMARY            -N/A-        TRUE  ##########
+boston     PHYSICAL STANDBY   chicago      TRUE  ##########
+
+2 rows selected.
+
+-- ★ STATUS 가 ########## 이다. 오류가 아니다.
+--   이 열은 문자열이 아니라 숫자이고
+--   COL status FOR a10 으로 문자 서식을 준 것이 원인이다.
+--   실측값은 0 이었다.
+--
+-- ★ SUCCESS 같은 문자열을 기대하면 어긋난다.
+--   Broker 의 화면과 뷰의 표현이 같지 않다.
+--
+-- ★ REDO_SOURCE 열이 이 뷰의 값어치다.
+--
+--   chicago  -N/A-     받지 않는다 (Primary)
+--   boston   chicago   chicago 에서 받는다
+--
+--   SHOW CONFIGURATION 의 들여쓰기를 열로 표현한 것이다.
+--   10장의 Cascading 구성이라면 boston 아래 다른 이름이 나온다.
+--
+-- ★ 서식을 주지 않고 조회하면 화면이 무너진다.
+--   DATABASE 와 REDO_SOURCE 가 512바이트로 정의되어 있다.
+--   COL 지정을 반드시 한다.
+
+SYS@boston> SELECT database, dataguard_role, redo_source, enabled
+  2            FROM v$dg_broker_config;
+
+DATABASE   DATAGUARD_ROLE     REDO_SOURCE  ENABL
+---------- ------------------ ------------ -----
+chicago    PRIMARY            -N/A-        TRUE
+boston     PHYSICAL STANDBY   chicago      TRUE
+
+2 rows selected.
+
+-- ★ Standby 에서도 같은 내용이 나온다.
+--   구성 정보는 양쪽 구성 파일에 같이 들어 있기 때문이다.
+--   13장에서 dr1boston.dat 이 따로 있는 것을 확인했다.
+--
+-- ★ 그러므로 Primary 가 죽어도 Standby 에서 구성을 조회할 수 있다.
+
+--------------------------------------------------------------------------------
+ [7] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① STATUS 와 STATS 는 한 글자 차이이고 뜻이 다르다
+--   ② 뷰 이름을 틀리면 ORA-00942. 권한 문제도 같은 번호다
+--   ③ V$DATAGUARD_STATS 에는 네 항목이 있다
+--   ④ apply finish time + estimated startup time = RTO 근거
+--   ⑤ Primary 에서는 no rows selected — 지연은 받는 쪽 개념
+--   ⑥ ERROR_CODE <> 0 으로 걸러야 볼 것만 남는다 (11건 → 2건)
+--   ⑦ 뷰는 과거 흔적을 들고 있다. TIMESTAMP 를 함께 본다
+--   ⑧ V$DG_BROKER_CONFIG 의 STATUS 는 숫자다. 서식에 주의한다
+--   ⑨ REDO_SOURCE 가 구성의 모양을 알려 준다
+--
+-- ★ 다음 실습에서 구성을 파일로 남긴다.

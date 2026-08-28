@@ -1,0 +1,271 @@
+================================================================================
+ 제8장 실습 03 — MANUAL 재현과 UNNAMED 파일
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : STANDBY_FILE_MANAGEMENT=MANUAL 에서 무슨 일이 일어나는지 재현하고
+          진단한다. ORA-1274 와 ORA-1111 을 구분한다
+ 소요   : 약 30분
+ 경고   : 적용이 실제로 멈춘다. 실습 04 를 반드시 이어서 수행한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] MANUAL 로 전환
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER SYSTEM SET standby_file_management='MANUAL' SCOPE=BOTH;
+
+System altered.
+
+SYS@boston> SHOW PARAMETER standby_file_management
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+standby_file_management              string      MANUAL
+
+-- ★ Standby 쪽만 바꿨다. Primary 는 계속 AUTO 다.
+--   실측에서 Primary 값은 아무 영향이 없었다.
+--   동작을 정하는 것은 Standby 쪽 값이라는 것을 여기서 확인한다.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         74
+
+1 row selected.
+
+-- 적용은 정상이다. 아직 아무 일도 일어나지 않았다.
+
+--------------------------------------------------------------------------------
+ [2] Primary 에 테이블스페이스 추가
+--------------------------------------------------------------------------------
+
+SYS@chicago> CREATE TABLESPACE dg_ts2 DATAFILE
+  2            '/u03/app/oracle/oradata/Chicago/dg_ts2_01.dbf'
+  3            SIZE 10M AUTOEXTEND OFF;
+
+Tablespace created.
+
+-- ★ Primary 는 아무 일 없이 성공한다.
+--   **Primary 는 Standby 의 사정을 모른다.**
+--   경고도 지연도 없다. 이것이 이 문제를 발견하기 어렵게 만든다.
+
+--------------------------------------------------------------------------------
+ [3] 30초 뒤 Standby
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a70
+SYS@boston> SELECT file#, name, bytes/1024/1024 mb FROM v$datafile
+  2            WHERE file#>12 ORDER BY file#;
+
+     FILE# NAME                                                                     MB
+---------- --------------------------------------------------------------- ----------
+        14 /u03/app/oracle/oradata/BOSTON/datafile/o1_mf_dg_ts1_o8z7v7lh_.dbf       30
+        15 /u03/app/oracle/oradata/BOSTON/datafile/o1_mf_dg_ts1_o8z7w2ch_.dbf       15
+        16 /u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00016                  0
+
+3 rows selected.
+
+-- ★★ **UNNAMED00016** 이 나타났다.
+--
+--   경로  $ORACLE_HOME/dbs   — 데이터 파일이 있을 자리가 아니다
+--   크기  0바이트
+--   이름  UNNAMED + 파일 번호 5자리
+--
+--   파일을 만들지 못했으므로 오라클이 **자리만 잡아 둔 것**이다.
+--   컨트롤 파일에는 16번 항목이 있지만 실체가 없다.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+no rows selected
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:30
+
+2 rows selected.
+
+-- ★★ **MRP0 이 사라졌다.** 적용이 죽었다.
+--
+--   transport lag 은 0 이다. 리두는 정상적으로 오고 있다.
+--   apply lag 만 벌어지기 시작했다. 받았는데 적용하지 못하는 상태다.
+--
+--   7장에서 배운 대로 두 지연을 나눠 보면 병목이 어디인지 바로 드러난다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 무엇이 죽였는가
+--------------------------------------------------------------------------------
+
+SYS@boston> COL message FOR a100
+SYS@boston> SELECT severity, error_code, TO_CHAR(timestamp,'hh24:mi:ss') ts, message
+  2            FROM v$dataguard_status
+  3            WHERE severity IN ('Error','Fatal Error','Warning')
+  4            ORDER BY timestamp DESC FETCH FIRST 6 ROWS ONLY;
+
+SEVERITY      ERROR_CODE TS       MESSAGE
+------------- ---------- -------- ------------------------------------------------------------
+Error               1274 11:23:26 MRP0: Background Media Recovery terminated with error 1274
+Warning                0 11:18:56 Media Recovery Waiting for T-1.S-75 (in transit)
+Warning                0 11:18:23 Media Recovery Waiting for T-1.S-74 (in transit)
+Warning                0 10:59:36 Media Recovery Waiting for T-1.S-73 (in transit)
+Warning            16037 10:59:29 MRP0: Background Media Recovery cancelled with status 16037
+Warning                0 10:53:11 Media Recovery Waiting for T-1.S-73 (in transit)
+
+6 rows selected.
+
+>>> 원인 파악
+    ★ **ORA-1274** — "파일을 추가할 수 없다"
+
+    STANDBY_FILE_MANAGEMENT 가 MANUAL 이라 리두에 담긴 파일 추가 지시를
+    처리할 수 없었고, MRP 가 그 자리에서 종료된 것이다.
+
+    ★ 함께 나온 것들을 구분해 읽어야 한다.
+      Warning 16037  사람이 CANCEL 을 냈을 때 남는 **정상 기록**이다
+      Warning 0      "Media Recovery Waiting for T-1.S-75 (in transit)" 는
+                     다음 로그를 기다린다는 정상 진행 메시지다
+
+      **오류와 정상 기록이 같은 뷰에 섞여 있다.**
+      SEVERITY 와 시각을 함께 보지 않으면 오판한다.
+
+    ★ Primary 쪽은 어떤가?
+
+SYS@chicago> COL error FOR a50
+SYS@chicago> SELECT dest_id, status, error FROM v$archive_dest_status WHERE dest_id=2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- --------------------------------------------------
+         2 VALID
+
+1 row selected.
+
+      **아무 신호가 없다.** 목적지는 VALID 이고 오류 열도 비어 있다.
+      전송은 정상이기 때문이다. 리두는 잘 가고 Standby 가 받고 있다.
+      다만 적용하지 못할 뿐이다.
+
+      ★★ Primary 만 감시하는 모니터링은 이 상태를 잡지 못한다.
+        7장에서 Standby 쪽 MRP0 존재를 확인해야 한다고 한 이유가
+        여기서 다시 확인된다.
+
+--------------------------------------------------------------------------------
+ [5] AUTO 로 되돌리면 해결되는가
+--------------------------------------------------------------------------------
+
+-- 원인이 MANUAL 이었으니 AUTO 로 되돌리면 될 것 같다. 해 본다.
+
+SYS@boston> ALTER SYSTEM SET standby_file_management='AUTO' SCOPE=BOTH;
+
+System altered.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+alter database recover managed standby database cancel
+*
+ERROR at line 1:
+ORA-16136: Managed Standby Recovery not active
+
+-- MRP 가 이미 죽어 있으므로 ORA-16136 이다 (7장). 무해하다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+-- 12초 뒤
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+no rows selected
+
+-- ★★ **또 죽었다.**
+
+SYS@boston> SELECT severity, error_code, TO_CHAR(timestamp,'hh24:mi:ss') ts, message
+  2            FROM v$dataguard_status WHERE severity IN ('Error','Fatal Error')
+  3            ORDER BY timestamp DESC FETCH FIRST 4 ROWS ONLY;
+
+SEVERITY      ERROR_CODE TS       MESSAGE
+------------- ---------- -------- ------------------------------------------------------------
+Error               1111 11:25:33 MRP0: Background Media Recovery terminated with error 1111
+Error               1111 11:24:12 MRP0: Background Media Recovery terminated with error 1111
+Error               1274 11:23:26 MRP0: Background Media Recovery terminated with error 1274
+
+3 rows selected.
+
+>>> 원인 파악
+    ★ 오류 번호가 **1274 에서 1111 로 바뀌었다.** 이 변화가 진행을 말해 준다.
+
+      ORA-1274  파일을 추가할 수 없다        (MANUAL 이라 만들지 못함)
+      ORA-1111  이름이 알려지지 않은 파일 16  (자리는 잡혔는데 실체가 없음)
+
+    원인이 "만들 수 없다"에서 "이미 만들어진 자리가 잘못됐다"로 옮겨 갔다.
+    **AUTO 로 되돌려도 이미 생긴 UNNAMED 항목은 저절로 고쳐지지 않는다.**
+
+    ★ 파일 상태를 두 뷰로 확인한다.
+
+SYS@boston> COL name FOR a60
+SYS@boston> SELECT file#, name, status, bytes FROM v$datafile WHERE file#=16;
+
+     FILE# NAME                                                    STATUS       BYTES
+---------- ------------------------------------------------------- ------- ----------
+        16 /u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00016 RECOVER          0
+
+SYS@boston> SELECT file#, status, error FROM v$datafile_header WHERE file#>=14 ORDER BY file#;
+
+     FILE# STATUS  ERROR
+---------- ------- ---------------
+        14 ONLINE
+        15 ONLINE
+        16 ONLINE  FILE MISSING
+
+3 rows selected.
+
+      V$DATAFILE.STATUS      = RECOVER
+      V$DATAFILE_HEADER.ERROR = FILE MISSING
+
+      두 뷰가 같은 사실을 다른 말로 알려 준다. 이 둘이 확실한 증거다.
+
+    ★ 운영체제에서도 확인한다.
+
+[oracle@boston-srv ~]$ ls -l /u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00016
+ls: cannot access ...: No such file or directory
+
+      컨트롤 파일에는 항목이 있는데 파일은 없다.
+
+    ★ 주의 — V$RECOVER_FILE 은 비어 있다.
+
+SYS@boston> SELECT file#, error, online_status FROM v$recover_file;
+
+no rows selected
+
+      복구가 필요한 파일을 보여 주는 뷰인데 16번이 나오지 않는다.
+      UNNAMED 파일은 아직 "복구할 대상"으로 등록되지도 못한 상태이기 때문이다.
+      **이 뷰만 믿으면 문제를 놓친다.**
+
+>>> 조치
+    파일을 사람이 직접 만들어 주어야 한다. 실습 04 에서 수행한다.
+
+>>> 재확인
+    실습 04 를 마친 뒤 MRP0 이 살아나고 지연이 0 이 되는지 확인한다.
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+  · MANUAL 이면 Standby 에 UNNAMED<파일번호> 가 0바이트로 만들어진다
+  · 경로는 $ORACLE_HOME/dbs 다
+  · MRP 가 죽는다. 첫 오류는 ORA-1274
+  · Primary 쪽에는 아무 신호가 없다. 목적지는 계속 VALID
+  · AUTO 로 되돌려도 저절로 고쳐지지 않는다. 오류가 ORA-1111 로 바뀔 뿐
+  · 증거는 V$DATAFILE.STATUS=RECOVER 와 V$DATAFILE_HEADER.ERROR=FILE MISSING
+  · V$RECOVER_FILE 은 비어 있다. 이 뷰만 믿지 않는다
+  · V$DATAGUARD_STATUS 에는 오류와 정상 기록이 섞여 있다. SEVERITY 를 본다
+
+================================================================================
+ 실습 03 종료 — 적용이 멈춘 상태다. 실습 04 를 반드시 이어서 수행한다.
+================================================================================

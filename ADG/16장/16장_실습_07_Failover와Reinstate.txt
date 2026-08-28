@@ -1,0 +1,453 @@
+================================================================================
+ 제16장 실습 07 — Failover 와 Reinstate
+ 대상   : chicago-srv, boston-srv
+ 목표   : Primary 를 강제 종료하고 Failover 한 뒤 옛 Primary 를 되살린다.
+          Switchover 와 무엇이 다른지 실측으로 확인한다
+ 소요   : 약 60분
+ 변경   : Failover → Reinstate → Switchover 로 원래 역할까지 되돌린다
+ 주의   : OPEN RESETLOGS 를 수반하므로 이후 백업 계획이 바뀐다
+          시작 전에 꺼진 상태의 VM 스냅샷을 확보한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 출발점과 표식
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL db_unique_name FOR a10
+SYS@chicago> SELECT db_unique_name, database_role, open_mode, flashback_on
+  2            FROM v$database;
+
+DB_UNIQUE_ DATABASE_ROLE    OPEN_MODE            FLASHBACK_ON
+---------- ---------------- -------------------- ------------------
+chicago    PRIMARY          READ WRITE           YES
+
+1 row selected.
+
+-- ★ 실습 06 에서 켠 플래시백이 YES 다. 이것이 전제다.
+
+SYS@chicago> INSERT INTO system.bk_t VALUES(97,'last-before-fo');
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+SYS@boston> COL tag FOR a16
+SYS@boston> SELECT id, tag FROM system.bk_t WHERE id=97;
+
+        ID TAG
+---------- ----------------
+        97 last-before-fo
+
+1 row selected.
+
+-- ★ 강제 종료 직전에 커밋한 행이다.
+--   Failover 뒤에도 살아 있는지 확인할 표식이다.
+
+--------------------------------------------------------------------------------
+ [2] Primary 가 죽는다
+--------------------------------------------------------------------------------
+
+SYS@chicago> SHUTDOWN ABORT;
+
+ORACLE instance shut down.
+
+-- ★ 재해를 흉내 낸다.
+--   IMMEDIATE 가 아니라 ABORT 인 것이 중요하다.
+--   정상 종료는 남은 리두를 정리하지만 재해는 그러지 않는다.
+
+--------------------------------------------------------------------------------
+ [3] Standby 에서 보이는 것
+--------------------------------------------------------------------------------
+
+SYS@boston> COL message FOR a80
+SYS@boston> SELECT severity, error_code, to_char(timestamp,'HH24:MI:SS') ts, message
+  2            FROM v$dataguard_status ORDER BY timestamp DESC FETCH FIRST 5 ROWS ONLY;
+
+SEVERITY      ERROR_CODE TS       MESSAGE
+------------- ---------- -------- ------------------------------------------------
+Warning                0 10:34:13 Possible network disconnect with primary database
+Warning                0 10:34:13 Possible network disconnect with primary database
+Warning                0 10:34:13 Possible network disconnect with primary database
+Warning                0 10:34:13 Possible network disconnect with primary database
+
+-- ★ Possible network disconnect — "아마도" 라고 말한다.
+--   Standby 는 Primary 가 죽은 것인지 네트워크가 끊긴 것인지
+--   구별할 수 없다.
+--
+-- ★ 14장에서 관측자가 제3의 위치에 있어야 하는 이유로 든
+--   그 사실이 여기서 문장으로 확인된다.
+--
+-- ★ ERROR_CODE 가 0 이다.
+--   15장에서 정한 ERROR_CODE <> 0 필터로는 이 행이 걸러진다.
+--   필터가 만능이 아니라는 예다.
+
+DGMGRL> show configuration
+
+  chicago - Primary database
+    Error: ORA-1034: ORACLE not available
+
+    boston  - Physical standby database
+
+Configuration Status:
+ERROR
+
+-- ★ Broker 가 상황을 정확히 말한다.
+--
+-- ★ ORA-1034 표기에 주의한다.
+--   SQL*Plus 는 ORA-01034 로 다섯 자리를 채우는데
+--   Broker 는 앞의 0 을 생략했다.
+--   같은 오류를 도구마다 다르게 적는다.
+--   문자열로 비교하는 스크립트라면 걸린다.
+
+DGMGRL> validate database 'boston'
+
+  Database Role:     Physical standby database
+  Primary Database:  chicago
+    Warning: primary database was not reachable
+
+  Ready for Switchover:  No
+  Ready for Failover:    Yes (Primary Not Running)
+
+  Flashback Database Status:
+    chicago:  Unknown
+    boston :  On
+
+  Temporary Tablespace File Information:
+    chicago TEMP Files:  Unknown
+    boston TEMP Files:   3
+
+  Transport-Related Information:
+    Transport On:  No
+    Gap Status:    Unknown
+
+-- ★ 두 가지를 읽는다.
+--
+--   ① Ready for Failover: Yes (Primary Not Running)
+--      괄호 안이 바뀌었다. 지금까지는 (Primary Running) 이었다.
+--      Failover 를 해도 되는 상황이라는 판정이다.
+--
+--   ② chicago 관련 항목이 전부 Unknown 이다.
+--      물어볼 상대가 없기 때문이며 이것 자체가 진단 정보다.
+--
+-- ★ Ready for Switchover 는 No 다.
+--   Switchover 는 양쪽이 살아 있어야 한다.
+
+--------------------------------------------------------------------------------
+ [4] FAILOVER
+--------------------------------------------------------------------------------
+
+DGMGRL> failover to 'boston'
+
+Performing failover NOW, please wait...
+Failover succeeded, new primary is "boston"
+
+-- ★ 두 줄이다. 실측 소요 24초.
+--   Switchover 가 64초였던 것과 대비된다.
+--
+-- ★ 짧은 이유가 있다. 옛 Primary 와 협상하지 않는다.
+--   Switchover 는 남은 리두를 보내고 상대를 다시 기동하는 단계가 있었지만
+--   Failover 에는 그럴 상대가 없다.
+
+--------------------------------------------------------------------------------
+ [5] 손실이 있었는가
+--------------------------------------------------------------------------------
+
+SYS@boston> COL tag FOR a16
+SYS@boston> SELECT id, tag FROM system.bk_t ORDER BY id;
+
+        ID TAG
+---------- ----------------
+         1 after-restart
+        90 ship-off
+        91 delayed
+        92 listener-down
+        93 traced
+        94 before-swo
+        95 boston-primary
+        97 last-before-fo
+
+8 rows selected.
+
+-- ★ id=97 이 살아 있다.
+--   Primary 를 강제 종료하기 직전에 커밋한 행이다.
+--
+-- ★ MaxPerformance(비동기)인데도 손실이 없었다.
+--   실시간 전송이므로 커밋 시점에 이미 SRL 로 흘러가 있었기 때문이다.
+--
+-- ★ 다만 이것은 보장이 아니다.
+--   부하가 높거나 네트워크가 느렸다면 결과가 달랐을 것이다.
+--   무손실을 보장하려면 8장의 MaxAvailability 이상이 필요하다.
+
+SYS@boston> SELECT current_scn, resetlogs_change#,
+  2                 to_char(resetlogs_time,'HH24:MI:SS') rt FROM v$database;
+
+CURRENT_SCN RESETLOGS_CHANGE# RT
+----------- ----------------- --------
+    2693895           2692902 10:35:03
+
+1 row selected.
+
+-- ★ RESETLOGS_TIME 이 방금이다.
+--   Failover 는 OPEN RESETLOGS 를 수반한다.
+--   버려진 리두 이후로 새 인큐네이션이 시작된다.
+--   5장에서 RESETLOGS_ID 를 다룰 때 배운 개념이다.
+--
+-- ★ 이것이 Reinstate 가 필요한 이유이기도 하다.
+--   옛 Primary 는 다른 인큐네이션에 있다.
+
+DGMGRL> show configuration
+
+  boston  - Primary database
+    chicago - Physical standby database (disabled)
+      ORA-16661: the standby database needs to be reinstated
+
+Configuration Status:
+SUCCESS
+
+-- ★ 두 가지를 읽는다.
+--
+--   ① (disabled) — chicago 가 구성에서 비활성 상태가 됐다.
+--      지워진 것은 아니다.
+--
+--   ② Configuration Status: SUCCESS
+--      멤버 하나에 ORA-16661 이 붙어 있는데도 SUCCESS 다.
+--      비활성 멤버는 판정에서 제외되기 때문이다.
+--
+-- ★ 14장부터 반복한 주제가 가장 극단적으로 나타난다.
+--   재해가 났고 Standby 가 없는 상태인데 화면은 SUCCESS 다.
+--   지금 이 구성에는 보호가 없다.
+
+SYS@boston> INSERT INTO system.bk_t VALUES(98,'after-failover');
+SYS@boston> COMMIT;
+SYS@boston> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+-- ★ 새 Primary 에서 업무를 계속한다.
+--   이 행이 나중에 되살아난 chicago 에도 가는지 확인한다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — 내려간 채로 Reinstate
+--------------------------------------------------------------------------------
+
+DGMGRL> reinstate database 'chicago'
+
+Reinstating database "chicago", please wait...
+Error: ORA-16653: failed to reinstate database
+
+Failed.
+Reinstatement of database "chicago" failed
+
+>>> 원인 파악
+
+-- ★ ORA-16653. 되살릴 대상에 접속할 수 없다.
+--   chicago 인스턴스가 아직 내려가 있다.
+--
+-- ★ Reinstate 는 대상 데이터베이스에서 플래시백을 수행해야 하므로
+--   인스턴스가 살아 있어야 한다.
+--
+-- ★ 다만 열면 안 된다. MOUNT 까지만 올린다.
+--   열면 옛 인큐네이션으로 열리게 되어 되감을 수 없다.
+
+>>> 조치
+
+SYS@chicago> STARTUP MOUNT;
+
+ORACLE instance started.
+
+Total System Global Area 3221223192 bytes
+Fixed Size                  9139992 bytes
+Variable Size             687865856 bytes
+Database Buffers         2516582400 bytes
+Redo Buffers                7634944 bytes
+Database mounted.
+
+SYS@chicago> SELECT db_unique_name, database_role, open_mode, flashback_on
+  2            FROM v$database;
+
+DB_UNIQUE_ DATABASE_ROLE    OPEN_MODE   FLASHBACK_ON
+---------- ---------------- ----------- ------------
+chicago    PRIMARY          MOUNTED     YES
+
+1 row selected.
+
+-- ★ 아직 PRIMARY 라고 말한다. 자기가 강등된 것을 모른다.
+--
+-- ★ FLASHBACK_ON 이 YES 인 것이 결정적이다.
+--   NO 였다면 이 데이터베이스는 버리고
+--   6장의 절차로 새로 만들어야 했다.
+
+>>> 재확인
+
+DGMGRL> reinstate database 'chicago'
+
+Reinstating database "chicago", please wait...
+Reinstatement of database "chicago" succeeded
+
+-- ★ 51초. 명령은 한 줄이다.
+--   내부적으로는 플래시백으로 되감고 역할을 바꾸고 적용을 시작한다.
+
+--------------------------------------------------------------------------------
+ [7] 되살아난 뒤
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT db_unique_name, database_role, open_mode FROM v$database;
+
+DB_UNIQUE_ DATABASE_ROLE    OPEN_MODE
+---------- ---------------- --------------------
+chicago    PHYSICAL STANDBY READ ONLY WITH APPLY
+
+1 row selected.
+
+SYS@chicago> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS         SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG          4
+
+1 row selected.
+
+-- ★ SEQUENCE# 가 4 다. 전환 전에는 95 였다.
+--   OPEN RESETLOGS 로 새 인큐네이션이 시작되면서
+--   시퀀스가 1 부터 다시 매겨졌다.
+--
+-- ★ 15장에서 두 시퀀스를 비교하라고 했는데
+--   Failover 직후에는 그 비교가 무의미하다.
+--   기준이 달라졌기 때문이다.
+--   감시 스크립트가 RESETLOGS_ID 나 RESETLOGS_CHANGE# 도
+--   함께 봐야 하는 이유다.
+--
+-- ★ READ ONLY WITH APPLY 로 열렸다.
+--   Active Data Guard 가 여기서도 재현됐다.
+
+SYS@chicago> COL tag FOR a16
+SYS@chicago> SELECT id, tag FROM system.bk_t ORDER BY id;
+
+        ID TAG
+---------- ----------------
+         1 after-restart
+        ...
+        97 last-before-fo
+        98 after-failover
+
+9 rows selected.
+
+-- ★ id=98 은 Failover 뒤 새 Primary 에서 넣은 행이다.
+--   되살아난 chicago 가 그것까지 받았다. 완전히 따라잡았다.
+
+--------------------------------------------------------------------------------
+ [8] 원래 역할로
+--------------------------------------------------------------------------------
+
+DGMGRL> switchover to 'chicago'
+
+Performing switchover NOW, please wait...
+...
+Switchover succeeded, new primary is "chicago"
+
+-- ★ 55초. 이제부터는 평범한 Switchover 다.
+
+DGMGRL> show configuration
+
+  chicago - Primary database
+    boston  - Physical standby database
+      Error: ORA-16786: unable to access Oracle Data Guard broker
+             configuration files
+
+Configuration Status:
+ERROR   (status updated 21 seconds ago)
+
+-- ★ ORA-16786 — 구성 파일에 접근할 수 없다.
+--   boston 이 방금 재기동됐기 때문이다.
+--
+-- ★ 15장에서 배운 그대로다.
+--   고친 직후의 화면을 결론으로 삼지 않는다.
+--   status updated 21 seconds ago 가 그 신호다.
+
+-- 1분 뒤
+
+DGMGRL> show configuration
+
+Configuration - dg_chicago
+
+  Protection Mode: MaxPerformance
+  Members:
+  chicago - Primary database
+    boston  - Physical standby database
+
+Fast-Start Failover:  Disabled
+
+Configuration Status:
+SUCCESS   (status updated 52 seconds ago)
+
+DGMGRL> show database 'boston'
+
+Database - boston
+
+  Role:               PHYSICAL STANDBY
+  Intended State:     APPLY-ON
+  Transport Lag:      0 seconds (computed 1 second ago)
+  Apply Lag:          0 seconds (computed 1 second ago)
+  Average Apply Rate: 4.00 KByte/s
+  Real Time Query:    ON
+
+Database Status:
+SUCCESS
+
+-- ★ 원상 복구됐다. Real Time Query 도 ON 이다.
+
+--------------------------------------------------------------------------------
+ [9] 소요 시간 정리
+--------------------------------------------------------------------------------
+
+-- ★ 실측
+--
+--   Switchover   약 64초 / 69초 / 55초
+--   Failover     약 24초
+--   Reinstate    약 51초
+--
+-- ★ Failover 가 가장 짧다. 협상할 상대가 없기 때문이다.
+--
+-- ★ 재해 대응의 총 소요는 Failover 시간만이 아니다.
+--
+--   상황 판단           사람이 결정한다 (자동이면 FSFO 의 Threshold)
+--   Failover            24초
+--   애플리케이션 재접속  접속 문자열과 재시도 설정에 달렸다
+--   Reinstate           51초 (업무 재개 후에 해도 된다)
+--
+-- ★ 14장에서 본 estimated startup time 11초와 함께
+--   이 숫자들이 RTO 를 말할 근거가 된다.
+
+--------------------------------------------------------------------------------
+ [10] 전환 이후에 할 일
+--------------------------------------------------------------------------------
+
+-- ★ ① 데이터 확인 — 손실이 있었는지 본다
+-- ★ ② 인큐네이션 확인 — RESETLOGS_TIME·RESETLOGS_CHANGE# 를 기록한다
+-- ★ ③ 감시 재정렬 — 시퀀스 비교의 기준선을 새로 잡는다
+-- ★ ④ 백업 재개 — 새 Primary 에서 전체 백업을 한 벌 받는다
+-- ★ ⑤ Reinstate 또는 재구축 — 플래시백 유무로 갈린다
+-- ★ ⑥ 원래 역할로 되돌릴 것인가 — 필수는 아니다. 계획해서 한다
+-- ★ ⑦ 기록 — 소요 시간과 각 단계의 출력을 남긴다
+
+--------------------------------------------------------------------------------
+ [11] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① Standby 는 Possible network disconnect 라고만 말한다
+--   ② 그 메시지의 ERROR_CODE 는 0 — 15장 필터로 걸러진다
+--   ③ Broker 는 ORA-1034 로 적는다 (SQL*Plus 는 ORA-01034)
+--   ④ Ready for Failover 의 괄호가 (Primary Not Running) 으로 바뀐다
+--   ⑤ Failover 는 두 줄, 24초
+--   ⑥ MaxPerformance 인데도 손실이 없었다 (보장은 아니다)
+--   ⑦ RESETLOGS_TIME 이 갱신된다 — 새 인큐네이션
+--   ⑧ 구성에 (disabled) + ORA-16661 인데 상태는 SUCCESS
+--   ⑨ 내려간 채로 Reinstate 하면 ORA-16653
+--   ⑩ 옛 Primary 는 MOUNT 까지만 올리고 자기를 PRIMARY 라고 말한다
+--   ⑪ Reinstate 51초, 이후 시퀀스가 4 로 시작
+--   ⑫ 전환 직후 ORA-16786 은 판정 시차
+--
+-- ★ 16장의 실습이 끝났다.
+--   1장에서 시작한 과정이 여기서 닫힌다.

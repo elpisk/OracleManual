@@ -1,0 +1,276 @@
+================================================================================
+ 제4장 실습 04 — Standby Redo Log 산정과 생성
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : 온라인 리두를 근거로 SRL 개수와 크기를 산정하고, 크기가 다른 SRL 을
+          만들어 무슨 일이 일어나는지 확인한다
+ 소요   : 약 25분
+ 되돌리기 : 잘못 만든 SRL 을 삭제하고 남은 파일까지 지운다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 산정의 근거 — 온라인 리두 현황
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL member FOR a52
+SYS@chicago> SELECT l.group#, l.thread#, l.bytes/1024/1024 mb, l.members,
+  2                 l.status, f.member
+  3            FROM v$log l JOIN v$logfile f ON l.group#=f.group#
+  4            ORDER BY l.group#;
+
+    GROUP#    THREAD#         MB    MEMBERS STATUS      MEMBER
+---------- ---------- ---------- ---------- ----------- ----------------------------------------
+         1          1        200          1 INACTIVE    /u03/app/oracle/oradata/Chicago/redo01.log
+         2          1        200          1 CURRENT     /u03/app/oracle/oradata/Chicago/redo02.log
+         3          1        200          1 INACTIVE    /u03/app/oracle/oradata/Chicago/redo03.log
+
+3 rows selected.
+
+-- 산정
+--   그룹 수 3, 크기 각 200MB, 스레드 1개
+--   → SRL 개수 : 3 + 1 = 4 이상
+--   → SRL 크기 : 200MB (온라인 리두와 정확히 동일)
+--   → THREAD  : 1 (RAC 가 아니므로)
+--
+-- 개수 규칙의 근거
+--   하나가 아카이브되는 동안 다른 하나가 계속 리두를 받아야 한다.
+--   온라인 리두 그룹 수만큼 있으면 모두 아카이브 중일 때 받을 곳이 없어진다.
+--   그래서 최소 하나가 더 필요하다.
+
+--------------------------------------------------------------------------------
+ [2] 생성 명령 (구축 시 실행한 것)
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1
+  2    GROUP 4 ('/u03/app/oracle/oradata/Chicago/stdbyredo04.log') SIZE 200m REUSE,
+  3    GROUP 5 ('/u03/app/oracle/oradata/Chicago/stdbyredo05.log') SIZE 200m REUSE,
+  4    GROUP 6 ('/u03/app/oracle/oradata/Chicago/stdbyredo06.log') SIZE 200m REUSE,
+  5    GROUP 7 ('/u03/app/oracle/oradata/Chicago/stdbyredo07.log') SIZE 200m REUSE;
+
+Database altered.
+
+-- 그룹 번호는 온라인 리두(1~3)와 겹치지 않게 4부터 시작했다.
+-- REUSE 는 같은 이름의 파일이 이미 있으면 덮어쓰라는 뜻이다.
+-- 파일 이름에 stdbyredo 를 넣어 온라인 리두와 구분되게 했다.
+
+--------------------------------------------------------------------------------
+ [3] 생성 결과 — Primary 와 Standby 가 다르다
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL member FOR a52
+SYS@chicago> SELECT s.group#, s.thread#, s.bytes/1024/1024 mb, s.status, f.member
+  2            FROM v$standby_log s JOIN v$logfile f ON s.group#=f.group#
+  3            ORDER BY s.group#;
+
+    GROUP#    THREAD#         MB STATUS     MEMBER
+---------- ---------- ---------- ---------- --------------------------------------------
+         4          1        200 UNASSIGNED /u03/app/oracle/oradata/Chicago/stdbyredo04.log
+         5          1        200 UNASSIGNED /u03/app/oracle/oradata/Chicago/stdbyredo05.log
+         6          1        200 UNASSIGNED /u03/app/oracle/oradata/Chicago/stdbyredo06.log
+         7          1        200 UNASSIGNED /u03/app/oracle/oradata/Chicago/stdbyredo07.log
+
+4 rows selected.
+
+-- Primary 의 SRL 은 전부 UNASSIGNED. 지금은 쓰이지 않는다.
+-- 그럼에도 만들어 두는 이유는 역할 전환이다.
+-- Switchover 로 chicago 가 Standby 가 되는 순간 즉시 필요해진다.
+
+SYS@boston> COL member FOR a56
+SYS@boston> SELECT group#, thread#, sequence#, bytes/1024/1024 mb, status, archived
+  2             FROM v$standby_log ORDER BY group#;
+
+    GROUP#    THREAD#  SEQUENCE#         MB STATUS     ARC
+---------- ---------- ---------- ---------- ---------- ---
+         4          1         50        200 ACTIVE     YES
+         5          1          0        200 UNASSIGNED NO
+         6          1          0        200 UNASSIGNED NO
+         7          1          0        200 UNASSIGNED YES
+
+4 rows selected.
+
+-- Standby 쪽은 실제로 쓰이고 있다.
+--   group 4  ACTIVE, 시퀀스 50 을 받는 중
+--   ARCHIVED 열은 그 SRL 의 내용이 아카이브됐는지를 나타낸다
+--
+-- 같은 구조인데 역할에 따라 상태가 다르다는 것이 요점이다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 크기가 다른 SRL 을 만들면
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1
+  2    GROUP 8 ('/u03/app/oracle/oradata/Chicago/stdbyredo08.log') SIZE 100m;
+
+Database altered.
+
+-- ★ 오류 없이 만들어졌다. 이것이 중요한 관찰이다.
+
+SYS@chicago> SELECT group#, bytes/1024/1024 mb, status FROM v$standby_log
+  2            ORDER BY group#;
+
+    GROUP#         MB STATUS
+---------- ---------- ----------
+         4        200 UNASSIGNED
+         5        200 UNASSIGNED
+         6        200 UNASSIGNED
+         7        200 UNASSIGNED
+         8        100 UNASSIGNED
+
+5 rows selected.
+
+
+>>> 원인 파악 — 무엇이 문제인가
+    오라클은 크기가 맞지 않는 SRL 의 **생성을 막지 않는다.**
+    다만 리두를 받을 때 그 SRL 을 **쓰지 않고 건너뛴다.**
+    즉 만들어 두었는데도 실제로는 없는 것과 같다.
+
+    증상이 조용하다는 점에서 3장의 VALID_FOR 오설정과 성격이 같다.
+      - 명령은 성공한다 ("Database altered")
+      - 조회하면 목록에 보인다
+      - 그런데 동작하지 않는다
+      - 오류도 경고도 없다
+
+    실무 시나리오
+      온라인 리두를 200MB 에서 500MB 로 키운 뒤 SRL 을 그대로 두면
+      기존 SRL 전부가 크기 불일치가 되어 무시된다.
+      실시간 적용이 멈춘 것처럼 보이는데 원인을 찾기 어렵다.
+
+>>> 조치 — 잘못 만든 SRL 을 지운다
+
+SYS@chicago> ALTER DATABASE DROP STANDBY LOGFILE GROUP 8;
+
+Database altered.
+
+SYS@chicago> SELECT group#, bytes/1024/1024 mb FROM v$standby_log ORDER BY group#;
+
+    GROUP#         MB
+---------- ----------
+         4        200
+         5        200
+         6        200
+         7        200
+
+4 rows selected.
+
+>>> 그런데 파일은 남아 있다
+
+[oracle@chicago-srv ~]$ ls -l /u03/app/oracle/oradata/Chicago/stdbyredo08.log
+-rw-r-----. 1 oracle dba 104858112 Aug 26 20:19 .../stdbyredo08.log
+
+-- 딕셔너리에서는 사라졌지만 파일은 디스크에 남아 있다.
+-- 오라클이 자동으로 지우지 않기 때문이다 (OMF 를 쓰면 다르다 — 6장).
+--
+-- 남겨 두면 나중에 같은 이름으로 만들려 할 때 문제가 된다. 실제로 확인해 본다.
+
+--------------------------------------------------------------------------------
+ [4-1] 오류 재현 — 파일이 남은 상태에서 REUSE 없이 다시 만들면
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE ADD STANDBY LOGFILE THREAD 1
+  2    GROUP 8 ('/u03/app/oracle/oradata/Chicago/stdbyredo08.log') SIZE 200m;
+ALTER DATABASE ADD STANDBY LOGFILE THREAD 1
+*
+ERROR at line 1:
+ORA-00301: error in adding log file
+'/u03/app/oracle/oradata/Chicago/stdbyredo08.log' - file cannot be created
+ORA-27038: created file already exists
+Additional information: 1
+
+
+>>> 원인 파악
+    두 줄을 함께 읽어야 한다.
+      ORA-00301 : 로그 파일 추가 실패 (어느 파일인지 알려 준다)
+      ORA-27038 : created file already exists  ← 실제 원인
+
+    앞서 DROP 으로 딕셔너리에서만 지웠고 파일은 디스크에 그대로 남아 있다.
+    REUSE 를 주지 않으면 오라클은 새 파일을 만들려 하고, 이미 있으므로 실패한다.
+
+    ★ 이 오류가 유용한 이유가 있다.
+      실수로 기존 파일을 덮어쓰는 것을 막아 주기 때문이다.
+      REUSE 는 "덮어써도 좋다" 는 명시적 허락이며,
+      그것 없이는 오라클이 파일을 건드리지 않는다.
+
+>>> 조치 — 두 가지 방법
+    ① REUSE 를 준다 : ... SIZE 200m REUSE;
+       기존 파일을 덮어쓴다. 크기가 같다면 가장 간편하다.
+    ② 파일을 먼저 지운다 : rm -f <경로> 후 REUSE 없이 생성
+       파일이 정말 불필요하다면 이 쪽이 깔끔하다.
+
+    실습에서는 group 8 자체가 불필요하므로 ② 를 택한다.
+
+>>> 재확인 — 운영체제 명령으로 직접 지운다
+
+[oracle@chicago-srv ~]$ rm -f /u03/app/oracle/oradata/Chicago/stdbyredo08.log
+[oracle@chicago-srv ~]$ ls /u03/app/oracle/oradata/Chicago/stdbyredo*.log
+
+/u03/app/oracle/oradata/Chicago/stdbyredo04.log
+/u03/app/oracle/oradata/Chicago/stdbyredo05.log
+/u03/app/oracle/oradata/Chicago/stdbyredo06.log
+/u03/app/oracle/oradata/Chicago/stdbyredo07.log
+
+-- 네 개만 남았다. 딕셔너리와 파일이 일치한다.
+
+--------------------------------------------------------------------------------
+ [5] 점검 조회 — 개수와 크기를 한 번에
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT 'primary' node, COUNT(*) srl_cnt,
+  2                 MIN(bytes/1024/1024) min_mb, MAX(bytes/1024/1024) max_mb
+  3            FROM v$standby_log
+  4  UNION ALL
+  5  SELECT 'online', COUNT(*), MIN(bytes/1024/1024), MAX(bytes/1024/1024)
+  6            FROM v$log;
+
+NODE       SRL_CNT     MIN_MB     MAX_MB
+-------- ---------- ---------- ----------
+primary           4        200        200
+online            3        200        200
+
+2 rows selected.
+
+SYS@boston> SELECT 'standby' node, COUNT(*) srl_cnt,
+  2                 MIN(bytes/1024/1024) min_mb, MAX(bytes/1024/1024) max_mb
+  3             FROM v$standby_log
+  4   UNION ALL
+  5   SELECT 'online', COUNT(*), MIN(bytes/1024/1024), MAX(bytes/1024/1024)
+  6             FROM v$log;
+
+NODE       SRL_CNT     MIN_MB     MAX_MB
+-------- ---------- ---------- ----------
+standby           4        200        200
+online            3        200        200
+
+2 rows selected.
+
+-- 이 한 줄짜리 조회로 두 규칙을 동시에 점검할 수 있다.
+--   ① SRL 개수 > 온라인 그룹 수 인가       →  4 > 3  OK
+--   ② MIN_MB = MAX_MB = 온라인 크기 인가   →  200 = 200  OK
+--
+-- 양쪽 노드에서 실행해 대칭인지 확인한다. 실습 환경은 대칭이다.
+--
+-- MIN 과 MAX 를 함께 보는 이유는 크기가 섞인 경우를 잡아내기 위해서다.
+-- 실습 [4] 직후에 실행했다면 MIN_MB 가 100 으로 나와 즉시 이상이 드러났을 것이다.
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+  규칙                     값              근거
+  ------------------------ --------------- ---------------------------------------
+  개수                     온라인 + 1 이상 하나가 아카이브되는 동안 다른 하나가 받는다
+  크기                     온라인과 동일   다르면 오라클이 건너뛴다
+  스레드                   1 (단일 인스턴스) RAC 면 스레드마다 별도로
+  그룹 번호                온라인과 겹치지 않게
+  Primary 에도 생성        필수            역할 전환 직후 즉시 필요
+
+  주의 사항
+    · 크기가 달라도 생성은 된다. 오류가 없으므로 만든 뒤 반드시 대조한다
+    · 지워도 파일은 남는다. 운영체제 명령으로 직접 지운다
+    · 온라인 리두를 바꾸면 SRL 도 함께 바꿔야 한다
+
+SYS@chicago> EXIT
+SYS@boston> EXIT
+
+================================================================================
+ 실습 04 종료
+ 원복 확인 : SRL 4개 × 200MB (양쪽), stdbyredo08.log 파일 삭제 완료
+================================================================================

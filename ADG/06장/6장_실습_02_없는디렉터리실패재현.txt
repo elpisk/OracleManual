@@ -1,0 +1,227 @@
+================================================================================
+ 제6장 실습 02 — 없는 디렉터리를 가리켰을 때
+ 대상   : boston-srv Standby (chicago-srv 에서 RMAN 실행)
+ 목표   : db_create_file_dest 가 존재하지 않는 경로일 때 어디서 막히는지
+          확인하고, 5장의 실패와 성격이 어떻게 다른지 대조한다
+ 소요   : 약 30분
+ 경고   : 이 실습부터 Standby 를 **헐어 버린다.**
+          VM 스냅샷을 뜬 뒤 진행한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 5장 구성을 완전히 제거한다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+[oracle@boston-srv ~]$ rm -rf /u03/app/oracle/oradata/Boston
+[oracle@boston-srv ~]$ rm -f $ORACLE_HOME/dbs/spfileboston.ora
+[oracle@boston-srv ~]$ ls /u03/app/oracle/oradata
+
+Chicago
+
+-- ★ 이번에는 Boston 디렉터리를 **통째로** 지운다.
+--   5장에서는 *.dbf 만 지우고 하위 디렉터리를 남겼다.
+--   OMF 는 디렉터리를 스스로 만들므로 남길 이유가 없다.
+--   이 차이가 이 장의 핵심이다.
+--
+--   남아 있는 Chicago 는 빈 디렉터리다. 지금은 신경 쓰지 않는다.
+
+--------------------------------------------------------------------------------
+ [2] 없는 경로를 가리키는 pfile 작성
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ cat > $ORACLE_HOME/dbs/initboston.ora <<'EOF'
+db_name=chicago
+enable_pluggable_database=true
+db_create_file_dest=/u03/nosuchdir
+EOF
+
+[oracle@boston-srv ~]$ cat $ORACLE_HOME/dbs/initboston.ora
+db_name=chicago
+enable_pluggable_database=true
+db_create_file_dest=/u03/nosuchdir
+
+[oracle@boston-srv ~]$ ls -ld /u03/nosuchdir
+ls: cannot access /u03/nosuchdir: No such file or directory
+
+-- 세 번째 줄이 5장의 pfile 에는 없던 줄이다.
+-- 그리고 그 경로는 존재하지 않는다.
+
+--------------------------------------------------------------------------------
+ [3] NOMOUNT 기동 시도 — 여기서 이미 막힌다
+--------------------------------------------------------------------------------
+
+SYS@boston> STARTUP NOMOUNT PFILE='/u01/app/oracle/product/19.3.0/dbhome_1/dbs/initboston.ora'
+
+ORA-01261: Parameter db_create_file_dest destination string cannot be translated
+ORA-01262: Stat failed on a file destination directory
+Linux-x86_64 Error: 2: No such file or directory
+ORA-01034: ORACLE not available
+Process ID: 0
+Session ID: 0 Serial number: 0
+
+>>> 원인 파악
+    **인스턴스가 뜨지 않았다.** DUPLICATE 를 실행해 보기도 전이다.
+
+    오류 네 줄을 아래에서 위로 읽는다.
+
+      ORA-01034               결과 — 인스턴스가 없다
+      Linux-x86_64 Error: 2   원인 — ENOENT, 그런 경로가 없다
+      ORA-01262               stat() 실패
+      ORA-01261               값을 경로로 해석할 수 없다
+
+    ★ 실습 01 에서 본 것과 같은 세 줄이다.
+      다만 그때는 ORA-02097(파라미터를 바꿀 수 없다)이 얹혀 있었고,
+      지금은 ORA-01034(인스턴스가 없다)가 얹혀 있다.
+      같은 원인이 어느 시점에 걸리느냐에 따라 겉옷이 달라진 것이다.
+
+    ★ Process ID: 0 / Session ID: 0 도 신호다.
+      프로세스가 만들어지지도 않았다는 뜻이다.
+
+    ★ **5장의 두 번째 실패와 비교한다.**
+      5장에서는 대상 디렉터리가 없어도 인스턴스는 정상으로 떴다.
+      DUPLICATE 도 시작됐고, 데이터 파일 세 개를 이미 복사한 뒤
+      네 번째에서 ORA-19505 로 멈췄다.
+
+      즉 5장은 **작업 도중**에, 6장은 **작업 전**에 막힌다.
+      OMF 가 경로를 실제로 검사하기 때문이다.
+
+--------------------------------------------------------------------------------
+ [4] 그래도 RMAN 을 실행해 보면
+--------------------------------------------------------------------------------
+
+-- 인스턴스가 없는 것을 모르고 DUPLICATE 를 실행하면 어떤 오류가 나는지
+-- 확인해 둔다. 실무에서는 이쪽을 먼저 만나는 경우도 많다.
+
+[oracle@chicago-srv ~]$ rman target "'sys/oracle@chicago as sysdba'" \
+>   auxiliary "'sys/oracle@boston as sysdba'" \
+>   cmdfile=/home/oracle/dup_omf_bad.rman
+
+RMAN> run
+2> {
+3>   allocate channel c1 type disk;
+4>   allocate auxiliary channel sby type disk;
+5>   duplicate target database for standby from active database
+...
+13>
+using target database control file instead of recovery catalog
+allocated channel: c1
+channel c1: SID=148 device type=DISK
+
+released channel: c1
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of allocate command at 08/27/2026 10:04:32
+RMAN-06403: could not obtain a fully authorized session
+RMAN-04006: error from auxiliary database: ORA-01034: ORACLE not available
+ORA-27101: shared memory realm does not exist
+Linux-x86_64 Error: 2: No such file or directory
+Additional information: 4376
+Additional information: 2097994235
+
+Recovery Manager complete.
+
+[oracle@chicago-srv ~]$ echo "rc=$?"
+rc=1
+
+>>> 원인 파악
+    ★ 첫 줄부터 5장과 다르다.
+
+      5장 : RMAN-03002: failure of **Duplicate Db** command
+      6장 : RMAN-03002: failure of **allocate** command
+
+      복제 명령까지 가지도 못하고 **채널 할당**에서 끝났다.
+      c1(Primary 쪽 채널)은 할당됐지만 sby(auxiliary 쪽 채널)에서 막혔다.
+
+    ★ RMAN-06403: could not obtain a fully authorized session
+      auxiliary 에 제대로 접속할 수 없다는 뜻이다.
+
+    ★ ORA-27101: shared memory realm does not exist
+      이유가 여기 있다. **SGA 자체가 없다.**
+      인스턴스가 뜨지 않았으니 공유 메모리 영역도 없다.
+
+    ★ Additional information 두 줄은 오라클 내부 진단용 값이다.
+      운영자가 해석할 필요는 없다.
+
+    ★ 헷갈리기 쉬운 지점
+      ORA-01034 는 3장에서도 만났다. 그때는 인스턴스가 아예 없었다.
+      지금은 인스턴스를 띄우려다 실패한 것이다.
+      결과 메시지는 같지만 원인이 다르다.
+      **Standby 쪽 alert 로그나 startup 출력을 봐야 갈린다.**
+
+>>> 조치
+    존재하는 경로로 pfile 을 고친다.
+
+[oracle@boston-srv ~]$ cat > $ORACLE_HOME/dbs/initboston.ora <<'EOF'
+db_name=chicago
+enable_pluggable_database=true
+db_create_file_dest=/u03/app/oracle/oradata
+EOF
+
+    또는 그 경로를 만들어 주어도 된다. 다만 /u03/nosuchdir 같은
+    임시 경로를 실제로 만드는 것은 권하지 않는다.
+
+>>> 재확인
+
+SYS@boston> STARTUP NOMOUNT PFILE='/u01/app/oracle/product/19.3.0/dbhome_1/dbs/initboston.ora'
+ORACLE instance started.
+
+Total System Global Area  356512392 bytes
+Fixed Size                  9134728 bytes
+Variable Size             289406976 bytes
+Database Buffers           50331648 bytes
+Redo Buffers                7639040 bytes
+
+SYS@boston> SHOW PARAMETER db_create_file_dest
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+db_create_file_dest                  string      /u03/app/oracle/oradata
+
+    인스턴스가 떴고 파라미터도 들어갔다.
+    ★ 이 두 줄이 확인되면 경로 문제는 없는 것이다.
+      OMF 의 장점이 여기 있다. **복제를 시작하기 전에 알 수 있다.**
+
+--------------------------------------------------------------------------------
+ [5] 두 방식의 실패 시점 비교
+--------------------------------------------------------------------------------
+
+  단계                          5장 경로 지정        6장 OMF
+  ----------------------------- -------------------- --------------------
+  pfile 작성                    통과                 통과
+  NOMOUNT 기동                  통과                 **여기서 실패**
+  RMAN 접속                     통과                 (도달 못함)
+  채널 할당                     통과                 (도달 못함)
+  Standby 마운트                통과                 —
+  데이터 파일 1,3,4 전송        통과                 —
+  데이터 파일 6 전송            **여기서 실패**      —
+  남은 파일                     세 개                없음
+  복구 작업                     전부 지우고 재시작   pfile 한 줄 수정
+
+  ★ 실패는 이를수록 좋다.
+    잘못을 알아채는 데 걸리는 시간도, 되돌리는 데 드는 수고도 적다.
+    OMF 를 고를 이유 중 하나가 이것이다.
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+  · db_create_file_dest 는 인스턴스 기동 시점에 stat() 으로 검증된다
+  · 없는 경로 → ORA-01261 + ORA-01262 + Linux Error 2 + ORA-01034
+  · Linux 오류 번호 2 는 ENOENT(경로 없음), 13 은 EACCES(권한 없음)
+  · 인스턴스가 없으면 RMAN 은 `failure of allocate command` 로 끝난다
+  · ORA-27101 은 SGA 가 없다는 뜻이다
+  · 5장과 달리 아무 파일도 남기지 않으므로 정리할 것이 없다
+
+================================================================================
+ 실습 02 종료 — boston 은 NOMOUNT 상태다. 실습 03 으로 이어진다.
+================================================================================

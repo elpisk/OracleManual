@@ -1,0 +1,221 @@
+================================================================================
+ 제3장 실습 03 — 정적 등록을 제거해 실패를 재현하고 복원한다
+ 대상   : boston-srv Standby (chicago-srv 에서 접속 시도)
+ 목표   : 정적 등록이 없을 때 NOMOUNT 인스턴스에 접속할 수 없다는 사실을 실증하고,
+          ORA-12514 와 ORA-12528 을 구분한다
+ 소요   : 약 30분
+ 경고   : boston 을 NOMOUNT 로 내렸다가 복구한다. 다른 실습과 겹치지 않게 진행한다.
+ 되돌리기 : 실습 끝에 listener.ora 복원 + boston 을 READ ONLY WITH APPLY 로 복귀
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 준비 — 현재 파일을 백업한다
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ cp $ORACLE_HOME/network/admin/listener.ora /tmp/listener.ora.bak
+[oracle@boston-srv ~]$ ls -l /tmp/listener.ora.bak
+
+-- 되돌릴 근거를 먼저 확보한다. 설정 파일을 건드리는 작업의 첫 단계는 항상 백업이다.
+
+--------------------------------------------------------------------------------
+ [2] 정적 등록을 제거한다
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ cat > $ORACLE_HOME/network/admin/listener.ora <<'EOF'
+LISTENER =
+  (DESCRIPTION =
+    (ADDRESS = (PROTOCOL = TCP)(HOST = boston-srv.localdomain)(PORT = 1521))
+  )
+
+ADR_BASE_LISTENER = /u01/app/oracle
+EOF
+
+[oracle@boston-srv ~]$ lsnrctl stop
+[oracle@boston-srv ~]$ lsnrctl start
+
+Version                   TNSLSNR for Linux: Version 19.0.0.0.0 - Production
+Start Date                26-AUG-2026 19:50:32
+Uptime                    0 days 0 hr. 0 min. 0 sec
+Listener Parameter File   /u01/app/oracle/product/19.3.0/dbhome_1/network/admin/listener.ora
+Listener Log File         /u01/app/oracle/diag/tnslsnr/boston-srv/listener/alert/log.xml
+Listening Endpoints Summary...
+  (DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=boston-srv)(PORT=1521)))
+The listener supports no services
+The command completed successfully
+
+-- "The listener supports no services"
+-- 리스너는 떠 있지만 아무 서비스도 모른다.
+-- 정적 등록을 뺐고, 인스턴스는 아직 자신을 등록하지 않았기 때문이다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 ① — ORA-12514
+--------------------------------------------------------------------------------
+
+[oracle@chicago-srv ~]$ sqlplus -s "sys/oracle@boston as sysdba"
+
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in connect
+descriptor
+
+SP2-0306: Invalid option.
+ERROR:
+ORA-01005: null password given; logon denied
+SP2-0157: unable to CONNECT to ORACLE after 3 attempts, exiting SQL*Plus
+
+
+>>> 원인 파악
+    실제 원인은 첫 줄의 ORA-12514 다.
+    그 뒤의 SP2-0306, ORA-01005, SP2-0157 은 SQL*Plus 가 재시도하면서 남긴
+    부산물이므로 무시한다. 오류 메시지가 여러 줄일 때는 첫 줄부터 읽는다.
+
+    ORA-12514 = "리스너는 응답했지만 요청한 서비스를 모른다"
+    즉 네트워크와 리스너는 정상이고, 서비스 등록만 없다는 뜻이다.
+
+[oracle@chicago-srv ~]$ tnsping boston
+OK (0 msec)
+
+-- tnsping 은 OK 다. 이것이 "tnsping OK 인데 접속 실패" 의 전형적인 모습이다.
+-- tnsping 은 리스너 생존까지만 보고 서비스 등록은 보지 않는다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 ② — NOMOUNT 로 내리면 ORA-12528
+--------------------------------------------------------------------------------
+
+-- 잠시 기다리면 인스턴스가 동적 등록을 수행해 접속이 되기 시작한다.
+-- 그 상태에서 인스턴스를 NOMOUNT 로 내린다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+Database altered.
+
+SYS@boston> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@boston> STARTUP NOMOUNT
+ORACLE instance started.
+
+Total System Global Area 3221223192 bytes
+Fixed Size                  9139992 bytes
+Variable Size             654311424 bytes
+Database Buffers         2550136832 bytes
+Redo Buffers                7634944 bytes
+
+[oracle@chicago-srv ~]$ sqlplus -s "sys/oracle@boston as sysdba"
+
+ERROR:
+ORA-12528: TNS:listener: all appropriate instances are blocking new connections
+
+
+>>> 원인 파악
+    오류 번호가 ORA-12514 에서 ORA-12528 로 바뀌었다.
+    리스너가 서비스는 알게 됐지만, 그 인스턴스가 새 접속을 막고 있다는 뜻이다.
+
+[oracle@boston-srv ~]$ lsnrctl status
+
+Services Summary...
+Service "boston" has 1 instance(s).
+  Instance "boston", status BLOCKED, has 1 handler(s) for this service...
+The command completed successfully
+
+    status 가 BLOCKED 다.
+    NOMOUNT 상태의 인스턴스가 동적으로 등록한 서비스는 이 상태가 되며
+    클라이언트 접속을 받지 않는다.
+
+    ★ 이것이 정적 등록이 필요한 이유다.
+      5장의 RMAN DUPLICATE 는 auxiliary(boston)가 NOMOUNT 여야 하고,
+      RMAN 은 그 인스턴스에 원격으로 접속해야 한다.
+      동적 등록에만 의존하면 여기서 막힌다.
+
+>>> 조치 — 정적 등록을 복원한다
+
+[oracle@boston-srv ~]$ cp /tmp/listener.ora.bak $ORACLE_HOME/network/admin/listener.ora
+[oracle@boston-srv ~]$ lsnrctl stop
+[oracle@boston-srv ~]$ lsnrctl start
+
+Services Summary...
+Service "boston" has 1 instance(s).
+  Instance "boston", status UNKNOWN, has 1 handler(s) for this service...
+Service "boston_DGMGRL" has 1 instance(s).
+  Instance "boston", status UNKNOWN, has 1 handler(s) for this service...
+The command completed successfully
+
+-- status 가 BLOCKED 에서 UNKNOWN 으로 바뀌었다.
+-- 정적 등록은 리스너가 인스턴스 상태를 모르는 채 일단 넘겨주는 방식이다.
+
+>>> 재확인 — NOMOUNT 상태 그대로 접속해 본다
+
+[oracle@chicago-srv ~]$ sqlplus -s "sys/oracle@boston as sysdba"
+
+SQL> SELECT instance_name, status FROM v$instance;
+
+INSTANCE_NAME    STATUS
+---------------- ------------
+boston           STARTED
+
+SQL> EXIT
+
+-- ★ 접속에 성공했다. 인스턴스는 여전히 NOMOUNT(STATUS = STARTED)다.
+--   정적 등록 덕분에 리스너가 접속을 넘겨준 것이다.
+--   5장의 RMAN DUPLICATE 가 가능한 이유가 정확히 이것이다.
+
+--------------------------------------------------------------------------------
+ [5] boston 을 원래 상태로 복구
+--------------------------------------------------------------------------------
+
+SYS@boston> SHUTDOWN IMMEDIATE
+ORA-01507: database not mounted
+
+ORACLE instance shut down.
+
+-- ORA-01507 은 "마운트되지 않았다" 는 안내다.
+-- NOMOUNT 상태에서 shutdown 하면 닫을 데이터베이스가 없어 이 메시지가 나오며,
+-- 이어지는 "ORACLE instance shut down" 이 종료가 정상 완료됐음을 알려 준다.
+-- 2장의 ORA-01109 와 같은 성격의 메시지다.
+
+SYS@boston> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@boston> ALTER DATABASE OPEN READ ONLY;
+Database altered.
+
+SYS@boston> ALTER PLUGGABLE DATABASE chicago_pdb1 OPEN READ ONLY;
+Pluggable database altered.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+Database altered.
+
+SYS@boston> COL name FOR a10
+SYS@boston> SELECT name, database_role, open_mode FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE
+---------- ---------------- --------------------
+CHICAGO    PHYSICAL STANDBY READ ONLY WITH APPLY
+
+1 row selected.
+
+[oracle@boston-srv ~]$ rm -f /tmp/listener.ora.bak
+
+--------------------------------------------------------------------------------
+ [6] 정리 — 두 오류의 차이
+--------------------------------------------------------------------------------
+
+  오류        조건                                     리스너 status  조치
+  ----------- ---------------------------------------- -------------- ---------------
+  ORA-12514   리스너가 그 서비스를 아예 모른다         (서비스 없음)  정적 등록 추가
+  ORA-12528   서비스는 알지만 인스턴스가 막고 있다     BLOCKED        정적 등록 추가
+  (성공)      정적 등록이 있어 일단 넘겨준다           UNKNOWN        —
+  ORA-01034   넘겨줬는데 인스턴스가 없다               UNKNOWN        인스턴스 기동
+
+  진단 요령
+    ORA-12514 → lsnrctl status 의 Services Summary 에 그 이름이 있는가
+    ORA-12528 → 있는데 status 가 BLOCKED 인가 (인스턴스가 NOMOUNT/MOUNT)
+    두 경우 모두 해법은 같다 — listener.ora 에 정적 등록을 넣고 리스너 재기동
+
+================================================================================
+ 실습 03 종료
+ 원복 확인 : listener.ora 원본 복원, boston = PHYSICAL STANDBY / READ ONLY WITH APPLY
+             임시 백업 파일 제거 완료
+================================================================================

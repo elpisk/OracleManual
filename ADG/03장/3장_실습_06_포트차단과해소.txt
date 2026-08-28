@@ -1,0 +1,235 @@
+================================================================================
+ 제3장 실습 06 — 포트 차단과 해소, 그리고 오류 계층 지도
+ 대상   : boston-srv (root 권한 필요) / chicago-srv 에서 확인
+ 목표   : 방화벽으로 1521 을 막아 TNS-12535 를 재현하고, 이 장에서 만난 오류들을
+          계층 지도로 정리한다
+ 소요   : 약 25분
+ 경고   : root 권한으로 iptables 규칙을 넣는다. 반드시 실습 끝에 제거한다.
+ 되돌리기 : iptables 규칙 삭제 + 목적지 DEFER/ENABLE
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 현재 방화벽·포트 상태
+--------------------------------------------------------------------------------
+
+[root@boston-srv ~]# systemctl is-active firewalld
+unknown
+
+[root@boston-srv ~]# rpm -q firewalld
+firewalld-0.6.3-11.0.1.el7.noarch
+
+[root@boston-srv ~]# which iptables
+/usr/sbin/iptables
+
+-- firewalld 패키지는 설치되어 있으나 서비스는 활성화되어 있지 않다(unknown).
+-- 설치 가이드 1장 Step 7 이 firewalld 를 stop/disable 하라고 하지만,
+-- 이 이미지에서는 애초에 돌고 있지 않아 그 단계가 무의미하다.
+-- 대신 iptables 로 직접 규칙을 넣어 차단을 재현한다.
+
+[root@boston-srv ~]# ss -lntp | grep 1521
+LISTEN  0  128  [::]:1521  [::]:*  users:(("tnslsnr",pid=11281,fd=8))
+
+-- tnslsnr 이 1521 을 열고 있다. Data Guard 는 이 포트 하나만 쓴다.
+-- 양방향으로 열려 있어야 한다 — FAL(갭 해소)과 역할 전환 때문이다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 1521 인입을 DROP 한다
+--------------------------------------------------------------------------------
+
+[root@boston-srv ~]# iptables -I INPUT -p tcp --dport 1521 -j DROP
+[root@boston-srv ~]# iptables -L INPUT -n --line-numbers | head -6
+
+Chain INPUT (policy ACCEPT)
+num  target     prot opt source               destination
+1    DROP       tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:1521
+2    ACCEPT     udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:53
+3    ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:53
+4    ACCEPT     udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:67
+
+-- 규칙 1번으로 삽입(-I)했으므로 가장 먼저 적용된다.
+-- DROP 은 응답을 보내지 않고 패킷을 버린다. REJECT 와의 차이가 곧 진단 단서가 된다.
+
+[oracle@chicago-srv ~]$ tnsping boston
+
+TNS Ping Utility for Linux: Version 19.0.0.0.0 - Production
+Used TNSNAMES adapter to resolve the alias
+Attempting to contact (DESCRIPTION = (ADDRESS_LIST = (ADDRESS = (PROTOCOL = TCP)
+(HOST = boston-srv.localdomain)(PORT = 1521))) (CONNECT_DATA = (SERVICE_NAME = boston)))
+TNS-12535: TNS:operation timed out
+
+
+>>> 원인 파악
+    TNS-12535 = "시간이 다 되도록 응답이 없었다"
+
+    ★ 여기서 가장 중요한 관찰은 **오류가 나기까지 시간이 걸렸다** 는 점이다.
+      DROP 은 아무 응답도 보내지 않으므로 클라이언트는 타임아웃을 기다려야 한다.
+
+    응답 속도로 원인을 가를 수 있다.
+      즉시 오류      → 리스너가 죽었거나 포트가 닫혀 있다 (ORA-12541, 연결 거부)
+      한참 뒤 타임아웃 → 방화벽 DROP 또는 라우팅 문제 (TNS-12535)
+
+    "이름은 풀렸는데(Attempting to contact 까지 출력됨) 응답만 없다" 는 것도 단서다.
+    tnsnames.ora 는 정상이라는 뜻이므로 이름 해석 계층은 볼 필요가 없다.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@chicago> COL error FOR a48
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id = 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ------------------------------------------------
+         2 ERROR     ORA-16191: Primary log shipping client not
+                     logged on standby
+
+1 row selected.
+
+-- 목적지 오류는 ORA-16191 로 나타났다.
+-- 실습 05 에서 패스워드 문제일 때 본 것과 같은 번호다.
+--
+-- ★ 여기서 중요한 교훈: ORA-16191 은 "로그온하지 못했다" 는 결과만 말해 준다.
+--   원인이 인증인지 네트워크인지는 이 번호만으로 구분되지 않는다.
+--   구분하려면 tnsping 을 함께 봐야 한다.
+--     tnsping OK   + ORA-16191 → 인증 문제 (실습 05)
+--     tnsping 실패 + ORA-16191 → 네트워크 문제 (지금)
+
+>>> 조치 — 차단 규칙을 제거한다
+
+[root@boston-srv ~]# iptables -D INPUT -p tcp --dport 1521 -j DROP
+[root@boston-srv ~]# iptables -L INPUT -n | head -4
+
+Chain INPUT (policy ACCEPT)
+target     prot opt source               destination
+ACCEPT     udp  --  0.0.0.0/0            0.0.0.0/0            udp dpt:53
+ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:53
+
+-- DROP 규칙이 사라졌다.
+
+>>> 재확인 ① — 네트워크
+
+[oracle@chicago-srv ~]$ tnsping boston
+
+Used TNSNAMES adapter to resolve the alias
+Attempting to contact (DESCRIPTION = (ADDRESS_LIST = (ADDRESS = (PROTOCOL = TCP)
+(HOST = boston-srv.localdomain)(PORT = 1521))) (CONNECT_DATA = (SERVICE_NAME = boston)))
+OK (0 msec)
+
+-- 즉시 OK 로 돌아왔다. 네트워크는 회복됐다.
+
+>>> 재확인 ② — 목적지 상태는 아직이다
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id = 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ------------------------------------------------
+         2 ERROR     ORA-16191: Primary log shipping client not
+                     logged on standby
+
+1 row selected.
+
+-- 실습 05 와 똑같은 상황이다.
+-- 원인은 사라졌는데 목적지가 실패 상태로 굳어 있다.
+
+>>> 조치 ② — 목적지를 되살린다
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_state_2=DEFER SCOPE=BOTH;
+System altered.
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_state_2=ENABLE SCOPE=BOTH;
+System altered.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+>>> 재확인 ③
+
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id <= 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ------------------------------------------------
+         1 VALID
+         2 VALID
+
+2 rows selected.
+
+SYS@boston> COL name FOR a16
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+--------------------------------------------------------------------------------
+ [3] 오류 계층 지도 — 이 장에서 만난 것을 정리한다
+--------------------------------------------------------------------------------
+
+  계층        오류            의미                              조치
+  ----------- --------------- --------------------------------- ---------------------------
+  이름 해석   TNS-03505       tnsnames 에 별칭이 없다           별칭 추가, TNS_ADMIN 확인
+  네트워크    TNS-12535       응답 없이 타임아웃 (DROP)         방화벽·라우팅 확인
+  네트워크    ORA-12541       리스너 없음 (즉시 거부)           리스너 기동
+  리스너      ORA-12514       서비스를 모른다                   정적 등록 / 동적 등록 대기
+  리스너      ORA-12528       인스턴스가 막고 있다 (BLOCKED)    정적 등록 추가
+  인스턴스    ORA-01034       인스턴스가 없다                   기동, ORACLE_SID 확인
+  인증        ORA-01017       패스워드 파일 불일치              양쪽 파일 일치시키기
+  인증(DG)    ORA-16191       전송 클라이언트 로그온 실패       원인 제거 후 DEFER/ENABLE
+  구성        ORA-16053       DB_UNIQUE_NAME 이 DG_CONFIG 에 없음  LOG_ARCHIVE_CONFIG 확인
+
+  위에서 아래로 갈수록 상위 계층이다. 진단은 위에서부터 하는 것이 빠르다.
+  이름이 안 풀리는데 인증을 의심할 필요는 없다.
+
+--------------------------------------------------------------------------------
+ [4] 표준 진단 절차
+--------------------------------------------------------------------------------
+
+  ① tnsping <별칭>
+       TNS-03505  → tnsnames.ora 문제. 여기서 끝.
+       TNS-12535  → 방화벽·라우팅. (한참 뒤 타임아웃)
+       ORA-12541  → 리스너가 죽었다. (즉시)
+       OK         → ② 로
+
+  ② 상대 노드에서 lsnrctl status
+       서비스 목록에 없다      → ORA-12514 원인. 정적 등록 추가
+       있는데 status BLOCKED   → ORA-12528 원인. 정적 등록 추가
+       status UNKNOWN / READY  → ③ 으로
+
+  ③ sqlplus "sys/oracle@<별칭> as sysdba"
+       ORA-01034 → 인스턴스가 없다. ORACLE_SID 확인
+       ORA-01017 → 패스워드 파일. 양쪽 대조 + sqlnet.ora 버전 확인
+       성공      → ④ 로 (Oracle Net 계층은 전부 정상)
+
+  ④ LOG_ARCHIVE_CONFIG 의 DG_CONFIG 확인
+       상대 DB_UNIQUE_NAME 이 없으면 목적지 설정 자체가 ORA-16053 으로 거부된다
+
+  ⑤ V$ARCHIVE_DEST 의 VALID_NOW, V$ARCHIVE_DEST_STATUS 의 STATUS·ERROR (2장)
+       ORA-16191 → ③ 으로 돌아간다
+
+  ⑥ 원인을 고쳤으면 목적지를 되살린다
+       LOG_ARCHIVE_DEST_STATE_n : DEFER → ENABLE → 로그 스위치 → 재확인
+
+  ⑦ 실제로 리두가 흐르는지 확인한다
+       Standby 의 V$MANAGED_STANDBY RFS 시퀀스 상승
+       V$DATAGUARD_STATS 의 두 lag 가 0 으로 수렴
+
+[root@boston-srv ~]# iptables -L INPUT -n | grep 1521 || echo "1521 관련 규칙 없음"
+1521 관련 규칙 없음
+
+SYS@chicago> EXIT
+SYS@boston> EXIT
+
+================================================================================
+ 실습 06 종료
+ 원복 확인 : iptables 에 1521 규칙 없음, tnsping OK,
+             dest_1/dest_2 모두 VALID, 두 lag 0
+================================================================================

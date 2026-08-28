@@ -1,0 +1,199 @@
+================================================================================
+ 제4장 실습 02 — ARCHIVELOG 모드 확인과 전환
+ 대상   : chicago-srv Primary
+ 목표   : ARCHIVELOG 상태를 두 가지 방법으로 확인하고, FRA 사용률을 점검한다.
+          전환이 거부되는 조건을 재현한다
+ 소요   : 약 20분
+ 변경   : 없음 (전환 시도는 거부되어 상태가 바뀌지 않는다)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] ARCHIVE LOG LIST — 한눈에 보기
+--------------------------------------------------------------------------------
+
+[oracle@chicago-srv ~]$ sqlplus -s / as sysdba
+
+SQL> ARCHIVE LOG LIST
+
+Database log mode              Archive Mode
+Automatic archival             Enabled
+Archive destination            USE_DB_RECOVERY_FILE_DEST
+Oldest online log sequence     51
+Next log sequence to archive   53
+Current log sequence           53
+
+-- 읽는 법
+--   Database log mode = Archive Mode   → ARCHIVELOG 모드다
+--   Automatic archival = Enabled       → ARCn 이 자동으로 아카이브한다
+--   Archive destination                → FRA 를 쓴다 (LOG_ARCHIVE_DEST_1 설정)
+--   Oldest online log sequence 51      → 온라인 리두에 남아 있는 가장 오래된 시퀀스
+--   Current log sequence 53            → 지금 쓰고 있는 시퀀스
+--
+-- ARCHIVE LOG LIST 는 SQL*Plus 전용 명령이다. 스크립트에서 쓰려면 뷰를 쓴다.
+
+--------------------------------------------------------------------------------
+ [2] 뷰로 확인하기
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a10
+SYS@chicago> SELECT name, log_mode, force_logging, flashback_on FROM v$database;
+
+NAME       LOG_MODE     FORCE_LOGGING   FLASHBACK_ON
+---------- ------------ --------------- ------------------
+CHICAGO    ARCHIVELOG   YES             NO
+
+1 row selected.
+
+-- LOG_MODE = ARCHIVELOG   → Data Guard 의 전제 조건 충족
+-- FORCE_LOGGING = YES     → 실습 03 에서 다룬다
+-- FLASHBACK_ON = NO       → 11장 Snapshot Standby, 16장 Reinstate 에서 켠다
+
+--------------------------------------------------------------------------------
+ [3] 아카이브 설정 확인
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a30
+SYS@chicago> COL value FOR a46
+SYS@chicago> SET LINES 200
+SYS@chicago> SELECT name, value FROM v$parameter
+  2            WHERE name IN ('db_recovery_file_dest','db_recovery_file_dest_size',
+  3                           'log_archive_format','log_archive_max_processes');
+
+NAME                           VALUE
+------------------------------ ----------------------------------------------
+log_archive_format             %t_%s_%r.dbf
+log_archive_max_processes      4
+db_recovery_file_dest          /u03/app/oracle/fast_recovery_area
+db_recovery_file_dest_size     16106127360
+
+4 rows selected.
+
+-- LOG_ARCHIVE_FORMAT 의 치환 문자
+--   %t  스레드 번호 (RAC 가 아니면 1)
+--   %s  시퀀스 번호
+--   %r  resetlogs ID
+-- 세 값이 모두 들어가야 파일 이름이 겹치지 않는다.
+-- 특히 %r 은 불완전 복구 후 resetlogs 를 했을 때 이전 파일과 구분해 준다.
+--
+-- LOG_ARCHIVE_MAX_PROCESSES = 4
+--   1장에서 확인한 ARC0~ARC3 네 개와 일치한다.
+--   Standby 가 여러 대이거나 갭 해소가 잦으면 늘리는 것을 검토한다.
+--
+-- db_recovery_file_dest_size = 16106127360 bytes = 15360 MB
+--   DBCA 의 -recoveryAreaSize 15360 이 그대로 반영됐다.
+
+--------------------------------------------------------------------------------
+ [4] FRA 사용률 — Data Guard 환경의 감시 항목
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a40
+SYS@chicago> SELECT name, space_limit/1024/1024 limit_mb,
+  2                 space_used/1024/1024 used_mb,
+  3                 ROUND(space_used/space_limit*100,2) pct
+  4            FROM v$recovery_file_dest;
+
+NAME                                     LIMIT_MB    USED_MB        PCT
+---------------------------------------- ---------- ---------- ----------
+/u03/app/oracle/fast_recovery_area            15360  228.23584       1.49
+
+1 row selected.
+
+-- 1.49 퍼센트. 만든 지 얼마 되지 않아 여유가 많다.
+--
+-- ★ 이 값이 100 퍼센트가 되면 아카이브를 쓸 수 없어 **Primary 가 멈춘다.**
+--   Data Guard 환경에서 특히 위험한 이유가 있다.
+--   Standby 가 아직 적용하지 않은 아카이브는 오라클이 지우지 않는다.
+--   따라서 Standby 가 오래 멈춰 있으면 FRA 가 차오르고, 결국 Primary 가 멈춘다.
+--
+--   2장에서 "Maximum Performance 는 Standby 장애가 Primary 에 영향을 주지 않는다"
+--   고 했지만, FRA 를 통한 이 경로는 예외다. 모드와 무관하게 발생한다.
+
+SYS@chicago> COL name FOR a58
+SYS@chicago> SELECT sequence#,
+  2                 TO_CHAR(completion_time,'YYYY-MM-DD HH24:MI:SS') done,
+  3                 blocks*block_size/1024/1024 mb
+  4            FROM v$archived_log
+  5           WHERE dest_id=1 AND ROWNUM<=5 ORDER BY sequence# DESC;
+
+ SEQUENCE# DONE                          MB
+---------- ------------------- ----------
+        10 2026-08-26 18:00:03 .094726563
+         9 2026-08-26 17:57:09 .000976563
+         8 2026-08-26 17:57:09 .027832031
+         7 2026-08-26 17:55:46 .000976563
+         6 2026-08-26 17:54:50     186.75
+
+5 rows selected.
+
+-- 시퀀스 6 이 186.75MB 인 반면 나머지는 1MB 미만이다.
+-- 6번은 로그가 꽉 차서 자동 전환된 것이고, 나머지는
+-- ALTER SYSTEM ARCHIVE LOG CURRENT 로 강제 전환한 것이기 때문이다.
+-- 실습에서 로그 스위치를 자주 내면 이렇게 작은 아카이브가 많이 생긴다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — 열린 상태에서 모드 전환
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE NOARCHIVELOG;
+ALTER DATABASE NOARCHIVELOG
+*
+ERROR at line 1:
+ORA-01126: database must be mounted in this instance and not open in any instance
+
+
+>>> 원인 파악
+    ORA-01126 이다. 2장에서 보호 모드를 올릴 때 만났던 바로 그 번호다.
+
+    ★ 그때와 지금은 의미가 다르다.
+      2장에서는 문면("마운트하라")과 실제 원인(보호 모드 요건 미충족)이 달랐다.
+      지금은 문면 그대로다. 정말로 마운트 상태여야 한다.
+
+    같은 오류 번호가 상황에 따라 다른 의미를 갖는다.
+    번호만 보고 원인을 단정하면 안 되는 또 하나의 사례다.
+
+>>> 올바른 절차 (참고 — 이 실습에서는 실행하지 않는다)
+
+    SYS@chicago> SHUTDOWN IMMEDIATE
+    SYS@chicago> STARTUP MOUNT
+    SYS@chicago> ALTER DATABASE ARCHIVELOG;     -- 또는 NOARCHIVELOG
+    SYS@chicago> ALTER DATABASE OPEN;
+
+    ★ 운영 중인 Data Guard 구성에서 ARCHIVELOG 를 끄는 일은 없어야 한다.
+      껐다가 다시 켜는 사이에 생성된 리두는 아카이브되지 않으므로
+      Standby 에 영구적인 구멍이 남는다. 재구축 말고는 메울 방법이 없다.
+
+>>> 조치
+    이 실습에서는 모드를 바꾸지 않는다. 거부되는 것을 확인하는 것이 목적이다.
+
+>>> 재확인 — 상태가 그대로인지 확인한다
+
+SYS@chicago> SELECT log_mode FROM v$database;
+
+LOG_MODE
+------------
+ARCHIVELOG
+
+1 row selected.
+
+-- 실패한 명령은 아무것도 바꾸지 않았다.
+
+--------------------------------------------------------------------------------
+ [6] 정리 — ARCHIVELOG 점검 항목
+--------------------------------------------------------------------------------
+
+  항목                        확인 방법                          기대값
+  --------------------------- ---------------------------------- -----------------
+  로그 모드                   V$DATABASE.LOG_MODE                ARCHIVELOG
+  자동 아카이브                ARCHIVE LOG LIST                   Enabled
+  아카이브 목적지              LOG_ARCHIVE_DEST_1                 FRA 또는 경로
+  아카이브 프로세스 수         LOG_ARCHIVE_MAX_PROCESSES          4 이상
+  FRA 사용률                  V$RECOVERY_FILE_DEST               여유 있음
+  아카이브 생성 여부           V$ARCHIVED_LOG 의 최근 행          시퀀스가 오른다
+
+  모드 전환은 MOUNT 상태에서만 가능하다. OPEN 에서 시도하면 ORA-01126.
+
+SYS@chicago> EXIT
+
+================================================================================
+ 실습 02 종료 — 환경 변경 없음. 거부된 ALTER 는 상태를 바꾸지 않았다.
+================================================================================

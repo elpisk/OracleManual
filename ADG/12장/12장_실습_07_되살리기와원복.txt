@@ -1,0 +1,518 @@
+================================================================================
+ 제12장 실습 07 — 되살리기와 원복
+ 대상   : boston-srv, chicago-srv, 호스트(vmrun)
+ 목표   : 깨진 SQL Apply 를 단계적으로 복구한다. 하나를 고치면 다음이
+          드러나는 과정을 겪고, 마지막에 스냅샷으로 환경을 되돌린다
+ 소요   : 약 50분
+ 변경   : 최종적으로 pre-logical 스냅샷으로 완전 원복
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] ① 원인을 읽는다
+--------------------------------------------------------------------------------
+
+SYS@boston> SET LONG 4000
+SYS@boston> COL status FOR a92
+SYS@boston> SELECT status_code, status FROM dba_logstdby_events
+  2            WHERE status_code <> 0 ORDER BY event_time DESC FETCH FIRST 3 ROWS ONLY;
+
+STATUS_CODE STATUS
+----------- ------------------------------------------------------------------------
+      16222 ORA-16222: automatic Logical Standby retry of last action
+      16111 ORA-16111: log mining and apply setting up
+      26676 ORA-26676: Table 'LGU.T1' has 2 columns in the LCR and 3 columns in the
+            replicated site
+
+3 rows selected.
+
+-- ★ DBA_LOGSTDBY_EVENTS 가 진단의 출발점이다.
+--   오류 메시지가 테이블 이름까지 알려 준다.
+--
+-- ★ 조회할 때 SET LONG 을 먼저 준다.
+--   STATUS 가 LONG 형이라 기본 설정으로는 앞부분만 보인다.
+
+SYS@boston> SELECT state FROM v$logstdby_state;
+
+STATE
+----------------
+SQL APPLY NOT ON
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [2] ② 구조를 되돌린다 — 그런데 끝이 아니다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE STOP LOGICAL STANDBY APPLY;
+
+Database altered.
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> COL column_name FOR a12
+SYS@boston> SELECT column_name, data_type FROM all_tab_columns
+  2            WHERE owner='LGU' AND table_name='T1' ORDER BY column_id;
+
+COLUMN_NAME  DATA_TYPE
+------------ ----------
+ID           NUMBER
+TAG          VARCHAR2
+MEMO         VARCHAR2
+
+3 rows selected.
+
+-- Primary 쪽과 대조한다
+
+SYS@chicago> SELECT column_name, data_type FROM all_tab_columns
+  2            WHERE owner='LGU' AND table_name='T1' ORDER BY column_id;
+
+COLUMN_NAME  DATA_TYPE
+------------ ----------
+ID           NUMBER
+TAG          VARCHAR2
+
+2 rows selected.
+
+-- ★ 3개 대 2개. ORA-26676 이 말한 그대로다.
+
+SYS@boston> ALTER TABLE lgu.t1 DROP COLUMN memo;
+
+Table altered.
+
+SYS@boston> SELECT column_name FROM all_tab_columns
+  2            WHERE owner='LGU' AND table_name='T1' ORDER BY column_id;
+
+COLUMN_NAME
+-----------
+ID
+TAG
+
+2 rows selected.
+
+SYS@boston> ALTER SESSION SET container=cdb$root;
+SYS@boston> ALTER DATABASE START LOGICAL STANDBY APPLY IMMEDIATE;
+
+Database altered.
+
+>>> 원인 파악
+
+SYS@boston> SELECT state FROM v$logstdby_state;
+
+STATE
+----------------
+SQL APPLY NOT ON
+
+1 row selected.
+
+-- ★ 여전히 안 된다. 오류를 다시 본다.
+
+SYS@boston> SELECT status_code, status FROM dba_logstdby_events
+  2            WHERE status_code <> 0 ORDER BY event_time DESC FETCH FIRST 2 ROWS ONLY;
+
+STATUS_CODE STATUS
+----------- ------------------------------------------------------------------------
+      16222 ORA-16222: automatic Logical Standby retry of last action
+      26786 ORA-26786: A row with key ("ID") = (1) exists but has conflicting
+            column(s) "TAG" in table LGU.T1
+
+2 rows selected.
+
+-- ★ 오류가 바뀌었다.
+--   구조 문제를 고치니 값 문제가 드러났다.
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> COL tag FOR a22
+SYS@boston> SELECT id, tag FROM lgu.t1;
+
+        ID TAG
+---------- ----------------------
+         1 changed-here
+
+1 row selected.
+
+SYS@chicago> SELECT id, tag FROM lgu.t1;
+
+        ID TAG
+---------- ----------------------
+         1 primary-update
+
+1 row selected.
+
+-- ★ 값이 다르다.
+--   실습 06 에서 SYS 로 실행한 UPDATE 가 값을 바꿔 놓았기 때문이다.
+--
+--   Primary 에서 온 LCR 은
+--   "TAG 가 이전 값이었던 행을 새 값으로 바꿔라" 인데
+--   그 이전 값이 이미 없다.
+--
+-- ★ 원인 하나가 여러 층의 결과를 만든다.
+--   오류가 하나 사라졌다고 끝난 것이 아니다.
+--   매번 이벤트를 다시 읽어야 한다.
+
+--------------------------------------------------------------------------------
+ [3] ③ 오류 재현 — 가드를 PDB 에서 바꾸려 하면
+--------------------------------------------------------------------------------
+
+-- 값까지 손으로 맞추는 것은 위험하다.
+-- 어느 행이 얼마나 어긋났는지 알 수 없기 때문이다.
+-- DBMS_LOGSTDBY.INSTANTIATE_TABLE 로 테이블 하나만 다시 가져온다.
+-- 그러려면 데이터베이스 링크가 필요하고 가드를 잠시 완화해야 한다.
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> ALTER DATABASE GUARD STANDBY;
+
+alter database guard standby
+*
+ERROR at line 1:
+ORA-65040: operation not allowed from within a pluggable database
+
+>>> 원인 파악
+
+-- ★ 가드는 CDB 전체의 설정이다. PDB 안에서는 바꿀 수 없다.
+--
+-- ★ 이 계열의 오류를 알아 두면 좋다.
+--   ORA-65040 은 "PDB 안에서 허용되지 않는 작업" 을 뜻하며
+--   데이터베이스 전체에 영향을 주는 명령에서 나타난다.
+
+>>> 조치
+
+SYS@boston> ALTER SESSION SET container=cdb$root;
+SYS@boston> ALTER DATABASE GUARD STANDBY;
+
+Database altered.
+
+>>> 재확인
+
+SYS@boston> SELECT guard_status FROM v$database;
+
+GUARD_STATUS
+------------
+STANDBY
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [4] ④ 링크를 만든다
+--------------------------------------------------------------------------------
+
+-- Primary 에 링크용 계정
+
+SYS@chicago> ALTER SESSION SET container=chicago_pdb1;
+SYS@chicago> CREATE USER lgadmin IDENTIFIED BY lgadmin;
+SYS@chicago> GRANT create session, select_catalog_role TO lgadmin;
+SYS@chicago> GRANT select ON lgu.t1 TO lgadmin;
+SYS@chicago> GRANT flashback ON lgu.t1 TO lgadmin;
+
+Grant succeeded.
+
+-- Standby 에 링크
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> CREATE DATABASE LINK prim_link
+  2            CONNECT TO lgadmin IDENTIFIED BY lgadmin
+  3            USING '//chicago-srv:1521/chicago_pdb1';
+
+Database link created.
+
+SYS@boston> SELECT count(*) FROM lgu.t1@prim_link;
+
+  COUNT(*)
+----------
+         1
+
+1 row selected.
+
+-- ★ 링크가 동작한다. 이 확인을 먼저 하는 것이 중요하다.
+--   다음 단계에서 그 이유가 드러난다.
+
+--------------------------------------------------------------------------------
+ [5] ⑤ 오류 재현 — 권한 부족이 남긴 것
+--------------------------------------------------------------------------------
+
+SYS@boston> EXEC dbms_logstdby.instantiate_table( -
+  2            schema_name=>'LGU', table_name=>'T1', dblink=>'PRIM_LINK');
+
+BEGIN dbms_logstdby.instantiate_table(schema_name=>'LGU', table_name=>'T1',
+dblink=>'PRIM_LINK'); END;
+
+*
+ERROR at line 1:
+ORA-31631: privileges are required
+ORA-06512: at "SYS.LOGSTDBY_INTERNAL", line 297
+ORA-06512: at "SYS.DBMS_SYS_ERROR", line 79
+ORA-06512: at "SYS.DBMS_DATAPUMP", line 4929
+ORA-06512: at "SYS.DBMS_DATAPUMP", line 6880
+ORA-06512: at "SYS.LOGSTDBY_INTERNAL", line 181
+ORA-06512: at "SYS.DBMS_LOGSTDBY", line 645
+
+>>> 원인 파악
+
+-- ★ 스택 추적에 DBMS_DATAPUMP 가 보인다.
+--   재적재가 Data Pump 를 쓴다는 뜻이며 링크 계정에 그 권한이 없다.
+--
+-- ★ 오류만 읽고 넘어가면 안 된다. 상태를 확인한다.
+
+SYS@boston> SELECT count(*) FROM lgu.t1;
+
+select count(*) from lgu.t1
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- ★ 테이블이 사라졌다.
+--
+--   INSTANTIATE_TABLE 은 먼저 대상 테이블을 지우고 새로 가져온다.
+--   권한 오류가 지운 뒤에 발생했으므로 중간 상태가 남았다.
+--
+-- ★ 교훈 — 되돌릴 수 없는 도구는 권한부터 확인한다.
+--
+--   실무 순서
+--   ① 링크 계정으로 select count(*) from <테이블>@<링크> 를 먼저 실행
+--   ② DBA_ROLE_PRIVS 로 권한 목록 확인
+--   ③ 그다음 재적재
+
+>>> 조치
+
+SYS@chicago> COL granted_role FOR a30
+SYS@chicago> SELECT granted_role FROM dba_role_privs WHERE grantee='LGADMIN' ORDER BY 1;
+
+GRANTED_ROLE
+------------------------------
+SELECT_CATALOG_ROLE
+
+1 row selected.
+
+SYS@chicago> GRANT datapump_exp_full_database TO lgadmin;
+
+Grant succeeded.
+
+SYS@chicago> SELECT granted_role FROM dba_role_privs WHERE grantee='LGADMIN' ORDER BY 1;
+
+GRANTED_ROLE
+------------------------------
+DATAPUMP_EXP_FULL_DATABASE
+SELECT_CATALOG_ROLE
+
+2 rows selected.
+
+>>> 재확인
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> EXEC dbms_logstdby.instantiate_table( -
+  2            schema_name=>'LGU', table_name=>'T1', dblink=>'PRIM_LINK');
+
+PL/SQL procedure successfully completed.
+
+SYS@boston> COL tag FOR a22
+SYS@boston> SELECT id, tag FROM lgu.t1 ORDER BY id;
+
+        ID TAG
+---------- ----------------------
+         1 primary-update
+         2 after-repair
+
+2 rows selected.
+
+-- ★ 테이블이 Primary 와 똑같아졌다.
+--   값 하나하나를 맞출 필요가 없었다.
+--
+-- ★ 2번 행은 복제가 멈춰 있는 동안 Primary 에 들어간 것이다.
+--   재적재는 "지금 Primary 의 모습" 을 그대로 가져온다.
+
+--------------------------------------------------------------------------------
+ [6] ⑥ 적용을 재개하고 검증한다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER SESSION SET container=cdb$root;
+SYS@boston> ALTER DATABASE GUARD ALL;
+SYS@boston> ALTER DATABASE START LOGICAL STANDBY APPLY IMMEDIATE;
+
+Database altered.
+
+-- 40초 뒤
+
+SYS@boston> SELECT state FROM v$logstdby_state;
+
+STATE
+--------
+IDLE
+
+1 row selected.
+
+SYS@boston> SELECT type, count(*) cnt FROM v$logstdby_process GROUP BY type ORDER BY 1;
+
+TYPE                  CNT
+-------------- ----------
+ANALYZER                1
+APPLIER                 5
+BUILDER                 1
+COORDINATOR             1
+PREPARER                1
+READER                  1
+
+6 rows selected.
+
+SYS@boston> SELECT applied_scn, newest_scn, newest_scn-applied_scn gap
+  2            FROM dba_logstdby_progress;
+
+APPLIED_SCN NEWEST_SCN        GAP
+----------- ---------- ----------
+    2309207    2309212          5
+
+1 row selected.
+
+-- ★ 프로세스가 다시 열 개로 돌아왔고 격차가 5 로 줄었다.
+--   그래도 아직 뷰만 본 것이다. 데이터로 확인한다.
+
+SYS@chicago> ALTER SESSION SET container=chicago_pdb1;
+SYS@chicago> INSERT INTO lgu.t1 VALUES(3,'after-instantiate');
+SYS@chicago> COMMIT;
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+-- 55초 뒤
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> SELECT id, tag FROM lgu.t1 ORDER BY id;
+
+        ID TAG
+---------- ----------------------
+         1 primary-update
+         2 after-repair
+         3 after-instantiate
+
+3 rows selected.
+
+SYS@boston> ALTER SESSION SET container=cdb$root;
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+-- ★ 지연이 0 이고 새 행이 넘어왔다. 완전히 복구됐다.
+--
+-- ★ 복구 절차를 정리한다.
+--
+--   ① 원인 확인       DBA_LOGSTDBY_EVENTS          ORA-26676
+--   ② 구조 복원       ALTER TABLE ... DROP COLUMN  다음 오류 ORA-26786
+--   ③ 가드 완화       CDB$ROOT 에서 실행           PDB 에서는 ORA-65040
+--   ④ 링크 준비       CREATE DATABASE LINK         권한 부족 시 ORA-31631
+--   ⑤ 재적재         INSTANTIATE_TABLE            성공
+--   ⑥ 재개·검증      START LOGICAL STANDBY APPLY  지연 0
+
+--------------------------------------------------------------------------------
+ [7] 원복 — 스냅샷으로 되돌린다
+--------------------------------------------------------------------------------
+
+-- ★ 13장부터 16장까지는 Physical Standby 가 필요하다.
+--   Broker 구성, 모니터링, 역할 전환이 모두 그 위에서 이뤄진다.
+--
+--   Logical Standby 를 Physical Standby 로 되돌리는 명령은 없다.
+--   실습 01 에서 만든 스냅샷을 쓴다.
+
+C:\> vmrun revertToSnapshot "D:\ADG\BOSTON\ADG-BOSTON.vmx"   pre-logical
+C:\> vmrun revertToSnapshot "D:\ADG\CHICAGO\ADG-CHICAGO.vmx" pre-logical
+
+C:\> vmrun start "D:\ADG\CHICAGO\ADG-CHICAGO.vmx" nogui
+C:\> vmrun start "D:\ADG\BOSTON\ADG-BOSTON.vmx"   nogui
+
+C:\> vmrun list
+Total running VMs: 3
+D:\ADG\FARSYNC\ADG-FARSYNC.vmx
+D:\ADG\CHICAGO\ADG-CHICAGO.vmx
+D:\ADG\BOSTON\ADG-BOSTON.vmx
+
+-- ★ 되돌린 뒤에는 반드시 상태를 확인한다.
+--   스냅샷이 제대로 잡혔는지 여기서 판명된다.
+
+--------------------------------------------------------------------------------
+ [8] 원복 확인
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT database_role, open_mode, protection_mode FROM v$database;
+
+DATABASE_ROLE  OPEN_MODE   PROTECTION_MODE
+-------------- ----------- --------------------
+PRIMARY        READ WRITE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@boston> SELECT database_role, open_mode, guard_status FROM v$database;
+
+DATABASE_ROLE     OPEN_MODE             GUARD_STATUS
+----------------- --------------------- ------------
+PHYSICAL STANDBY  READ ONLY WITH APPLY  NONE
+
+1 row selected.
+
+SYS@boston> COL recovery_mode FOR a34
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ----------------------------------
+         1 VALID     MANAGED REAL TIME APPLY
+
+1 row selected.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         43
+
+1 row selected.
+
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+SYS@boston> SELECT name, open_mode FROM v$pdbs;
+
+NAME         OPEN_MODE
+------------ ----------
+PDB$SEED     READ ONLY
+CHICAGO_PDB1 READ ONLY
+
+2 rows selected.
+
+-- ★ 완전히 돌아왔다.
+--
+--   DATABASE_ROLE   LOGICAL STANDBY → PHYSICAL STANDBY
+--   OPEN_MODE       READ WRITE      → READ ONLY WITH APPLY
+--   GUARD_STATUS    ALL             → NONE
+--   MRP0            없었다          → APPLYING_LOG
+--   두 지연         —               → 0
+--
+-- ★ 실습 04~07 에서 만든 LGU·RPT·LGADMIN 스키마도 함께 사라졌다.
+--   스냅샷 시점에는 없던 것들이기 때문이다.
+--
+-- ★ 실행 중 상태로 찍은 스냅샷이라 메모리까지 그대로 돌아왔다.
+--   MRP0 의 시퀀스가 43 인 것이 그 증거다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① DBA_LOGSTDBY_EVENTS 가 진단의 출발점 (SET LONG 필수)
+--   ② 구조를 고치면 값 문제가 드러난다 — ORA-26676 → ORA-26786
+--   ③ 가드는 CDB 전체 설정 — PDB 에서 바꾸면 ORA-65040
+--   ④ INSTANTIATE_TABLE 은 Data Pump 를 쓴다 — 권한 없으면 ORA-31631
+--   ⑤ 그 실패는 테이블을 지운 뒤에 났다 (ORA-00942)
+--   ⑥ 권한을 주고 다시 실행하면 통째로 복구된다
+--   ⑦ 뷰가 정상이어도 마지막 확인은 데이터로 한다
+--   ⑧ 스냅샷 원복으로 Physical Standby 를 되찾았다
+--
+-- ★ 12장을 마친다.
+--   13장은 Data Guard Broker 를 다루며 이 상태에서 시작한다.

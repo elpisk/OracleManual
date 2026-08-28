@@ -1,0 +1,166 @@
+================================================================================
+ 제11장 실습 02 — 전환 실패와 성공
+ 대상   : boston-srv
+ 목표   : MRP 가 도는 채로 전환을 시도해 ORA-38784 를 만나고, 원인을 밝힌 뒤
+          전환한다. 전환 명령이 안에서 무엇을 하는지 오류에서 읽어 낸다
+ 소요   : 약 25분
+ 변경   : boston 이 SNAPSHOT STANDBY 로 전환됨 (실습 06 에서 복귀)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 오류 재현 — 준비 없이 바로
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT process, status FROM v$managed_standby WHERE process='MRP0';
+
+PROCESS   STATUS
+--------- ------------
+MRP0      APPLYING_LOG
+
+1 row selected.
+
+SYS@boston> ALTER DATABASE CONVERT TO SNAPSHOT STANDBY;
+
+alter database convert to snapshot standby
+*
+ERROR at line 1:
+ORA-38784: Cannot create restore point 'SNAPSHOT_STANDBY_REQUIRED_08/27/2026 16:16:39'.
+ORA-01153: an incompatible media recovery is active
+
+>>> 원인 파악
+
+-- ★ 오류가 두 줄인 것이 고맙다. 많은 것을 알려 준다.
+--
+-- ORA-38784  "복원 지점을 만들 수 없다"
+--            그 이름이 SNAPSHOT_STANDBY_REQUIRED_<날짜> <시각> 이다
+--
+-- ORA-01153  "호환되지 않는 미디어 복구가 활성 상태다"
+--            MRP 가 리두를 적용하고 있다는 뜻이다
+--
+-- ★ 여기서 두 가지를 알 수 있다.
+--
+--   ① 전환의 첫 단계는 복원 지점 생성이다.
+--      역할을 바꾸는 것이 아니라 되돌아갈 자리를 먼저 만든다.
+--
+--   ② 복원 지점을 만들려면 SCN 이 고정되어야 한다.
+--      MRP 가 계속 앞으로 나아가고 있으면 만들 수 없다.
+--
+-- ★ 오라클의 설계 원칙이 드러난다.
+--   되돌릴 준비를 먼저 하고 바꾼다.
+--   만약 순서가 반대여서 역할부터 바꾼 뒤 복원 지점 생성이 실패했다면
+--   되돌릴 수 없는 어중간한 상태가 만들어졌을 것이다.
+
+>>> 조치
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> SELECT open_mode, database_role FROM v$database;
+
+OPEN_MODE            DATABASE_ROLE
+-------------------- ----------------
+READ ONLY            PHYSICAL STANDBY
+
+1 row selected.
+
+SYS@boston> SELECT count(*) mrp FROM v$managed_standby WHERE process='MRP0';
+
+       MRP
+----------
+         0
+
+1 row selected.
+
+-- ★ READ ONLY WITH APPLY 가 READ ONLY 로 바뀌었다.
+--   9장에서 배운 대로 WITH APPLY 는 MRP 의 존재를 반영하는 꼬리표다.
+--   MRP0 도 사라졌다.
+
+>>> 재확인
+
+SYS@boston> ALTER DATABASE CONVERT TO SNAPSHOT STANDBY;
+
+Database altered.
+
+-- ★ 이번에는 성공이다.
+--   열려 있는 상태(READ ONLY)에서 그대로 전환됐다.
+--   MOUNT 로 내릴 필요가 없다.
+
+--------------------------------------------------------------------------------
+ [2] 전환 직후 상태 — 네 가지가 바뀐다
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT database_role, open_mode, controlfile_type, flashback_on
+  2            FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE   CONTROLFILE_TYPE  FLASHBACK_ON
+---------------- ----------- ----------------- ------------------
+SNAPSHOT STANDBY MOUNTED     CURRENT           RESTORE POINT ONLY
+
+1 row selected.
+
+-- ★ 전과 후를 나란히 놓는다.
+--
+--   항목                전               후
+--   ------------------  ---------------  ------------------
+--   DATABASE_ROLE       PHYSICAL STANDBY SNAPSHOT STANDBY
+--   CONTROLFILE_TYPE    STANDBY          CURRENT
+--   FLASHBACK_ON        NO               RESTORE POINT ONLY
+--   OPEN_MODE           READ ONLY        MOUNTED
+--
+-- ★ OPEN_MODE 가 MOUNTED 로 바뀐 것을 놓치기 쉽다.
+--   열려 있는 상태에서 명령을 냈는데 끝나고 보니 마운트다.
+--   전환 과정에서 데이터베이스를 닫았다가 다시 마운트했기 때문이다.
+--   그래서 전환 후에는 따로 열어야 한다. 실습 04 에서 한다.
+--
+-- ★ CONTROLFILE_TYPE 이 CURRENT 가 된 것이 특히 중요하다.
+--
+--   1장   Primary   CURRENT   → MRP 못 띄운다 (ORA-01665)
+--   10장  Far Sync  FARSYNC   → MRP 못 띄운다 (ORA-01665)
+--   지금  Snapshot  CURRENT   → ?
+--
+--   실습 05 에서 확인한다.
+--
+-- ★ FLASHBACK_ON 이 RESTORE POINT ONLY 다.
+--   전체 플래시백 로깅(YES)이 아니라
+--   복원 지점만으로 되돌릴 수 있는 상태라는 뜻이다.
+--   실습 01 에서 NO 였던 것이 여기서 켜졌다.
+
+--------------------------------------------------------------------------------
+ [3] 무엇이 남았고 무엇이 없어졌나
+--------------------------------------------------------------------------------
+
+SYS@boston> COL recovery_mode FOR a30
+SYS@boston> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- ------------------------------
+         1 VALID     IDLE
+
+1 row selected.
+
+-- ★ RECOVERY_MODE 가 IDLE 이다.
+--   7장에서 MANAGED REAL TIME APPLY 였던 그 자리다.
+--   적용이 멈췄다는 뜻이다.
+--
+-- ★ 그런데 STATUS 는 VALID 다.
+--   목적지 자체는 정상이다. 7장에서 배운 대로
+--   두 열이 다른 질문에 답한다는 것을 여기서도 확인한다.
+
+--------------------------------------------------------------------------------
+ [4] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① MRP 가 돌면 전환할 수 없다 — ORA-38784 + ORA-01153
+--   ② 오류 메시지에 복원 지점 이름이 드러난다
+--      → 전환의 첫 단계가 복원 지점 생성이다
+--   ③ MRP 를 멈추면 READ ONLY WITH APPLY → READ ONLY
+--   ④ 열린 채로도 전환된다. MOUNT 로 내릴 필요 없다
+--   ⑤ 전환 후 네 값이 바뀐다
+--      SNAPSHOT STANDBY / MOUNTED / CURRENT / RESTORE POINT ONLY
+--   ⑥ RECOVERY_MODE 가 IDLE 이 된다
+--
+-- ★ 다음 실습에서 자동으로 만들어진 복원 지점을 읽는다.

@@ -1,0 +1,318 @@
+================================================================================
+ 제9장 실습 06 — 세션 지연 한도
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : STANDBY_MAX_DATA_DELAY 로 세션이 허용할 지연을 정하고,
+          ORA-03172·ORA-03174·ORA-03173 을 구분한다
+ 소요   : 약 35분
+ 경고   : 적용을 잠시 멈춘다. 마지막에 반드시 복귀한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 준비
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SESSION SET CONTAINER=chicago_pdb1;
+SYS@chicago> CREATE USER adgu IDENTIFIED BY oracle;
+SYS@chicago> GRANT connect, resource, unlimited tablespace TO adgu;
+SYS@chicago> CREATE TABLE adgu.d(id NUMBER);
+SYS@chicago> INSERT INTO adgu.d VALUES(1);
+SYS@chicago> COMMIT;
+
+-- 20초 뒤 Standby 에서 확인
+
+[oracle@boston-srv ~]$ sqlplus -s adgu/oracle@boston-srv:1521/chicago_pdb1
+
+SQL> SELECT COUNT(*) FROM d;
+
+  COUNT(*)
+----------
+         1
+
+-- ★ **일반 사용자로 시험한다.** 이유는 [2] 에서 드러난다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 ① — SYS 로 하면 적용되지 않는다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER SESSION SET standby_max_data_delay=1;
+
+ERROR:
+ORA-03174: STANDBY_MAX_DATA_DELAY does not apply to SYS users
+
+
+SYS@boston> SELECT COUNT(*) FROM dba_objects WHERE rownum<=1;
+
+  COUNT(*)
+----------
+         1
+
+1 row selected.
+
+>>> 원인 파악
+    **ORA-03174.** SYS 세션에는 이 파라미터가 적용되지 않는다.
+
+    ★ 관리자가 진단 조회를 하는데 지연 한도 때문에 막히면 곤란하다.
+      Standby 가 뒤처져 있을 때야말로 관리자가 조회해야 하는 상황이므로
+      SYS 를 예외로 둔 것으로 보인다.
+
+    ★ 오류가 났지만 **그 뒤의 조회는 정상 수행됐다.**
+      설정만 거부되고 세션은 그대로 쓸 수 있다.
+
+    ★★ DML 리다이렉션에서 SYS 가 ORA-16397 로 막혔던 것과 같은 교훈이다.
+      **ADG 의 세션 기능들은 대체로 일반 사용자를 전제로 설계되어 있다.**
+      관리자 계정으로 기능을 시험하고 "동작하지 않는다"고
+      결론짓는 실수가 이 장에서만 두 번 나온다.
+
+>>> 조치
+    일반 사용자로 접속해 시험한다.
+
+>>> 재확인
+    [3] 에서 확인한다.
+
+--------------------------------------------------------------------------------
+ [3] 정상 상태에서의 동작
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION SET standby_max_data_delay=1;
+
+Session altered.
+
+SQL> SELECT COUNT(*) FROM d;
+
+  COUNT(*)
+----------
+         1
+
+-- ★ 일반 사용자에게는 설정이 적용된다. 오류가 없다.
+--   지금 apply lag 이 0 이므로 1초 한도를 통과한다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 ② — 0 으로 주면
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION SET standby_max_data_delay=0;
+
+Session altered.
+
+SQL> SELECT COUNT(*) FROM d;
+
+select count(*) from d
+*
+ERROR at line 1:
+ORA-03172: STANDBY_MAX_DATA_DELAY of 0 seconds exceeded
+
+>>> 원인 파악
+    **ORA-03172.** 0 은 "지연이 전혀 없어야 한다"는 뜻이다.
+
+    ★ 비동기 전송 구성에서는 사실상 항상 위반된다.
+      LGWR 이 쓴 리두와 Standby 에 도착한 리두 사이에
+      아무리 짧아도 시차가 있기 때문이다.
+
+    ★ 0 을 쓰려면 **동기 전송**이어야 한다.
+      MAXIMUM PROTECTION 또는 MAXIMUM AVAILABILITY 다.
+      실습 환경은 MAXIMUM PERFORMANCE(ASYNC)이므로 쓸 수 없다.
+
+    ★ 2장에서 다룬 보호 모드의 선택이 여기서 또 다른 결과로 나타난다.
+      성능을 위해 ASYNC 를 택하면 이 값을 쓸 수 없다.
+
+>>> 조치
+    업무가 허용하는 실제 값을 준다. 정상 상태의 지연을 먼저 관찰하고
+    여유를 두어 정한다.
+
+>>> 재확인
+
+SQL> ALTER SESSION SET standby_max_data_delay=5;
+SQL> SELECT COUNT(*) FROM d;
+
+  COUNT(*)
+----------
+         1
+
+    5초 한도는 통과한다.
+
+--------------------------------------------------------------------------------
+ [5] 지연을 만들어 본다
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@chicago> ALTER SESSION SET CONTAINER=chicago_pdb1;
+SYS@chicago> INSERT INTO adgu.d VALUES(2);
+SYS@chicago> COMMIT;
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+-- 75초 뒤
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:01:22
+
+2 rows selected.
+
+SYS@boston> SELECT COUNT(*) mrp FROM v$managed_standby WHERE process='MRP0';
+
+       MRP
+----------
+         0
+
+-- ★ transport lag 은 0 이고 apply lag 만 1분 22초다.
+--   7장에서 배운 대로 리두는 왔는데 적용이 멈춘 상태다.
+
+--------------------------------------------------------------------------------
+ [6] 한도가 있을 때와 없을 때
+--------------------------------------------------------------------------------
+
+-- 한도 없이 조회
+
+SQL> SELECT COUNT(*) FROM d;
+
+  COUNT(*)
+----------
+         1
+
+-- ★ **성공한다. 다만 옛 데이터다.**
+--   Primary 에는 2건이 있지만 Standby 는 아직 1건만 적용했다.
+--   조회는 그 시점의 일관된 상태를 돌려준다.
+
+-- 한도를 두고 조회
+
+SQL> ALTER SESSION SET standby_max_data_delay=1;
+
+Session altered.
+
+SQL> SELECT COUNT(*) FROM d;
+
+select count(*) from d
+*
+ERROR at line 1:
+ORA-03172: STANDBY_MAX_DATA_DELAY of 1 seconds exceeded
+
+-- ★★ 이 대비가 이 기능의 요점이다.
+--
+--   한도 없음 → 옛 데이터를 그대로 준다
+--   한도 있음 → 거부한다
+--
+--   **판단을 애플리케이션이 하게 해 준다.**
+--   오래된 데이터라도 받겠다면 한도를 두지 않고,
+--   신선도가 중요하면 한도를 두고 실패 시 Primary 로 재시도한다.
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 ③ — SYNC WITH PRIMARY
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION SYNC WITH PRIMARY;
+
+ERROR:
+ORA-03173: Standby may not be synced with primary
+
+
+SQL> SELECT COUNT(*) FROM d;
+
+  COUNT(*)
+----------
+         1
+
+>>> 원인 파악
+    **ORA-03173.** 이 명령은 조회 전에 Standby 가 Primary 를
+    따라잡을 때까지 기다리게 한다.
+
+    ★ 그런데 실습 환경에서는 항상 실패한다.
+      적용이 정상으로 돌고 있을 때도 마찬가지였다.
+
+    ★ 이유는 보호 모드다.
+      이 명령은 Primary 가 보낸 리두가 Standby 에
+      **모두 도착했음이 보장되는** 구성에서만 성립한다.
+      즉 동기 전송(SYNC)이 필요하다.
+
+      실습 환경은 MAXIMUM PERFORMANCE(ASYNC)이므로 그 보장이 없고,
+      오라클은 시도 자체를 거부한다.
+
+    구성                          SYNC WITH PRIMARY   MAX_DATA_DELAY=0
+    ----------------------------- ------------------- ------------------
+    MAXIMUM PERFORMANCE (ASYNC)   ORA-03173           ORA-03172
+    MAXIMUM AVAILABILITY (SYNC)   동작한다            동작한다
+    MAXIMUM PROTECTION (SYNC)     동작한다            동작한다
+
+>>> 조치
+    이 환경에서는 STANDBY_MAX_DATA_DELAY 를 쓴다.
+    SYNC WITH PRIMARY 가 필요하다면 보호 모드를 먼저 바꿔야 한다.
+
+>>> 재확인
+    적용을 재개하고 따라잡은 뒤 한도 조회가 통과하는지 본다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+-- 30초 뒤
+
+SQL> ALTER SESSION SET standby_max_data_delay=1;
+SQL> SELECT COUNT(*) FROM d;
+
+  COUNT(*)
+----------
+         2
+
+-- ★ 통과했고 2건이 보인다. 따라잡은 것이다.
+
+--------------------------------------------------------------------------------
+ [8] 두 장치의 성격 차이
+--------------------------------------------------------------------------------
+
+  장치                       동작              적합한 상황
+  -------------------------- ----------------- ----------------------------
+  STANDBY_MAX_DATA_DELAY     초과하면 거부     실패를 감지해 Primary 로
+                             (ORA-03172)       재시도할 수 있는 경우
+  SYNC WITH PRIMARY          따라잡을 때까지   조금 느려도 최신 데이터가
+                             기다린다          필요한 조회
+  한도 없음 (기본)           그대로 돌려준다   신선도가 중요하지 않은
+                                               보고서·집계
+
+  ★ 애플리케이션 설계 관점에서는 첫 번째가 다루기 쉽다.
+    오류가 나면 재시도하면 되기 때문이다.
+
+      try {
+          connect to standby;
+          alter session set standby_max_data_delay = 5;
+          result = query();
+      } catch (ORA-03172) {
+          connect to primary;
+          result = query();
+      }
+
+  ★ 이 구조의 장점
+    **Standby 가 정상일 때는 부하를 나누고,
+    뒤처졌을 때만 Primary 로 간다.**
+
+  ★ 값은 정상 상태의 지연을 관찰해 정한다.
+    실측에서 정상 상태의 apply lag 은 0초였다.
+    5초나 10초로 잡으면 평상시에는 거의 걸리지 않고
+    실제로 문제가 생겼을 때만 걸린다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SESSION SET CONTAINER=chicago_pdb1;
+SYS@chicago> DROP TABLE adgu.d PURGE;
+SYS@chicago> DROP USER adgu CASCADE;
+
+  · STANDBY_MAX_DATA_DELAY 는 세션이 허용할 지연을 초 단위로 정한다
+  · 초과하면 ORA-03172. 한도를 풀면 옛 데이터를 돌려준다
+  · **SYS 세션에는 적용되지 않는다 — ORA-03174**
+  · 0 은 ASYNC 구성에서 항상 위반된다
+  · SYNC WITH PRIMARY 는 동기 전송이 전제다. ASYNC 에서는 ORA-03173
+  · 보호 모드는 성능만이 아니라 조회 신선도 보장까지 결정한다
+  · 실패를 감지해 Primary 로 재시도하는 구조가 가장 다루기 쉽다
+
+================================================================================
+ 실습 06 종료 — 적용 재개, 테스트 사용자 제거 완료.
+================================================================================

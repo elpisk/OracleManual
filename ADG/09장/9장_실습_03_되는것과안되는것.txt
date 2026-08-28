@@ -1,0 +1,291 @@
+================================================================================
+ 제9장 실습 03 — Standby 에서 되는 것과 안 되는 것
+ 대상   : boston-srv Standby (준비는 chicago-srv)
+ 목표   : 쓰기가 막히는 것을 확인하고, 그럼에도 되는 작업들을 실측해
+          경계를 가르는 기준을 세운다
+ 소요   : 약 35분
+ 변경   : Primary 에 테스트 객체를 만들었다가 지운다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 오류 재현 — 쓰기는 모두 막힌다
+--------------------------------------------------------------------------------
+
+SYS@boston> INSERT INTO system.adg_t VALUES(99,'from-standby',SYSTIMESTAMP);
+
+insert into system.adg_t values(99,'from-standby',systimestamp)
+                   *
+ERROR at line 1:
+ORA-16000: database or pluggable database open for read-only access
+
+SYS@boston> UPDATE system.adg_t SET tag='x' WHERE id=1;
+
+update system.adg_t set tag='x' where id=1
+              *
+ERROR at line 1:
+ORA-16000: database or pluggable database open for read-only access
+
+SYS@boston> CREATE TABLE system.adg_s(id NUMBER);
+
+create table system.adg_s(id number)
+*
+ERROR at line 1:
+ORA-16000: database or pluggable database open for read-only access
+
+>>> 원인 파악
+    세 가지 모두 **ORA-16000** 이다. INSERT·UPDATE·DDL 이 같은 오류다.
+
+    8장에서 테이블스페이스를 만들려다 만난 것과 같으며 원인도 같다.
+    읽기 전용으로 열려 있기 때문이다.
+
+    ★ STANDBY_FILE_MANAGEMENT 값과 무관하다.
+      그 파라미터는 "리두를 적용하다 파일 추가 지시를 만났을 때"의 동작이고,
+      여기는 사람이 직접 쓰기를 시도한 경우다.
+
+>>> 조치
+    Standby 에서 쓰기가 필요하다면 두 가지 길이 있다.
+      ① Primary 에 접속해 실행한다
+      ② DML 리다이렉션을 쓴다 (실습 04)
+
+>>> 재확인
+    Primary 에서 같은 명령이 정상 수행되는지 확인한다.
+
+SYS@chicago> CREATE TABLE system.adg_s(id NUMBER);
+
+Table created.
+
+    Primary 에서는 문제가 없다. 역할의 차이다.
+
+--------------------------------------------------------------------------------
+ [2] 그런데 정렬은 된다
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT COUNT(*) FROM (SELECT object_name FROM dba_objects
+  2                               ORDER BY object_name);
+
+  COUNT(*)
+----------
+     72386
+
+1 row selected.
+
+SYS@boston> SELECT tablespace_name, bytes_used/1024/1024 used_mb
+  2            FROM v$temp_space_header WHERE bytes_used>0;
+
+TABLESPACE_NAME                   USED_MB
+------------------------------ ----------
+TEMP                                    3
+TEMP                                    3
+TEMP                                    3
+
+3 rows selected.
+
+-- ★ 7만 행을 정렬했고 임시 테이블스페이스가 실제로 쓰였다.
+--
+--   이것이 ADG 활용의 핵심 근거다.
+--   **무거운 조회를 Standby 로 옮길 수 있다.**
+--   보고서·집계처럼 정렬과 해시 조인이 많은 작업이 대상이다.
+
+--------------------------------------------------------------------------------
+ [3] EXPLAIN PLAN 도 된다
+--------------------------------------------------------------------------------
+
+SYS@boston> EXPLAIN PLAN FOR SELECT COUNT(*) FROM dba_objects;
+
+Explained.
+
+SYS@boston> SELECT COUNT(*) plan_rows FROM plan_table;
+
+ PLAN_ROWS
+----------
+        33
+
+1 row selected.
+
+-- ★ PLAN_TABLE 이 **전역 임시 테이블(GTT)** 이기 때문이다.
+--   실행 계획을 쓰는 것도 일종의 INSERT 인데 통과했다.
+--   다음 항목과 이어진다.
+
+--------------------------------------------------------------------------------
+ [4] 전역 임시 테이블에 대한 DML 도 된다
+--------------------------------------------------------------------------------
+
+-- Primary 에 GTT 를 만들어 둔다.
+
+SYS@chicago> CREATE GLOBAL TEMPORARY TABLE system.gtt(id NUMBER)
+  2            ON COMMIT PRESERVE ROWS;
+
+Table created.
+
+-- 20초 뒤 Standby 에서 INSERT 를 시도한다.
+
+SYS@boston> INSERT INTO system.gtt VALUES(1);
+
+1 row created.
+
+SYS@boston> SELECT COUNT(*) FROM system.gtt;
+
+  COUNT(*)
+----------
+         1
+
+1 row selected.
+
+-- ★★ **성공했다.** 읽기 전용 데이터베이스인데 INSERT 가 된다.
+--
+--   GTT 의 데이터는 임시 테이블스페이스에 있고
+--   영구 데이터 파일을 건드리지 않기 때문이다.
+
+SYS@boston> SHOW PARAMETER temp_undo_enabled
+
+NAME                  TYPE      VALUE
+--------------------- --------- -----
+temp_undo_enabled     boolean   FALSE
+
+-- ★ TEMP_UNDO_ENABLED 가 FALSE 인데도 동작했다.
+--   이 파라미터는 임시 UNDO 를 별도 관리할지를 정하는 것이며,
+--   ADG 에서 GTT 를 쓰기 위한 필수 조건은 아니다.
+
+--------------------------------------------------------------------------------
+ [5] 시퀀스도 된다 — 다만 값이 뛴다
+--------------------------------------------------------------------------------
+
+SYS@chicago> CREATE SEQUENCE system.seq1 START WITH 1;
+
+Sequence created.
+
+SYS@chicago> SELECT system.seq1.nextval FROM dual;
+
+   NEXTVAL
+----------
+         1
+
+-- 20초 뒤 Standby 에서 같은 시퀀스를 쓴다.
+
+SYS@boston> SELECT system.seq1.nextval FROM dual;
+
+   NEXTVAL
+----------
+        21
+
+1 row selected.
+
+-- ★★ **21 이 나왔다.** Primary 에서 1 을 받았는데 2 가 아니다.
+--
+--   Standby 는 Primary 가 쓰는 범위와 겹치지 않도록
+--   **별도의 범위를 통째로 할당받는다.**
+--   딕셔너리를 갱신할 수 없으므로 메모리에서만 관리한다.
+--
+-- ★ 실무적 결론
+--   **Standby 에서 얻은 시퀀스 값은 Primary 와 연속되지 않는다.**
+--   채번을 두 노드에서 나눠 하면 값에 큰 구멍이 생긴다.
+--   순번의 연속성이 업무 요건이라면 Standby 에서 시퀀스를 쓰지 않는다.
+
+--------------------------------------------------------------------------------
+ [6] 관리 작업은 대부분 막힌다
+--------------------------------------------------------------------------------
+
+SYS@boston> EXEC dbms_stats.gather_table_stats('SYSTEM','SQLPLUS_PRODUCT_PROFILE');
+
+BEGIN dbms_stats.gather_table_stats('SYSTEM','SQLPLUS_PRODUCT_PROFILE'); END;
+*
+ERROR at line 1:
+ORA-00604: error occurred at recursive SQL level 1
+ORA-06512: at "SYS.DBMS_STATS", line 40751
+ORA-06512: at "SYS.DBMS_STATS", line 40035
+ORA-06512: at "SYS.DBMS_STATS", line 38912
+ORA-06512: at "SYS.DBMS_STATS", line 17786
+ORA-16000: database or pluggable database open for read-only access
+ORA-06512: at "SYS.DBMS_STATS", line 1800
+ORA-06512: at "SYS.DBMS_STATS", line 17545
+ORA-06512: at "SYS.DBMS_STATS", line 38836
+ORA-06512: at "SYS.DBMS_STATS", line 39738
+ORA-06512: at "SYS.DBMS_STATS", line 40183
+ORA-06512: at "SYS.DBMS_STATS", line 40732
+ORA-06512: at line 1
+
+-- ★ 오류 스택이 길다. 읽는 요령이 있다.
+--
+--   맨 위  ORA-00604  "재귀 SQL 에서 오류가 났다" — 포장이다
+--   중간   ORA-06512  PL/SQL 호출 스택 — 어디를 지났는지만 알려 준다
+--   그 사이 ORA-16000  ← **이것이 내용이다**
+--
+--   ★★ **ORA-06512 를 건너뛰고 그것이 아닌 번호를 찾는다.**
+--     여기서는 ORA-00604 와 ORA-16000 둘인데,
+--     앞의 것은 형식이고 뒤의 것이 원인이다.
+
+SYS@boston> EXEC dbms_workload_repository.create_snapshot;
+
+BEGIN dbms_workload_repository.create_snapshot; END;
+*
+ERROR at line 1:
+ORA-13516: AWR Operation failed: database not open readwrite
+ORA-06512: at "SYS.DBMS_WORKLOAD_REPOSITORY", line 99
+ORA-06512: at line 1
+
+-- ★ AWR 은 **전용 오류 번호 ORA-13516** 이 있다.
+--   메시지도 database not open readwrite 로 직접적이다.
+--   자주 시도되는 작업이라 오라클이 별도 오류를 마련해 둔 것으로 보인다.
+--
+-- ★ 스택도 짧다. ORA-16000 까지 내려가기 전에
+--   AWR 패키지가 먼저 상태를 확인하고 거부했기 때문이다.
+--   **오류 번호와 스택 길이가 그 기능이 상태를 얼마나 일찍 점검하는지 보여 준다.**
+
+-- 반면 동적 성능 뷰 조회는 문제가 없다.
+
+SYS@boston> SELECT COUNT(*) FROM v$sysstat WHERE name LIKE 'redo%';
+
+  COUNT(*)
+----------
+       100
+
+1 row selected.
+
+-- ★ V$ 뷰는 메모리 구조를 읽는 것이므로 아무 제약이 없다.
+--   그래서 Standby 의 상태 진단은 전부 가능하다.
+--   이 과정에서 지금까지 써 온 조회들이 모두 여기에 속한다.
+--
+-- ★ 정리하면 **"보는 것은 되고 남기는 것은 안 된다."**
+--   진단은 할 수 있지만 그 결과를 데이터베이스에 저장할 수 없다.
+
+--------------------------------------------------------------------------------
+ [7] 경계를 가르는 하나의 기준
+--------------------------------------------------------------------------------
+
+  ★ 표를 외우기보다 기준 하나를 이해한다.
+    **영구 데이터 파일이나 딕셔너리를 바꾸는가.**
+
+  작업                     무엇을 바꾸는가              Standby 에서
+  ------------------------ --------------------------- --------------
+  정렬·해시 조인           임시 세그먼트               된다
+  GTT INSERT               임시 세그먼트               된다
+  EXPLAIN PLAN             GTT (PLAN_TABLE)            된다
+  시퀀스 NEXTVAL           메모리의 별도 범위          된다 (값이 뜀)
+  V$ 뷰 조회               아무것도 안 바꾼다          된다
+  일반 테이블 DML          블록 + UNDO + 리두          ORA-16000
+  DDL                      위 + 딕셔너리               ORA-16000
+  통계 수집                딕셔너리                    ORA-16000
+  AWR 스냅샷               AWR 테이블                  ORA-13516
+
+  ★ 이 기준으로 보면 새로운 상황도 판단할 수 있다.
+    "이 작업이 영구 파일이나 딕셔너리를 바꾸는가"를 물으면 된다.
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+SYS@chicago> DROP TABLE system.adg_s PURGE;
+SYS@chicago> DROP TABLE system.gtt PURGE;
+SYS@chicago> DROP SEQUENCE system.seq1;
+
+  · 쓰기는 모두 ORA-16000 이다 (INSERT·UPDATE·DDL)
+  · 정렬은 된다. 실측 7만 행, TEMP 3MB씩 사용
+  · EXPLAIN PLAN 과 GTT INSERT 도 된다. 데이터가 TEMP 에 있기 때문
+  · 시퀀스도 되지만 값이 뛴다. Primary 1 → Standby 21
+  · 통계 수집은 ORA-16000, AWR 은 전용 오류 ORA-13516
+  · V$ 뷰 조회는 자유롭다. 진단은 전부 가능하다
+  · 기준: 영구 데이터 파일이나 딕셔너리를 바꾸는가
+
+================================================================================
+ 실습 03 종료 — 테스트 객체 제거 완료.
+================================================================================

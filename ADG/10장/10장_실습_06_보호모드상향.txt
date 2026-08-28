@@ -1,0 +1,262 @@
+================================================================================
+ 제10장 실습 06 — 보호 모드 상향과 Far Sync 의 정체
+ 대상   : chicago-srv, farsync-srv, boston-srv
+ 목표   : MAXIMUM AVAILABILITY 로 올리고 세 노드의 값이 왜 다른지 이해한다.
+          Far Sync 인스턴스가 무엇을 갖고 무엇을 못 하는지 확인한다
+ 소요   : 약 35분
+ 변경   : 보호 모드 (실습 07 에서 원복)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 상향
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE AVAILABILITY;
+
+Database altered.
+
+-- ★ 재기동 없이 바뀐다.
+--   2장에서 배운 대로 MAXIMUM PROTECTION 으로 올릴 때만
+--   MOUNT 단계가 필요하고, AVAILABILITY 는 열린 채로 된다.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM AVAILABILITY RESYNCHRONIZATION
+
+1 row selected.
+
+-- ★ 두 열의 값이 다르다. 오류가 아니다.
+--
+--   PROTECTION_MODE   목표. 우리가 지정한 값
+--   PROTECTION_LEVEL  현재 달성 수준
+--
+--   RESYNCHRONIZATION 은 "아직 동기화 확인을 못 했다" 는 과도 상태다.
+--   2장에서 개념으로 배운 것을 여기서 실제로 본다.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+-- 리두가 몇 번 오간 뒤 다시 본다.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM AVAILABILITY MAXIMUM AVAILABILITY
+
+1 row selected.
+
+-- ★ 도달했다.
+--   목표와 현재가 같아졌다는 것은 동기 파트너와 실제로 동기화되었다는 뜻이다.
+
+--------------------------------------------------------------------------------
+ [2] 세 노드의 값이 다르다
+--------------------------------------------------------------------------------
+
+SYS@farsync> SELECT protection_mode, protection_level, database_role FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL     DATABASE_ROLE
+-------------------- -------------------- ----------------
+MAXIMUM AVAILABILITY MAXIMUM AVAILABILITY FAR SYNC
+
+1 row selected.
+
+SYS@boston> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM AVAILABILITY RESYNCHRONIZATION
+
+1 row selected.
+
+-- ★ 정리하면 이렇다.
+--
+--   chicago  MAXIMUM AVAILABILITY / MAXIMUM AVAILABILITY
+--   farsync  MAXIMUM AVAILABILITY / MAXIMUM AVAILABILITY
+--   boston   MAXIMUM AVAILABILITY / RESYNCHRONIZATION
+--
+-- ★ boston 만 다르다. 그런데 이것이 정상이다.
+--
+--   보호 모드는 구성 전체의 값이므로 세 노드가 같은 MODE 를 본다.
+--   LEVEL 은 각자의 관점에서 본 달성 수준이다.
+--
+--   동기 보장이 성립하는 구간은 chicago ↔ farsync 다.
+--   boston 은 farsync 에게서 ASYNC 로 받는다.
+--   그러므로 boston 의 관점에서 "나는 동기 파트너가 아니다" 가 정확하고
+--   그것이 RESYNCHRONIZATION 으로 나타난다.
+--
+-- ★ 이것이 Far Sync 구성의 핵심을 보여 준다.
+--
+--   보호 수준은 Primary 와 Far Sync 사이에서 달성되고
+--   그 뒤는 성능을 위해 비동기로 흘린다.
+--
+--   데이터 손실 위험은 "Far Sync 까지는 확실하다" 는 선까지 줄어든다.
+--   완전한 무손실이 아니라 절충이다.
+
+--------------------------------------------------------------------------------
+ [3] 데이터가 끝까지 가는가
+--------------------------------------------------------------------------------
+
+SYS@chicago> CREATE TABLE system.fs_t(id NUMBER, tag VARCHAR2(20));
+
+Table created.
+
+SYS@chicago> INSERT INTO system.fs_t VALUES(1,'via-farsync');
+
+1 row created.
+
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+-- 30초 뒤
+
+SYS@boston> COL tag FOR a16
+SYS@boston> SELECT id, tag FROM system.fs_t ORDER BY id;
+
+        ID TAG
+---------- ----------------
+         1 via-farsync
+
+1 row selected.
+
+-- ★ 경로가 하나 늘었지만 결과는 같다.
+--   9장에서 확인한 실시간 조회가 그대로 동작한다.
+--   중계소가 끼어들어도 Standby 는 여전히 최신 데이터를 보여 준다.
+
+--------------------------------------------------------------------------------
+ [4] Far Sync 는 무엇을 갖고 있는가
+--------------------------------------------------------------------------------
+
+SYS@farsync> SELECT count(*) datafiles FROM v$datafile;
+
+ DATAFILES
+----------
+         0
+
+SYS@farsync> SELECT count(*) tempfiles FROM v$tempfile;
+
+ TEMPFILES
+----------
+         3
+
+SYS@farsync> SELECT count(*) srl FROM v$standby_log;
+
+       SRL
+----------
+         4
+
+SYS@farsync> SELECT count(*) online_grp FROM v$log;
+
+ONLINE_GRP
+----------
+         0
+
+-- ★ 데이터 파일이 0개다. 이것이 Far Sync 의 정의다.
+--
+-- ★ 임시 파일 3개는 정의만 상속된 것이다. 실제 파일은 없다.
+--
+-- ★ V$LOG 가 0행인 것을 주목한다.
+--
+--   실습 03 에서 V$LOGFILE 에는 ONLINE 그룹 1~3 이 있었다.
+--   그런데 V$LOG 에는 그룹이 하나도 없다.
+--
+--   두 뷰가 보는 것이 다르기 때문이다.
+--     V$LOGFILE  컨트롤 파일에 적힌 파일 정의
+--     V$LOG      실제로 존재하는 로그 그룹
+--
+--   Far Sync 는 자기 온라인 리두를 쓰지 않으므로
+--   그룹으로서는 존재하지 않는다.
+
+[oracle@farsync-srv ~]$ du -sh /u01/app/oracle/oradata/FARSYNC \
+>   /u01/app/oracle/fast_recovery_area/FARSYNC
+819M    /u01/app/oracle/oradata/FARSYNC
+107M    /u01/app/oracle/fast_recovery_area/FARSYNC
+
+-- ★ 819MB 는 SRL 네 개(200MB × 4)와 컨트롤 파일이다.
+--   Primary 의 데이터가 3.2GB 인 것과 비교하면 가볍다.
+--   이것이 Far Sync 노드에 자원을 적게 주어도 되는 이유다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — 적용을 시켜 보면
+--------------------------------------------------------------------------------
+
+-- 7장에서 boston 에 MRP 를 띄웠던 명령을 farsync 에 그대로 써 본다.
+
+SYS@farsync> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT FROM SESSION;
+
+alter database recover managed standby database disconnect from session
+*
+ERROR at line 1:
+ORA-01665: control file is not a standby control file
+
+>>> 원인 파악
+
+-- ORA-01665 는 1장에서 만난 적이 있다.
+-- Primary 에 MRP 를 띄우려 했을 때 나온 그 오류다.
+--
+-- 이유도 같다. 컨트롤 파일이 Standby 용이 아니다.
+--
+--   Primary  CONTROLFILE_TYPE = CURRENT   → 적용 불가
+--   Far Sync CONTROLFILE_TYPE = FARSYNC   → 적용 불가
+--   Standby  CONTROLFILE_TYPE = STANDBY   → 적용 가능
+--
+-- ★ 적용할 데이터 파일이 없으니 당연한 결과다.
+--   그런데 오류 메시지는 데이터 파일을 언급하지 않고
+--   컨트롤 파일 유형을 말한다.
+--   오라클이 이 판단을 컨트롤 파일 수준에서 한다는 뜻이다.
+
+>>> 조치
+
+-- 적용은 Far Sync 의 역할이 아니므로 조치할 것이 없다.
+-- Far Sync 는 받아서 넘기기만 한다.
+
+>>> 재확인
+
+SYS@farsync> SELECT database_role, controlfile_type, open_mode FROM v$database;
+
+DATABASE_ROLE    CONTROLFILE_TYPE  OPEN_MODE
+---------------- ----------------- -----------
+FAR SYNC         FARSYNC           MOUNTED
+
+1 row selected.
+
+-- ★ 세 역할의 능력을 정리하면 이렇다.
+--
+--                     Primary   Standby   Far Sync
+--   리두 생성           O         X          X
+--   리두 수신           -         O          O
+--   SRL 기록            -         O          O
+--   로컬 아카이브       O         O          O
+--   다음 목적지 전달    O         설정하면    O (주 역할)
+--   리두 적용           -         O          X  (ORA-01665)
+--   데이터 파일         O         O          X
+--   조회 서비스         O         ADG면 O     X  (ORA-16476)
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① MAXIMUM AVAILABILITY 로 올리면 처음엔 RESYNCHRONIZATION
+--   ② 리두가 오간 뒤 MAXIMUM AVAILABILITY 에 도달한다
+--   ③ 세 노드의 LEVEL 이 다르다. boston 만 RESYNCHRONIZATION
+--   ④ 동기 보장 구간이 chicago ↔ farsync 이기 때문이다
+--   ⑤ 데이터는 끝까지 간다 (via-farsync 행을 boston 에서 조회)
+--   ⑥ Far Sync 는 데이터 파일 0개, V$LOG 0행, SRL 4개
+--   ⑦ 디스크 819MB + 107MB. Primary 3.2GB 와 비교된다
+--   ⑧ 적용은 못 한다 — ORA-01665
+--
+-- ★ 다음 실습에서 Cascading 규칙을 확인하고 구성을 원복한다.

@@ -1,0 +1,189 @@
+================================================================================
+ 제2장 실습 03 — 보호 모드 전환과 거부 재현
+ 대상   : chicago-srv Primary
+ 목표   : Maximum Protection 으로 올라가는 정확한 경로를 찾고,
+          ORA-01126 이 두 가지 서로 다른 원인으로 발생하는 것을 구분한다
+ 소요   : 약 30분
+ 되돌리기 : 실습 끝에 Maximum Performance + ASYNC 로 원복
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 오류 재현 ① — Performance 에서 Protection 으로 직접
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+-- 먼저 목적지를 SYNC AFFIRM 으로 바꿔 요건 하나를 갖춘다.
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston SYNC AFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PROTECTION;
+ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PROTECTION
+*
+ERROR at line 1:
+ORA-01126: database must be mounted in this instance and not open in any instance
+
+
+>>> 원인 파악 (1차)
+    SYNC AFFIRM 으로 바꿨는데도 거부된다.
+    Maximum Performance 에서 Maximum Protection 으로 **직접** 올리는 것은
+    인스턴스가 OPEN 인 상태에서 허용되지 않는다.
+    현재 보호 수준이 Protection 의 요건을 만족한다는 근거가 아직 없기 때문이다.
+
+>>> 조치 — 중간 단계를 거친다
+
+--------------------------------------------------------------------------------
+ [2] Maximum Availability 를 거쳐 간다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE AVAILABILITY;
+
+Database altered.
+
+SYS@chicago> COL name FOR a10
+SYS@chicago> SELECT name, database_role, open_mode,
+  2                 protection_mode, protection_level FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            PROTECTION_MODE      PROTECTION_LEVEL
+---------- ---------------- -------------------- -------------------- --------------------
+CHICAGO    PRIMARY          READ WRITE           MAXIMUM AVAILABILITY RESYNCHRONIZATION
+
+1 row selected.
+
+-- 명령은 성공했지만 PROTECTION_LEVEL 이 RESYNCHRONIZATION 이다.
+-- "설정은 Maximum Availability 인데 아직 그 수준에 도달하지 못했고 맞춰 가는 중"
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 ② — 동기화 전에 Protection 으로
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PROTECTION;
+ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PROTECTION
+*
+ERROR at line 1:
+ORA-01126: database must be mounted in this instance and not open in any instance
+
+
+>>> 원인 파악 (2차)
+    같은 오류 번호지만 원인이 다르다.
+    이번에는 PROTECTION_LEVEL 이 RESYNCHRONIZATION 이기 때문이다.
+    "아직 Maximum Availability 수준도 달성하지 못했는데 그보다 높은 Protection 으로
+    올릴 수는 없다" 는 것이 실제 사유다.
+
+    ORA-01126 의 문면("마운트하라")은 두 경우 모두 실제 원인을 가린다.
+    오라클이 이 상황을 위해 별도의 오류 번호를 두지 않았을 뿐이다.
+    오류 번호를 문면 그대로 믿지 말고 요건부터 확인해야 하는 이유다.
+
+>>> 조치 — 동기화가 끝나기를 기다린다
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@chicago> SELECT protection_level FROM v$database;
+
+PROTECTION_LEVEL
+--------------------
+MAXIMUM AVAILABILITY
+
+1 row selected.
+
+-- 로그 스위치 한 번으로 RESYNCHRONIZATION 이 해소됐다.
+-- 이제 설정과 실제 수준이 일치한다.
+
+--------------------------------------------------------------------------------
+ [4] 재확인 — 동기화된 상태에서 Protection 으로
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PROTECTION;
+
+Database altered.
+
+SYS@chicago> SELECT name, database_role, open_mode,
+  2                 protection_mode, protection_level FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            PROTECTION_MODE      PROTECTION_LEVEL
+---------- ---------------- -------------------- -------------------- --------------------
+CHICAGO    PRIMARY          READ WRITE           MAXIMUM PROTECTION   MAXIMUM PROTECTION
+
+1 row selected.
+
+-- 성공했다. OPEN 상태 그대로다. 마운트할 필요가 없었다.
+-- 필요했던 것은 "요건 충족" 이었지 "마운트" 가 아니었다.
+
+--------------------------------------------------------------------------------
+ [5] 실측으로 확인한 전환 규칙
+--------------------------------------------------------------------------------
+
+  출발 모드                              도착 모드            상태   결과
+  -------------------------------------- -------------------- ------ ----------------
+  Maximum Performance                    Maximum Protection   OPEN   ORA-01126 거부
+  Maximum Performance                    Maximum Availability OPEN   허용 (LEVEL=RESYNC)
+  Maximum Availability (LEVEL=RESYNC)    Maximum Protection   OPEN   ORA-01126 거부
+  Maximum Availability (LEVEL=MAX AVAIL) Maximum Protection   OPEN   허용
+  Maximum Protection                     Maximum Performance  OPEN   허용
+
+  올바른 순서
+    ① Standby 에 SRL 이 있는지 확인 (V$STANDBY_LOG)
+    ② 목적지를 SYNC AFFIRM 으로 변경
+    ③ ALTER SYSTEM ARCHIVE LOG CURRENT
+    ④ MAXIMIZE AVAILABILITY
+    ⑤ PROTECTION_LEVEL 이 MAXIMUM AVAILABILITY 가 될 때까지 대기
+    ⑥ MAXIMIZE PROTECTION
+    ⑦ PROTECTION_LEVEL 재확인
+
+--------------------------------------------------------------------------------
+ [6] 원복 — Maximum Performance + ASYNC
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER DATABASE SET STANDBY DATABASE TO MAXIMIZE PERFORMANCE;
+
+Database altered.
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston ASYNC NOAFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@chicago> SELECT protection_mode, protection_level FROM v$database;
+
+PROTECTION_MODE      PROTECTION_LEVEL
+-------------------- --------------------
+MAXIMUM PERFORMANCE  MAXIMUM PERFORMANCE
+
+1 row selected.
+
+SYS@chicago> COL destination FOR a12
+SYS@chicago> SELECT dest_id, destination, transmit_mode, affirm, valid_now
+  2            FROM v$archive_dest WHERE dest_id = 2;
+
+   DEST_ID DESTINATION  TRANSMIT_MOD AFF VALID_NOW
+---------- ------------ ------------ --- ----------------
+         2 boston       ASYNCHRONOUS NO  YES
+
+1 row selected.
+
+-- 낮추는 방향은 제약이 없다. OPEN 상태에서 바로 된다.
+-- 보호 수준을 낮추는 일은 언제든 할 수 있고, 올리는 일만 요건을 따진다.
+
+SYS@chicago> EXIT
+
+================================================================================
+ 실습 03 종료
+ 원복 확인 : MAXIMUM PERFORMANCE / MAXIMUM PERFORMANCE, dest_2 ASYNC NOAFFIRM
+================================================================================

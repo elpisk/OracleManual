@@ -1,0 +1,295 @@
+================================================================================
+ 제15장 실습 04 — 적용의 진행과 APPLIED 열의 함정
+ 대상   : boston-srv, chicago-srv
+ 목표   : V$MANAGED_STANDBY 의 프로세스 구성을 읽는다.
+          V$ARCHIVED_LOG 의 APPLIED 와 APPLIED_SEQ# 를 오해 없이 해석한다
+ 소요   : 약 25분
+ 변경   : 없음 (전부 조회)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 프로세스 전체를 본다
+--------------------------------------------------------------------------------
+
+SYS@boston> COL client_process FOR a14
+SYS@boston> SELECT process, status, client_process, thread#, sequence#, block#
+  2            FROM v$managed_standby ORDER BY process;
+
+PROCESS   STATUS       CLIENT_PROCESS  THREAD#  SEQUENCE#     BLOCK#
+--------- ------------ -------------- -------- ---------- ----------
+ARCH      CLOSING      ARCH                  1         68          1
+ARCH      CLOSING      ARCH                  1         71          1
+ARCH      CLOSING      ARCH                  1         72          1
+ARCH      CLOSING      ARCH                  1         73          1
+DGRD      ALLOCATED    N/A                   0          0          0
+DGRD      ALLOCATED    N/A                   0          0          0
+MRP0      APPLYING_LOG N/A                   1         74      17964
+RFS       IDLE         UNKNOWN               0          0          0
+RFS       IDLE         Archival              1          0          0
+RFS       IDLE         LGWR                  1         74      17964
+
+10 rows selected.
+
+-- ★ 프로세스마다 하는 일이 다르다.
+--
+--   RFS (LGWR)      Primary 의 LGWR 가 보낸 리두를 SRL 에 쓴다
+--   RFS (Archival)  Primary 의 ARCH 가 보낸 아카이브를 받는다
+--   RFS (UNKNOWN)   아직 배정되지 않은 예비
+--   MRP0            SRL 을 읽어 적용한다
+--   ARCH            Standby 에서 SRL 을 아카이브한다
+--   DGRD            Data Guard 브로커 통신용
+--
+-- ★ DGRD 는 13장에서 Broker 를 켠 뒤에 생긴 것이다.
+--   Broker 를 쓰지 않는 6~12장 초반에는 없었다.
+
+--------------------------------------------------------------------------------
+ [2] 실시간 적용의 모습
+--------------------------------------------------------------------------------
+
+-- ★ 두 행을 나란히 놓고 본다.
+--
+--   RFS (LGWR)   THREAD 1  SEQUENCE 74  BLOCK 17964
+--   MRP0         THREAD 1  SEQUENCE 74  BLOCK 17964
+--
+-- ★ SEQUENCE# 와 BLOCK# 이 모두 같다.
+--   받는 즉시 적용하고 있다는 뜻이다.
+--   이것이 실시간 적용(Real Time Apply)의 모습이다.
+--
+-- ★ 두 값이 벌어지면 적용이 밀린 것이다.
+--   지연을 초 단위가 아니라 블록 단위로 볼 수 있다.
+--   V$DATAGUARD_STATS 의 apply lag 보다 정밀하다.
+--
+-- ★ ARCH 가 CLOSING 으로 넷 있는 것은 정상이다.
+--   각각 다른 시퀀스(68·71·72·73)를 마무리하고 있다.
+
+SYS@boston> SELECT group#, sequence#, status FROM v$standby_log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------
+         4         74 ACTIVE
+         5          0 UNASSIGNED
+         6          0 UNASSIGNED
+         7          0 UNASSIGNED
+
+4 rows selected.
+
+-- ★ 실습 01 에서 본 SRL 과 연결된다.
+--   ACTIVE 인 4번 그룹의 SEQUENCE# 74 가
+--   RFS(LGWR) · MRP0 와 같다.
+--
+-- ★ 세 곳에서 같은 숫자를 보는 것이 정상 확인의 요령이다.
+--
+--   Primary V$LOG 의 CURRENT     74
+--   Standby V$STANDBY_LOG ACTIVE 74
+--   Standby MRP0                 74
+
+--------------------------------------------------------------------------------
+ [3] MRP 의 STATUS 로 읽는 상태
+--------------------------------------------------------------------------------
+
+-- ★ 값별 뜻
+--
+--   APPLYING_LOG   적용 중. 정상이다
+--   WAIT_FOR_LOG   다음 리두를 기다린다
+--   WAIT_FOR_GAP   갭이 있어 채워지기를 기다린다
+--
+-- ★ WAIT_FOR_LOG 가 늘 문제인 것은 아니다.
+--   한가한 시스템에서는 정상일 수 있다.
+--   SEQUENCE# 가 Primary 의 현재 시퀀스와 같은지 함께 봐야 구별된다.
+--
+--   WAIT_FOR_LOG + SEQUENCE# 가 같음   → 한가한 것. 정상
+--   WAIT_FOR_LOG + SEQUENCE# 가 뒤짐   → 안 오고 있다. 문제
+--
+-- ★ 실습 03 에서는 후자였다. MRP0 가 75를 기다리는데
+--   Primary 는 이미 그 앞에 있었다.
+--
+-- ★ MRP0 행 자체가 없으면 적용이 멈춘 것이다.
+--   6장에서 여러 번 확인했다.
+
+--------------------------------------------------------------------------------
+ [4] 함정 ① — APPLIED 열
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT dest_id, sequence#, applied, to_char(completion_time,'HH24:MI:SS') ct
+  2            FROM v$archived_log ORDER BY sequence# DESC, dest_id
+  3            FETCH FIRST 8 ROWS ONLY;
+
+   DEST_ID  SEQUENCE# APPLIED   CT
+---------- ---------- --------- --------
+         1         73 NO        19:59:48
+         2         73 YES       19:59:48
+         1         72 NO        19:57:53
+         2         72 YES       19:57:53
+         1         71 NO        19:57:32
+         2         71 YES       19:57:32
+         1         70 NO        19:55:38
+         2         70 YES       19:56:30
+
+8 rows selected.
+
+>>> 원인 파악
+
+-- ★ 같은 시퀀스가 두 줄씩 나오고 APPLIED 가 서로 다르다.
+--   오해하면 "절반이 적용되지 않았다" 고 잘못 읽는다.
+--
+-- ★ dest_id=1 은 Primary 자신의 로컬 아카이브다.
+--   자기가 만든 것을 자기가 적용할 일이 없으므로 영원히 NO 다.
+--
+-- ★ dest_id=2 가 Standby 로 보낸 것이며
+--   이 행의 APPLIED 가 실제 적용 여부다.
+
+>>> 조치
+
+-- ★ Primary 에서 적용 여부를 볼 때는 WHERE dest_id=2 가 필수다.
+
+>>> 재확인
+
+SYS@chicago> SELECT sequence#, applied FROM v$archived_log
+  2            WHERE dest_id=2 ORDER BY sequence# DESC FETCH FIRST 4 ROWS ONLY;
+
+ SEQUENCE# APPLIED
+---------- ---------
+        73 YES
+        72 YES
+        71 YES
+        70 YES
+
+4 rows selected.
+
+-- ★ 전부 YES 다. 조건 하나로 판정이 달라진다.
+--
+-- ★ 70번의 COMPLETION_TIME 도 눈여겨본다.
+--   로컬 19:55:38, 원격 19:56:30 — 약 52초 차이다.
+--   그것이 전송에 걸린 시간이다.
+--   평소 이 차이를 알아 두면 느려졌을 때 알아볼 수 있다.
+
+--------------------------------------------------------------------------------
+ [5] 함정 ② — APPLIED_SEQ#
+--------------------------------------------------------------------------------
+
+SYS@boston> COL recovery_mode FOR a26
+SYS@boston> SELECT dest_id, status, recovery_mode, archived_seq#, applied_seq#
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE              ARCHIVED_SEQ# APPLIED_SEQ#
+---------- --------- -------------------------- ------------- ------------
+         1 VALID     MANAGED REAL TIME APPLY               73            0
+
+1 row selected.
+
+>>> 원인 파악
+
+-- ★ APPLIED_SEQ# 가 0 이다. 적용이 안 되고 있다는 뜻이 아니다.
+--
+-- ★ 실시간 적용은 아카이브 파일이 아니라 SRL 에서 직접 읽는다.
+--   그래서 "몇 번 아카이브까지 적용했는가" 라는 이 열이 채워지지 않는다.
+--
+-- ★ RECOVERY_MODE 가 MANAGED REAL TIME APPLY 라는 것이 그 근거다.
+--   실시간이 아닌 MANAGED 모드였다면 이 값이 채워진다.
+--
+-- ★ 이 값을 감시 지표로 쓰면 상시 경보가 뜬다.
+--   9장에서 실시간 적용을 켠 순간부터 계속 0 이었을 것이다.
+
+>>> 조치
+
+-- ★ 실시간 적용 환경에서는 다른 지표를 쓴다.
+--
+--   V$DATAGUARD_STATS 의 apply lag
+--   V$MANAGED_STANDBY 의 MRP0 SEQUENCE#
+--   V$STANDBY_LOG 의 ACTIVE 그룹
+
+>>> 재확인
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby WHERE process='MRP0';
+
+PROCESS   STATUS         SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         74
+
+1 row selected.
+
+-- ★ 74번을 적용 중이다. ARCHIVED_SEQ# 73 보다 앞서 있다.
+--   아카이브되기 전의 리두를 이미 적용하고 있다는 뜻이며
+--   실시간 적용이 정상 동작한다는 증거다.
+
+--------------------------------------------------------------------------------
+ [6] 과거의 흔적 — ERROR_CODE 로 거른다
+--------------------------------------------------------------------------------
+
+SYS@boston> COL message FOR a70
+SYS@boston> SELECT severity, error_code, to_char(timestamp,'HH24:MI:SS') ts, message
+  2            FROM v$dataguard_status WHERE error_code <> 0 ORDER BY timestamp DESC;
+
+SEVERITY      ERROR_CODE TS       MESSAGE
+------------- ---------- -------- ----------------------------------------------
+Warning            16037 19:59:41 MRP0: Background Media Recovery cancelled with status 16037
+Warning            16037 19:57:23 MRP0: Background Media Recovery cancelled with status 16037
+
+2 rows selected.
+
+>>> 원인 파악
+
+-- ★ ORA-16037 은 "사용자가 관리 대상 복구를 취소했다" 는 뜻이다.
+--   6장에서 MRP 를 껐다 켤 때 본 번호다.
+--
+-- ★ 지금은 적용이 정상인데 왜 이 행이 남아 있는가.
+--   이 뷰는 인스턴스를 재기동하기 전까지 과거 기록을 그대로 들고 있다.
+--   실습 준비 과정에서 MRP 를 껐다 켠 흔적이다.
+--
+-- ★ 그러므로 ERROR_CODE 만으로 판정하면 안 된다.
+--   TIMESTAMP 를 함께 봐야 "지금 문제인가" 를 알 수 있다.
+
+>>> 조치
+
+-- ★ 감시 SQL 에는 시간 조건을 넣는다.
+
+SYS@boston> SELECT count(*) FROM v$dataguard_status
+  2            WHERE error_code <> 0 AND timestamp > sysdate - 1/24;
+
+>>> 재확인
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby WHERE process='MRP0';
+
+PROCESS   STATUS         SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         74
+
+1 row selected.
+
+-- ★ 지금은 정상이다. 과거의 기록이 남아 있을 뿐이다.
+
+--------------------------------------------------------------------------------
+ [7] 갭 확인
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT * FROM v$archive_gap;
+
+no rows selected
+
+-- ★ 비어 있는 것이 정상이다.
+--
+-- ★ 다만 실습 03 에서 확인한 대로
+--   전송이 아예 끊기면 이 뷰도 비어 있다.
+--   갭을 인식하려면 Standby 가 Primary 와 통신해야 하기 때문이다.
+--
+-- ★ 그러므로 이 뷰만으로 "갭이 없다" 고 판정하지 않는다.
+--   목적지 상태와 함께 본다.
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① RFS 는 클라이언트별로 여럿 뜬다 (LGWR·Archival·UNKNOWN)
+--   ② DGRD 는 Broker 통신용이며 13장 이후에 생겼다
+--   ③ RFS(LGWR) 와 MRP0 의 SEQUENCE#·BLOCK# 이 같으면 실시간 적용 중
+--   ④ 세 곳(V$LOG·V$STANDBY_LOG·MRP0)에서 같은 시퀀스를 본다
+--   ⑤ WAIT_FOR_LOG 는 SEQUENCE# 를 함께 봐야 판정된다
+--   ⑥ V$ARCHIVED_LOG 의 APPLIED 는 dest_id=2 만 의미가 있다
+--   ⑦ 두 목적지의 COMPLETION_TIME 차이가 전송 시간이다 (실측 52초)
+--   ⑧ APPLIED_SEQ#=0 은 실시간 적용이므로 정상이다
+--   ⑨ ERROR_CODE<>0 로 걸러도 TIMESTAMP 를 함께 봐야 한다 (ORA-16037)
+--   ⑩ V$ARCHIVE_GAP 이 비어 있다고 갭이 없는 것은 아니다
+--
+-- ★ 다음 실습에서 추적을 켠다.

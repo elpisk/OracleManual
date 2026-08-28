@@ -1,0 +1,263 @@
+================================================================================
+ 제12장 실습 01 — 전제 조건 점검
+ 대상   : chicago-srv Primary, boston-srv Physical Standby
+ 목표   : Logical Standby 로 전환하기 전에 무엇을 확인해야 하는지 익힌다.
+          DBA_LOGSTDBY_* 뷰로 지원 여부·고유 식별자·스킵 규칙을 읽는다
+ 소요   : 약 30분
+ 변경   : 없음 (전부 조회)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작하기 전에 — 되돌릴 수 없다
+--------------------------------------------------------------------------------
+
+-- ★ 이 장의 실습은 11장과 성격이 완전히 다르다.
+--
+--   11장 Snapshot Standby   명령 한 줄로 되돌아간다
+--   12장 Logical Standby    되돌리는 명령이 없다
+--
+-- ★ 되돌리려면 5·6장의 절차로 Standby 를 처음부터 다시 만들어야 한다.
+--   RMAN DUPLICATE 를 다시 돌린다는 뜻이다.
+--
+-- ★ 그래서 시작 전에 VM 스냅샷을 만든다.
+
+C:\> vmrun snapshot "D:\ADG\CHICAGO\ADG-CHICAGO.vmx" pre-logical
+C:\> vmrun snapshot "D:\ADG\BOSTON\ADG-BOSTON.vmx"   pre-logical
+
+C:\> vmrun listSnapshots "D:\ADG\BOSTON\ADG-BOSTON.vmx"
+Total snapshots: 2
+adg-configured
+pre-logical
+
+-- ★ 실행 중인 상태로 찍으면 메모리까지 저장되므로 되돌리면 그대로 돌아온다.
+--   대신 시간이 걸린다. 6GB 메모리 두 노드에 10분 이상 걸렸다.
+--
+-- ★ 기존 adg-configured 는 5장 시점이라 되돌리면 6장부터 다시 해야 한다.
+--   pre-logical 은 11장을 마친 상태이므로 13장을 바로 시작할 수 있다.
+--
+-- ★ 되돌릴 수 없는 작업 앞에서는 되돌릴 수 있는 지점을 먼저 만든다.
+--   11장에서 오라클이 CONVERT TO SNAPSHOT STANDBY 를 설계한 방식과 같다.
+--   도구가 해 주지 않으면 사람이 한다.
+
+--------------------------------------------------------------------------------
+ [1] 출발점
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a10
+SYS@chicago> SELECT name, db_unique_name, database_role, open_mode, cdb
+  2            FROM v$database;
+
+NAME       DB_UNIQUE_NAME  DATABASE_ROLE  OPEN_MODE   CDB
+---------- --------------- -------------- ----------- ---
+CHICAGO    chicago         PRIMARY        READ WRITE  YES
+
+1 row selected.
+
+SYS@boston> SELECT name, db_unique_name, database_role, open_mode FROM v$database;
+
+NAME       DB_UNIQUE_NAME  DATABASE_ROLE     OPEN_MODE
+---------- --------------- ----------------- ---------------------
+CHICAGO    boston          PHYSICAL STANDBY  READ ONLY WITH APPLY
+
+1 row selected.
+
+-- ★ CDB 가 YES 라는 것을 기억해 둔다.
+--   "Multitenant 에서 Logical Standby 를 쓸 수 있는가" 는 흔한 질문이다.
+--   실습 03 에서 답이 나온다.
+
+--------------------------------------------------------------------------------
+ [2] 보충 로깅 — 지금은 꺼져 있다
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT supplemental_log_data_min mn, supplemental_log_data_pk pk,
+  2                supplemental_log_data_ui ui, supplemental_log_data_fk fk,
+  3                supplemental_log_data_all al, force_logging fl
+  4            FROM v$database;
+
+MN       PK  UI  FK  AL  FL
+-------- --- --- --- --- ---
+NO       NO  NO  NO  NO  YES
+
+1 row selected.
+
+-- ★ 보충 로깅이 왜 필요한가.
+--
+--   Primary 가 UPDATE emp SET sal=3500 WHERE empno=7788 을 실행하면
+--   리두에는 "파일 5, 블록 1234, 오프셋 …의 값이 바뀌었다" 가 기록된다.
+--
+--   블록 안의 위치는 알지만 그 행이 논리적으로 무엇인지는 없다.
+--   같은 데이터가 Logical Standby 에서는 다른 블록에 있을 수 있으므로
+--   이 정보로는 SQL 을 만들 수 없다.
+--
+--   보충 로깅은 행을 식별할 수 있는 컬럼 값을 리두에 함께 기록한다.
+--
+-- ★ FORCE_LOGGING 과 혼동하지 않는다.
+--
+--   FORCE_LOGGING  리두를 남기느냐의 문제        (4장에서 켰다)
+--   보충 로깅       리두에 무엇을 더 담느냐의 문제
+--
+--   둘 다 필요하며 서로를 대신하지 못한다.
+--
+-- ★ 지금 꺼져 있는데 어떻게 켤까.
+--   ALTER DATABASE ADD SUPPLEMENTAL LOG DATA 를 직접 실행할 수도 있지만
+--   실습 02 에서 다른 방법을 본다.
+
+--------------------------------------------------------------------------------
+ [3] 지원되지 않는 것이 있는가
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL data_type FOR a34
+SYS@chicago> SELECT DISTINCT data_type FROM dba_logstdby_unsupported
+  2            WHERE data_type IS NOT NULL ORDER BY 1;
+
+no rows selected
+
+SYS@chicago> SELECT count(*) unsupported_cols,
+  2                count(DISTINCT owner||'.'||table_name) unsupported_tabs
+  3            FROM dba_logstdby_unsupported;
+
+UNSUPPORTED_COLS UNSUPPORTED_TABS
+---------------- ----------------
+               0                0
+
+1 row selected.
+
+-- ★ 실습 환경에는 걸리는 것이 없다. 사용자 데이터가 단순하기 때문이다.
+--
+-- ★ 여기 나온 테이블은 복제되지 않는다.
+--   업무에 중요한 테이블이 나온다면 Logical Standby 는 답이 아니다.
+--
+-- ★ 대표적으로 걸리는 것들
+--     BFILE, ROWID, UROWID
+--     사용자 정의 타입, 컬렉션(중첩 테이블·VARRAY)
+--     객체 관계형 뷰, XMLType 의 일부 저장 방식
+--     압축 테이블의 일부 형태
+--
+--   목록을 외우기보다 이 뷰를 조회하는 습관이 낫다.
+--   버전마다 지원 범위가 달라진다.
+--
+-- ★ 실습 05 에서 일부러 ROWID 컬럼을 만들어 이 뷰를 채워 본다.
+
+--------------------------------------------------------------------------------
+ [4] 고유 식별자가 없는 테이블
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT count(*) not_unique FROM dba_logstdby_not_unique;
+
+NOT_UNIQUE
+----------
+         0
+
+1 row selected.
+
+-- ★ 기본 키도 고유 인덱스도 없는 테이블을 보여 준다.
+--
+--   그런 테이블도 복제는 된다.
+--   다만 오라클이 "어느 행을 고쳐야 하는가" 를 판단하려고
+--   모든 컬럼을 비교하므로 느려진다.
+--
+-- ★ 운영에서 이 뷰에 많은 테이블이 나온다면
+--   기본 키를 추가하는 것이 Logical Standby 도입의 사전 작업이 된다.
+
+--------------------------------------------------------------------------------
+ [5] 기본 스킵 규칙 — 이미 35개가 있다
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL statement_opt FOR a18
+SYS@chicago> COL owner FOR a12
+SYS@chicago> SELECT error, statement_opt, owner, name FROM dba_logstdby_skip
+  2            WHERE rownum <= 12;
+
+ERROR STATEMENT_OPT      OWNER        NAME
+----- ------------------ ------------ ----
+N     INTERNAL SCHEMA    SYS          %
+N     INTERNAL SCHEMA    SYSTEM       %
+N     INTERNAL SCHEMA    XS$NULL      %
+N     INTERNAL SCHEMA    OJVMSYS      %
+N     INTERNAL SCHEMA    LBACSYS      %
+N     INTERNAL SCHEMA    OUTLN        %
+N     INTERNAL SCHEMA    SYS$UMF      %
+N     INTERNAL SCHEMA    APPQOSSYS    %
+N     INTERNAL SCHEMA    DBSNMP       %
+N     INTERNAL SCHEMA    DBSFWUSER    %
+N     INTERNAL SCHEMA    ANONYMOUS    %
+N     INTERNAL SCHEMA    GGSYS        %
+
+12 rows selected.
+
+SYS@chicago> SELECT count(*) skip_rules FROM dba_logstdby_skip;
+
+SKIP_RULES
+----------
+        35
+
+1 row selected.
+
+-- ★ 35개 규칙이 이미 있고 대부분이 INTERNAL SCHEMA 다.
+--
+-- ★ 이것이 실무에서 가장 먼저 부딪히는 문제를 예고한다.
+--
+--   SYSTEM 스키마에 만든 테이블은 Logical Standby 로 복제되지 않는다.
+--
+--   지금까지의 실습에서 system.ss_base 같은 테이블을 편의상 자주 썼다.
+--   Logical Standby 환경에서는 그 습관이 통하지 않는다.
+--   실습 04 에서 직접 확인한다.
+--
+-- ★ "업무 객체를 SYSTEM 에 두지 않는다" 는 원칙이
+--   여기서 실질적인 의미를 갖는다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — 뷰 이름을 헷갈리면
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT count(*) FROM dba_logstdby_skipped;
+
+SELECT count(*) FROM dba_logstdby_skipped
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+>>> 원인 파악
+
+-- 뷰 이름이 DBA_LOGSTDBY_SKIP 이다. 복수형이 아니다.
+--
+-- ★ 이 계열의 뷰 이름을 정리해 둔다.
+--
+--   DBA_LOGSTDBY_UNSUPPORTED   지원되지 않는 컬럼
+--   DBA_LOGSTDBY_NOT_UNIQUE    고유 식별자 없는 테이블
+--   DBA_LOGSTDBY_SKIP          스킵 규칙        (SKIPPED 아님)
+--   DBA_LOGSTDBY_SKIP_TRANSACTION  건너뛸 트랜잭션
+--   DBA_LOGSTDBY_EVENTS        적용 이벤트와 오류
+--   DBA_LOGSTDBY_PARAMETERS    SQL Apply 파라미터
+--   DBA_LOGSTDBY_PROGRESS      적용 진척
+--
+--   V$ 뷰도 따로 있다.
+--   V$LOGSTDBY_PROCESS / V$LOGSTDBY_STATE / V$LOGSTDBY_STATS
+
+>>> 조치
+
+SYS@chicago> SELECT count(*) FROM dba_logstdby_skip;
+
+>>> 재확인
+
+  COUNT(*)
+----------
+        35
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [7] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① 전환은 되돌릴 수 없다 → VM 스냅샷 pre-logical 을 먼저 만든다
+--   ② 출발점 — PRIMARY / PHYSICAL STANDBY, CDB=YES
+--   ③ 보충 로깅은 전부 NO, FORCE_LOGGING 만 YES
+--   ④ DBA_LOGSTDBY_UNSUPPORTED 0행 — 걸리는 것이 없다
+--   ⑤ DBA_LOGSTDBY_NOT_UNIQUE 0행
+--   ⑥ DBA_LOGSTDBY_SKIP 35개 — 대부분 INTERNAL SCHEMA
+--   ⑦ SYSTEM 스키마는 복제되지 않는다
+--
+-- ★ 다음 실습에서 LogMiner 딕셔너리를 만든다.

@@ -1,0 +1,244 @@
+================================================================================
+ 제7장 실습 01 — 적용 프로세스 관찰
+ 대상   : boston-srv Standby
+ 목표   : V$MANAGED_STANDBY 에 나타나는 프로세스들의 역할과 상태를 읽고,
+          RFS 와 MRP0 의 관계에서 실시간 적용의 증거를 찾는다
+ 소요   : 약 25분
+ 변경   : 없음 (적용을 잠시 멈췄다가 되돌린다)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 프로세스 전체 목록
+--------------------------------------------------------------------------------
+
+SYS@boston> SET LINES 200
+SYS@boston> COL process FOR a9
+SYS@boston> COL status FOR a13
+SYS@boston> SELECT process, pid, status, thread#, sequence#, block#, blocks
+  2            FROM v$managed_standby ORDER BY process, sequence#;
+
+PROCESS   PID    STATUS        THREAD#  SEQUENCE#     BLOCK#     BLOCKS
+--------- ------ ------------- ------- ---------- ---------- ----------
+ARCH      4570   CONNECTED           0          0          0          0
+ARCH      4578   CONNECTED           0          0          0          0
+ARCH      4580   CONNECTED           0          0          0          0
+ARCH      4576   CONNECTED           0          0          0          0
+DGRD      4574   ALLOCATED           0          0          0          0
+DGRD      4572   ALLOCATED           0          0          0          0
+MRP0      4618   APPLYING_LOG        1         64       2285     409600
+RFS       4626   IDLE                1          0          0          0
+RFS       4628   IDLE                1         64       2285          1
+
+9 rows selected.
+
+-- ★ 네 종류가 보인다.
+--
+--   ARCH  아카이브 담당. 4개
+--   DGRD  Data Guard 관리용 보조. 2개
+--   RFS   Primary 에서 오는 리두를 받아 SRL 에 쓴다. 2개
+--   MRP0  받은 리두를 데이터 파일에 적용한다. 항상 1개
+--
+-- ★ 이 장에서 볼 것은 RFS 와 MRP0 두 개다. 나머지는 배경이다.
+
+--------------------------------------------------------------------------------
+ [2] ARCH 가 왜 네 개인가
+--------------------------------------------------------------------------------
+
+SYS@boston> SHOW PARAMETER log_archive_max_processes
+
+NAME                        TYPE      VALUE
+--------------------------- --------- -----
+log_archive_max_processes   integer   4
+
+-- ★ 우연이 아니다.
+--   5장·6장의 DUPLICATE 스크립트에 다음 줄이 있었다.
+--     set log_archive_max_processes = '4'
+--   그 값이 그대로 프로세스 개수가 되었다.
+--
+-- ★ 상태가 전부 CONNECTED 다. Standby 에서는 아카이브할 일이 거의 없다.
+--   역할 전환 후 Primary 가 되면 이들이 일을 시작한다.
+--   미리 떠 있는 것이며 자원 낭비가 아니다.
+
+--------------------------------------------------------------------------------
+ [3] 결정적 관찰 — RFS 와 MRP0 의 시퀀스가 같다
+--------------------------------------------------------------------------------
+
+-- 위 출력에서 두 행만 다시 본다.
+--
+--   MRP0  APPLYING_LOG   thread 1  sequence 64  block 2285
+--   RFS   IDLE           thread 1  sequence 64  block 2285
+--
+-- ★ **받는 지점과 적용하는 지점이 같다.**
+--   RFS 가 시퀀스 64 의 2285번 블록까지 받았고,
+--   MRP0 도 시퀀스 64 의 2285번 블록까지 적용했다.
+--
+--   이것이 실시간 적용이 작동하고 있다는 **직접적인 증거**다.
+--   아카이브 적용이라면 MRP0 의 시퀀스가 RFS 보다 뒤처져 있어야 한다.
+--   받고 있는 로그는 아직 아카이브되지 않았으므로 적용 대상이 아니기 때문이다.
+--
+-- ★ 첫 번째 RFS 행은 시퀀스가 0 이다.
+--   아직 어느 로그도 담당하지 않은 대기 연결이다.
+--   개수 자체는 진단 근거가 못 된다.
+--   **의미 있는 것은 시퀀스가 0 이 아닌 RFS 가 있는가**다.
+
+SYS@boston> SELECT process, status, thread#, sequence# FROM v$managed_standby
+  2            WHERE process IN ('MRP0','RFS') ORDER BY process;
+
+PROCESS   STATUS        THREAD#  SEQUENCE#
+--------- ------------ -------- ----------
+MRP0      WAIT_FOR_LOG        1         67
+RFS       IDLE                1         67
+RFS       IDLE                1          0
+RFS       IDLE                0          0
+
+4 rows selected.
+
+-- 다른 시점의 조회다. RFS 가 네 개로 늘었다.
+-- 연결마다 하나씩 만들어지며 끊기면 정리된다.
+--
+-- THREAD# 가 0 인 RFS 는 담당 스레드가 정해지지 않은 것이다.
+-- RAC 가 아닌 단일 인스턴스이므로 스레드는 1번 하나뿐이다.
+
+--------------------------------------------------------------------------------
+ [4] BLOCKS 열의 409600
+--------------------------------------------------------------------------------
+
+-- MRP0 행의 BLOCKS 가 409600 이었다. 무엇을 뜻하는가.
+
+SYS@boston> SELECT group#, bytes/1024/1024 mb FROM v$standby_log WHERE rownum=1;
+
+    GROUP#         MB
+---------- ----------
+         4        200
+
+-- 200MB = 209,715,200바이트.
+-- 리두 로그의 블록 크기는 512바이트다.
+-- 209,715,200 / 512 = 409,600
+--
+-- ★ 즉 MRP0 이 적용 대상으로 보고 있는 로그 전체의 블록 수다.
+--   BLOCK# 2285 는 그중 어디까지 왔는지를 뜻한다.
+--   2285 / 409600 = 0.56퍼센트. 이제 막 시작한 셈이다.
+--
+-- ★ 이 두 값으로 진행률을 계산할 수 있다.
+--   지연이 크고 BLOCK# 이 계속 늘어나면 따라잡는 중이다.
+--   BLOCK# 이 멈춰 있으면 적용이 막힌 것이다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — MRP0 이 사라졌을 때
+--------------------------------------------------------------------------------
+
+-- 적용을 멈추면 MRP0 이 목록에서 없어진다. 그 상태를 관찰한다.
+
+SYS@boston> SELECT open_mode FROM v$database;
+
+OPEN_MODE
+--------------------
+READ ONLY WITH APPLY
+
+1 row selected.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> SELECT open_mode FROM v$database;
+
+OPEN_MODE
+--------------------
+READ ONLY
+
+1 row selected.
+
+SYS@boston> SELECT COUNT(*) mrp FROM v$managed_standby WHERE process='MRP0';
+
+       MRP
+----------
+         0
+
+1 row selected.
+
+-- ★ 두 가지가 함께 바뀌었다.
+--   OPEN_MODE 가 READ ONLY WITH APPLY → READ ONLY
+--   MRP0 개수가 1 → 0
+--
+--   **WITH APPLY 라는 꼬리표가 MRP0 의 존재를 그대로 반영한다.**
+--   프로세스가 사라지면 꼬리표도 사라진다.
+--
+-- ★ 그런데 같은 시점에 지연을 조회하면 이렇다.
+
+SYS@boston> COL name FOR a16
+SYS@boston> COL value FOR a20
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+-- ★★ **적용이 멈춰 있는데 지연이 0 이다.**
+--   적용할 것이 없으니 뒤처질 것도 없다는 계산이다.
+--   지연 값만 보고 "정상"이라고 판단하면 정확히 이 함정에 빠진다.
+
+>>> 원인 파악
+    적용을 중지했으므로 MRP0 이 종료되었다.
+    ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL 의 정상 결과다.
+
+    ★ 이 상태를 발견했을 때 던져야 할 질문은 "왜 멈췄는가"다.
+      사람이 멈춘 것인지, 오류로 멈춘 것인지에 따라 대응이 다르다.
+      Standby 의 alert 로그에서 마지막 MRP 관련 메시지를 확인한다.
+
+    ★ 다시 멈추려 하면 다음과 같다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+alter database recover managed standby database cancel
+*
+ERROR at line 1:
+ORA-16136: Managed Standby Recovery not active
+
+      "관리 대상 Standby 복구가 활성 상태가 아니다."
+      멈출 것이 없다는 뜻이며 손상은 없다.
+
+>>> 조치
+    적용을 다시 기동한다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+>>> 재확인
+
+SYS@boston> SELECT open_mode FROM v$database;
+
+OPEN_MODE
+--------------------
+READ ONLY WITH APPLY
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS        SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         73
+
+    OPEN_MODE 에 WITH APPLY 가 돌아왔고 MRP0 도 다시 보인다.
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+  · V$MANAGED_STANDBY 에는 ARCH·DGRD·RFS·MRP0 이 보인다 (실측 9행)
+  · ARCH 개수는 log_archive_max_processes 가 정한다 (실측 4)
+  · RFS 개수는 유동적이다. 시퀀스가 0 이 아닌 RFS 가 의미 있는 것이다
+  · RFS 와 MRP0 의 시퀀스·블록이 같으면 실시간 적용의 직접 증거다
+  · BLOCKS 409600 = 200MB / 512바이트. BLOCK# 과 함께 진행률을 준다
+  · 적용을 멈추면 MRP0 이 사라지고 OPEN_MODE 가 READ ONLY 가 된다
+  · 그때도 두 지연은 0 으로 보인다 — 가장 중요한 함정이다
+  · 멈춘 상태에서 CANCEL → ORA-16136. 무해하다
+
+================================================================================
+ 실습 01 종료 — 적용을 다시 켰다. 기준 상태로 복귀했다.
+================================================================================

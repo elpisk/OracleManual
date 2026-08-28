@@ -1,0 +1,214 @@
+================================================================================
+ 제6장 실습 01 — OMF 파라미터와 기준 상태 확인
+ 대상   : chicago-srv Primary / boston-srv Standby
+ 목표   : OMF 세 파라미터의 현재 값을 확인하고, 5장에서 만든 구성을
+          기록해 둔다. 6장 실습이 끝난 뒤 대조할 기준이다
+ 소요   : 약 25분
+ 변경   : 없음 (한 번 설정을 시도하지만 거부된다)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] OMF 세 파라미터 — 양쪽 노드
+--------------------------------------------------------------------------------
+
+SYS@chicago> SET LINES 200
+SYS@chicago> COL name FOR a28
+SYS@chicago> COL value FOR a52
+SYS@chicago> SELECT name, value FROM v$parameter WHERE name IN
+  2            ('db_create_file_dest','db_create_online_log_dest_1',
+  3             'db_recovery_file_dest','db_recovery_file_dest_size')
+  4            ORDER BY name;
+
+NAME                         VALUE
+---------------------------- ----------------------------------------------------
+db_create_file_dest
+db_create_online_log_dest_1
+db_recovery_file_dest        /u03/app/oracle/fast_recovery_area
+db_recovery_file_dest_size   16106127360
+
+4 rows selected.
+
+-- Standby 에서도 같은 조회를 한다.
+
+SYS@boston> SELECT name, value FROM v$parameter WHERE name IN
+  2            ('db_create_file_dest','db_create_online_log_dest_1',
+  3             'db_recovery_file_dest','db_recovery_file_dest_size')
+  4            ORDER BY name;
+
+NAME                         VALUE
+---------------------------- ----------------------------------------------------
+db_create_file_dest
+db_create_online_log_dest_1
+db_recovery_file_dest        /u03/app/oracle/fast_recovery_area
+db_recovery_file_dest_size   16106127360
+
+4 rows selected.
+
+-- ★ 두 노드가 똑같다. 그리고 앞의 두 개가 **비어 있다.**
+--   즉 지금 구성은 OMF 가 아니다. 5장에서 경로를 직접 지정해 만들었기 때문이다.
+--
+-- ★ db_recovery_file_dest 만 값이 있다.
+--   4장에서 아카이브 목적지로 쓰려고 설정한 FRA 다.
+--   OMF 와는 별개로 설정할 수 있고, 실제로 그렇게 되어 있다.
+--
+--   16106127360 바이트 = 15GB 다.
+--   6장에서 이 값이 다시 등장한다. OMF 가 온라인 로그를 FRA 에도
+--   만들기 때문에 이 크기가 계산에 들어간다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 없는 경로를 설정하려 하면
+--------------------------------------------------------------------------------
+
+-- OMF 를 켜기 전에 이 파라미터가 어떤 성격인지 확인해 둔다.
+-- 존재하지 않는 경로를 주고 설정해 본다.
+
+SYS@chicago> ALTER SYSTEM SET db_create_file_dest='/u03/nosuchdir' SCOPE=MEMORY;
+
+alter system set db_create_file_dest='/u03/nosuchdir' scope=memory
+*
+ERROR at line 1:
+ORA-02097: parameter cannot be modified because specified value is invalid
+ORA-01261: Parameter db_create_file_dest destination string cannot be translated
+ORA-01262: Stat failed on a file destination directory
+Linux-x86_64 Error: 2: No such file or directory
+
+>>> 원인 파악
+    오류가 네 줄이다. 아래에서 위로 읽는다.
+
+      Linux-x86_64 Error: 2   운영체제가 돌려준 errno. ENOENT — 그런 경로가 없다
+      ORA-01262               목적지 디렉터리에 stat() 이 실패했다
+      ORA-01261               따라서 값을 경로로 해석할 수 없다
+      ORA-02097               그러므로 파라미터를 바꿀 수 없다
+
+    ★ 핵심은 `Linux-x86_64 Error: 2` 다.
+      운영체제 오류 번호가 그대로 노출된다.
+        2  (ENOENT)  경로가 없다      ← 지금
+        13 (EACCES)  권한이 없다
+      두 원인이 이 숫자 하나로 갈린다.
+
+    ★ 그리고 더 중요한 사실.
+      **오라클이 이 경로를 실제로 확인한다.**
+      단순히 문자열을 저장하는 것이 아니라 stat() 시스템 콜로
+      디렉터리의 존재를 검사한다.
+
+      5장의 db_file_name_convert 와 대조해 본다.
+      그쪽은 문자열 치환 규칙일 뿐이라 검사할 대상이 없었다.
+      그래서 잘못된 경로를 주어도 설정은 성공했고,
+      파일 전송 도중에야 ORA-19505 로 실패했다.
+
+>>> 조치
+    존재하는 경로를 준다. 6장 실습에서는 /u03/app/oracle/oradata 를 쓴다.
+    이 디렉터리는 이미 있다.
+
+[oracle@boston-srv ~]$ ls -ld /u03/app/oracle/oradata
+drwxrwxr-x. 3 oracle oinstall 20 Aug 27 10:07 /u03/app/oracle/oradata
+
+>>> 재확인
+    설정이 거부됐으므로 파라미터는 그대로 비어 있다.
+    아무것도 바뀌지 않았다.
+
+SYS@chicago> SHOW PARAMETER db_create_file_dest
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+db_create_file_dest                  string
+
+    빈 값 그대로다. 원복할 것이 없다.
+    ★ 실패한 설정은 아무것도 남기지 않는다는 점도 확인해 둔다.
+
+--------------------------------------------------------------------------------
+ [3] 기준 상태 기록 ① — 5장이 만든 파일 배치
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a64
+SYS@boston> SELECT file#, name FROM v$datafile ORDER BY file#;
+
+     FILE# NAME
+---------- ----------------------------------------------------------------
+         1 /u03/app/oracle/oradata/Boston/datafile/system01.dbf
+         3 /u03/app/oracle/oradata/Boston/datafile/sysaux01.dbf
+         4 /u03/app/oracle/oradata/Boston/datafile/undotbs01.dbf
+         5 /u03/app/oracle/oradata/Boston/datafile/pdbseed/system01.dbf
+         6 /u03/app/oracle/oradata/Boston/datafile/pdbseed/sysaux01.dbf
+         7 /u03/app/oracle/oradata/Boston/datafile/users01.dbf
+         8 /u03/app/oracle/oradata/Boston/datafile/pdbseed/undotbs01.dbf
+         9 /u03/app/oracle/oradata/Boston/datafile/chicago_pdb1/system01.dbf
+        10 /u03/app/oracle/oradata/Boston/datafile/chicago_pdb1/sysaux01.dbf
+        11 /u03/app/oracle/oradata/Boston/datafile/chicago_pdb1/undotbs01.dbf
+        12 /u03/app/oracle/oradata/Boston/datafile/chicago_pdb1/users01.dbf
+
+11 rows selected.
+
+SYS@boston> SELECT name FROM v$controlfile;
+
+NAME
+----------------------------------------------------------------
+/u03/app/oracle/oradata/Boston/controlfile/control_standby01.ctl
+
+1 row selected.
+
+-- ★ 기록해 둘 특징 네 가지
+--   ① 디렉터리 이름이 Boston — 첫 글자만 대문자. 사람이 정했다
+--   ② 파일 이름이 system01.dbf — 사람이 읽을 수 있다
+--   ③ PDB 디렉터리가 pdbseed, chicago_pdb1 — PDB 이름 그대로
+--   ④ 컨트롤 파일이 한 개, Boston/controlfile/ 아래
+--
+--   6장 실습 05 에서 이 네 가지가 어떻게 바뀌는지 대조한다.
+
+--------------------------------------------------------------------------------
+ [4] 기준 상태 기록 ② — 디스크 상황
+--------------------------------------------------------------------------------
+
+[oracle@boston-srv ~]$ df -h /u03
+
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb1        50G  4.7G   46G  10% /u03
+
+[oracle@boston-srv ~]$ ls -l /u03/app/oracle/oradata
+
+total 0
+drwxrwxr-x. 5 oracle oinstall 58 Aug 26 17:37 Boston
+drwxrwxr-x. 2 oracle oinstall 27 Aug 27 09:19 Chicago
+
+-- ★ Chicago 디렉터리가 왜 boston 서버에 있는가?
+--   5장 실습 중에 만들어진 잔재다. 지금은 비어 있다.
+--   6장 실습에서 이 이름이 다시 등장하는데, 그때는 비어 있지 않다.
+--   6.7절의 컨트롤 파일 문제가 바로 이 디렉터리에서 벌어진다.
+--
+-- ★ 사용량 4.7GB 를 기억해 둔다.
+--   OMF 로 다시 만든 뒤 이 값이 어떻게 되는지 실습 05 에서 본다.
+
+--------------------------------------------------------------------------------
+ [5] 기준 상태 기록 ③ — 로그 파일 개수
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT type, COUNT(*) FROM v$logfile GROUP BY type;
+
+TYPE      COUNT(*)
+------- ----------
+ONLINE           3
+STANDBY          4
+
+2 rows selected.
+
+-- 그룹 7개, 멤버도 7개다. 그룹당 멤버가 하나씩이다.
+--
+-- ★ 이 숫자를 꼭 기억해 둔다.
+--   OMF 로 만든 뒤에는 **14행**이 나온다. 실습 05 에서 그 이유를 밝힌다.
+
+--------------------------------------------------------------------------------
+ [6] 정리 — 이 실습에서 확인한 것
+--------------------------------------------------------------------------------
+
+  · 현재 구성은 OMF 가 아니다 (db_create_file_dest 비어 있음)
+  · FRA 만 15GB 로 설정되어 있다
+  · db_create_file_dest 는 설정 시점에 경로를 실제로 검사한다
+  · 없는 경로 → ORA-02097 + ORA-01261 + ORA-01262 + Linux Error 2
+  · 5장 구성: Boston/ 아래, 사람이 읽는 파일 이름, PDB 이름 디렉터리, 로그 7행
+
+SYS@chicago> EXIT
+SYS@boston> EXIT
+
+================================================================================
+ 실습 01 종료 — 환경 변경 없음. 다음 실습부터 Standby 를 헌다.
+================================================================================

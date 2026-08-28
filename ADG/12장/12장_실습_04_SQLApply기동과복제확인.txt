@@ -1,0 +1,357 @@
+================================================================================
+ 제12장 실습 04 — SQL Apply 기동과 복제 확인
+ 대상   : boston-srv, chicago-srv
+ 목표   : Logical Standby 를 열고 SQL Apply 를 시작한다. 여섯 종류 프로세스와
+          상태 메시지를 읽고, 일반 스키마와 SYSTEM 스키마의 차이를 확인한다
+ 소요   : 약 40분
+ 변경   : PDB 에 LGU 스키마 생성
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 연다
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT database_role, open_mode FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE
+---------------- ----------
+LOGICAL STANDBY  MOUNTED
+
+1 row selected.
+
+SYS@boston> ALTER DATABASE OPEN;
+
+Database altered.
+
+SYS@boston> SELECT database_role, open_mode FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE
+---------------- ----------
+LOGICAL STANDBY  READ WRITE
+
+1 row selected.
+
+-- ★ READ WRITE 다.
+--
+--   ALTER DATABASE OPEN READ ONLY 가 아니라 그냥 OPEN 이고
+--   결과도 읽기 전용이 아니다.
+--
+-- ★ 11장의 Snapshot Standby 와 같은 모습이지만 성격이 다르다.
+--
+--   Snapshot Standby   잠시 빌려 쓰는 상태. 되돌린다
+--   Logical Standby    평상시 상태가 이것이다
+--
+-- ★ 그럼 아무나 아무 데나 쓸 수 있는가.
+--   아니다. 데이터베이스 가드가 막는다. 실습 06 에서 다룬다.
+
+SYS@boston> SELECT name, open_mode FROM v$pdbs;
+
+NAME         OPEN_MODE
+------------ ----------
+PDB$SEED     READ ONLY
+CHICAGO_PDB1 MOUNTED
+
+2 rows selected.
+
+SYS@boston> ALTER PLUGGABLE DATABASE chicago_pdb1 OPEN;
+
+Pluggable database altered.
+
+SYS@boston> SELECT name, open_mode FROM v$pdbs;
+
+NAME         OPEN_MODE
+------------ ----------
+PDB$SEED     READ ONLY
+CHICAGO_PDB1 READ WRITE
+
+2 rows selected.
+
+-- ★ 또 따로 열어야 한다. 11장에서 세 번 겪은 그것이다.
+--   CDB 를 열어도 PDB 는 따라오지 않는다.
+
+--------------------------------------------------------------------------------
+ [2] SQL Apply 시작
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT count(*) lsp FROM v$logstdby_process;
+
+       LSP
+----------
+         0
+
+1 row selected.
+
+SYS@boston> ALTER DATABASE START LOGICAL STANDBY APPLY IMMEDIATE;
+
+Database altered.
+
+-- ★ IMMEDIATE 는 실시간 적용을 뜻한다.
+--   7장의 USING CURRENT LOGFILE 에 해당하며
+--   SRL 에 도착하는 리두를 아카이브를 기다리지 않고 바로 처리한다.
+
+--------------------------------------------------------------------------------
+ [3] 상태 메시지를 오류로 오해하지 않는다
+--------------------------------------------------------------------------------
+
+-- 시작 직후 조회하면
+
+SYS@boston> COL status FOR a46
+SYS@boston> SELECT sid, serial#, type, status_code, substr(status,1,40) status
+  2            FROM v$logstdby_process ORDER BY type;
+
+       SID    SERIAL# TYPE           STATUS_CODE STATUS
+---------- ---------- -------------- ----------- ----------------------------------------
+        12       1984 COORDINATOR          16111 ORA-16111: log mining and apply setting
+
+1 row selected.
+
+-- ★ ORA-16111 은 오류가 아니다.
+--   "로그 마이닝과 적용을 준비하는 중" 이라는 상태 메시지다.
+--
+-- ★ V$LOGSTDBY_PROCESS 의 STATUS 열은 오류 번호 형식으로 상태를 표현한다.
+--   이 계열의 번호를 알아 둔다.
+--
+--   ORA-16111  준비 중              (기동 직후)
+--   ORA-16116  할 일이 없다         (정상)
+--   ORA-16242  로그 파일 처리 중    (정상)
+--
+--   이 장에서 실측한 셋이다. 전부 정상 동작 중에 나타난다.
+--   ORA-16128(정상 종료)·ORA-16222(자동 재시도)도 뒤에서 만난다.
+
+SYS@boston> SELECT primary_dbid, session_id, realtime_apply, state
+  2            FROM v$logstdby_state;
+
+PRIMARY_DBID SESSION_ID REALTIME_APPLY STATE
+------------ ---------- -------------- -------------
+  1852041610          1 Y              INITIALIZING
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [4] 자리를 잡으면
+--------------------------------------------------------------------------------
+
+-- 30초 뒤
+
+SYS@boston> COL type FOR a14
+SYS@boston> SELECT type, count(*) cnt FROM v$logstdby_process
+  2            GROUP BY type ORDER BY 1;
+
+TYPE                  CNT
+-------------- ----------
+ANALYZER                1
+APPLIER                 5
+BUILDER                 1
+COORDINATOR             1
+PREPARER                1
+READER                  1
+
+6 rows selected.
+
+SYS@boston> SELECT sid, type, status_code, substr(status,1,44) status
+  2            FROM v$logstdby_process ORDER BY type, sid;
+
+       SID TYPE           STATUS_CODE STATUS
+---------- -------------- ----------- --------------------------------------------
+       279 ANALYZER             16116 ORA-16116: no work available
+        27 APPLIER              16116 ORA-16116: no work available
+       149 APPLIER              16116 ORA-16116: no work available
+       281 APPLIER              16116 ORA-16116: no work available
+       405 APPLIER              16116 ORA-16116: no work available
+       407 APPLIER              16116 ORA-16116: no work available
+        18 BUILDER              16116 ORA-16116: no work available
+        12 COORDINATOR          16116 ORA-16116: no work available
+       138 PREPARER             16116 ORA-16116: no work available
+       401 READER               16242 ORA-16242: Processing log file (thread# 1, s
+
+10 rows selected.
+
+-- ★ 여섯 종류 열 개가 파이프라인을 이룬다.
+--
+--   READER       리두를 읽어 들인다
+--   PREPARER     리두를 논리적 변경 레코드(LCR)로 바꾼다
+--   BUILDER      LCR 을 트랜잭션 단위로 묶는다
+--   ANALYZER     트랜잭션 사이의 의존 관계를 계산한다
+--   COORDINATOR  적용 순서를 정하고 배분한다
+--   APPLIER      실제로 SQL 을 실행한다
+--
+-- ★ MRP0 하나가 병렬 슬레이브를 거느리던 Redo Apply 와 구조가 다르다.
+--   각 단계가 전용 프로세스로 나뉘어 있다.
+--   이 구조가 SQL Apply 를 유연하게 만들고 동시에 무겁게 만든다.
+
+SYS@boston> SELECT primary_dbid, realtime_apply, state FROM v$logstdby_state;
+
+PRIMARY_DBID REALTIME_APPLY STATE
+------------ -------------- --------
+  1852041610 Y              IDLE
+
+1 row selected.
+
+-- ★ IDLE 은 "적용할 것이 없다" 는 뜻이지 "멈췄다" 가 아니다.
+--   멈춘 상태는 SQL APPLY NOT ON 으로 표시된다.
+--   둘을 구별하지 못하면 정상인 시스템을 장애로 신고하게 된다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — 없는 열을 찾으면
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT applied_scn, newest_scn, applied_time, newest_time,
+  2                restart_scn FROM dba_logstdby_progress;
+
+       restart_scn from dba_logstdby_progress
+       *
+ERROR at line 2:
+ORA-00904: "RESTART_SCN": invalid identifier
+
+>>> 원인 파악
+
+-- DBA_LOGSTDBY_PROGRESS 에 RESTART_SCN 열이 없다.
+--
+-- ★ 8장(V$LOG 의 TYPE)·10장(V$ARCHIVE_DEST_STATUS 의 TRANSMIT_MODE)에서
+--   만난 것과 같은 종류의 혼동이다.
+--   뷰마다 있는 열이 다르며, 이름이 비슷하면 더 헷갈린다.
+
+>>> 조치
+
+SYS@boston> SELECT applied_scn, newest_scn, applied_time, newest_time
+  2            FROM dba_logstdby_progress;
+
+>>> 재확인
+
+APPLIED_SCN NEWEST_SCN APPLIED_TIME  NEWEST_TIME
+----------- ---------- ------------- -------------
+    2265943    2265956 27-AUG-26     27-AUG-26
+
+1 row selected.
+
+-- ★ NEWEST_SCN 은 받은 리두의 끝, APPLIED_SCN 은 적용을 마친 지점이다.
+--   두 값의 차이가 밀린 양이다.
+
+SYS@boston> SELECT name, value FROM v$logstdby_stats WHERE rownum <= 14;
+
+NAME                             VALUE
+-------------------------------- ------------
+logminer session id              1
+number of preparers              1
+number of appliers               5
+server processes in use          9
+maximum SGA for LCR cache (MB)   100
+maximum events recorded          10000
+preserve commit order            TRUE
+transaction consistency          FULL
+record skipped errors            Y
+record skipped DDLs              Y
+record applied DDLs              N
+record unsupported operations    N
+realtime apply                   Y
+apply delay (minutes)            0
+
+14 rows selected.
+
+-- ★ preserve commit order = TRUE 와 transaction consistency = FULL 이
+--   SQL Apply 의 정확성을 보장하는 설정이다.
+--
+--   Primary 에서 커밋된 순서를 그대로 지킨다는 뜻이며
+--   그래서 여러 APPLIER 가 병렬로 적용하면서도 결과가 어긋나지 않는다.
+
+--------------------------------------------------------------------------------
+ [6] 복제가 되는가 — 일반 스키마
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SESSION SET container=chicago_pdb1;
+SYS@chicago> CREATE USER lgu IDENTIFIED BY lgu QUOTA UNLIMITED ON users;
+SYS@chicago> GRANT create session, create table TO lgu;
+SYS@chicago> CREATE TABLE lgu.t1(id NUMBER PRIMARY KEY, tag VARCHAR2(30));
+SYS@chicago> INSERT INTO lgu.t1 VALUES(1,'replicated');
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+-- 60초 뒤
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> COL tag FOR a22
+SYS@boston> SELECT id, tag FROM lgu.t1 ORDER BY id;
+
+        ID TAG
+---------- ----------------------
+         1 replicated
+
+1 row selected.
+
+-- ★ 사용자 생성, 권한 부여, 테이블 생성, 데이터 삽입이 모두 복제됐다.
+--   DDL 과 DML 이 함께 넘어온다.
+--
+-- ★ Physical Standby 라면 당연한 일이지만 여기서는 의미가 다르다.
+--   블록을 복사한 것이 아니라 같은 SQL 을 다시 실행한 결과다.
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 — SYSTEM 스키마는 다르다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SESSION SET container=chicago_pdb1;
+SYS@chicago> CREATE TABLE system.lg_skip(id NUMBER);
+SYS@chicago> INSERT INTO system.lg_skip VALUES(1);
+SYS@chicago> COMMIT;
+
+Commit complete.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+-- 45초 뒤
+
+SYS@boston> ALTER SESSION SET container=chicago_pdb1;
+SYS@boston> SELECT count(*) FROM system.lg_skip;
+
+select count(*) from system.lg_skip
+                            *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+>>> 원인 파악
+
+-- ★ 복제되지 않았다.
+--   실습 01 에서 본 INTERNAL SCHEMA 스킵 규칙이 작동한 것이다.
+--
+--   DBA_LOGSTDBY_SKIP 의 35개 기본 규칙 중 하나가
+--   OWNER='SYSTEM', STATEMENT_OPT='INTERNAL SCHEMA' 다.
+--
+-- ★ 이것이 Logical Standby 환경에서 가장 먼저 부딪히는 실무 문제다.
+--   지금까지의 실습에서 system.ss_base 같은 테이블을 편의상 자주 썼다.
+--   여기서는 그 습관이 통하지 않는다.
+
+>>> 조치
+
+-- 업무 객체를 SYSTEM 에 두지 않는다. 그것이 유일한 답이다.
+-- UNSKIP 으로 규칙을 뺄 수는 있지만 권장되지 않는다.
+-- 내부 스키마의 변경까지 복제하면 딕셔너리가 어긋날 위험이 있다.
+
+>>> 재확인
+
+SYS@boston> SELECT count(*) FROM lgu.t1;
+
+  COUNT(*)
+----------
+         1
+
+1 row selected.
+
+-- ★ 일반 스키마는 정상이다. 규칙대로 동작하고 있을 뿐이다.
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① ALTER DATABASE OPEN → READ WRITE (READ ONLY 가 아니다)
+--   ② PDB 는 따로 연다
+--   ③ ORA-16111·16116·16242 는 오류가 아니라 상태 메시지다
+--   ④ 여섯 종류 열 개 프로세스가 파이프라인을 이룬다
+--   ⑤ IDLE 은 "할 일 없음", SQL APPLY NOT ON 이 "멈춤"
+--   ⑥ DBA_LOGSTDBY_PROGRESS 에 RESTART_SCN 은 없다 (ORA-00904)
+--   ⑦ 일반 스키마는 복제되고 SYSTEM 은 복제되지 않는다 (ORA-00942)
+--
+-- ★ 다음 실습에서 골라서 복제하는 방법과 지원되지 않는 타입을 다룬다.

@@ -1,0 +1,299 @@
+================================================================================
+ 제1장 실습 04 — Standby 유형별 ROLE / OPEN_MODE 확인
+ 대상   : boston-srv Standby (chicago-srv 는 확인용)
+ 목표   : physical standby 를 snapshot standby 로 변환해 DATABASE_ROLE·OPEN_MODE·
+          CONTROLFILE_TYPE 이 어떻게 바뀌는지 관찰하고, 원래 상태로 되돌린다
+ 소요   : 약 30분
+ 주의   : Standby 를 여러 번 재기동한다. 다른 실습과 동시에 진행하지 않는다.
+ 되돌리기 : 실습 끝에 반드시 physical standby / READ ONLY WITH APPLY 로 복귀시킨다.
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 시작 상태 기록
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a10
+SYS@boston> SELECT name, database_role, open_mode, controlfile_type FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            CONTROL
+---------- ---------------- -------------------- -------
+CHICAGO    PHYSICAL STANDBY READ ONLY WITH APPLY STANDBY
+
+1 row selected.
+
+-- 이 세 값을 적어 둔다. 실습 끝에 같은 값으로 돌아와야 한다.
+--   DATABASE_ROLE    = PHYSICAL STANDBY
+--   OPEN_MODE        = READ ONLY WITH APPLY
+--   CONTROLFILE_TYPE = STANDBY
+
+--------------------------------------------------------------------------------
+ [2] snapshot standby 로 변환
+--------------------------------------------------------------------------------
+
+-- 변환 전에 리두 적용을 멈춰야 한다. MRP 가 돌고 있으면 변환이 거부된다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@boston> STARTUP MOUNT
+ORACLE instance started.
+
+Total System Global Area 3221223192 bytes
+Fixed Size                  9139992 bytes
+Variable Size             654311424 bytes
+Database Buffers         2550136832 bytes
+Redo Buffers                7634944 bytes
+Database mounted.
+
+SYS@boston> ALTER DATABASE CONVERT TO SNAPSHOT STANDBY;
+
+Database altered.
+
+-- 변환은 MOUNT 상태에서 수행한다.
+-- 이 명령 하나가 내부적으로 다음을 한다.
+--   (1) 보장 복원 지점(guaranteed restore point)을 자동 생성
+--   (2) standby 컨트롤 파일을 일반 컨트롤 파일로 전환
+--   (3) 역할을 SNAPSHOT STANDBY 로 변경
+
+SYS@boston> ALTER DATABASE OPEN;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+ [3] 변환 결과 관찰
+--------------------------------------------------------------------------------
+
+SYS@boston> COL name FOR a10
+SYS@boston> SELECT name, database_role, open_mode, controlfile_type FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            CONTROL
+---------- ---------------- -------------------- -------
+CHICAGO    SNAPSHOT STANDBY READ WRITE           CURRENT
+
+1 row selected.
+
+-- 세 값이 모두 바뀌었다.
+--   DATABASE_ROLE    : PHYSICAL STANDBY → SNAPSHOT STANDBY
+--   OPEN_MODE        : READ ONLY WITH APPLY → READ WRITE
+--   CONTROLFILE_TYPE : STANDBY → CURRENT
+--
+-- CONTROLFILE_TYPE 이 CURRENT 로 바뀐 것이 핵심이다.
+-- 갱신 가능한 상태가 되려면 일반 컨트롤 파일이 필요하기 때문이다.
+-- NAME 은 여전히 CHICAGO 다. DB_NAME 은 바뀌지 않는다.
+
+SYS@boston> COL name FOR a30
+SYS@boston> SELECT name, scn, time, guarantee_flashback_database FROM v$restore_point;
+
+NAME                              SCN TIME                                     GUA
+------------------------------ ------- ---------------------------------------- ---
+SNAPSHOT_STANDBY_REQUIRED_08/2 2173646 26-AUG-26 06.22.01.000000000 PM          YES
+6/2026 18:22:01
+
+1 row selected.
+
+-- 오라클이 자동으로 만든 복원 지점이다.
+--   이름 : SNAPSHOT_STANDBY_REQUIRED_<변환시각>
+--   SCN  : 2173646  ← 되돌아갈 지점
+--   GUARANTEE_FLASHBACK_DATABASE = YES
+--        보장 복원 지점이므로 필요한 플래시백 로그가 삭제되지 않는다.
+--
+-- 주의 : 이 복원 지점은 사용자가 지우면 안 된다.
+--        physical standby 로 복귀할 때 오라클이 쓰고 스스로 제거한다.
+--        FRA 공간이 부족하면 변환 자체가 실패하거나 이후 운영이 막힌다.
+
+--------------------------------------------------------------------------------
+ [4] snapshot standby 에 실제로 써 본다
+--------------------------------------------------------------------------------
+
+SYS@boston> CREATE TABLE system.t_snap_test(c1 NUMBER);
+
+Table created.
+
+SYS@boston> INSERT INTO system.t_snap_test VALUES(1);
+
+1 row created.
+
+SYS@boston> COMMIT;
+
+Commit complete.
+
+-- 실습 01 에서 ORA-16000 으로 거부되던 DDL 이 이번에는 성공한다.
+-- 역할이 SNAPSHOT STANDBY 이고 OPEN_MODE 가 READ WRITE 이기 때문이다.
+--
+-- 이 동안에도 Primary 의 리두는 계속 도착한다. 다만 적용되지 않고 쌓인다.
+-- 복귀하면 쌓인 리두가 한꺼번에 적용되어 Primary 를 따라잡는다.
+
+--------------------------------------------------------------------------------
+ [5] physical standby 로 복귀
+--------------------------------------------------------------------------------
+
+SYS@boston> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@boston> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@boston> ALTER DATABASE CONVERT TO PHYSICAL STANDBY;
+
+Database altered.
+
+-- 변환이 끝나면 인스턴스를 한 번 더 재기동해야 한다.
+-- 이때 화면에 오류처럼 보이는 메시지가 나온다.
+
+SYS@boston> SHUTDOWN IMMEDIATE
+ORA-01109: database not open
+
+
+Database dismounted.
+ORACLE instance shut down.
+
+
+>>> 원인 파악
+    ORA-01109 는 "데이터베이스가 열려 있지 않다" 는 뜻이다.
+    CONVERT TO PHYSICAL STANDBY 는 MOUNT 상태에서 수행하므로, 그 직후의
+    SHUTDOWN IMMEDIATE 는 닫을 데이터베이스가 없는 상태에서 실행된다.
+    SQL*Plus 는 이 사실을 ORA- 번호로 알려 주고 곧바로 dismount 로 넘어간다.
+    이어지는 'Database dismounted / ORACLE instance shut down' 이 그 증거다.
+
+    즉 이것은 실패가 아니라 안내 메시지다. 변환 절차가 중단된 것이 아니므로
+    그대로 진행하면 된다. 오류로 오인해 절차를 되돌리는 것이 오히려 사고를 만든다.
+
+>>> 조치 — 그대로 재기동하고 CDB → PDB 순서로 연다.
+
+SYS@boston> STARTUP MOUNT
+ORACLE instance started.
+Database mounted.
+
+SYS@boston> ALTER DATABASE OPEN READ ONLY;
+
+Database altered.
+
+SYS@boston> ALTER PLUGGABLE DATABASE chicago_pdb1 OPEN READ ONLY;
+
+Pluggable database altered.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+>>> 재확인
+
+SYS@boston> COL name FOR a10
+SYS@boston> SELECT name, database_role, open_mode, controlfile_type FROM v$database;
+
+NAME       DATABASE_ROLE    OPEN_MODE            CONTROL
+---------- ---------------- -------------------- -------
+CHICAGO    PHYSICAL STANDBY READ ONLY WITH APPLY STANDBY
+
+1 row selected.
+
+-- [1] 에서 적어 둔 세 값과 완전히 일치한다. 복귀 성공이다.
+
+--------------------------------------------------------------------------------
+ [6] 쓴 데이터는 어떻게 됐는가
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT COUNT(*) FROM system.t_snap_test;
+SELECT COUNT(*) FROM system.t_snap_test
+                     *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- 만들었던 테이블이 사라졌다. 오류가 아니라 설계된 동작이다.
+-- snapshot standby 에서의 모든 변경은 복귀 시 복원 지점으로 되돌려지며 폐기된다.
+--
+-- 실무 함의 : 테스트 결과를 남기려면 복귀 전에 별도로 추출해야 한다.
+--            (Data Pump 로 export 하거나 다른 DB 로 DB link 를 통해 옮긴다)
+
+SYS@boston> SELECT COUNT(*) FROM v$restore_point;
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+-- 자동 생성된 복원 지점도 함께 제거됐다.
+
+--------------------------------------------------------------------------------
+ [7] logical standby 는 어떻게 확인하는가
+--------------------------------------------------------------------------------
+
+-- 이 환경에는 logical standby 가 없다. 관련 뷰는 비어 있다.
+
+SYS@boston> SELECT COUNT(*) AS logstdby_events FROM dba_logstdby_events;
+
+LOGSTDBY_EVENTS
+---------------
+              0
+
+1 row selected.
+
+SYS@boston> SELECT COUNT(*) AS unsupported FROM dba_logstdby_unsupported;
+
+UNSUPPORTED
+-----------
+          0
+
+1 row selected.
+
+-- DBA_LOGSTDBY_UNSUPPORTED 는 SQL Apply 가 지원하지 않는 데이터 타입을 알려 주는
+-- 뷰다. logical standby 를 만들기 전에 반드시 확인해야 하는 목록이며,
+-- physical standby 인 지금은 비어 있다. 12장에서 다시 본다.
+
+--------------------------------------------------------------------------------
+ [8] 세 유형 정리
+--------------------------------------------------------------------------------
+
+  유형                       DATABASE_ROLE     OPEN_MODE             CONTROLFILE_TYPE
+  -------------------------- ----------------- --------------------- ----------------
+  Primary                    PRIMARY           READ WRITE            CURRENT
+  Physical Standby (미개방)  PHYSICAL STANDBY  MOUNTED               STANDBY
+  Physical Standby (ADG)     PHYSICAL STANDBY  READ ONLY WITH APPLY  STANDBY
+  Snapshot Standby           SNAPSHOT STANDBY  READ WRITE            CURRENT
+  Logical Standby            LOGICAL STANDBY   READ WRITE            CURRENT
+
+-- 마지막으로 Primary 쪽에서 동기화가 정상인지 확인하고 끝낸다.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby WHERE process='MRP0';
+
+PROCESS   STATUS       SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         20
+
+1 row selected.
+
+SYS@boston> COL name FOR a16
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+2 rows selected.
+
+-- 지연 0. snapshot standby 기간에 쌓였던 리두까지 모두 따라잡았다.
+
+SYS@boston> EXIT
+SYS@chicago> EXIT
+
+================================================================================
+ 실습 04 종료
+ 되돌리기 완료 : PHYSICAL STANDBY / READ ONLY WITH APPLY / STANDBY 컨트롤 파일
+                 복원 지점 0개, 테스트 테이블 없음
+================================================================================

@@ -1,0 +1,308 @@
+================================================================================
+ 제2장 실습 02 — LOG_ARCHIVE_DEST_2 속성 해부
+ 대상   : chicago-srv Primary
+ 목표   : SERVICE·SYNC/ASYNC·AFFIRM·VALID_FOR·DB_UNIQUE_NAME 을 하나씩 바꿔 가며
+          V$ARCHIVE_DEST 의 어느 열이 어떻게 변하는지 대응시킨다
+ 소요   : 약 30분
+ 되돌리기 : 실습 끝에 반드시 ASYNC NOAFFIRM / valid_for=(online_logfiles,primary_role) 로 원복
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 출발점 — 파라미터 문자열과 뷰를 나란히 본다
+--------------------------------------------------------------------------------
+
+SYS@chicago> SET LINES 200
+SYS@chicago> COL value FOR a90
+SYS@chicago> SELECT value FROM v$parameter WHERE name='log_archive_dest_2';
+
+VALUE
+------------------------------------------------------------------------------------------
+service=boston async valid_for=(online_logfiles,primary_role) db_unique_name=boston
+
+1 row selected.
+
+SYS@chicago> COL dest_name FOR a20
+SYS@chicago> COL destination FOR a12
+SYS@chicago> SELECT dest_id, dest_name, destination, transmit_mode, affirm,
+  2                 valid_now, valid_type, valid_role
+  3            FROM v$archive_dest WHERE dest_id <= 2;
+
+   DEST_ID DEST_NAME            DESTINATION  TRANSMIT_MOD AFF VALID_NOW        VALID_TYPE      VALID_ROLE
+---------- -------------------- ------------ ------------ --- ---------------- --------------- ------------
+         1 LOG_ARCHIVE_DEST_1   USE_DB_RECOV SYNCHRONOUS  NO  YES              ALL_LOGFILES    ALL_ROLES
+                                ERY_FILE_DES
+                                T
+
+         2 LOG_ARCHIVE_DEST_2   boston       ASYNCHRONOUS NO  YES              ONLINE_LOGFILE  PRIMARY_ROLE
+
+2 rows selected.
+
+-- 파라미터 문자열의 각 속성이 뷰의 어느 열로 나타나는지 대응시킨다.
+--
+--   service=boston                    →  DESTINATION = boston
+--   async                             →  TRANSMIT_MODE = ASYNCHRONOUS, AFFIRM = NO
+--   valid_for=(online_logfiles, ...)  →  VALID_TYPE = ONLINE_LOGFILE
+--   valid_for=(..., primary_role)     →  VALID_ROLE = PRIMARY_ROLE
+--   (역할과 로그 유형이 지금 맞는가)  →  VALID_NOW = YES
+--
+-- dest_1 의 TRANSMIT_MODE 가 SYNCHRONOUS 인 것에 놀라지 말자.
+-- 로컬 디스크 기록이므로 애초에 동기다. 원격 전송 방식과 무관한 값이다.
+
+--------------------------------------------------------------------------------
+ [2] SYNC AFFIRM 으로 바꾼다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston SYNC AFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> SELECT dest_id, destination, transmit_mode, affirm
+  2            FROM v$archive_dest WHERE dest_id = 2;
+
+   DEST_ID DESTINATION  TRANSMIT_MOD AFF
+---------- ------------ ------------ ---
+         2 boston       PARALLELSYNC YES
+
+1 row selected.
+
+-- TRANSMIT_MODE : ASYNCHRONOUS  →  PARALLELSYNC
+-- AFFIRM        : NO            →  YES
+--
+-- PARALLELSYNC 는 여러 동기 목적지가 있을 때 병렬 전송한다는 뜻이며,
+-- 동기 전송이 켜졌음을 나타낸다.
+-- AFFIRM=YES 는 "Standby 가 SRL 에 디스크 기록을 마친 뒤 확인을 보내라" 는 지시다.
+
+--------------------------------------------------------------------------------
+ [3] 프로세스가 바뀐다 — NSSn 의 등장
+--------------------------------------------------------------------------------
+
+SYS@chicago> COL name FOR a8
+SYS@chicago> COL role FOR a26
+SYS@chicago> COL action FOR a10
+SYS@chicago> SELECT name, role, action, sequence#
+  2            FROM v$dataguard_process
+  3           WHERE name LIKE 'NSS%' OR role LIKE '%sync%' ORDER BY name;
+
+NAME     ROLE                       ACTION      SEQUENCE#
+-------- -------------------------- ---------- ----------
+NSS2     sync                       IDLE                0
+TT02     async ORL multi            CLOSING            22
+TT04     async ORL single           CLOSING            22
+
+3 rows selected.
+
+-- NSS2 (Network Server SYNC) 가 role='sync' 로 새로 떴다.
+-- 1장에서 리두 본류를 나르던 TT04 'async ORL single' 은 CLOSING 으로 물러난다.
+--
+-- 이제 커밋 경로가 바뀌었다.
+--   LGWR → NSS2 → (네트워크) → boston 의 RFS → SRL 기록 → 확인 → LGWR 커밋 완료
+--
+-- 즉 커밋 응답시간에 네트워크 왕복이 그대로 더해진다.
+
+--------------------------------------------------------------------------------
+ [4] ASYNC 로 되돌려 대조한다
+--------------------------------------------------------------------------------
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston ASYNC NOAFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+SYS@chicago> SELECT dest_id, destination, transmit_mode, affirm
+  2            FROM v$archive_dest WHERE dest_id = 2;
+
+   DEST_ID DESTINATION  TRANSMIT_MOD AFF
+---------- ------------ ------------ ---
+         2 boston       ASYNCHRONOUS NO
+
+1 row selected.
+
+-- 원래대로 돌아왔다.
+--
+-- 주의 : 속성을 생략하면 기본값으로 되돌아간다.
+--        SYNC 만 쓰고 AFFIRM 을 빼면 NOAFFIRM 이 된다.
+--        따라서 문자열을 항상 완전하게 적는 습관이 필요하다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 ① — 속성 이름을 잘못 쓴다
+--------------------------------------------------------------------------------
+
+-- ASYNC 를 ASYNCH 로 잘못 쓴 경우
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston ASYNCH NOAFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH;
+ALTER SYSTEM SET log_archive_dest_2 = 'service=boston ASYNCH NOAFFIRM
+valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH
+*
+ERROR at line 1:
+ORA-02097: parameter cannot be modified because specified value is invalid
+ORA-16024: parameter LOG_ARCHIVE_DEST_2 cannot be parsed
+
+-- db_unique_name 을 구성에 없는 이름으로 준 경우
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston ASYNC NOAFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=wrongname' SCOPE=BOTH;
+ALTER SYSTEM SET log_archive_dest_2 = 'service=boston ASYNC NOAFFIRM
+valid_for=(online_logfiles,primary_role) db_unique_name=wrongname' SCOPE=BOTH
+*
+ERROR at line 1:
+ORA-02097: parameter cannot be modified because specified value is invalid
+ORA-16053: DB_UNIQUE_NAME wrongname is not in the Data Guard Configuration
+
+
+>>> 원인 파악
+    두 경우 모두 ORA-02097 이 겉껍데기이고, 두 번째 줄이 실제 원인이다.
+      ORA-16024 : 문자열을 파싱할 수 없다 → 속성 이름이나 문법이 틀렸다
+      ORA-16053 : 지정한 DB_UNIQUE_NAME 이 Data Guard 구성에 없다
+                  → LOG_ARCHIVE_CONFIG 의 DG_CONFIG 목록과 대조한다
+
+    ORA-16053 이 알려 주는 것이 중요하다. DB_UNIQUE_NAME 속성은 단순한 표기가 아니라
+    실제로 검증되는 값이며, LOG_ARCHIVE_CONFIG 에 등록된 이름만 쓸 수 있다.
+    리두가 엉뚱한 데이터베이스로 가는 사고를 막는 장치다.
+
+SYS@chicago> COL value FOR a70
+SYS@chicago> SELECT value FROM v$parameter WHERE name='log_archive_config';
+
+VALUE
+----------------------------------------------------------------------
+dg_config=(chicago,boston)
+
+1 row selected.
+
+>>> 조치
+    두 오류 모두 ALTER SYSTEM 자체가 실패했으므로 기존 설정이 그대로 유지된다.
+    잘못된 값이 반영되지 않았다는 점이 오히려 다행이다.
+    올바른 문자열로 다시 실행하면 된다.
+
+>>> 재확인
+
+SYS@chicago> SELECT dest_id, destination, transmit_mode, affirm, valid_now
+  2            FROM v$archive_dest WHERE dest_id = 2;
+
+   DEST_ID DESTINATION  TRANSMIT_MOD AFF VALID_NOW
+---------- ------------ ------------ --- ----------------
+         2 boston       ASYNCHRONOUS NO  YES
+
+1 row selected.
+
+-- 이 두 오류는 "실패해 주는" 오류다. 다음 절의 VALID_FOR 오설정과 대비된다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 ② — VALID_FOR 를 잘못 준다 (실패하지 않는 오류)
+--------------------------------------------------------------------------------
+
+-- 이 데이터베이스는 Primary 인데, 목적지를 standby_role 로 지정해 본다.
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston ASYNC NOAFFIRM
+  3     valid_for=(online_logfiles,standby_role) db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+-- "System altered" 다. 오류가 나지 않았다.
+
+SYS@chicago> SELECT dest_id, destination, valid_now, valid_type, valid_role
+  2            FROM v$archive_dest WHERE dest_id = 2;
+
+   DEST_ID DESTINATION  VALID_NOW        VALID_TYPE      VALID_ROLE
+---------- ------------ ---------------- --------------- ------------
+         2 boston       WRONG VALID_ROLE ONLINE_LOGFILE  STANDBY_ROLE
+
+1 row selected.
+
+SYS@chicago> COL error FOR a40
+SYS@chicago> SELECT dest_id, status, error
+  2            FROM v$archive_dest_status WHERE dest_id = 2;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ----------------------------------------
+         2 VALID
+
+1 row selected.
+
+
+>>> 원인 파악
+    이것이 VALID_FOR 오설정의 가장 위험한 점이다.
+      - ALTER SYSTEM 은 성공한다 ("System altered")
+      - V$ARCHIVE_DEST_STATUS 의 STATUS 는 VALID 이고 ERROR 도 비어 있다
+      - 그런데 리두는 가지 않는다
+
+    유일한 단서는 V$ARCHIVE_DEST 의 VALID_NOW 열이다.
+    'WRONG VALID_ROLE' 은 "이 목적지는 이 데이터베이스가 STANDBY 일 때만 쓴다.
+    지금은 PRIMARY 이므로 쓰지 않는다" 는 뜻이다.
+
+    STATUS=VALID 와 VALID_NOW=YES 는 다른 이야기다.
+      STATUS    : 이 목적지에 문제가 없는가
+      VALID_NOW : 지금 이 목적지를 실제로 쓰는가
+
+>>> 조치 — VALID_FOR 를 primary_role 로 바로잡는다
+
+SYS@chicago> ALTER SYSTEM SET log_archive_dest_2 =
+  2    'service=boston ASYNC NOAFFIRM
+  3     valid_for=(online_logfiles,primary_role) db_unique_name=boston' SCOPE=BOTH;
+
+System altered.
+
+>>> 재확인
+
+SYS@chicago> SELECT dest_id, destination, valid_now, valid_type, valid_role
+  2            FROM v$archive_dest WHERE dest_id = 2;
+
+   DEST_ID DESTINATION  VALID_NOW        VALID_TYPE      VALID_ROLE
+---------- ------------ ---------------- --------------- ------------
+         2 boston       YES              ONLINE_LOGFILE  PRIMARY_ROLE
+
+1 row selected.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+
+System altered.
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2             WHERE process IN ('MRP0','RFS') ORDER BY process;
+
+PROCESS   STATUS       SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         24
+RFS       IDLE                 24
+RFS       IDLE                  0
+RFS       IDLE                  0
+
+4 rows selected.
+
+-- 전송과 적용이 재개됐다.
+
+--------------------------------------------------------------------------------
+ [7] 속성-열 대응표 정리
+--------------------------------------------------------------------------------
+
+  파라미터 속성                       V$ARCHIVE_DEST 열      값 예시
+  ----------------------------------- ---------------------- -----------------------
+  SERVICE=boston                      DESTINATION            boston
+  ASYNC                               TRANSMIT_MODE          ASYNCHRONOUS
+  SYNC                                TRANSMIT_MODE          PARALLELSYNC
+  AFFIRM                              AFFIRM                 YES
+  NOAFFIRM                            AFFIRM                 NO
+  VALID_FOR=(online_logfiles, ...)    VALID_TYPE             ONLINE_LOGFILE
+  VALID_FOR=(..., primary_role)       VALID_ROLE             PRIMARY_ROLE
+  (현재 역할과 맞는가)                VALID_NOW              YES / WRONG VALID_ROLE
+  DB_UNIQUE_NAME=boston               (표시되지 않음, 검증용)
+
+  진단 순서
+    ① VALID_NOW 가 YES 인가            → 아니면 설정 문제. 오류를 찾을 필요 없음
+    ② V$ARCHIVE_DEST_STATUS 의 ERROR   → ORA- 번호가 있으면 그것이 원인
+    ③ V$DATAGUARD_PROCESS 의 ACTION    → 전송 프로세스가 움직이는가
+
+SYS@chicago> EXIT
+
+================================================================================
+ 실습 02 종료
+ 원복 확인 : log_archive_dest_2 = 'service=boston ASYNC NOAFFIRM
+             valid_for=(online_logfiles,primary_role) db_unique_name=boston'
+             VALID_NOW = YES, 전송·적용 정상
+================================================================================
