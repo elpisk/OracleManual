@@ -1,0 +1,372 @@
+================================================================================
+ 제9장 실습 08 — 옵션 없는 대안 경로
+ 대상   : boston-srv, chicago-srv
+ 목표   : ADG 옵션을 쓰지 않고 Standby 를 MOUNTED 로 두었을 때
+          적용이 계속되는지, 동기화를 어떻게 확인하는지 실측한다
+ 소요   : 약 40분
+ 변경   : boston 을 잠시 MOUNTED 로 내린다. 실습 끝에서 원복한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 출발 상태를 기록한다
+--------------------------------------------------------------------------------
+
+-- ★ 나중에 되돌린 것을 확인하려면 지금 값을 적어 두어야 한다.
+
+SYS@boston> SELECT database_role, open_mode FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE
+---------------- --------------------
+PHYSICAL STANDBY READ ONLY WITH APPLY
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS         SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         10
+
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+-- Primary 쪽도 함께 본다.
+
+SYS@chicago> COL dest FOR a10
+SYS@chicago> SELECT dest_id, destination dest, database_mode, recovery_mode,
+  2                 archived_seq#, applied_seq#
+  3            FROM v$archive_dest_status WHERE dest_id IN (1,2);
+
+   DEST_ID DEST       DATABASE_MODE    RECOVERY_MODE                       ARCHIVED_SEQ# APPLIED_SEQ#
+---------- ---------- ---------------- ----------------------------------- ------------- ------------
+         1            OPEN             IDLE                                            9            0
+         2 boston     OPEN_READ-ONLY   MANAGED REAL TIME APPLY WITH QUERY              9            8
+
+-- ★ 두 값을 눈여겨본다. 이 실습의 핵심이다.
+--
+--   DATABASE_MODE  = OPEN_READ-ONLY
+--   RECOVERY_MODE  = MANAGED REAL TIME APPLY WITH QUERY
+--
+--   RECOVERY_MODE 끝에 "WITH QUERY" 가 붙어 있다.
+--   9.2.1 에서 정리한 표식 둘은 Standby 에서 보는 것이었는데
+--   이것은 Primary 에서 보이는 세 번째 표식이다.
+
+DGMGRL> show database 'boston'
+
+  Transport Lag:      0 seconds (computed 0 seconds ago)
+  Apply Lag:          0 seconds (computed 0 seconds ago)
+  Real Time Query:    ON
+
+Database Status:
+SUCCESS
+
+--------------------------------------------------------------------------------
+ [2] Primary 에서는 두 지연을 볼 수 없다
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT count(*) dgs_rows FROM v$dataguard_stats;
+
+  DGS_ROWS
+----------
+         0
+
+>>> 원인 파악
+
+-- ★ 0행이다. 오류가 아니라 행이 없는 것이다.
+--
+--   V$DATAGUARD_STATS 는 "리두를 받는 쪽이 얼마나 뒤처졌는가"를 계산한다.
+--   Primary 는 받는 쪽이 아니므로 계산할 것이 없다.
+--
+-- ★ 이것이 이 실습의 출발점이다.
+--   "Primary 에서 V$DATAGUARD_STATS 로 동기화를 확인한다"는 방법은
+--   실제로는 성립하지 않는다. 다른 길을 찾아야 한다.
+--
+-- ★ 감시 스크립트를 양쪽에 똑같이 돌리면 Primary 쪽에서
+--   "지연을 못 읽었다"가 나온다. 이것을 장애로 오인하면 안 된다.
+--   15장에서 역할별로 다른 것을 본다는 원칙으로 정리한다.
+
+--------------------------------------------------------------------------------
+ [3] MOUNTED 로 내린다
+--------------------------------------------------------------------------------
+
+-- ★ ADG 옵션은 "Standby 를 열어 둔 채 적용하는 것"에 대한 과금이다.
+--   9.2.2 에서 확인한 대로 MOUNTED 로만 두면 옵션의 영역이 아니다.
+--   그렇다면 닫은 채로 운영할 수 있는지 확인한다.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+
+Database altered.
+
+SYS@boston> SHUTDOWN IMMEDIATE
+SYS@boston> STARTUP MOUNT
+
+ORACLE instance started.
+Database mounted.
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+>>> 재확인
+
+SYS@boston> SELECT database_role, open_mode FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE
+---------------- ----------
+PHYSICAL STANDBY MOUNTED
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS         SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         11
+
+-- ★ 적용은 그대로 돈다.
+--   USING CURRENT LOGFILE 도 그대로 받아들여졌으므로 실시간 적용이다.
+--   재해 복구 능력은 조금도 줄지 않는다. 줄어드는 것은 조회뿐이다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 닫힌 데이터베이스를 조회하면
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT count(*) FROM system.bk_t;
+
+select count(*) from system.bk_t
+                            *
+ERROR at line 1:
+ORA-01219: database or pluggable database not open:
+           queries allowed on fixed tables or views only
+
+>>> 원인 파악
+
+-- ★ 9.4.1 의 ORA-16000 과 다른 번호다. 둘을 구분해야 한다.
+--
+--   ORA-16000  database or pluggable database open for read-only access
+--              → 열려 있는데 쓰려고 했다
+--   ORA-01219  database or pluggable database not open
+--              → 아예 열려 있지 않다
+--
+--   오류 번호가 데이터베이스의 상태를 알려 준다.
+--
+-- ★ 그런데 메시지의 뒷부분이 더 중요하다.
+--   "queries allowed on fixed tables or views only"
+--   고정 뷰는 조회된다는 뜻이다.
+
+>>> 조치
+
+-- 사용자 표 대신 고정 뷰를 본다.
+
+SYS@boston> SELECT name, value FROM v$dataguard_stats WHERE name LIKE '%lag';
+
+NAME             VALUE
+---------------- --------------------
+transport lag    +00 00:00:00
+apply lag        +00 00:00:00
+
+>>> 재확인
+
+-- ★ 닫혀 있는데도 두 지연이 그대로 나온다.
+--
+--   V$ 뷰는 메모리 구조를 읽는 것이므로 데이터베이스가 열려 있을 필요가 없다.
+--   9.4.4 에서 "V$ 뷰 조회는 된다"고 했던 그 성질이
+--   MOUNTED 에서도 유지된다.
+--
+-- ★ 결론 하나가 나온다.
+--   ADG 옵션이 없어도 Standby 에 SYSDBA 로 붙을 수만 있으면
+--   지연을 그대로 잴 수 있다.
+
+-- PDB 서비스는 어떻게 되는가.
+
+[oracle@boston-srv ~]$ sqlplus -s sys/****@//boston-srv:1521/chicago_pdb1 as sysdba
+
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in connect
+descriptor
+
+-- ★ ORA-12514 다. 15장에서 리스너를 내렸을 때의 ORA-12541 과 구별한다.
+--
+--   ORA-12541  TNS:no listener            → 리스너가 없다
+--   ORA-12514  service ... not known       → 리스너는 있는데 그 서비스가 없다
+--
+--   PDB 가 열려 있지 않으므로 리스너에 등록될 서비스가 없다.
+--   리스너 자체는 살아 있다.
+
+--------------------------------------------------------------------------------
+ [5] Primary 에서만 보고 판단한다
+--------------------------------------------------------------------------------
+
+-- ★ Standby 에 접속할 수 없는 상황을 가정한다.
+--   네트워크가 분리되어 있거나 감시 도구가 Primary 에만 붙는 경우다.
+
+SYS@chicago> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@chicago> SELECT dest_id, destination dest, database_mode, recovery_mode,
+  2                 archived_seq#, applied_seq#
+  3            FROM v$archive_dest_status WHERE dest_id IN (1,2);
+
+   DEST_ID DEST       DATABASE_MODE    RECOVERY_MODE                 ARCHIVED_SEQ# APPLIED_SEQ#
+---------- ---------- ---------------- ----------------------------- ------------- ------------
+         1            OPEN             IDLE                                     11            0
+         2 boston     MOUNTED-STANDBY  MANAGED REAL TIME APPLY                  11           10
+
+>>> 재확인
+
+-- ★ [1] 과 비교한다. 두 열이 함께 바뀌었다.
+--
+--   DATABASE_MODE   OPEN_READ-ONLY  →  MOUNTED-STANDBY
+--   RECOVERY_MODE   ... WITH QUERY  →  ... (WITH QUERY 가 사라짐)
+--
+--   이 두 값이 "저쪽이 열려 있는가"를 Primary 에서 답해 준다.
+--   라이선스 관점에서도 쓸 수 있다.
+--   WITH QUERY 가 붙어 있으면 그 Standby 는 옵션을 쓰고 있다.
+--
+-- ★ 진행은 두 시퀀스로 본다.
+--
+--   ARCHIVED_SEQ# 11   여기까지 보냈다
+--   APPLIED_SEQ#  10   여기까지 적용됐다
+--
+--   차이가 밀린 양이다. 닫은 뒤에도 APPLIED_SEQ# 는 계속 올라간다(8 → 10).
+--   적용이 도는 것을 Primary 에서 확인한 셈이다.
+
+DGMGRL> show database 'boston'
+
+  Transport Lag:      0 seconds (computed 0 seconds ago)
+  Apply Lag:          0 seconds (computed 0 seconds ago)
+  Real Time Query:    OFF
+
+Database Status:
+SUCCESS
+
+DGMGRL> show configuration
+Configuration Status:  SUCCESS
+
+-- ★ Real Time Query 가 ON 에서 OFF 로 바뀌었다.
+--   그런데 구성 상태는 여전히 SUCCESS 다.
+--   닫는 것은 장애가 아니라 정상적인 선택이다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — V$ARCHIVED_LOG 로 세면
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT max(sequence#) max_applied FROM v$archived_log
+  2            WHERE dest_id=2 AND applied='YES';
+
+MAX_APPLIED
+-----------
+         94
+
+SYS@chicago> SELECT max(sequence#) cur_seq FROM v$log WHERE status='CURRENT';
+
+   CUR_SEQ
+----------
+        12
+
+>>> 원인 파악
+
+-- ★ 적용된 최대 시퀀스가 94 인데 현재 시퀀스는 12 다.
+--   적용이 앞서 갈 수는 없다. 숫자가 이상하다.
+--
+-- ★ 원인은 인큐네이션이다.
+--   16장의 Failover 로 OPEN RESETLOGS 가 있었고 시퀀스가 1부터 다시 시작됐다.
+--   그런데 컨트롤 파일에는 이전 인큐네이션의 아카이브 기록이 그대로 남아 있다.
+--   max() 는 그 옛 번호를 집는다.
+
+SYS@chicago> SELECT resetlogs_change# FROM v$database;
+
+-- ★ 걸러야 한다.
+--
+--   SELECT max(sequence#) FROM v$archived_log
+--    WHERE dest_id=2 AND applied='YES'
+--      AND resetlogs_change# = (SELECT resetlogs_change# FROM v$database);
+
+>>> 조치
+
+-- ★ 더 간단한 길이 있다.
+--   V$ARCHIVE_DEST_STATUS 의 APPLIED_SEQ# 는 현재 인큐네이션의 값이다.
+--   [5] 에서 본 10 이 그것이다.
+--   시퀀스로 진행을 볼 때는 이쪽을 쓴다.
+
+>>> 재확인
+
+-- ★ 이 함정은 이 장에만 있는 것이 아니다.
+--   RESETLOGS 를 거친 환경에서 V$ARCHIVED_LOG 를 집계할 때는
+--   항상 인큐네이션을 확인한다. 16장의 인큐네이션 이야기가 여기서 쓰인다.
+
+--------------------------------------------------------------------------------
+ [7] 원복
+--------------------------------------------------------------------------------
+
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+SYS@boston> ALTER DATABASE OPEN READ ONLY;
+SYS@boston> ALTER PLUGGABLE DATABASE chicago_pdb1 OPEN READ ONLY;
+SYS@boston> ALTER DATABASE RECOVER MANAGED STANDBY DATABASE
+  2            USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+
+Database altered.
+
+-- ★ PDB 를 따로 여는 것을 잊지 않는다.
+--   CDB 를 열어도 PDB 는 따라오지 않는다.
+
+>>> 재확인
+
+SYS@boston> SELECT database_role, open_mode FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE
+---------------- --------------------
+PHYSICAL STANDBY READ ONLY WITH APPLY
+
+SYS@boston> SELECT process, status, sequence# FROM v$managed_standby
+  2            WHERE process='MRP0';
+
+PROCESS   STATUS         SEQUENCE#
+--------- ------------ ----------
+MRP0      APPLYING_LOG         12
+
+SYS@boston> SELECT count(*) FROM system.bk_t;
+
+  COUNT(*)
+----------
+        10
+
+SYS@chicago> SELECT dest_id, database_mode, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=2;
+
+   DEST_ID DATABASE_MODE    RECOVERY_MODE
+---------- ---------------- -----------------------------------
+         2 OPEN_READ-ONLY   MANAGED REAL TIME APPLY WITH QUERY
+
+-- ★ WITH QUERY 가 돌아왔다. [1] 의 상태와 같다.
+--   사용자 표 조회도 다시 된다. ORA-01219 는 사라졌다.
+
+DGMGRL> show configuration
+Configuration Status:  SUCCESS
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① Primary 의 V$DATAGUARD_STATS 는 0행이다.
+--      "Primary 에서 두 지연을 본다"는 방법은 성립하지 않는다
+--   ② MOUNTED 로 내려도 MRP0 은 그대로 돌고 실시간 적용도 유지된다
+--   ③ 사용자 표 조회는 ORA-01219 로 막힌다.
+--      ORA-16000(열려 있는데 쓰기)과 번호로 구분한다
+--   ④ 그러나 고정 뷰는 조회되므로 MOUNTED Standby 에서
+--      V$DATAGUARD_STATS 를 그대로 읽을 수 있다 — 옵션 없이 지연을 재는 방법
+--   ⑤ PDB 서비스는 사라져 ORA-12514.
+--      리스너가 없을 때의 ORA-12541 과 구별한다
+--   ⑥ Primary 쪽 표식은 DATABASE_MODE 와 RECOVERY_MODE 의 WITH QUERY 유무다
+--   ⑦ 진행은 ARCHIVED_SEQ# 와 APPLIED_SEQ# 의 차이로 본다
+--   ⑧ Broker 의 Real Time Query 는 OFF 가 되지만 구성은 SUCCESS 다
+--   ⑨ V$ARCHIVED_LOG 의 max(sequence#) 는 RESETLOGS 이전 번호를 집는다
+--      (실측 94, 그때 현재 시퀀스는 12)
+--
+-- ★ 요약하면 이렇다.
+--   Standby 에 붙을 수 있으면 V$DATAGUARD_STATS,
+--   붙을 수 없으면 Primary 의 V$ARCHIVE_DEST_STATUS.
+--   옵션이 없어도 감시는 할 수 있다.
