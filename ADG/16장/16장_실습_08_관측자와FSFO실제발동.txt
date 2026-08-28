@@ -1,0 +1,553 @@
+================================================================================
+ 제16장 실습 08 — 관측자와 Fast-Start Failover 실제 발동
+ 대상   : farsync-srv(관측자), chicago-srv, boston-srv
+ 목표   : 제3의 호스트에 관측자를 띄우고 Primary 를 죽여 자동 전환을 관찰한다.
+          사람이 명령을 내리지 않고 전환과 재편입이 일어나는 것을 확인한다
+ 소요   : 약 50분
+ 변경   : FSFO 를 켜고 자동 전환·자동 재편입을 겪은 뒤 원래 역할로 되돌린다
+ 주의   : 14장 실습 07 에서 예고한 "실제 자동 전환" 이 이 실습이다
+          시작 전에 꺼진 상태의 VM 스냅샷을 확보한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 관측자 호스트
+--------------------------------------------------------------------------------
+
+[oracle@farsync-srv ~]$ hostname
+farsync-srv
+
+[oracle@farsync-srv ~]$ which dgmgrl
+/u01/app/oracle/product/19.3.0/dbhome_1/bin/dgmgrl
+
+[oracle@farsync-srv ~]$ ps -ef | grep -c [o]ra_pmon
+0
+
+-- ★ 10장에서 Far Sync 를 만들었던 그 호스트다.
+--   지금은 인스턴스가 없고 Oracle 소프트웨어만 있다.
+--
+-- ★ 관측자에는 그것으로 충분하다.
+--   14장에서 확인한 대로 관측자는 데이터베이스의 백그라운드 프로세스가 아니라
+--   tnsnames 로 접속하는 별개의 클라이언트다.
+--
+-- ★ 그리고 이것이 제3의 호스트라는 점이 핵심이다.
+--   chicago 나 boston 에 두면 그 호스트가 죽을 때
+--   판단할 주체가 함께 사라진다.
+
+[oracle@farsync-srv ~]$ tnsping chicago | tail -2
+[oracle@farsync-srv ~]$ tnsping boston | tail -2
+
+OK (0 msec)
+
+-- ★ 양쪽에 모두 닿아야 한다.
+--   "Primary 만 안 보이는가" 와 "내 네트워크가 문제인가" 를
+--   구별하려면 둘 다 봐야 하기 때문이다.
+
+--------------------------------------------------------------------------------
+ [2] FSFO 를 켠다
+--------------------------------------------------------------------------------
+
+DGMGRL> edit database 'chicago' set property 'FastStartFailoverTarget'='boston';
+DGMGRL> edit database 'boston' set property 'FastStartFailoverTarget'='chicago';
+
+Property "FastStartFailoverTarget" updated
+Property "FastStartFailoverTarget" updated
+
+DGMGRL> enable fast_start failover
+
+-- ★ 14장과 달리 ORA-16827 경고가 나오지 않는다.
+--   실습 06 에서 양쪽에 플래시백을 켰기 때문이다.
+--
+-- ★ 경고 없이 켜졌다는 것 자체가 전제를 갖췄다는 확인이다.
+
+DGMGRL> show configuration
+
+  chicago - Primary database
+    Warning: ORA-16819: fast-start failover observer not started
+
+    boston  - (*) Physical standby database
+      Warning: ORA-16819: fast-start failover observer not started
+
+Fast-Start Failover: Enabled in Potential Data Loss Mode
+
+Configuration Status:
+WARNING
+
+-- ★ 14장에서 본 그 화면이다. 관측자가 없으니 ORA-16819 다.
+--   이번에는 여기서 멈추지 않고 관측자를 띄운다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — CONNECT IDENTIFIER 형식으로 띄우면
+--------------------------------------------------------------------------------
+
+-- ★ 14장에서 확인한 구문 중 IN BACKGROUND 형식을 먼저 써 본다.
+
+[oracle@farsync-srv ~]$ dgmgrl -silent sys/****@chicago <<'EOF'
+> start observer obs_far in background
+>   file is '/home/oracle/fsfo_obs.dat'
+>   logfile is '/home/oracle/obs.log'
+>   connect identifier is chicago;
+> EOF
+
+Connected to "chicago"
+ORA-01017: invalid username/password; logon denied
+
+Unable to connect to database using chicago
+
+>>> 원인 파악
+
+-- ★ 앞줄에서 Connected to "chicago" 가 나왔다.
+--   즉 로그인 자체는 성공했다. 비밀번호는 맞다.
+--
+-- ★ 그런데 CONNECT IDENTIFIER IS 절이 있으면
+--   관측자 프로세스가 그 식별자로 다시 접속한다.
+--   이때 자격증명을 새로 요구하는데 스크립트에는 줄 방법이 없다.
+--
+-- ★ 대화식으로 실행하면 암호를 물어보므로 동작한다.
+--   자동화하려면 다른 방법이 필요하다.
+
+>>> 조치
+
+-- ★ 전경 실행 형식을 쓰고 셸에서 배경으로 돌린다.
+--   14장의 help 에서 본 첫 번째 구문이다.
+--
+--   START OBSERVER [FILE=<observer file>];
+
+[oracle@farsync-srv ~]$ nohup dgmgrl -silent sys/****@chicago \
+>   "start observer file='/home/oracle/fsfo_obs.dat'" \
+>   > /home/oracle/obs.log 2>&1 &
+
+-- ★ 로그인 정보가 처음 한 번만 쓰이므로 문제가 없다.
+--
+-- ★ 이 프로세스는 계속 떠 있어야 한다.
+--   nohup 으로 띄우고 표준 출력을 파일로 돌린다.
+
+>>> 재확인
+
+[oracle@farsync-srv ~]$ ps -ef | grep [d]gmgrl
+
+oracle 3632 3629 1 13:25 ? 00:00:03 dgmgrl -silent  start observer file='/home/oracle/fsfo_obs.dat'
+
+[oracle@farsync-srv ~]$ cat /home/oracle/obs.log
+
+Connected to "chicago"
+[W000 2026-08-28T13:25:18.396+09:00] FSFO target standby is boston
+Observer 'farsync-srv' started
+[W000 2026-08-28T13:25:19.240+09:00] Observer trace level is set to USER
+[W000 2026-08-28T13:25:19.240+09:00] Try to connect to the primary.
+[W000 2026-08-28T13:25:19.240+09:00] Try to connect to the primary chicago.
+[W000 2026-08-28T13:25:20.054+09:00] The standby boston is ready to be a FSFO target
+[W000 2026-08-28T13:25:20.054+09:00] Connection to the primary restored!
+[W000 2026-08-28T13:25:22.076+09:00] Disconnecting from database chicago.
+
+[oracle@farsync-srv ~]$ ls -l /home/oracle/fsfo_obs.dat
+
+-rw-r--r--. 1 oracle dba 116 Aug 28 13:25 /home/oracle/fsfo_obs.dat
+
+-- ★ Observer 'farsync-srv' started. 이름은 호스트 이름을 쓴다.
+--
+-- ★ 로그의 [W000] 은 작업 스레드 번호다. 아래에서 [S002] 도 나온다.
+--
+-- ★ fsfo_obs.dat 116바이트가 생겼다.
+--   14장에서 FILE 절이 왜 있는지 설명한 그 파일이며
+--   관측자가 재기동해도 이어서 감시할 수 있게 상태를 담는다.
+
+--------------------------------------------------------------------------------
+ [4] Broker 가 관측자를 인식한다
+--------------------------------------------------------------------------------
+
+DGMGRL> show fast_start failover
+
+Fast-Start Failover: Enabled in Potential Data Loss Mode
+
+  Threshold:          30 seconds
+  Active Target:      boston
+  Potential Targets:  "boston"
+    boston     valid
+  Observer:           farsync-srv
+  Shutdown Primary:   TRUE
+  Auto-reinstate:     TRUE
+
+DGMGRL> show observer
+
+Configuration - dg_chicago
+
+  Primary:            chicago
+  Active Target:      boston
+
+Observer "farsync-srv" - Master
+
+  Host Name:                    farsync-srv
+  Last Ping to Primary:         2 seconds ago
+  Last Ping to Target:          2 seconds ago
+
+DGMGRL> show configuration
+
+  chicago - Primary database
+    boston  - (*) Physical standby database
+
+Fast-Start Failover: Enabled in Potential Data Loss Mode
+
+Configuration Status:
+SUCCESS
+
+-- ★ Observer 항목이 (none) 에서 farsync-srv 로 바뀌었다.
+--   ORA-16819 가 사라지고 SUCCESS 가 됐다.
+--
+-- ★ SHOW OBSERVER 는 이번에 처음 쓴다.
+--   Last Ping 두 줄이 감시가 살아 있다는 증거다.
+--   이 값이 커지면 관측자가 응답하지 않는 것이다.
+--
+-- ★ "Master" 라는 표시도 읽어 둔다.
+--   19c 는 관측자를 여럿 둘 수 있고 그중 하나가 주 관측자다.
+
+--------------------------------------------------------------------------------
+ [5] Primary 를 죽인다 — 이후 아무 명령도 내리지 않는다
+--------------------------------------------------------------------------------
+
+SYS@chicago> INSERT INTO system.bk_t VALUES(99,'before-fsfo');
+SYS@chicago> COMMIT;
+
+SYS@chicago> SHUTDOWN ABORT;
+
+ORACLE instance shut down.
+
+-- ★ 여기서부터는 관측만 한다.
+--   실습 07 과 달리 failover 명령을 내리지 않는다.
+
+--  21초  boston: PHYSICAL STANDBY / READ ONLY WITH APPLY
+--  37초  boston: PHYSICAL STANDBY / READ ONLY WITH APPLY
+--  53초  boston: PHYSICAL STANDBY / MOUNTED
+--  69초  boston: PRIMARY / READ WRITE
+
+-- ★ 약 69초에 자동 전환이 끝났다.
+--
+-- ★ 53초의 MOUNTED 가 전환이 진행 중인 순간이다.
+--   READ ONLY WITH APPLY → MOUNTED → PRIMARY / READ WRITE 로 간다.
+--   Active Data Guard 로 조회 중이던 세션은 이때 끊긴다.
+
+--------------------------------------------------------------------------------
+ [6] 관측자는 무엇을 했는가
+--------------------------------------------------------------------------------
+
+[oracle@farsync-srv ~]$ tail -35 /home/oracle/obs.log
+
+[W000 2026-08-28T13:32:18.438+09:00] Try to connect to the primary.
+[W000 2026-08-28T13:32:41.660+09:00] Primary database cannot be reached.
+[W000 2026-08-28T13:32:41.660+09:00] Fast-Start Failover threshold has not exceeded.
+                                     Retry for the next 3 seconds
+[W000 2026-08-28T13:32:42.663+09:00] Try to connect to the primary.
+[W000 2026-08-28T13:32:44.076+09:00] Primary database cannot be reached.
+[W000 2026-08-28T13:32:44.076+09:00] Fast-Start Failover threshold has expired.
+[W000 2026-08-28T13:32:44.078+09:00] Try to connect to the standby.
+[W000 2026-08-28T13:32:44.078+09:00] Making a last connection attempt to primary
+                                     database before proceeding with Fast-Start Failover.
+[W000 2026-08-28T13:32:44.078+09:00] Check if the standby is ready for failover.
+[W000 2026-08-28T13:32:44.080+09:00] Fast-Start Failover is not possible because
+                                     primary last contacted the standby within
+                                     FastStartFailoverThreshold seconds.
+[W000 2026-08-28T13:32:47.118+09:00] Failed to ping the primary.
+[W000 2026-08-28T13:32:47.118+09:00] Check if the standby is ready for failover.
+[S002 2026-08-28T13:32:47.123+09:00] Fast-Start Failover started...
+
+2026-08-28T13:32:47.123+09:00
+Initiating Fast-Start Failover to database "boston"...
+[S002 2026-08-28T13:32:47.124+09:00] Initiating Fast-start Failover.
+Performing failover NOW, please wait...
+Failover succeeded, new primary is "boston"
+2026-08-28T13:33:20.830+09:00
+[S002 2026-08-28T13:33:20.830+09:00] Fast-Start Failover finished...
+[W000 2026-08-28T13:33:20.830+09:00] Failover succeeded. Restart pinging.
+[W000 2026-08-28T13:33:20.869+09:00] Primary database has changed to boston.
+
+-- ★ 판단 과정이 전부 남는다. 순서대로 읽는다.
+--
+--   ① Primary database cannot be reached.
+--      Primary 가 안 보인다.
+--
+--   ② Fast-Start Failover threshold has not exceeded. Retry for the next 3 seconds
+--      아직 30초가 안 됐다. 더 기다린다.
+--      네트워크가 잠깐 끊긴 경우를 걸러 내는 구간이다.
+--
+--   ③ Fast-Start Failover threshold has expired.
+--      30초가 지났다.
+--
+--   ④ Making a last connection attempt to primary database
+--      마지막으로 한 번 더 붙어 본다.
+--
+--   ⑤ ★ Fast-Start Failover is not possible because primary last contacted
+--      the standby within FastStartFailoverThreshold seconds.
+--
+--      여기서 한 번 거부한다.
+--      "Standby 가 방금까지 Primary 와 연락하고 있었다" 는 뜻이다.
+--      관측자에게만 안 보이는 상황일 수 있으므로 전환하지 않는다.
+--      split brain 을 막는 안전장치이며 14장에서 설명한 그 이유다.
+--
+--   ⑥ Failed to ping the primary. / Check if the standby is ready for failover.
+--      Standby 쪽에서도 Primary 가 끊긴 것이 확인됐다.
+--
+--   ⑦ Fast-Start Failover started...
+--      그제야 시작한다.
+--
+-- ★ ⑤ 가 이 로그에서 가장 중요한 줄이다.
+--   관측자 혼자 판단하지 않고 Standby 의 관점까지 확인한다.
+--   두 곳이 모두 "안 보인다" 고 해야 전환한다.
+--
+-- ★ 시간을 계산해 본다.
+--   13:32:47 시작 → 13:33:20 완료. 전환 자체는 약 33초.
+--   강제 종료부터 세면 약 69초.
+--   차이인 36초가 threshold 30초와 확인 절차다.
+
+--------------------------------------------------------------------------------
+ [7] 전환 결과
+--------------------------------------------------------------------------------
+
+SYS@boston> SELECT db_unique_name, database_role, open_mode FROM v$database;
+
+DB_UNIQUE_ DATABASE_ROLE    OPEN_MODE
+---------- ---------------- --------------------
+boston     PRIMARY          READ WRITE
+
+SYS@boston> COL tag FOR a16
+SYS@boston> SELECT id, tag FROM system.bk_t WHERE id=99;
+
+        ID TAG
+---------- ----------------
+        99 before-fsfo
+
+1 row selected.
+
+SYS@boston> SELECT current_scn, resetlogs_change#,
+  2                 to_char(resetlogs_time,'HH24:MI:SS') rt FROM v$database;
+
+CURRENT_SCN RESETLOGS_CHANGE# RT
+----------- ----------------- --------
+    2828292           2827218 13:33:01
+
+-- ★ 표식이 살아 있다. 손실 없음.
+--   실습 07 과 같은 이유이며 역시 보장은 아니다.
+--
+-- ★ RESETLOGS_TIME 13:33:01 — 자동 전환도 OPEN RESETLOGS 를 수반한다.
+--   수동 Failover 와 다르지 않다.
+
+DGMGRL> show configuration
+
+  boston  - Primary database
+    Warning: ORA-16824: multiple warnings, including fast-start failover-related
+             warnings, detected for the database
+
+    chicago - (*) Physical standby database (disabled)
+      ORA-16661: the standby database needs to be reinstated
+
+Fast-Start Failover: Enabled in Potential Data Loss Mode
+
+Configuration Status:
+WARNING
+
+DGMGRL> show fast_start failover
+
+  Active Target:      chicago
+  Potential Targets:  "chicago"
+    chicago    invalid - member is disabled
+  Observer:           farsync-srv
+
+-- ★ 세 가지를 읽는다.
+--
+--   ① ORA-16824 — 새 Primary 에 여러 경고가 겹쳐 있다.
+--      실습 07 에서는 못 본 번호다. FSFO 관련 경고가 포함됐다는 뜻이다.
+--
+--   ② chicago 가 (disabled) + ORA-16661.
+--      실습 07 과 같다.
+--
+--   ③ Active Target 이 chicago 로 바뀌었다.
+--      양쪽에 서로를 지정해 둔 덕분이며
+--      다음 전환은 반대 방향이 된다.
+--      다만 지금은 invalid - member is disabled 다.
+--
+-- ★ 여기서 실습 07 과 결정적으로 다른 점이 있다.
+--   Configuration Status 가 SUCCESS 가 아니라 WARNING 이다.
+--   FSFO 가 켜져 있으면 재편입이 필요한 상태를 경고로 올린다.
+
+--------------------------------------------------------------------------------
+ [8] 자동 재편입 — 역시 명령을 내리지 않는다
+--------------------------------------------------------------------------------
+
+SYS@chicago> STARTUP MOUNT;
+
+ORACLE instance started.
+Database mounted.
+
+-- ★ MOUNT 까지만 올린다. 실습 07 에서 배운 대로다.
+--   그다음에는 아무것도 하지 않는다.
+
+--  21초  chicago: PRIMARY / MOUNTED
+--  42초  chicago: PHYSICAL STANDBY / MOUNTED
+
+-- ★ 약 42초에 자동으로 재편입됐다.
+--   REINSTATE 명령을 사람이 내리지 않았다.
+
+[oracle@farsync-srv ~]$ tail -20 /home/oracle/obs.log
+
+[W000 ...] The standby chicago needs to be reinstated
+[W000 ...] Try to connect to the new standby chicago.
+[W000 ...] Connection to the new standby restored!
+[W000 ...] Failed to ping the new standby.
+[W000 ...] Try to connect to the new standby chicago.
+   (몇 차례 반복)
+[W000 2026-08-28T13:34:16.611+09:00] Wait for new primary to be ready to reinstate.
+[W000 2026-08-28T13:34:16.615+09:00] New primary is now ready to reinstate.
+[W000 2026-08-28T13:34:17.626+09:00] Issuing REINSTATE command.
+
+2026-08-28T13:34:17.627+09:00
+Initiating reinstatement for database "chicago"...
+Reinstating database "chicago", please wait...
+[W000 ...] The standby chicago is ready to be a FSFO target
+Reinstatement of database "chicago" succeeded
+[W000 2026-08-28T13:35:13.117+09:00] Successfully reinstated database chicago.
+
+-- ★ 관측자가 실습 07 에서 우리가 손으로 한 일을 대신했다.
+--
+--   The standby chicago needs to be reinstated   상태를 알아챘다
+--   Failed to ping the new standby (반복)        아직 준비가 안 됐다
+--   Wait for new primary to be ready             기다린다
+--   Issuing REINSTATE command.                   그리고 실행한다
+--
+-- ★ Auto-reinstate: TRUE 라는 설정이 이 동작이다.
+--   14장에서 값만 보고 넘어갔던 항목이 여기서 실제로 도는 것을 본다.
+--
+-- ★ 반복되는 Failed to ping 은 오류가 아니다.
+--   MOUNT 직후에는 아직 응답할 준비가 안 된 것이며
+--   관측자가 될 때까지 재시도한다.
+
+DGMGRL> show configuration
+
+  boston  - Primary database
+    Warning: ORA-16824: multiple warnings, ...
+
+    chicago - (*) Physical standby database
+      Warning: ORA-16657: reinstatement of database in progress
+
+Configuration Status:
+WARNING
+
+-- ★ ORA-16657 — 재편입 진행 중.
+--   이 번호도 실습 07 에서는 못 봤다.
+--   손으로 할 때는 명령이 끝날 때까지 기다리므로 중간 상태를 볼 일이 없었다.
+
+--------------------------------------------------------------------------------
+ [9] 재편입 직후의 상태
+--------------------------------------------------------------------------------
+
+SYS@chicago> SELECT db_unique_name, database_role, open_mode FROM v$database;
+
+DB_UNIQUE_ DATABASE_ROLE    OPEN_MODE
+---------- ---------------- --------------------
+chicago    PHYSICAL STANDBY MOUNTED
+
+SYS@chicago> SELECT process, status FROM v$managed_standby WHERE process='MRP0';
+
+no rows selected
+
+SYS@chicago> SELECT dest_id, status, recovery_mode
+  2            FROM v$archive_dest_status WHERE dest_id=1;
+
+   DEST_ID STATUS    RECOVERY_MODE
+---------- --------- --------------------------
+         1 VALID     IDLE
+
+-- ★ 역할은 바뀌었는데 아직 MOUNTED 이고 MRP 도 없다.
+--
+-- ★ 실습 07 의 수동 Reinstate 에서는
+--   READ ONLY WITH APPLY / MRP0 APPLYING_LOG 였다.
+--   차이는 확인 시점이다.
+--
+-- ★ 재편입은 "역할을 되돌리는 것" 까지이고
+--   그다음 Intended State(APPLY-ON, 열기)를 적용하는 것은
+--   Broker 가 이어서 하는 별개의 단계다.
+--   조금 더 기다리면 READ ONLY WITH APPLY 가 된다.
+--
+-- ★ 즉 자동 전환 뒤에는 두 번 확인해야 한다.
+--   ① 역할이 돌아왔는가  ② 적용이 시작됐는가
+--   ①만 보고 끝내면 복제가 아직 없는 구간을 놓친다.
+
+--------------------------------------------------------------------------------
+ [10] 정리 — 관측자 중지와 FSFO 해제
+--------------------------------------------------------------------------------
+
+DGMGRL> stop observer
+
+[oracle@farsync-srv ~]$ ps -ef | grep -c [d]gmgrl
+0
+
+[oracle@farsync-srv ~]$ tail -3 /home/oracle/obs.log
+
+Reinstatement of database "chicago" succeeded
+[W000 ...] Successfully reinstated database chicago.
+Observer 'farsync-srv' stopped
+
+-- ★ STOP OBSERVER 는 현재 Primary 쪽 DGMGRL 에서 낸다.
+--   관측자 호스트에 접속할 필요가 없다.
+--   프로세스가 실제로 사라진 것을 확인한다.
+
+DGMGRL> disable fast_start failover
+DGMGRL> edit database 'chicago' set property 'FastStartFailoverTarget'='';
+DGMGRL> edit database 'boston' set property 'FastStartFailoverTarget'='';
+
+DGMGRL> show fast_start failover
+
+Fast-Start Failover:  Disabled
+  Active Target:      (none)
+  Potential Targets:  (none)
+  Observer:           (none)
+
+-- ★ 14장에서 정한 순서 그대로다.
+--   DISABLE 이 먼저, 대상 속성 삭제가 나중.
+--   여기에 관측자 중지가 맨 앞에 붙는다.
+--
+--   ① STOP OBSERVER
+--   ② DISABLE FAST_START FAILOVER
+--   ③ 대상 속성 삭제
+
+--------------------------------------------------------------------------------
+ [11] 원복
+--------------------------------------------------------------------------------
+
+DGMGRL> switchover to 'chicago'
+
+Switchover succeeded, new primary is "chicago"
+
+SYS@chicago> SELECT db_unique_name, database_role, open_mode FROM v$database;
+
+DB_UNIQUE_ DATABASE_ROLE    OPEN_MODE
+---------- ---------------- --------------------
+chicago    PRIMARY          READ WRITE
+
+SYS@boston> SELECT database_role, open_mode FROM v$database;
+
+DATABASE_ROLE    OPEN_MODE
+---------------- --------------------
+PHYSICAL STANDBY READ ONLY WITH APPLY
+
+-- ★ 원래 역할로 돌아왔다.
+
+--------------------------------------------------------------------------------
+ [12] 정리
+--------------------------------------------------------------------------------
+
+-- ★ 이 실습에서 확인한 것
+--
+--   ① 관측자는 인스턴스 없는 호스트에서도 돈다 (소프트웨어만 필요)
+--   ② CONNECT IDENTIFIER IS 형식은 자격증명을 다시 요구한다 (ORA-01017)
+--   ③ nohup + 전경 실행 형식이 자동화에 맞다
+--   ④ 관측자 이름은 호스트 이름을 쓴다
+--   ⑤ SHOW OBSERVER 의 Last Ping 두 줄이 감시 생존 신호다
+--   ⑥ 자동 전환까지 약 69초 (threshold 30초 + 확인 + 전환 33초)
+--   ⑦ 전환 중 Standby 는 MOUNTED 를 거친다
+--   ⑧ ★ 관측자는 "Standby 가 방금까지 Primary 와 연락했다" 면 한 번 거부한다
+--   ⑨ 자동 전환도 OPEN RESETLOGS 를 수반한다
+--   ⑩ 전환 후 ORA-16824(새 Primary) + ORA-16661(옛 Primary, disabled)
+--   ⑪ MOUNT 만 해 두면 약 42초에 자동 재편입된다
+--   ⑫ 재편입 중에는 ORA-16657
+--   ⑬ 재편입 직후에는 아직 MOUNTED 다. 적용 시작은 그다음 단계다
+--   ⑭ 정리 순서는 STOP OBSERVER → DISABLE → 대상 삭제
+--
+-- ★ 다음 실습에서 Standby 를 백업에 활용한다.
