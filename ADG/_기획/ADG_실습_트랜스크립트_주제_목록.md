@@ -131,7 +131,7 @@
 3. **전송 중단 상황 재현과 진단** — standby 리스너를 내려 전송을 끊고 `V$ARCHIVE_DEST.ERROR` 확인 → 복구 후 재개 확인
 4. `LOG_ARCHIVE_TRACE` 수준별 추적 활성화와 트레이스 파일 판독
 5. `V$DATAGUARD_STATS` / `V$DATAGUARD_STATUS`로 현재 상태와 최근 메시지 확인
-6. logical standby 전용 모니터링 — `V$LOGSTDBY_TRANSACTION`으로 적용 중인 트랜잭션 추적
+6. **logical standby 전용 모니터링** — `V$LOGSTDBY_TRANSACTION`으로 적용 중인 트랜잭션 추적 (실습 07 로 반영 완료)
 7. 상시 점검 스크립트 작성 — 위 지표를 한 번에 수집하고 임계값으로 판정하는 절차 고정
 
 ## 16장. 역할 전환과 이후 운영 ★ (9개)
