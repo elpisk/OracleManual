@@ -1,0 +1,254 @@
+================================================================================
+ 제1장 실습 04 — 단일 인스턴스와의 구조 차이
+ 대상   : rac1(racdb1) — 조회는 한 노드에서 수행한다
+ 목표   : 스레드별 리두, 인스턴스별 UNDO, 공유 컨트롤 파일을 조회로 확인하고
+          단일 인스턴스 데이터베이스와 무엇이 다른지 정리한다
+ 소요   : 약 25분
+ 선행   : racdb 두 인스턴스가 모두 OPEN 상태일 것
+ 계정   : oracle
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 스레드별 리두 로그
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+SQL> SET LINES 160 PAGES 60
+
+-- 단일 인스턴스에서는 리두 그룹이 그냥 번호만 가진다. RAC 에서는 그룹마다
+-- 소속 스레드가 있다. 인스턴스 1에서 조회했는데 스레드 2의 그룹도 보인다.
+SQL> SELECT inst_id, thread#, group#, bytes/1024/1024 mb, members, status
+  2    FROM gv$log WHERE inst_id=1 ORDER BY thread#, group#;
+
+   INST_ID    THREAD#     GROUP#         MB    MEMBERS STATUS
+---------- ---------- ---------- ---------- ---------- ----------------
+         1          1          1        200          2 CURRENT
+         1          1          2        200          2 INACTIVE
+         1          2          3        200          2 CURRENT
+         1          2          4        200          2 UNUSED
+
+4 rows selected.
+
+-- 스레드 1 은 그룹 1, 2 를 / 스레드 2 는 그룹 3, 4 를 쓴다.
+-- 두 스레드가 각각 CURRENT 그룹을 하나씩 가지고 있다. 두 인스턴스가 동시에
+-- 서로 다른 그룹에 기록하고 있다는 뜻이다.
+-- WHERE inst_id=1 을 붙인 이유: GV$LOG 는 각 인스턴스가 보고한 같은 내용을
+-- 인스턴스 수만큼 중복 반환한다. 한 인스턴스 것만 보면 충분하다.
+
+SQL> COL member FOR a58
+SQL> SELECT l.thread#, f.group#, f.member
+  2    FROM gv$logfile f, gv$log l
+  3   WHERE f.inst_id=1 AND l.inst_id=1 AND f.group#=l.group#
+  4   ORDER BY 1, 2;
+
+   THREAD#     GROUP# MEMBER
+---------- ---------- ----------------------------------------------------------
+         1          1 +DATA/RACDB/ONLINELOG/group_1.262.1242761749
+         1          1 +FRA/RACDB/ONLINELOG/group_1.258.1242761759
+         1          2 +DATA/RACDB/ONLINELOG/group_2.263.1242761749
+         1          2 +FRA/RACDB/ONLINELOG/group_2.257.1242761759
+         2          3 +DATA/RACDB/ONLINELOG/group_3.270.1242762459
+         2          3 +FRA/RACDB/ONLINELOG/group_3.259.1242762467
+         2          4 +DATA/RACDB/ONLINELOG/group_4.271.1242762473
+         2          4 +FRA/RACDB/ONLINELOG/group_4.260.1242762483
+
+8 rows selected.
+
+-- 모든 리두 파일이 +DATA 와 +FRA 에 있다. 스레드 2의 파일도 노드 1에서 보인다.
+-- 공유 스토리지이기 때문이다. 이 점이 인스턴스 복구를 가능하게 한다.
+-- 노드 1이 죽으면 노드 2가 +DATA 의 group_1, group_2 를 읽어 복구를 수행한다.
+
+--------------------------------------------------------------------------------
+ [2] V$THREAD — 스레드의 상태
+--------------------------------------------------------------------------------
+
+SQL> SELECT thread#, status, enabled, instance, groups FROM v$thread ORDER BY 1;
+
+   THREAD# STATUS ENABLED  INSTANCE           GROUPS
+---------- ------ -------- ---------------- ----------
+         1 OPEN   PUBLIC   racdb1                    2
+         2 OPEN   PUBLIC   racdb2                    2
+
+2 rows selected.
+
+-- STATUS  : OPEN 이면 이 스레드를 쓰는 인스턴스가 열려 있다. CLOSED 면 아니다.
+-- ENABLED : PUBLIC 이면 어느 인스턴스든 이 스레드를 가져다 쓸 수 있다.
+--           PRIVATE 이면 특정 인스턴스에 고정된다.
+-- INSTANCE: 지금 이 스레드를 쓰고 있는 인스턴스 이름
+-- GROUPS  : 이 스레드에 속한 리두 그룹 수
+--
+-- 실습 06 에서 인스턴스를 하나 정지하면 STATUS 가 CLOSED 로 바뀌는 것을 본다.
+
+--------------------------------------------------------------------------------
+ [3] 인스턴스별 UNDO
+--------------------------------------------------------------------------------
+
+SQL> COL value FOR a30
+SQL> COL name FOR a28
+SQL> SELECT inst_id, name, value FROM gv$parameter
+  2   WHERE name IN ('undo_tablespace','instance_number','instance_name',
+  3                  'cluster_database','cluster_database_instances','thread',
+  4                  'db_unique_name','remote_listener','local_listener')
+  5   ORDER BY name, inst_id;
+
+   INST_ID NAME                         VALUE
+---------- ---------------------------- ------------------------------
+         1 cluster_database             TRUE
+         2 cluster_database             TRUE
+         1 cluster_database_instances   2
+         2 cluster_database_instances   2
+         1 db_unique_name               racdb
+         2 db_unique_name               racdb
+         1 instance_name                racdb1
+         2 instance_name                racdb2
+         1 instance_number              1
+         2 instance_number              2
+         1 local_listener                (ADDRESS=(PROTOCOL=TCP)(HOST=
+                                        172.16.225.111)(PORT=1521))
+         2 local_listener                (ADDRESS=(PROTOCOL=TCP)(HOST=
+                                        172.16.225.112)(PORT=1521))
+         1 remote_listener               rac-scan:1521
+         2 remote_listener               rac-scan:1521
+         1 thread                       1
+         2 thread                       2
+         1 undo_tablespace              UNDOTBS1
+         2 undo_tablespace              UNDOTBS2
+
+20 rows selected.
+
+-- 값이 같은 것과 다른 것을 구분해 읽는다.
+--   같아야 하는 것 : cluster_database, cluster_database_instances,
+--                    db_unique_name, remote_listener
+--   달라야 하는 것 : instance_name, instance_number, thread,
+--                    undo_tablespace, local_listener
+--
+-- local_listener 가 각자 자기 노드의 VIP 를 가리키는 점을 눈여겨본다.
+-- 인스턴스는 자기 노드 VIP 로 로컬 리스너에 등록하고, SCAN 이름으로
+-- 원격 리스너에 등록한다. 이 두 등록이 SCAN 재지시의 토대다.
+
+SQL> SELECT tablespace_name, status, contents FROM dba_tablespaces ORDER BY 1;
+
+TABLESPACE_NAME                STATUS    CONTENTS
+------------------------------ --------- ---------------------
+SYSAUX                         ONLINE    PERMANENT
+SYSTEM                         ONLINE    PERMANENT
+TEMP                           ONLINE    TEMPORARY
+UNDOTBS1                       ONLINE    UNDO
+UNDOTBS2                       ONLINE    UNDO
+USERS                          ONLINE    PERMANENT
+
+6 rows selected.
+
+-- UNDO 테이블스페이스가 둘이다. 인스턴스마다 하나씩 필요하기 때문이다.
+-- 단일 인스턴스라면 UNDOTBS1 하나만 있었을 것이다.
+-- 노드를 하나 더 추가하면 UNDOTBS3 을 만들어야 한다(18장).
+
+--------------------------------------------------------------------------------
+ [4] SPFILE 안에서 인스턴스별 값이 구분되는 방식
+--------------------------------------------------------------------------------
+
+-- SPFILE 은 공유 스토리지에 한 벌뿐인데 인스턴스마다 다른 값을 갖는다.
+-- 어떻게 가능한지 확인한다.
+
+SQL> CREATE PFILE='/tmp/racdb_check.ora' FROM SPFILE;
+
+File created.
+
+SQL> HOST grep -iE 'undo_tablespace|instance_number|thread' /tmp/racdb_check.ora
+racdb1.instance_number=1
+racdb2.instance_number=2
+racdb1.thread=1
+racdb2.thread=2
+racdb1.undo_tablespace='UNDOTBS1'
+racdb2.undo_tablespace='UNDOTBS2'
+
+-- 파라미터 이름 앞에 sid 접두어가 붙어 있다. 접두어가 없으면 모든 인스턴스에
+-- 적용되고, 인스턴스 이름이 붙으면 그 인스턴스에만 적용된다.
+-- ALTER SYSTEM 으로 바꿀 때도 SID 절로 같은 구분을 한다.
+--   ALTER SYSTEM SET undo_tablespace='UNDOTBS2' SID='racdb2' SCOPE=BOTH;
+--   ALTER SYSTEM SET db_files=300 SID='*' SCOPE=SPFILE;
+-- SID 절을 빠뜨리면 기본값이 SID='*' 라 모든 인스턴스에 적용된다. 13장에서
+-- 이 구문을 본격적으로 다룬다.
+
+SQL> HOST rm -f /tmp/racdb_check.ora
+
+--------------------------------------------------------------------------------
+ [5] 공유 컨트롤 파일
+--------------------------------------------------------------------------------
+
+SQL> COL name FOR a62
+SQL> SELECT name FROM v$controlfile;
+
+NAME
+--------------------------------------------------------------
++DATA/RACDB/CONTROLFILE/current.261.1242761745
++FRA/RACDB/CONTROLFILE/current.256.1242761745
+
+2 rows selected.
+
+-- 두 파일은 다중화된 사본이지 인스턴스별 파일이 아니다. 모든 인스턴스가
+-- 두 파일을 모두 열고 같은 내용을 본다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — 존재하지 않는 파라미터 이름
+--------------------------------------------------------------------------------
+
+-- 단일 인스턴스 습관으로 db_name 을 조회 목록에 넣으면 어떻게 되는지 본다.
+
+SQL> SELECT inst_id, name, value FROM gv$parameter
+  2   WHERE name IN ('undo_tablespace','instance_number','db_name');
+                                                          *
+ERROR at line 2:
+ORA-00904: "DB_NAME": invalid identifier
+
+-- 원인 파악
+--   오류 위치를 보면 WHERE 절의 문자열이 아니라 식별자로 해석됐다.
+--   작은따옴표를 빠뜨렸거나 셸을 통해 실행하면서 따옴표가 벗겨진 것이다.
+--   RAC 실습에서는 SSH 로 원격 실행하는 경우가 많아 이 실수가 잦다.
+--   실제로 문자열이 잘못됐는지는 오류가 가리키는 위치로 판별한다.
+--   따옴표가 살아 있었다면 조건에 맞는 행이 없어 결과가 비었을 뿐
+--   오류는 나지 않았을 것이다.
+
+-- 조치 — 스크립트를 파일로 저장해 실행하면 따옴표가 보존된다.
+SQL> HOST cat > /tmp/p.sql
+SELECT inst_id, name, value FROM gv$parameter
+ WHERE name IN ('undo_tablespace','instance_number','db_name')
+ ORDER BY name, inst_id;
+
+SQL> @/tmp/p.sql
+
+   INST_ID NAME                         VALUE
+---------- ---------------------------- ------------------------------
+         1 db_name                      racdb
+         2 db_name                      racdb
+         1 instance_number              1
+         2 instance_number              2
+         1 undo_tablespace              UNDOTBS1
+         2 undo_tablespace              UNDOTBS2
+
+6 rows selected.
+
+-- 재확인
+--   db_name 은 두 인스턴스가 같고 instance_number 와 undo_tablespace 는 다르다.
+--   예상한 대로다.
+
+SQL> HOST rm -f /tmp/p.sql
+
+--------------------------------------------------------------------------------
+ [7] 정리 — 단일 인스턴스와의 차이 요약
+--------------------------------------------------------------------------------
+
+--   항목               단일 인스턴스        RAC
+--   ------------------------------------------------------------------
+--   리두               스레드 개념 없음     스레드마다 그룹 세트
+--   UNDO               하나                 인스턴스마다 하나
+--   SPFILE             하나                 하나, sid 접두어로 구분
+--   컨트롤 파일        다중화               다중화(공유)
+--   동적 성능 뷰       V$                   GV$ 로 전체, V$ 로 로컬
+--   cluster_database   FALSE                TRUE
+--
+-- 이 실습은 조회와 임시 파일 생성만 했고 임시 파일은 지웠으므로
+-- 원상 복구할 것이 없다.
+================================================================================
+ 실습 04 종료
+================================================================================

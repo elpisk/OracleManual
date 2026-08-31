@@ -1,0 +1,218 @@
+================================================================================
+ 제1장 실습 05 — 라이선스 경계 확인
+ 대상   : rac1(racdb1)
+ 목표   : RAC 옵션의 링크 여부, 데이터 사전 설치 상태, 실제 사용 이력을
+          각각 다른 뷰로 확인하고, 멀티테넌트에서 DBA_ 뷰를 그대로 쓰면
+          왜 잘못된 결론이 나오는지 확인한다
+ 소요   : 약 20분
+ 선행   : racdb 인스턴스가 OPEN 상태일 것
+ 계정   : oracle
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 소프트웨어에 옵션이 링크되어 있는가 — V$OPTION
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+SQL> SET LINES 160 PAGES 60
+SQL> COL parameter FOR a44
+SQL> COL value FOR a8
+SQL> SELECT parameter, value FROM v$option
+  2   WHERE parameter LIKE '%Cluster%' OR parameter LIKE '%Storage Man%'
+  3   ORDER BY 1;
+
+PARAMETER                                    VALUE
+-------------------------------------------- --------
+Automatic Storage Management                 TRUE
+Real Application Clusters                    TRUE
+Table Clustering                             TRUE
+
+3 rows selected.
+
+-- 함정이 하나 있다. Table Clustering 은 CREATE CLUSTER 로 만드는 클러스터
+-- 테이블 기능이고 RAC 와 아무 관계가 없다. 이름에 Cluster 가 들어간다고
+-- RAC 관련 항목으로 세면 안 된다.
+--
+-- 더 중요한 함정은 TRUE 의 의미다. TRUE 는 소프트웨어에 링크되어 있다는
+-- 뜻이지 라이선스를 구매했다는 뜻이 아니다. 설치 미디어에는 옵션이 모두
+-- 들어 있고 링크 여부만 chopt 로 조절한다.
+
+SQL> SELECT parameter, value FROM v$option
+  2   WHERE parameter IN ('Partitioning','Advanced Compression',
+  3                       'Active Data Guard','Oracle Database Vault')
+  4   ORDER BY 1;
+
+PARAMETER                                    VALUE
+-------------------------------------------- --------
+Active Data Guard                            TRUE
+Advanced Compression                         TRUE
+Oracle Database Vault                        FALSE
+Partitioning                                 TRUE
+
+4 rows selected.
+
+-- 유료 옵션 대부분이 TRUE 다. 이 데이터베이스가 그 옵션들을 모두 구매했을
+-- 리는 없다. 라이선스 실사에서는 링크 여부가 아니라 사용 이력을 본다.
+
+--------------------------------------------------------------------------------
+ [2] 데이터 사전에 정상 설치되어 있는가 — DBA_REGISTRY
+--------------------------------------------------------------------------------
+
+SQL> COL comp_name FOR a44
+SQL> COL version FOR a14
+SQL> SELECT comp_id, comp_name, version, status FROM dba_registry ORDER BY comp_id;
+
+COMP_ID     COMP_NAME                                    VERSION      STATUS
+----------- -------------------------------------------- ------------ --------
+APS         OLAP Analytic Workspace                      19.0.0.0.0   VALID
+CATALOG     Oracle Database Catalog Views                19.0.0.0.0   VALID
+CATJAVA     Oracle Database Java Packages                19.0.0.0.0   VALID
+CATPROC     Oracle Database Packages and Types           19.0.0.0.0   VALID
+CONTEXT     Oracle Text                                  19.0.0.0.0   VALID
+DV          Oracle Database Vault                        19.0.0.0.0   VALID
+JAVAVM      JServer JAVA Virtual Machine                 19.0.0.0.0   VALID
+OLS         Oracle Label Security                        19.0.0.0.0   VALID
+ORDIM       Oracle Multimedia                            19.0.0.0.0   VALID
+OWM         Oracle Workspace Manager                     19.0.0.0.0   VALID
+RAC         Oracle Real Application Clusters             19.0.0.0.0   VALID
+SDO         Spatial                                      19.0.0.0.0   VALID
+XDB         Oracle XML Database                          19.0.0.0.0   VALID
+XML         Oracle XDK                                   19.0.0.0.0   VALID
+XOQ         Oracle OLAP API                              19.0.0.0.0   VALID
+
+15 rows selected.
+
+-- COMP_ID 가 RAC 인 항목이 VALID 다. 데이터 사전에 RAC 관련 객체가 정상
+-- 설치되어 있다는 뜻이다. INVALID 면 catclust.sql 같은 스크립트를 다시
+-- 돌려야 한다. 업그레이드 직후 이 열을 확인하는 습관이 중요하다.
+--
+-- 참고: DV 가 VALID 인데 V$OPTION 의 Oracle Database Vault 는 FALSE 다.
+-- 사전에는 설치되어 있지만 소프트웨어에는 링크되지 않은 상태다.
+-- 두 뷰가 서로 다른 질문에 답한다는 것이 여기서 분명해진다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — 멀티테넌트에서 DBA_ 뷰만 보면
+--------------------------------------------------------------------------------
+
+-- 실제로 기능을 사용한 이력은 DBA_FEATURE_USAGE_STATISTICS 로 본다.
+-- 단일 인스턴스·비CDB 시절의 습관대로 조회해 본다.
+
+SQL> COL name FOR a50
+SQL> SELECT name, detected_usages FROM dba_feature_usage_statistics
+  2   WHERE name LIKE 'Real Application%';
+
+no rows selected
+
+SQL> SELECT COUNT(*) FROM dba_feature_usage_statistics;
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+-- 여기서 멈추고 RAC 를 사용한 이력이 없다고 보고하면 잘못된 결론이다.
+-- 지금 이 데이터베이스는 명백히 RAC 로 돌아가고 있다.
+
+-- 원인 파악
+--   접속한 컨테이너를 먼저 확인한다.
+
+SQL> SHOW CON_NAME
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+--   CDB 루트에 접속해 있다. 그런데 피처 사용 샘플링은 PDB 단위로 이루어져
+--   통계가 PDB 쪽에 쌓인다. DBA_ 뷰는 현재 컨테이너만 보여 주므로
+--   CDB 루트에서 조회하면 비어 있다.
+--   CDB_ 접두어 뷰를 CON_ID 와 함께 조회해야 전체가 보인다.
+
+-- 조치
+SQL> SELECT con_id, COUNT(*) FROM cdb_feature_usage_statistics
+  2   GROUP BY con_id ORDER BY 1;
+
+    CON_ID   COUNT(*)
+---------- ----------
+         3        243
+
+1 row selected.
+
+--   CON_ID 3, 즉 RACPDB1 에 243 건이 쌓여 있다.
+
+-- 재확인
+SQL> SELECT con_id, name, detected_usages, currently_used
+  2    FROM cdb_feature_usage_statistics
+  3   WHERE name LIKE 'Real Application%' ORDER BY con_id, name;
+
+    CON_ID NAME                                        DETECTED_USAGES CURRE
+---------- ------------------------------------------- --------------- -----
+         3 Real Application Cluster One Node                         0 FALSE
+         3 Real Application Clusters (RAC)                           0 FALSE
+         3 Real Application Security                                 0 FALSE
+
+3 rows selected.
+
+-- 이제 항목이 보인다. DETECTED_USAGES 가 0 인 것은 샘플링이 아직 이 PDB 에서
+-- RAC 사용을 감지하지 않았기 때문이다. 샘플링은 주 1회 자동 수행되고
+-- 필요하면 수동으로 돌릴 수 있다.
+
+SQL> EXEC dbms_feature_usage_internal.exec_db_usage_sampling(SYSDATE);
+
+PL/SQL procedure successfully completed.
+
+-- 배운 것
+--   멀티테넌트 환경에서 라이선스 실사 자료를 만들 때 DBA_ 뷰만 보고
+--   사용 이력이 없다고 보고하면 치명적인 오류가 된다. 반드시 CDB_ 뷰를
+--   CON_ID 와 함께 조회하고, 모든 PDB 를 포괄했는지 확인한다.
+--   Real Application Cluster One Node 와 Real Application Security 는
+--   RAC 와 별개의 항목이니 혼동하지 않는다.
+
+--------------------------------------------------------------------------------
+ [4] 클러스터 소프트웨어 버전과 패치 수준
+--------------------------------------------------------------------------------
+
+SQL> SELECT banner FROM v$version;
+
+BANNER
+--------------------------------------------------------------------------------
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+
+1 row selected.
+
+-- Enterprise Edition 이다. 19c 부터 Standard Edition 2 의 RAC 지원이
+-- 제거되었으므로, 19c 에서 RAC 를 쓰려면 EE 와 RAC 옵션이 함께 필요하다.
+
+SQL> EXIT
+[oracle@rac1 ~]$ su - grid
+
+[grid@rac1 ~]$ crsctl query crs activeversion -f
+Oracle Clusterware active version on the cluster is [19.0.0.0.0].
+The cluster upgrade state is [NORMAL].
+The cluster active patch level is [724960844].
+
+[grid@rac1 ~]$ crsctl query crs softwarepatch
+Oracle Clusterware patch level on node rac1 is [724960844].
+
+-- active patch level 과 node 별 software patch 가 같으면 패치 적용이
+-- 클러스터 전체에 반영된 상태다. 롤링 패치 도중에는 두 값이 다르고
+-- upgrade state 가 ROLLING PATCH 로 표시된다. 18장에서 다룬다.
+
+--------------------------------------------------------------------------------
+ [5] 정리 — 감사 대응 자료를 만들 때
+--------------------------------------------------------------------------------
+
+-- 세 가지 조회가 각각 다른 질문에 답한다.
+--   V$OPTION                        소프트웨어에 링크되어 있는가
+--   DBA_REGISTRY                    데이터 사전에 정상 설치되어 있는가
+--   CDB_FEATURE_USAGE_STATISTICS    실제로 사용한 이력이 있는가
+--
+-- 자료를 남길 때는 세 조회 결과를 조회 시각과 함께 저장한다.
+-- 특히 쓴 적 없는 옵션이 켜져 있는 상황을 설명하려면 사용 이력이 0 이라는
+-- 증거가 필요하다. V$OPTION 만 캡처해 제출하면 오히려 불리한 자료가 된다.
+--
+-- 이 실습은 조회와 샘플링 프로시저 실행만 했다. 샘플링은 통계를 갱신할 뿐
+-- 구성을 바꾸지 않으므로 원상 복구할 것이 없다.
+================================================================================
+ 실습 05 종료
+================================================================================
