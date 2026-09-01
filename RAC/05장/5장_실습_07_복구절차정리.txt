@@ -1,0 +1,327 @@
+================================================================================
+ 제5장 실습 07 — 복구 절차 정리
+ 대상   : rac1, rac2
+ 목표   : 복원 명령이 클러스터 가동 중에 막히는 것을 확인하고, 시나리오별
+          복구 절차서와 주기 점검표를 작성한다
+ 소요   : 약 30분
+ 선행   : 실습 06 까지 완료되어 클러스터가 정상 상태일 것
+ 계정   : root
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 복원 명령의 가드 — 오류 재현
+--------------------------------------------------------------------------------
+
+-- 실습 03 에서 만든 백업 목록을 다시 본다.
+[root@rac1 ~]# ocrconfig -showbackup
+PROT-24: Auto backups for the Oracle Cluster Registry are not available
+
+rac2  2026/09/01 16:17:13  +CRS:/rac-cluster/OCRBACKUP/backup_20260901_161713.ocr.260.1242836233  724960844
+rac2  2026/09/01 16:17:06  +CRS:/rac-cluster/OCRBACKUP/backup_20260901_161706.ocr.259.1242836227  724960844
+rac2  2026/09/01 16:09:24  +CRS:/rac-cluster/OCRBACKUP/backup_20260901_160924.ocr.258.1242835765  724960844
+
+-- 가장 오래된 백업으로 복원을 시도해 본다.
+[root@rac1 ~]# ocrconfig -restore +CRS:/rac-cluster/OCRBACKUP/backup_20260901_160924.ocr.258.1242835765
+PROT-19: Cannot proceed while the Cluster Ready Service is running
+
+-- 논리적 복원도 시도한다.
+[root@rac1 ~]# ocrconfig -import /root/ocr_ch5.dmp
+PROT-19: Cannot proceed while the Cluster Ready Service is running
+
+-- 노드별 구성 수정도 시도한다.
+[root@rac1 ~]# ocrconfig -repair -add +DATA
+PROT-19: Cannot proceed while the Cluster Ready Service is running
+
+-- 오류 : PROT-19 (세 명령 모두 동일)
+-- 원인 파악 : crsd 는 OCR 을 열어 놓고 계속 읽고 쓴다. 그 밑에서 파일을
+--             통째로 갈아 끼우면 crsd 가 메모리에 들고 있는 내용과 디스크의
+--             내용이 어긋난다. 그래서 세 명령이 모두 같은 벽에 막힌다.
+--             세 명령이 같은 메시지로 막힌다는 사실 자체가 근거다. 개별
+--             명령의 문제가 아니라 공통 전제의 문제다.
+-- 조치     : 모든 노드에서 crsctl stop crs 를 먼저 실행하고, 한 노드만
+--             배타 모드로 기동한 뒤 복원한다. 절차는 [3] 에 정리한다.
+-- 재확인   : 세 번의 실패가 아무것도 바꾸지 않았는지 확인한다.
+
+[root@rac1 ~]# ocrcheck | head -8
+Status of Oracle Cluster Registry is as follows :
+         Version                  :          4
+         Total space (kbytes)     :     491684
+         Used space (kbytes)      :      84288
+         Available space (kbytes) :     407396
+         ID                       :  665666554
+         Device/File Name         :       +CRS
+                                    Device/File integrity check succeeded
+
+[root@rac1 ~]# ocrcheck -config
+Oracle Cluster Registry configuration is :
+         Device/File Name         :       +CRS
+
+[root@rac1 ~]# crsctl query css votedisk | tail -1
+Located 3 voting disk(s).
+
+[root@rac1 ~]# crsctl check cluster -all | grep -c online
+6
+
+-- ID 665666554 그대로, 위치 +CRS 한 벌 그대로, Voting File 3개 그대로다.
+-- Used space 가 84,240 에서 84,288 로 48KB 늘어난 것은 실습 04 의 다중화와
+-- 복귀 과정에서 OCR 내부 키가 갱신된 결과이며, 실패한 세 명령과는 무관하다.
+
+--------------------------------------------------------------------------------
+ [2] ocrconfig 가 제공하는 복구 수단
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# ocrconfig -help
+Name:
+        ocrconfig - Configuration tool for Oracle Cluster/Local Registry.
+
+        [-local] -export <filename>       - Export OCR/OLR contents to a file
+        [-local] -import <filename>       - Import OCR/OLR contents from a file
+        [-local] -backuploc { <dirname> | +<diskgroupname> }
+        [-local] -showbackuploc           - Show OCR/OLR backup location
+        [-local] -showbackup [auto|manual]
+        [-local] -manualbackup            - Perform OCR/OLR backup
+        [-local] -restore { +<diskgroupname> | <filename> }
+        -replace { +<current> } -replacement { +<new> }
+        -add { +<diskgroupname> | <filename> }
+        -delete { +<diskgroupname> | <filename> }
+        -overwrite                        - Overwrite OCR configuration on disk
+        -repair -add | -delete | -replace - Repair OCR configuration on the local node
+        -copy <source> <destination>      - Copy OCR physical backup
+        [-local] -delbackup { ... }       - Delete OCR/OLR physical backup file
+
+Notes:
+        * Use option '-local' to indicate that the operation is to be performed
+          on the Oracle Local Registry.
+
+-- 세 갈래로 나뉜다.
+--   백업/복원   -manualbackup, -export, -restore, -import
+--   구성 변경   -add, -delete, -replace, -backuploc
+--   수리        -repair, -overwrite
+--
+-- -local 을 붙이면 같은 동작이 OLR 을 대상으로 한다. 명령 체계가 대칭이다.
+-- -repair 는 이름 그대로 노드 하나의 구성만 고친다. 클러스터 전체가 아니라
+-- 그 노드의 ocr.loc 을 다른 노드와 맞추는 용도다.
+
+--------------------------------------------------------------------------------
+ [3] 시나리오별 복구 절차서
+--------------------------------------------------------------------------------
+
+-- 이 실습에서는 실제로 복원을 수행하지 않는다. 클러스터가 정상인 상태에서
+-- 굳이 복원할 이유가 없기 때문이다. 대신 절차서를 작성해 실제 상황에 대비한다.
+-- 아래 절차는 이 장에서 실측한 가드와 동작을 근거로 구성한 것이다.
+
+-- 시나리오 A. OCR 다중화 상태에서 한 위치만 손상
+--   진단   ocrcheck 에서 해당 위치만 integrity check 실패
+--   조치   ocrconfig -delete <손상 위치> 후 ocrconfig -add <손상 위치>
+--   근거   실습 04 에서 두 벌 상태일 때 하나를 지워도 클러스터가 정상이었다
+--   중단   없음
+
+-- 시나리오 B. OCR 전부 손상
+--   진단   ocrcheck 실패, crsd 기동 실패
+--   조치   1) 전 노드   crsctl stop crs        (필요시 -f)
+--          2) 한 노드   crsctl start crs -excl -nocrs
+--          3) 한 노드   crsctl status resource ora.CRS.dg -init
+--          4) 한 노드   ocrconfig -restore <백업 경로>
+--          5) 한 노드   ocrcheck
+--          6) 한 노드   crsctl stop crs -f
+--          7) 전 노드   crsctl start crs
+--   근거   PROT-19 때문에 crsd 가 떠 있으면 복원할 수 없다
+--   중단   전면 중단
+
+-- 시나리오 C. 한 노드만 ocr.loc 불일치
+--   진단   그 노드만 crsd 기동 실패, ocr.loc 내용이 다른 노드와 다름
+--   조치   1) 해당 노드   crsctl stop crs
+--          2) 해당 노드   ocrconfig -repair -add / -delete / -replace
+--          3) 해당 노드   crsctl start crs
+--   근거   -repair 도 PROT-19 에 걸리므로 CRS 정지가 선행되어야 한다
+--   중단   해당 노드만
+
+-- 시나리오 D. Voting File 1개 손실 (Normal 중복도)
+--   진단   crsctl query css votedisk 가 2개만 표시
+--   조치   v$asm_disk 에서 OFFLINE 디스크 확인, 장치 복구 후
+--          alter diskgroup CRS online disk <이름>
+--   근거   실습 06 에서 그대로 재현했다. 클러스터는 계속 동작한다
+--   중단   없음
+
+-- 시나리오 E. Voting File 과반수 손실
+--   진단   전 노드 CSS 기동 실패
+--   조치   1) 전 노드   crsctl stop crs -f
+--          2) 한 노드   crsctl start crs -excl -nocrs
+--          3) 디스크그룹 마운트 확인 (필요시 수동 마운트 또는 재생성)
+--          4) 한 노드   crsctl replace votedisk +CRS
+--          5) 한 노드   crsctl query css votedisk 로 개수와 STATE 확인
+--          6) 한 노드   crsctl stop crs -f
+--          7) 전 노드   crsctl start crs
+--   근거   Voting File 은 복원이 아니라 재생성이다. 백업이 필요 없다
+--   중단   전면 중단
+--   주의   FUID 는 전부 새 값이 된다. 정상이다
+
+-- 시나리오 F. 디스크그룹 자체 소실
+--   진단   ASM 마운트 실패
+--   조치   디스크그룹 재생성, crsctl replace votedisk, ocrconfig -restore 순
+--   근거   OCR 백업이 그 디스크그룹 안에 있었다면 백업도 함께 사라진다
+--   중단   전면 중단
+--   주의   이 경우를 대비해 export 파일을 클러스터 밖에 보관한다
+
+-- 시나리오 G. OLR 손상 (특정 노드)
+--   진단   그 노드 ohasd 기동 실패, ocrcheck -local 실패
+--   조치   ocrconfig -local -restore <그 노드의 OLR 백업>
+--          백업이 없으면 rootcrs.sh -deconfig -force 후 root.sh 재실행
+--   근거   실습 02 에서 OLR 백업이 노드 로컬임을 확인했다
+--   중단   해당 노드만
+
+-- 반복되는 패턴
+--   Voting File 은 replace 로, OCR 은 restore 로 되살린다
+--   대부분의 절차가 배타 모드 기동을 거친다
+--   전면 중단 시나리오는 모두 PROT-19 가 원인이다
+
+--------------------------------------------------------------------------------
+ [4] 배타 모드가 필요한 이유
+--------------------------------------------------------------------------------
+
+-- crsctl start crs -excl -nocrs 의 각 요소에는 이유가 있다.
+--
+--   start crs   ohasd 스택을 띄운다. ASM 이 떠야 +CRS 의 백업 파일을 읽는다
+--   -excl       한 노드에서만 배타적으로. 두 노드가 동시에 OCR 을 쓰지 못하게
+--   -nocrs      crsd 를 띄우지 않는다. 그래야 PROT-19 를 피한다
+--
+-- 종료할 때 -f 가 필요한 이유는 배타 모드로 뜬 스택이 정상 종료 경로를 따르지
+-- 않기 때문이다.
+--
+-- 백업 경로는 ocrconfig -showbackup 이 알려 준 형식을 그대로 쓴다.
+--   +CRS:/rac-cluster/OCRBACKUP/backup_20260901_160924.ocr.258.1242835765
+-- 디스크그룹 이름과 콜론, ASM 파일 번호까지 전부 포함한다.
+-- 목록의 마지막 열(패치 레벨 724960844)이 현재와 같은지도 반드시 확인한다.
+
+--------------------------------------------------------------------------------
+ [5] 주기 점검표
+--------------------------------------------------------------------------------
+
+-- 항목 / 명령 / 정상 판정 기준 / 이상 시 조치
+--
+-- OCR 무결성
+--   ocrcheck
+--   두 검사 줄 모두 succeeded, ID 가 665666554
+--   실패한 위치를 delete 후 add 로 재생성
+--
+-- OCR 구성
+--   ocrcheck -config, 전 노드 cat /etc/oracle/ocr.loc
+--   위치 목록이 기준과 같고 모든 노드가 일치
+--   불일치 노드는 CRS 정지 후 ocrconfig -repair
+--
+-- OCR 백업
+--   ocrconfig -showbackup
+--   최근 항목이 24시간 이내, 패치 레벨이 현재와 동일
+--   PROT-24 가 계속되면 crsd 기동 시각 확인 후 -manualbackup 배치 추가
+--
+-- 논리적 백업
+--   백업 서버에서 export 파일 확인
+--   최근 구성 변경 이후의 export 가 클러스터 밖에 존재
+--   없으면 ocrconfig -export 실행 후 외부로 복사
+--
+-- OLR 무결성
+--   각 노드에서 ocrcheck -local
+--   succeeded, ID 가 노드별 기록값 (rac1 1636561748 / rac2 877385927)
+--   실패하면 -local -restore 또는 노드 재구축 검토
+--
+-- Voting File
+--   crsctl query css votedisk
+--   개수가 중복도에 맞고(Normal 3개) 모든 항목이 ONLINE
+--   줄었으면 v$asm_disk 에서 OFFLINE 디스크를 찾아 복구 후 online
+--
+-- ASM 여유
+--   v$asm_diskgroup 의 USABLE_FILE_MB, OFFLINE_DISKS
+--   USABLE_FILE_MB 가 양수이고 OFFLINE_DISKS 가 0
+--   음수이거나 OFFLINE 디스크가 있으면 원인 조사 후 디스크 복구
+
+-- 점검 스크립트 예 (root 로 실행)
+[root@rac1 ~]# {
+>   echo "=== $(date '+%F %T') ==="
+>   ocrcheck | grep -E 'ID|succeeded|Device/File Name'
+>   ocrcheck -local | grep -E 'ID|succeeded'
+>   ocrconfig -showbackup 2>&1 | head -4
+>   crsctl query css votedisk
+>   crsctl check cluster -all | grep -c online
+> } > /root/ch5_check_$(date '+%Y%m%d').txt
+
+--------------------------------------------------------------------------------
+ [6] 이 장에서 재현한 오류 코드 정리
+--------------------------------------------------------------------------------
+
+--   PROT-19   클러스터 가동 중 복원 불가        실습 07
+--   PROT-20   grid 계정의 변경 시도             실습 01, 03
+--   PROT-24   자동 백업 없음                    실습 02
+--   PROT-25   수동 백업 없음                    실습 02
+--   PROT-28   마지막 한 벌 삭제 시도            실습 04
+--   PROT-29   이미 등록된 위치 추가             실습 04
+--   PROT-30   쓸 수 없는 위치                   실습 04
+--   PROC-50   해당 노드에서 접근 불가           실습 04
+--   PROT-42   유효하지 않은 저장소 종류         실습 03
+--   PROT-58   export 성공                       실습 03
+--   CRS-4258  ASM 관리 Voting File 개별 조작    실습 05
+--   CRS-4261  같은 디스크그룹으로 replace       실습 05
+--   CRS-4266  replace 성공                      실습 05
+--   CRS-4628  실패 후 롤백 성공                 실습 05
+--   CRS-4648  Voting File 생성 실패             실습 05
+--   ORA-15001 디스크그룹 없음 또는 미마운트     실습 05
+--   ORA-15032 일부 변경 미수행 (포괄)           실습 06
+--   ORA-15242 속성 설정 실패                    실습 06
+--   ORA-15244 호환성 하향 시도                  실습 06
+--   ORA-15283 compatible.rdbms 부족             실습 06
+--
+-- PROT-58 과 CRS-4266, CRS-4628 은 성공 또는 보증 메시지다.
+-- 코드 접두어가 PROT- 나 CRS- 라고 해서 모두 오류가 아니다.
+
+--------------------------------------------------------------------------------
+ [7] 최종 상태 확인
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# ocrcheck | grep -E 'ID|Device/File Name'
+         ID                       :  665666554
+         Device/File Name         :       +CRS
+[root@rac1 ~]# crsctl query css votedisk
+ 1. ONLINE   e6a57fb460704f3abfbb19eac915bad6 (/dev/asmdisk/crs1) [CRS]
+ 2. ONLINE   be1b37d29fa34fcdbf72f6a2c7bd59b7 (/dev/asmdisk/crs2) [CRS]
+ 3. ONLINE   da88767cf5414f5cbf24612ef531394e (/dev/asmdisk/crs3) [CRS]
+Located 3 voting disk(s).
+[root@rac1 ~]# crsctl check cluster -all | grep -c online
+6
+[root@rac1 ~]# srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+
+-- 이 장을 시작할 때와 비교해 달라진 것
+--   OCR 의 ASM 파일 번호   1242760249 -> 1242835837  (실습 04)
+--   Voting FUID            세 개 모두 교체           (실습 05, 06)
+--   compatible.rdbms       10.1 -> 11.2              (실습 06, 되돌릴 수 없음)
+--   OCR 백업               0벌 -> 3벌                (실습 03)
+--   논리적 export          없음 -> /root/ocr_ch5.dmp (실습 03)
+--
+-- 앞의 셋은 작업의 결과이고 뒤의 둘은 이 장의 성과다. 이 장을 시작할 때
+-- 우리 클러스터에는 되돌릴 수단이 하나도 없었다. 지금은 물리적 백업 세 벌과
+-- 논리적 export 한 벌이 있다.
+
+--------------------------------------------------------------------------------
+ [8] 정리
+--------------------------------------------------------------------------------
+
+-- 확인한 것
+--   1) -restore, -import, -repair 가 모두 PROT-19 로 막힌다
+--   2) 세 명령이 같은 메시지로 막히는 것은 공통 전제 때문이다
+--   3) 실패한 세 명령이 구성을 전혀 바꾸지 않았다
+--   4) ocrconfig 의 명령 체계는 -local 유무로 OCR/OLR 대칭을 이룬다
+--   5) 배타 모드는 ASM 은 띄우고 crsd 는 띄우지 않는 특수 상태다
+--   6) Voting File 은 복원이 아니라 재생성으로 되살린다
+--
+-- 작성한 산출물
+--   시나리오 A~G 복구 절차서
+--   항목·명령·판정 기준·조치의 네 칸 주기 점검표
+--   이 장에서 재현한 오류 코드 20종 목록
+--
+-- 마지막 당부
+--   설치가 끝난 직후 ocrconfig -manualbackup 과 ocrconfig -export 를 한 번
+--   실행하라. 5분이면 된다. 백업이 없는 상태에서 OCR 을 잃으면 복구 방법이
+--   없고 클러스터 재구축뿐이다.
+================================================================================
+ 실습 07 종료
+================================================================================

@@ -1,0 +1,515 @@
+================================================================================
+ 제5장 실습 06 — 디스크 강제 OFFLINE  (파괴적 ⚠)
+ 대상   : rac1, rac2
+ 목표   : Voting File 을 담은 디스크를 실제로 내리고 클러스터의 반응을
+          관찰한다. 그 전에 ORA-15283 을 만나 원인을 진단한다
+ 소요   : 약 40분
+ 선행   : 공유 디스크 백업이 확보되어 있을 것 (아래 [0] 참조)
+ 계정   : root, grid
+ 주의   : 이 실습만 되돌릴 수 없는 변경(compatible.rdbms 상향)을 남긴다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 안전망 확보 — 반드시 먼저 한다
+--------------------------------------------------------------------------------
+
+-- VMware 스냅샷은 공유 디스크를 담지 않는다. 공유 디스크는
+-- independent-persistent 로 붙어 있어 스냅샷 대상에서 제외되기 때문이다.
+-- 스냅샷을 찍었다고 안심하면 안 된다.
+--
+-- 절차 (호스트에서)
+--   1) srvctl stop database -d racdb -o immediate
+--   2) 두 노드에서 crsctl stop crs
+--   3) 두 노드 OS 종료
+--   4) D:\RAC\SHARED 의 crs1/crs2/crs3 (각 4GB, 합계 12GB) 를 복사
+--   5) 두 노드 부팅, 클러스터와 DB 정상 확인
+--
+-- 이 교안을 만들 때 실제로 이 절차를 거쳤다. 정지에 rac1 4.2분, rac2 1.1분,
+-- 복사에 2분 36초가 걸렸다.
+
+[root@rac1 ~]# crsctl check cluster -all | grep -c online
+6
+[root@rac1 ~]# srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+[root@rac1 ~]# crsctl query css votedisk
+ 1. ONLINE   e6a57fb460704f3abfbb19eac915bad6 (/dev/asmdisk/crs1) [CRS]
+ 2. ONLINE   be1b37d29fa34fcdbf72f6a2c7bd59b7 (/dev/asmdisk/crs2) [CRS]
+ 3. ONLINE   038ff9924acb4f74bf7373f4a62bdeb3 (/dev/asmdisk/crs3) [CRS]
+Located 3 voting disk(s).
+
+-- 백업 후 클러스터가 정상 복귀했음을 확인하고 시작한다.
+
+--------------------------------------------------------------------------------
+ [1] 표준 명령을 실행한다 — 오류 재현
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> alter diskgroup CRS offline disk CRS_0002;
+alter diskgroup CRS offline disk CRS_0002
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-15283: ASM operation requires compatible.rdbms of 11.1.0.0.0 or higher
+
+-- 오류 : ORA-15032, ORA-15283
+-- 원인 파악 : ORA-15032 는 "요청한 변경을 전부 수행하지 못했다" 는 포괄
+--             메시지다. 결과만 알려 줄 뿐 원인이 없다. 진짜 이유는 함께
+--             나온 ORA-15283 이다. 이 작업에는 compatible.rdbms 가 11.1
+--             이상이어야 한다.
+-- 조치     : 디스크그룹 속성을 확인한다.
+
+SQL> select name, value from v$asm_attribute
+  2   where group_number = (select group_number from v$asm_diskgroup where name='CRS')
+  3     and name like 'compatible%';
+
+NAME                VALUE
+------------------- ------------
+compatible.asm      19.0.0.0.0
+compatible.rdbms    10.1.0.0.0
+
+-- compatible.asm 은 19.0.0.0.0 인데 compatible.rdbms 만 10.1.0.0.0 이다.
+--
+-- 왜 그런가. 4장에서 사용한 응답 파일 gridsetup.rsp 를 보면 답이 나온다.
+--   oracle.install.asm.diskGroup.redundancy=NORMAL
+--   oracle.install.asm.diskGroup.AUSize=4
+-- 중복도와 AU 크기는 지정했지만 compatible 계열 항목이 없다. 지정하지 않으면
+-- ASM 은 compatible.rdbms 에 가장 낮은 값인 10.1.0.0.0 을 넣는다.
+--
+-- 19c 로 설치했으니 모든 기능이 켜져 있으리라 생각하기 쉽지만, 디스크그룹
+-- 속성은 설치 버전과 무관하게 기본값을 따른다. 디스크 OFFLINE/ONLINE, 즉
+-- fast mirror resync 는 11.1 에서 들어온 기능이라 막혀 있었다.
+--
+-- 재확인   : alert.log 에도 같은 기록이 남았는지 본다.
+
+[grid@rac1 ~]$ tail -6 /u01/app/grid/diag/asm/+asm/+ASM1/trace/alert_+ASM1.log
+2026-09-01T16:12:52.753869+09:00
+SQL> alter diskgroup CRS offline disk CRS_0002
+2026-09-01T16:12:52.773096+09:00
+ORA-15032: not all alterations performed
+ORA-15283: ASM operation requires compatible.rdbms of 11.1.0.0.0 or higher
+ERROR: alter diskgroup CRS offline disk CRS_0002
+
+-- 디스크 상태도 확인한다. 아무것도 바뀌지 않았다.
+SQL> select name, mode_status, state, voting_file from v$asm_disk
+  2   where group_number=(select group_number from v$asm_diskgroup where name='CRS')
+  3   order by disk_number;
+
+NAME       MODE_ST STATE  V
+---------- ------- ------ -
+CRS_0000   ONLINE  NORMAL Y
+CRS_0001   ONLINE  NORMAL Y
+CRS_0002   ONLINE  NORMAL Y
+
+--------------------------------------------------------------------------------
+ [2] 속성 상향 — 되돌릴 수 없음을 먼저 확인한다
+--------------------------------------------------------------------------------
+
+-- 상향하기 전에, 같은 값으로 설정하면 어떻게 되는지 본다.
+
+SQL> alter diskgroup CRS set attribute 'compatible.rdbms'='10.1.0.0.0';
+
+Diskgroup altered.
+
+-- 성공한다. 현재 값과 같으므로 실질적인 변경이 없기 때문이다.
+-- 이 결과를 기억해 둔다. 잠시 뒤 같은 명령이 실패한다.
+
+SQL> alter diskgroup CRS set attribute 'compatible.rdbms'='11.2.0.0.0';
+
+Diskgroup altered.
+
+SQL> select name, value from v$asm_attribute
+  2   where group_number = (select group_number from v$asm_diskgroup where name='CRS')
+  3     and name like 'compatible%';
+
+NAME                VALUE
+------------------- ------------
+compatible.asm      19.0.0.0.0
+compatible.rdbms    11.2.0.0.0
+
+-- 11.2 로 올렸다. 왜 19.0 이 아니라 11.2 인가.
+-- 필요한 최소 값만 올리는 것이 원칙이다. ORA-15283 이 요구한 것은 11.1
+-- 이상이고, 19.0 까지 올리면 데이터베이스 쪽 호환성 제약이 함께 걸린다.
+
+-- 이제 다시 낮춰 본다.
+SQL> alter diskgroup CRS set attribute 'compatible.rdbms'='10.1.0.0.0';
+alter diskgroup CRS set attribute 'compatible.rdbms'='10.1.0.0.0'
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-15242: could not set attribute compatible.rdbms
+ORA-15244: new compatibility setting less than current [11.2.0.0.0]
+
+-- 오류 : ORA-15242, ORA-15244
+-- 원인 파악 : 조금 전에는 같은 명령이 성공했다. 그때는 현재 값이 10.1 이라
+--             같은 값 설정이었고, 지금은 11.2 에서 10.1 로 낮추는 것이다.
+--             compatible 속성은 올릴 수만 있고 낮출 수 없다.
+-- 조치     : 낮추려면 디스크그룹을 삭제하고 다시 만드는 수밖에 없다.
+--             그런데 +CRS 에는 OCR 과 Voting File 이 들어 있다. 삭제한다는
+--             것은 클러스터를 재구축한다는 뜻이다. 실질적으로 되돌릴 수 없다.
+-- 재확인   : 값이 11.2 로 유지되고 있는지 확인한다. 실패한 명령이 값을
+--             건드리지 않았다.
+
+-- ※ 이 장의 다른 모든 실습은 원상 복구된다. 이 한 가지만 예외다.
+--    실습 시작 전 [0] 의 공유 디스크 백업이 필요한 이유 중 하나가 이것이다.
+
+--------------------------------------------------------------------------------
+ [3] 디스크를 내린다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ date '+%H:%M:%S'
+16:14:27
+
+SQL> alter diskgroup CRS offline disk CRS_0002;
+
+Diskgroup altered.
+
+-- 성공했다. 15초 기다린 뒤 상태를 본다.
+-- 곧바로 조회하면 안 되는 이유는 [5] 에서 설명한다.
+
+SQL> select name, path, mode_status, state, repair_timer, voting_file
+  2    from v$asm_disk
+  3   where group_number = (select group_number from v$asm_diskgroup where name='CRS')
+  4   order by disk_number;
+
+NAME       PATH                MODE_ST STATE  REPAIR_TIMER V
+---------- ------------------- ------- ------ ------------ -
+CRS_0000   /dev/asmdisk/crs1   ONLINE  NORMAL            0 Y
+CRS_0001   /dev/asmdisk/crs2   ONLINE  NORMAL            0 Y
+CRS_0002                       OFFLINE NORMAL            0 N
+
+-- 세 가지가 바뀌었다.
+--   MODE_STATUS   ONLINE -> OFFLINE
+--   PATH          /dev/asmdisk/crs3 -> (빈 값)
+--   VOTING_FILE   Y -> N
+--
+-- PATH 가 비었다고 디스크가 사라진 것이 아니다. 물리적으로는
+-- /dev/asmdisk/crs3 이 그대로 있다. ASM 이 그 디스크를 더 이상 열어 두지
+-- 않을 뿐이다.
+
+[grid@rac1 ~]$ ls -l /dev/asmdisk/crs3
+brw-rw----. 1 grid asmadmin 8, 49 Sep  1 15:52 /dev/asmdisk/crs3
+
+-- 장치는 그대로 있다. udev 규칙도 유효하다.
+
+SQL> select name, state, type, voting_files, offline_disks,
+  2         total_mb, free_mb, usable_file_mb
+  3    from v$asm_diskgroup where name = 'CRS';
+
+NAME  STATE    TYPE   V OFFLINE_DISKS  TOTAL_MB  FREE_MB USABLE_FILE_MB
+----- -------- ------ - ------------- --------- -------- --------------
+CRS   MOUNTED  NORMAL Y             1     12288    11364           3634
+
+-- 디스크그룹은 여전히 MOUNTED 다. OFFLINE_DISKS 가 1로 올라갔다.
+-- TOTAL_MB 는 12288 그대로다. 내려간 디스크도 여전히 디스크그룹 구성원이기
+-- 때문이다. 제거된 것이 아니라 일시적으로 접근 불가로 표시된 상태다.
+--
+-- USABLE_FILE_MB 3634 를 눈여겨본다. 이 값은 "지금 이 상태에서 디스크 한 장을
+-- 더 잃어도 살아남으려면 얼마나 쓸 수 있는가" 를 뜻한다. 양수이므로 아직
+-- 여유가 있다. 음수라면 추가 손실 시 복구가 불가능하다는 신호다.
+
+--------------------------------------------------------------------------------
+ [4] Voting File 은 2개가 되었다
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl query css votedisk
+##  STATE    File Universal Id                File Name Disk group
+--  -----    -----------------                --------- ---------
+ 1. ONLINE   e6a57fb460704f3abfbb19eac915bad6 (/dev/asmdisk/crs1) [CRS]
+ 2. ONLINE   be1b37d29fa34fcdbf72f6a2c7bd59b7 (/dev/asmdisk/crs2) [CRS]
+Located 2 voting disk(s).
+
+[root@rac2 ~]# crsctl query css votedisk
+ 1. ONLINE   e6a57fb460704f3abfbb19eac915bad6 (/dev/asmdisk/crs1) [CRS]
+ 2. ONLINE   be1b37d29fa34fcdbf72f6a2c7bd59b7 (/dev/asmdisk/crs2) [CRS]
+Located 2 voting disk(s).
+
+-- 3개에서 2개가 되었다. 그리고 3개 중 2개는 과반수다.
+-- 두 노드가 같은 2개를 보고 있다. 인식이 갈리지 않았다.
+
+[root@rac1 ~]# crsctl check cluster -all
+**************************************************************
+rac1:
+CRS-4537: Cluster Ready Services is online
+CRS-4529: Cluster Synchronization Services is online
+CRS-4533: Event Manager is online
+**************************************************************
+rac2:
+CRS-4537: Cluster Ready Services is online
+CRS-4529: Cluster Synchronization Services is online
+CRS-4533: Event Manager is online
+**************************************************************
+
+[root@rac1 ~]# srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+
+[root@rac1 ~]# ocrcheck | head -8
+Status of Oracle Cluster Registry is as follows :
+         Version                  :          4
+         Total space (kbytes)     :     491684
+         Used space (kbytes)      :      84240
+         Available space (kbytes) :     407444
+         ID                       :  665666554
+         Device/File Name         :       +CRS
+                                    Device/File integrity check succeeded
+
+-- 디스크 한 장을 잃었는데 클러스터도 데이터베이스도 OCR 도 모두 정상이다.
+-- Normal 중복도가 디스크 한 장 손실을 견딘다는 설계가 실제로 동작했다.
+-- OCR 도 +CRS 에 있지만 미러 사본이 남은 두 디스크에 있으므로 문제가 없다.
+
+--------------------------------------------------------------------------------
+ [5] ASM 은 무엇을 했는가
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ tail -25 /u01/app/grid/diag/asm/+asm/+ASM1/trace/alert_+ASM1.log
+NOTE: DRTimer CD Create:  for disk group 1 disks:
+ 2
+NOTE: process _user4368_+asm1 (4368) initiating offline of disk 2.4042308524
+      (CRS_0002) with mask 0x7e in group 1 (CRS) without client assisting
+NOTE: initiating PST update: grp 1 (CRS), dsk = 2/0xf0f0bbac, mask = 0x6a,
+      op = clear mandatory
+2026-09-01T16:14:27.928526+09:00
+GMON updating disk modes for group 1 at 32 for pid 47, osid 4368
+cluster guid (35f3a1f5ccb64f82ff10a3f12d15a42a) generated for PST Hbeat for instance 1
+NOTE: PST update grp = 1 completed successfully
+NOTE: initiating PST update: grp 1 (CRS), dsk = 2/0xf0f0bbac, mask = 0x7e,
+      op = clear mandatory
+GMON updating disk modes for group 1 at 33 for pid 47, osid 4368
+NOTE: cache closing disk 2 of grp 1: CRS_0002
+NOTE: PST update grp = 1 completed successfully
+NOTE: DRTimer CD Destroy: for diskgroup 1
+2026-09-01T16:14:28.015372+09:00
+SUCCESS: alter diskgroup CRS offline disk CRS_0002
+2026-09-01T16:14:28.843610+09:00
+NOTE: Attempting voting file refresh on diskgroup CRS
+NOTE: Refresh completed on diskgroup CRS. Found 3 voting file(s).
+NOTE: Voting file relocation is required in diskgroup CRS
+2026-09-01T16:14:32.044594+09:00
+NOTE: Attempting voting file relocation on diskgroup CRS
+NOTE: Successful voting file relocation on diskgroup CRS
+
+-- 읽는 순서
+--   1) PST(Partner Status Table) 갱신. GMON 프로세스가 수행한다
+--      PST 는 어느 디스크가 어느 디스크의 미러 파트너인지, 각 디스크의 상태가
+--      어떤지를 담은 ASM 내부 구조다
+--   2) op = clear mandatory. Voting File 디스크의 mandatory 속성 해제
+--   3) cache closing disk. ASM 이 디스크를 닫는다
+--   4) SUCCESS: alter diskgroup ... offline. 여기까지가 OFFLINE 작업
+--   5) 16:14:28 refresh -> Found 3 voting file(s). 아직 3개다
+--   6) Voting file relocation is required 판단
+--   7) 16:14:32 재배치 수행 -> 여기서 2개가 된다
+--
+-- (5)~(7)이 중요하다. 디스크 OFFLINE 과 Voting File 조정은 별개 단계이고
+-- 사이에 약 4초의 시차가 있었다. OFFLINE 직후 곧바로 crsctl query 를 실행하면
+-- 아직 3개로 보일 수 있다. 이것을 문제로 오해하지 않도록 잠시 기다린 뒤
+-- 확인해야 한다.
+--
+-- without client assisting 은 데이터베이스 인스턴스의 협조 없이 ASM 단독으로
+-- 처리했다는 뜻이다. +CRS 에는 데이터베이스 파일이 없으므로 클라이언트가 없다.
+
+--------------------------------------------------------------------------------
+ [6] repair_timer 가 0인 이유
+--------------------------------------------------------------------------------
+
+-- 일반적인 ASM 디스크를 내리면 REPAIR_TIMER 가 흐르기 시작한다.
+-- DISK_REPAIR_TIME 안에 다시 올리면 변경분만 재동기화하고, 넘기면 디스크가
+-- 강제로 제거되어 전체 리밸런스가 일어난다.
+
+SQL> select name, value from v$asm_attribute
+  2   where group_number = (select group_number from v$asm_diskgroup where name='CRS')
+  3     and name like '%repair%';
+
+NAME                    VALUE
+----------------------- ------
+disk_repair_time        12.0h
+failgroup_repair_time   24.0h
+
+-- 12시간이면 넉넉하다. 그런데 1분을 기다려도 타이머가 움직이지 않는다.
+
+SQL> select name, mode_status, repair_timer from v$asm_disk
+  2   where group_number = (select group_number from v$asm_diskgroup where name='CRS')
+  3   order by disk_number;
+
+NAME       MODE_ST REPAIR_TIMER
+---------- ------- ------------
+CRS_0000   ONLINE             0
+CRS_0001   ONLINE             0
+CRS_0002   OFFLINE            0
+
+-- 이유는 alert.log 의 op = clear mandatory 에 있다.
+-- Voting File 을 담은 디스크는 mandatory 속성을 갖는다. 그 속성이 해제된
+-- 디스크에는 통상적인 repair timer 가 적용되지 않는다. Voting File 은 이미
+-- 재배치로 처리되었으므로 타이머로 관리할 대상이 아니다.
+--
+-- 설정을 잘못한 것이 아니다. alert.log 를 함께 읽지 않으면 설명할 수 없는
+-- 현상이다.
+
+--------------------------------------------------------------------------------
+ [7] 복구 — 디스크를 다시 올린다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ date '+%H:%M:%S'
+16:15:50
+
+SQL> alter diskgroup CRS online disk CRS_0002;
+
+Diskgroup altered.
+
+-- 리밸런스가 끝날 때까지 v$asm_operation 을 폴링한다.
+SQL> select operation, state, sofar, est_work, est_minutes from v$asm_operation;
+
+no rows selected
+
+-- 우리 환경에서는 20초 안에 끝났다. 디스크그룹이 12GB 로 작기 때문이다.
+-- 운영 환경에서는 수십 분이 걸릴 수 있으므로 이 조회로 진행률을 본다.
+
+SQL> select name, path, mode_status, state, repair_timer, voting_file
+  2    from v$asm_disk
+  3   where group_number = (select group_number from v$asm_diskgroup where name='CRS')
+  4   order by disk_number;
+
+NAME       PATH                MODE_ST STATE  REPAIR_TIMER V
+---------- ------------------- ------- ------ ------------ -
+CRS_0000   /dev/asmdisk/crs1   ONLINE  NORMAL            0 Y
+CRS_0001   /dev/asmdisk/crs2   ONLINE  NORMAL            0 Y
+CRS_0002   /dev/asmdisk/crs3   ONLINE  NORMAL            0 Y
+
+SQL> select name, state, voting_files, offline_disks from v$asm_diskgroup where name='CRS';
+
+NAME  STATE    V OFFLINE_DISKS
+----- -------- - -------------
+CRS   MOUNTED  Y             0
+
+-- PATH 가 돌아왔고 VOTING_FILE 이 다시 Y 가 되었으며 OFFLINE_DISKS 는 0이다.
+
+--------------------------------------------------------------------------------
+ [8] FUID 가 바뀌었다 — 실패인가
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl query css votedisk
+##  STATE    File Universal Id                File Name Disk group
+--  -----    -----------------                --------- ---------
+ 1. ONLINE   e6a57fb460704f3abfbb19eac915bad6 (/dev/asmdisk/crs1) [CRS]
+ 2. ONLINE   be1b37d29fa34fcdbf72f6a2c7bd59b7 (/dev/asmdisk/crs2) [CRS]
+ 3. ONLINE   da88767cf5414f5cbf24612ef531394e (/dev/asmdisk/crs3) [CRS]
+Located 3 voting disk(s).
+
+-- 실습 05 종료 시점의 값과 대조한다.
+--
+--   1번  e6a57fb460704f3abfbb19eac915bad6   그대로
+--   2번  be1b37d29fa34fcdbf72f6a2c7bd59b7   그대로
+--   3번  038ff9924acb4f74bf7373f4a62bdeb3 -> da88767cf5414f5cbf24612ef531394e
+--
+-- 3번만 바뀌었다. 실패가 아니다.
+-- Voting File 은 되살아나는 것이 아니라 새로 만들어진다. 디스크가 돌아오면
+-- ASM 이 그 디스크에 Voting File 을 새로 배치하고 새 FUID 를 부여한다.
+--
+-- 그렇다면 FUID 기록은 왜 남기는가. 무엇이 바뀌고 무엇이 그대로인지를
+-- 구분하기 위해서다. 1번과 2번이 그대로라는 사실이 재배치 범위가 3번 디스크에
+-- 한정되었음을 증명한다. 만약 세 개가 모두 바뀌었다면 전체 재배치가 일어난
+-- 것이므로 원인을 따로 확인해야 한다.
+--
+-- 올바른 복구 판정 기준
+--   1) 개수가 원래대로인가            Located 3 voting disk(s)
+--   2) 모든 항목의 STATE 가 ONLINE 인가
+--   3) v$asm_disk 의 MODE_STATUS ONLINE, VOTING_FILE Y, OFFLINE_DISKS 0
+
+--------------------------------------------------------------------------------
+ [9] 복구 과정의 alert.log
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ tail -22 /u01/app/grid/diag/asm/+asm/+ASM1/trace/alert_+ASM1.log
+2026-09-01T16:15:59.467297+09:00
+NOTE: Attempting voting file relocation on diskgroup CRS
+NOTE: Successful voting file relocation on diskgroup CRS
+2026-09-01T16:16:05.900071+09:00
+NOTE: initiating PST update: grp 1 (CRS), dsk = 2/0x0, mask = 0x7f,
+      op = assign mandatory
+GMON updating disk modes for group 1 at 43 for pid 41, osid 5698
+NOTE: PST update grp = 1 completed successfully
+NOTE: reset timers for disk: 2
+NOTE: completed online of disk group 1 disks
+CRS_0002 (2)
+2026-09-01T16:16:06.250076+09:00
+NOTE: stopping process ARBA
+NOTE: stopping process ARB0
+NOTE: Starting expel slave for group 1/0x2cc04b53 (CRS)
+NOTE: GroupBlock outside rolling migration privileged region
+NOTE: requesting all-instance membership refresh for group=1
+NOTE: membership refresh pending for group 1/0x2cc04b53 (CRS)
+GMON querying group 1 at 44 for pid 26, osid 6314
+SUCCESS: refreshed membership for 1/0x2cc04b53 (CRS)
+2026-09-01T16:16:08.548639+09:00
+SUCCESS: rebalance completed for group 1/0x2cc04b53 (CRS)
+NOTE: Attempting voting file refresh on diskgroup CRS
+NOTE: Refresh completed on diskgroup CRS. Found 3 voting file(s).
+
+-- 내릴 때와 정확히 대칭이다.
+--
+--   내릴 때   op = clear mandatory
+--   올릴 때   op = assign mandatory
+--
+-- reset timers for disk: 2 는 repair timer 초기화다.
+-- ARB0, ARBA 는 리밸런스를 수행하는 백그라운드 프로세스이고, 작업이 끝나자
+-- stopping process 로 종료되었다.
+-- all-instance membership refresh 는 rac2 의 ASM 인스턴스에도 변경을
+-- 알린 것이다.
+-- 마지막 refresh 가 Found 3 voting file(s) 로 복구를 확인한다.
+
+--------------------------------------------------------------------------------
+ [10] 최종 상태 대조
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl check cluster -all | grep -c online
+6
+[root@rac1 ~]# srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+[root@rac1 ~]# ocrcheck | grep ID
+         ID                       :  665666554
+[root@rac1 ~]# crsctl query css votedisk | tail -1
+Located 3 voting disk(s).
+
+-- 실습 01 의 기준과 대조한다.
+--   OCR ID        665666554        일치
+--   Voting 개수   3                일치
+--   CRS online    6줄              일치
+--   인스턴스      2개 running      일치
+--
+-- 달라진 것 (모두 설명 가능한 변화)
+--   Voting FUID       3번만 da88767c... 로 교체
+--   compatible.rdbms  10.1.0.0.0 -> 11.2.0.0.0  (되돌릴 수 없음)
+
+--------------------------------------------------------------------------------
+ [11] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류
+--   ORA-15032 / ORA-15283   compatible.rdbms 가 11.1 미만
+--   ORA-15242 / ORA-15244   compatible 속성 하향 시도
+--
+-- 확인한 것
+--   1) 19c 로 설치해도 compatible.rdbms 기본값은 10.1 이다
+--   2) 응답 파일에 항목이 없으면 ASM 이 가장 낮은 값을 넣는다
+--   3) compatible 속성은 올릴 수만 있고 낮출 수 없다
+--   4) 같은 값 설정은 성공하지만 낮추면 ORA-15244 다
+--   5) 디스크를 내리면 MODE_STATUS OFFLINE, PATH 빈 값, VOTING_FILE N
+--   6) TOTAL_MB 는 그대로다. 제거가 아니라 접근 불가 표시다
+--   7) USABLE_FILE_MB 가 줄어든다. 3634 였다
+--   8) Voting File 이 2개가 되었지만 과반수라 클러스터는 정상이다
+--   9) OFFLINE 과 Voting File 재배치는 별개 단계다. 약 4초 시차가 있었다
+--  10) Voting File 디스크는 mandatory 속성 때문에 repair timer 가 흐르지 않는다
+--  11) 복구 시 그 디스크의 FUID 는 새로 부여된다. 정상이다
+--  12) alert.log 의 clear mandatory 와 assign mandatory 가 대칭을 이룬다
+--
+-- 실무 체크리스트 (디스크 교체 전)
+--   USABLE_FILE_MB 가 양수인가
+--   해당 디스크가 VOTING_FILE=Y 인가
+--   중복도가 Normal 이상인가
+--   DISK_REPAIR_TIME 이 작업 시간보다 긴가
+--   작업 전후 crsctl query css votedisk 로 FUID 를 기록했는가
+================================================================================
+ 실습 06 종료
+================================================================================
