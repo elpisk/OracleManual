@@ -1,0 +1,261 @@
+================================================================================
+ 제3장 실습 05 — udev 규칙과 권한
+ 대상   : rac1 / rac2
+ 목표   : udev 규칙 한 줄의 구성 요소를 분석하고, 링크와 대상 파일의 권한을
+          정확히 확인하며, 두 노드의 결과를 대조한다
+ 소요   : 약 25분
+ 선행   : udev 규칙이 적용되어 있을 것
+ 계정   : root, grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 규칙 파일 한 줄 뜯어 읽기
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# head -1 /etc/udev/rules.d/99-oracle-asmdisk.rules
+KERNEL=="sd?", SUBSYSTEM=="block", PROGRAM=="/lib/udev/scsi_id -g -u -d $devnode", RESULT=="36000c29895fb6f08c44ceae9d85133a2", SYMLINK+="asmdisk/crs1", OWNER="grid", GROUP="asmadmin", MODE="0660"
+
+-- 항목별로 끊어 본다.
+--
+--   KERNEL=="sd?"
+--     sda~sdz 형태의 디바이스에만 적용한다. sda1 같은 파티션은 제외된다.
+--
+--   SUBSYSTEM=="block"
+--     블록 디바이스로 한정한다.
+--
+--   PROGRAM=="/lib/udev/scsi_id -g -u -d $devnode"
+--     이 명령을 실행하고 그 출력을 다음 조건과 비교한다.
+--     $devnode 는 udev 가 현재 처리 중인 디바이스 경로로 치환된다.
+--
+--   RESULT=="36000c29895fb6f08c44ceae9d85133a2"
+--     PROGRAM 의 출력이 이 값과 같을 때만 아래 항목을 적용한다.
+--     여기가 WWN 매칭 지점이다.
+--
+--   SYMLINK+="asmdisk/crs1"
+--     /dev/asmdisk/crs1 링크를 만든다. += 이므로 기존 링크에 더한다.
+--
+--   OWNER="grid"  GROUP="asmadmin"  MODE="0660"
+--     디바이스 파일의 소유권과 권한. ASM 인스턴스가 grid 계정으로 돌고
+--     asmadmin 그룹 권한으로 디스크를 열기 때문에 이 조합이 필요하다.
+
+[root@rac1 ~]# grep -c . /etc/udev/rules.d/99-oracle-asmdisk.rules
+8
+
+[root@rac1 ~]# grep -o 'asmdisk/[a-z0-9]*' /etc/udev/rules.d/99-oracle-asmdisk.rules
+asmdisk/crs1
+asmdisk/crs2
+asmdisk/crs3
+asmdisk/data1
+asmdisk/data2
+asmdisk/data3
+asmdisk/fra1
+asmdisk/fra2
+
+-- 여덟 줄. 공유 디스크 여덟 개에 하나씩이다.
+-- 100GB OS 디스크는 포함되지 않았다.
+
+--------------------------------------------------------------------------------
+ [2] 규칙 생성 스크립트가 OS 디스크를 걸러 내는 방법
+--------------------------------------------------------------------------------
+
+-- 규칙을 손으로 여덟 줄 쓰면 오타가 나기 쉽다. 스크립트로 만든다.
+-- 핵심은 case 문이다.
+--
+--   ci=1; di=1; fi=1
+--   for d in /dev/sd?; do
+--     sz=$(lsblk -bdno SIZE $d); gb=$((sz/1073741824))
+--     id=$(/lib/udev/scsi_id -g -u -d $d)
+--     [ -z "$id" ] && continue
+--     case $gb in
+--       4)  name="crs${ci}";  ci=$((ci+1)) ;;
+--       20) name="data${di}"; di=$((di+1)) ;;
+--       12) name="fra${fi}";  fi=$((fi+1)) ;;
+--       *)  continue ;;
+--     esac
+--     echo "KERNEL==... RESULT==\"$id\" SYMLINK+=\"asmdisk/$name\" ..." >> $RULE
+--   done
+--
+-- case 의 *) continue 가 OS 디스크를 걸러 낸다. 100GB 는 4, 20, 12 어디에도
+-- 해당하지 않아 건너뛴다. 링크드 클론 환경에서 OS 디스크의 WWN 이 노드 간에
+-- 같더라도 이 조건이 막아 준다.
+
+[root@rac1 ~]# lsblk /dev/sda
+NAME        MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+sda           8:0    0  100G  0 disk
+├─sda2        8:2    0   99G  0 part
+│ ├─ol-swap 252:1    0 15.6G  0 lvm  [SWAP]
+│ └─ol-root 252:0    0 83.4G  0 lvm  /
+└─sda1        8:1    0 1000M  0 part /boot
+
+-- sda 에는 /boot 와 루트 LVM, 스왑이 있다. 명백히 OS 디스크다.
+-- 여기에 ASM 헤더를 쓰면 노드가 부팅하지 못한다.
+
+--------------------------------------------------------------------------------
+ [3] 적용
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# udevadm control --reload-rules
+[root@rac1 ~]# udevadm trigger --type=devices --action=change
+[root@rac1 ~]# sleep 3
+
+-- reload-rules 는 udev 데몬에게 규칙 파일을 다시 읽으라고 알린다.
+-- trigger 는 이미 존재하는 디바이스에 대해 이벤트를 다시 발생시킨다.
+-- 새 규칙은 다음 이벤트부터 적용되므로 trigger 없이는 재부팅해야 반영된다.
+
+--------------------------------------------------------------------------------
+ [4] 확인 — 링크와 대상의 권한은 다르다
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# ls -l /dev/asmdisk/
+total 0
+lrwxrwxrwx. 1 root root 6 Sep  1 14:23 crs1  -> ../sdb
+lrwxrwxrwx. 1 root root 6 Sep  1 14:23 crs2  -> ../sdc
+lrwxrwxrwx. 1 root root 6 Sep  1 14:25 crs3  -> ../sdd
+lrwxrwxrwx. 1 root root 6 Sep  1 14:25 data1 -> ../sde
+lrwxrwxrwx. 1 root root 6 Sep  1 14:25 data2 -> ../sdf
+lrwxrwxrwx. 1 root root 6 Sep  1 14:23 data3 -> ../sdg
+lrwxrwxrwx. 1 root root 6 Sep  1 14:25 fra1  -> ../sdh
+lrwxrwxrwx. 1 root root 6 Sep  1 14:25 fra2  -> ../sdi
+
+-- 여기 보이는 lrwxrwxrwx root root 는 심볼릭 링크 자체의 정보다.
+-- 링크의 권한은 의미가 없다. ASM 이 여는 것은 링크가 가리키는 디바이스 파일이다.
+
+[root@rac1 ~]# ls -lL /dev/asmdisk/
+total 0
+brw-rw----. 1 grid asmadmin 8,  16 Sep  1 14:27 crs1
+brw-rw----. 1 grid asmadmin 8,  32 Sep  1 14:27 crs2
+brw-rw----. 1 grid asmadmin 8,  48 Sep  1 14:27 crs3
+brw-rw----. 1 grid asmadmin 8,  64 Sep  1 14:27 data1
+brw-rw----. 1 grid asmadmin 8,  80 Sep  1 14:27 data2
+brw-rw----. 1 grid asmadmin 8,  96 Sep  1 14:27 data3
+brw-rw----. 1 grid asmadmin 8, 112 Sep  1 14:27 fra1
+brw-rw----. 1 grid asmadmin 8, 128 Sep  1 14:27 fra2
+
+-- -L 을 붙이면 링크를 따라가 대상 파일의 정보를 보여 준다.
+--   b             블록 디바이스
+--   rw-rw----     0660. 소유자와 그룹만 읽고 쓸 수 있다
+--   grid asmadmin 규칙의 OWNER 와 GROUP 이 반영됐다
+--   8, 16         major, minor 번호. 8 은 SCSI 디스크, 16 은 sdb 다
+--
+-- 이 세 가지가 모두 맞아야 ASM 이 디스크를 연다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — ls -L 을 빠뜨렸을 때의 오판
+--------------------------------------------------------------------------------
+
+-- ASM 이 디스크를 못 연다는 신고를 받고 권한을 확인하는 상황을 재현한다.
+
+[root@rac1 ~]# ls -l /dev/asmdisk/crs1
+lrwxrwxrwx. 1 root root 6 Sep  1 14:23 /dev/asmdisk/crs1 -> ../sdb
+
+-- 여기서 흔한 오판이 나온다.
+--   "소유자가 root 이고 그룹도 root 다. grid 가 열 수 없다."
+--   → chown grid:asmadmin 을 실행하려 한다.
+
+-- 원인 파악
+--   ls -l 은 심볼릭 링크 자체를 보여 준다. 링크의 소유권과 권한은 리눅스에서
+--   의미를 갖지 않는다. 접근 판정은 링크가 가리키는 대상 파일의 권한으로 한다.
+--   확인은 -L 을 붙여서 한다.
+
+[root@rac1 ~]# ls -lL /dev/asmdisk/crs1
+brw-rw----. 1 grid asmadmin 8, 16 Sep  1 14:27 /dev/asmdisk/crs1
+
+--   대상 파일은 처음부터 grid:asmadmin 0660 이었다. 권한 문제가 아니다.
+--   ASM 이 못 여는 다른 원인을 찾아야 한다.
+
+-- 조치 — 확인 순서를 바로잡는다.
+--   1) ls -lL 로 대상 파일의 소유권과 권한
+--   2) ASM 의 발견 문자열이 이 경로를 포함하는지
+[grid@rac1 ~]$ asmcmd dsget
+parameter:/dev/asmdisk/*
+profile:/dev/asmdisk/*
+
+--   3) ASM 이 실제로 디스크를 인식하는지
+-- 여기서 계정을 잘못 쓰면 어떻게 되는지도 함께 확인한다.
+[oracle@rac1 ~]$ export ORACLE_HOME=/u01/app/19.3.0/grid
+[oracle@rac1 ~]$ export ORACLE_SID=+ASM1
+[oracle@rac1 ~]$ $ORACLE_HOME/bin/sqlplus -s / as sysasm
+ERROR:
+ORA-01017: invalid username/password; logon denied
+
+SP2-0157: unable to CONNECT to ORACLE after 3 attempts, exiting SQL*Plus
+
+[oracle@rac1 ~]$ $ORACLE_HOME/bin/asmcmd lsdg
+Connected to an idle instance.
+ASMCMD-8102: no connection to Oracle ASM; command requires Oracle ASM to run
+
+--   ORA-01017 은 OS 인증이 거부됐다는 뜻이다. / as sysasm 은 접속하는 OS
+--   계정이 asmadmin 그룹에 속해 있을 때만 통과한다. oracle 은 asmdba 에는
+--   있지만 asmadmin 에는 없다(실습 06 의 id 출력 참고).
+--   ASMCMD-8102 도 같은 원인이다. 접속하지 못했으니 idle instance 로 보인다.
+--   ASM 조회는 grid 계정으로 한다.
+
+[root@rac1 ~]# su - grid
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+SQL> SELECT path, header_status, mount_status FROM v$asm_disk ORDER BY path;
+
+PATH                       HEADER_STATU MOUNT_S
+-------------------------- ------------ -------
+/dev/asmdisk/crs1          MEMBER       CACHED
+/dev/asmdisk/crs2          MEMBER       CACHED
+/dev/asmdisk/crs3          MEMBER       CACHED
+/dev/asmdisk/data1         MEMBER       CACHED
+/dev/asmdisk/data2         MEMBER       CACHED
+/dev/asmdisk/data3         MEMBER       CACHED
+/dev/asmdisk/fra1          MEMBER       CACHED
+/dev/asmdisk/fra2          MEMBER       CACHED
+
+-- 재확인
+--   여덟 개 모두 MEMBER 이고 CACHED 다. ASM 이 정상적으로 열고 있다.
+--   권한 문제가 없었음이 확정된다.
+--
+-- 배운 것
+--   심볼릭 링크의 권한은 의미가 없다. 반드시 -L 을 붙여 대상 파일을 본다.
+--   이 한 글자 차이로 없던 문제를 만들고 시간을 버릴 수 있다.
+--   HEADER_STATUS 와 MOUNT_STATUS 는 6장에서 자세히 다룬다.
+
+--------------------------------------------------------------------------------
+ [6] 두 노드 대조
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# for h in rac1 rac2; do
+>   echo "===== $h ====="
+>   ssh $h 'for f in /dev/asmdisk/*; do
+>     printf "%-22s %s\n" $f $(/lib/udev/scsi_id -g -u -d $(readlink -f $f))
+>   done'
+> done
+===== rac1 =====
+/dev/asmdisk/crs1      36000c29895fb6f08c44ceae9d85133a2
+/dev/asmdisk/crs2      36000c29f6be51822332005c44b4352bd
+/dev/asmdisk/crs3      36000c29536db115b31143f96347fbe43
+/dev/asmdisk/data1     36000c29b21cbf101cf58984292a222c6
+/dev/asmdisk/data2     36000c29fcedbd7520d3d9c110bb3413b
+/dev/asmdisk/data3     36000c2976226c81c029d91038e5cfb24
+/dev/asmdisk/fra1      36000c294925c5c7b2df0386287d47f5d
+/dev/asmdisk/fra2      36000c299212006d4478b392df1de6e42
+===== rac2 =====
+(같은 값)
+
+-- 이름이 같은 링크가 같은 WWN 을 가리키는지 확인하는 것이 요점이다.
+-- 이름만 맞고 실제로는 다른 디스크를 가리키는 상황을 이 대조가 잡아낸다.
+--
+-- 이 실습 환경에서는 우연히 양쪽 모두 crs1 이 sdb 를 가리키지만
+-- 그것은 우연이고 보장은 WWN 이 한다.
+
+--------------------------------------------------------------------------------
+ [7] 정리
+--------------------------------------------------------------------------------
+
+-- 확인한 것
+--   1) 규칙 한 줄은 여덟 항목으로 이루어지며 RESULT 가 WWN 매칭 지점이다
+--   2) 스크립트의 case *) continue 가 OS 디스크를 걸러 낸다
+--   3) sda 에는 /boot 와 루트 LVM, 스왑이 있다
+--   4) reload-rules 와 trigger 를 함께 실행해야 즉시 반영된다
+--   5) ls -l 은 링크, ls -lL 은 대상 파일을 보여 준다
+--   6) 대상은 brw-rw---- grid asmadmin 이어야 한다
+--   7) 두 노드에서 같은 이름이 같은 WWN 을 가리키는지 대조한다
+--
+-- 이 실습은 조회만 했으므로 원상 복구할 것이 없다.
+================================================================================
+ 실습 05 종료
+================================================================================
