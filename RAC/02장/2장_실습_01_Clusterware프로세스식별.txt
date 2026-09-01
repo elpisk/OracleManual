@@ -1,0 +1,229 @@
+================================================================================
+ 제2장 실습 01 — Clusterware 프로세스 식별
+ 대상   : rac1(172.16.225.101)
+ 목표   : ps 로 Clusterware 데몬을 찾아 각각의 역할과 소유 계정을 정리하고,
+          systemd 진입점부터 프로세스가 어떻게 뻗어 나가는지 확인한다
+ 소요   : 약 25분
+ 선행   : Clusterware 가 기동되어 있을 것
+ 계정   : root(프로세스 조회), grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] systemd 진입점부터 본다
+--------------------------------------------------------------------------------
+
+-- Clusterware 는 systemd 유닛 하나에서 시작한다. 그 유닛부터 확인한다.
+[root@rac1 ~]# systemctl is-enabled oracle-ohasd
+enabled
+
+[root@rac1 ~]# systemctl is-active oracle-ohasd
+active
+
+[root@rac1 ~]# cat /etc/systemd/system/oracle-ohasd.service
+# Copyright (c) 2016, 2018, Oracle and/or its affiliates. All rights reserved.
+#
+# Oracle OHASD startup
+
+[Unit]
+Description=Oracle High Availability Services
+After=network-online.target remote-fs.target autofs.service
+Wants=network-online.target remote-fs.target
+
+[Service]
+ExecStart=/etc/init.d/init.ohasd run >/dev/null 2>&1 </dev/null
+ExecStop=/etc/init.d/init.ohasd stop >/dev/null 2>&1 </dev/null
+TimeoutStopSec=60min
+Type=simple
+Restart=always
+
+# Do not kill any processes except init.ohasd after ExecStop, unless the
+# stop command times out.
+KillMode=process
+SendSIGKILL=yes
+
+# Allow continuous restarts
+StartLimitBurst=0
+
+[Install]
+WantedBy=multi-user.target graphical.target
+
+-- 네 가지를 짚어 둔다.
+--   After=network-online.target : 네트워크가 올라온 뒤에 기동한다. 인터커넥트와
+--     공용 네트워크가 없으면 클러스터가 성립하지 않으므로 당연한 조건이다.
+--   Restart=always, StartLimitBurst=0 : ohasd 가 죽으면 무한히 재기동한다.
+--   TimeoutStopSec=60min : 정지에 최대 한 시간을 준다. Oracle 스스로 Clusterware
+--     정지가 그만큼 오래 걸릴 수 있다고 인정한 값이다.
+--   KillMode=process : ExecStop 뒤에 init.ohasd 외의 프로세스를 죽이지 않는다.
+
+--------------------------------------------------------------------------------
+ [2] 프로세스 목록
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# ps -ef | grep -E 'ohasd|crsd\.bin|ocssd\.bin|evmd\.bin|octssd|oraagent|orarootagent|osysmond|cssdagent|cssdmonitor|gipcd|gpnpd|mdnsd' | grep -v grep | while read -r u p rest; do
+>   cmd=$(echo "$rest" | awk '{print $6}')
+>   printf "%-8s %-7s %s\n" "$u" "$p" "$(basename $cmd 2>/dev/null)"
+> done | sort -k3
+
+root     4611    crsd.bin
+root     3412    cssdagent
+root     3269    cssdmonitor
+grid     3021    evmd.bin
+grid     3114    gipcd.bin
+grid     3051    gpnpd.bin
+grid     3019    mdnsd.bin
+grid     3445    ocssd.bin
+root     4089    octssd.bin
+root     2719    ohasd.bin
+grid     2997    oraagent.bin
+grid     15715   oraagent.bin
+oracle   19234   oraagent.bin
+root     2874    orarootagent.bin
+root     4886    orarootagent.bin
+root     3271    osysmond.bin
+root     1454    init.ohasd
+
+-- PID 를 보면 기동 순서가 그대로 보인다. ohasd 가 2719 로 가장 작고,
+-- crsd 가 4611 로 가장 크다. 그 사이 번호들이 순서대로 뜬 프로세스들이다.
+
+--------------------------------------------------------------------------------
+ [3] 계정 배치의 규칙
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# ps -eo user,comm | grep -E 'ohasd|crsd|ocssd|evmd|octssd|osysmond|gipcd|gpnpd|mdnsd' | sort | uniq -c | sort -rn
+      1 root     osysmond.bin
+      1 root     ohasd.bin
+      1 root     octssd.bin
+      1 root     init.ohasd
+      1 root     crsd.bin
+      1 grid     ocssd.bin
+      1 grid     mdnsd.bin
+      1 grid     gpnpd.bin
+      1 grid     gipcd.bin
+      1 grid     evmd.bin
+
+-- 규칙이 있다. 노드나 시스템을 바꿀 권한이 필요한 프로세스는 root 로 돈다.
+--   root : ohasd, crsd, cssdagent, cssdmonitor, octssd, osysmond
+--   grid : ocssd, evmd, gpnpd, gipcd, mdnsd
+--
+-- ocssd 가 grid 인 것이 흥미롭다. 멤버십을 판정하는 핵심 프로세스인데도 grid 다.
+-- 판단은 ocssd 가 하고 실제 재부팅은 root 로 도는 cssdagent 가 수행하기 때문이다.
+-- 판단과 실행이 분리되어 있고, 권한은 실행하는 쪽에만 필요하다.
+
+--------------------------------------------------------------------------------
+ [4] 프로세스별 역할 정리
+--------------------------------------------------------------------------------
+
+-- 데몬
+--   ohasd.bin     OHAS 스택의 진입점. 저수준 자원을 기동·감시한다.
+--                 죽으면 systemd 가 즉시 재기동한다(Restart=always).
+--   crsd.bin      CRS 스택의 관리자. OCR 을 읽어 위층 자원을 기동·감시·페일오버.
+--                 죽으면 ohasd 가 재기동한다.
+--   ocssd.bin     노드 멤버십 판정. 하트비트와 보팅 파일로 살아 있는 노드를 결정.
+--                 죽으면 노드가 재부팅된다.
+--   evmd.bin      이벤트 발행. FAN 이벤트의 출발점.
+--                 죽으면 통지만 끊기고 자원 관리는 계속된다.
+--   octssd.bin    클러스터 시간 동기화(CTSS).
+--   gpnpd.bin     GPnP 프로필 관리. 인터커넥트·ASM 발견 문자열 등 부팅 정보.
+--   gipcd.bin     인터커넥트 통신 계층 관리.
+--   mdnsd.bin     멀티캐스트 이름 해석. GNS 와 gpnp 가 쓴다.
+--   osysmond.bin  시스템 자원 수집(CHM). ologgerd 로 넘긴다.
+--
+-- 감시자
+--   cssdagent     ocssd 를 기동하고 감시. 응답 없으면 노드를 재부팅시킨다.
+--   cssdmonitor   cssdagent 자체와 시스템 행(hang)을 감시한다.
+--
+-- 에이전트 — crsd 와 ohasd 는 지시만 하고 실제 작업은 이쪽이 한다.
+--   orarootagent  root 권한 자원. VIP, 네트워크, HAIP, ASM 디스크그룹.
+--   oraagent      일반 계정 자원. 리스너, ASM 인스턴스, 데이터베이스, 서비스.
+--                 자원 소유자별로 하나씩 뜬다.
+
+-- oraagent 가 세 개인 이유를 확인해 본다.
+[root@rac1 ~]# ps -ef | grep oraagent | grep -v grep | awk '{print $1, $2, $8}'
+grid     2997    /u01/app/19.3.0/grid/bin/oraagent.bin
+grid     15715   /u01/app/19.3.0/grid/bin/oraagent.bin
+oracle   19234   /u01/app/oracle/product/19.3.0/dbhome_rac/bin/oraagent.bin
+
+-- 실행 파일 경로가 다르다. 앞의 둘은 Grid 홈에서 실행됐고 마지막 하나는 DB 홈이다.
+-- grid 두 개는 각각 OHAS 계층용과 CRS 계층용이고,
+-- oracle 하나는 데이터베이스 자원을 다루기 위한 것이다.
+-- 에이전트는 자원 소유자 계정으로 떠야 그 자원을 다룰 수 있다.
+
+--------------------------------------------------------------------------------
+ [5] OLR 위치 확인
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# cat /etc/oracle/olr.loc
+olrconfig_loc=/u01/app/grid/crsdata/rac1/olr/rac1_19.olr
+crs_home=/u01/app/19.3.0/grid
+
+-- ohasd 가 가장 먼저 뜰 수 있는 이유가 여기 있다. OLR 은 로컬 파일이므로
+-- ASM 없이도 읽을 수 있다. 반면 crsd 가 읽어야 하는 OCR 은 ASM 안에 있다.
+-- 이 차이가 부팅 순서를 결정한다(실습 04 에서 확인한다).
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — grid 계정으로 조회할 수 없는 명령
+--------------------------------------------------------------------------------
+
+-- 프로세스를 확인했으니 자동 기동 설정도 보려 한다. grid 계정으로 시도한다.
+
+[root@rac1 ~]# su - grid
+[grid@rac1 ~]$ crsctl config crs
+CRS-4563: Insufficient user privileges.
+
+CRS-4000: Command Config failed, or completed with errors.
+
+[grid@rac1 ~]$ crsctl config has
+CRS-4563: Insufficient user privileges.
+
+CRS-4000: Command Config failed, or completed with errors.
+
+-- 원인 파악
+--   CRS-4563 은 권한 부족이다. crsctl 의 모든 하위 명령이 grid 로 되는 것은
+--   아니며, config 계열은 조회조차 root 를 요구한다.
+--   어떤 명령이 grid 로 되는지 확인해 본다.
+
+[grid@rac1 ~]$ crsctl check has
+CRS-4638: Oracle High Availability Services is online
+
+[grid@rac1 ~]$ crsctl get css misscount
+CRS-4678: Successful get misscount 30 for Cluster Synchronization Services.
+
+[grid@rac1 ~]$ crsctl status resource -t | head -5
+--------------------------------------------------------------------------------
+Name           Target  State        Server                   State details
+--------------------------------------------------------------------------------
+Local Resources
+--------------------------------------------------------------------------------
+
+--   check, get, status 계열은 grid 로 된다. config 계열만 root 를 요구한다.
+
+-- 조치
+[grid@rac1 ~]$ exit
+[root@rac1 ~]# /u01/app/19.3.0/grid/bin/crsctl config crs
+CRS-4622: Oracle High Availability Services autostart is enabled.
+
+-- 재확인
+[root@rac1 ~]# /u01/app/19.3.0/grid/bin/crsctl config has
+CRS-4622: Oracle High Availability Services autostart is enabled.
+
+-- 배운 것
+--   crsctl 명령이 실패했을 때 CRS-4563 이면 문법이나 클러스터 상태 문제가
+--   아니라 단순히 계정 문제다. root 로 다시 실행하면 된다.
+--   root 로 실행할 때는 PATH 에 Grid 홈이 없으므로 전체 경로를 써야 한다.
+
+--------------------------------------------------------------------------------
+ [7] 정리
+--------------------------------------------------------------------------------
+
+-- 확인한 것
+--   1) systemd 유닛 oracle-ohasd 하나에서 전체가 시작된다
+--   2) 데몬 9개, 감시자 2개, 에이전트 5개가 돌고 있다
+--   3) 노드를 바꿀 권한이 필요한 프로세스는 root, 나머지는 grid
+--   4) oraagent 는 계층과 자원 소유자별로 뜬다 — 실행 파일 경로로 구분된다
+--   5) OLR 은 로컬 파일이라 ASM 없이 읽을 수 있다
+--   6) crsctl config 계열은 조회에도 root 가 필요하다(CRS-4563)
+--
+-- 이 실습은 조회만 했으므로 원상 복구할 것이 없다.
+================================================================================
+ 실습 01 종료
+================================================================================
