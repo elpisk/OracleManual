@@ -1,0 +1,275 @@
+================================================================================
+ 제6장 실습 07 — 이중화 수준 세 가지
+ 대상   : rac1
+ 목표   : External·Normal·High 디스크그룹을 각각 만들어 실제 용량과 장애 그룹
+          배치를 비교하고, 이중화가 늘리는 것이 무엇인지 확인한다
+ 소요   : 약 30분
+ 선행   : 실습 06 으로 test 디스크 6장이 CANDIDATE 또는 FORMER 일 것
+ 계정   : grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 세 개를 만든다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> create diskgroup TEST external redundancy disk '/dev/asmdisk/test1'
+  2    attribute 'compatible.asm'='19.0.0.0.0','compatible.rdbms'='19.0.0.0.0';
+
+Diskgroup created.
+
+SQL> create diskgroup TESTN normal redundancy
+  2    failgroup fg1 disk '/dev/asmdisk/test2'
+  3    failgroup fg2 disk '/dev/asmdisk/test3'
+  4    attribute 'compatible.asm'='19.0.0.0.0';
+
+Diskgroup created.
+
+SQL> create diskgroup TESTH high redundancy
+  2    failgroup fg1 disk '/dev/asmdisk/test4'
+  3    failgroup fg2 disk '/dev/asmdisk/test5'
+  4    failgroup fg3 disk '/dev/asmdisk/test6'
+  5    attribute 'compatible.asm'='19.0.0.0.0';
+
+Diskgroup created.
+
+-- 디스크는 모두 4096MB 짜리로 같다. 개수만 1장, 2장, 3장이다.
+
+--------------------------------------------------------------------------------
+ [2] 용량을 비교한다
+--------------------------------------------------------------------------------
+
+SQL> select name, type, total_mb, free_mb, required_mirror_free_mb,
+  2         usable_file_mb, offline_disks, voting_files
+  3    from v$asm_diskgroup where name like 'TEST%' order by name;
+
+NAME     TYPE     TOTAL_MB    FREE_MB REQUIRED_MIRROR_FREE_MB USABLE_FILE_MB OFFLINE_DISKS V
+-------- ------ ---------- ---------- ----------------------- -------------- ------------- -
+TEST     EXTERN       4096       3998                       0           3998             0 N
+TESTH    HIGH        12288      12111                       0           4037             0 N
+TESTN    NORMAL       8192       8076                       0           4038             0 N
+
+-- 이 세 줄이 이 실습의 결론이다.
+--
+--   중복도    디스크  TOTAL_MB  USABLE_FILE_MB  비율
+--   External      1장      4096            3998   약 100%
+--   Normal        2장      8192            4038   약  50%
+--   High          3장     12288            4037   약  33%
+--
+-- 물리 용량은 1배, 2배, 3배로 늘었는데 실제로 담을 수 있는 데이터는
+-- 4GB 남짓으로 모두 같다.
+--
+-- 이중화가 늘리는 것은 용량이 아니라 견딜 수 있는 손실 개수다.
+--   External  0개
+--   Normal    1개
+--   High      2개
+--
+-- 용량 산정에서 이 비율을 놓치면 발주 규모가 두세 배 틀린다.
+-- 33TB 를 쓰려면 High 기준으로 100TB 를 사야 한다.
+
+--------------------------------------------------------------------------------
+ [3] REQUIRED_MIRROR_FREE_MB 가 0인 이유
+--------------------------------------------------------------------------------
+
+-- 이 컬럼은 디스크 한 장이 죽었을 때 미러를 다시 만들기 위해 남겨 두어야 할
+-- 공간이다. 지금은 셋 다 0이다. 디스크그룹이 방금 만들어져 데이터가 없기
+-- 때문이다.
+--
+-- USABLE_FILE_MB 는 이렇게 계산된다.
+--   USABLE_FILE_MB = (FREE_MB - REQUIRED_MIRROR_FREE_MB) / 미러 배수
+--
+-- Normal 을 확인해 보면
+--   (8076 - 0) / 2 = 4038   맞다
+-- High 는
+--   (12111 - 0) / 3 = 4037   맞다
+--
+-- 8장에서 데이터를 채우고 디스크를 추가하면 REQUIRED_MIRROR_FREE_MB 에
+-- 실제 값이 잡히는 것을 보게 된다. 운영에서 USABLE_FILE_MB 가 음수가 되는
+-- 순간이 있는데, 그것은 이 값이 FREE_MB 보다 커졌다는 뜻이고 디스크 한 장을
+-- 더 잃으면 복구할 수 없다는 경고다.
+
+--------------------------------------------------------------------------------
+ [4] 장애 그룹 배치
+--------------------------------------------------------------------------------
+
+SQL> select g.name dg, d.name, d.path, d.failgroup, d.failgroup_type,
+  2         d.total_mb, d.free_mb
+  3    from v$asm_disk d, v$asm_diskgroup g
+  4   where d.group_number=g.group_number and g.name like 'TEST%'
+  5   order by g.name, d.disk_number;
+
+DG       NAME        PATH                 FAILGROUP  FAILGRO   TOTAL_MB    FREE_MB
+-------- ----------- -------------------- ---------- ------- ---------- ----------
+TEST     TEST_0000   /dev/asmdisk/test1   TEST_0000  REGULAR       4096       3998
+TESTH    TESTH_0000  /dev/asmdisk/test4   FG1        REGULAR       4096       4037
+TESTH    TESTH_0001  /dev/asmdisk/test5   FG2        REGULAR       4096       4037
+TESTH    TESTH_0002  /dev/asmdisk/test6   FG3        REGULAR       4096       4037
+TESTN    TESTN_0000  /dev/asmdisk/test2   FG1        REGULAR       4096       4038
+TESTN    TESTN_0001  /dev/asmdisk/test3   FG2        REGULAR       4096       4038
+
+-- TEST 는 장애 그룹 이름이 디스크 이름과 같은 TEST_0000 이다.
+-- 명시하지 않으면 ASM 이 디스크마다 별도 장애 그룹을 만들고 디스크 이름을
+-- 그대로 쓴다. 그래서 디스크 1장 = 장애 그룹 1개가 된다.
+-- 실습 05 에서 Normal 을 디스크 1장으로 만들려다 ORA-15167 이 났던 이유다.
+--
+-- FAILGROUP_TYPE 은 모두 REGULAR 다. 다른 값은 QUORUM 이며, 데이터는 담지
+-- 않고 투표에만 참여하는 장애 그룹이다. 확장 클러스터에서 제3의 사이트에
+-- 두어 사이트 하나가 통째로 끊겨도 과반수를 유지하게 하는 용도다.
+
+--------------------------------------------------------------------------------
+ [5] 실습 환경의 한계를 분명히 한다
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# ls -l /dev/asmdisk/test1 /dev/asmdisk/test2 /dev/asmdisk/test3
+lrwxrwxrwx. 1 root root 6 Sep  1 19:17 /dev/asmdisk/test1 -> ../sdj
+lrwxrwxrwx. 1 root root 6 Sep  1 19:17 /dev/asmdisk/test2 -> ../sdk
+lrwxrwxrwx. 1 root root 6 Sep  1 19:17 /dev/asmdisk/test3 -> ../sdl
+
+-- 이 세 장치는 모두 호스트의 D:\RAC\SHARED 폴더에 있는 vmdk 파일이다.
+-- D 드라이브 하나가 죽으면 FG1 과 FG2 가 함께 죽는다.
+-- 물리적으로는 장애 그룹이 하나뿐이다.
+--
+-- 실습에서 FG1, FG2, FG3 으로 나눈 것은 ASM 의 동작을 관찰하기 위한 논리적
+-- 구분일 뿐이다. 이 점을 분명히 인식해야 한다. 실무에서는 스토리지 구성도를
+-- 보고 실제로 함께 죽는 단위를 기준으로 나눠야 한다.
+--
+-- 명명 원칙
+--   FG1, FG2 처럼 무의미한 이름 대신 실제 경계를 반영한다.
+--     CTRL_A, CTRL_B        스토리지 컨트롤러 기준
+--     RACK_1, RACK_2        랙 기준
+--     SITE_SEOUL, SITE_BUSAN  사이트 기준
+--   이렇게 하면 v$asm_disk 만 조회해도 배치가 안전한지 판단할 수 있다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — High 를 디스크 2장으로
+--------------------------------------------------------------------------------
+
+SQL> drop diskgroup TESTH including contents;
+
+Diskgroup dropped.
+
+SQL> create diskgroup TESTH high redundancy
+  2    failgroup fg1 disk '/dev/asmdisk/test4'
+  3    failgroup fg2 disk '/dev/asmdisk/test5'
+  4    attribute 'compatible.asm'='19.0.0.0.0';
+create diskgroup TESTH high redundancy
+*
+ERROR at line 1:
+ORA-15018: diskgroup cannot be created
+ORA-15167: command requires at least 3 failure groups; found only 2
+
+-- 오류 : ORA-15018, ORA-15167
+-- 원인 파악 : High 는 3벌 미러이므로 미러를 놓을 장애 그룹이 3개 필요하다.
+--             2개로는 3벌을 서로 다른 곳에 놓을 수 없다.
+--             실습 05 에서 Normal 로 시도했을 때는 같은 코드에 숫자가
+--             2였다. 중복도가 요구 수량을 정한다.
+-- 조치     : 장애 그룹을 3개 이상 지정한다.
+-- 재확인   : 3장으로 다시 만든다.
+
+SQL> create diskgroup TESTH high redundancy
+  2    failgroup fg1 disk '/dev/asmdisk/test4'
+  3    failgroup fg2 disk '/dev/asmdisk/test5'
+  4    failgroup fg3 disk '/dev/asmdisk/test6'
+  5    attribute 'compatible.asm'='19.0.0.0.0';
+
+Diskgroup created.
+
+SQL> select name, type, total_mb, free_mb, usable_file_mb
+  2    from v$asm_diskgroup where name like 'TEST%' order by name;
+
+NAME       TYPE     TOTAL_MB    FREE_MB USABLE_FILE_MB
+---------- ------ ---------- ---------- --------------
+TEST       EXTERN       4096       3998           3998
+TESTH      HIGH        12288      12111           4037
+TESTN      NORMAL       8192       8076           4038
+
+--------------------------------------------------------------------------------
+ [7] 어느 중복도를 고를 것인가
+--------------------------------------------------------------------------------
+
+-- 판단 기준은 하나다. 스토리지가 이미 보호하고 있는가.
+--
+--   상황                        권장       이유
+--   ------------------------    --------   ------------------------------
+--   엔터프라이즈 스토리지(RAID) External   이중 보호는 용량만 낭비
+--   JBOD·로컬 디스크            Normal+    ASM 이 유일한 보호 수단
+--   OCR·Voting File 디스크그룹  Normal+    Voting File 3개로 한 장 손실 견딤
+--   확장 클러스터(2개 사이트)   Normal+QUORUM  사이트별 장애 그룹
+--   극도로 중요한 데이터        High       두 장 손실을 견딤
+--
+-- 우리 실습 환경을 이 기준으로 보면
+--   +CRS   Normal    VMware 가상 디스크에 RAID 보호가 없고 OCR·Voting 이 있다
+--   +DATA  External  학습 환경이라 용량을 우선했다
+--   +FRA   External  같은 이유
+--
+-- 흔한 실수는 RAID 보호가 있는 스토리지 위에 Normal 을 얹는 것이다.
+-- 물리 100TB 가 논리 25TB 가 된다. RAID 에서 절반, ASM 에서 다시 절반이다.
+-- 게다가 ASM 이 미러 쓰기를 추가로 수행하므로 쓰기 부하가 두 배가 된다.
+
+--------------------------------------------------------------------------------
+ [8] 정리 — 기준 상태로 되돌린다
+--------------------------------------------------------------------------------
+
+SQL> drop diskgroup TEST;
+SQL> drop diskgroup TESTN;
+SQL> drop diskgroup TESTH;
+
+Diskgroup dropped.
+Diskgroup dropped.
+Diskgroup dropped.
+
+SQL> select name, state, type, total_mb from v$asm_diskgroup order by name;
+
+NAME       STATE       TYPE     TOTAL_MB
+---------- ----------- ------ ----------
+CRS        MOUNTED     NORMAL      12288
+DATA       MOUNTED     EXTERN      61440
+FRA        MOUNTED     EXTERN      24576
+
+SQL> select header_status, count(*) from v$asm_disk group by header_status order by 1;
+
+HEADER_STATU   COUNT(*)
+------------ ----------
+FORMER                6
+MEMBER                8
+
+-- test 디스크 6장이 FORMER 로 돌아왔다. 8장에서 그대로 다시 쓴다.
+
+[root@rac1 ~]# crsctl check cluster -all | grep -c online
+6
+[root@rac1 ~]# srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+[root@rac1 ~]# ocrcheck | grep ID
+         ID                       :  665666554
+
+-- 클러스터, 데이터베이스, OCR 모두 5장 종료 시점과 같다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류
+--   ORA-15018 / ORA-15167   High 를 장애 그룹 2개로 생성 시도
+--
+-- 실측한 것
+--   중복도    디스크  TOTAL_MB  USABLE_FILE_MB
+--   External      1장      4096            3998
+--   Normal        2장      8192            4038
+--   High          3장     12288            4037
+--
+-- 확인한 것
+--   1) 물리 용량이 3배가 되어도 담을 수 있는 데이터는 같다
+--   2) 이중화가 늘리는 것은 손실 허용 개수다 (0 / 1 / 2)
+--   3) USABLE = (FREE - REQUIRED_MIRROR_FREE) / 미러 배수
+--   4) REQUIRED_MIRROR_FREE_MB 는 데이터가 없으면 0이다
+--   5) 장애 그룹을 지정하지 않으면 디스크마다 하나씩 만들어진다
+--   6) FAILGROUP_TYPE 은 REGULAR 와 QUORUM 두 가지
+--   7) 실습 환경은 물리적으로 장애 그룹이 하나뿐이다
+--   8) 삭제 후 디스크는 FORMER 가 되어 그대로 재사용할 수 있다
+--
+-- 이 장에서 만든 test1~test6 은 7장과 8장에서 계속 쓴다.
+================================================================================
+ 실습 07 종료
+================================================================================

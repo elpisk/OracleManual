@@ -1,0 +1,236 @@
+================================================================================
+ 제6장 실습 05 — 디스크그룹 생성 오류 재현
+ 대상   : rac1
+ 목표   : 디스크그룹 생성이 실패하는 세 가지 경우를 만들어 보고, ORA-15018
+          아래에 붙는 실제 원인 코드를 읽는 훈련을 한다
+ 소요   : 약 20분
+ 선행   : 실습 04 로 TEST 디스크그룹이 만들어져 있을 것
+ 계정   : grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 이미 쓰이는 디스크로 만들려 하면
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> create diskgroup TESTX external redundancy disk '/dev/asmdisk/data1';
+create diskgroup TESTX external redundancy disk '/dev/asmdisk/data1'
+*
+ERROR at line 1:
+ORA-15018: diskgroup cannot be created
+ORA-15029: disk '/dev/asmdisk/data1' is already mounted by this instance
+
+-- 오류 : ORA-15018, ORA-15029
+-- 원인 파악 : ORA-15018 은 diskgroup cannot be created 라는 결과만 알려 준다.
+--             실제 원인은 ORA-15029 다. 지정한 디스크가 이미 다른 디스크그룹의
+--             구성원이라는 뜻이다.
+--             확인은 v$asm_disk 에서 한다.
+-- 조치     : 다른 디스크를 쓴다. 정말 그 디스크를 회수해야 한다면 원래
+--             디스크그룹에서 정상적으로 drop disk 한 뒤에 쓴다.
+-- 재확인   : 어느 디스크그룹에 속했는지 확인하고, 아무것도 만들어지지
+--             않았는지 본다.
+
+SQL> select d.path, d.name, d.header_status, g.name dg
+  2    from v$asm_disk d, v$asm_diskgroup g
+  3   where d.group_number=g.group_number and d.path='/dev/asmdisk/data1';
+
+PATH                 NAME       HEADER_STATU DG
+-------------------- ---------- ------------ ----------
+/dev/asmdisk/data1   DATA_0000  MEMBER       DATA
+
+SQL> select name from v$asm_diskgroup order by name;
+
+NAME
+----------
+CRS
+DATA
+FRA
+TEST
+
+-- TESTX 는 생기지 않았다.
+
+-- +CRS 의 디스크로 시도해도 같은 오류가 난다.
+SQL> create diskgroup TESTX external redundancy disk '/dev/asmdisk/crs1';
+ERROR at line 1:
+ORA-15018: diskgroup cannot be created
+ORA-15029: disk '/dev/asmdisk/crs1' is already mounted by this instance
+
+-- OCR 과 Voting File 이 들어 있는 디스크라고 해서 특별한 메시지가 나오지는
+-- 않는다. ASM 이 보기에는 그저 MEMBER 디스크다. 그래서 FORCE 를 붙이면
+-- 클러스터를 통째로 날릴 수 있다.
+
+--------------------------------------------------------------------------------
+ [2] 없는 경로를 지정하면
+--------------------------------------------------------------------------------
+
+SQL> create diskgroup TESTX external redundancy disk '/dev/asmdisk/nosuch';
+create diskgroup TESTX external redundancy disk '/dev/asmdisk/nosuch'
+*
+ERROR at line 1:
+ORA-15018: diskgroup cannot be created
+ORA-15031: disk specification '/dev/asmdisk/nosuch' matches no disks
+
+-- 오류 : ORA-15018, ORA-15031
+-- 원인 파악 : matches no disks. 지정한 경로 패턴에 맞는 디스크를 찾지
+--             못했다는 뜻이다. 원인은 셋 중 하나다.
+--               경로 오타
+--               udev 심볼릭 링크가 만들어지지 않음
+--               ASM_DISKSTRING 이 그 경로를 포함하지 않음
+-- 조치     : 세 가지를 순서대로 확인한다.
+-- 재확인   : 실제 경로와 ASM_DISKSTRING 을 확인한다.
+
+[grid@rac1 ~]$ ls /dev/asmdisk/
+crs1  crs2  crs3  data1  data2  data3  fra1  fra2  test1  test2  test3  test4  test5  test6
+[grid@rac1 ~]$ asmcmd dsget
+parameter:/dev/asmdisk/*
+profile:/dev/asmdisk/*
+
+-- nosuch 라는 이름은 없다. 오타였다.
+-- ASM_DISKSTRING 은 /dev/asmdisk/* 이므로 그 디렉터리 아래의 이름만 쓸 수 있다.
+
+--------------------------------------------------------------------------------
+ [3] 중복도가 요구하는 장애 그룹을 채우지 못하면
+--------------------------------------------------------------------------------
+
+SQL> create diskgroup TESTX normal redundancy disk '/dev/asmdisk/test2';
+create diskgroup TESTX normal redundancy disk '/dev/asmdisk/test2'
+*
+ERROR at line 1:
+ORA-15018: diskgroup cannot be created
+ORA-15167: command requires at least 2 failure groups; found only 1
+
+-- 오류 : ORA-15018, ORA-15167
+-- 원인 파악 : Normal 중복도는 2벌 미러를 만드는데, 미러를 서로 다른 장애
+--             그룹에 놓아야 의미가 있다. 디스크가 1장이면 장애 그룹도 1개뿐이라
+--             미러를 놓을 곳이 없다.
+--             장애 그룹을 명시하지 않으면 ASM 이 디스크마다 하나씩 만든다.
+--             따라서 디스크 1장 = 장애 그룹 1개다.
+-- 조치     : 디스크를 2장 이상 지정한다.
+-- 재확인   : High 로 시도하면 요구 수량이 3으로 바뀌는지 본다.
+
+SQL> create diskgroup TESTX high redundancy
+  2    failgroup fg1 disk '/dev/asmdisk/test2'
+  3    failgroup fg2 disk '/dev/asmdisk/test3';
+create diskgroup TESTX high redundancy
+*
+ERROR at line 1:
+ORA-15018: diskgroup cannot be created
+ORA-15167: command requires at least 3 failure groups; found only 2
+
+-- 같은 오류 코드인데 메시지의 숫자가 2에서 3으로 바뀌었다.
+-- 코드만 보고 판단하면 안 되고 메시지를 끝까지 읽어야 하는 이유다.
+--
+--   중복도      최소 장애 그룹 수
+--   External    1
+--   Normal      2
+--   High        3
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 없는 속성을 지정하면
+--------------------------------------------------------------------------------
+
+SQL> create diskgroup TESTX normal redundancy
+  2    failgroup fg1 disk '/dev/asmdisk/test2'
+  3    failgroup fg2 disk '/dev/asmdisk/test3'
+  4    attribute 'compatible.asm'='19.0.0.0.0', 'disk_repair_time'='3m';
+create diskgroup TESTX normal redundancy
+*
+ERROR at line 1:
+ORA-15018: diskgroup cannot be created
+ORA-15237: invalid attribute disk_repair_time to CREATE DISKGROUP command
+
+-- 오류 : ORA-15018, ORA-15237
+-- 원인 파악 : disk_repair_time 은 CREATE DISKGROUP 절에서 지정할 수 없는
+--             속성이다. 디스크그룹이 만들어진 뒤에 ALTER DISKGROUP 으로
+--             설정해야 한다.
+--             CREATE 에서 지정할 수 있는 것은 compatible 계열, au_size,
+--             sector_size 처럼 생성 시점에 고정되는 속성뿐이다.
+-- 조치     : 생성과 속성 설정을 두 단계로 나눈다.
+-- 재확인   : 나눠서 실행하면 성공한다.
+
+SQL> create diskgroup TESTX normal redundancy
+  2    failgroup fg1 disk '/dev/asmdisk/test2'
+  3    failgroup fg2 disk '/dev/asmdisk/test3'
+  4    attribute 'compatible.asm'='19.0.0.0.0','compatible.rdbms'='19.0.0.0.0';
+
+Diskgroup created.
+
+SQL> alter diskgroup TESTX set attribute 'disk_repair_time'='3m';
+
+Diskgroup altered.
+
+SQL> select name, value from v$asm_attribute
+  2   where group_number=(select group_number from v$asm_diskgroup where name='TESTX')
+  3     and name like '%repair%';
+
+NAME                    VALUE
+----------------------- ------
+disk_repair_time        3m
+failgroup_repair_time   24.0h
+
+-- disk_repair_time 은 8장의 주제다. 디스크를 OFFLINE 했을 때 몇 분 안에
+-- 복구하면 변경분만 재동기화하고, 넘기면 강제로 제거되어 전체 리밸런스가
+-- 일어나는지를 정하는 값이다. 기본값은 3.6h 다.
+
+--------------------------------------------------------------------------------
+ [5] 정리 — 만든 TESTX 를 지운다
+--------------------------------------------------------------------------------
+
+SQL> drop diskgroup TESTX;
+
+Diskgroup dropped.
+
+SQL> select path, header_status from v$asm_disk
+  2   where path in ('/dev/asmdisk/test2','/dev/asmdisk/test3') order by path;
+
+PATH                     HEADER_STATU
+------------------------ ------------
+/dev/asmdisk/test2       FORMER
+/dev/asmdisk/test3       FORMER
+
+-- CANDIDATE 가 아니라 FORMER 가 되었다. 한 번 디스크그룹에 속했다가
+-- 정상적으로 빠져나왔다는 이력이 헤더에 남는다.
+-- 실무적으로는 CANDIDATE 와 같다. 그대로 다시 쓸 수 있다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 코드 정리
+--------------------------------------------------------------------------------
+
+-- 이 실습에서 만든 오류
+--
+--   ORA-15018   diskgroup cannot be created     (포괄 — 항상 첫 줄)
+--     ORA-15029   already mounted by this instance   MEMBER 디스크 지정
+--     ORA-15031   matches no disks                   경로 오류
+--     ORA-15167   requires at least N failure groups  장애 그룹 부족
+--     ORA-15237   invalid attribute to CREATE         생성 시 지정 불가 속성
+--
+-- 규칙이 하나 보인다. ORA-15018 은 결과만 알려 주고 실제 원인은 항상 그
+-- 아래 줄에 있다. 5장에서 ORA-15032 아래에 ORA-15283 이 붙었던 것,
+-- 그리고 삭제 시 ORA-15039 아래에 ORA-15053 이나 ORA-15073 이 붙는 것과
+-- 같은 구조다.
+--
+-- 오류를 검색할 때는 첫 줄이 아니라 마지막 줄의 코드로 검색해야 한다.
+
+--------------------------------------------------------------------------------
+ [7] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류 다섯 가지
+--   ORA-15018   포괄 메시지
+--   ORA-15029   이미 쓰이는 디스크
+--   ORA-15031   없는 경로
+--   ORA-15167   장애 그룹 부족 (Normal 2, High 3)
+--   ORA-15237   CREATE 에 지정할 수 없는 속성
+--
+-- 확인한 것
+--   1) +CRS 디스크도 ASM 이 보기에는 그냥 MEMBER 다. FORCE 는 위험하다
+--   2) ORA-15031 의 원인은 오타·udev 링크 없음·DISKSTRING 불일치 셋 중 하나
+--   3) 같은 ORA-15167 이라도 메시지의 숫자가 중복도에 따라 다르다
+--   4) 생성과 속성 설정은 나눠야 하는 경우가 있다
+--   5) 삭제 후 헤더는 FORMER 가 된다
+--
+-- 모든 실패한 명령이 아무것도 만들지 않았다. 디스크그룹 생성은 원자적이다.
+================================================================================
+ 실습 05 종료
+================================================================================
