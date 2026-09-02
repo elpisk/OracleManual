@@ -1,0 +1,243 @@
+================================================================================
+ 제7장 실습 03 — 별칭 만들기
+ 대상   : rac1
+ 목표   : 별칭 생성 구문에서 틀리기 쉬운 세 지점을 직접 만나 보고, 별칭과
+          실제 파일이 같은 FILE_NUMBER 를 가리키는 것을 확인한다
+ 소요   : 약 25분
+ 선행   : 실습용 디스크그룹과 테이블스페이스
+ 계정   : grid, oracle
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 실습 환경 준비
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> create diskgroup TEST external redundancy disk '/dev/asmdisk/test1'
+  2    attribute 'compatible.asm'='19.0.0.0.0','compatible.rdbms'='19.0.0.0.0';
+
+Diskgroup created.
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> create tablespace ts_alias datafile '+TEST' size 100M;
+
+Tablespace created.
+
+SQL> select file#, name from v$datafile where name like '%TEST%';
+
+     FILE# NAME
+---------- ----------------------------------------------------
+        16 +TEST/RACDB/DATAFILE/ts_alias.256.1242847959
+
+-- 파일 번호는 256, incarnation 은 1242847959 다.
+-- 이 이름을 그대로 복사해 두고 뒤에서 쓴다. 손으로 옮겨 적지 않는다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — for file 이라고 쓰면
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> alter diskgroup TEST add alias '+TEST/mydir/a.dbf'
+  2    for file '+TEST/RACDB/DATAFILE/ts_alias.256.1242847959';
+alter diskgroup TEST add alias '+TEST/mydir/a.dbf' for file '+TEST/RACDB/DATA...'
+                                                       *
+ERROR at line 1:
+ORA-15114: missing or invalid ASM file name
+
+-- 오류 : ORA-15114
+-- 원인 파악 : 별표 위치를 보라. for 다음의 file 이라는 단어를 가리킨다.
+--             ASM 은 FOR 다음에 오는 것을 파일 이름으로 해석하는데, file 이
+--             유효한 ASM 파일 이름 형식이 아니므로 거절한 것이다.
+--             즉 파일 이름이 아니라 구문이 틀렸다.
+--             영어 문장으로는 for file 이 자연스러워 무심코 넣게 되지만
+--             구문에는 없는 단어다.
+-- 조치     : file 을 뺀다. ADD ALIAS '별칭' FOR '실제파일' 이 올바른 형식이다.
+-- 재확인   : 별표 위치로 구분한다. 별표가 경로를 가리키면 경로 문제,
+--             file 같은 단어를 가리키면 구문 문제다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — 디렉터리가 없으면
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup TEST add alias '+TEST/nodir/a.dbf'
+  2    for '+TEST/RACDB/DATAFILE/ts_alias.256.1242847959';
+alter diskgroup TEST add alias '+TEST/nodir/a.dbf' for '+TEST/RACDB/DATAFILE/...'
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-15173: entry 'nodir' does not exist in directory '/'
+
+-- 오류 : ORA-15032, ORA-15173
+-- 원인 파악 : 이번에는 구문이 맞다. 별칭을 놓을 디렉터리 nodir 가 없다는
+--             경로 문제다. 유닉스에서 mkdir 없이 그 아래에 파일을 만들 수
+--             없는 것과 같다.
+--             ORA-15114 와 구분하는 두 가지 단서가 있다.
+--               첫째, 동반 코드. ORA-15173 은 ORA-15032 아래에 붙는다
+--               둘째, 별표 위치. 명령 첫 줄 맨 앞을 가리킨다
+-- 조치     : add directory 로 디렉터리를 먼저 만든다.
+-- 재확인   : 디렉터리를 만들고 다시 시도한다.
+
+SQL> alter diskgroup TEST add directory '+TEST/mydir';
+
+Diskgroup altered.
+
+SQL> select name, alias_directory ad, system_created sc
+  2    from v$asm_alias
+  3   where group_number=(select group_number from v$asm_diskgroup where name='TEST')
+  4   order by reference_index;
+
+NAME                       A S
+-------------------------- - -
+RACDB                      Y Y
+DATAFILE                   Y Y
+mydir                      Y N
+TS_ALIAS.256.1242847959    N Y
+
+-- mydir 이 생겼고 SYSTEM_CREATED 가 N 이다. 사용자가 만든 디렉터리다.
+
+--------------------------------------------------------------------------------
+ [4] 별칭을 만든다
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup TEST add alias '+TEST/mydir/my_alias.dbf'
+  2    for '+TEST/RACDB/DATAFILE/ts_alias.256.1242847959';
+
+Diskgroup altered.
+
+SQL> select name, file_number, alias_directory ad, system_created sc, alias_index
+  2    from v$asm_alias
+  3   where group_number=(select group_number from v$asm_diskgroup where name='TEST')
+  4   order by reference_index;
+
+NAME                       FILE_NUMBER A S ALIAS_INDEX
+-------------------------- ----------- - - -----------
+RACDB                       4294967295 Y Y           0
+DATAFILE                    4294967295 Y Y          53
+mydir                       4294967295 Y N           1
+my_alias.dbf                       256 N N         159
+TS_ALIAS.256.1242847959            256 N Y         106
+
+-- 다섯 행을 세 종류로 나눈다.
+--
+--   FILE_NUMBER 4294967295, AD=Y   디렉터리 (RACDB, DATAFILE, mydir)
+--   FILE_NUMBER 256, SC=Y          시스템이 만든 정규 이름
+--   FILE_NUMBER 256, SC=N          사용자가 만든 별칭
+--
+-- 핵심은 마지막 두 행의 FILE_NUMBER 가 둘 다 256 이라는 것이다.
+-- 이름은 둘인데 파일은 하나다. 별칭은 데이터를 복사하지 않는다.
+
+--------------------------------------------------------------------------------
+ [5] asmcmd 는 화살표로 보여 준다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd ls -l +TEST/mydir
+Type      Redund  Striped  Time             Sys  Name
+DATAFILE  UNPROT  COARSE   SEP 01 19:00:00  N    my_alias.dbf => +TEST/RACDB/DATAFILE/TS_ALIAS.256.1242847959
+
+-- 유닉스 심볼릭 링크와 같은 표기다. Sys 도 N 으로 사용자가 만든 것임을
+-- 알려 준다.
+-- Type, Redund, Striped 는 대상 파일의 속성을 그대로 보여 준다.
+-- 별칭 자체는 속성을 갖지 않는다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — 별칭에 별칭을 걸면
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup TEST add alias '+TEST/mydir/second.dbf'
+  2    for '+TEST/mydir/my_alias.dbf';
+alter diskgroup TEST add alias '+TEST/mydir/second.dbf' for '+TEST/mydir/my_a...'
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-15046: ASM file name '+TEST/mydir/my_alias.dbf' is not in single-file creation form
+
+-- 오류 : ORA-15032, ORA-15046
+-- 원인 파악 : single-file creation form 은 태그.파일번호.incarnation 형식을
+--             가리킨다. my_alias.dbf 는 그 형식이 아니므로 별칭의 대상이
+--             될 수 없다.
+--             유닉스와 다른 점이다. 유닉스는 링크를 가리키는 링크를
+--             허용하지만 ASM 은 한 단계만 허용한다. 별칭 체인이 길어지면
+--             추적이 어려워지므로 아예 막았다.
+-- 조치     : 정규 이름을 대상으로 지정한다. 여러 별칭이 필요하면 각각을
+--             정규 이름에 건다.
+-- 재확인   : 정규 이름으로 두 번째 별칭을 만든다.
+
+SQL> alter diskgroup TEST add alias '+TEST/mydir/second.dbf'
+  2    for '+TEST/RACDB/DATAFILE/ts_alias.256.1242847959';
+
+Diskgroup altered.
+
+SQL> select name, file_number from v$asm_alias
+  2   where group_number=(select group_number from v$asm_diskgroup where name='TEST')
+  3     and file_number <> 4294967295 order by name;
+
+NAME                       FILE_NUMBER
+-------------------------- -----------
+TS_ALIAS.256.1242847959            256
+my_alias.dbf                       256
+second.dbf                         256
+
+-- 이름이 셋인데 파일은 하나다. 모두 FILE_NUMBER 256 을 가리킨다.
+
+--------------------------------------------------------------------------------
+ [7] 데이터베이스는 무엇으로 참조하는가
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> select file#, name from v$datafile where name like '%TEST%';
+
+     FILE# NAME
+---------- ----------------------------------------------------
+        16 +TEST/RACDB/DATAFILE/ts_alias.256.1242847959
+
+-- 별칭이 둘이나 생겼는데 데이터베이스는 여전히 정규 이름으로 참조한다.
+-- 별칭은 데이터베이스가 모르는 이름이다.
+--
+-- 이 사실이 실습 04 의 전제가 된다. 데이터베이스가 참조하지 않는 이름이므로
+-- 지워도 영향이 없다.
+
+--------------------------------------------------------------------------------
+ [8] 별칭은 언제 쓰는가
+--------------------------------------------------------------------------------
+
+-- 별칭 자체는 성능에 아무 영향이 없다. 쓰는 이유는 사람이 읽기 위해서다.
+--
+-- 유용한 경우 세 가지
+--   1) 파라미터에 경로를 적어야 하는 파일
+--      control_files 파라미터에 정규 이름 대신 별칭을 적으면 컨트롤파일을
+--      재생성해도 파라미터를 고치지 않아도 된다.
+--   2) 이관·복제 스크립트에서 고정된 이름으로 참조하고 싶을 때
+--      다만 파일을 새로 만들면 별칭도 다시 걸어야 한다.
+--   3) RMAN 백업을 알아보기 쉬운 이름으로 남기고 싶을 때
+--
+-- 불필요한 경우
+--   데이터파일에 별칭을 거는 것은 대개 의미가 없다. 데이터베이스는
+--   정규 이름으로 참조하고 있고, 별칭을 지워도 아무 일이 일어나지 않는다.
+--   관리 대상만 늘어난다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류
+--   ORA-15114              for file 이라고 쓴 구문 오류
+--   ORA-15032 / ORA-15173  디렉터리가 없는 경로 오류
+--   ORA-15032 / ORA-15046  별칭에 별칭을 건 경우
+--
+-- 확인한 것
+--   1) 올바른 구문은 ADD ALIAS '별칭' FOR '실제파일'
+--   2) 별표 위치로 구문 문제와 경로 문제를 구분한다
+--   3) 디렉터리를 먼저 add directory 로 만들어야 한다
+--   4) 별칭과 정규 이름은 같은 FILE_NUMBER 를 가리킨다
+--   5) 한 파일에 여러 별칭을 걸 수 있다 (셋까지 만들어 봤다)
+--   6) 별칭에 별칭은 걸 수 없다. 한 단계만 허용된다
+--   7) 데이터베이스는 정규 이름으로만 참조한다
+--
+-- 실습 04 에서 이 별칭들을 지우고 실제 파일이 무사한지 확인한다.
+================================================================================
+ 실습 03 종료
+================================================================================
