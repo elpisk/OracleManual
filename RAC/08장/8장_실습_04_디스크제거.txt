@@ -1,0 +1,283 @@
+================================================================================
+ 제8장 실습 04 — 디스크 제거
+ 대상   : rac1
+ 목표   : 장애 그룹 수를 최소 요건까지 줄일 수 없는 것을 확인하고, 제거가
+          즉시 일어나지 않는 이유와 FORCE 의 대가를 관찰한다
+ 소요   : 약 30분
+ 선행   : 실습 03 으로 TESTN 에 디스크 4장이 있을 것
+ 계정   : grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 현재 구성
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select d.name, d.path, d.failgroup, d.total_mb-d.free_mb used_mb
+  2    from v$asm_disk d, v$asm_diskgroup g
+  3   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME     PATH                 FAILGR    USED_MB
+-------- -------------------- ------ ----------
+D_A      /dev/asmdisk/test2   FGA          1337
+D_B      /dev/asmdisk/test3   FGB          1338
+D_C      /dev/asmdisk/test6   FGC          1330
+D_D      /dev/asmdisk/test5   FGD          1339
+
+SQL> select name, type, total_mb, free_mb, usable_file_mb
+  2    from v$asm_diskgroup where name='TESTN';
+
+NAME     TYPE     TOTAL_MB    FREE_MB USABLE_FILE_MB
+-------- ------ ---------- ---------- --------------
+TESTN    NORMAL      16384      11040           3472
+
+-- 장애 그룹이 4개다. Normal 의 최소 요건은 2개이므로 여유가 있다.
+
+--------------------------------------------------------------------------------
+ [2] 정상 제거 — 4개에서 3개로
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup TESTN drop disk d_c rebalance power 1;
+
+Diskgroup altered.
+
+-- 명령은 즉시 끝난다. 그런데 디스크는 아직 빠지지 않았다.
+
+SQL> select name, path, header_status, mount_status, state, total_mb, free_mb
+  2    from v$asm_disk where path like '%test6%';
+
+NAME     PATH                 HEADER_STATU MOUNT_S STATE      TOTAL_MB    FREE_MB
+-------- -------------------- ------------ ------- -------- ---------- ----------
+D_C      /dev/asmdisk/test6   MEMBER       CACHED  DROPPING       4096       2767
+
+-- STATE 가 DROPPING 이다. 네 가지를 읽는다.
+--   NAME           D_C 그대로. 아직 디스크그룹 구성원이다
+--   HEADER_STATUS  MEMBER 그대로
+--   MOUNT_STATUS   CACHED 그대로. ASM 이 여전히 열고 있다
+--   STATE          DROPPING. 데이터를 옮기는 중이라는 뜻
+--
+-- 이 상태에서 물리적으로 디스크를 뽑으면 어떻게 될까.
+-- 아직 옮기지 못한 익스텐트의 유일한 사본이 그 디스크에만 있을 수 있다.
+-- Normal 중복도라도 마찬가지다. 이미 옮겨진 것은 사본이 둘이지만 아직
+-- 옮기지 않은 것은 남은 디스크에 사본이 하나뿐인 상태일 수 있다.
+--
+-- 실무에서 가장 위험한 지점이다. drop disk 명령이 성공했다는 것만 보고
+-- 스토리지 담당자에게 회수를 요청하면 데이터를 잃는다.
+
+--------------------------------------------------------------------------------
+ [3] 리밸런스가 끝나야 실제로 빠진다
+--------------------------------------------------------------------------------
+
+SQL> select operation, state, power, sofar, est_work from v$asm_operation;
+
+OPERA STAT      POWER      SOFAR   EST_WORK
+----- ---- ---------- ---------- ----------
+REBAL RUN           1        844       1545
+
+-- 리밸런스가 돌고 있다. 완료를 기다린다. 실측에서 88.4초 걸렸다.
+
+SQL> select count(*) from v$asm_operation;
+
+  COUNT(*)
+----------
+         0
+
+SQL> select name, path, header_status, mount_status, group_number, state
+  2    from v$asm_disk where path like '%test6%';
+
+NAME     PATH                 HEADER_STATU MOUNT_S GROUP_NUMBER STATE
+-------- -------------------- ------------ ------- ------------ --------
+         /dev/asmdisk/test6   FORMER       CLOSED             0 NORMAL
+
+-- 이제 네 가지가 모두 바뀌었다.
+--   NAME           비었다
+--   HEADER_STATUS  FORMER
+--   MOUNT_STATUS   CLOSED
+--   GROUP_NUMBER   0
+--
+-- 이 상태가 되어야 물리적으로 회수해도 된다. 6장에서 디스크그룹을
+-- 삭제했을 때와 같은 상태이며 그대로 다시 쓸 수 있다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 3개에서 2개로 줄이려 하면
+--------------------------------------------------------------------------------
+
+-- 지금 장애 그룹이 3개다. 한 장을 더 빼 본다.
+
+SQL> alter diskgroup TESTN drop disk d_d;
+alter diskgroup TESTN drop disk d_d
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-59327: Dropping more fail groups is not allowed with disk group redundancy.
+
+-- 오류 : ORA-15032, ORA-59327
+-- 원인 파악 : 장애 그룹을 3개에서 2개로 줄이면 Normal 중복도의 최소 요건에
+--             딱 맞게 된다. 그 상태에서는 한 장만 더 잃어도 미러를 복구할
+--             수 없다. ASM 이 그 위험한 상태로 가는 것을 막는다.
+--             19c 에서 추가된 검사다. 이전 버전에서는 허용되어 운영자가
+--             모르는 사이에 위험한 구성이 만들어지곤 했다.
+-- 조치     : 두 가지 중 하나다.
+--             제거가 꼭 필요하면 다른 디스크를 새 장애 그룹으로 추가해
+--             개수를 늘린 뒤 제거한다.
+--             아니면 제거를 포기하고 다른 방법을 찾는다.
+-- 재확인   : 구성이 그대로인지 확인한다.
+
+SQL> select d.name, d.failgroup, d.state
+  2    from v$asm_disk d, v$asm_diskgroup g
+  3   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME     FAILGR STATE
+-------- ------ --------
+D_A      FGA    NORMAL
+D_B      FGB    NORMAL
+D_D      FGD    NORMAL
+
+-- 세 장 그대로다. 실패한 명령이 아무것도 바꾸지 않았다.
+
+--------------------------------------------------------------------------------
+ [5] FORCE 를 붙이면
+--------------------------------------------------------------------------------
+
+-- 막힌다고 FORCE 를 붙이면 통한다. 그런데 대가가 있다.
+-- 조건을 맞추기 위해 먼저 test6 을 다시 넣어 4장으로 만든다.
+
+SQL> alter diskgroup TESTN add failgroup fgC disk '/dev/asmdisk/test6'
+  2    name d_c rebalance power 8;
+
+Diskgroup altered.
+
+-- 리밸런스 완료 후 FORCE 로 제거한다.
+
+SQL> alter diskgroup TESTN drop disk d_c force;
+
+Diskgroup altered.
+
+SQL> select d.name, d.path, d.failgroup, d.total_mb, d.free_mb
+  2    from v$asm_disk d, v$asm_diskgroup g
+  3   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME                  PATH                 FAILGR   TOTAL_MB    FREE_MB
+--------------------- -------------------- ------ ---------- ----------
+D_A                   /dev/asmdisk/test2   FGA          4096       2163
+D_B                   /dev/asmdisk/test3   FGB          4096       2165
+_DROPPED_0002_TESTN                        FGC          4096       2805
+D_D                   /dev/asmdisk/test5   FGD          4096       3913
+
+-- 디스크 이름이 _DROPPED_0002_TESTN 으로 바뀌었다.
+-- 형식은 _DROPPED_<디스크번호>_<디스크그룹명> 이다.
+-- PATH 도 비었다. ASM 이 그 디스크를 더 이상 열지 않는다.
+--
+-- 그런데 여전히 목록에 나온다. 데이터를 옮기는 작업이 남아 있기 때문이다.
+
+--------------------------------------------------------------------------------
+ [6] FORCE 의 대가 — 헤더가 정리되지 않는다
+--------------------------------------------------------------------------------
+
+-- 리밸런스가 끝난 뒤 헤더를 확인한다.
+
+SQL> select path, name, header_status, mount_status, group_number, total_mb, os_mb
+  2    from v$asm_disk where path like '%test6%';
+
+PATH                 NAME  HEADER_STATU MOUNT_S GROUP_NUMBER   TOTAL_MB      OS_MB
+-------------------- ----- ------------ ------- ------------ ---------- ----------
+/dev/asmdisk/test6         MEMBER       CLOSED             0          0       4096
+
+-- [3] 의 정상 제거 결과와 비교한다.
+--
+--   컬럼            정상 제거   FORCE 제거
+--   ------------    ---------   ----------
+--   NAME            비었다      비었다
+--   HEADER_STATUS   FORMER      MEMBER      <-- 다르다
+--   MOUNT_STATUS    CLOSED      CLOSED
+--   GROUP_NUMBER    0           0
+--
+-- FORCE 는 데이터를 옮기되 디스크 헤더는 정리하지 않는다.
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 — 재사용이 막힌다
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup TESTN add failgroup fgC disk '/dev/asmdisk/test6' name d_c;
+alter diskgroup TESTN add failgroup fgC disk '/dev/asmdisk/test6' name d_c
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-15033: disk '/dev/asmdisk/test6' belongs to diskgroup "TESTN"
+
+-- 오류 : ORA-15032, ORA-15033
+-- 원인 파악 : 헤더에 TESTN 소속이라고 적혀 있으니 ASM 이 거절한다.
+--             실제로는 이미 빠진 디스크인데도 그렇다.
+--             ASM 은 add 명령을 받으면 헤더를 먼저 읽는다. 다른 디스크그룹이
+--             쓰고 있는 디스크를 빼앗지 않기 위한 정상적인 보호 동작이다.
+-- 조치     : add 에도 FORCE 를 붙여 헤더를 덮어쓴다.
+--             다만 그 전에 GROUP_NUMBER 가 0인지 확인한다. 0이면 현재 어느
+--             디스크그룹에도 마운트되어 있지 않다는 뜻이므로 비교적 안전하다.
+--             다른 클러스터가 쓰는 디스크라면 GROUP_NUMBER 가 0이어도
+--             위험하므로 스토리지 담당자에게 LUN 매핑을 확인한다.
+-- 재확인   : FORCE 로 편입한다.
+
+SQL> alter diskgroup TESTN add failgroup fgC disk '/dev/asmdisk/test6'
+  2    name d_c force rebalance power 8;
+
+Diskgroup altered.
+
+SQL> select name, path, header_status, mount_status, group_number
+  2    from v$asm_disk where path like '%test6%';
+
+NAME     PATH                 HEADER_STATU MOUNT_S GROUP_NUMBER
+-------- -------------------- ------------ ------- ------------
+D_C      /dev/asmdisk/test6   MEMBER       CACHED             5
+
+-- 정상적으로 편입되었다.
+
+--------------------------------------------------------------------------------
+ [8] FORCE 가 누적되면
+--------------------------------------------------------------------------------
+
+-- 이 실습에서 확인한 흐름을 정리하면 문제가 분명해진다.
+--
+--   1) drop disk force  -> 헤더가 MEMBER 로 남는다
+--   2) add disk         -> ORA-15033 으로 막힌다
+--   3) add disk force   -> 남의 헤더를 덮어쓴다
+--
+-- FORCE 가 FORCE 를 부른다. 이것이 반복되면 헤더 정보와 실제 소속이 계속
+-- 어긋나고, 어느 디스크가 어느 디스크그룹에 실제로 속하는지 헤더만으로는
+-- 판단할 수 없게 된다.
+--
+-- 최악의 경우는 이렇다. 새 디스크를 받았는데 MEMBER 로 나오길래 습관적으로
+-- FORCE 를 붙였다. 그런데 그 디스크는 운영 중인 다른 클러스터가 쓰고 있었다.
+-- 그 클러스터의 데이터가 사라진다.
+--
+-- ORA-59327 처럼 막히는 것은 대부분 이유가 있다. FORCE 로 뚫기 전에
+-- 왜 막혔는지 먼저 확인하는 습관이 필요하다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류
+--   ORA-15032 / ORA-59327   장애 그룹을 최소 요건까지 줄이려 함
+--   ORA-15032 / ORA-15033   FORCE 제거된 디스크 재사용 시도
+--
+-- 확인한 것
+--   1) drop disk 명령은 즉시 끝나지만 디스크는 바로 빠지지 않는다
+--   2) STATE 가 DROPPING 인 동안은 물리적으로 뽑으면 안 된다
+--   3) 정상 제거 완료 시 HEADER_STATUS 가 FORMER 가 된다
+--   4) 장애 그룹을 최소 요건까지 줄이는 것은 막힌다 (ORA-59327)
+--   5) FORCE 제거 시 이름이 _DROPPED_번호_디스크그룹명 이 된다
+--   6) FORCE 는 헤더를 MEMBER 로 남긴다
+--   7) 그 디스크를 재사용하려면 add 에도 FORCE 가 필요하다 (ORA-15033)
+--
+-- 물리 회수 조건 (모두 만족해야 한다)
+--   v$asm_operation 이 비어 있다
+--   NAME 이 비어 있다
+--   HEADER_STATUS 가 FORMER 다
+--   MOUNT_STATUS 가 CLOSED 다
+--   GROUP_NUMBER 가 0이다
+--
+--   이 조회 결과를 캡처해 스토리지 담당자에게 함께 전달하는 것이 좋다.
+================================================================================
+ 실습 04 종료
+================================================================================

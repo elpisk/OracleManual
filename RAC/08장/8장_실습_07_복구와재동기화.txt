@@ -1,0 +1,422 @@
+================================================================================
+ 제8장 실습 07 — 복구와 fast mirror resync
+ 대상   : rac1
+ 목표   : 강제 제거된 디스크를 되돌리고, 타이머 안에 복구할 때의 재동기화가
+          왜 26배 빠른지 확인한다
+ 소요   : 약 30분
+ 선행   : 실습 06 으로 test6 이 강제 제거되어 있을 것
+ 계정   : grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 강제 제거된 디스크의 상태
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select path, name, header_status, mount_status, group_number, total_mb, os_mb
+  2    from v$asm_disk where path like '%test6%';
+
+PATH                 NAME  HEADER_STATU MOUNT_S GROUP_NUMBER   TOTAL_MB      OS_MB
+-------------------- ----- ------------ ------- ------------ ---------- ----------
+/dev/asmdisk/test6         MEMBER       CLOSED             0          0       4096
+
+-- 실습 06 에서 ASM 이 FORCE 로 제거했으므로 HEADER_STATUS 가 MEMBER 로
+-- 남았다. GROUP_NUMBER 는 0이므로 현재 어느 디스크그룹에도 마운트되어
+-- 있지 않다.
+--
+-- FORCE 를 붙이기 전에 이 GROUP_NUMBER 를 확인하는 것이 중요하다.
+-- 0이면 우리 클러스터의 어느 디스크그룹도 쓰고 있지 않다는 뜻이다.
+-- 다만 다른 클러스터가 쓰는 디스크라면 이 값이 0이어도 위험하므로
+-- 스토리지 담당자에게 LUN 매핑을 확인해야 한다.
+
+SQL> select d.name, d.failgroup, d.total_mb-d.free_mb used_mb
+  2    from v$asm_disk d, v$asm_diskgroup g
+  3   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME     FAILGR    USED_MB
+-------- ------ ----------
+D_A      FGA          1782
+D_B      FGB          1780
+D_D      FGD          1783
+
+-- 디스크 3장으로 줄었고 데이터가 재분배되었다.
+
+--------------------------------------------------------------------------------
+ [2] FORCE 로 되돌린다
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup TESTN add failgroup fgC disk '/dev/asmdisk/test6'
+  2    name d_c force rebalance power 8;
+
+Diskgroup altered.
+
+[  1.1s] REBAL RUN power=8 sofar=0    est_work=0
+[ 17.2s] REBAL RUN power=8 sofar=203  est_work=1394
+...
+
+-- 전체 리밸런스가 일어난다. 헤더를 덮어쓰고 새 디스크로 취급하므로
+-- 데이터를 처음부터 다시 분배해야 한다.
+--
+-- 여기서 실습 06 의 대가가 드러난다. 타이머가 만료되어 강제 제거되면
+-- 복구에 전체 리밸런스가 필요하다.
+
+-- 완료 후
+SQL> select d.name, d.path, d.failgroup, d.mode_status, d.state, d.repair_timer,
+  2         d.total_mb-d.free_mb used_mb
+  3    from v$asm_disk d, v$asm_diskgroup g
+  4   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME     PATH                 FAILGR MODE_ST STATE    REPAIR_TIMER    USED_MB
+-------- -------------------- ------ ------- -------- ------------ ----------
+D_A      /dev/asmdisk/test2   FGA    ONLINE  NORMAL              0       1337
+D_B      /dev/asmdisk/test3   FGB    ONLINE  NORMAL              0       1336
+D_C      /dev/asmdisk/test6   FGC    ONLINE  NORMAL              0       1328
+D_D      /dev/asmdisk/test5   FGD    ONLINE  NORMAL              0       1337
+
+-- 네 장으로 돌아왔고 고르게 분배되었다.
+
+--------------------------------------------------------------------------------
+ [3] 타이머를 늘린다
+--------------------------------------------------------------------------------
+
+-- 이번에는 타이머가 만료되기 전에 되돌려 본다.
+-- 실습 06 처럼 3분이면 관찰하는 사이에 만료될 수 있으므로 넉넉히 둔다.
+
+SQL> alter diskgroup TESTN set attribute 'disk_repair_time'='2h';
+
+Diskgroup altered.
+
+SQL> select name, value from v$asm_attribute
+  2   where group_number=(select group_number from v$asm_diskgroup where name='TESTN')
+  3     and name like '%repair%';
+
+NAME                    VALUE
+----------------------- ------
+disk_repair_time        2h
+failgroup_repair_time   24.0h
+
+--------------------------------------------------------------------------------
+ [4] 다시 오프라인
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ date '+%H:%M:%S'
+20:29:22
+
+SQL> alter diskgroup TESTN offline disk d_c;
+
+Diskgroup altered.
+
+-- 15초 뒤
+SQL> select d.name, d.path, d.failgroup, d.mode_status, d.state, d.repair_timer,
+  2         d.total_mb-d.free_mb used_mb
+  3    from v$asm_disk d, v$asm_diskgroup g
+  4   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME     PATH                 FAILGR MODE_ST STATE    REPAIR_TIMER    USED_MB
+-------- -------------------- ------ ------- -------- ------------ ----------
+D_A      /dev/asmdisk/test2   FGA    ONLINE  NORMAL              0       1337
+D_B      /dev/asmdisk/test3   FGB    ONLINE  NORMAL              0       1336
+D_C                           FGC    OFFLINE NORMAL           7200       1328
+D_D      /dev/asmdisk/test5   FGD    ONLINE  NORMAL              0       1337
+
+-- REPAIR_TIMER 가 7200 이다. 2시간을 초로 환산한 값이다.
+--
+-- 그리고 D_C 의 USED_MB 가 1328 로 그대로다. 이것이 핵심이다.
+-- 오프라인은 제거가 아니므로 디스크의 데이터를 지우지 않는다.
+-- 디스크에는 오프라인 직전까지의 데이터가 온전히 남아 있다.
+
+SQL> select name, offline_disks, free_mb, required_mirror_free_mb, usable_file_mb
+  2    from v$asm_diskgroup where name='TESTN';
+
+NAME       OFFLINE_DISKS    FREE_MB REQUIRED_MIRROR_FREE_MB USABLE_FILE_MB
+-------- ------------- ---------- ----------------------- --------------
+TESTN                1      11046                    4096           3475
+
+-- OFFLINE_DISKS 가 1이 되었지만 FREE_MB 는 그대로다. 리밸런스가 일어나지
+-- 않았기 때문이다.
+
+--------------------------------------------------------------------------------
+ [5] 40초 뒤 되돌린다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ date '+%H:%M:%S'
+20:30:20
+
+SQL> alter diskgroup TESTN online disk d_c;
+
+Diskgroup altered.
+
+-- v$asm_operation 을 15초 간격으로 조회했다.
+[ 18.4s] 리밸런스 없음
+[ 34.7s] 리밸런스 없음
+[ 50.9s] 리밸런스 없음
+
+-- 18초 시점에 이미 끝나 있었다.
+
+[grid@rac1 ~]$ date '+%H:%M:%S'
+20:31:11
+
+SQL> select d.name, d.path, d.failgroup, d.mode_status, d.state, d.repair_timer,
+  2         d.total_mb-d.free_mb used_mb
+  3    from v$asm_disk d, v$asm_diskgroup g
+  4   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME     PATH                 FAILGR MODE_ST STATE    REPAIR_TIMER    USED_MB
+-------- -------------------- ------ ------- -------- ------------ ----------
+D_A      /dev/asmdisk/test2   FGA    ONLINE  NORMAL              0       1337
+D_B      /dev/asmdisk/test3   FGB    ONLINE  NORMAL              0       1338
+D_C      /dev/asmdisk/test6   FGC    ONLINE  NORMAL              0       1330
+D_D      /dev/asmdisk/test5   FGD    ONLINE  NORMAL              0       1339
+
+SQL> select name, offline_disks, free_mb, required_mirror_free_mb, usable_file_mb
+  2    from v$asm_diskgroup where name='TESTN';
+
+NAME       OFFLINE_DISKS    FREE_MB REQUIRED_MIRROR_FREE_MB USABLE_FILE_MB
+-------- ------------- ---------- ----------------------- --------------
+TESTN                0      11040                    4096           3472
+
+-- 완전히 복구되었다. MODE_STATUS ONLINE, REPAIR_TIMER 0, OFFLINE_DISKS 0 이다.
+-- PATH 도 돌아왔다.
+
+--------------------------------------------------------------------------------
+ [6] 왜 이렇게 빨랐는가
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ tail -25 /u01/app/grid/diag/asm/+asm/+ASM1/trace/alert_+ASM1.log
+Starting background process ARBA
+2026-09-01T20:30:22.822917+09:00
+ARBA started with pid=46, OS id=13779
+NOTE: starting process ARB0
+Starting background process ARB0
+2026-09-01T20:30:22.830879+09:00
+ARB0 started with pid=47, OS id=13781
+NOTE: assigning ARBA to group 5/0x9c506d29 (TESTN) to compute estimates
+NOTE: assigning ARB0 to group 5/0x9c506d29 (TESTN) with 1 parallel I/O
+2026-09-01T20:30:22.834176+09:00
+NOTE: Starting resync using Staleness Registry and ATE scan for group 5
+2026-09-01T20:30:25.897350+09:00
+NOTE: Starting resync using Staleness Registry and ATE scan for group 5
+2026-09-01T20:30:29.162456+09:00
+NOTE: initiating PST update: grp 5 (TESTN), dsk = 2/0x0, mask = 0x7f, op = assign mandatory
+NOTE: PST update grp = 5 completed successfully
+NOTE: reset timers for disk: 2
+NOTE: completed online of disk group 5 disks
+D_C (2)
+NOTE: stopping process ARBA
+NOTE: stopping process ARB0
+NOTE: requesting all-instance membership refresh for group=5
+SUCCESS: refreshed membership for 5/0x9c506d29 (TESTN)
+2026-09-01T20:30:32.014034+09:00
+SUCCESS: rebalance completed for group 5/0x9c506d29 (TESTN)
+
+-- 시각을 보면 20:30:22 에 시작해 20:30:32 에 끝났다. 약 9초다.
+--
+-- 답은 이 줄에 있다.
+--   NOTE: Starting resync using Staleness Registry and ATE scan for group 5
+--
+-- ASM 은 디스크가 오프라인인 동안 그 디스크에 반영하지 못한 변경을
+-- Staleness Registry 라는 별도 구조에 기록해 둔다. 디스크가 돌아오면
+-- 전체를 다시 복사하지 않고 그 목록에 있는 익스텐트만 갱신한다.
+-- 이것이 fast mirror resync 다.
+--
+-- ATE 는 Allocation Table Entry 로 익스텐트 할당 정보를 뜻한다.
+--
+-- 실습에서는 40초 동안만 오프라인이었고 그사이 변경이 거의 없었으므로
+-- 옮길 것이 몇 개 되지 않았다.
+--
+-- op = assign mandatory 도 눈여겨보라. 5장에서 디스크를 내릴 때 나온
+-- clear mandatory 와 정확히 대칭이다.
+
+--------------------------------------------------------------------------------
+ [7] 네 가지 상황을 비교한다
+--------------------------------------------------------------------------------
+
+--   상황                        동작                            실측
+--   ------------------------    ----------------------------    --------
+--   디스크 추가 (power 1)       전체 리밸런스. 모든 디스크 재분배  239.1초
+--   디스크 추가 (power 8)       전체 리밸런스                     68.4초
+--   디스크 제거 (power 1)       나가는 디스크 데이터만 이동        88.4초
+--   타이머 내 online            Staleness Registry 기반 부분 갱신   약 9초
+--
+-- 같은 4GB 디스크인데 추가는 239초, 복귀는 9초다. 26배 차이다.
+-- 옮기는 양이 근본적으로 다르기 때문이다.
+
+--------------------------------------------------------------------------------
+ [8] 5장의 ORA-15283 이 여기서 완결된다
+--------------------------------------------------------------------------------
+
+-- 5장에서 +CRS 의 디스크를 내리려 했을 때 이런 오류를 만났다.
+--
+--   ORA-15032: not all alterations performed
+--   ORA-15283: ASM operation requires compatible.rdbms of 11.1.0.0.0 or higher
+--
+-- 그때는 왜 11.1 이 필요한지 알 수 없었다. 이제 이유가 분명하다.
+-- fast mirror resync 가 11.1 에서 도입된 기능이기 때문이다.
+-- Staleness Registry 라는 구조 자체가 11.1 에서 추가되었으므로 그 이하
+-- 호환성으로는 디스크 OFFLINE 을 허용할 수 없었다.
+--
+-- 오프라인을 허용해 놓고 재동기화 구조가 없으면, 디스크가 돌아올 때마다
+-- 전체 리밸런스를 해야 한다. 그럴 바에는 아예 막는 편이 낫다는 판단이다.
+
+SQL> select name, value from v$asm_attribute
+  2   where group_number=(select group_number from v$asm_diskgroup where name='CRS')
+  3     and name like 'compatible%';
+
+NAME                VALUE
+------------------- ------------
+compatible.asm      19.0.0.0.0
+compatible.rdbms    11.2.0.0.0
+
+-- 5장에서 10.1 에서 11.2 로 올린 값이다. 되돌릴 수 없는 변경이었다.
+
+--------------------------------------------------------------------------------
+ [8b] 오류 재현 — 이미 온라인인 디스크를 online 하면
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup TESTN online disk d_c;
+alter diskgroup TESTN online disk d_c
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-15245: ASM disk D_C is already online or being brought online.
+
+-- 오류 : ORA-15032, ORA-15245
+-- 원인 파악 : 이미 온라인 상태이거나 온라인 처리가 진행 중이라는 뜻이다.
+--             두 상황을 한 메시지로 묶어 놓았다는 점이 중요하다.
+--             복구 스크립트를 만들 때 online 명령을 반복 실행하면 이 오류가
+--             나는데, 실제로는 정상 상태이므로 실패로 처리하면 안 된다.
+-- 조치     : 실행 전에 MODE_STATUS 를 확인해 OFFLINE 인 디스크만 대상으로
+--             한다. 또는 이 오류 코드를 정상으로 간주하도록 스크립트를 짠다.
+-- 재확인   : 현재 상태를 조회해 실제로 온라인인지 본다.
+
+SQL> select name, mode_status, state, repair_timer from v$asm_disk
+  2   where group_number=(select group_number from v$asm_diskgroup where name='TESTN')
+  3   order by disk_number;
+
+NAME     MODE_ST STATE    REPAIR_TIMER
+-------- ------- -------- ------------
+D_A      ONLINE  NORMAL              0
+D_B      ONLINE  NORMAL              0
+D_C      ONLINE  NORMAL              0
+D_D      ONLINE  NORMAL              0
+
+-- 네 장 모두 정상이다. 오류가 났지만 상태는 문제없다.
+
+--------------------------------------------------------------------------------
+ [8c] 오류 재현 — 없는 디스크 이름을 지정하면
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup TESTN online disk d_zz;
+alter diskgroup TESTN online disk d_zz
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-15054: disk "D_ZZ" does not exist in diskgroup "TESTN"
+
+-- 오류 : ORA-15032, ORA-15054
+-- 원인 파악 : 이름이 틀렸다. ASM 은 이름을 대문자로 정규화해 비교하므로
+--             메시지에 D_ZZ 로 나온다.
+--             ORA-15245 와 구분해야 한다. 15245 는 이름은 맞는데 이미
+--             온라인이라는 뜻이고, 15054 는 그런 이름 자체가 없다는 뜻이다.
+--             복구 스크립트에서 두 코드의 처리가 달라야 한다. 15245 는
+--             넘어가도 되지만 15054 는 사람이 확인해야 한다.
+-- 조치     : v$asm_disk 의 NAME 을 조회해 정확한 이름을 쓴다.
+-- 재확인   : 정확한 이름 목록을 확인한다.
+
+SQL> select name, disk_number, mode_status from v$asm_disk
+  2   where group_number=(select group_number from v$asm_diskgroup where name='TESTN')
+  3   order by disk_number;
+
+NAME     DISK_NUMBER MODE_ST
+-------- ----------- -------
+D_A                0 ONLINE
+D_B                1 ONLINE
+D_C                2 ONLINE
+D_D                3 ONLINE
+
+--------------------------------------------------------------------------------
+ [9] 실습 환경 정리
+--------------------------------------------------------------------------------
+
+-- 타이머를 원래대로 되돌린다.
+SQL> alter diskgroup TESTN set attribute 'disk_repair_time'='3.6h';
+
+Diskgroup altered.
+
+-- 테이블스페이스를 지운다.
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+SQL> drop tablespace ts_reb including contents and datafiles;
+
+Tablespace dropped.
+
+-- rac2 에서 언마운트한다 (6장의 ORA-15073 을 피하기 위해)
+[grid@rac2 ~]$ sqlplus -s / as sysasm
+SQL> alter diskgroup TESTN dismount;
+
+Diskgroup altered.
+
+-- 디스크그룹을 지운다.
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+SQL> drop diskgroup TESTN;
+
+Diskgroup dropped.
+
+SQL> select header_status, count(*) from v$asm_disk group by header_status order by 1;
+
+HEADER_STATU   COUNT(*)
+------------ ----------
+FORMER                6
+MEMBER                8
+
+-- test 디스크 6장이 모두 FORMER 로 돌아왔다.
+
+--------------------------------------------------------------------------------
+ [10] 기준 상태 확인
+--------------------------------------------------------------------------------
+
+SQL> select name, state, type, total_mb, free_mb from v$asm_diskgroup order by name;
+
+NAME       STATE       TYPE     TOTAL_MB    FREE_MB
+---------- ----------- ------ ---------- ----------
+CRS        MOUNTED     NORMAL      12288      11324
+DATA       MOUNTED     EXTERN      61440      56956
+FRA        MOUNTED     EXTERN      24576      23636
+
+[root@rac1 ~]# crsctl check cluster -all | grep -c online
+6
+[root@rac1 ~]# srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+[root@rac1 ~]# ocrcheck | grep ID
+         ID                       :  665666554
+[root@rac1 ~]# crsctl query css votedisk | tail -1
+Located 3 voting disk(s).
+
+-- 5장 종료 시점과 같은 상태다.
+-- 되돌리지 못한 것은 하나뿐이다. 5장에서 올린 +CRS 의 compatible.rdbms
+-- 11.2.0.0.0 이며, 이는 처음부터 되돌릴 수 없는 변경이라고 밝혀 두었다.
+
+--------------------------------------------------------------------------------
+ [11] 정리
+--------------------------------------------------------------------------------
+
+-- 확인한 것
+--   1) 강제 제거된 디스크는 add ... force 로만 되돌릴 수 있다
+--   2) 그때는 전체 리밸런스가 일어난다
+--   3) 오프라인 시 USED_MB 가 유지된다. 데이터를 지우지 않는다
+--   4) 타이머 안에 online 하면 약 9초에 끝난다
+--   5) alert.log 의 Starting resync using Staleness Registry 가 근거다
+--   6) op = assign mandatory 는 5장의 clear mandatory 와 대칭이다
+--   7) 239초 대 9초. 26배 차이다
+--   8) 5장의 ORA-15283 이 막았던 것이 바로 이 기능이었다
+--
+-- 실무 지침
+--   계획된 스토리지 작업이라면
+--     1) DISK_REPAIR_TIME 을 작업 시간보다 길게 확인한다
+--     2) 작업 직전에 해당 디스크를 명시적으로 offline 한다
+--     3) 작업 후 online 하면 fast mirror resync 로 빠르게 복구된다
+--   타이머를 넘기면 전체 리밸런스가 필요하고 헤더 정리도 해야 한다.
+================================================================================
+ 실습 07 종료
+================================================================================

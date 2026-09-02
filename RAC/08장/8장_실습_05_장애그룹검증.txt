@@ -1,0 +1,359 @@
+================================================================================
+ 제8장 실습 05 — 장애 그룹 검증
+ 대상   : rac1
+ 목표   : 같은 익스텐트의 원본과 미러가 서로 다른 장애 그룹에 놓이는지를
+          조회로 직접 검증한다
+ 소요   : 약 25분
+ 선행   : 실습 04 로 TESTN 에 디스크 4장이 있을 것
+ 계정   : grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 설계와 실제를 대조한다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select d.disk_number, d.name, d.path, d.failgroup, d.failgroup_type,
+  2         d.total_mb-d.free_mb used_mb
+  3    from v$asm_disk d, v$asm_diskgroup g
+  4   where d.group_number=g.group_number and g.name='TESTN'
+  5   order by d.disk_number;
+
+DISK_NUMBER NAME     PATH                 FAILGR FAILGRO    USED_MB
+----------- -------- -------------------- ------ ------- ----------
+          0 D_A      /dev/asmdisk/test2   FGA    REGULAR       1337
+          1 D_B      /dev/asmdisk/test3   FGB    REGULAR       1338
+          2 D_C      /dev/asmdisk/test6   FGC    REGULAR       1330
+          3 D_D      /dev/asmdisk/test5   FGD    REGULAR       1339
+
+-- 첫 번째 확인은 이름 대조다.
+-- 우리가 의도한 대로 FGA, FGB, FGC, FGD 네 개의 장애 그룹이 있다.
+--
+-- 여기서 놓치기 쉬운 실수가 있다. 디스크를 추가할 때 failgroup 절을
+-- 빠뜨리면 ASM 이 디스크 이름을 장애 그룹 이름으로 쓴다. 6장에서 확인했다.
+-- 그러면 D_C 라는 이름의 장애 그룹이 생기고, 설계 문서와 대조하지 않으면
+-- 눈치채기 어렵다.
+--
+-- FAILGROUP_TYPE 은 모두 REGULAR 다. 다른 값은 QUORUM 이며 데이터는 담지
+-- 않고 투표에만 참여한다. 확장 클러스터의 제3 사이트용이다.
+
+--------------------------------------------------------------------------------
+ [2] 디스크별 원본과 미러 분포
+--------------------------------------------------------------------------------
+
+SQL> select x.disk_kffxp disk, x.lxn_kffxp side, count(*) extents
+  2    from x$kffxp x, v$asm_diskgroup g
+  3   where x.group_kffxp=g.group_number and g.name='TESTN'
+  4   group by x.disk_kffxp, x.lxn_kffxp order by 1,2;
+
+      DISK       SIDE    EXTENTS
+---------- ---------- ----------
+         0          0        654
+         0          1        671
+         0          2          8
+         1          0        654
+         1          1        658
+         1          2         23
+         2          0        650
+         2          1        653
+         2          2         25
+         3          0        653
+         3          1        629
+         3          2         54
+
+12 rows selected.
+
+-- 네 디스크 모두 SIDE 0(원본)과 SIDE 1(미러)을 비슷한 개수로 갖고 있다.
+-- 원본은 650~654, 미러는 629~671 사이다. 특정 디스크가 미러 전용이 되지 않는다.
+--
+-- SIDE 2 가 새로 보인다. 실습 01 에서 디스크 2장일 때는 65534 행에만
+-- 있었다. 이것은 세 번째 데이터 사본이 아니라 디스크그룹 메타데이터를 위한
+-- 별도 익스텐트다.
+-- 근거는 개수다. 8, 23, 25, 54개로 매우 적다. 데이터 익스텐트가 650개
+-- 내외인 것과 비교하면 자릿수가 다르다. Normal 중복도에서도 일부
+-- 메타데이터는 세 벌로 유지된다.
+
+--------------------------------------------------------------------------------
+ [3] 이 조회만으로는 부족하다
+--------------------------------------------------------------------------------
+
+-- [2] 의 결과는 "각 디스크가 원본과 미러를 골고루 갖고 있다" 는 것만
+-- 보여 준다. 정작 중요한 질문에는 답하지 못한다.
+--
+--   같은 익스텐트의 원본과 미러가 서로 다른 장애 그룹에 있는가
+--
+-- 이것을 확인하려면 익스텐트 단위로 짝을 맞춰야 한다.
+-- x$kffxp 를 자기 자신과 조인한다.
+
+--------------------------------------------------------------------------------
+ [4] 원본과 미러의 짝을 맞춘다
+--------------------------------------------------------------------------------
+
+SQL> select p.disk_kffxp pri_disk, s.disk_kffxp sec_disk, count(*) cnt
+  2    from x$kffxp p, x$kffxp s, v$asm_diskgroup g
+  3   where p.group_kffxp=g.group_number and g.name='TESTN'
+  4     and s.group_kffxp=p.group_kffxp
+  5     and s.number_kffxp=p.number_kffxp
+  6     and s.xnum_kffxp=p.xnum_kffxp
+  7     and p.lxn_kffxp=0 and s.lxn_kffxp=1
+  8     and p.disk_kffxp<>65534 and s.disk_kffxp<>65534
+  9   group by p.disk_kffxp, s.disk_kffxp order by 1,2;
+
+  PRI_DISK   SEC_DISK        CNT
+---------- ---------- ----------
+         0          1        228
+         0          2        217
+         0          3        209
+         1          0        227
+         1          2        218
+         1          3        209
+         2          0        220
+         2          1        219
+         2          3        211
+         3          0        224
+         3          1        211
+         3          2        218
+
+12 rows selected.
+
+-- 조인 조건을 하나씩 설명한다.
+--
+--   number_kffxp   파일 번호
+--   xnum_kffxp     그 파일 안의 익스텐트 번호
+--   -> 두 값이 같으면 같은 익스텐트다
+--
+--   p.lxn_kffxp=0  원본 쪽 행
+--   s.lxn_kffxp=1  미러 쪽 행
+--   -> 두 행을 짝지으면 원본과 미러의 위치를 나란히 볼 수 있다
+--
+--   disk_kffxp<>65534   미할당 가상 디스크 제외
+--
+-- 결과에서 읽을 것은 하나다.
+--   PRI_DISK 와 SEC_DISK 가 같은 조합이 하나도 없다.
+--
+-- 12개 조합은 디스크 4개에서 서로 다른 둘을 고르는 모든 경우다.
+-- 4 x 3 = 12 다. 대각선(0-0, 1-1, 2-2, 3-3)이 비어 있다.
+--
+-- 즉 원본과 미러가 같은 디스크에 놓인 익스텐트가 하나도 없다.
+-- 실습 환경은 디스크마다 장애 그룹이 하나씩이므로 디스크가 다르면
+-- 장애 그룹도 다르다. 규칙이 지켜지고 있다.
+
+--------------------------------------------------------------------------------
+ [5] 왜 이 검증이 필요한가
+--------------------------------------------------------------------------------
+
+-- 설계 문서에 "CTRL_A 와 CTRL_B 로 나눈다" 고 적혀 있어도 실제로 그렇게
+-- 배치되었는지는 별개다.
+--
+-- 실패하는 경우가 있다.
+--   1) 디스크를 추가할 때 failgroup 절을 빠뜨렸다
+--      -> ASM 이 디스크마다 새 장애 그룹을 만든다
+--   2) 스토리지 담당자가 LUN 매핑을 바꿔 CTRL_A 로 알고 있던 디스크가
+--      실제로는 CTRL_B 에 있다
+--      -> ASM 은 이를 알 수 없다. 이름만 CTRL_A 다
+--   3) 확장 클러스터에서 사이트 정보가 잘못 입력되었다
+--
+-- 특히 3번이 위험하다. 사이트 A 의 디스크에 원본과 미러가 함께 놓였다면
+-- 사이트 A 가 통째로 끊길 때 데이터를 잃는다. Normal 중복도라는 것만
+-- 믿고 있으면 사고가 날 때까지 모른다.
+
+--------------------------------------------------------------------------------
+ [6] 장애 그룹 단위로 확인한다
+--------------------------------------------------------------------------------
+
+-- 실습 환경은 디스크 하나가 장애 그룹 하나이므로 [4] 의 조회로 충분하다.
+-- 그러나 한 장애 그룹에 디스크가 여럿인 구성이라면 디스크가 달라도
+-- 같은 장애 그룹일 수 있다. 그때는 장애 그룹 기준으로 집계해야 한다.
+
+SQL> select dp.failgroup pri_fg, ds.failgroup sec_fg, count(*) cnt
+  2    from x$kffxp p, x$kffxp s, v$asm_diskgroup g,
+  3         v$asm_disk dp, v$asm_disk ds
+  4   where p.group_kffxp=g.group_number and g.name='TESTN'
+  5     and s.group_kffxp=p.group_kffxp
+  6     and s.number_kffxp=p.number_kffxp
+  7     and s.xnum_kffxp=p.xnum_kffxp
+  8     and p.lxn_kffxp=0 and s.lxn_kffxp=1
+  9     and dp.group_number=p.group_kffxp and dp.disk_number=p.disk_kffxp
+ 10     and ds.group_number=s.group_kffxp and ds.disk_number=s.disk_kffxp
+ 11   group by dp.failgroup, ds.failgroup order by 1,2;
+
+PRI_FG SEC_FG        CNT
+------ ------ ----------
+FGA    FGB           228
+FGA    FGC           217
+FGA    FGD           209
+FGB    FGA           227
+FGB    FGC           218
+FGB    FGD           209
+FGC    FGA           220
+FGC    FGB           219
+FGC    FGD           211
+FGD    FGA           224
+FGD    FGB           211
+FGD    FGC           218
+
+12 rows selected.
+
+-- 같은 조회를 디스크 기준으로 하면 숫자가 정확히 일치한다.
+
+SQL> select p.disk_kffxp pri, s.disk_kffxp sec, count(*) cnt
+  2    from x$kffxp p, x$kffxp s, v$asm_diskgroup g
+  3   where p.group_kffxp=g.group_number and g.name='TESTN'
+  4     and s.group_kffxp=p.group_kffxp and s.number_kffxp=p.number_kffxp
+  5     and s.xnum_kffxp=p.xnum_kffxp and p.lxn_kffxp=0 and s.lxn_kffxp=1
+  6     and p.disk_kffxp<>65534 and s.disk_kffxp<>65534
+  7   group by p.disk_kffxp, s.disk_kffxp order by 1,2;
+
+       PRI        SEC        CNT
+---------- ---------- ----------
+         0          1        228
+         0          2        217
+         0          3        209
+         1          0        227
+         1          2        218
+         1          3        209
+         2          0        220
+         2          1        219
+         2          3        211
+         3          0        224
+         3          1        211
+         3          2        218
+
+-- 디스크 0이 FGA, 1이 FGB, 2가 FGC, 3이 FGD 이므로 값이 그대로 대응한다.
+-- 실습 환경은 디스크와 장애 그룹이 1대1이므로 당연한 결과다.
+--
+-- 운영 환경에서는 장애 그룹 기준 조회를 써야 정확하다.
+-- PRI_FG 와 SEC_FG 가 같은 행이 하나라도 있으면 그 장애 그룹이 통째로
+-- 사라질 때 데이터를 잃는다는 뜻이다.
+
+--------------------------------------------------------------------------------
+ [7] 검증 결과를 기록한다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ cat > /tmp/fg_verify.sql <<'SQL'
+set lines 140 pages 100
+col dg for a10
+col name for a10
+col failgroup for a12
+prompt === 장애 그룹 구성 ===
+select g.name dg, d.disk_number, d.name, d.failgroup, d.failgroup_type
+  from v$asm_disk d, v$asm_diskgroup g
+ where d.group_number=g.group_number and g.name='&1'
+ order by d.disk_number;
+prompt === 원본-미러 짝 (대각선이 비어야 한다) ===
+select dp.failgroup pri_fg, ds.failgroup sec_fg, count(*) cnt
+  from x$kffxp p, x$kffxp s, v$asm_diskgroup g, v$asm_disk dp, v$asm_disk ds
+ where p.group_kffxp=g.group_number and g.name='&1'
+   and s.group_kffxp=p.group_kffxp and s.number_kffxp=p.number_kffxp
+   and s.xnum_kffxp=p.xnum_kffxp and p.lxn_kffxp=0 and s.lxn_kffxp=1
+   and dp.group_number=p.group_kffxp and dp.disk_number=p.disk_kffxp
+   and ds.group_number=s.group_kffxp and ds.disk_number=s.disk_kffxp
+ group by dp.failgroup, ds.failgroup order by 1,2;
+SQL
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm @/tmp/fg_verify.sql TESTN > /tmp/fg_verify_$(date +%Y%m%d).txt
+
+-- 디스크 구성이 바뀔 때마다 이 검증을 다시 해야 하므로 스크립트로 만들어
+-- 두고 결과를 날짜와 함께 남긴다.
+--
+-- 주의할 점은 x$kffxp 가 문서화되지 않은 내부 테이블이라는 것이다.
+-- 버전이 바뀌면 컬럼이 달라질 수 있으므로 업그레이드 후에는 조회가
+-- 동작하는지 먼저 확인해야 한다.
+
+--------------------------------------------------------------------------------
+ [8] 오류 재현 — 없는 디스크를 지정하면
+--------------------------------------------------------------------------------
+
+-- 검증 조회에서 디스크 이름을 잘못 쓰는 경우를 확인해 둔다.
+
+SQL> alter diskgroup TESTN offline disk d_zz;
+alter diskgroup TESTN offline disk d_zz
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-15054: disk "D_ZZ" does not exist in diskgroup "TESTN"
+
+-- 오류 : ORA-15032, ORA-15054
+-- 원인 파악 : 디스크 이름이 틀렸다. ASM 은 이름을 대문자로 정규화해
+--             비교하므로 메시지에 D_ZZ 로 나온다.
+--             주의할 것은 이 오류가 두 가지 상황에서 똑같이 나온다는 점이다.
+--             하나는 여기처럼 오타이고, 다른 하나는 이미 제거된 디스크를
+--             지정한 경우다. 실습 04 에서 FORCE 제거 후 d_c 를 다시
+--             지정했을 때도 같은 코드가 나왔다.
+-- 조치     : v$asm_disk 에서 정확한 NAME 을 확인해 쓴다. 이름 대신
+--             DISK_NUMBER 로 지정할 수도 있다.
+-- 재확인   : 정확한 이름으로는 동작하는지 본다.
+
+SQL> select name, disk_number from v$asm_disk
+  2   where group_number=(select group_number from v$asm_diskgroup where name='TESTN')
+  3   order by disk_number;
+
+NAME     DISK_NUMBER
+-------- -----------
+D_A                0
+D_B                1
+D_C                2
+D_D                3
+
+--------------------------------------------------------------------------------
+ [8b] 오류 재현 — 조회 대상 인스턴스를 틀리면
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> select count(*) from x$kffxp;
+
+  COUNT(*)
+----------
+         0
+
+-- 오류 : 오류가 나지 않는다. 0건이 나온다.
+-- 원인 파악 : x$kffxp 는 ASM 인스턴스의 익스텐트 정보를 담는다. RDBMS
+--             인스턴스에는 그 정보가 없으므로 빈 결과가 나온다.
+--             오류가 아니라 빈 결과이므로 스크립트에서는 성공한 것으로
+--             처리된다. 검증 스크립트가 아무것도 검사하지 않고 통과하는
+--             조용한 실패다.
+-- 조치     : 반드시 ASM 인스턴스에서 실행한다. 스크립트 앞에 인스턴스
+--             종류를 확인하는 코드를 넣는다.
+-- 재확인   : ASM 인스턴스에서 같은 조회를 한다.
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select count(*) from x$kffxp;
+
+  COUNT(*)
+----------
+     11260
+
+-- 11,260 건이다. 실습 환경의 모든 디스크그룹 익스텐트를 합한 수다.
+--
+-- 검증 스크립트 맨 앞에 이런 확인을 넣으면 안전하다.
+--   select decode(value,'ASM','OK','STOP: not an ASM instance')
+--     from v$parameter where name='instance_type';
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류
+--   RDBMS 인스턴스에서 x$kffxp 조회 — 오류 없이 0건. 조용한 실패
+--
+-- 확인한 것
+--   1) 장애 그룹 이름을 설계 문서와 대조하는 것이 첫 단계다
+--   2) 각 디스크가 원본 650~669, 미러 629~669 로 골고루 갖고 있다
+--   3) SIDE 2 는 세 벌로 유지되는 메타데이터다. 개수가 8~54개로 적다
+--   4) 디스크별 분포만으로는 규칙 준수를 증명하지 못한다
+--   5) 익스텐트 단위로 짝을 맞춰야 한다 (number_kffxp, xnum_kffxp 조인)
+--   6) 대각선이 비어 있으면 규칙이 지켜지고 있다
+--   7) 장애 그룹에 디스크가 여럿이면 장애 그룹 기준으로 집계한다
+--   8) x$kffxp 는 ASM 인스턴스에서만 의미 있는 값을 준다
+--
+-- 검증이 필요한 시점
+--   디스크를 추가하거나 제거한 뒤
+--   스토리지 구성이 바뀐 뒤
+--   확장 클러스터를 구축한 뒤
+--   정기 점검 항목으로 (분기 1회 이상)
+================================================================================
+ 실습 05 종료
+================================================================================
