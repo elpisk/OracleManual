@@ -1,0 +1,360 @@
+================================================================================
+ 제9장 실습 06 — 용량 산정 : USABLE_FILE_MB 를 음수로 만들기
+ 대상   : rac1 (정리 단계에서 rac2 포함)
+ 목표   : USABLE_FILE_MB 공식을 검산하고, 디스크를 늘렸는데 쓸 공간이 줄어드는
+          현상과 값이 음수가 되는 상황을 직접 만들어 그 의미를 확인한다
+ 소요   : 약 40분 (데이터파일 생성에만 약 4분)
+ 선행   : 실습 05 에서 만든 CH9DG 가 존재할 것
+ 계정   : grid, oracle
+ 주의   : 이 실습 끝에서 CH9DG 를 삭제해 기준선으로 복귀한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 공식 검산 — 세 숫자의 관계
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> col name for a8
+SQL> select name, type, free_mb, required_mirror_free_mb rmf, usable_file_mb usable,
+  2         case type when 'NORMAL' then (free_mb-required_mirror_free_mb)/2
+  3                   else free_mb-required_mirror_free_mb end calc
+  4    from v$asm_diskgroup order by group_number;
+
+NAME     TYPE      FREE_MB        RMF     USABLE       CALC
+-------- ------ ---------- ---------- ---------- ----------
+CRS      NORMAL      11324       4096       3614       3614
+DATA     EXTERN      56916          0      56916      56916
+FRA      EXTERN      23636          0      23636      23636
+
+3 rows selected.
+
+-- USABLE 과 CALC 가 정확히 일치한다. 공식이 확인되었다.
+--
+--   FREE_MB : 디스크에 남은 원시 공간. 중복도를 고려하지 않는다.
+--   RMF     : 디스크 한 장을 잃었을 때 이중화를 복원하는 데 필요한 공간.
+--   USABLE  : 지금부터 안전하게 더 넣을 수 있는 데이터의 양.
+--
+--   Normal   : (FREE_MB - RMF) / 2   ← 데이터 1MB 에 원시 2MB 를 쓰므로
+--   External : FREE_MB - RMF         ← 미러가 없으므로 RMF 도 0
+
+--------------------------------------------------------------------------------
+ [2] RMF 는 무엇으로 정해지는가
+--------------------------------------------------------------------------------
+
+SQL> col failgroup for a12
+SQL> select failgroup, count(*) disks, sum(total_mb) total_mb, sum(free_mb) free_mb
+  2    from v$asm_disk where group_number=1 group by failgroup order by 1;
+
+FAILGROUP         DISKS   TOTAL_MB    FREE_MB
+------------ ---------- ---------- ----------
+CRS_0000              1       4096       3772
+CRS_0001              1       4096       3776
+CRS_0002              1       4096       3776
+
+3 rows selected.
+
+-- +CRS 의 RMF 가 4096 인 이유가 여기 있다.
+-- 장애 그룹이 셋이고 각각 4096MB 이므로 가장 큰 것이 4096 이다.
+--
+-- 논리 : 장애 그룹 하나가 통째로 사라지면 거기 있던 데이터를 남은
+--        장애 그룹들에 다시 복제해야 한다. 그러려면 사라진 장애 그룹만큼의
+--        공간이 남아 있어야 한다.
+
+--------------------------------------------------------------------------------
+ [3] 장애 그룹이 2 개면 RMF 가 0 이다
+--------------------------------------------------------------------------------
+
+SQL> select name, type, total_mb, free_mb, required_mirror_free_mb rmf,
+  2         usable_file_mb usable from v$asm_diskgroup where name='CH9DG';
+
+NAME     TYPE     TOTAL_MB    FREE_MB        RMF     USABLE
+-------- ------ ---------- ---------- ---------- ----------
+CH9DG    NORMAL       8192       7990          0       3995
+
+1 row selected.
+
+-- RMF 가 0 이다. Normal 중복도인데도 예약이 없다.
+--
+-- 원인 파악 : Normal 은 원본과 미러를 서로 다른 장애 그룹에 둔다.
+--             장애 그룹이 둘뿐인데 하나가 사라지면, 남은 하나에는 이미
+--             사본이 있으므로 같은 장애 그룹 안에 또 하나를 만들 수 없다.
+--             복원이 불가능하므로 예약할 공간도 없다.
+
+--------------------------------------------------------------------------------
+ [4] 디스크를 늘렸는데 쓸 공간이 줄어든다
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup CH9DG add disk '/dev/asmdisk/test3';
+
+Diskgroup altered.
+
+-- 리밸런스가 끝날 때까지 기다린다. 데이터가 없으므로 금방 끝난다.
+
+SQL> select group_number, operation, state from v$asm_operation;
+
+no rows selected
+                                              (리밸런스 포함 14.4초 소요)
+
+-- 0 행이면 리밸런스가 끝난 것이다. 데이터가 없는 디스크그룹이라 옮길
+-- 익스텐트가 거의 없어 금방 끝났다.
+-- 데이터가 들어 있는 디스크그룹이었다면 8장에서처럼 수 분이 걸린다.
+
+SQL> select name, type, total_mb, free_mb, required_mirror_free_mb rmf,
+  2         usable_file_mb usable from v$asm_diskgroup where name='CH9DG';
+
+NAME     TYPE     TOTAL_MB    FREE_MB        RMF     USABLE
+-------- ------ ---------- ---------- ---------- ----------
+CH9DG    NORMAL      12288      11982       4096       3943
+
+1 row selected.
+
+SQL> select failgroup, count(*) disks, sum(total_mb) total_mb, sum(free_mb) free_mb
+  2    from v$asm_disk
+  3   where group_number=(select group_number from v$asm_diskgroup where name='CH9DG')
+  4   group by failgroup order by 1;
+
+FAILGROUP         DISKS   TOTAL_MB    FREE_MB
+------------ ---------- ---------- ----------
+CH9DG_0000            1       4096       3994
+CH9DG_0001            1       4096       3994
+CH9DG_0002            1       4096       3994
+
+3 rows selected.
+
+-- 결과를 비교한다.
+--   TOTAL_MB :  8192 → 12288   (4GB 증가)
+--   RMF      :     0 →  4096
+--   USABLE   :  3995 →  3943   (52MB 감소)
+--
+-- 총량은 4GB 늘었는데 쓸 수 있는 공간은 오히려 줄었다.
+--
+-- 원인 파악 : 장애 그룹이 셋이 되면서 "하나를 잃어도 복원 가능" 한
+--             구성이 되었고, 그 대가로 4096MB 가 예약되었다.
+--
+-- 실무 대응 : "증설했는데 공간이 안 늘었다" 는 항의가 실제로 자주 있다.
+--             설명할 때는 총량이 아니라 "얻은 보장" 을 기준으로 말한다.
+--             이전에는 디스크 한 장을 잃으면 이중화가 영구히 깨진 채
+--             운영해야 했고, 지금은 자동으로 복구된다.
+--             줄어든 52MB 는 그 보장의 값이다.
+
+--------------------------------------------------------------------------------
+ [5] 채워서 음수 만들기
+--------------------------------------------------------------------------------
+
+-- 공식대로면 FREE_MB 가 RMF(4096) 보다 작아질 때 음수가 되어야 한다.
+-- 1GB 데이터파일을 하나씩 더하며 값을 추적한다.
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> create tablespace ts_ch9 datafile '+CH9DG' size 1000M autoextend off;
+
+Tablespace created.                                          (53.7초 소요)
+
+SQL> alter tablespace ts_ch9 add datafile '+CH9DG' size 1000M autoextend off;
+
+Tablespace altered.                                          (52초 소요)
+
+SQL> alter tablespace ts_ch9 add datafile '+CH9DG' size 1000M autoextend off;
+
+Tablespace altered.                                          (43초 소요)
+
+SQL> alter tablespace ts_ch9 add datafile '+CH9DG' size 1000M autoextend off;
+
+Tablespace altered.                                          (40초 소요)
+
+-- 각 단계의 값 (grid 계정에서 조회)
+--
+--   적재량   FREE_MB    RMF    USABLE
+--   ------  --------  -----  --------
+--   0GB       11982    4096      3943
+--   1GB        9956    4096      2930
+--   2GB        7951    4096      1927
+--   3GB        5946    4096       925
+--   4GB        3941    4096       -77
+--
+-- 규칙성 : 1GB 데이터파일 하나가 FREE_MB 를 약 2005MB 씩 깎는다.
+--          Normal 중복도라 미러까지 2000MB 를 쓰고 나머지 5MB 정도가
+--          메타데이터다. USABLE 은 매번 약 1002MB 씩 줄어든다.
+--
+-- 4GB 시점에 FREE_MB 3941 이 RMF 4096 보다 작아졌다.
+--   (3941 - 4096) / 2 = -77.5  →  ASM 은 -77 로 보고했다.
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> col name for a10
+SQL> select name, type, total_mb, free_mb, required_mirror_free_mb rmf,
+  2         usable_file_mb usable from v$asm_diskgroup where name='CH9DG';
+
+NAME       TYPE     TOTAL_MB    FREE_MB        RMF     USABLE
+---------- ------ ---------- ---------- ---------- ----------
+CH9DG      NORMAL      12288       3941       4096        -77
+
+1 row selected.
+
+[grid@rac1 ~]$ asmcmd lsdg CH9DG
+State    Type    Total_MB  Free_MB  Req_mir_free_MB  Usable_file_MB  Name
+MOUNTED  NORMAL     12288     3941             4096             -77  CH9DG/
+
+-- SQL 과 asmcmd 모두 -77 로 같다.
+
+--------------------------------------------------------------------------------
+ [6] 음수는 무엇을 뜻하는가 — 쓰기가 되는지 확인
+--------------------------------------------------------------------------------
+
+-- 음수를 보면 "공간이 없다" 로 읽기 쉽다. 실제로 그런지 확인한다.
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> create table sys.ch9_t (a number, b varchar2(200)) tablespace ts_ch9;
+
+Table created.
+
+SQL> insert into sys.ch9_t select level, lpad('x',200,'x')
+  2    from dual connect by level<=50000;
+
+50000 rows created.
+
+SQL> commit;
+
+Commit complete.
+
+SQL> select count(*) from sys.ch9_t;
+
+  COUNT(*)
+----------
+     50000
+
+1 row selected.
+
+-- 아무 문제 없이 5 만 건이 들어갔다.
+-- USABLE_FILE_MB 가 -77 인 상태에서도 쓰기는 정상이다.
+--
+-- 결론 : USABLE_FILE_MB 음수는
+--          "더 못 쓴다"                                    (X)
+--          "디스크를 한 장 잃으면 이중화를 복원할 공간이 없다"  (O)
+--        를 뜻한다.
+--
+--        실제 여유는 FREE_MB 3941 이고 Normal 중복도이므로 데이터 기준
+--        약 1970MB 를 더 넣을 수 있다. 다만 그렇게 하면 위험만 커진다.
+--
+-- 감시 설계 : FREE_MB 만 보는 스크립트는 이 상황에서 아무 경보도 울리지
+--             않는다. 3941 은 전체 12288 의 32% 라 넉넉해 보이기 때문이다.
+--             Normal·High 중복도 디스크그룹은 반드시 USABLE_FILE_MB 로
+--             임계값을 잡아야 한다.
+--             권장 : 전체 용량의 10~20% 아래에서 경고, 0 근처에서 심각.
+
+--------------------------------------------------------------------------------
+ [7] 정리 1 — 테이블스페이스 삭제
+--------------------------------------------------------------------------------
+
+SQL> drop table sys.ch9_t purge;
+
+Table dropped.
+
+SQL> drop tablespace ts_ch9 including contents and datafiles;
+
+Tablespace dropped.                                           (8.1초 소요)
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select free_mb, required_mirror_free_mb rmf, usable_file_mb usable
+  2    from v$asm_diskgroup where name='CH9DG';
+
+   FREE_MB        RMF     USABLE
+---------- ---------- ----------
+     11961       4096       3932
+
+1 row selected.
+
+-- 4GB 를 지우는 데 8.1 초다. 만드는 데는 4 분 가까이 걸렸다.
+--
+-- 원인 파악 : 파일 생성은 실제로 블록을 초기화하지만 삭제는 익스텐트 맵만
+--             정리하기 때문이다. 약 30 배 차이가 난다.
+-- 조치     : 실습 시간을 계획할 때 생성 시간만 감안하면 된다.
+--             정리 단계는 거의 시간이 들지 않는다.
+-- 재확인   : USABLE 이 음수에서 양수로 돌아왔는지 위 조회로 확인했다.
+--             -77 → 3932 로 복귀했다.
+--
+-- USABLE 이 3932 로 돌아왔다. 처음 3943 보다 11MB 적은 것은 삭제한 파일의
+-- 메타데이터 흔적이다.
+
+--------------------------------------------------------------------------------
+ [8] 정리 2 — 디스크그룹 삭제
+--------------------------------------------------------------------------------
+
+-- 순서에 주의한다. 다른 노드에서 먼저 dismount 한다.
+
+[grid@rac2 ~]$ sqlplus -s / as sysasm
+
+SQL> alter diskgroup CH9DG dismount;
+
+Diskgroup altered.
+
+SQL> exit
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> drop diskgroup CH9DG including contents;
+
+Diskgroup dropped.
+
+-- 원인 파악 : DROP DISKGROUP 은 그 디스크그룹이 자기 인스턴스에만
+--             마운트되어 있을 때 동작한다. 다른 인스턴스가 붙들고 있으면
+--             거부된다.
+-- 조치     : rac2 에서 dismount 한 뒤 rac1 에서 drop 한다.
+--             반대로 하면 rac1 이 자기 것을 놓아 버려 명령을 낼 주체가
+--             사라진다.
+
+--------------------------------------------------------------------------------
+ [9] 기준선 복귀 확인
+--------------------------------------------------------------------------------
+
+SQL> select header_status, count(*) from v$asm_disk group by header_status order by 1;
+
+HEADER_STATU   COUNT(*)
+------------ ----------
+FORMER                6
+MEMBER                8
+
+2 rows selected.
+
+SQL> select name, state, type, total_mb from v$asm_diskgroup order by group_number;
+
+NAME                           STATE       TYPE     TOTAL_MB
+------------------------------ ----------- ------ ----------
+CRS                            MOUNTED     NORMAL      12288
+DATA                           MOUNTED     EXTERN      61440
+FRA                            MOUNTED     EXTERN      24576
+
+3 rows selected.
+
+SQL> exit
+
+[grid@rac1 ~]$ crsctl stat res -t | grep -i ch9dg
+[grid@rac1 ~]$
+-- 출력 없음. CRS 자원 잔여물이 없다.
+
+[grid@rac1 ~]$ crsctl check cluster -all | grep -c "is online"
+6
+
+[oracle@rac1 ~]$ srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+
+[grid@rac1 ~]$ ocrcheck | head -3
+Status of Oracle Cluster Registry is as follows :
+         Version                  :          4
+         Total space (kbytes)     :     491684
+
+-- 확인 항목과 기대값
+--   1. HEADER_STATUS         → FORMER 6 / MEMBER 8      ✓
+--   2. 디스크그룹            → CRS·DATA·FRA 3개 MOUNTED ✓
+--   3. CRS 자원 잔여물       → ora.CH9DG.dg 없음         ✓
+--   4. 클러스터              → online 6줄               ✓
+--   5. 데이터베이스          → racdb1·racdb2 running    ✓
+--   6. OCR                   → 무결성 정상              ✓
+
+================================================================================
+ 실습 06 종료 — 랩이 기준선으로 완전히 복귀함
+================================================================================
