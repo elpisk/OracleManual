@@ -1,0 +1,210 @@
+================================================================================
+ 제15장 실습 06 — 오류 재현, 서비스를 다루며 만나는 오류들
+ 대상   : rac1
+ 목표   : 서비스 생성·조회·접속에서 나오는 오류를 재현하고 접두어별로
+          어디를 봐야 하는지 익힌다. ORA-12514 의 원인 후보를 정리한다
+ 소요   : 약 25분
+ 선행   : 실습 05 완료 (서비스 2개가 선호 인스턴스에서 도는 상태)
+ 계정   : oracle, grid
+ 주의   : 이 실습의 명령은 모두 거부되거나 조회뿐이다. 서비스에 영향이 없다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl status service -d racdb
+Service ch15_batch is running on instance(s) racdb2
+Service ch15_oltp is running on instance(s) racdb1
+
+--------------------------------------------------------------------------------
+ [1] 오류 재현 A — 없는 인스턴스를 선호로
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl add service -d racdb -s new_svc -preferred racdb3
+PRKO-2101 : Failed to find database instances racdb3
+
+-- 원인 파악 : racdb3 이라는 인스턴스가 없다. 이 랩은 2 노드이며
+--             인스턴스는 racdb1 과 racdb2 뿐이다.
+--             PRKO 는 srvctl 의 명령행 해석 계층이다. 14장의 접두어
+--             체계로 보면 내가 친 명령이 틀렸다는 뜻이며, 자원을
+--             조회하러 가기도 전에 거부되었다.
+-- 조치     : 실제 인스턴스 이름을 확인하고 바로잡는다.
+--               srvctl config database -d racdb | grep instances
+--             노드를 세 번째로 추가할 계획이었다면 노드와 인스턴스를
+--             먼저 추가한 뒤 서비스를 만든다.
+-- 재확인   : srvctl config service -d racdb 목록에 new_svc 가 없는지 본다.
+
+[oracle@rac1 ~]$ srvctl config database -d racdb | grep -i instances
+Database instances: racdb1,racdb2
+
+[oracle@rac1 ~]$ srvctl config service -d racdb | grep 'Service name'
+Service name: ch15_batch
+Service name: ch15_oltp
+
+-- new_svc 가 없다. 거부되었으므로 만들어지지 않았다.
+--
+-- 이 오류가 이 시점에 나는 것이 다행이다.
+-- 만들어졌다면 기동할 때가 되어서야 문제를 알게 되고, 그때는 이미
+-- 애플리케이션 접속 문자열이 그 서비스 이름에 의존하고 있을 수 있다.
+-- 만들 때 막아 주는 것이 훨씬 싸게 먹힌다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 B — 없는 데이터베이스
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl add service -d nodb -s ch15_bad2 -preferred racdb1
+PRCD-1120 : The resource for database nodb could not be found.
+PRCR-1001 : Resource ora.nodb.db does not exist
+
+-- 접두어가 다르다. PRCD 는 데이터베이스 계층, PRCR 은 자원 계층이다.
+-- 두 줄로 나왔고 진짜 원인은 아래에 있다. 14장의 규칙 그대로다.
+--
+-- PRKO 와의 차이가 진단에 쓰인다.
+--   PRKO       내가 친 명령이 틀렸다. 명령행만 다시 보면 된다.
+--   PRCD/PRCR  명령은 맞는데 대상이 없거나 상태가 다르다. 자원을 봐야 한다.
+
+[oracle@rac1 ~]$ crsctl stat res | grep '.db$'
+NAME=ora.racdb.db
+
+-- 등록된 데이터베이스 자원은 ora.racdb.db 하나뿐이다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 C — 정지된 서비스로 접속하면
+--------------------------------------------------------------------------------
+
+-- 잠시 ch15_oltp 를 정지해 확인하고 바로 되돌린다.
+
+[oracle@rac1 ~]$ srvctl stop service -d racdb -s ch15_oltp
+[oracle@rac1 ~]$ srvctl status service -d racdb
+Service ch15_batch is running on instance(s) racdb2
+Service ch15_oltp is not running.
+
+[oracle@rac1 ~]$ sqlplus system/<암호>@rac-scan:1521/ch15_oltp
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in connect
+descriptor
+
+-- 원인 파악 : 서비스 정의는 남아 있지만 리스너에 등록되어 있지 않다.
+--             ORA-12514 의 뜻을 정확히 새겨야 한다.
+--             "그런 서비스가 없다" 가 아니라
+--             "리스너가 지금 그 서비스를 모른다" 다.
+--             존재 여부가 아니라 등록 여부를 말한다.
+-- 조치     : 서비스를 기동한다.
+--               srvctl start service -d racdb -s ch15_oltp
+-- 재확인   : SCAN 으로 접속해 instance_name 이 나오는지 본다.
+
+[oracle@rac1 ~]$ srvctl start service -d racdb -s ch15_oltp
+[oracle@rac1 ~]$ /tmp/svc_check.sh ch15_oltp | grep -v '^$' | sort | uniq -c
+     10 racdb1
+
+--------------------------------------------------------------------------------
+ [4] ORA-12514 의 원인 후보 정리
+--------------------------------------------------------------------------------
+
+-- 같은 오류가 여러 원인에서 나온다. 후보를 정리해 두면 진단이 빨라진다.
+--
+--   (1) 서비스가 정지되어 있다.            → [3] 에서 재현한 경우
+--   (2) 그 서비스를 제공하던 인스턴스가 죽었다.
+--                                          → 실습 05 의 -force 정지 경우
+--   (3) 서비스 이름을 잘못 적었다. 오타나 대소문자.
+--   (4) 서비스가 다른 노드로 옮겨 갔는데 로컬 리스너 주소로 접속했다.
+--                                          → 실습 03 에서 재현한 경우
+--
+-- 확인 순서.
+--
+--   1. srvctl status service -d racdb
+--      "is not running" 이면 (1) 이다.
+--
+--   2. srvctl config service -d racdb | grep 'Service name'
+--      목록에 그 이름이 없으면 (3) 이다.
+--
+--   3. srvctl status database -d racdb -v
+--      인스턴스가 죽어 있으면 (2) 다.
+--
+--   4. lsnrctl status LISTENER_SCAN1 | grep -A3 '<서비스>'
+--      SCAN 리스너에 있는데 접속이 안 되면 접속 주소를 확인한다.
+--      로컬 리스너 주소를 썼다면 (4) 다.
+--
+-- 조치는 각각 다르다.
+--   (1) srvctl start service
+--   (2) 인스턴스를 올리거나 서비스를 다른 인스턴스로 옮긴다
+--   (3) 이름을 수정한다
+--   (4) 접속 주소를 SCAN 으로 바꾼다
+
+--------------------------------------------------------------------------------
+ [5] 진단 — 서비스를 만들었는데 부하가 여전히 몰린다면
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, service_name, count(*) cnt
+  2    from gv$session where type='USER'
+  3   group by inst_id, service_name order by inst_id, service_name;
+
+   INST_ID SERVICE_NAME            CNT
+---------- -------------------- ------
+         1 SYS$USERS                14
+         1 ch15_oltp                 2
+         2 SYS$USERS                 1
+         2 ch15_batch                1
+
+-- SYS$USERS 세션이 대부분이라면 문제가 있다.
+--
+-- 원인 파악 : 클라이언트가 서비스 이름을 지정하지 않고 접속하고 있다.
+--             SYS$USERS 는 서비스 이름 없이 접속한 세션이 속하는
+--             내부 서비스다. 이 세션들은 어떤 사용자 서비스에도
+--             속하지 않으므로 서비스를 옮겨도 따라오지 않는다.
+--             서비스를 아무리 잘 설계해도 소용이 없는 상태다.
+--             어떤 클라이언트인지 좁히려면 다음을 함께 본다.
+--               select machine, program, count(*) from gv$session
+--                where service_name='SYS$USERS' group by machine, program;
+-- 조치     : 클라이언트의 접속 문자열을 고친다.
+--             rac-scan:1521/racdb 처럼 데이터베이스 이름을 쓰거나
+--             SID 방식으로 접속하고 있을 것이다. 이것을
+--             rac-scan:1521/ch15_oltp 처럼 서비스 이름으로 바꾼다.
+--             tnsnames.ora 라면 CONNECT_DATA 의 SERVICE_NAME 을,
+--             JDBC 라면 URL 의 서비스 이름 부분을 바꾼다.
+-- 재확인   : 같은 조회를 다시 실행해 SYS$USERS 가 줄고 의도한 서비스
+--             이름으로 잡히는지 본다.
+
+-- 서비스 도입 프로젝트의 첫 단계가 대개 이 값을 0 으로 만드는 일이다.
+-- 서버 쪽 설정만으로는 끝나지 않고 클라이언트를 함께 바꿔야 한다.
+--
+-- 참고로 SQL*Plus 로 SID 방식이나 IPC 로 붙으면 SYS$USERS 로 잡힌다.
+-- 관리자가 진단하려고 붙은 세션이 여기 섞이는 것은 정상이다.
+-- 애플리케이션 세션이 여기 있는 것이 문제다. MACHINE 과 PROGRAM 으로
+-- 구분한다.
+
+--------------------------------------------------------------------------------
+ [6] 접두어 정리
+--------------------------------------------------------------------------------
+
+접두어      계층                        이 장에서 만난 예
+---------- --------------------------- ------------------------------------
+PRKO-      srvctl 명령행 해석           PRKO-2101 (없는 인스턴스)
+PRCD-      srvctl 데이터베이스 계층     PRCD-1120, PRCD-1131
+PRCR-      srvctl 자원 계층             PRCR-1001, PRCR-1132, PRCR-1133
+CRS-       Clusterware 자원 계층        CRS-2974 (force 플래그 없음)
+ORA-       데이터베이스·네트워크        ORA-12514 (리스너가 모름)
+
+-- 14장에서 정리한 체계가 그대로 이어진다.
+-- 접두어만 봐도 어디를 볼지 좁혀진다.
+--
+-- 그리고 겹쳐 나오면 마지막 줄을 먼저 읽는다.
+-- 실습 05 의 네 줄짜리 오류에서 진짜 이유는 CRS-2974 였다.
+
+--------------------------------------------------------------------------------
+ [7] 상태 확인
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl status service -d racdb
+Service ch15_batch is running on instance(s) racdb2
+Service ch15_oltp is running on instance(s) racdb1
+
+[grid@rac1 ~]$ crsctl stat res | grep -c '^NAME='
+19
+
+-- 시작 전과 같다. 거부된 명령과 조회, 그리고 잠시 정지했다 되돌린 것뿐이다.
+
+================================================================================
+ 실습 06 종료 — 서비스 2개 정상 동작, 자원 19개 유지
+================================================================================
