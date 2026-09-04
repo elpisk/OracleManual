@@ -1,0 +1,155 @@
+================================================================================
+ 제13장 실습 01 — 스레드별 리두 확인, 노드와의 대응
+ 대상   : rac1
+ 목표   : 리두로그가 스레드로 나뉘어 있고 각 스레드가 어느 인스턴스에 대응하는지
+          확인한다. 스레드와 멤버가 다른 개념이라는 것을 행 수로 이해한다
+ 소요   : 약 20분
+ 선행   : racdb 양 노드 OPEN, 부하 4 이하
+ 계정   : oracle
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 상태 확인
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ cat /proc/loadavg
+4.07 4.59 4.71 1/1058 31084
+
+[oracle@rac1 ~]$ srvctl status database -d racdb
+Instance racdb1 is running on node rac1. Instance status: Open.
+Instance racdb2 is running on node rac2. Instance status: Open.
+
+-- 부하가 4 근처다. 이 실습은 조회뿐이라 부하를 거의 만들지 않는다.
+
+--------------------------------------------------------------------------------
+ [1] 리두 그룹 — 스레드로 나뉜다
+--------------------------------------------------------------------------------
+
+SQL> select group#, thread#, sequence#, bytes/1024/1024 mb, members, status
+  2    from v$log order by group#;
+
+    GROUP#    THREAD#  SEQUENCE#         MB    MEMBERS STATUS
+---------- ---------- ---------- ---------- ---------- ----------------
+         1          1         15        200          2 INACTIVE
+         2          1         16        200          2 CURRENT
+         3          2         13        200          2 CURRENT
+         4          2         12        200          2 INACTIVE
+
+4 rows selected.
+
+-- 읽는 순서.
+--
+--   (1) THREAD# 열. 그룹 1·2 가 스레드 1, 그룹 3·4 가 스레드 2 다.
+--       네 그룹이 두 스레드로 나뉘어 있다. 스레드마다 두 그룹씩이다.
+--
+--   (2) SEQUENCE# 열. 스레드 1 은 15·16, 스레드 2 는 12·13 이다.
+--       번호가 다르다. 이것이 이 실습의 핵심 관찰이다.
+--       스레드마다 독립적으로 번호가 올라간다는 뜻이며,
+--       두 인스턴스가 서로 다른 속도로 리두를 쓰고 있다는 뜻이다.
+--       스레드 1 이 세 번 더 스위치했다.
+--
+--   (3) STATUS 열. CURRENT 가 두 개다. 처음 보면 이상하게 느껴지지만
+--       스레드마다 하나씩이므로 정상이다. 단일 인스턴스라면 하나뿐이다.
+--
+--   (4) MB 열. 네 그룹 모두 200MB 다. 스레드마다 크기를 다르게 하지 않는다.
+--       인스턴스가 노드 간에 옮겨 다닐 수 있고 복구 시간을 예측해야 하기 때문이다.
+
+--------------------------------------------------------------------------------
+ [2] 멤버 — 그룹마다 두 벌
+--------------------------------------------------------------------------------
+
+SQL> select l.group#, l.thread#, f.member, f.type
+  2    from v$log l, v$logfile f
+  3   where l.group#=f.group# order by l.group#, f.member;
+
+    GROUP#    THREAD# MEMBER                                          TYPE
+---------- ---------- ---------------------------------------------- -------
+         1          1 +DATA/RACDB/ONLINELOG/group_1.262.1242761749    ONLINE
+         1          1 +FRA/RACDB/ONLINELOG/group_1.258.1242761759     ONLINE
+         2          1 +DATA/RACDB/ONLINELOG/group_2.263.1242761749    ONLINE
+         2          1 +FRA/RACDB/ONLINELOG/group_2.257.1242761759     ONLINE
+         3          2 +DATA/RACDB/ONLINELOG/group_3.270.1242762459    ONLINE
+         3          2 +FRA/RACDB/ONLINELOG/group_3.259.1242762467     ONLINE
+         4          2 +DATA/RACDB/ONLINELOG/group_4.271.1242762473    ONLINE
+         4          2 +FRA/RACDB/ONLINELOG/group_4.260.1242762483     ONLINE
+
+8 rows selected.
+
+-- 그룹은 넷인데 행은 여덟이다. 이 숫자 차이가 두 개념을 갈라 준다.
+--
+--   스레드 = 누가 쓰는가.  RAC 때문에 생긴 축이다.
+--   멤버   = 몇 벌 두는가. 단일 인스턴스에도 있는 축이다.
+--
+-- 축이 둘이므로 4 × 2 = 8 행이 된다.
+--
+-- 멤버가 +DATA 와 +FRA 에 하나씩 있다. dbca 가 이렇게 만들었다.
+-- 디스크그룹 하나를 잃어도 리두가 남는다는 뜻이다.
+
+--------------------------------------------------------------------------------
+ [3] 스레드와 인스턴스의 대응
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, instance_name, thread# from gv$instance order by inst_id;
+
+   INST_ID INSTANCE_NAME       THREAD#
+---------- ---------------- ----------
+         1 racdb1                    1
+         2 racdb2                    2
+
+2 rows selected.
+
+SQL> select thread#, status, enabled, groups, instance from v$thread order by thread#;
+
+   THREAD# STATUS ENABLED      GROUPS INSTANCE
+---------- ------ -------- ---------- ------------
+         1 OPEN   PUBLIC            2 racdb1
+         2 OPEN   PUBLIC            2 racdb2
+
+2 rows selected.
+
+-- 두 조회가 같은 사실을 알려 준다. 스레드 1 이 racdb1, 스레드 2 가 racdb2 다.
+-- V$THREAD 쪽이 스레드 관점의 정보를 더 준다.
+--
+--   STATUS  = OPEN    → 지금 어떤 인스턴스가 이 스레드를 쓰고 있다.
+--                       인스턴스를 내리면 CLOSED 가 된다.
+--   ENABLED = PUBLIC  → 어느 인스턴스든 이 스레드를 쓸 수 있다.
+--                       PRIVATE 이면 특정 인스턴스에 고정된다.
+--   GROUPS  = 2       → 이 스레드에 속한 리두 그룹 수.
+--                       스레드마다 최소 둘이어야 로그 스위치가 가능하다.
+
+--------------------------------------------------------------------------------
+ [4] 흔한 오류 — V$LOG_HISTORY 에서 STATUS 를 찾으면
+--------------------------------------------------------------------------------
+
+SQL> select thread#, sequence#, to_char(first_time,'MM-DD HH24:MI') first_time, status
+  2    from v$log_history order by first_time desc;
+select thread#, sequence#, to_char(first_time,'MM-DD HH24:MI') first_time, status
+                                                                           *
+ERROR at line 1:
+ORA-00904: "STATUS": invalid identifier
+
+-- 원인 파악 : V$LOG 에는 STATUS 가 있지만 V$LOG_HISTORY 에는 없다.
+--             앞의 것은 지금의 그룹 상태를, 뒤의 것은 이미 지나간
+--             스위치 이력을 담는다. 지나간 이력에는 CURRENT 나 ACTIVE 같은
+--             지금의 상태 개념이 없으므로 열 자체가 없다.
+-- 조치     : 이력에서 필요한 것은 스레드별 스위치 횟수와 범위다.
+--             STATUS 를 빼고 집계 형태로 다시 조회한다.
+-- 재확인   : 스레드별 건수와 SEQUENCE# 범위가 나오는지 본다.
+
+SQL> select thread#, count(*) cnt, min(sequence#) mn, max(sequence#) mx
+  2    from v$log_history group by thread# order by thread#;
+
+   THREAD#        CNT         MN         MX
+---------- ---------- ---------- ----------
+         1         15          1         15
+         2         12          1         12
+
+2 rows selected.
+
+-- 스레드 1 이 15 번, 스레드 2 가 12 번 스위치했다.
+-- [1] 에서 본 SEQUENCE# 차이가 누적 이력으로도 확인된다.
+-- 이 차이는 두 인스턴스의 변경량 차이에서 온다. 실습 05 에서 그 양을 직접 잰다.
+
+================================================================================
+ 실습 01 종료 — 조회만 했으므로 변경된 것 없음
+================================================================================
