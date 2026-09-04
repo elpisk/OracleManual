@@ -1,0 +1,188 @@
+================================================================================
+ 제20장 실습 02 — 클러스터 대기 이벤트, gc 경합 만들기
+ 대상   : rac1, rac2
+ 목표   : 통제된 부하로 캐시 퓨전을 강제하고 gc 통계와 대기 이벤트가
+          어떻게 변하는지 전후로 비교한다
+ 소요   : 약 20분
+ 선행   : 실습 01 완료
+ 계정   : oracle
+ 주의   : 호스트 부하가 4 이하일 때 시작한다. 40초 동안 양 노드에 부하가 걸린다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 실험 대상을 만든다
+--------------------------------------------------------------------------------
+
+SQL> create tablespace ts_ch20 datafile '+DATA' size 100M;
+
+Tablespace created.
+
+SQL> create table sys.ch20_t (id number primary key, pad varchar2(200))
+  2    tablespace ts_ch20;
+
+Table created.
+
+SQL> insert into sys.ch20_t
+  2  select level, rpad('x',200,'x') from dual connect by level <= 20000;
+
+20000 rows created.
+
+SQL> commit;
+
+-- 한 행이 200 바이트 남짓이므로 20000 행이 여러 블록에 퍼진다.
+-- 뒤에서 id 1~50 만 건드리면 그 행들은 소수의 블록에 몰려 있다.
+-- 좁은 범위를 고르는 것이 이 실험의 핵심이다.
+
+--------------------------------------------------------------------------------
+ [2] 부하 전 통계를 찍는다
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, name, value from gv$sysstat
+  2   where name in ('gc current blocks received','gc current blocks served',
+  3                  'gc cr blocks received','gc local grants','gc remote grants')
+  4   order by name, inst_id;
+
+   INST_ID NAME                            VALUE
+---------- ------------------------------ ------
+         1 gc cr blocks received            3490
+         2 gc cr blocks received            2070
+         1 gc current blocks received       2426
+         2 gc current blocks received       8743
+         1 gc current blocks served        15907
+         2 gc current blocks served         1027
+         1 gc local grants                 13866
+         2 gc local grants                  4649
+         1 gc remote grants                 3309
+         2 gc remote grants                 4122
+
+-- 이 값을 적어 둔다. 부하 후 같은 조회를 하고 차이를 본다.
+
+--------------------------------------------------------------------------------
+ [3] 통계 이름을 틀리게 적으면
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, name, value from gv$sysstat
+  2   where name = 'gc current block received' order by inst_id;
+
+no rows selected
+
+-- 원인 파악: 통계 이름은 'gc current blocks received' 다. blocks 가 복수형이다.
+--            GV$SYSSTAT 은 이름이 틀려도 오류를 내지 않는다.
+--            조건에 맞는 행이 없을 뿐이므로 조용히 빈 결과가 나온다.
+--            성능 조회에서 가장 위험한 실수다. 통계가 0 인 것과
+--            이름을 잘못 적은 것을 구분할 수 없기 때문이다.
+-- 조치     : 이름을 LIKE 로 먼저 확인한 뒤 정확한 이름을 쓴다.
+
+SQL> select distinct name from v$statname where name like 'gc current block%'
+  2   order by name;
+
+NAME
+------------------------------------
+gc current block busy
+gc current blocks received
+gc current blocks served
+
+SQL> select inst_id, name, value from gv$sysstat
+  2   where name = 'gc current blocks received' order by inst_id;
+
+   INST_ID NAME                            VALUE
+---------- ------------------------------ ------
+         1 gc current blocks received       2426
+         2 gc current blocks received       8743
+
+-- 재확인: 값이 나온다.
+-- 습관으로 삼을 것 — 통계나 이벤트 이름은 V$STATNAME 이나 V$EVENT_NAME 에서
+-- 먼저 확인하고 붙여 넣는다.
+
+--------------------------------------------------------------------------------
+ [4] 부하를 건다 — 양 노드 동시에
+--------------------------------------------------------------------------------
+
+-- rac1 세션
+declare
+  v_end date := sysdate + 40/86400;
+begin
+  while sysdate < v_end loop
+    update sys.ch20_t set pad = rpad('a',200,'a') where id between 1 and 50;
+    commit;
+  end loop;
+end;
+/
+
+-- rac2 세션 (동시에 실행. 'a' 대신 'b')
+declare
+  v_end date := sysdate + 40/86400;
+begin
+  while sysdate < v_end loop
+    update sys.ch20_t set pad = rpad('b',200,'b') where id between 1 and 50;
+    commit;
+  end loop;
+end;
+/
+
+-- 두 인스턴스가 같은 블록의 현재 버전을 서로 뺏는다.
+-- 갱신하려면 current 블록을 독점해야 하므로 블록 자체가 계속 이동한다.
+
+--------------------------------------------------------------------------------
+ [5] 부하 후 통계 — 대칭을 확인한다
+--------------------------------------------------------------------------------
+
+   INST_ID NAME                            VALUE   (전)      증가
+---------- ------------------------------ ------ -------  --------
+         1 gc current blocks received       6413    2426     +3987
+         2 gc current blocks received      12739    8743     +3996
+         1 gc current blocks served        19903   15907     +3996
+         2 gc current blocks served         5014    1027     +3987
+         1 gc cr blocks received            4668    3490     +1178
+         2 gc cr blocks received            3801    2070     +1731
+         1 gc local grants                 21294   13866     +7428
+         2 gc local grants                  9352    4649     +4703
+         1 gc remote grants                 3514    3309      +205
+         2 gc remote grants                 4320    4122      +198
+
+-- 대칭이 선명하다.
+--   인스턴스 1 이 받은 3987 = 인스턴스 2 가 보낸 3987
+--   인스턴스 2 가 받은 3996 = 인스턴스 1 이 보낸 3996
+--
+-- 40 초 동안 블록이 약 8000 번 인터커넥트를 건넜다.
+--
+-- remote grants 는 +205, +198 로 거의 안 늘었다.
+-- 권한만 주고받은 것이 아니라 실제 블록을 옮겼다는 뜻이다.
+-- 두 노드가 읽기만 했다면 반대 모양이 나왔을 것이다.
+
+--------------------------------------------------------------------------------
+ [6] 상위 대기 이벤트가 바뀐다
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, event, total_waits, round(time_waited/100,2) sec_waited,
+  2         round(average_wait,2) avg_cs
+  3    from gv$system_event where event like 'gc %' and total_waits > 100
+  4   order by time_waited desc fetch first 8 rows only;
+
+   INST_ID EVENT                     TOTAL_WAITS SEC_WAITED  AVG_CS
+---------- ------------------------- ----------- ---------- -------
+         2 gc current block busy            4728      20.76     .44
+         1 gc current block busy            4733      19.71     .42
+         2 gc current block 2-way           6768      13.17     .19
+         1 gc buffer busy release           1008       6.48     .64
+         2 gc buffer busy release            950       5.79     .61
+         1 gc cr block 2-way                4109       5.21     .13
+         2 gc cr block 2-way                2659       4.79     .18
+         2 gc cr multi block mixed           248       3.39    1.37
+
+-- 실험 전에는 gc cr block 2-way 가 1 위였다.
+-- 이제 gc current block busy 가 양 노드에서 1 위다.
+--
+-- busy 가 붙었다는 것이 핵심이다. 상대가 그 블록을 쓰고 있어 기다렸다는 뜻이며
+-- 정확히 우리가 만든 상황이다.
+--
+-- 평균 대기가 0.42~0.44 센티초, 즉 4 밀리초 남짓이다.
+-- 2-way 의 0.19 보다 두 배 넘게 길다.
+--
+-- gc buffer busy release 는 같은 경합을 반대편에서 본 것이다.
+-- 그 블록이 지금 다른 노드로 보내지는 중이라 접근하지 못하고 기다린 세션이다.
+-- 두 이벤트가 함께 오르는 것이 전형적인 패턴이다.
+
+================================================================================
+ 실습 02 종료 — TS_CH20 과 CH20_T 는 실습 03 에서 계속 쓴다. 아직 지우지 않는다
+================================================================================

@@ -1,0 +1,159 @@
+================================================================================
+ 제20장 실습 01 — 인터커넥트와 HAIP 확인
+ 대상   : rac1, rac2
+ 목표   : 데이터베이스가 실제로 쓰는 인터커넥트 주소를 확인하고
+          HAIP 의 구조와 진단 순서를 익힌다
+ 소요   : 약 15분
+ 선행   : 두 인스턴스 OPEN
+ 계정   : oracle, grid, root
+ 주의   : 읽기 전용 실습이다. oifcfg setif / delif 는 절대 쓰지 않는다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 데이터베이스가 보고하는 주소
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, name, ip_address, is_public, source
+  2    from gv$cluster_interconnects order by inst_id;
+
+   INST_ID NAME         IP_ADDRESS       IS_ SOURCE
+---------- ------------ ---------------- --- ------
+         1 ens160:1     169.254.27.118   NO
+         2 ens160:1     169.254.26.245   NO
+
+-- 5장에서 사설 인터커넥트를 172.16.119.0 대역으로 구성했는데
+-- 여기에는 169.254.x.x 가 나온다.
+--
+-- 인터페이스 이름도 ens160 이 아니라 ens160:1 이다.
+-- 콜론 뒤의 1 은 가상 인터페이스, 즉 별칭이라는 뜻이다.
+--
+-- IS_PUBLIC 이 NO 인 것은 확인해 둔다. YES 이면 캐시 퓨전이
+-- 공용망으로 흐르고 있다는 뜻이며 심각한 오구성이다.
+
+--------------------------------------------------------------------------------
+ [2] 등록된 구성과 실제 주소를 대조한다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ oifcfg getif
+ens160  172.16.119.0  global  cluster_interconnect,asm
+ens33   172.16.225.0  global  public
+
+-- 관리자가 CRS 에 등록한 구성이다. ens160 이 인터커넥트다.
+
+[grid@rac1 ~]$ ip -4 addr show ens160
+bash: ip: command not found
+
+-- 원인 파악: grid 사용자의 PATH 에 /sbin 이 없다.
+--            ip 는 /sbin/ip 에 있는데 일반 사용자 PATH 에 포함되지 않는 배포판이 있다.
+-- 조치     : 전체 경로로 실행한다.
+
+[root@rac1 ~]# /sbin/ip -4 addr show ens160 | grep inet
+    inet 172.16.119.101/24 brd 172.16.119.255 scope global noprefixroute ens160
+    inet 169.254.27.118/19 brd 169.254.31.255 scope global ens160:1
+
+[root@rac2 ~]# /sbin/ip -4 addr show ens160 | grep inet
+    inet 172.16.119.102/24 brd 172.16.119.255 scope global noprefixroute ens160
+    inet 169.254.26.245/19 brd 169.254.31.255 scope global ens160:1
+
+-- 재확인: 그림이 맞았다.
+--   하나의 물리 인터페이스에 주소가 둘이다.
+--   물리 주소 172.16.119.101 과 그 위에 얹힌 HAIP 별칭 169.254.27.118 이다.
+--   [1] 에서 본 값은 별칭 쪽이다.
+--
+-- 169.254.x.x 는 링크 로컬 대역이다. 라우팅되지 않고 같은 링크 안에서만
+-- 쓰인다. 같은 스위치에 붙은 노드끼리 쓰는 인터커넥트에 맞는 성질이다.
+
+--------------------------------------------------------------------------------
+ [3] HAIP 자원 상태 — -init 을 빠뜨리면
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ crsctl status res ora.cluster_interconnect.haip
+CRS-2613: Could not find resource 'ora.cluster_interconnect.haip'.
+
+-- 원인 파악: HAIP 는 OHAS 가 관리하는 -init 자원이다.
+--            crsctl 의 기본 조회 대상은 CRSD 가 관리하는 일반 자원 목록이므로
+--            -init 을 붙이지 않으면 그 자원을 찾지 못한다.
+--            14장에서 -init 목록을 따로 봐야 했던 것과 같은 이유다.
+-- 조치     : -init 을 붙인다.
+
+[grid@rac1 ~]$ crsctl status res ora.cluster_interconnect.haip -init
+NAME=ora.cluster_interconnect.haip
+TYPE=ora.haip.type
+TARGET=ONLINE
+STATE=ONLINE on rac1
+
+-- 재확인: TARGET 과 STATE 가 모두 ONLINE 이다.
+--
+-- rac2 에서도 같은 명령을 실행한다. -init 자원은 노드마다 따로 있으므로
+-- 한 노드에서 본 결과가 다른 노드를 대신하지 못한다.
+
+[grid@rac2 ~]$ crsctl status res ora.cluster_interconnect.haip -init
+NAME=ora.cluster_interconnect.haip
+TYPE=ora.haip.type
+TARGET=ONLINE
+STATE=ONLINE on rac2
+
+--------------------------------------------------------------------------------
+ [4] 인터커넥트를 진단하는 순서
+--------------------------------------------------------------------------------
+
+-- 위 세 단계를 순서로 정리하면 이렇다.
+--
+--   1단계  oifcfg getif
+--          어떤 인터페이스가 인터커넥트로 등록되어 있는가.
+--          여기가 틀리면 나머지가 다 틀어진다.
+--
+--   2단계  /sbin/ip -4 addr show <인터페이스>
+--          물리 주소와 169.254 별칭이 함께 있는가.
+--          별칭이 없으면 HAIP 가 안 뜬 것이다.
+--
+--   3단계  crsctl status res ora.cluster_interconnect.haip -init
+--          그 자원이 ONLINE 인가. 노드마다 실행한다.
+--
+--   4단계  GV$CLUSTER_INTERCONNECTS
+--          데이터베이스가 무엇을 쓰는가. IS_PUBLIC 이 NO 인가.
+--
+-- 이 랩에서 실제로 겪은 사고가 이 절차의 배경이다.
+-- rac1 이 클러스터에 못 붙었는데 사설망 ping 은 정상이었다.
+-- 물리 주소는 살아 있고 HAIP 자원만 OFFLINE 이었기 때문이다.
+-- ping 은 물리 주소로 가므로 성공한다. 2단계와 3단계가 없으면 못 찾는다.
+
+--------------------------------------------------------------------------------
+ [5] 인터커넥트 통계
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, name, value from gv$sysstat
+  2   where name in ('gc cr blocks received','gc current blocks received',
+  3                  'gc cr blocks served','gc current blocks served',
+  4                  'gc local grants','gc remote grants')
+  5   order by name, inst_id;
+
+   INST_ID NAME                            VALUE
+---------- ------------------------------ ------
+         1 gc cr blocks received            3490
+         2 gc cr blocks received            2070
+         1 gc cr blocks served              2418
+         2 gc cr blocks served              3052
+         1 gc current blocks received       2426
+         2 gc current blocks received       8743
+         1 gc current blocks served        15907
+         2 gc current blocks served         1027
+         1 gc local grants                 13866
+         2 gc local grants                  4649
+         1 gc remote grants                 3309
+         2 gc remote grants                 4122
+
+-- received 와 served 가 짝을 이룬다.
+-- 한 인스턴스가 받은 것은 다른 인스턴스가 보낸 것이다.
+-- 값이 정확히 같지 않은 것은 조회 시점과 통계 갱신 시점이 다르기 때문이다.
+--
+-- local grants 대 remote grants 의 비율이 인터커넥트 부담을 보여 준다.
+-- 인스턴스 1 은 13866 대 3309 로 로컬이 압도적이고
+-- 인스턴스 2 는 4649 대 4122 로 비슷하다.
+-- 두 인스턴스의 작업 성격이 다르다는 신호다.
+--
+-- 이 값들은 인스턴스 기동 이후 누적이다. 다음 실습에서 전후 차이를 본다.
+
+================================================================================
+ 실습 01 종료 — 구성 변경 없음. HAIP 양 노드 ONLINE 확인
+================================================================================
