@@ -1,0 +1,240 @@
+================================================================================
+ 제16장 실습 02 — 부하 분산 권고, clbgoal·rlbgoal 과 V$SERVICEMETRIC
+ 대상   : rac1
+ 목표   : 부하 분산 설정을 지정한 서비스를 만들고, rlbgoal 을 켰을 때
+          V$SERVICEMETRIC 에서 무엇이 달라지는지 확인한다
+ 소요   : 약 25분
+ 선행   : 실습 01 완료
+ 계정   : oracle, grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 두 설정의 차이
+--------------------------------------------------------------------------------
+
+-- 15장에서 SCAN 분산이 부하 기반이라는 것을 확인했고 판단 기준이
+-- Connection Load Balancing Goal 이라고 했다. 짝이 되는 설정이 하나 더 있다.
+--
+--   clbgoal   접속을 맺는 순간에 작동한다.
+--             SHORT(응답 시간) / LONG(세션 수). 기본 LONG.
+--
+--   rlbgoal   접속이 이미 있고 그중 하나를 고를 때 작동한다.
+--             NONE / SERVICE_TIME / THROUGHPUT. 기본 NONE.
+--
+-- rlbgoal 은 데이터베이스가 인스턴스별 처리 능력을 계산해
+-- FAN 이벤트로 클라이언트에 알려 주고, 클라이언트가 그 값을 보고 고른다.
+-- 그래서 커넥션 풀이 있어야 실제 효과가 나타난다.
+
+[oracle@rac1 ~]$ srvctl add service -help 2>&1 | grep -E 'clbgoal|rlbgoal'
+       [-clbgoal {SHORT | LONG}] [-rlbgoal {NONE | SERVICE_TIME | THROUGHPUT}]
+    -clbgoal    (SHORT | LONG)   Connection Load Balancing Goal. Default is LONG.
+    -rlbgoal    (SERVICE_TIME | THROUGHPUT | NONE)  Runtime Load Balancing Goal
+
+-- 값 목록은 -help 로 확인한다. 외우지 않아도 된다.
+
+--------------------------------------------------------------------------------
+ [2] 서비스 생성
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl add service -d racdb -s ch16_lb \
+>                  -preferred racdb1,racdb2 \
+>                  -clbgoal SHORT -rlbgoal SERVICE_TIME -notification TRUE
+[oracle@rac1 ~]$ echo $?
+0
+
+[oracle@rac1 ~]$ srvctl start service -d racdb -s ch16_lb
+[oracle@rac1 ~]$ srvctl status service -d racdb
+Service ch16_lb is running on instance(s) racdb1,racdb2
+
+-- 선호 인스턴스를 둘 지정했다. 15장에서 예고한 대로 양쪽에서 동시에 돈다.
+
+--------------------------------------------------------------------------------
+ [3] config 에서 무엇이 바뀌었나
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl config service -d racdb -s ch16_lb
+Service name: ch16_lb
+Server pool:
+Cardinality: 2
+Service role: PRIMARY
+Management policy: AUTOMATIC
+DTP transaction: false
+AQ HA notifications: true
+Global: false
+Commit Outcome: false
+Failover type:
+Failover method:
+Failover retries:
+Failover delay:
+Failover restore: NONE
+Connection Load Balancing Goal: SHORT
+Runtime Load Balancing Goal: SERVICE_TIME
+TAF policy specification: NONE
+Edition:
+Pluggable database name:
+Maximum lag time: ANY
+Retention: 86400 seconds
+Replay Initiation Time: 300 seconds
+Session State Consistency: DYNAMIC
+Service is enabled
+Preferred instances: racdb1,racdb2
+Available instances:
+CSS critical: no
+
+-- 15장에서 본 출력과 비교하면 세 항목이 바뀌었다.
+--
+--   Cardinality: 2
+--     선호를 둘 지정했으므로 자동으로 2 가 되었다.
+--     15장의 서비스는 1 이었다.
+--
+--   AQ HA notifications: true
+--     -notification TRUE 가 이 항목으로 나타난다.
+--     실습 01 에서 기본값이 false 인 것을 확인했다.
+--
+--   Runtime Load Balancing Goal: SERVICE_TIME
+--     기본값 NONE 에서 바뀌었다.
+--
+-- Available instances 가 비어 있다. 선호를 둘 다 지정했으므로
+-- 따로 가용 인스턴스를 둘 필요가 없다. 하나가 죽으면 남은 쪽에서 계속 돈다.
+
+--------------------------------------------------------------------------------
+ [4] 데이터베이스 쪽에서도 확인
+--------------------------------------------------------------------------------
+
+SQL> select name, goal, clb_goal, aq_ha_notifications, dtp
+  2    from dba_services where name like 'ch16%' or name='racdb' order by name;
+
+NAME       GOAL           CLB_GO AQ_ D
+---------- -------------- ------ --- -
+ch16_ac    NONE           LONG   YES N
+ch16_lb    SERVICE_TIME   SHORT  YES N
+racdb                     LONG   NO  N
+
+-- 열 이름이 명령 옵션과 다르다는 점에 주의한다.
+--   GOAL 열     = rlbgoal
+--   CLB_GOAL 열 = clbgoal
+--
+-- 문서를 찾을 때 헷갈리기 쉽고 자동 점검 스크립트를 짤 때 실제로 걸린다.
+--
+-- 기본 서비스 racdb 는 GOAL 이 비어 있고 AQ_HA_NOTIFICATIONS 가 NO 다.
+-- dbca 가 만든 서비스는 이 설정들이 꺼져 있다.
+--
+-- ch16_ac 는 다음 실습에서 만드는 서비스다. 여기서는 비교용으로만 본다.
+
+--------------------------------------------------------------------------------
+ [5] V$SERVICEMETRIC — 두 종류의 집계가 섞여 있다
+--------------------------------------------------------------------------------
+
+SQL> select group_id, count(*) cnt, min(intsize_csec) mn, max(intsize_csec) mx
+  2    from gv$servicemetric group by group_id order by group_id;
+
+  GROUP_ID        CNT         MN         MX
+---------- ---------- ---------- ----------
+         6         13       5953       6053
+        10         13        512        512
+
+-- INTSIZE_CSEC 는 집계 구간의 길이를 1/100 초 단위로 나타낸다.
+--   GROUP_ID 6  약 6000 = 60초 구간
+--   GROUP_ID 10 512 = 5.12초 구간
+--
+-- 짧은 구간이 실시간 권고에 쓰이고 긴 구간이 추세를 본다.
+-- 조회할 때 GROUP_ID 로 걸러야 의미가 분명해진다.
+-- 안 거르면 같은 서비스가 두 번씩 나온다.
+
+--------------------------------------------------------------------------------
+ [6] GOODNESS 는 언제 계산되는가
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, service_name, goodness, delta, flags,
+  2         round(cpupercall,1) cpupercall, round(dbtimepercall,1) dbtimepercall,
+  3         round(callspersec,2) callspersec
+  4    from gv$servicemetric
+  5   where service_name like 'ch16%' or service_name='racdb'
+  6   order by service_name, inst_id;
+
+   INST_ID SERVICE_NAME       GOODNESS      DELTA      FLAGS CPUPERCALL DBTIMEPERCALL CALLSPERSEC
+---------- ---------------- ---------- ---------- ---------- ---------- ------------- -----------
+         1 ch16_ac                   0          1          4     1521.1       12066.5        2.48
+         1 ch16_ac                   0          1          4          0             0           0
+         1 ch16_lb                 100        100          4          0             0           0
+         1 ch16_lb                 100        100          4       2395        9682.2        3.01
+         2 ch16_lb                 100        100          4     1443.7       14687.9         .69
+         2 ch16_lb                 100        100          4          0             0           0
+         1 racdb                     0          1          4     1479.9       14234.3        5.46
+         1 racdb                     0          1          4     1394.9        5441.4         .93
+         2 racdb                     0          1          4     1834.8       10171.2        4.63
+         2 racdb                     0          1          4     1517.4        6810.8        5.47
+
+10 rows selected.
+
+-- 결정적인 관찰이 여기 있다.
+--
+-- GOODNESS 가 ch16_lb 만 100 이고 나머지는 0 이다.
+-- DELTA 도 ch16_lb 만 100 이고 나머지는 1 이다.
+--
+-- ch16_lb 만 rlbgoal 을 SERVICE_TIME 으로 지정한 서비스다.
+-- ch16_ac 와 racdb 는 NONE 이다.
+--
+-- 즉 rlbgoal 을 켜지 않으면 GOODNESS 가 계산되지 않는다.
+-- 값이 0 인 것은 "나쁘다" 가 아니라 "계산하지 않는다" 는 뜻이다.
+--
+-- 이 구분을 모르면 인스턴스 상태가 나쁘다고 오해해 엉뚱한 곳을 조사하게 된다.
+
+-- 각 열이 뜻하는 것.
+--   GOODNESS      이 인스턴스가 이 서비스를 받기에 얼마나 좋은가. 클수록 좋다.
+--   DELTA         접속을 하나 더 받았을 때 GOODNESS 가 얼마나 변할지 예측한 값.
+--   CPUPERCALL    호출 하나당 CPU 시간 (마이크로초)
+--   DBTIMEPERCALL 호출 하나당 DB 시간 (마이크로초)
+--   CALLSPERSEC   초당 호출 수
+--   FLAGS         권고의 성격을 나타내는 비트. 이 랩에서는 모두 4 였다.
+--
+-- 뒤의 네 열은 rlbgoal 과 무관하게 항상 채워진다는 점도 눈여겨본다.
+-- racdb 서비스도 CPUPERCALL 과 DBTIMEPERCALL 이 있다.
+-- 권고를 만들지 않을 뿐 측정은 하고 있다.
+--
+-- 그러므로 rlbgoal 을 켜지 않은 서비스라도 이 뷰로 인스턴스별 부하를
+-- 비교할 수 있다. 13장에서 redo size 로 편중을 봤던 것에 더할 지표다.
+
+--------------------------------------------------------------------------------
+ [7] 흔한 오류 — rlbgoal 값을 잘못 주면
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl add service -d racdb -s ch16_bad3 -preferred racdb1 -rlbgoal FASTEST
+PRKO-3125 : Invalid value FASTEST for command line option rlbgoal
+
+-- 원인 파악 : FASTEST 는 rlbgoal 의 값이 아니다.
+--             실제 값은 NONE, SERVICE_TIME, THROUGHPUT 셋이다.
+--             이름만 보면 그럴듯해서 흔히 하는 실수다.
+--             PRKO 접두어이므로 명령행 해석 단계에서 걸렸다.
+--             자원을 조회하러 가기도 전에 거부되었다는 뜻이다.
+-- 조치     : srvctl add service -help 로 값 목록을 확인한다.
+--             응답 시간 기준이면 SERVICE_TIME, 처리량 기준이면 THROUGHPUT 이다.
+-- 재확인   : srvctl config service -d racdb 목록에 ch16_bad3 이 없는지 본다.
+--             거부되었으므로 만들어지지 않았다.
+
+[oracle@rac1 ~]$ srvctl config service -d racdb | grep 'Service name'
+Service name: ch16_lb
+
+-- 값 목록을 외우려 하지 말고 -help 를 보는 습관을 들인다.
+-- 14장에서 dbca 와 srvctl 의 도움말이 그 도구의 진짜 계약이라고 한 그대로다.
+
+--------------------------------------------------------------------------------
+ [8] 이 실습에서 확인할 수 있는 것과 없는 것
+--------------------------------------------------------------------------------
+
+-- 확인할 수 있는 것
+--   설정이 서버에 반영되었는가        srvctl config, dba_services
+--   권고가 계산되고 있는가            gv$servicemetric 의 GOODNESS
+--   서비스가 몇 인스턴스에 등록되었나 lsnrctl status LISTENER_SCAN1
+--
+-- 확인할 수 없는 것
+--   rlbgoal 의 실제 효과
+--     이미 열린 접속 중에서 고르는 것이므로 커넥션 풀이 있어야 한다.
+--     SQL*Plus 로 붙었다 끊는 방식으로는 고를 접속이 없다.
+--
+-- 도구가 재려는 대상에 맞는지 확인하는 것이 중요하다.
+-- 맞지 않으면 어떤 숫자가 나와도 의미가 없다.
+
+================================================================================
+ 실습 02 종료 — ch16_lb 서비스 생성·기동됨 (Cardinality 2)
+================================================================================
