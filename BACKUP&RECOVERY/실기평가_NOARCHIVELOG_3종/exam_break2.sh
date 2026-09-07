@@ -96,7 +96,7 @@ EOS
   ls -l "$BK/cf_exam.sql" | sed 's/^/  /'
   echo
   echo "  참고 - trace 안의 데이터파일 줄 수"
-  sed -n '/NORESETLOGS/,/^;/p' "$BK/cf_exam.sql" | grep -c 'dbf' | sed 's/^/    /'
+  sed -n '/^CREATE CONTROLFILE.*NORESETLOGS/,/^;/p' "$BK/cf_exam.sql" | grep -c 'dbf' | sed 's/^/    /'
   echo "  참고 - 실제 데이터파일 개수"
   ls "$D1"/*.dbf | grep -v temp | wc -l | sed 's/^/    /'
   echo "=== 재기동 시도 ==="

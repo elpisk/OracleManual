@@ -80,7 +80,7 @@ set feed off
 alter database backup controlfile to trace as '$BK/cf_exam.sql' reuse;
 EOS
 echo -n "  trace 안의 데이터파일 수 : "
-sed -n '/NORESETLOGS/,/^;/p' "$BK/cf_exam.sql" | grep -c 'dbf'
+sed -n '/^CREATE CONTROLFILE.*NORESETLOGS/,/^;/p' "$BK/cf_exam.sql" | grep -c 'dbf'
 
 #--- 5. trace 이후 데이터파일 추가 (시나리오 2 의 함정) ------------------------
 echo "=== [5] trace 이후 exam_tbs 추가 ==="
