@@ -24,19 +24,27 @@ SAFE=/home/oracle/backup/_proctor
 EX=/home/oracle/exam
 
 #--- 0. 아무것도 지우기 전에 데이터베이스가 정상인지 먼저 확인한다 --------------
-STATE=$(sqlplus -s / as sysdba <<'EOS' | tr -d ' \n'
+STATE=$(sqlplus -s / as sysdba <<'EOS' | tr -d '[:space:]'
 set feed off pages 0 head off
 select open_mode from v$database;
 EOS
 )
+# 사람이 읽을 수 있는 상태 이름으로 바꾼다
+case "$STATE" in
+  *ORA-01034*|*ORA-12560*|"") SHOW="인스턴스 정지" ;;
+  *ORA-01507*)                SHOW="NOMOUNT (인스턴스만 기동)" ;;
+  *MOUNTED*)                  SHOW="MOUNTED" ;;
+  *READONLY*)                 SHOW="READ ONLY" ;;
+  *)                          SHOW="$STATE" ;;
+esac
 case "$STATE" in
   READWRITE) : ;;
-  *) echo "중단: 데이터베이스가 READ WRITE 가 아니다 (현재: '$STATE')."
+  *) echo "중단: 데이터베이스가 READ WRITE 가 아니다 (현재: $SHOW)."
      echo "     먼저 정상 기동한 뒤 다시 실행할 것. 백업은 건드리지 않았다."
      exit 1 ;;
 esac
 
-MODE=$(sqlplus -s / as sysdba <<'EOS' | tr -d ' \n'
+MODE=$(sqlplus -s / as sysdba <<'EOS' | tr -d '[:space:]'
 set feed off pages 0 head off
 select log_mode from v$database;
 EOS

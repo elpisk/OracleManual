@@ -21,6 +21,35 @@ BK=/home/oracle/backup/exam_nolog
 HID=/home/oracle/backup/_proctor/hidden
 STEP="${1:-}"
 
+#--- 앞 케이스를 복구하지 않으면 다음 케이스를 주입할 수 없다 -------------------
+# 각 단계는 시작할 때 hr.exam_log 에 표식 행을 넣으므로 DB 가 OPEN 이어야 한다.
+STATE=$(sqlplus -s / as sysdba <<'EOS' | tr -d '[:space:]'
+set feed off pages 0 head off
+select open_mode from v$database;
+EOS
+)
+# 사람이 읽을 수 있는 상태 이름으로 바꾼다
+case "$STATE" in
+  *ORA-01034*|*ORA-12560*|"") SHOW="인스턴스 정지" ;;
+  *ORA-01507*)                SHOW="NOMOUNT (인스턴스만 기동)" ;;
+  *MOUNTED*)                  SHOW="MOUNTED" ;;
+  *READONLY*)                 SHOW="READ ONLY" ;;
+  *)                          SHOW="$STATE" ;;
+esac
+if [ "$STATE" != "READWRITE" ]; then
+  echo "=============================================================="
+  echo " 중단 : 데이터베이스가 READ WRITE 가 아니다 (현재: $SHOW)"
+  echo
+  echo " 앞 케이스의 복구가 끝나지 않았다."
+  echo "   · 복구를 계속하려면 이 스크립트를 실행하지 말 것"
+  echo "   · 포기하고 다음 케이스로 넘어가려면 감독관이 아래를 실행한 뒤"
+  echo "     다시 이 스크립트를 실행한다"
+  echo "       /home/oracle/exam/exam_reset.sh"
+  echo "=============================================================="
+  exit 1
+fi
+
+
 mark() {
   sqlplus -s / as sysdba <<EOS
 set feed off
