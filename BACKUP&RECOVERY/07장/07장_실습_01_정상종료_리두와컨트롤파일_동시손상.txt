@@ -118,7 +118,7 @@ SYS@orcl> !ls /u01/app/oracle/oradata/orcl/*.log /u02/oradata/orcl/*.log 2>/dev/
 SYS@orcl> !ls /u01/app/oracle/oradata/orcl/*.dbf | grep -v temp | wc -l
 5
 
-SYS@orcl> !sed -n '/NORESETLOGS NOARCHIVELOG/,/^;/p' /home/oracle/backup/cf_71.sql \
+SYS@orcl> !sed -n '/^CREATE CONTROLFILE.*NORESETLOGS/,/^;/p' /home/oracle/backup/cf_71.sql \
         | grep -c 'dbf'
 5
 
@@ -141,9 +141,9 @@ SYS@orcl> !cp -p /u01/app/oracle/oradata/orcl/*.dbf /home/oracle/before_recover_
 -- RECOVER DATABASE, ALTER DATABASE OPEN 이 함께 적혀 있다.
 -- CREATE CONTROLFILE 문만 잘라 두 개의 스크립트로 나눈다.
 
-SYS@orcl> !sed -n '/NORESETLOGS NOARCHIVELOG/,/^;/p' /home/oracle/backup/cf_71.sql \
+SYS@orcl> !sed -n '/^CREATE CONTROLFILE.*NORESETLOGS/,/^;/p' /home/oracle/backup/cf_71.sql \
         > /home/oracle/backup/cf_71_noresetlogs.sql
-SYS@orcl> !sed -n '/ RESETLOGS NOARCHIVELOG/,/^;/p' /home/oracle/backup/cf_71.sql \
+SYS@orcl> !sed -n '/^CREATE CONTROLFILE.*[^O]RESETLOGS/,/^;/p' /home/oracle/backup/cf_71.sql \
         > /home/oracle/backup/cf_71_resetlogs.sql
 
 -- 두 번째 패턴 앞에는 공백이 있다.
@@ -161,14 +161,13 @@ CREATE CONTROLFILE REUSE DATABASE "ORCL" NORESETLOGS NOARCHIVELOG
 *
 ERROR at line 1:
 ORA-01503: CREATE CONTROLFILE failed
-ORA-00202: control file: '/u01/app/oracle/oradata/orcl/control01.ctl'
-ORA-00301: error in adding log file
-           '/u01/app/oracle/oradata/orcl/redo01.log' - file cannot be created
-ORA-27040: file create error, unable to create file
+ORA-01565: error in identifying file '/u01/app/oracle/oradata/orcl/redo01.log'
+ORA-27037: unable to obtain file status
 Linux-x86_64 Error: 2: No such file or directory
+Additional information: 7
 
 -- << 원인 파악 >>
--- ORA-01503은 총괄 오류이고 ORA-00301이 실제 원인이다.
+-- ORA-01503은 총괄 오류이고 ORA-01565가 실제 원인이다.
 -- NORESETLOGS 형식은 LOGFILE 절에 나열된 리두 파일을 그대로 인식하려 한다.
 -- 그 파일이 실제로 존재하지 않으므로 문 자체가 실패했다.
 -- RESETLOGS 형식은 리두 로그를 새로 만들어 인식시키므로 파일이 없어도 성립한다.
@@ -256,13 +255,16 @@ SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarna
 
 INCARNATION# RESETLOGS_CHANGE# STATUS
 ------------ ----------------- -------
-           1                 1 PARENT
-           2           2382140 PARENT
-           3           2385641 PARENT
-           4           2386721 PARENT
-           5           2391041 CURRENT
+           1           2391041 CURRENT
 
--- 손실이 없어도 인카네이션은 올라갔다.
+-- 한 행뿐이다. 여기에 두 가지가 함께 담겨 있다.
+--   ① OPEN RESETLOGS 를 했으므로 RESETLOGS_CHANGE# 가 갱신되었다.
+--   ② 그런데 과거 인카네이션 이력이 남아 있지 않다.
+--      이력은 컨트롤파일에 저장되는데 그 컨트롤파일을 새로 만들었기 때문이다.
+--
+-- 컨트롤파일 재생성은 인카네이션 이력뿐 아니라 RMAN 저장소 정보(백업 이력)와
+-- TEMP 파일 등록 정보도 함께 지운다. Binary 백업본이 있으면 그쪽을 먼저 쓰는
+-- 이유가 여기에 있다. trace 재생성은 마지막 수단이다.
 
 SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
 
@@ -300,7 +302,7 @@ SYS@orcl> STARTUP
 --    FUZZY가 전부 NO이고 SCN이 같다는 것이 그 증거다.
 --
 -- 2) NORESETLOGS 형식은 리두 파일이 실제로 있어야 성립한다.
---    없으면 ORA-00301 계열 오류로 문 자체가 실패한다.
+--    없으면 ORA-01565 계열 오류로 문 자체가 실패한다.
 --    두 형식이 한 파일에 함께 들어 있으므로 실패 즉시 다른 쪽을 시도할 수 있다.
 --
 -- 3) 실패한 CREATE CONTROLFILE 은 컨트롤파일을 남기지 않는다.
@@ -316,6 +318,10 @@ SYS@orcl> STARTUP
 --
 -- 5) 손실이 없어도 인카네이션은 올라간다.
 --    리두를 새로 만들었으므로 연속성이 끊긴 것이며, 즉시 전체 백업이 필요하다.
+--    덧붙여 컨트롤파일을 재생성하면 인카네이션 이력 자체가 사라진다.
+--    v$database_incarnation 이 한 행만 남는 것이 그 증거다.
+--    RMAN 백업 이력도 함께 사라지므로 카탈로그를 쓰지 않는 환경에서는
+--    재생성 직후 백업을 다시 받고 기록을 새로 시작해야 한다.
 --
 -- 6) 리두 로그와 컨트롤파일을 같은 디스크에 두면 이 상황이 실제로 발생한다.
 --    이 실습은 정상 종료였기에 손실이 없었을 뿐이며, 다음 실습에서 반대 경우를 본다.
