@@ -15,8 +15,8 @@ set -u
 export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
 export ORACLE_SID=orcl
 export PATH=$ORACLE_HOME/bin:/usr/local/bin:/usr/bin:/bin
-D1=/u01/app/oracle/oradata/orcl
-D2=/u02/oradata/orcl
+D1=/u02/oradata/orcl
+D2=/fra/oradata/ORCL
 BK=/home/oracle/backup/exam_nolog
 HID=/home/oracle/backup/_proctor/hidden
 STEP="${1:-}"

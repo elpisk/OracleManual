@@ -17,7 +17,7 @@ set -u
 export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
 export ORACLE_SID=orcl
 export PATH=$ORACLE_HOME/bin:/usr/local/bin:/usr/bin:/bin
-D1=/u02/oradata/orcl
+D1=/u01/app/oracle/oradata/orcl
 STEP="${1:-}"
 
 #--- 앞 케이스를 복구하지 않으면 다음 케이스를 주입할 수 없다 -------------------

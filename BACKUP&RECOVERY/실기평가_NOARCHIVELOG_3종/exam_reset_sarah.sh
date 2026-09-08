@@ -13,8 +13,8 @@ export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
 export ORACLE_SID=orcl
 export PATH=$ORACLE_HOME/bin:/usr/local/bin:/usr/bin:/bin
 
-D1=/u02/oradata/orcl
-D2=/fra/oradata/ORCL
+D1=/u01/app/oracle/oradata/orcl
+D2=/u02/oradata/orcl
 SAFE=/home/oracle/backup/_proctor
 BK=/home/oracle/backup/exam_nolog
 
@@ -32,10 +32,10 @@ EOS
 
 echo "=== 파일 복원 ==="
 cp -p "$SAFE"/*.dbf "$D1"/
-cp -p "$SAFE"/control01.ctl "$SAFE"/control03.ctl "$D1"/
-cp -p "$SAFE"/control02.ctl "$D2"/
-cp -p "$SAFE"/redo01.log "$SAFE"/redo02.log "$SAFE"/redo03.log "$D1"/
-cp -p "$SAFE"/redo01b.log "$SAFE"/redo02b.log "$SAFE"/redo03b.log "$D2"/
+cp -p "$SAFE"/control01.ctl "$SAFE"/control02.ctl "$D1"/
+cp -p "$SAFE"/control03.ctl "$D2"/
+cp -p "$SAFE"/redo01.log "$SAFE"/redo03.log "$SAFE"/redo04.log "$D1"/
+cp -p "$SAFE"/redo01b.log "$SAFE"/redo03b.log "$SAFE"/redo04b.log "$D2"/
 cp -p "$SAFE"/spfileorcl.ora "$SAFE"/orapworcl "$ORACLE_HOME/dbs/"
 chown oracle:dba "$D1"/* "$D2"/*.ctl "$D2"/*.log 2>/dev/null
 

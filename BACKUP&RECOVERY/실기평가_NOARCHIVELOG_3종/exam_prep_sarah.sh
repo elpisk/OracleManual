@@ -17,8 +17,8 @@ export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
 export ORACLE_SID=orcl
 export PATH=$ORACLE_HOME/bin:/usr/local/bin:/usr/bin:/bin
 
-D1=/u02/oradata/orcl
-D2=/fra/oradata/ORCL
+D1=/u01/app/oracle/oradata/orcl
+D2=/u02/oradata/orcl
 BK=/home/oracle/backup/exam_nolog
 SAFE=/home/oracle/backup/_proctor
 EX=/home/oracle/exam

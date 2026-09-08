@@ -76,7 +76,7 @@ case "$STEP" in
   mark 'S3-1' '멤버 하나가 사라져도 서비스는 계속되는가'
   G=$(pick INACTIVE)
   echo "  대상 그룹 : $G"
-  M=$(members "$G" | grep '/u02/' | head -1)
+  M=$(members "$G" | grep '/fra/' | head -1)   # 다중화 사본(b멤버) 쪽을 지운다
   echo "  삭제할 멤버 : $M"
   rm -f "$M"
   sqlplus -s / as sysdba <<'EOS' >/dev/null
