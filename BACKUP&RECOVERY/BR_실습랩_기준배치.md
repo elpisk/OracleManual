@@ -96,14 +96,58 @@ ORA-00289: suggestion : /home/oracle/arch2/arch_1_256_1239893756.arc
 그 인카네이션의 `%r` 을 쓴다(15-10). `DELETE EXPIRED ARCHIVELOG` 나 `CROSSCHECK` 가
 찍는 이름은 적용이 아니라 남아 있는 기록이므로 옛 `%r` 일 수 있다(10-4).
 
-## 3. 계정과 소유권
+## 3. 파일을 지울 때의 순서
+
+데이터파일을 지우는 장애 유발에는 **순서가 있다.**
+
+```
+ALTER SYSTEM FLUSH BUFFER_CACHE;     -- 먼저 비운다
+!rm -f <데이터파일>                    -- 그 다음에 지운다
+SELECT ... ;                          -- ORA-01116 이 난다
+```
+
+거꾸로 하면 인스턴스가 죽는다. 랩에서 실측한 결과다.
+
+```
+-- 더티 버퍼가 남은 채 파일을 지우고 쓰기를 시도했을 때 (alert log)
+ORA-63999: data file suffered media failure
+ORA-01116: error in opening database file 10
+ORA-01110: data file 10: '/u01/app/oracle/oradata/orcl/tbs01.dbf'
+ORA-27041: unable to open file
+Linux-x86_64 Error: 2: No such file or directory
+Additional information: 3
+...
+USER (ospid: ): terminating the instance due to ORA error
+Instance terminated by USER, pid = 10440        ← CKPT
+```
+
+`FLUSH BUFFER_CACHE` 뿐 아니라 평범한 `ALTER SYSTEM CHECKPOINT` 로도 같다.
+19c 는 `_datafile_write_errors_crash_instance` 가 기본 TRUE 라서, 데이터파일
+쓰기 실패를 만나면 손상을 넓히지 않으려고 인스턴스를 내린다.
+
+더티 버퍼를 먼저 없애 두면 남는 것은 읽기 실패뿐이라 인스턴스가 버틴다.
+
+```
+SYS@orcl> SELECT COUNT(*) FROM hr.emp85;
+ERROR at line 1:
+ORA-01116: error in opening database file 10
+ORA-01110: data file 10: '/u01/app/oracle/oradata/orcl/tbs01.dbf'
+ORA-27041: unable to open file
+Linux-x86_64 Error: 2: No such file or directory
+Additional information: 3
+```
+
+`ORA-27041`(열기 실패)에는 `Additional information: 3`,
+`ORA-27037`(상태 조회 실패)에는 `Additional information: 7` 이 붙는다.
+
+## 4. 계정과 소유권
 
 `oracle` 의 주 그룹은 **`dba`** 다(`uid=1000(oracle) gid=54322(dba) groups=54322(dba),54321(oinstall)`).
 따라서 데이터베이스가 만든 파일은 `ls -l` 에서 `oracle dba` 로 보인다.
 `oracle oinstall` 로 보이는 것은 root 가 그렇게 바꿔 둔 디렉터리뿐이다
 (`/archsmall`, `/u03/dpdump`, `/u03/dpdump_bad`, `/archive_keep`).
 
-## 4. 감독자 사전 준비 (root)
+## 5. 감독자 사전 준비 (root)
 
 `/` 는 `dr-xr-xr-x root root` 이므로 **oracle 계정은 최상위 디렉터리를 만들 수 없다.**
 아래는 랩을 배포하기 전에 root 로 한 번 해 두어야 한다.
@@ -133,7 +177,7 @@ lsnrctl start          # oracle 계정
 로컬 접속한다. 리스너가 내려간 상태에서 `sqlplus hr/hr@orcl` 을 쓰면
 `ORA-12541: TNS:no listener` 로 막힌다(실측).
 
-## 5. 장별 아카이브 모드 전제
+## 6. 장별 아카이브 모드 전제
 
 | 장 | 모드 | 비고 |
 |---|---|---|
@@ -142,14 +186,14 @@ lsnrctl start          # oracle 계정
 | 3~7장 | NOARCHIVELOG | 4~7장 시나리오를 위해 잠시 되돌린다 |
 | 8장 이후 | ARCHIVELOG | 2장의 구성을 그대로 쓴다 |
 
-## 6. 점검 도구
+## 7. 점검 도구
 
 트랜스크립트는 기계 검사를 통과한 상태로 유지한다. 검사기는 `_rac_scratch/` 에 있다.
 
 | 스크립트 | 잡는 것 |
 |---|---|
 | `_br_verify.py` | A~F : SCN 역전, 시각 모순, errno 모순, 날짜 표기 뒤집힘(`13/05` 는 `05/13`) 등 |
-| `_br_proc.py` | G : 상태(DOWN/NOMOUNT/MOUNT/OPEN)에서 실행할 수 없는 명령<br>H : `RENAME FILE` · `RECOVER TABLESPACE/DATAFILE` 앞의 OFFLINE 누락 |
+| `_br_proc.py` | G : 상태(DOWN/NOMOUNT/MOUNT/OPEN)에서 실행할 수 없는 명령<br>H : `RENAME FILE` · `RECOVER TABLESPACE/DATAFILE` 앞의 OFFLINE 누락<br>P : 데이터파일을 지운 뒤 쓰기 시도 |
 | `_br_base.py` | L : 기준 배치와 다른 경로<br>M : 없는 아카이브 경로, 실측과 다른 아카이브 파일명<br>O : OPEN RESETLOGS 를 지나고도 그대로인 `%r` |
 | `_br_align.py` | N : SQL*Plus 출력 표의 열 정렬 |
 
