@@ -91,6 +91,18 @@ ls -ld /arch /fra          # 이미 마련되어 있어야 한다
 이 아래의 하위 디렉터리(`/u03/arch2`, `/u03/oradata/ORCL`, `/u04/clone/arch` 등)는
 각 실습이 oracle 계정으로 직접 만든다.
 
+### 리스너
+
+13장부터 `@rcat`, `@NEWDB` 같은 네트워크 접속을 쓴다. 리스너가 떠 있어야 한다.
+
+```bash
+lsnrctl start          # oracle 계정
+```
+
+12장까지는 리스너를 쓰지 않는다. 그 장들의 두 번째 세션은 `sqlplus hr/hr` 로
+로컬 접속한다. 리스너가 내려간 상태에서 `sqlplus hr/hr@orcl` 을 쓰면
+`ORA-12541: TNS:no listener` 로 막힌다(실측).
+
 ## 5. 장별 아카이브 모드 전제
 
 | 장 | 모드 | 비고 |
