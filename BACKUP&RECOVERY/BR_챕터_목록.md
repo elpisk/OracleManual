@@ -87,8 +87,8 @@
 |---|---|---|
 | BNR_05 시18 | `from v$datafile a, v$table b` | `v$tablespace`로 수정 |
 | BNR_05 시18 | `b.next_v$logfile a, v$log b` (문장 깨짐) | `b.next_change# from v$logfile a, v$log b`로 복원 |
-| BNR_02 시3 | `/u01/app/oracle/oradata/ORCL/tbs01.율` (인코딩 깨짐) | `tbs01.dbf` |
-| BNR_01 | 프롬프트가 `SYS@orcl>` / `SYS@ora19c>` / `SQL>` 혼재, 경로도 `ORCL`/`ORA19C` 혼재 | **`SYS@orcl>` + `/u01/app/oracle/oradata/ORCL/`로 통일** |
+| BNR_02 시3 | `/u01/app/oracle/oradata/orcl/tbs01.율` (인코딩 깨짐) | `tbs01.dbf` |
+| BNR_01 | 프롬프트가 `SYS@orcl>` / `SYS@ora19c>` / `SQL>` 혼재, 경로도 `ORCL`/`ORA19C` 혼재 | **`SYS@orcl>` + `/u01/app/oracle/oradata/orcl/`로 통일** |
 | BNR_11 시26 | "Alert log 확인" 항목 이후 내용 없음 | alert log 출력 예시 작성 |
 | BNR_08 시9 | `v$datafile` 출력이 컬럼 줄바꿈으로 판독 불가 | `set linesize 200` 적용한 정돈된 출력으로 재작성 |
 | BNR_15 | DRA 출력의 `Impact: Object    owned by    might be unavailable`(객체명 공백) | 실제 객체명(`EMP owned by HR`)으로 채움 |
@@ -304,6 +304,6 @@ v1에서 16장은 배정 주제가 11개였다. 본문 26,000~30,000자 규격 �
   본문 불릿 18pt `202830` / 하위 16pt `5A6672`, 코드 12.5pt Consolas.
   **발표자 노트 전 슬라이드 200~500자**(1장 실적 min 209 / avg 314 / max 461).
 - **트랜스크립트**: 표준 8단계 템플릿. 장애 복구가 아닌 장은 ④⑤를 "작업 수행 / 진행 로그"로 치환.
-  프롬프트 `SYS@orcl>` · `HR@orcl>` · `RMAN>` · `[oracle@oel7v9r1 ~]$`, 경로 `/u01/app/oracle/oradata/ORCL/`.
+  프롬프트 `SYS@orcl>` · `HR@orcl>` · `RMAN>` · `[oracle@oel7v9r1 ~]$`, 경로 `/u01/app/oracle/oradata/orcl/`.
 - **빌더**: `br_style.py`(docx) / `br_ppt.py`(pptx) / `build_body.py N` / `build_pptx0N.py` / `build_quiz.py N` / `verify_ch.py N`. 장 번호를 인자로 받아 재사용한다.
   세션 스크래치패드에서 관리하며 프로젝트 폴더에 남기지 않는다.

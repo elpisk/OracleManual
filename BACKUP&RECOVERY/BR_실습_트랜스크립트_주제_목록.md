@@ -5,7 +5,7 @@
 - **소스**: `BNR_01~16.pdf` + `Clone DB.pdf` 원본 시나리오 93개 + 결손 보완 케이스 (`BR_시나리오_매핑.md` 참고)
 - **형식**: SQL*Plus / RMAN / 셸 세션 트랜스크립트
   - 프롬프트 표기 통일: `SYS@orcl>` (SQL*Plus, SYSDBA), `HR@orcl>` (일반 사용자), `RMAN>` (RMAN), `[oracle@oel7v9r1 ~]$` (셸)
-  - 경로 표기 통일: `/u01/app/oracle/oradata/ORCL/`, `$ORACLE_HOME = /u01/app/oracle/product/19.3.0/dbhome_1`
+  - 경로 표기 통일: `/u01/app/oracle/oradata/orcl/`, `$ORACLE_HOME = /u01/app/oracle/product/19.3.0/dbhome_1`
   - 한글 주석은 `--` 로 달고, 명령 위에 붙인다
 - **필수 구조**: 모든 트랜스크립트는 `BR_챕터_목록.md` 2-1절의 **표준 8단계 템플릿**(개요 → 사전조건 → 초기상태 → 장애유발 → 증상 → 진단 → 복구 → 검증)을 따른다
 - **오류 흐름**: 파일마다 최소 1곳에 "오류 발생 → 원인 파악 → 수정" 흐름을 넣는다. 복구 시나리오 특성상 실제 있음직한 `ORA-01110`, `ORA-01113`, `ORA-01157`, `ORA-00279`, `ORA-01547`, `ORA-01194`, `ORA-00257` 등을 사용한다
