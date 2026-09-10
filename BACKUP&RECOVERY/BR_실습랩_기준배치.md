@@ -140,14 +140,49 @@ Additional information: 3
 `ORA-27041`(열기 실패)에는 `Additional information: 3`,
 `ORA-27037`(상태 조회 실패)에는 `Additional information: 7` 이 붙는다.
 
-## 4. 계정과 소유권
+## 4. 복구 실습의 명령 순서
+
+랩에서 실측해 확정한 규칙이다.
+
+**내린 것은 명시적으로 올린다.**
+`RECOVER DATABASE` 는 OFFLINE 데이터파일을 건너뛴다. 내려간 파일만 남으면
+`ORA-00264: no recovery required` 로 끝난다. MOUNT 에서
+`ALTER DATABASE DATAFILE n ONLINE` 을 먼저 해야 복구 대상에 들어온다.
+그리고 파일이 ONLINE 이 되어도 테이블스페이스는 그대로 OFFLINE 이다.
+
+```
+SYS@orcl> SELECT COUNT(*) FROM hr.t10;
+ORA-00376: file 10 cannot be read at this time
+ORA-01110: data file 10: '/u01/app/oracle/oradata/orcl/t10_01.dbf'
+```
+
+`ALTER TABLESPACE x ONLINE` 까지 해야 읽힌다. READ ONLY 로 연 상태에서는
+그 명령이 `ORA-16000: database or pluggable database open for read-only access`
+로 거부되므로, 데이터 확인은 RESETLOGS 로 연 뒤에 한다.
+
+**템프파일은 함부로 다시 만들지 않는다.**
+`OPEN RESETLOGS` 는 템프파일 기록을 지우지 않는다. 이미 있는 파일을 다시 추가하면
+
+```
+ORA-01537: cannot add file '...temp01.dbf' - file already part of database
+```
+
+`CREATE CONTROLFILE` 로 컨트롤파일을 다시 만든 경우에만 템프파일이 사라진다.
+그때만 `ALTER TABLESPACE temp ADD TEMPFILE` 이 성립한다.
+
+**AUTORECOVERY 를 켜지 않으면 프롬프트가 뜬다.**
+SQL*Plus 기본값은 OFF 다. `UNTIL TIME` · `UNTIL CHANGE` · `UNTIL SEQUENCE` 모두
+로그마다 `Specify log:` 를 묻는다. 프롬프트 없이 `Media recovery complete.` 로
+끝나려면 앞에 `SET AUTORECOVERY ON` 이 있어야 한다.
+
+## 5. 계정과 소유권
 
 `oracle` 의 주 그룹은 **`dba`** 다(`uid=1000(oracle) gid=54322(dba) groups=54322(dba),54321(oinstall)`).
 따라서 데이터베이스가 만든 파일은 `ls -l` 에서 `oracle dba` 로 보인다.
 `oracle oinstall` 로 보이는 것은 root 가 그렇게 바꿔 둔 디렉터리뿐이다
 (`/archsmall`, `/u03/dpdump`, `/u03/dpdump_bad`, `/archive_keep`).
 
-## 5. 감독자 사전 준비 (root)
+## 6. 감독자 사전 준비 (root)
 
 `/` 는 `dr-xr-xr-x root root` 이므로 **oracle 계정은 최상위 디렉터리를 만들 수 없다.**
 아래는 랩을 배포하기 전에 root 로 한 번 해 두어야 한다.
@@ -177,7 +212,7 @@ lsnrctl start          # oracle 계정
 로컬 접속한다. 리스너가 내려간 상태에서 `sqlplus hr/hr@orcl` 을 쓰면
 `ORA-12541: TNS:no listener` 로 막힌다(실측).
 
-## 6. 장별 아카이브 모드 전제
+## 7. 장별 아카이브 모드 전제
 
 | 장 | 모드 | 비고 |
 |---|---|---|
@@ -186,7 +221,7 @@ lsnrctl start          # oracle 계정
 | 3~7장 | NOARCHIVELOG | 4~7장 시나리오를 위해 잠시 되돌린다 |
 | 8장 이후 | ARCHIVELOG | 2장의 구성을 그대로 쓴다 |
 
-## 7. 점검 도구
+## 8. 점검 도구
 
 트랜스크립트는 기계 검사를 통과한 상태로 유지한다. 검사기는 `_rac_scratch/` 에 있다.
 
@@ -196,6 +231,7 @@ lsnrctl start          # oracle 계정
 | `_br_proc.py` | G : 상태(DOWN/NOMOUNT/MOUNT/OPEN)에서 실행할 수 없는 명령<br>H : `RENAME FILE` · `RECOVER TABLESPACE/DATAFILE` 앞의 OFFLINE 누락<br>P : 데이터파일을 지운 뒤 쓰기 시도 |
 | `_br_base.py` | L : 기준 배치와 다른 경로<br>M : 없는 아카이브 경로, 실측과 다른 아카이브 파일명<br>O : OPEN RESETLOGS 를 지나고도 그대로인 `%r` |
 | `_br_align.py` | N : SQL*Plus 출력 표의 열 정렬 |
+| `_br_seq.py` | Q : OFFLINE 뒤 ONLINE 누락<br>R : 컨트롤파일을 그대로 둔 채 ADD TEMPFILE<br>S : AUTORECOVERY OFF 인데 프롬프트 없이 끝나는 복구 |
 
 ```
 python _br_verify.py "*/*.txt"
