@@ -1,0 +1,135 @@
+================================================================================
+ 4장 실습 01 — 성능 관련 초기화 파라미터 일괄 점검
+ 목표: V$PARAMETER를 성능 관련 항목으로 필터링해 이 인스턴스의 구성(블록
+       크기·SGA/PGA·PROCESSES/SESSIONS·Undo)을 한 화면으로 읽는다. 값 하나가
+       나머지를 어떻게 파생시키는지(PROCESSES→SESSIONS)와 SPFILE·메모리 값의
+       불일치 가능성을 확인한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 주의: 개인 실습 환경 전용. 이 실습은 대부분 읽기 전용 조회이며, 마지막에
+       파라미터 변경 예시가 있으나 SCOPE=MEMORY 임시 변경 후 즉시 원복한다.
+       공용 데이터베이스에서 수행하지 않는다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 성능에 영향을 주는 파라미터를 한 번에 조회한다.
+--     이름 목록을 IN 절로 좁혀 '이 인스턴스의 성격'을 요약해 읽는다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value
+  2       FROM  v$parameter
+  3       WHERE name IN ('db_block_size','sga_target','pga_aggregate_target',
+  4              'processes','sessions','undo_management','undo_tablespace',
+  5              'undo_retention','optimizer_mode','cursor_sharing',
+  6              'db_file_multiblock_read_count','memory_target')
+  7       ORDER BY name;
+
+NAME                            VALUE
+------------------------------- ----------------
+cursor_sharing                  EXACT
+db_block_size                   8192
+db_file_multiblock_read_count   128
+memory_target                   0
+optimizer_mode                  ALL_ROWS
+pga_aggregate_target            734003200
+processes                       500
+sessions                        776
+sga_target                      1577058304
+undo_retention                  900
+undo_tablespace                 UNDOTBS1
+
+-- 해석(구성 읽기):
+--   db_block_size=8192  → 8KB 블록. OLTP 표준값(5장 이후 부하도 이 전제).
+--   memory_target=0     → AMM 꺼짐. SGA/PGA를 각각 목표로 두는 ASMM.
+--   sga_target=1,577,058,304B ≈ 1.47GB, pga_aggregate_target≈700MB.
+--   processes=500 → sessions=776 (약 processes*1.5+22 규칙으로 파생).
+--   undo_tablespace=UNDOTBS1, undo_retention=900초(15분) → 자동 Undo 관리.
+--   cursor_sharing=EXACT → 리터럴 SQL 비공유(2·18장 주제).
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 바이트 값은 MB로 환산해 읽는다. 사람이 읽는 단위로 바꾼다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name,
+  2         ROUND(TO_NUMBER(value)/1024/1024) mb
+  3       FROM  v$parameter
+  4       WHERE name IN ('sga_target','pga_aggregate_target');
+
+NAME                   MB
+-------------------- ------
+pga_aggregate_target    700
+sga_target             1504
+
+-- 해석: sga_target≈1504MB, pga_aggregate_target=700MB. 문서·PPT의 '약 1.5GB /
+--   약 700MB'와 일치한다. 바이트로 보이면 1024로 두 번 나눠 확인한다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) PROCESSES가 왜 '1차 파라미터'인가 — 파생 관계를 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value, isdefault
+  2       FROM  v$parameter
+  3       WHERE name IN ('processes','sessions','transactions');
+
+NAME             VALUE      ISDEFAULT
+---------------- ---------- ---------
+processes        500        FALSE
+sessions         776        TRUE
+transactions     853        TRUE
+
+-- 해석: sessions·transactions의 ISDEFAULT=TRUE. 즉 명시 설정이 아니라
+--   processes에서 자동 파생된 값이다. processes를 바꾸면 이들도 따라 바뀐다.
+--   공유 서버를 켜면 이 파생 sessions가 부족할 수 있어 별도로 키운다(실습 04).
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     SPFILE 값과 현재 메모리 값이 다를 수 있다. 이를 놓치면 '분명히 바꿨는데
+--     반영이 안 된다'는 혼란이 생긴다. V$SPPARAMETER와 대조한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 이상 징후 재현: 세션 메모리에서만 값을 바꿔 본다(원복 예정).
+SYS@orcl> ALTER SYSTEM SET db_file_multiblock_read_count=64 SCOPE=MEMORY;
+System altered.
+
+SYS@orcl> -- 현재 메모리 값
+SYS@orcl> SELECT value FROM v$parameter WHERE name='db_file_multiblock_read_count';
+VALUE
+----------
+64
+
+SYS@orcl> -- SPFILE 값 (다음 기동 시 적용될 값)
+SYS@orcl> SELECT value FROM v$spparameter WHERE name='db_file_multiblock_read_count';
+VALUE
+----------
+128
+
+-- 이상 징후: 같은 파라미터인데 현재값(64)과 SPFILE값(128)이 다르다!
+-- 원인 파악: SCOPE=MEMORY로 바꿔서 현재 인스턴스에만 적용되고 SPFILE에는
+--   반영되지 않았다. 재기동하면 128로 돌아간다. '반영이 안 된다'가 아니라
+--   'SCOPE를 MEMORY로 줬다'가 원인이다.
+
+SYS@orcl> -- 조치: 실습이므로 원래 값으로 되돌린다(원복).
+SYS@orcl> ALTER SYSTEM SET db_file_multiblock_read_count=128 SCOPE=MEMORY;
+System altered.
+
+SYS@orcl> -- 재확인: 현재값과 SPFILE값이 다시 일치
+SYS@orcl> SELECT (SELECT value FROM v$parameter  WHERE name='db_file_multiblock_read_count') mem,
+  2              (SELECT value FROM v$spparameter WHERE name='db_file_multiblock_read_count') spf
+  3       FROM dual;
+MEM        SPF
+---------- ----------
+128        128
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 성능 관련 파라미터는 소수다. V$PARAMETER를 IN 절로 좁혀 한 화면에 읽는다.
+-- 2) 실측 구성: 8KB 블록 / ASMM(SGA 약 1.5GB·PGA 700MB, memory_target=0) /
+--    processes 500·sessions 776(파생) / undo_retention 900·UNDOTBS1.
+-- 3) sessions·transactions는 processes에서 파생(ISDEFAULT=TRUE)된다.
+-- 4) 변경 시 SCOPE를 이해한다: MEMORY(현재)/SPFILE(다음 기동)/BOTH(둘 다).
+--    현재값과 SPFILE값을 V$PARAMETER·V$SPPARAMETER로 대조해 혼란을 막는다.
+-- ※ 이 조회들은 관리 팩 라이선스가 필요 없다.
+
+SYS@orcl> EXIT
+================================================================================

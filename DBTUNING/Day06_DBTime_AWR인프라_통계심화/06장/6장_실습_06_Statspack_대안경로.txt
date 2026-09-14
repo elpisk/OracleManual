@@ -1,0 +1,144 @@
+================================================================================
+ 6장 실습 06 — Statspack 대안 경로: 설치·스냅샷·보고서와 AWR과의 차이
+ 목표: Diagnostics Pack이 없는 환경을 가정해 Statspack을 설치하고, 부하 구간을
+       스냅샷 쌍으로 감싸 보고서를 만든 뒤, AWR과의 차이를 확인한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA 설치 + PERFSTAT 수집/보고)
+ 라이선스: ★ 이 실습은 라이선스 불필요 ★ (Statspack은 무상)
+       ↔ 실습 01~05의 AWR 경로는 Diagnostics Pack(🔒)이 필요했다.
+ 부하: WL_06_mixed.sql (실습 02와 동일 구간을 Statspack으로 다시 감싼다).
+ 주의: 개인 실습 환경 전용. PERFSTAT 계정과 STATS$* 객체가 생성된다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 라이선스 없는 환경을 가정한다 — 팩 접근을 NONE으로.
+--------------------------------------------------------------------------------
+SYS@orcl> SHOW PARAMETER control_management_pack_access
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+control_management_pack_access       string      DIAGNOSTIC+TUNING
+
+SYS@orcl> -- 미보유 환경 재현: 이 값을 NONE으로 두면 AWR 경로가 막힌다.
+SYS@orcl> ALTER SYSTEM SET control_management_pack_access='NONE' SCOPE=BOTH;
+
+System altered.
+
+SYS@orcl> -- 확인: 이 상태에서 AWR 수동 스냅샷은 의미가 없다(실습 02의 이상 상황).
+SYS@orcl> --   그래서 무상 대안인 Statspack으로 간다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) Statspack 설치 — spcreate.sql (PERFSTAT 계정 생성).
+--------------------------------------------------------------------------------
+SYS@orcl> @?/rdbms/admin/spcreate.sql
+... Enter value for perfstat_password: <환경값>
+... Enter value for default_tablespace: SYSAUX
+... Enter value for temporary_tablespace: TEMP
+... Creating PERFSTAT user ...
+... Creating STATS$* tables, indexes, package (STATSPACK) ...
+NOTE: SPCPKG complete. Please check spcpkg.lis for any errors.
+
+SYS@orcl> -- 확인: PERFSTAT 계정과 스냅샷 테이블이 생겼는지 본다.
+SYS@orcl> SELECT COUNT(*) statspack_tables FROM dba_tables
+  2       WHERE owner='PERFSTAT' AND table_name LIKE 'STATS$%';
+
+STATSPACK_TABLES
+----------------
+      <환경값>       -- 0보다 크면 설치 성공
+
+--------------------------------------------------------------------------------
+-- [3] (조치) 부하 구간을 Statspack 스냅샷 쌍으로 감싼다.
+--------------------------------------------------------------------------------
+SYS@orcl> CONNECT perfstat/<환경값>
+Connected.
+PERFSTAT@orcl> EXEC STATSPACK.SNAP;        -- 시작 스냅샷
+
+PL/SQL procedure successfully completed.
+
+PERFSTAT@orcl> SELECT MAX(snap_id) start_snap FROM stats$snapshot;
+
+ START_SNAP
+----------
+         1
+
+-- (다른 터미널 SQLT 세션) @WL_06_mixed.sql  ... 종합 부하 실행 ...
+
+PERFSTAT@orcl> EXEC STATSPACK.SNAP;        -- 종료 스냅샷
+
+PL/SQL procedure successfully completed.
+
+PERFSTAT@orcl> SELECT snap_id, TO_CHAR(snap_time,'MM-DD HH24:MI') t
+  2       FROM stats$snapshot ORDER BY snap_id;
+
+   SNAP_ID T
+---------- -----------
+         1 08-25 12:00
+         2 08-25 12:17
+
+-- 해석: Statspack 스냅샷 1~2 구간이 부하 구간이다.
+--   AWR의 CREATE_SNAPSHOT ↔ STATSPACK.SNAP이 같은 역할을 한다.
+
+--------------------------------------------------------------------------------
+-- [4] (조치) 보고서 생성 — spreport.sql.
+--------------------------------------------------------------------------------
+PERFSTAT@orcl> @?/rdbms/admin/spreport.sql
+... Enter value for begin_snap: 1
+... Enter value for end_snap:   2
+... Enter value for report_name: sp_1_2.txt
+... 보고서 생성 ...
+
+-- 보고서 상단 구조(AWR과 읽는 법이 거의 같다):
+--   Load Profile        : per second / per transaction
+--   Top 5 Timed Events  : 상위 대기·CPU
+--   SQL ordered by ...   : Gets / Reads / Elapsed
+-- (구체 수치는 환경·구간에 따라 다르므로 <환경값>. 절대값 단정 금지)
+
+--------------------------------------------------------------------------------
+-- [5] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 보고서에서 ADDM Findings 섹션을 찾는데 없다.
+--------------------------------------------------------------------------------
+PERFSTAT@orcl> -- 원인 파악: ADDM 자동 진단은 Diagnostics Pack 기능이다.
+PERFSTAT@orcl> --   Statspack은 데이터를 모아 보고서로 "보여줄" 뿐, 자동 진단이 없다.
+PERFSTAT@orcl> --   즉 "무엇이 문제인가"는 사람이 Load Profile·Top 5로 판독해야 한다.
+PERFSTAT@orcl> -- 조치: 자동 진단을 기대하지 말고, 8장의 보고서 판독법으로 직접 읽는다.
+PERFSTAT@orcl> --   상위 대기와 상위 SQL을 DB Time 비중과 함께 본다.
+PERFSTAT@orcl> -- 재확인: spreport 보고서의 Top 5 Timed Events에서 이번 부하의
+PERFSTAT@orcl> --   상위 대기(예: CPU time, log file sync)가 잡히는지 확인한다.
+
+--------------------------------------------------------------------------------
+-- [6] (원복) 학습 환경이므로 팩 접근을 되돌린다.
+--------------------------------------------------------------------------------
+PERFSTAT@orcl> CONNECT / as sysdba
+Connected.
+SYS@orcl> ALTER SYSTEM SET control_management_pack_access='DIAGNOSTIC+TUNING'
+  2       SCOPE=BOTH;
+
+System altered.
+
+SYS@orcl> SELECT value FROM v$parameter WHERE name='control_management_pack_access';
+
+VALUE
+--------------------
+DIAGNOSTIC+TUNING
+
+-- 재확인: 원복 완료. (실무 미보유 환경이라면 NONE으로 두고 Statspack만 쓴다)
+-- 참고: Statspack 제거가 필요하면 SYSDBA로 @?/rdbms/admin/spdrop.sql.
+
+--------------------------------------------------------------------------------
+-- [정리] AWR ↔ Statspack 대응
+--------------------------------------------------------------------------------
+-- 1) 설치        : (AWR 기본 내장)        ↔ spcreate.sql (PERFSTAT)
+-- 2) 스냅샷      : CREATE_SNAPSHOT        ↔ STATSPACK.SNAP
+-- 3) 자동 수집   : 60분 자동              ↔ spauto.sql (잡 등록)
+-- 4) 보고서      : awrrpt.sql             ↔ spreport.sql
+-- 5) 정리        : DROP_SNAPSHOT_RANGE    ↔ sppurge.sql
+-- 6) 저장 위치   : SYSAUX / DBA_HIST_*    ↔ PERFSTAT / STATS$*
+-- 7) 없는 기능   : (AWR은 ADDM·ASH·베이스라인 통합) ↔ Statspack엔 없음
+-- 결론: 라이선스가 없어도 진단은 가능하다. 자동화·통합만 손으로 대신할 뿐이며,
+--   원천 데이터는 언제나 V$에 있다(한 구간만이면 V$ 델타로도 충분).
+
+SYS@orcl> EXIT
+================================================================================

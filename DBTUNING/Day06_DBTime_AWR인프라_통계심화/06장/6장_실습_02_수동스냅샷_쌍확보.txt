@@ -1,0 +1,116 @@
+================================================================================
+ 6장 실습 02 — WL_06_mixed.sql을 사이에 두고 수동 스냅샷 쌍 확보
+ 목표: CREATE_SNAPSHOT으로 부하 직전·직후 스냅샷을 떠 분석용 구간(295~296)을
+       만들고, DBA_HIST_SNAPSHOT으로 구간을 확인한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA + SQLT 부하 세션)
+ 라이선스 주의(🔒): CREATE_SNAPSHOT·DBA_HIST_*는 Diagnostics Pack 필요.
+       미보유 시 실습 06(Statspack STATSPACK.SNAP)로 같은 구간을 감싼다.
+ 부하: WL_06_mixed.sql (종합 부하. Tuning\부하스크립트\).
+ 주의: 개인 실습 환경 전용. 부하가 CPU·I/O·리두를 소모한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 부하 직전, 시작 스냅샷을 손으로 뜬다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT MAX(snap_id) AS start_snap FROM dba_hist_snapshot;
+
+ START_SNAP
+----------
+       295
+
+-- 해석: 시작 스냅샷이 295번으로 찍혔다. 이 번호를 기록해 둔다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) 다른 터미널의 SQLT 세션에서 종합 부하를 실행한다.
+--     여기서는 7세션 100초 구간을 만들기 위해 wl_cycles를 올려 돌렸다.
+--------------------------------------------------------------------------------
+-- [터미널 2 : SQLT]
+--   SQLT@orcl> @WL_06_mixed.sql
+--   ... 파싱/랜덤 I/O/전체 스캔/정렬·해시/건당·배치 커밋을 순환 실행 ...
+--   ... 스크립트가 전후 델타와 Load Profile 요약을 스스로 출력 ...
+--   [Load Profile]  구간 <환경값> 초 / 트랜잭션 <환경값> 건
+--   (초당·트랜잭션당 값은 환경에 따라 다르므로 절대값 단정 금지)
+
+-- (선택) 잠금 경합까지 넣으려면 별도 터미널 2개에서 WL_04_lock.sql을
+--        wl_role=A / wl_role=B로 함께 돌린다. 이 실습은 단일 부하로 진행했다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치) 부하 종료 직후, 종료 스냅샷을 뜬다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT snap_id,
+  2         TO_CHAR(begin_interval_time,'MM-DD HH24:MI') begin_t,
+  3         TO_CHAR(end_interval_time,  'MM-DD HH24:MI') end_t
+  4       FROM dba_hist_snapshot
+  5       WHERE snap_id IN (295,296) ORDER BY snap_id;
+
+   SNAP_ID BEGIN_T      END_T
+---------- -----------  -----------
+       295 08-25 12:00  08-25 12:15
+       296 08-25 12:15  08-25 12:17
+
+-- 결과: 295~296 구간이 우리가 만든 부하 구간이다.
+--   이 구간을 8장(awrrpt), 9장(ADDM), 10장(ASH)에서 재료로 쓴다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 실습 재현 중, 스냅샷을 떴는데 MAX(snap_id)가 그대로였다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT MAX(snap_id) FROM dba_hist_snapshot;
+
+MAX(SNAP_ID)
+------------
+       296        -- ← 늘지 않았다(여전히 296)
+
+SYS@orcl> -- 원인 파악: 프로시저는 오류 없이 끝났지만 AWR이 꺼져 있었다.
+SYS@orcl> SHOW PARAMETER control_management_pack_access
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+control_management_pack_access       string      NONE     -- ← AWR 사용 불가 상태
+
+SYS@orcl> -- 조치: 팩 접근을 DIAGNOSTIC(+TUNING)으로 되돌린 뒤 다시 뜬다.
+SYS@orcl> ALTER SYSTEM SET control_management_pack_access='DIAGNOSTIC+TUNING'
+  2       SCOPE=BOTH;
+
+System altered.
+
+SYS@orcl> EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT MAX(snap_id) FROM dba_hist_snapshot;
+
+MAX(SNAP_ID)
+------------
+       297
+
+-- 재확인: 297번으로 정상 증가했다. "떴는데 안 생김"의 범인은 대개
+--   STATISTICS_LEVEL=BASIC 또는 PACK_ACCESS=NONE(AWR off)이다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 자동 스냅샷이 구간과 어긋나면 부하 앞뒤에 CREATE_SNAPSHOT을 손으로 뜬다.
+-- 2) 이 실습의 결과물: 부하 구간 295~296 (뒤 6개 장의 공통 재료).
+-- 3) 스냅샷을 뜬 직후에는 반드시 DBA_HIST_SNAPSHOT의 번호 증가를 눈으로 확인.
+-- 4) 번호가 안 늘면 AWR이 꺼졌는지(STATISTICS_LEVEL·PACK_ACCESS) 의심한다.
+-- 5) 라이선스 미보유 시: STATSPACK.SNAP을 부하 앞뒤에 실행(실습 06).
+
+SYS@orcl> EXIT
+================================================================================

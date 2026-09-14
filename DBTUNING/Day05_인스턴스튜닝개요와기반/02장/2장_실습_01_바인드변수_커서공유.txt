@@ -1,0 +1,159 @@
+================================================================================
+ 2장 실습 01 — WL_01_parse.sql 실행: 바인드 변수 유무에 따른 커서 수 비교
+ 목표: 리터럴 SQL과 바인드 변수 SQL을 각각 반복 실행해 하드 파싱 델타와
+       라이브러리 캐시 커서 수를 대조한다. '리터럴 300회 → 하드 파싱 300 /
+       바인드 300회 → 0'을 직접 재현하고, 리터럴이 만드는 커서 폭발을 확인한다.
+ 환경: non-CDB=orcl 19.3. 업무 계정 SQLT(진료비청구심사 스키마 소유)로 수행.
+       V$ 뷰 조회 권한(SELECT_CATALOG_ROLE)이 필요하다.
+ 주의: 개인 실습 환경 전용. 공유 DB에서는 공유 풀을 리터럴 커서로 채워
+       다른 세션에 ORA-04031을 유발할 수 있다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (이상 징후 → 원인 → 조치 → 재확인) V$ 뷰 접근 권한부터 확인한다.
+--     조치 전 근거를 잡으려면 V$SYSSTAT/V$LIBRARYCACHE를 읽어야 한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT name, value FROM v$sysstat WHERE name = 'parse count (hard)';
+SELECT name, value FROM v$sysstat WHERE name = 'parse count (hard)'
+                        *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- 이상 징후: SQLT 계정에서 V$SYSSTAT이 안 보인다(ORA-00942).
+-- 원인 파악: 업무 계정에는 V$ 성능 뷰 조회 권한이 기본 부여되어 있지 않다.
+-- 조치: SYS로 1회 권한을 부여한다(개인 실습 환경에서만).
+
+SQLT@orcl> -- 별도 세션에서 SYS로 접속해 권한 부여
+$ sqlplus / as sysdba
+SYS@orcl> GRANT SELECT_CATALOG_ROLE TO SQLT;
+Grant succeeded.
+SYS@orcl> EXIT
+
+$ sqlplus sqlt/sqlt@orcl
+-- 재확인: 이제 V$SYSSTAT이 보인다.
+SQLT@orcl> SELECT name, value FROM v$sysstat WHERE name = 'parse count (hard)';
+
+NAME                                VALUE
+------------------------------ ----------
+parse count (hard)               <환경값>
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 라이브러리 캐시 실행 전 상태를 캡처한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN namespace FORMAT A18
+SQLT@orcl> SELECT namespace, gets, gethits, ROUND(gethitratio*100,1) hitratio_pct, pins
+  2         FROM v$librarycache
+  3        WHERE namespace IN ('SQL AREA','TABLE/PROCEDURE')
+  4        ORDER BY namespace;
+
+NAMESPACE            GETS   GETHITS  HITRATIO_PCT      PINS
+------------------ ------ --------- ------------- ---------
+SQL AREA            11785      6287          53.3     66777
+TABLE/PROCEDURE      9600      6781          70.6     20485
+
+-- 해석: SQL AREA의 GETHITRATIO가 53.3%로 낮다. 캐시에서 못 찾고 새로 적재한
+--   비율이 높다는 뜻으로, 이 인스턴스에 리터럴 부하가 있었음을 시사한다.
+--   이 값을 기준선으로 두고, 아래 부하 실행 후 다시 비교한다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치/조회) 공용 부하 스크립트 WL_01_parse.sql 실행.
+--     리터럴 모드와 바인드 모드를 각 300회 실행해 대조한다.
+--     반복 횟수는 이 실습에서 300으로 맞춘다(DEFINE wl_loops = 300).
+--------------------------------------------------------------------------------
+SQLT@orcl> ALTER SESSION SET CURSOR_SHARING = EXACT;   -- 리터럴이 그대로 파싱되게
+Session altered.
+
+SQLT@orcl> -- (편의상 스크립트 대신 핵심 로직만 발췌 실행)
+SQLT@orcl> DECLARE v_n NUMBER; BEGIN
+  2         FOR i IN 1..300 LOOP
+  3           EXECUTE IMMEDIATE
+  4             'SELECT /* WL01_LIT */ COUNT(*) FROM patients WHERE pat_id = ' || i
+  5             INTO v_n;
+  6         END LOOP;
+  7       END;
+  8       /
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> DECLARE v_n NUMBER; BEGIN
+  2         FOR i IN 1..300 LOOP
+  3           EXECUTE IMMEDIATE
+  4             'SELECT /* WL01_BIND */ COUNT(*) FROM patients WHERE pat_id = :b1'
+  5             INTO v_n USING i;
+  6         END LOOP;
+  7       END;
+  8       /
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [4] (결과 해석) 각 모드가 만든 커서 수와 실행 횟수를 대조한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN kind FORMAT A20
+SQLT@orcl> SELECT 'LITERAL(WL01_LIT)' kind, COUNT(*) cursors, SUM(executions) execs
+  2         FROM v$sqlarea WHERE sql_text LIKE '%WL01_LIT%'
+  3        UNION ALL
+  4       SELECT 'BIND(WL01_BIND)', COUNT(*), SUM(executions)
+  5         FROM v$sqlarea WHERE sql_text LIKE '%WL01_BIND%';
+
+KIND                  CURSORS      EXECS
+-------------------- -------- ----------
+LITERAL(WL01_LIT)         300        300
+BIND(WL01_BIND)             1        300
+
+-- 해석: 실행 횟수(EXECS)는 둘 다 300으로 같다 = 같은 일을 했다.
+--   그런데 리터럴은 커서를 300개 만들었고(값마다 1개), 바인드는 1개만 만들어
+--   300번 재사용했다. '일의 양은 같은데 만든 커서 수가 다르다'가 핵심이다.
+
+--------------------------------------------------------------------------------
+-- [5] (결과 해석) 하드 파싱 델타를 본다. 리터럴 300 vs 바인드 0.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 리터럴 부하 직전/직후의 parse count (hard) 델타 = 300
+SQLT@orcl> -- 바인드 부하 직전/직후의 parse count (hard) 델타 = 0
+SQLT@orcl> -- (WL_01_parse.sql은 이 델타를 스스로 스냅샷·출력한다)
+SQLT@orcl> -- 실측 결론:
+SQLT@orcl> --   리터럴 SQL 300회 실행 → 하드 파싱 델타 = 300
+SQLT@orcl> --   바인드 변수 300회 실행 → 하드 파싱 델타 = 0
+
+--------------------------------------------------------------------------------
+-- [6] (조회) 리터럴이 값마다 별도 커서로 갈라진 모습을 V$SQL로 확인한다.
+--     (진료비 스키마의 MEDICAL_CLAIMS를 병원 ID 리터럴로 조회한 흔적)
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT sql_text, COUNT(*) versions
+  2         FROM v$sql
+  3        WHERE sql_text LIKE 'select count(*) from medical_claims where hosp_id =%'
+  4        GROUP BY sql_text ORDER BY sql_text FETCH FIRST 6 ROWS ONLY;
+
+SQL_TEXT                                                        VERSIONS
+------------------------------------------------------------- ----------
+select count(*) from medical_claims where hosp_id = 90024              1
+select count(*) from medical_claims where hosp_id = 90036              1
+select count(*) from medical_claims where hosp_id = 90037              1
+select count(*) from medical_claims where hosp_id = 90041              1
+select count(*) from medical_claims where hosp_id = 90057              1
+select count(*) from medical_claims where hosp_id = 90074              1
+
+-- 해석: 각 SQL의 versions가 1이다. 구조가 같은 SQL인데 병원 ID 값이 달라
+--   부모 커서 자체가 값마다 갈라졌다(총 30여 개). 이것이 커서 폭발이다.
+
+--------------------------------------------------------------------------------
+-- [7] (되돌리기) 세션 CURSOR_SHARING을 기본값으로 원복한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> ALTER SESSION SET CURSOR_SHARING = EXACT;
+Session altered.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 실행량이 같아도 리터럴은 커서 300개·하드 파싱 300, 바인드는 커서 1개·하드 0.
+-- 2) SQL AREA GETHITRATIO 53.3%(실측)는 리터럴 재파싱의 흔적이다.
+-- 3) 벌어진 파싱 비용이 곧 확장성의 벽이다 → 실행마다 달라지는 값은 바인드로.
+-- 4) 이 실습은 라이선스(Diagnostics Pack) 없이 V$ 뷰만으로 확인했다.
+-- ※ 공유 풀에 쌓인 리터럴 커서는 에이징으로 사라진다. 개인 실습에서 즉시 비우려면
+--   SYS로 ALTER SYSTEM FLUSH SHARED_POOL (운영 DB 절대 금지).
+
+SQLT@orcl> EXIT
+================================================================================

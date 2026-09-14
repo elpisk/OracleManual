@@ -1,0 +1,125 @@
+================================================================================
+ 16장 실습 05 — 메모리 부족 상황 재현(ORA-04031) → 구성 조정으로 해소
+ 목표: 공유 풀을 인위적으로 압박해 ORA-04031을 재현하고, 원인(부족·단편화)을
+       감별해 구성 조정·바인드 변수화로 해소한다. '증상과 원인의 구분'을 메모리에 적용.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA / SQLT AS 일반사용자로 수행)
+ ⚠ 주의: 파라미터 변경을 포함한다. 반드시 격리된 개인 실습 DB에서만 수행하고,
+        재현 후 반드시 원복(구성 복원)한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 현재 공유 풀 크기와 여유를 기록한다(원복·감별 대비).
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, ROUND(bytes/1024/1024,1) mb FROM v$sgainfo
+  2       WHERE name IN ('Shared Pool Size','Free SGA Memory Available');
+
+NAME                        MB
+-------------------------- ------
+Shared Pool Size           416
+Free SGA Memory Available  544
+
+-- 조치 전: 공유 풀 416MB. 정상 가동 중이며 아직 오류는 없다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 → 오류 재현) 공유 풀에 아주 작은 하한을 걸어 압박한 뒤 리터럴 SQL을 퍼붓는다.
+--------------------------------------------------------------------------------
+-- 공유 풀을 인위적으로 작게 고정해 단편화·부족을 유도한다(격리 환경 전용).
+SYS@orcl> ALTER SYSTEM SET shared_pool_size=64M SCOPE=BOTH;
+System altered.
+
+-- 다른 세션(SQLT)에서 바인드 없는 리터럴 SQL을 대량 생성해 라이브러리 캐시를 채운다.
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> BEGIN
+  2    FOR i IN 1..200000 LOOP
+  3      EXECUTE IMMEDIATE
+  4        'SELECT count(*) FROM medical_claims WHERE claim_id='||i;
+  5    END LOOP;
+  6  END;
+  7  /
+BEGIN
+*
+ERROR at line 1:
+ORA-04031: unable to allocate 4096 bytes of shared memory ("shared
+pool","...","sga heap","...")
+ORA-06512: at line 3
+
+-- * 오류: ORA-04031이 발생했다. 리터럴 값(claim_id=1,2,3,...)마다 다른 SQL_ID가 생겨
+--     라이브러리 캐시를 잘게 채웠고, 작게 고정한 공유 풀에서 연속 조각을 못 얻은 것이다.
+
+--------------------------------------------------------------------------------
+-- [3] (원인 감별) 절대 부족인가, 단편화인가.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT ROUND(SUM(bytes)/1024/1024,1) free_mb
+  2       FROM v$sgastat WHERE pool='shared pool' AND name='free memory';
+
+  FREE_MB
+--------
+<환경값>   -- 총 free는 어느 정도 있는데도 4096바이트 연속 청크를 못 얻었다.
+
+SYS@orcl> SELECT sql_text, COUNT(*) child_or_variants
+  2       FROM v$sqlarea
+  3       WHERE sql_text LIKE 'SELECT count(*) FROM medical_claims WHERE claim_id=%'
+  4       GROUP BY sql_text HAVING COUNT(*)=1
+  5       FETCH FIRST 3 ROWS ONLY;
+-- (리터럴만 다른 문장이 각각 별개 SQL_ID로 수만 개 — 커서를 공유하지 못한 흔적)
+
+-- * 감별: free memory 총량은 있는데 작은 연속 청크(4096B)를 못 만들었다 → 단편화형이다.
+--     원인은 바인드 없는 리터럴 SQL이 라이브러리 캐시를 잘게 채운 것. 여기에 공유 풀을
+--     64M로 인위적으로 줄인 절대 부족도 겹쳤다. 두 요인이 함께 작용했다.
+
+--------------------------------------------------------------------------------
+-- [4] (조치) 구성 조정 + 임시책 + 근본책을 순서대로 적용한다.
+--------------------------------------------------------------------------------
+-- (임시책) 연속 공간을 즉시 확보한다. 단, 캐시를 날려 하드 파싱이 급증한다.
+SYS@orcl> ALTER SYSTEM FLUSH SHARED_POOL;
+System altered.
+
+-- (구성 조정) 인위적으로 줄였던 공유 풀 하한을 원복/상향한다.
+SYS@orcl> ALTER SYSTEM SET shared_pool_size=0 SCOPE=BOTH;   -- 자동 분배로 복원
+System altered.
+SYS@orcl> ALTER SYSTEM SET sga_target=1504M SCOPE=BOTH;     -- SGA_TARGET 원복 확인
+System altered.
+
+-- (근본책) 애플리케이션은 리터럴 대신 바인드 변수를 쓰도록 고친다.
+SQLT@orcl> BEGIN
+  2    FOR i IN 1..200000 LOOP
+  3      EXECUTE IMMEDIATE
+  4        'SELECT count(*) FROM medical_claims WHERE claim_id=:1' USING i;
+  5    END LOOP;
+  6  END;
+  7  /
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [5] (재확인) 오류가 사라지고 커서 공유가 회복됐는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, ROUND(bytes/1024/1024,1) mb FROM v$sgainfo
+  2       WHERE name IN ('Shared Pool Size','Free SGA Memory Available');
+
+NAME                        MB
+-------------------------- ------
+Shared Pool Size           <환경값>   -- 자동 분배로 다시 넉넉해짐
+Free SGA Memory Available  <환경값>
+
+-- * 재확인:
+--   (a) 바인드 변수화한 루프는 ORA-04031 없이 정상 완료됐다.
+--   (b) 같은 문장(claim_id=:1)이 하나의 SQL_ID로 공유되어 라이브러리 캐시가 단편화되지 않는다.
+--   (c) 공유 풀을 자동 분배로 되돌려 여유가 회복됐다.
+-- → 오류 흐름 '재현 → 감별 → 조치 → 재확인'이 완결됐다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) ORA-04031 = 공유 메모리 연속 청크 할당 실패. 원인은 절대 부족 또는 단편화.
+-- 2) 감별: free memory가 넉넉한데 실패하면 단편화, 기동 직후·free 부족이면 절대 부족.
+-- 3) FLUSH SHARED_POOL은 임시책(하드 파싱 급증). 근본은 구성 상향 + 바인드 변수화.
+-- 4) 리터럴 SQL이 단편화의 주범 — '메모리를 더 달라'가 아니라 '애플리케이션을 고쳐라'.
+-- ※ 이 실습은 격리 환경 전용이며, 절대값은 <환경값>이다. 재현 후 반드시 원복한다.
+
+SYS@orcl> EXIT
+================================================================================

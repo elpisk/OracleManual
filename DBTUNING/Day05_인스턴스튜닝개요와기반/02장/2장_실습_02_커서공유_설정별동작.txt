@@ -1,0 +1,130 @@
+================================================================================
+ 2장 실습 02 — CURSOR_SHARING 설정별 동작 확인
+ 목표: CURSOR_SHARING을 EXACT와 FORCE로 바꿔 가며 같은 리터럴 SQL이
+       커서를 공유하는지 여부를 대조한다. 코드를 못 고칠 때의 차선책이
+       어떻게 작동하고 어떤 부작용이 있는지 확인한다.
+ 환경: non-CDB=orcl 19.3. 업무 계정 SQLT로 수행(V$ 조회 권한 보유 전제).
+ 주의: 개인 실습 환경 전용. FLUSH SHARED_POOL은 개인 실습에서만.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 현재 세션의 CURSOR_SHARING 값을 확인한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SHOW PARAMETER cursor_sharing
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+cursor_sharing                       string      EXACT
+
+-- 해석: 기본값 EXACT. SQL 텍스트가 정확히 같아야만 커서를 공유한다.
+--   즉 리터럴은 값마다 갈라져 하드 파싱된다.
+
+--------------------------------------------------------------------------------
+-- [2] (이상 → 원인 → 조치 → 재확인) 잘못된 값 설정 시도.
+--------------------------------------------------------------------------------
+SQLT@orcl> ALTER SESSION SET CURSOR_SHARING = FORCED;
+ERROR:
+ORA-00096: invalid value FORCED for parameter cursor_sharing, must be from
+among FORCE, EXACT, SIMILAR
+
+-- 이상 징후: 설정이 거부된다(ORA-00096).
+-- 원인 파악: cursor_sharing의 허용 값은 EXACT / FORCE / SIMILAR 세 가지다.
+--   'FORCED'는 오타다(SIMILAR는 19c에서 사용 자제 권고).
+-- 조치: 올바른 값 FORCE로 설정한다.
+
+SQLT@orcl> ALTER SESSION SET CURSOR_SHARING = EXACT;   -- 먼저 EXACT로 대조 준비
+Session altered.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 전 근거) EXACT 상태에서 리터럴 SQL을 반복 실행하고 커서 수를 본다.
+--------------------------------------------------------------------------------
+SQLT@orcl> BEGIN
+  2         FOR i IN 1..50 LOOP
+  3           EXECUTE IMMEDIATE
+  4             'SELECT /* CS_TEST */ COUNT(*) FROM patients WHERE pat_id = ' || i
+  5             INTO :dummy;
+  6         END LOOP;
+  7       END;
+  8       /
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> SELECT COUNT(*) cursors
+  2         FROM v$sqlarea WHERE sql_text LIKE '%CS_TEST%';
+
+   CURSORS
+----------
+        50
+
+-- 해석: EXACT에서는 값 50개가 각각 별도 커서로 갈라져 50개가 만들어졌다.
+--   (리터럴 → 값마다 새 SQL_ID → 하드 파싱)
+
+--------------------------------------------------------------------------------
+-- [4] (조치) 공유 풀을 비우고 CURSOR_SHARING을 FORCE로 바꿔 재실행한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 개인 실습 환경에서만: 직전 커서를 지워 깨끗하게 대조
+$ sqlplus / as sysdba
+SYS@orcl> ALTER SYSTEM FLUSH SHARED_POOL;   -- 운영 DB 절대 금지
+System altered.
+SYS@orcl> EXIT
+
+$ sqlplus sqlt/sqlt@orcl
+SQLT@orcl> ALTER SESSION SET CURSOR_SHARING = FORCE;
+Session altered.
+
+SQLT@orcl> BEGIN
+  2         FOR i IN 1..50 LOOP
+  3           EXECUTE IMMEDIATE
+  4             'SELECT /* CS_TEST2 */ COUNT(*) FROM patients WHERE pat_id = ' || i
+  5             INTO :dummy;
+  6         END LOOP;
+  7       END;
+  8       /
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [5] (결과 해석 / 재확인) FORCE에서는 커서가 하나로 모인다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT sql_text, COUNT(*) cursors
+  2         FROM v$sqlarea WHERE sql_text LIKE '%CS_TEST2%'
+  3        GROUP BY sql_text;
+
+SQL_TEXT                                                        CURSORS
+------------------------------------------------------------- --------
+SELECT /* CS_TEST2 */ COUNT(*) FROM patients WHERE pat_id =          1
+:"SYS_B_0"
+
+-- 해석: 리터럴 값이 :"SYS_B_0"라는 시스템 생성 바인드 변수로 치환되어,
+--   50개 값이 커서 1개를 공유했다. 하드 파싱이 값마다가 아니라 1회로 줄었다.
+--   EXACT(커서 50) vs FORCE(커서 1) → 커서 공유가 작동한 것이다.
+
+--------------------------------------------------------------------------------
+-- [6] (부작용 점검) FORCE의 대가 — 편중 컬럼의 계획 고정.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- MEDICAL_CLAIMS는 HOSP_ID 1~50에 청구 절반이 몰린 편중 데이터다.
+SQLT@orcl> -- FORCE에서는 hosp_id 조건이 SYS_B_n으로 치환되어, 첫 실행의 값으로
+SQLT@orcl> -- 만든 하나의 계획을 이후 값에도 공유한다. 분포가 다른 값에서는
+SQLT@orcl> -- 그 계획이 최적이 아닐 수 있다(바인드 변수 엿보기 부작용).
+SQLT@orcl> -- → FORCE는 임시방편일 뿐, 근본 해법은 애플리케이션 코드에서
+SQLT@orcl> --   실행마다 달라지는 값만 바인드하도록 고치는 것이다.
+
+--------------------------------------------------------------------------------
+-- [7] (되돌리기) 기본값으로 원복한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> ALTER SESSION SET CURSOR_SHARING = EXACT;
+Session altered.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 허용 값은 EXACT/FORCE/SIMILAR. 잘못된 값은 ORA-00096으로 거부된다.
+-- 2) EXACT: 리터럴이 값마다 커서를 만든다(대조 실습에서 커서 50개).
+-- 3) FORCE: 리터럴을 SYS_B_n으로 치환해 커서 1개로 공유(커서 50→1).
+-- 4) FORCE는 히스토그램·편중 컬럼에서 나쁜 계획을 고정할 수 있다 → 차선책.
+-- 5) 커서 수 확인은 V$SQLAREA 조회로 충분(라이선스 불필요).
+
+SQLT@orcl> EXIT
+================================================================================

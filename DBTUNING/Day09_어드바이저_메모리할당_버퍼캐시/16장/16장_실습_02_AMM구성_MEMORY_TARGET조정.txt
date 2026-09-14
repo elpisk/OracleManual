@@ -1,0 +1,119 @@
+================================================================================
+ 16장 실습 02 — AMM 구성과 MEMORY_TARGET 조정 후 재기동 확인
+ 목표: ASMM인 인스턴스를 자동 메모리 관리(AMM)로 전환하는 절차를 익힌다.
+       ① MEMORY_MAX_TARGET(정적, 상한)을 잡고 ② 재기동 후 MEMORY_TARGET(동적)을 설정한다.
+       전환 과정에서 흔한 오류(ORA-00838)를 재현하고 원인·조치를 확인한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ ⚠ 주의: 파라미터 변경·재기동을 포함한다. 반드시 개인 실습 DB에서만 수행한다.
+        공유 서버에서 실행하면 인스턴스 기동 실패·타 세션 영향이 발생한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 현재는 ASMM이다. 전환 전 값을 기록해 둔다(원복 대비).
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, display_value FROM v$parameter
+  2       WHERE name IN ('memory_target','memory_max_target',
+  3         'sga_target','sga_max_size','pga_aggregate_target');
+
+NAME                   DISPLAY_VALUE
+---------------------- --------------
+memory_max_target      0
+memory_target          0
+sga_target             1504M
+sga_max_size           2G
+pga_aggregate_target   700M
+
+-- 조치 전: MEMORY_TARGET=0 → ASMM. SGA(1504M)+PGA(700M) ≈ 2204M가 대략의 총 수요다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 → 이상/오류 재현) MEMORY_TARGET을 너무 작게 주면 어떻게 되는지 먼저 본다.
+--------------------------------------------------------------------------------
+-- MEMORY_MAX_TARGET(정적)을 먼저 잡는다. 정적이라 재기동해야 반영된다.
+SYS@orcl> ALTER SYSTEM SET memory_max_target=2400M SCOPE=SPFILE;
+System altered.
+
+-- (오류 재현) MEMORY_TARGET을 SGA+PGA 합보다 작게 주려 시도한다.
+SYS@orcl> ALTER SYSTEM SET memory_target=800M SCOPE=SPFILE;
+System altered.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> STARTUP
+ORA-00838: Specified value of MEMORY_TARGET is too small, needs to be at
+least 2416M
+
+-- * 이상/오류: 인스턴스가 기동하지 못하고 ORA-00838로 멈춘다.
+-- * 원인: MEMORY_TARGET은 SGA와 PGA가 나눠 쓸 총 메모리다. 800M는 기존 SGA 최소치와
+--     PGA 수요를 담기에 턱없이 작아, 오라클이 필요한 최소치(2416M)를 알려 주며 거부한다.
+--     '자동'이라도 총량이 부족하면 기동 자체가 안 된다 — 상한·목표를 잘못 주면 자동이
+--     오히려 인스턴스를 못 띄운다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 → 재확인) 오라클이 알려 준 최소치 이상으로 올바르게 설정한다.
+--------------------------------------------------------------------------------
+-- 기동 실패 상태에서는 SPFILE 값을 고쳐야 한다. NOMOUNT로 접근해 값을 정정한다.
+SYS@orcl> STARTUP NOMOUNT
+ORACLE instance started.
+
+SYS@orcl> ALTER SYSTEM SET memory_target=2400M SCOPE=SPFILE;
+System altered.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+ORA-01507: database not mounted
+ORACLE instance shut down.
+
+SYS@orcl> STARTUP
+ORACLE instance started.
+Database mounted.
+Database opened.
+
+-- * 재확인: MEMORY_TARGET을 최소치 이상(2400M ≤ MEMORY_MAX_TARGET 2400M)으로 주니
+--     정상 기동했다. ORA-00838 오류 흐름이 해소되었다.
+
+--------------------------------------------------------------------------------
+-- [4] (해석) AMM으로 전환됐는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, display_value FROM v$parameter
+  2       WHERE name IN ('memory_target','memory_max_target','sga_target');
+
+NAME                   DISPLAY_VALUE
+---------------------- --------------
+memory_max_target      2400M
+memory_target          2400M
+sga_target             <환경값>     -- AMM에서는 SGA 하한으로만 작동(자동 조정)
+
+-- memory_target>0 → 판별 규칙 ①에 의해 이제 AMM이다.
+-- AMM에서는 SGA와 PGA 사이 경계까지 오라클이 조정한다. 통합 구성은 아래로 본다.
+SYS@orcl> SELECT component, ROUND(current_size/1024/1024,1) cur_mb
+  2       FROM v$memory_dynamic_components
+  3       WHERE current_size>0 ORDER BY current_size DESC;
+-- (SGA Target·PGA Target 등 SGA+PGA 통합 구성 요소가 함께 나타난다 — <환경값>)
+
+--------------------------------------------------------------------------------
+-- [5] (원복) 실습 후 원래 ASMM 구성으로 되돌린다(개인 환경 위생).
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET memory_target=0 SCOPE=SPFILE;
+SYS@orcl> ALTER SYSTEM SET memory_max_target=0 SCOPE=SPFILE;
+SYS@orcl> ALTER SYSTEM SET sga_target=1504M SCOPE=SPFILE;
+SYS@orcl> ALTER SYSTEM SET pga_aggregate_target=700M SCOPE=SPFILE;
+-- 재기동하면 다시 ASMM(실습 01 상태)로 복원된다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) AMM 전환 순서: MEMORY_MAX_TARGET(정적) 설정 → 재기동 → MEMORY_TARGET(동적) 설정.
+-- 2) MEMORY_TARGET이 SGA+PGA 최소 수요보다 작으면 ORA-00838로 기동 실패한다.
+--    오라클이 알려 준 최소치 이상으로 주어야 한다.
+-- 3) 재기동·파라미터 변경은 개인 환경 전용. 실습 후 반드시 원복한다.
+-- 4) memory_target>0이면 AMM, =0이면 ASMM — 값 하나가 방식을 바꾼다.
+-- ※ 절대값은 환경 의존 <환경값>. 핵심은 전환 절차와 오류 흐름의 이해다.
+
+SYS@orcl> EXIT
+================================================================================

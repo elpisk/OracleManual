@@ -1,0 +1,156 @@
+================================================================================
+ 4장 실습 02 — Undo 보존과 ORA-01555 재현 → UNDO_RETENTION·테이블스페이스 조정
+ 목표: 짧은 보존·NOGUARANTEE 상태에서 '긴 조회 + 동시 대량 변경'으로
+       ORA-01555 snapshot too old를 재현한다. 원인을 조회 길이·동시 변경량·
+       Undo 공간의 함수로 규명하고, UNDO_RETENTION 상향과 RETENTION GUARANTEE로
+       해소한 뒤 V$UNDOSTAT로 재발이 없음을 확인한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행). 세션 2개 사용(A: 긴 조회,
+       B: 대량 변경). 대상은 복제 테이블 REVIEW_LOG_WL(원본 훼손 금지).
+ 주의: 개인 실습 환경 전용. 파라미터·테이블스페이스 변경이 포함된다. 마지막에
+       변경값을 원복하는 절차를 반드시 수행한다. 공용 DB에서 수행하지 않는다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 현재 Undo 구성을 캡처한다. 근거 없는 조치를 경계한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT tablespace_name, contents, retention
+  2       FROM  dba_tablespaces WHERE contents='UNDO';
+TABLESPACE_NAME   CONTENTS   RETENTION
+----------------- ---------- -------------
+UNDOTBS1          UNDO       NOGUARANTEE
+
+SYS@orcl> SELECT value FROM v$parameter WHERE name='undo_retention';
+VALUE
+----------
+900
+
+SYS@orcl> SELECT tablespace_name, ROUND(SUM(bytes)/1024/1024) mb
+  2       FROM  dba_data_files WHERE tablespace_name='UNDOTBS1'
+  3       GROUP BY tablespace_name;
+TABLESPACE_NAME          MB
+----------------- ----------
+UNDOTBS1                 380
+
+-- 조치 전 요약: RETENTION=NOGUARANTEE, UNDO_RETENTION=900(15분), Undo 380MB.
+--   ORA-01555가 날 수 있는 세 조건이 모두 갖춰질 수 있는 상태다.
+
+--------------------------------------------------------------------------------
+-- [2] (재현 준비) 재현을 위해 보존을 아주 짧게 낮춘다(개인 실습 전용).
+--     Undo 자동 확장을 끄면 공간이 상한이 되어 재현이 쉬워진다.
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET undo_retention=1 SCOPE=MEMORY;   -- 보존 1초로 극단화
+System altered.
+SYS@orcl> ALTER DATABASE DATAFILE '/u01/.../undotbs01.dbf' AUTOEXTEND OFF;
+Database altered.
+
+SYS@orcl> -- 재현용 복제 테이블(원본 REVIEW_LOG를 훼손하지 않는다)
+SYS@orcl> CREATE TABLE sqlt.review_log_wl AS SELECT * FROM sqlt.review_log;
+Table created.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 발생) 세션 A에서 '느린 긴 조회'를 시작한다.
+--     의도적으로 지연 함수를 끼워 조회를 길게 만든다.
+--------------------------------------------------------------------------------
+-- ==== 세션 A (긴 조회) ====
+SQLT@orcl> SELECT /*+ NO_MERGE */ r.review_id,
+  2         (SELECT COUNT(*) FROM sqlt.claim_details d
+  3           WHERE d.claim_id = r.claim_id) cd_cnt
+  4       FROM sqlt.review_log_wl r
+  5       ORDER BY r.review_id;      -- 수 분간 도는 무거운 조회
+
+-- (A가 도는 동안, 다른 터미널에서 세션 B를 실행한다)
+
+-- ==== 세션 B (동시 대량 변경 + 잦은 커밋) ====
+SQLT@orcl> BEGIN
+  2         FOR i IN 1..50 LOOP
+  3           UPDATE sqlt.review_log_wl SET status = 'X'||i;   -- 전체 갱신
+  4           COMMIT;                                          -- Undo 빠른 순환
+  5         END LOOP;
+  6       END;
+  7       /
+PL/SQL procedure successfully completed.
+
+-- ==== 세션 A 로 돌아오면 ====
+ERROR at line 1:
+ORA-01555: snapshot too old: rollback segment number 11 with name
+"_SYSSMU11_..." too small
+
+-- 이상 징후: 세션 A의 조회가 ORA-01555로 중단됐다. A의 SQL 자체는 문제없다.
+
+--------------------------------------------------------------------------------
+-- [4] (원인 파악) 왜 났는가 — V$UNDOSTAT로 근거를 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT TO_CHAR(begin_time,'HH24:MI') begin, maxquerylen mql,
+  2         tuned_undoretention tuned, ssolderrcnt ora1555, nospaceerrcnt nospace
+  3       FROM  v$undostat
+  4       ORDER BY begin_time DESC FETCH FIRST 3 ROWS ONLY;
+BEGIN        MQL      TUNED    ORA1555    NOSPACE
+----- ---------- ---------- ---------- ----------
+14:20        <환경값>          1          1          0
+14:10        <환경값>          1          0          0
+
+-- 원인 확정:
+--   TUNED_UNDORETENTION=1 → 실제 보장 보존이 1초에 불과(우리가 극단화한 값).
+--   MAXQUERYLEN(최장 조회, 초) >> 1 → 조회가 보존 시간보다 훨씬 길다.
+--   SSOLDERRCNT=1 → 이 구간에 ORA-01555가 1건 발생.
+--   => '조회 길이 > 보존 시간' + '동시 변경이 Undo를 덮어씀'의 전형적 결과다.
+--      SQL을 고칠 문제가 아니라 Undo 구성 문제임이 수치로 확인된다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치) 보존을 조회 길이보다 길게 늘리고, 보장 모드로 전환한다.
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET undo_retention=3600 SCOPE=BOTH;     -- 1시간
+System altered.
+SYS@orcl> ALTER TABLESPACE undotbs1 RETENTION GUARANTEE;       -- 보존 보장
+Tablespace altered.
+SYS@orcl> ALTER DATABASE DATAFILE '/u01/.../undotbs01.dbf'
+  2       AUTOEXTEND ON NEXT 32M MAXSIZE 1G;                   -- 공간 여유 확보
+Database altered.
+
+--------------------------------------------------------------------------------
+-- [6] (조치 후 상태 + 재확인) 같은 재현을 다시 돌린다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT tablespace_name, retention FROM dba_tablespaces
+  2       WHERE contents='UNDO';
+TABLESPACE_NAME   RETENTION
+----------------- -------------
+UNDOTBS1          GUARANTEE
+
+-- (세션 A의 긴 조회 + 세션 B의 대량 변경을 동일하게 재실행)
+-- ==== 세션 A ====
+SQLT@orcl> SELECT ... ORDER BY r.review_id;   -- 이번엔 끝까지 완주
+   ... (정상 종료) ...
+
+SYS@orcl> SELECT ssolderrcnt ora1555 FROM v$undostat
+  2       ORDER BY begin_time DESC FETCH FIRST 1 ROWS ONLY;
+   ORA1555
+----------
+         0
+
+-- 재확인: 조치 후 구간의 SSOLDERRCNT=0. 재발하지 않았다.
+--   보존(3600초) > 조회 길이 + GUARANTEE로 과거 이미지가 보호됐다.
+
+--------------------------------------------------------------------------------
+-- [7] (원복) 실습 변경을 되돌리고 재현용 객체를 정리한다.
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLESPACE undotbs1 RETENTION NOGUARANTEE;
+SYS@orcl> ALTER SYSTEM SET undo_retention=900 SCOPE=BOTH;
+SYS@orcl> DROP TABLE sqlt.review_log_wl PURGE;
+Table dropped.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) ORA-01555는 Undo 세그먼트가 '작아서'가 아니라, 긴 조회가 필요로 하는
+--    과거 이미지를 동시 변경이 덮어써서 난다. SQL 문제가 아니다.
+-- 2) 근거는 V$UNDOSTAT: MAXQUERYLEN > (TUNED_)UNDORETENTION 이고 SSOLDERRCNT>0.
+-- 3) 조치는 셋 중 하나 이상: Undo 확장 / UNDO_RETENTION↑ / RETENTION GUARANTEE.
+--    GUARANTEE는 강력하지만 공간 부족 시 DML이 ORA-30036으로 막히므로,
+--    Undo 크기가 최대 DML을 감당하는지 먼저 확인한다.
+-- 4) 조치 전→재현→원인(수치)→조치→재확인→원복의 순서를 그대로 남긴다.
+-- ※ V$UNDOSTAT·DBA_TABLESPACES 조회는 관리 팩 라이선스가 필요 없다.
+
+SYS@orcl> EXIT
+================================================================================

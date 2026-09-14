@@ -1,0 +1,140 @@
+================================================================================
+ 12장 실습 07 — 서비스 단위 모니터링(V$SERVICE_STATS · V$SERVICEMETRIC)
+ 목표: 업무를 서비스 단위로 나눠 성능을 분리 관찰하고, 서비스별로 임계값을
+       거는 방법을 확인한다. 누적 통계를 델타로 읽는 원칙을 적용한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA)
+ 라이선스: V$ 조회·서비스 임계값은 기본 기능(라이선스 무관).
+ 주의: 개인 실습 환경 전용. 서비스 등록은 실습용으로만 수행 후 원복한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COLUMN service_name FORMAT A16
+SYS@orcl> COLUMN stat_name FORMAT A20
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 서비스별 누적 통계 — V$SERVICE_STATS. 델타로 봐야 한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT service_name, stat_name, value
+  2       FROM  v$service_stats
+  3       WHERE stat_name IN ('DB time','DB CPU','user calls','physical reads')
+  4         AND service_name NOT LIKE 'SYS$%'
+  5       ORDER BY service_name, stat_name;
+
+SERVICE_NAME     STAT_NAME            VALUE
+---------------- -------------------- ---------------
+orcl             DB CPU               <환경값>
+orcl             DB time              <환경값>
+orcl             physical reads       <환경값>
+orcl             user calls           <환경값>
+
+-- 해석: 값은 인스턴스 기동 이후 누적이다. 절대값은 '총합'일 뿐 의미가 적다.
+--   특정 구간 부하를 보려면 두 시점의 차(델타)로 계산한다(1장·5장 원칙).
+--   실습 환경은 orcl 서비스 하나뿐 — 운영에선 업무별로 서비스를 분리 등록한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 서비스별 최근 구간 메트릭 — V$SERVICEMETRIC.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT service_name,
+  2         ROUND(elapsedpercall/1000,2) ms_per_call,
+  3         ROUND(cpupercall/1000,2)     cpu_ms_per_call,
+  4         callspersec
+  5       FROM  v$servicemetric
+  6       WHERE service_name NOT LIKE 'SYS$%'
+  7         AND intsize_csec BETWEEN 5900 AND 6100;
+
+SERVICE_NAME     MS_PER_CALL CPU_MS_PER_CALL CALLSPERSEC
+---------------- ----------- --------------- -----------
+orcl                 <환경값>          <환경값>       <환경값>
+
+-- 해석: 서비스별 '호출당 응답시간(ms)'·'호출당 CPU'·'초당 호출 수'를 본다.
+--   업무가 여럿이면 서비스마다 이 값이 다르므로, 어느 업무가 느린지 바로 드러난다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 서비스별 대기 프로파일 — V$SERVICE_EVENT.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT service_name, SUBSTR(event,1,32) event, total_waits
+  2       FROM  v$service_event
+  3       WHERE service_name='orcl' AND wait_class <> 'Idle'
+  4       ORDER BY total_waits DESC FETCH FIRST 5 ROWS ONLY;
+
+SERVICE_NAME     EVENT                            TOTAL_WAITS
+---------------- -------------------------------- -----------
+orcl             db file sequential read              <환경값>
+orcl             log file sync                        <환경값>
+
+-- 해석: 서비스 단위로 상위 대기를 보면, 그 업무가 무엇 때문에 느린지 좁혀진다.
+
+--------------------------------------------------------------------------------
+-- [4] (설정) 서비스에 임계값을 건다 — object_type=SERVICE.
+--     사용자 대면 서비스의 '호출당 응답시간'에만 경고를 걸어 배치와 분리 감시.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    DBMS_SERVER_ALERT.SET_THRESHOLD(
+  3      metrics_id=>DBMS_SERVER_ALERT.ELAPSED_TIME_PER_CALL,
+  4      warning_operator=>DBMS_SERVER_ALERT.OPERATOR_GE, warning_value=>'50000',
+  5      critical_operator=>DBMS_SERVER_ALERT.OPERATOR_GE, critical_value=>'80000',
+  6      observation_period=>1, consecutive_occurrences=>3,
+  7      instance_name=>'orcl',
+  8      object_type=>DBMS_SERVER_ALERT.OBJECT_TYPE_SERVICE, object_name=>'orcl');
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+-- 해석: 서비스 orcl의 호출당 경과시간에 경고/위험을 걸었다(마이크로초 단위).
+--   ※ 50000/80000은 예시. 실제 값은 그 서비스의 이력 p95·p99로 산정한다(실습 03).
+
+--------------------------------------------------------------------------------
+-- [5] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 서비스 임계값을 걸었는데 알림이 오지 않는다. 왜?
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악 후보 1: 해당 서비스로 실제 접속·호출이 없어 메트릭이 0에 가깝다.
+SYS@orcl> SELECT service_name, callspersec FROM v$servicemetric
+  2       WHERE service_name='orcl' AND intsize_csec BETWEEN 5900 AND 6100;
+
+SERVICE_NAME     CALLSPERSEC
+---------------- -----------
+orcl                       0
+
+-- 원인 확정: 호출이 0이면 '호출당 응답시간'이 성립하지 않아 임계값이 트리거되지 않는다.
+--   메트릭은 부하가 있어야 나타난다(1장 교훈). 오류가 아니라 정상이다.
+-- 조치: 해당 서비스로 부하를 유발한 뒤(예: WL_06_mixed) 다시 관찰한다.
+SYS@orcl> -- (부하 구간에서) 재확인
+SYS@orcl> SELECT service_name, ROUND(elapsedpercall/1000,2) ms_per_call
+  2       FROM v$servicemetric WHERE service_name='orcl'
+  3         AND intsize_csec BETWEEN 5900 AND 6100;
+
+SERVICE_NAME     MS_PER_CALL
+---------------- -----------
+orcl                 <환경값>
+
+-- 재확인: 부하가 있으면 호출당 응답시간이 값을 갖고, 임계값 판정이 동작한다.
+
+--------------------------------------------------------------------------------
+-- [6] (원복) 실습용 서비스 임계값을 기본값으로 되돌린다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    DBMS_SERVER_ALERT.SET_THRESHOLD(
+  3      metrics_id=>DBMS_SERVER_ALERT.ELAPSED_TIME_PER_CALL,
+  4      warning_operator=>DBMS_SERVER_ALERT.OPERATOR_GE, warning_value=>NULL,
+  5      critical_operator=>DBMS_SERVER_ALERT.OPERATOR_GE, critical_value=>NULL,
+  6      observation_period=>1, consecutive_occurrences=>1,
+  7      instance_name=>'orcl',
+  8      object_type=>DBMS_SERVER_ALERT.OBJECT_TYPE_SERVICE, object_name=>'orcl');
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 인스턴스 전체 지표로는 '어느 업무가' 문제인지 모른다 — 서비스로 나눈다.
+-- 2) V$SERVICE_STATS(누적, 델타로) / V$SERVICEMETRIC(최근 구간) / V$SERVICE_EVENT.
+-- 3) 서비스별 임계값(object_type=SERVICE)으로 업무별 이상을 정밀 포착한다.
+-- 4) 메트릭은 부하가 있어야 나타난다. 호출 0이면 임계값이 트리거되지 않는다(정상).
+
+SYS@orcl> EXIT
+================================================================================

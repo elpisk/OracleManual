@@ -1,0 +1,117 @@
+================================================================================
+ 19장 실습 03 — 결과 캐시 모니터링(V$RESULT_CACHE_STATISTICS)과 적용 부적합 판별
+ 목표: V$RESULT_CACHE_STATISTICS를 판독해 '건강한 캐시'를 알아보고, 변경 잦은
+       테이블(CLAIM_DETAILS)에 결과 캐시를 붙였을 때의 손해를 통계로 판별한다.
+       DBMS_RESULT_CACHE.MEMORY_REPORT로 메모리 사용도 확인한다.
+ 환경: non-CDB=orcl 19.3 (SYS 및 SQLT)
+ 주의: 개인 실습 환경 전용. 부적합 사례는 '판별'이 목적이며 운영엔 적용하지 않는다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COLUMN name FORMAT a32
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태·조회) 실측 인스턴스의 결과 캐시 통계 전체를 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value
+  2         FROM  v$result_cache_statistics
+  3         ORDER BY id;
+
+NAME                             VALUE
+-------------------------------- ----------
+Block Size (Bytes)               1024
+Block Count Maximum              7712
+Block Count Current              32
+Result Size Maximum (Blocks)     385
+Create Count Success             1
+Create Count Failure             0
+Find Count                       5
+Invalidation Count               0
+Delete Count Invalid             0
+Delete Count Valid               0
+...
+
+-- 해석: 판독 기준은 명확하다 — Find는 높게, Create Count Failure와
+--   Delete Count Valid는 낮게, Invalidation은 낮게. 실측은 Create 1 / Find 5 /
+--   Invalidation 0 / Failure 0 이다. 한 번 만든 결과를 다섯 번 재사용했고
+--   실패·무효화·유효삭제가 모두 0 → '건강한 캐시'다. 또한 Block Count Current
+--   32 / Maximum 7712 → 캐시 공간에 여유가 매우 크다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 메모리 사용 요약을 MEMORY_REPORT로 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SET SERVEROUTPUT ON
+SYS@orcl> EXECUTE DBMS_RESULT_CACHE.MEMORY_REPORT
+
+R e s u l t   C a c h e   M e m o r y   R e p o r t
+[Parameters]
+Block Size          = 1024 bytes
+Maximum Cache Size  = 7712K bytes (7712 blocks)
+Maximum Result Size = 385 blocks
+[Memory]
+Total Memory = <환경값> bytes [<환경값>% of the Shared Pool]
+... Cache Memory = 32 blocks
+....... Used Memory  = <환경값> blocks
+....... Unused Memory= <환경값> blocks
+PL/SQL procedure successfully completed.
+
+-- 해석: 결과 캐시가 공유 풀의 극히 일부만 쓰고 있다. 결과 캐시가 공유 풀을
+--   과도하게 잠식하는지 점검할 때 이 리포트의 '% of the Shared Pool'을 본다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인) 적용 부적합 판별.
+--     변경 잦은 테이블(CLAIM_DETAILS)에 캐시를 붙이면 무슨 일이 나는지 본다.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- (부적합 후보) CLAIM_DETAILS는 100만+ 행이며 심사 과정에서 계속 변경된다.
+SQLT@orcl> SELECT /*+ RESULT_CACHE */ drug_code, COUNT(*) cnt
+  2         FROM  claim_details
+  3         GROUP BY drug_code;      -- 첫 실행: 캐시 생성
+
+SQLT@orcl> -- 이 테이블에 변경이 들어오는 상황을 흉내낸다(한 건 삽입·커밋).
+SQLT@orcl> INSERT INTO claim_details (detail_id, claim_id, drug_code, quantity, claim_amount)
+  2         VALUES (seq_detail.NEXTVAL, <환경값>, <환경값>, 1, 1000);
+SQLT@orcl> COMMIT;
+
+SQLT@orcl> -- 같은 집계를 다시 실행 (캐시가 무효화되어 재계산될 것)
+SQLT@orcl> SELECT /*+ RESULT_CACHE */ drug_code, COUNT(*) cnt
+  2         FROM  claim_details GROUP BY drug_code;
+
+SYS@orcl> SELECT name, value FROM v$result_cache_statistics
+  2         WHERE name IN ('Create Count Success','Find Count','Invalidation Count');
+NAME                     VALUE
+------------------------ ----------
+Create Count Success     <환경값>   -- 변경마다 재생성으로 증가
+Find Count               <환경값>   -- 거의 안 쌓임
+Invalidation Count       <환경값>   -- 변경마다 증가 (Create를 바짝 따라감)
+
+-- 원인: CLAIM_DETAILS가 자주 바뀌어 캐시가 만들어지자마자 무효화된다.
+--   Invalidation Count가 Create Count를 바짝 따라 오르고 Find는 안 쌓인다.
+--   '생성→무효화→재생성' 반복 — 관리 비용만 들고 재사용 이득이 없다.
+
+SQLT@orcl> -- 조치: 캐시를 '키우는' 것이 아니라 그 질의에서 '뗀다'.
+SQLT@orcl> SELECT /*+ NO_RESULT_CACHE */ drug_code, COUNT(*) cnt
+  2         FROM  claim_details GROUP BY drug_code;
+-- 재확인: 이 질의는 더 이상 캐시를 만들지 않는다. 이후 Invalidation Count가
+--   더 오르지 않는다. 결과 캐시는 DRUG_MASTER 같은 참조 테이블 질의에만 남긴다.
+
+--------------------------------------------------------------------------------
+-- [4] (점검) 실수로 걸린 캐시 주석이 없는지 테이블 주석을 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT table_name, result_cache
+  2         FROM  dba_tables
+  3         WHERE owner='SQLT' AND result_cache <> 'DEFAULT';
+-- 결과가 없으면 강제(FORCE) 주석이 걸린 테이블이 없다는 뜻(정상).
+-- FORCE로 걸린 변경 잦은 테이블이 있으면 ALTER TABLE ... RESULT_CACHE(MODE DEFAULT)로 해제.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 건강한 캐시 = Find↑ · Invalidation≈0 · Create Failure≈0 (실측이 그러함).
+-- 2) 변경 잦은 테이블(CLAIM_DETAILS)은 Invalidation이 Create를 따라 오른다 → 부적합.
+-- 3) 부적합의 조치는 '크기 키우기'가 아니라 '캐시 제거(NO_RESULT_CACHE)'.
+-- 4) DBA_TABLES.RESULT_CACHE로 강제 주석을 정기 점검한다.
+
+SYS@orcl> EXIT
+================================================================================

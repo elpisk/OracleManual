@@ -1,0 +1,160 @@
+================================================================================
+ 18장 실습 01 — 라이브러리 캐시 구성 확인(V$LIBRARYCACHE)과 재파싱 지표 판독
+ 목표: 공유 풀 안 라이브러리 캐시의 히트율(GET/PIN)과 경보 지표(RELOADS·
+       INVALIDATIONS)를 네임스페이스별로 읽고, 커서 재사용 실패(하드 파싱)를
+       지목한다. 누적값을 절대값으로 오판하는 함정을 델타로 교정한다.
+ 환경: non-CDB=orcl 19.3, ASMM(memory_target=0, sga_target>0). SYS로 수행.
+ 주의: 개인 실습 환경 전용. 조회 위주다. V$LIBRARYCACHE·V$SGASTAT는
+       라이선스와 무관한 기본 V$ 뷰다(DBA_HIST_* 이력만 Diagnostics Pack 🔒).
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 메모리 관리 방식과 공유 풀이 어디에 있는지부터 확인.
+--------------------------------------------------------------------------------
+SYS@orcl> SHOW PARAMETER memory_target
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+memory_target                        big integer 0
+
+SYS@orcl> SHOW PARAMETER sga_target
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+sga_target                           big integer <환경값>
+
+-- 해석: memory_target=0, sga_target>0 → ASMM. 공유 풀은 SGA_TARGET 안에서
+--   자동 조정된다(16장 판별 기준과 동일).
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 라이브러리 캐시 상태 — 네임스페이스별 히트율과 경보 지표.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN namespace FORMAT A16
+SYS@orcl> SELECT namespace, gets, ROUND(gethitratio*100,1) get_hit,
+  2         pins, ROUND(pinhitratio*100,1) pin_hit, reloads, invalidations
+  3       FROM  v$librarycache
+  4       WHERE gets > 0
+  5       ORDER BY gets DESC FETCH FIRST 8 ROWS ONLY;
+
+NAMESPACE           GETS  GET_HIT     PINS PIN_HIT RELOADS INVALIDATIONS
+--------------- -------- -------- -------- ------- ------- -------------
+SQL AREA          304311     13.9   704765    44.6    2441           699
+TABLE/PROCEDURE   163666     95.2   653743    97.2    4318             0
+SQL AREA BUILD    130983      1.1        0   100.0       0             0
+SQL AREA STATS    129372      0.4   129408     0.4       0             0
+SCHEMA             10179     99.7        0   100.0       0             0
+BODY                2174     93.6     9131    97.1     106             0
+INDEX               1216     84.4     1209    70.8     163             0
+TRIGGER              392     80.9      392    80.4       0             0
+
+-- 해석(핵심): SQL AREA의 GET_HIT가 13.9%로 바닥이다. 라이브러리 캐시에서
+--   커서를 찾으려 했지만 대부분 실패했다는 뜻 → 못 찾으면 하드 파싱한다.
+--   PIN_HIT 44.6%도 낮아 재파싱이 잦다. 반면 TABLE/PROCEDURE는 GET_HIT
+--   95.2%로 양호하다. '테이블 정의는 재사용되는데 SQL 커서만 재사용 실패' →
+--   매번 텍스트가 다른 리터럴 SQL의 전형적 지문이다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) GETS와 PINS의 관계 — 왜 PINS가 더 큰가.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT namespace, gets, pins,
+  2         ROUND(pins/NULLIF(gets,0),1) pins_per_get
+  3       FROM  v$librarycache
+  4       WHERE namespace IN ('SQL AREA','TABLE/PROCEDURE');
+
+NAMESPACE           GETS     PINS PINS_PER_GET
+--------------- -------- -------- ------------
+SQL AREA          304311   704765          2.3
+TABLE/PROCEDURE   163666   653743          4.0
+
+-- 해석: GET은 핸들을 '찾는' 동작, PIN은 실행하려 '고정'하는 동작이다.
+--   한 번 찾은 커서를 여러 번 고정해 실행하므로 PINS > GETS가 자연스럽다.
+--   GET_HIT 낮음=찾기 자체 실패(새 SQL이라 없음), PIN_HIT 낮음=찾았는데
+--   재파싱 필요(밀려났다 왔거나 무효화). SQL AREA는 둘 다 낮은 이중고다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: "GET_HIT 13.9%니까 '지금' 라이브러리 캐시가 심각하다"고
+--       곧바로 단정하려 한다. 그러나 이 값은 기동 이후 누적값이다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 이 인스턴스가 언제부터 돌았는지(누적 구간)를 먼저 본다.
+SYS@orcl> SELECT TO_CHAR(startup_time,'YYYY-MM-DD HH24:MI') startup,
+  2         ROUND((SYSDATE-startup_time)*24,1) up_hours
+  3       FROM v$instance;
+
+STARTUP             UP_HOURS
+---------------- -----------
+<환경값>              <환경값>
+
+-- 원인: GET_HIT 13.9%는 '기동 이후 전체 파싱'의 누적 히트율이다. 이 환경은
+--   WL_01_parse로 리터럴을 대량 유발한 이력이 누적에 그대로 남아 히트율을
+--   끌어내렸다. 누적 절대값 하나로 '지금'을 진단하면 오판이다(13장 원칙).
+-- 조치: 두 시점의 값을 빼는 '델타'로 본다. 지금 값을 스냅샷으로 저장한다.
+SYS@orcl> CREATE GLOBAL TEMPORARY TABLE lc_snap
+  2         ON COMMIT PRESERVE ROWS
+  3       AS SELECT namespace, gets, pins, reloads, invalidations, SYSDATE ts
+  4          FROM v$librarycache WHERE 1=0;
+
+Table created.
+
+SYS@orcl> INSERT INTO lc_snap
+  2       SELECT namespace, gets, pins, reloads, invalidations, SYSDATE
+  3       FROM v$librarycache;
+
+23 rows created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> -- 재확인: (나중에 부하를 준 뒤) 델타로 RELOADS·하드파싱 증가분을 본다.
+SYS@orcl> SELECT c.namespace,
+  2         c.reloads - s.reloads AS reload_delta,
+  3         c.invalidations - s.invalidations AS inval_delta
+  4       FROM v$librarycache c JOIN lc_snap s ON c.namespace=s.namespace
+  5       WHERE c.namespace='SQL AREA';
+
+NAMESPACE        RELOAD_DELTA INVAL_DELTA
+--------------- ------------ -----------
+SQL AREA                   0           0
+
+-- 재확인 결과: 아직 부하를 주지 않아 델타 0이다. 실습 02에서 WL_01_parse를
+--   실행한 뒤 이 델타가 리터럴 횟수만큼 튀는 것을 관찰한다. 즉 '지금 심각한가'는
+--   누적값이 아니라 이 델타로 판정한다.
+
+--------------------------------------------------------------------------------
+-- [5] (조회) RELOADS와 INVALIDATIONS는 원인이 다르다 — 조치가 갈린다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT namespace, reloads, invalidations
+  2       FROM v$librarycache
+  3       WHERE reloads > 0 OR invalidations > 0
+  4       ORDER BY reloads DESC;
+
+NAMESPACE        RELOADS INVALIDATIONS
+--------------- ------- -------------
+TABLE/PROCEDURE    4318             0
+SQL AREA           2441           699
+INDEX               163             0
+BODY                106             0
+
+-- 해석: RELOADS = 공간 압박(커서가 밀려났다 재적재) → 공유 풀 크기·하드파싱 점검.
+--         INVALIDATIONS = 변경(DDL·통계 재수집으로 무효화) → 업무시간 통계수집·
+--         DDL 남발 점검. SQL AREA만 INVALIDATIONS 699가 있는데, 통계 재수집이
+--         커서를 무효화한 흔적이다. TABLE/PROCEDURE RELOADS 4318은 크지만
+--         GET_HIT 95%로 양호하니 광범위 접근의 자연스러운 결과로 본다.
+--         → RELOADS 절대값 하나로 단정하지 않고 지표 조합으로 판정한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) SQL AREA GET_HIT 13.9%·PIN_HIT 44.6% → 커서 재사용 실패(하드 파싱) 신호.
+-- 2) TABLE/PROCEDURE 95.2%와의 대비 → 리터럴 SQL을 지목(크기 문제 아님).
+-- 3) 누적값을 '지금'으로 오판하지 않는다 → 스냅샷·델타로 본다(실습 02로 연결).
+-- 4) RELOADS(공간 압박)와 INVALIDATIONS(객체 변경)는 원인·조치가 다르다.
+-- ※ 라이선스: 여기 쓴 V$LIBRARYCACHE·V$INSTANCE는 모두 무관. 이력은
+--    DBA_HIST_LIBRARYCACHE(🔒)를 쓰거나, 위처럼 V$를 직접 델타로 계산한다.
+
+SYS@orcl> EXIT
+================================================================================

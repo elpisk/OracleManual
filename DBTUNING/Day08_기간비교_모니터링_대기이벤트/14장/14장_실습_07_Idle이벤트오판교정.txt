@@ -1,0 +1,101 @@
+================================================================================
+ 14장 실습 07 — Idle 이벤트를 병목으로 오판하는 사례 재현과 교정
+ 목표: wait_class 필터 없이 V$SYSTEM_EVENT를 정렬하면 Idle 이벤트가 상위를
+       점령해 '가짜 병목'을 만든다. 이를 재현하고, wait_class<>'Idle' 및
+       V$EVENT_NAME 검증으로 진짜 병목만 남기는 절차로 교정한다.
+ 환경: non-CDB=orcl 19.3 (진단 SYS AS SYSDBA)
+ 라이선스: V$ 실시간 조회는 라이선스 무관.
+ 부하: 별도 부하 불필요(누적 통계로 재현). 필요 시 앞 실습 부하 재사용.
+ 주의: 개인 실습 환경 전용. 조회 위주라 원본 데이터를 변경하지 않는다.
+================================================================================
+
+$ sqlplus / as sysdba
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COLUMN event FORMAT A34
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태 = 오판 재현) 필터 없이 총 대기 시간으로 정렬한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT SUBSTR(event,1,34) event, ROUND(time_waited/100) sec,
+  2         wait_class
+  3       FROM  v$system_event
+  4       ORDER BY time_waited DESC FETCH FIRST 5 ROWS ONLY;
+
+EVENT                              SEC  WAIT_CLASS
+---------------------------------- ---- ----------
+SQL*Net message from client        <환경값>  Idle       -- (거대)
+rdbms ipc message                  <환경값>  Idle
+Streams AQ: waiting for messages   <환경값>  Idle
+pmon timer                         <환경값>  Idle
+log file sync                        53   Commit
+
+-- 해석: 맨 위 네 개가 전부 Idle 클래스다. 이대로 "SQL*Net message from client가
+--   최대 병목"이라 결론 내면 오판이다. Idle은 'DB가 할 일 없이 논' 유휴 시간이며,
+--   값이 큰 것이 오히려 정상이다.
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 신입 담당자가 위 결과로 "SQL*Net message from client가 70%,
+--       네트워크 병목"이라는 진단서를 작성해 회선 점검을 요청하려 한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: 정말 Idle인지 사전 뷰로 검증한다.
+SYS@orcl> SELECT name, wait_class FROM v$event_name
+  2       WHERE name IN ('SQL*Net message from client',
+  3                      'SQL*Net message to client',
+  4                      'SQL*Net vector data to client');
+
+NAME                            WAIT_CLASS
+------------------------------- ----------
+SQL*Net message from client     Idle       -- 요청 대기(유휴)
+SQL*Net message to client       Network    -- 결과 전송
+SQL*Net vector data to client   Network    -- 대량 결과 전송
+
+-- 원인 확정: from client는 Idle(요청을 기다린 유휴), to client·vector는
+--   Network(실제 전송)다. 이름이 비슷해도 클래스가 다르다. 필터를 빠뜨린 것이 원인.
+-- 조치: wait_class<>'Idle'을 걸어 다시 집계한다.
+SYS@orcl> SELECT SUBSTR(event,1,34) event, total_waits,
+  2         ROUND(time_waited/100) sec, wait_class
+  3       FROM  v$system_event
+  4       WHERE wait_class <> 'Idle'
+  5       ORDER BY time_waited DESC FETCH FIRST 6 ROWS ONLY;
+
+EVENT                          TOTAL_WAITS   SEC  WAIT_CLASS
+------------------------------ ----------- ----- -----------
+SQL*Net vector data to client         3974   358  Network
+log file sync                        63826    53  Commit
+log file parallel write              64602    52  System I/O
+db file sequential read              17097    52  User I/O
+RMAN backup & recovery I/O            4385    40  System I/O
+control file parallel write          13958    24  System I/O
+
+-- 재확인 완료: 필터를 걸자 진짜 상위가 드러났다. 흥미롭게도 Network 계열에서도
+--   from client(Idle)가 아니라 vector data to client(358초)가 진짜 전송 부하다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 횟수 함정도 함께 확인한다 — to client는 횟수만 크다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT SUBSTR(event,1,34) event, total_waits,
+  2         ROUND(time_waited/100) sec
+  3       FROM  v$system_event
+  4       WHERE event IN ('SQL*Net message to client',
+  5                       'SQL*Net vector data to client');
+
+EVENT                          TOTAL_WAITS   SEC
+------------------------------ ----------- -----
+SQL*Net message to client           313388     1
+SQL*Net vector data to client         3974   358
+
+-- 해석: to client는 313388회지만 대기 1초 — 라운드트립은 많되 건당은 짧다.
+--   vector data는 3974회지만 358초 — 대량 전송이 실재한다. 횟수가 아니라 총
+--   대기 시간으로 봐야 하는 이유다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 대기 목록의 맨 위가 Idle이면 '발견'이 아니라 '필터 누락' 신호다.
+-- 2) wait_class<>'Idle'이 대기 이벤트 조회의 첫 규율. V$EVENT_NAME으로 검증.
+-- 3) from client(Idle) ≠ to client/vector(Network). 이름이 비슷해도 클래스가 다르다.
+-- 4) 정렬은 총 대기 시간(time_waited) 기준. 횟수(to client 313388)에 속지 않는다.
+
+SYS@orcl> EXIT
+================================================================================

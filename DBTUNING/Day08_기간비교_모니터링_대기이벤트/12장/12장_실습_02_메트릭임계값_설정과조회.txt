@@ -1,0 +1,120 @@
+================================================================================
+ 12장 실습 02 — 메트릭 임계값 설정과 현재 설정 조회
+ 목표: DBA_THRESHOLDS로 현재 임계값을 확인하고, DBMS_SERVER_ALERT.SET_THRESHOLD로
+       임계값을 설정·초기화한다. 연속 관측(consecutive)의 의미를 확인한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA)
+ 라이선스: 임계값 설정·조회는 기본 기능(라이선스 무관).
+ 주의: 개인 실습 환경 전용. 설정 변경 후 원복까지 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COLUMN metrics_name FORMAT A24
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 현재 설정된 임계값을 먼저 캡처한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT metrics_name, warning_value, critical_value,
+  2         consecutive_occurrences
+  3       FROM  dba_thresholds
+  4       WHERE rownum <= 15
+  5       ORDER BY metrics_name;
+
+METRICS_NAME             WARNING_VALUE           CRITICAL_VALUE CONSEC
+------------------------ ----------------------- -------------- ------
+Tablespace Space Usage   <SYSTEM-GENERATED THR..> 0
+Tablespace Space Usage   85                      97                  1
+Tablespace Space Usage   <SYSTEM-GENERATED THR..> 0
+Tablespace Space Usage   <SYSTEM-GENERATED THR..> 0
+
+-- 해석: WARNING 85 / CRITICAL 97 행이 데이터베이스 기본 임계값이다.
+--   <SYSTEM-GENERATED THRESHOLD> 행은 특정 TS에 시스템이 자동 생성한 항목으로
+--   CRITICAL 0이면 위험 임계값이 실질적으로 없다는 뜻. CONSEC=1은 1회 초과 시 알림.
+
+--------------------------------------------------------------------------------
+-- [2] (설정) 서비스의 '호출당 CPU 시간'에 임계값을 건다.
+--     값은 실습 03(이력 산정)에서 정한다는 전제로, 여기서는 절차만 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    DBMS_SERVER_ALERT.SET_THRESHOLD(
+  3      metrics_id             => DBMS_SERVER_ALERT.CPU_TIME_PER_CALL,
+  4      warning_operator       => DBMS_SERVER_ALERT.OPERATOR_GE,
+  5      warning_value          => '8000',
+  6      critical_operator      => DBMS_SERVER_ALERT.OPERATOR_GE,
+  7      critical_value         => '10000',
+  8      observation_period     => 1,
+  9      consecutive_occurrences=> 3,
+ 10      instance_name          => 'orcl',
+ 11      object_type            => DBMS_SERVER_ALERT.OBJECT_TYPE_SERVICE,
+ 12      object_name            => 'orcl');
+ 13  END;
+ 14  /
+
+PL/SQL procedure successfully completed.
+
+-- 해석: 5개의 손잡이 — 경고·위험 값, 연산자(GE), 관측주기(1분),
+--   연속 관측(3회), 대상(서비스 orcl). consecutive=3이라 연속 3회 초과해야 울린다.
+--   ※ 8000/10000은 예시값. 실제 값은 실습 03에서 이력 분포로 산정한다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 방금 건 임계값이 DBA_THRESHOLDS에 반영됐는지 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT metrics_name, warning_value, critical_value,
+  2         consecutive_occurrences, object_name
+  3       FROM  dba_thresholds
+  4       WHERE metrics_name LIKE '%CPU Time Per%';
+
+METRICS_NAME               WARNING CRITICAL CONSEC OBJECT_NAME
+-------------------------- ------- -------- ------ -----------
+CPU Time Per User Call     8000    10000         3 orcl
+
+-- 해석: 서비스 orcl에 경고 8000·위험 10000·연속 3회로 설정됐다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 임계값을 지웠다고 생각했는데 DBA_THRESHOLDS에 그대로 남아 있다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- (잘못된 시도) DBA_THRESHOLDS는 뷰라 DELETE로 지울 수 없다.
+SYS@orcl> DELETE FROM dba_thresholds WHERE metrics_name LIKE '%CPU Time Per%';
+DELETE FROM dba_thresholds WHERE metrics_name LIKE '%CPU Time Per%'
+            *
+ERROR at line 1:
+ORA-01031: insufficient privileges
+
+SYS@orcl> -- 원인 파악: 임계값은 딕셔너리 뷰를 직접 지우는 게 아니라
+SYS@orcl> --   SET_THRESHOLD에 NULL을 주어 기본값으로 되돌리는 것이다.
+SYS@orcl> -- 조치: warning/critical을 NULL로 지정해 초기화한다.
+SYS@orcl> BEGIN
+  2    DBMS_SERVER_ALERT.SET_THRESHOLD(
+  3      metrics_id=>DBMS_SERVER_ALERT.CPU_TIME_PER_CALL,
+  4      warning_operator=>DBMS_SERVER_ALERT.OPERATOR_GE, warning_value=>NULL,
+  5      critical_operator=>DBMS_SERVER_ALERT.OPERATOR_GE, critical_value=>NULL,
+  6      observation_period=>1, consecutive_occurrences=>1,
+  7      instance_name=>'orcl',
+  8      object_type=>DBMS_SERVER_ALERT.OBJECT_TYPE_SERVICE, object_name=>'orcl');
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT COUNT(*) left_over FROM dba_thresholds
+  2       WHERE metrics_name LIKE '%CPU Time Per%' AND object_name='orcl'
+  3         AND warning_value IS NOT NULL;
+
+ LEFT_OVER
+----------
+         0
+
+-- 재확인: 사용자 설정이 제거되어 기본값 상태로 돌아왔다. 실습 환경을 원복했다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 현재 임계값은 DBA_THRESHOLDS로 본다(뷰라 직접 수정 불가).
+-- 2) 설정·변경·초기화는 모두 SET_THRESHOLD로 한다. NULL 두 개 = 기본값 복원.
+-- 3) consecutive_occurrences로 순간 스파이크를 흡수한다.
+-- 4) 어떤 값을 넣을지는 감이 아니라 이력에서 정한다(실습 03).
+
+SYS@orcl> EXIT
+================================================================================

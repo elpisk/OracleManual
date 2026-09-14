@@ -1,0 +1,184 @@
+================================================================================
+ 8장 실습 01 — 텍스트 AWR 보고서 생성(awrrpt.sql)과 섹션 구조 확인
+ 목표: 공용 부하 스크립트로 실제 부하를 준 뒤 수동 스냅샷 쌍을 확보하고,
+       awrrpt.sql로 텍스트 AWR 보고서를 생성한다. 보고서의 섹션 구조를
+       위(요약)에서 아래(세부)로 확인한다. 스냅샷 사이 재기동으로 보고서가
+       실패하는 이상 상황을 재현하고 원인·조치·재확인까지 익힌다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 부하: 과정 공용 WL_06_mixed.sql (7세션 종합 부하 = 리터럴파싱2+대량스캔2+정렬2+커밋1)
+ 주의: 개인 실습 환경 전용. 파라미터 변경·부하 유발이 포함된다.
+ 라이선스: 🔒 Diagnostics Pack 필요(AWR·awrrpt.sql). 미보유 시 하단 Statspack 대안.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) AWR을 쓸 수 있는 전제부터 확인한다.
+--     (1) STATISTICS_LEVEL이 TYPICAL/ALL이어야 스냅샷이 수집된다.
+--     (2) 관리 팩 접근이 DIAGNOSTIC 이상이어야 AWR을 쓸 수 있다(라이선스).
+--------------------------------------------------------------------------------
+SYS@orcl> SHOW PARAMETER statistics_level
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+statistics_level                     string      TYPICAL
+
+SYS@orcl> SHOW PARAMETER control_management_pack_access
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+control_management_pack_access       string      DIAGNOSTIC+TUNING
+
+-- 해석: TYPICAL이므로 스냅샷 수집 OK. DIAGNOSTIC+TUNING이므로 AWR 사용 가능.
+--   만약 여기가 NONE이면 awrrpt.sql은 라이선스로 막혀 동작하지 않는다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) 부하 구간을 감싸는 수동 스냅샷 쌍을 만든다.
+--     시작 스냅샷 → 부하 → 종료 스냅샷 순으로 확보한다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT snap_id, TO_CHAR(end_interval_time,'HH24:MI:SS') endt
+  2       FROM  dba_hist_snapshot
+  3       ORDER BY snap_id DESC FETCH FIRST 1 ROWS ONLY;
+
+   SNAP_ID ENDT
+---------- --------
+       295 14:20:37
+
+-- 시작 스냅샷 = 295. 이제 다른 7개 세션에서 WL_06_mixed.sql을 100초간 돌린다.
+--   (별도 터미널에서 실행. 아래는 부하 종료 후 이 세션으로 돌아와 계속)
+SYS@orcl> -- 부하 실행 중 ... (WL_06_mixed.sql, 약 100초)
+
+SYS@orcl> EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT snap_id, TO_CHAR(end_interval_time,'HH24:MI:SS') endt
+  2       FROM  dba_hist_snapshot
+  3       ORDER BY snap_id DESC FETCH FIRST 1 ROWS ONLY;
+
+   SNAP_ID ENDT
+---------- --------
+       296 14:22:19
+
+-- 종료 스냅샷 = 296. 부하 구간 = 295~296 (약 100초) 확보 완료.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) awrrpt.sql로 텍스트 보고서를 생성한다.
+--     보고서 형식=text, 최근 1일 스냅샷 목록에서 295~296을 지정한다.
+--------------------------------------------------------------------------------
+SYS@orcl> @$ORACLE_HOME/rdbms/admin/awrrpt.sql
+
+Enter value for report_type: text
+
+Type Specified:  text
+
+Enter value for num_days: 1
+
+Listing the last day's Completed Snapshots
+                                                        Snap
+Instance     DB Name        Snap Id    Snap Started    Level
+------------ ------------ ---------- ------------------ -----
+orcl         ORCL                294  25 Aug 2026 14:10     1
+                                 295  25 Aug 2026 14:20     1
+                                 296  25 Aug 2026 14:22     1
+
+Enter value for begin_snap: 295
+Begin Snapshot Id specified: 295
+
+Enter value for end_snap: 296
+End   Snapshot Id specified: 296
+
+Enter value for report_name:
+Using the report name awrrpt_1_295_296.txt
+
+... (보고서 본문 출력) ...
+
+Report written to awrrpt_1_295_296.txt
+
+-- 해석: awrrpt.sql은 형식→목록 일수→시작/종료 스냅샷→파일명을 차례로 묻는다.
+--   비대화식으로 돌리려면 DEFINE으로 값을 미리 지정할 수 있다.
+
+--------------------------------------------------------------------------------
+-- [4] (조회) 생성된 보고서의 섹션 구조를 위에서 아래로 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> HOST grep -nE "Load Profile|Instance Efficiency|Top 10 Foreground|SQL ordered by|Advisory|Instance Activity" awrrpt_1_295_296.txt
+
+  61:Load Profile
+  78:Instance Efficiency Percentages (Target 100%)
+  95:Top 10 Foreground Events by Total Wait Time
+ 210:SQL ordered by Elapsed Time
+ 265:SQL ordered by Gets
+ 512:Instance Activity Stats
+ 940:Buffer Pool Advisory
+ 958:Shared Pool Advisory
+ 985:PGA Aggregate Target Advisory
+
+-- 해석: 보고서는 요약(Load Profile/Instance Efficiency/Top Events) → SQL 통계
+--   → Instance Activity → Advisory 순이다. 판독은 이 순서 그대로 위에서
+--   아래로 내려간다. 큰 그림(무슨 일이 있었나)을 먼저 잡고 세부로 좁힌다.
+
+--------------------------------------------------------------------------------
+-- [5] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 다른 스냅샷 쌍(재기동을 걸친 구간)으로 보고서를 만들려니 실패.
+--------------------------------------------------------------------------------
+SYS@orcl> @$ORACLE_HOME/rdbms/admin/awrrpt.sql
+Enter value for report_type: text
+Enter value for num_days: 1
+Enter value for begin_snap: 290
+Enter value for end_snap: 296
+
+ERROR at line 1:
+ORA-20200: The instance was shutdown between snapshots 290 and 296
+
+-- 원인 파악: AWR 보고서는 '델타(종료-시작)'다. 290~296 사이에 인스턴스
+--   재기동이 있었다면 V$ 통계가 0으로 초기화되어 델타가 음수가 된다.
+SYS@orcl> SELECT snap_id, startup_time
+  2       FROM  dba_hist_snapshot
+  3       WHERE snap_id IN (290,291,296) ORDER BY snap_id;
+
+   SNAP_ID STARTUP_TIME
+---------- -------------------
+       290 25-AUG-26 09:00:11
+       291 25-AUG-26 13:55:02   <- startup_time이 바뀜 = 재기동 발생
+       296 25-AUG-26 13:55:02
+
+-- 원인 확정: 290과 291 사이에서 startup_time이 달라졌다 = 재기동이 있었다.
+-- 조치: 재기동을 걸치지 않는 같은 기동 구간의 스냅샷 쌍(295~296)을 쓴다.
+-- 재확인: [3]에서 295~296은 정상 생성됐다. 같은 startup_time이면 문제없다.
+SYS@orcl> SELECT COUNT(DISTINCT startup_time) distinct_startups
+  2       FROM  dba_hist_snapshot WHERE snap_id BETWEEN 295 AND 296;
+
+DISTINCT_STARTUPS
+-----------------
+                1
+
+-- 재확인 완료: 295~296은 startup_time이 1종류 → 재기동 없음 → 보고서 정상.
+
+--------------------------------------------------------------------------------
+-- [대안 경로] 🔒 Diagnostics Pack 미보유 환경 — Statspack로 같은 것을 본다.
+--------------------------------------------------------------------------------
+-- 1) 설치(최초 1회): @?/rdbms/admin/spcreate.sql  (PERFSTAT 계정 생성)
+-- 2) 부하 전/후 스냅샷: EXEC STATSPACK.SNAP;  (부하 사이에 두 번)
+-- 3) 보고서 생성:       @?/rdbms/admin/spreport.sql  (begin/end snap 지정)
+-- Statspack 보고서에도 Load Profile / Top Events / SQL / Instance Efficiency가
+-- 있어 이 실습의 섹션 판독이 거의 그대로 적용된다(ADDM·ASH는 없음).
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) AWR 전제: STATISTICS_LEVEL>=TYPICAL, 관리 팩 DIAGNOSTIC 이상(라이선스).
+-- 2) 부하 구간을 감싸는 수동 스냅샷 쌍(295~296)을 확보한 뒤 awrrpt.sql 실행.
+-- 3) 보고서는 요약→SQL→활동통계→Advisory 순. 위에서 아래로 판독한다.
+-- 4) 재기동을 걸친 스냅샷 쌍은 델타가 음수라 보고서 실패(ORA-20200) → 같은
+--    기동 구간 쌍을 쓴다(startup_time으로 확인).
+-- 5) 라이선스 없으면 Statspack(spcreate/SNAP/spreport)으로 유사 판독.
+
+SYS@orcl> EXIT
+================================================================================

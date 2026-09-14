@@ -1,0 +1,114 @@
+================================================================================
+ 3장 실습 05 — 진단 근거를 남기는 절차 (조치 전 스냅샷·상태 캡처)
+ 목표: 조치(세션 종료 등)를 하기 전에 순간 상태를 SPOOL 로 파일에 남기고,
+       조치 후 상태와 전후를 비교하는 절차를 익힌다. 성능 조치는 근거가
+       기록으로 남을 때에만 튜닝이 된다.
+ 환경: non-CDB=orcl 19.3. 캡처·관찰은 SYS@orcl>.
+ 주의: 개인 실습 환경 전용. 이 실습은 '캡처 절차'가 본체다. 실제 종료는
+       근거를 남긴 뒤에만 수행한다(선행 실습 02·04에서 블로킹을 재현해 둔다).
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태 · 캡처 대상 확인) 무엇이 순간 상태인가.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 순간 상태(조치하면 사라짐): V$SESSION / V$LOCK 의 블로킹 관계.
+SYS@orcl> -- 누적 상태(델타로 계산): V$SYS_TIME_MODEL / V$SYSSTAT.
+SYS@orcl> -- 판정: 세션 종료로 사라질 순간 상태는 '반드시 사전 캡처' 대상이다.
+SYS@orcl> SELECT sid, username, event, blocking_session blk
+  2       FROM  v$session WHERE username='SQLT' AND blocking_session IS NOT NULL;
+
+       SID USERNAME EVENT                            BLK
+---------- -------- -------------------------------- ---
+       597 SQLT     enq: TX - row lock contention    596
+
+-- 해석: 597 이 596 에 막혀 있다(선행 실습에서 재현한 블로킹). 이 관계는
+--   596 이 커밋/롤백/종료되는 순간 사라진다 → 캡처 없이는 원인 규명 불가.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 캡처) SPOOL 로 조치 전 스냅샷을 파일에 남긴다.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN captured_at NEW_VALUE cap
+SYS@orcl> SELECT TO_CHAR(SYSDATE,'YYYYMMDD_HH24MISS') captured_at FROM dual;
+CAPTURED_AT
+---------------
+<환경값>
+
+SYS@orcl> SPOOL /tmp/before_&cap..txt
+SYS@orcl> PROMPT === 조치 전 스냅샷 (블로킹) ===
+SYS@orcl> SELECT sid, serial#, username, event, blocking_session blk,
+  2         seconds_in_wait, sql_id, row_wait_obj#
+  3       FROM  v$session WHERE username='SQLT' ORDER BY sid;
+
+       SID    SERIAL# USERNAME EVENT                            BLK SECONDS_IN_WAIT
+---------- ---------- -------- -------------------------------- --- ---------------
+       596   <환경값> SQLT     SQL*Net message from client          <환경값>
+       597   <환경값> SQLT     enq: TX - row lock contention    596 <환경값>
+
+SYS@orcl> SELECT sid, type, lmode, request, block FROM v$lock WHERE type='TX' ORDER BY sid;
+
+       SID TYPE      LMODE    REQUEST      BLOCK
+---------- ---- ---------- ---------- ----------
+       596 TX            6          0          1
+       597 TX            0          6          0
+
+SYS@orcl> SPOOL OFF
+
+-- 해석: 블로커(596: block=1)·대기자(597: request=6)·SERIAL#·SQL_ID·대상 객체가
+--   한 파일에 남았다. SERIAL# 은 종료 명령에 필요하므로 반드시 포함한다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인) 캡처가 비어 있는 사고.
+--     이상 징후: 스풀 파일을 열었더니 표가 비어 있다(캡처 실패).
+--------------------------------------------------------------------------------
+SYS@orcl> -- 흔한 원인 1: 세션을 먼저 KILL 한 뒤 조회해 이미 행이 사라졌다.
+SYS@orcl> -- 흔한 원인 2: SET PAGESIZE 0 등으로 헤더/행이 안 찍혔거나,
+SYS@orcl> --            WHERE 조건(username)이 실제와 달라 0행이 조회됐다.
+SYS@orcl> -- 원인 요지: '조치 후'에 캡처했거나, 조회 조건/환경설정이 틀렸다.
+SYS@orcl> -- 조치: (1) 반드시 '조치 전'에 캡처한다. (2) 조회 결과 행수를 확인한다.
+SYS@orcl> SELECT COUNT(*) rows_captured FROM v$session
+  2       WHERE username='SQLT' AND blocking_session IS NOT NULL;
+ROWS_CAPTURED
+-------------
+            1
+-- 재확인: rows_captured 가 1 이상이면 캡처 대상이 살아 있는 것이다. 0 이면
+--   이미 조치가 된 뒤이므로, 다음부터는 순서를 '캡처 → 조치'로 바로잡는다.
+
+--------------------------------------------------------------------------------
+-- [4] (조치) 근거를 남긴 뒤에만 해소한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 정상 경로: 블로커(596)의 커밋/롤백 유도.
+SYS@orcl> -- 비상 경로: ALTER SYSTEM KILL SESSION '596,<환경값>' IMMEDIATE;
+SYS@orcl> --   ★ [2] 캡처가 끝난 것을 확인한 뒤에만 실행한다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치 후 상태 · 캡처) 조치 후 스냅샷을 같은 방식으로 남긴다.
+--------------------------------------------------------------------------------
+SYS@orcl> SPOOL /tmp/after_&cap..txt
+SYS@orcl> PROMPT === 조치 후 스냅샷 ===
+SYS@orcl> SELECT sid, event, blocking_session blk, wait_class
+  2       FROM  v$session WHERE username='SQLT' ORDER BY sid;
+
+       SID EVENT                            BLK WAIT_CLASS
+---------- -------------------------------- --- -----------
+       597 SQL*Net message from client          Idle
+
+SYS@orcl> SPOOL OFF
+
+-- 해석: 조치 후 597 의 BLK 가 비었다. before_ 파일과 after_ 파일을 나란히 두면
+--   '조치 전(597→596) → 조치 → 조치 후(BLK 비움)'의 3단 근거가 완성된다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 순간 상태(V$SESSION/V$LOCK)는 조치하면 사라진다 → 반드시 사전 캡처.
+-- 2) SPOOL 로 before_/after_ 두 파일을 남겨 전후를 비교한다.
+-- 3) SERIAL#·SQL_ID·대상 객체까지 캡처해야 원인 규명이 가능하다.
+-- 4) 캡처가 비면 대개 '조치 후 캡처'거나 조회 조건 오류다. 순서를 바로잡는다.
+-- 5) 근거 없는 조치는 도박이다. 캡처가 조치보다 앞선다.
+SYS@orcl> EXIT
+================================================================================

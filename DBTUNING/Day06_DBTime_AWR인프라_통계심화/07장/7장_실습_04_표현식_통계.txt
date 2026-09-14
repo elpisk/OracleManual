@@ -1,0 +1,141 @@
+================================================================================
+ 7장 실습 04 — 표현식 통계 생성 (함수 적용 컬럼의 추정 개선)
+ 목표: RECEIPT_DATE에 함수를 적용한 조건에서 옵티마이저가 기본 선택도로
+       추정해 어긋나는 것을 확인하고, 표현식 통계로 추정을 개선한다.
+ 환경: non-CDB=orcl 19.3 (업무 계정 SQLT로 수행)
+ 주의: ★개인 실습 환경 전용★. 표현식 통계를 생성·재수집하므로, 실습 끝에
+       DROP_EXTENDED_STATS로 제거하고 기본 정책으로 재수집해 원복한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) RECEIPT_DATE의 통계와 연도별 실제 분포를 확인한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN column_name FORMAT A14
+SQLT@orcl> SELECT column_name, num_distinct, histogram, num_buckets
+  2       FROM user_tab_col_statistics
+  3       WHERE table_name='MEDICAL_CLAIMS' AND column_name='RECEIPT_DATE';
+
+COLUMN_NAME    NUM_DISTINCT HISTOGRAM  NUM_BUCKETS
+-------------- ------------ ---------- -----------
+RECEIPT_DATE            366 HYBRID             254
+
+SQLT@orcl> SELECT EXTRACT(YEAR FROM receipt_date) yr, COUNT(*) cnt
+  2       FROM medical_claims
+  3       GROUP BY EXTRACT(YEAR FROM receipt_date) ORDER BY yr;
+
+        YR        CNT
+---------- ----------
+      <환경값>   <환경값>
+
+-- 해석: RECEIPT_DATE 원본 컬럼에는 히스토그램이 있지만, EXTRACT(YEAR ...)로
+--   함수를 씌우면 옵티마이저는 이 원본 통계를 쓰지 못한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 함수 조건의 E-Rows를 본다. 기본 선택도가 적용된다.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims
+  3       WHERE EXTRACT(YEAR FROM receipt_date)=2026;
+Explained.
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'BASIC ROWS'));
+
+-------------------------------------------------------------------
+| Id  | Operation         | Name           | Rows  |
+-------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                | <환경값>|
+|   1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS | <환경값>|
+-------------------------------------------------------------------
+
+-- 해석: 함수가 컬럼을 가려 옵티마이저가 원본 분포를 못 보고, 등식 기본
+--   선택도(대개 1%, 약 3,000행)로 추정한다. 실제 연도 비율과 어긋난다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치) 표현식 통계를 생성한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT DBMS_STATS.CREATE_EXTENDED_STATS(
+  2         USER,'MEDICAL_CLAIMS','(EXTRACT(YEAR FROM RECEIPT_DATE))') ext
+  3       FROM dual;
+
+EXT
+--------------------------------------------------
+SYS_STU<환경값>
+
+-- 해석: 표현식에 대한 확장 통계(가상 컬럼)가 정의됐다. 아직 값은 비어 있다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 표현식 통계를 만들었는데 함수 조건 E-Rows가 여전히 그대로다.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims
+  3       WHERE EXTRACT(YEAR FROM receipt_date)=2026;
+Explained.
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'BASIC ROWS'));
+
+-- (E-Rows가 [2]와 동일 — 아직 개선되지 않음)
+
+-- 이상 징후: 추정이 개선되지 않는다.
+-- 원인: 확장 통계는 정의만 만들어졌고 값이 비어 있다. 재수집 전이다.
+-- 조치: 표현식을 포함해 통계를 재수집한다.
+SQLT@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'MEDICAL_CLAIMS', -
+>            method_opt=>'FOR ALL COLUMNS SIZE AUTO ' || -
+>              'FOR COLUMNS (EXTRACT(YEAR FROM RECEIPT_DATE)) SIZE AUTO');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> -- 재확인: 표현식 확장 통계가 등록됐는지 본다.
+SQLT@orcl> COLUMN extension FORMAT A45
+SQLT@orcl> SELECT extension_name, extension
+  2       FROM user_stat_extensions WHERE table_name='MEDICAL_CLAIMS';
+
+EXTENSION_NAME             EXTENSION
+-------------------------- ---------------------------------------------
+SYS_STU<환경값>            (EXTRACT(YEAR FROM "RECEIPT_DATE"))
+
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT * FROM medical_claims
+  3       WHERE EXTRACT(YEAR FROM receipt_date)=2026;
+Explained.
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL,NULL,'BASIC ROWS'));
+
+-- 재확인: 이제 E-Rows가 표현식의 실제 분포에 근거해 계산되어, [1]의 연도별
+--   실제 건수에 가까워진다. 함수가 가리던 분포를 표현식 통계가 복원했다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치) 실습 원복 — 표현식 통계를 제거하고 기본 정책으로 재수집한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> EXEC DBMS_STATS.DROP_EXTENDED_STATS(USER,'MEDICAL_CLAIMS', -
+>            '(EXTRACT(YEAR FROM RECEIPT_DATE))');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'MEDICAL_CLAIMS', -
+>            method_opt=>'FOR ALL COLUMNS SIZE AUTO');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> SELECT COUNT(*) ext_cnt FROM user_stat_extensions
+  2       WHERE table_name='MEDICAL_CLAIMS';
+
+   EXT_CNT
+----------
+         0
+
+-- 재확인: 표현식 통계 제거 + 기본 재수집 완료. Before 상태로 원복.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 함수(EXTRACT 등)가 컬럼을 가리면 원본 통계를 못 써 기본 선택도로 추정.
+-- 2) 표현식 통계가 함수 결과의 분포를 저장해 추정을 실제에 가깝게 만든다.
+-- 3) CREATE_EXTENDED_STATS는 정의만. 반드시 GATHER 재수집해야 값이 채워진다.
+-- 4) 함수 없이 조건을 재작성할 수 있으면 그것이 더 낫다(표현식 통계는 차선).
+-- ※ 원복 완료: DROP_EXTENDED_STATS + 기본 재수집. 확장 통계 0개.
+
+SQLT@orcl> EXIT
+================================================================================

@@ -1,0 +1,106 @@
+================================================================================
+ 5장 실습 03 — 대기 클래스별 집계와 상위 클래스 지목 (V$SYSTEM_WAIT_CLASS)
+ 목표: V$SYSTEM_WAIT_CLASS로 대기를 클래스 단위로 집계하고 상위를 지목한다.
+       Idle을 제외하지 않아 SQL*Net message from client가 1위로 잡히는 오판을
+       재현·교정하고, 대기의 실체는 V$SESSION_EVENT로 확인함을 익힌다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 주의: 개인 실습 환경 전용. 이 실습은 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (이상 징후 → 원인 → 조치) Idle을 제외하지 않고 집계하면?
+--     이상 징후: 상위가 Idle 대기로 채워져 엉뚱한 결론에 이른다.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN wait_class FORMAT A22
+SYS@orcl> SELECT wait_class, total_waits, ROUND(time_waited/100) sec
+  2       FROM  v$system_wait_class
+  3       ORDER BY time_waited DESC
+  4       FETCH FIRST 3 ROWS ONLY;
+
+WAIT_CLASS             TOTAL_WAITS        SEC
+---------------------- ----------- ----------
+Idle                       <환경값>   <환경값>
+Network                       8583        358
+System I/O                   81525         77
+
+-- 원인 파악: 최상위 Idle은 세션이 할 일 없이 쉰 시간이다(SQL*Net message from
+--   client 등). 이를 병목으로 오해하면 네트워크 증설 같은 근거 없는 조치로 이어진다.
+-- 조치: 대기 클래스 집계는 항상 WHERE wait_class <> 'Idle'로 Idle을 제외한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 후 상태) Idle을 제외한 대기 클래스별 집계 — 상위 지목.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT wait_class, total_waits, ROUND(time_waited/100) sec
+  2       FROM  v$system_wait_class
+  3       WHERE wait_class <> 'Idle'
+  4       ORDER BY time_waited DESC;
+
+WAIT_CLASS             TOTAL_WAITS        SEC
+---------------------- ----------- ----------
+Network                       8583        358
+System I/O                   81525         77
+User I/O                     13860         52
+Other                        19811         27
+Application                    128          7
+Commit                         109          5
+Concurrency                     75          2
+Administrative                 109          1
+
+-- 해석(주의): 이 값들은 인스턴스 기동 이후 '누적'이라 학습자 환경과 반드시 다르다.
+--   누적 상위는 Network → System I/O → User I/O 순이지만, 이것을 그대로
+--   '이 시스템의 병목은 네트워크다'라고 읽으면 안 된다(다음 [3] 참조).
+
+--------------------------------------------------------------------------------
+-- [3] (재확인) 누적 순위와 '구간 델타' 순위는 다를 수 있다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 특정 부하 구간의 병목을 지목하려면 클래스별로도 델타를 봐야 한다.
+SYS@orcl> -- 부하 직전(T0)과 직후(T1)에 같은 집계를 떠서 그 차이를 본다.
+SYS@orcl> -- (개념 예시. WL_06_mixed.sql이 대기 클래스 델타를 스스로 출력한다.)
+SYS@orcl> SELECT wait_class, ROUND(time_waited/100) sec_now
+  2       FROM v$system_wait_class WHERE wait_class <> 'Idle'
+  3       ORDER BY time_waited DESC FETCH FIRST 3 ROWS ONLY;   -- (T1 예)
+
+WAIT_CLASS             SEC_NOW
+---------------------- ----------
+Network                <환경값>
+System I/O             <환경값>
+User I/O               <환경값>
+
+-- 재확인 포인트: 구간 델타(= T1 - T0)에서 DB Time 대비 비중이 큰 클래스가
+--   그 구간의 병목이다. 누적 1위(Network)가 구간 델타에서는 상위가 아닐 수 있다.
+
+--------------------------------------------------------------------------------
+-- [4] (조회) 특정 세션이 기다린 이벤트로 대기의 실체를 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN event FORMAT A30
+SYS@orcl> SELECT event, total_waits, ROUND(time_waited_micro/1000) ms
+  2       FROM  v$session_event
+  3       WHERE sid = <내SID> AND wait_class <> 'Idle'
+  4       ORDER BY time_waited_micro DESC;
+
+EVENT                          TOTAL_WAITS         MS
+------------------------------ ----------- ----------
+db file scattered read                 120         65
+db file sequential read                 12         17
+log file sync                            1          0
+SQL*Net message to client               12          0
+
+-- 해석: 클래스(User I/O) 아래의 실제 이벤트는 db file scattered read다. 클래스로
+--   방향을 좁히고, 이벤트로 실체를 확인한 뒤, 세그먼트·SQL로 원인을 추적한다(13·14장).
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 대기 클래스 집계는 항상 Idle을 제외한다(SQL*Net message from client는 유휴).
+-- 2) 실측 상위(누적): Network 358초 / System I/O 77초 / User I/O 52초 — 누적이라 참고만.
+-- 3) 구간 병목은 누적이 아니라 델타로, DB Time 비중과 함께 지목한다.
+-- 4) 대기는 증상이다. 클래스 → 이벤트 → 세그먼트·SQL로 좁혀 원인을 찾는다.
+-- ※ V$SYSTEM_WAIT_CLASS·V$SESSION_EVENT 조회는 라이선스가 필요 없다.
+
+SYS@orcl> EXIT
+================================================================================

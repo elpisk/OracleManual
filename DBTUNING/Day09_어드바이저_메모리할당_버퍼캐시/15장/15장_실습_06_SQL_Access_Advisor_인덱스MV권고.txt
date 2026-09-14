@@ -1,0 +1,128 @@
+================================================================================
+ 15장 실습 06 — SQL Access Advisor: 인덱스·구체화 뷰 권고와 채택 판단
+ 목표: DBMS_ADVISOR로 SQL Access Advisor를 실행해 인덱스/MV 권고와 DDL
+       스크립트를 확인한다. 실습 04의 '단일 문장'과 달리 워크로드 관점의
+       종합 권고가 왜 더 나은지 이해하고, 채택 판단 기준을 정리한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행, 대상은 SQLT 스키마)
+ 라이선스(🔒): SQL Access Advisor는 Tuning Pack이 필요하다(Diagnostics 선행).
+ 주의: 권고 DDL은 '확인'만 한다. 실제 인덱스/MV는 만들지 않는다.
+       MEDICAL_CLAIMS는 PK만 있는 Before 상태를 유지한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LONG 100000 LINESIZE 130 PAGESIZE 0
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전) 대상 테이블의 현재 인덱스를 확인한다 — PK만 있다(Before 상태).
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN index_name FORMAT A24
+SYS@orcl> SELECT index_name, uniqueness FROM dba_indexes
+  2       WHERE owner='SQLT' AND table_name='MEDICAL_CLAIMS';
+
+INDEX_NAME               UNIQUENESS
+------------------------ ----------
+PK_MEDICAL_CLAIMS        UNIQUE
+
+-- 해석: 인덱스가 PK 하나뿐이다. 선택 조건 SQL은 전체 스캔할 수밖에 없다(실습 04).
+
+--------------------------------------------------------------------------------
+-- [2] 간편 실행: QUICK_TUNE으로 단일 SQL에 대한 액세스 권고를 받는다.
+--------------------------------------------------------------------------------
+SYS@orcl> VAR sql VARCHAR2(300)
+SYS@orcl> EXEC :sql := 'select claim_id, total_amt from sqlt.medical_claims '|| -
+>   'where hosp_id=777 and receipt_date=date ''2024-06-15''';
+SYS@orcl> EXEC DBMS_ADVISOR.QUICK_TUNE( -
+>   advisor_name => DBMS_ADVISOR.SQLACCESS_ADVISOR, -
+>   task_name    => 'QT_CLAIMS', -
+>   attr1        => :sql);
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 권고 DDL 스크립트를 확인한다(적용하지 않는다).
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT DBMS_ADVISOR.GET_TASK_SCRIPT('QT_CLAIMS') FROM dual;
+
+Rem  SQL Access Advisor: Version ...
+Rem  Username:        SYS
+Rem  Repository:      ...
+Rem  Recommendation actions
+CREATE INDEX "SQLT"."MEDICAL_CLAIMS_IDX$1"
+    ON "SQLT"."MEDICAL_CLAIMS" ("HOSP_ID","RECEIPT_DATE","CLAIM_ID","TOTAL_AMT")
+    COMPUTE STATISTICS;
+
+-- 해석: 단일 SQL로 QUICK_TUNE을 돌리면, 실습 04에서 SQL Tuning Advisor가 낸 것과
+--   사실상 같은 좁은 인덱스 권고가 나온다. 단일 문장이므로 유지 비용·중복까지는
+--   고려되지 않는다. Access Advisor의 진가는 '워크로드'를 줄 때 나온다(→ [4]).
+
+--------------------------------------------------------------------------------
+-- [4] 워크로드 관점 — 여러 SQL을 담은 STS를 워크로드로 주는 정식 흐름(개념).
+--------------------------------------------------------------------------------
+SYS@orcl> -- (개념 예시) STS를 만들고, 대표 SQL 집합을 채운 뒤 태스크에 연결한다.
+SYS@orcl> --   DBMS_ADVISOR.CREATE_TASK('SQL Access Advisor','ACC_TASK');
+SYS@orcl> --   DBMS_ADVISOR.ADD_STS_REF('ACC_TASK','SYS','CLAIMS_STS');
+SYS@orcl> --   DBMS_ADVISOR.SET_TASK_PARAMETER('ACC_TASK','ANALYSIS_SCOPE','ALL');
+SYS@orcl> --      -- ALL = INDEX, MVIEW, PARTITION 모두 고려
+SYS@orcl> --   DBMS_ADVISOR.EXECUTE_TASK('ACC_TASK');
+-- 워크로드 기반이면 인덱스들이 서로 겹치지 않게 통합하고, 인덱스 유지 오버헤드와
+-- 추가 공간까지 계산한 '종합' 권고(인덱스+구체화 뷰+파티셔닝)를 준다.
+
+--------------------------------------------------------------------------------
+-- [5] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 권고 스크립트를 조회하는데 태스크 이름을 오타로 넣어 오류가 난다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT DBMS_ADVISOR.GET_TASK_SCRIPT('QT_CLAIMSS') FROM dual;
+SELECT DBMS_ADVISOR.GET_TASK_SCRIPT('QT_CLAIMSS') FROM dual
+       *
+ERROR at line 1:
+ORA-13605: The specified task or object QT_CLAIMSS does not exist for the
+current user.
+ORA-06512: at "SYS.PRVT_ADVISOR", line 2892
+
+SYS@orcl> -- 원인 파악: 'QT_CLAIMSS'라는 태스크가 없다(실제는 QT_CLAIMS).
+SYS@orcl> SELECT task_name, advisor_name FROM dba_advisor_tasks
+  2       WHERE task_name LIKE 'QT_CLAIM%';
+
+TASK_NAME       ADVISOR_NAME
+--------------- --------------------
+QT_CLAIMS       SQL Access Advisor
+
+SYS@orcl> -- 조치: 올바른 이름 'QT_CLAIMS'로 다시 조회하면 정상이다(위 [3]).
+SYS@orcl> -- 재확인 완료.
+
+--------------------------------------------------------------------------------
+-- [6] (채택 판단 체크리스트)
+--------------------------------------------------------------------------------
+-- □ 기존 인덱스와 선두 컬럼이 겹치는 중복 인덱스가 아닌가.
+-- □ 대상 테이블의 쓰기(INSERT/UPDATE/DELETE) 빈도는 어떤가(쓰기 잦으면 유지 비용↑).
+-- □ MV 권고라면 갱신 주기·정합성 요구와 맞는가(신선도 ↔ 공간 트레이드오프).
+-- □ 단일 SQL이 아니라 대표 워크로드로 돌렸는가.
+-- □ 테스트 환경에서 먼저 적용하고 같은 워크로드로 before/after를 측정했는가.
+
+--------------------------------------------------------------------------------
+-- [7] (정리) 태스크를 삭제한다. 인덱스/MV는 만들지 않았다(Before 상태 유지).
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_ADVISOR.DELETE_TASK('QT_CLAIMS');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT COUNT(*) idx_cnt FROM dba_indexes
+  2       WHERE owner='SQLT' AND table_name='MEDICAL_CLAIMS';
+
+   IDX_CNT
+----------
+         1
+
+-- 재확인: 인덱스는 여전히 PK 1개. Before 상태가 보존됐다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) SQL Access Advisor는 워크로드 관점에서 인덱스·MV·파티셔닝을 권고한다(🔒 Tuning).
+-- 2) QUICK_TUNE(단일 SQL)은 좁은 권고, STS 워크로드는 유지 비용까지 고려한 종합 권고.
+-- 3) GET_TASK_SCRIPT로 DDL을 확인만 하고 적용하지 않는다. 태스크 오타는 ORA-13605.
+-- 4) 채택은 중복·쓰기 빈도·공간·워크로드 대표성을 확인하고 테스트 후 판정한다.
+
+SYS@orcl> EXIT
+================================================================================

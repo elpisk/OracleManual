@@ -1,0 +1,123 @@
+================================================================================
+ 13장 실습 01 — 실시간 진단 경로: 세션 → 대기 → SQL → 세그먼트
+ 목표: 활성 세션에서 출발해 무엇을 기다리는지(대기), 어떤 문장인지(SQL),
+       어느 객체인지(세그먼트) 순서로 병목을 좁힌다. 'ACTIVE인데 대기가
+       Idle뿐'을 병목으로 오판하는 흐름을 재현하고, 걸러 내는 법을 익힌다.
+ 환경: non-CDB=orcl 19.3 (진단 조회는 SYS AS SYSDBA로 수행)
+ 부하: 다른 세션에서 WL_06_mixed.sql(종합 부하)을 돌리는 동안 실시간 관측.
+ 주의: 개인 실습 환경 전용. 진단 조회는 읽기 전용이다. V$ 조회는 라이선스 불필요.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 진단의 출발점 = 지금 활성인 사용자 세션.
+--     status='ACTIVE'인 SQLT 세션이 무엇을 물고 무엇을 기다리는지 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sid, status, SUBSTR(event,1,30) event,
+  2         wait_class, SUBSTR(sql_id,1,13) sql_id
+  3       FROM  v$session
+  4       WHERE username='SQLT' AND status='ACTIVE';
+
+SID STATUS   EVENT                          WAIT_CLASS SQL_ID
+--- -------- ------------------------------ ---------- -------------
+692 ACTIVE   SQL*Net message from client    Idle       9vmszgd1ft9x0
+694 ACTIVE   SQL*Net message from client    Idle       9vmszgd1ft9x0
+
+-- 해석: 두 세션이 ACTIVE지만 마지막 대기가 SQL*Net message from client이고
+--   대기 클래스가 Idle이다. 캡처 순간 서버가 클라이언트의 다음 명령을
+--   기다린 것뿐이다. 다만 두 세션 모두 최근 SQL_ID 9vmszgd1ft9x0을 실행했다.
+--   → 이 SQL_ID가 다음 칸으로 갈 실마리다.
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 대기가 전부 Idle이라 신입 엔지니어가 "네트워크가 병목"이라며
+--       회선 증설을 요청한다. 정말 병목인가?
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: Idle 대기는 '자원 경합'이 아니라 '할 일 없음'이다.
+SYS@orcl> -- 실제 자원을 경합하는 세션이 있는지 wait_class로 걸러 재조회한다.
+SYS@orcl> SELECT sid, SUBSTR(event,1,30) event, wait_class,
+  2         seconds_in_wait secs
+  3       FROM  v$session_wait
+  4       WHERE wait_class <> 'Idle'
+  5       ORDER BY seconds_in_wait DESC;
+
+SID EVENT                          WAIT_CLASS       SECS
+--- ------------------------------ ---------- ----------
+711 db file scattered read         User I/O            2
+708 db file scattered read         User I/O            1
+
+-- 원인 확정: 네트워크 대기가 아니라 User I/O(db file scattered read)가
+--   실제 병목 후보다. scattered read = 다중 블록 읽기 = 대개 풀 스캔.
+--   → 조치 방향은 회선 증설이 아니라 '풀 스캔하는 SQL'을 찾는 것.
+-- 조치: Idle을 걸러 낸 이 결과를 들고 SQL 칸으로 넘어간다.
+-- 재확인: 회선 증설 요청은 근거가 없으므로 보류한다(아래 [5]에서 최종 확인).
+
+--------------------------------------------------------------------------------
+-- [3] (조회) SQL 칸 — 어느 문장이 원인인가. buffer_gets 상위로 정렬한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sql_id, executions execs, buffer_gets,
+  2         ROUND(buffer_gets/GREATEST(executions,1)) per_exec,
+  3         SUBSTR(sql_text,1,40) txt
+  4       FROM (SELECT sql_id, executions, buffer_gets, sql_text
+  5             FROM   v$sql
+  6             WHERE  parsing_schema_name='SQLT'
+  7             ORDER BY buffer_gets DESC)
+  8       WHERE ROWNUM<=3;
+
+SQL_ID        EXECS BUFFER_GETS PER_EXEC TXT
+------------- ----- ----------- -------- ----------------------------------------
+9vmszgd1ft9x0  1290     8494906     6585 select /*+ full(d) */ count(*), sum(d.am
+ddukvcz4gwcad   631     1946786     3085 select hosp_id, count(*), avg(total_amt)
+2hwjffuh4cs8t     2        6188     3094 select count(*) from medical_claims wher
+
+-- 해석: 1위가 세션이 물고 있던 9vmszgd1ft9x0이다. 실행 1,290회에 논리읽기
+--   849만, 실행당 6,585 블록. sql_text에 /*+ full(d) */ 힌트가 보인다.
+--   → 인덱스를 두고 강제 풀 스캔 → scattered read 대기의 원인과 일치한다.
+--   대기 칸([2])과 SQL 칸([3])이 서로를 확인해 준다.
+
+--------------------------------------------------------------------------------
+-- [4] (조회) 세그먼트 칸 — 그 문장이 어느 객체를 두드리는가.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM (
+  2         SELECT object_name, statistic_name, value
+  3         FROM   v$segment_statistics
+  4         WHERE  owner='SQLT' AND statistic_name='logical reads'
+  5         ORDER BY value DESC)
+  6       WHERE ROWNUM<=3;
+
+OBJECT_NAME              STATISTIC_NAME        VALUE
+------------------------ --------------- -----------
+MEDICAL_CLAIMS           logical reads       <환경값>
+CLAIM_DETAILS            logical reads       <환경값>
+PK_MEDICAL_CLAIMS        logical reads       <환경값>
+
+-- 해석: MEDICAL_CLAIMS가 세그먼트 논리읽기 1위다(값은 부하·시점에 따라
+--   달라지는 <환경값>이므로 순위와 대소로 판정한다). 9vmsz…의 /*+ full(d) */가
+--   이 테이블을 풀 스캔한다는 사실이 세그먼트 통계로도 확인된다.
+--   → 세션→대기→SQL→세그먼트가 한 줄의 인과로 꿰였다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치 후 상태) 네 칸이 가리키는 조치와 재확인.
+--------------------------------------------------------------------------------
+-- * 원인 문장: 9vmszgd1ft9x0 의 /*+ full(d) */ 강제 풀 스캔.
+-- * 조치: 힌트를 제거해 기존 인덱스를 타게 한다(SQL 소유 개발팀에 인계).
+-- * 재확인(개념): 조치 후 같은 SQL_ID의 per_exec(buffer_gets/executions)가
+--     크게 줄고, V$SESSION_WAIT의 db file scattered read가 사라지는지 본다.
+-- * [2]에서 제기된 '네트워크 병목'은 오판이었다 → 회선 증설 요청 최종 기각.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 진단은 활성 세션이라는 좁은 입구에서 시작한다(통계부터 훑지 않는다).
+-- 2) ACTIVE라도 대기가 Idle이면 병목이 아니다 — wait_class<>'Idle'로 거른다.
+-- 3) 대기(scattered read) → SQL(full 힌트) → 세그먼트(MEDICAL_CLAIMS)가
+--    서로를 확인하며 조치 대상까지 한 줄로 이어졌다.
+-- 4) 값이 환경에 따라 다른 것은 <환경값>으로 두고 순위·대소로 판정한다.
+-- ※ 이 실습의 모든 조회는 관리 팩 라이선스가 필요 없다(V$ 실시간 조회).
+
+SYS@orcl> EXIT
+================================================================================

@@ -1,0 +1,143 @@
+================================================================================
+ 10장 실습 06 — AWR로는 안 보이고 ASH로만 보이는 짧은 스파이크 재현
+ 목표: 짧은(수 분) 부하를 만들어, 넓은 AWR 구간에는 희석돼 안 보이던 스파이크가
+       구간을 좁힌 ASH에는 선명히 드러남을 재현한다. 'AWR에 없음 = 문제 없음'
+       이라는 오판을 교정한다.
+ 환경: non-CDB=orcl 19.3 (진단 SYS AS SYSDBA / 부하 SQLT@orcl)
+ 라이선스: 🔒 Diagnostics Pack 필요. 미보유 시 대안은 실습 후반 [6] 참조.
+ 부하: 공용 부하 스크립트(WL 계열)로 약 100초 CPU 부하를 만든다.
+ 주의: 개인 실습 환경 전용. 부하 유발이 포함된다. 원본 데이터는 훼손하지 않는다.
+================================================================================
+
+-- [별도 터미널 B] 업무 계정으로 짧은 부하를 건다(약 100초).
+$ sqlplus sqlt/****@orcl
+SQLT@orcl> -- 리터럴 하드파싱 + 대량 스캔으로 CPU를 태우는 공용 부하 실행
+SQLT@orcl> @?/../부하스크립트/WL_06_mixed.sql
+... (약 100초간 CPU 부하 유발 후 종료) ...
+
+-- [터미널 A] 진단 계정으로 관찰한다.
+$ sqlplus / as sysdba
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 넓은 구간(최근 60분)의 상위 대기를 본다 — AWR 관점 흉내.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT NVL(event,'ON CPU') AS event,
+  2         ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS pct
+  3       FROM  v$active_session_history
+  4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '60' MINUTE
+  5       GROUP BY NVL(event,'ON CPU') ORDER BY pct DESC FETCH FIRST 4 ROWS ONLY;
+
+EVENT                              PCT
+--------------------------------- -----
+ON CPU                             41.5
+db file sequential read           10.2
+log file sync                       6.8
+control file parallel write         5.1
+
+-- 해석: 60분 평균으로는 ON CPU가 41.5%로 밋밋하다. 100초짜리 스파이크가
+--   3,600초 안에서 평균에 희석됐다. AWR 보고서였다면 '특이사항 없음'으로
+--   보였을 것이다 — 이것이 짧은 문제가 AWR에 안 보이는 이유다.
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 사용자는 "방금 잠깐 화면이 멎었다"는데, 위 60분 조회로는
+--       병목이 안 보인다. 신입 DBA가 "문제 없음"으로 종결하려 한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: 구간이 너무 넓어 스파이크가 희석됐을 가능성을 의심한다.
+SYS@orcl> --   부하가 걸린 최근 2분만 좁혀 다시 본다.
+SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS samples,
+  2         ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS pct
+  3       FROM  v$active_session_history
+  4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
+  5       GROUP BY NVL(event,'ON CPU') ORDER BY samples DESC FETCH FIRST 4 ROWS ONLY;
+
+EVENT                              SAMPLES   PCT
+--------------------------------- -------- -----
+ON CPU                                 529  90.7
+log file sync                           17   2.9
+log file parallel write                 14   2.4
+db file sequential read                 10   1.7
+
+-- 원인 확정: 최근 2분만 보니 ON CPU가 90.7%로 치솟는다. 스파이크는 실재했고,
+--   60분 평균에 묻혔을 뿐이다. 'AWR에 안 보임'은 '문제 없음'이 아니다.
+-- 조치: 문제가 난 그 구간만 좁혀(ashrpt.sql begin_time·duration) 분석한다.
+
+SYS@orcl> -- 재확인: 시간 슬롯(분 단위)으로 어느 1분에 몰렸는지 skew를 본다.
+SYS@orcl> SELECT TO_CHAR(sample_time,'HH24:MI') AS slot, COUNT(*) AS slot_count,
+  2         SUM(CASE WHEN session_state='ON CPU' THEN 1 END) AS on_cpu
+  3       FROM  v$active_session_history
+  4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '4' MINUTE
+  5       GROUP BY TO_CHAR(sample_time,'HH24:MI') ORDER BY slot;
+
+SLOT   SLOT_COUNT   ON_CPU
+----- ----------- --------
+12:14           3        1
+12:15         198      181
+12:16         241      219
+12:17         143      129
+
+-- 재확인 완료: 12:15~12:17에 Slot Count가 급등(3 → 241)했다. 스파이크가 그
+--   구간에 몰렸음이 명확하다. Slot Count 급등 = 활성 세션(워크로드) 증가이며,
+--   ON CPU가 대부분이라 스파이크의 정체는 CPU를 태우는 SQL이다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 스파이크 구간의 원인 SQL을 지목한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sql_id, COUNT(*) AS samples
+  2       FROM  v$active_session_history
+  3       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
+  4         AND sql_id IS NOT NULL
+  5       GROUP BY sql_id ORDER BY samples DESC FETCH FIRST 2 ROWS ONLY;
+
+SQL_ID          SAMPLES
+------------- ----------
+9vmszgd1ft9x0        186
+43fd4b2pxfzvm        154
+
+-- 해석: 상위 두 SQL이 스파이크를 만들었다. 이 부하는 리터럴 하드파싱+대량 스캔
+--   조합이라, 9장 ADDM의 Hard Parse Due to Literal Usage 진단과 같은 현상이다.
+
+--------------------------------------------------------------------------------
+-- [4] (해석) 왜 AWR은 못 보고 ASH는 봤나 — 정리.
+--------------------------------------------------------------------------------
+-- * AWR/ADDM은 스냅샷 구간(기본 1시간)을 평균·합계로 본다 → 100초 스파이크는
+--   구간 비중이 작아 severity가 희석되거나 상위 이벤트에 안 뜬다.
+-- * ASH는 1초 원본 샘플을 보관 → 문제 구간만 잘라 그 안의 스파이크를 그대로 본다.
+-- * 순서: AWR/ADDM으로 큰 그림 → 의심 시각을 ASH로 좁혀 확대(안전한 진단 흐름).
+
+--------------------------------------------------------------------------------
+-- [5] (되돌리기) 부하로 생성된 임시 객체 정리(공용 스크립트 규약).
+--------------------------------------------------------------------------------
+-- * WL_06_mixed.sql은 복제 테이블(*_WL)에서만 DML을 수행하고 스크립트 끝에서
+--   정리한다. 원본 진료비 스키마 데이터는 훼손되지 않는다. 추가 잔재가 있으면
+--   해당 *_WL 객체를 DROP 한다(스크립트 되돌리기 절 참조).
+
+--------------------------------------------------------------------------------
+-- [6] (라이선스 대안 경로) ASH 없이 스파이크를 잡으려면.
+--------------------------------------------------------------------------------
+SYS@orcl> -- Diagnostics Pack이 없으면, V$SESSION을 부하 의심 시간대에 1초마다
+SYS@orcl> -- 폴링해 이력 테이블에 적재한 뒤, 분 단위로 GROUP BY 해 Slot Count의
+SYS@orcl> -- 급등을 찾으면 같은 skew 분석을 할 수 있다. 관건은 '스파이크가 일어난
+SYS@orcl> -- 그 시간대에 폴링이 돌고 있었는가'다. 사후 소급은 불가하므로, 짧은
+SYS@orcl> -- 스파이크가 의심되면 상시 폴링을 켜 두어야 한다(자동 보존이 없는 한계).
+SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS active_now
+  2       FROM  v$session WHERE status='ACTIVE' AND wait_class<>'Idle'
+  3       GROUP BY NVL(event,'ON CPU') ORDER BY active_now DESC;
+
+EVENT                             ACTIVE_NOW
+--------------------------------- ----------
+ON CPU                                     5
+log file sync                              1
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 짧은 스파이크는 넓은 구간 평균(AWR)에 희석돼 '문제 없음'처럼 보인다.
+-- 2) 구간을 좁힌 ASH에서는 ON CPU 90.7%로 스파이크가 선명히 드러난다.
+-- 3) 시간 슬롯 Slot Count 급등으로 어느 1분에 몰렸는지(skew)를 짚는다.
+-- 4) 라이선스가 없으면 의심 시간대에 V$SESSION을 상시 폴링해 적재해야 한다.
+
+SYS@orcl> EXIT
+================================================================================

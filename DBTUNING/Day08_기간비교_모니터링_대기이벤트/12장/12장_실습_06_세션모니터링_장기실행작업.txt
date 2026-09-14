@@ -1,0 +1,109 @@
+================================================================================
+ 12장 실습 06 — 세션 모니터링 · 장기 실행 작업(V$SESSION_LONGOPS)
+ 목표: 활성 세션을 'work vs wait'로 가르고, 장기 실행 작업의 진척과
+       남은 시간을 V$SESSION_LONGOPS로 확인한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA)
+ 라이선스: V$ 조회는 기본 기능(라이선스 무관).
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 활성 세션을 대기 이벤트로 묶는다 — 지금 병목의 성격.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT NVL(event,'ON CPU') event, COUNT(*) sessions
+  2       FROM  v$session
+  3       WHERE status='ACTIVE' AND type='USER'
+  4         AND sid <> USERENV('SID')
+  5       GROUP BY NVL(event,'ON CPU') ORDER BY sessions DESC;
+
+EVENT                                    SESSIONS
+---------------------------------------- --------
+ON CPU                                        <환경값>
+db file sequential read                       <환경값>
+
+-- 해석: event가 'ON CPU'면 바빠서 활성(work) = 용량 문제 쪽,
+--   특정 대기에 몰리면 기다려서 활성(wait) = 경합 문제 쪽. 이 둘을 먼저 가른다.
+--   부하가 없으면 행이 없을 수 있다(정상).
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 장기 실행 작업의 진척 — V$SESSION_LONGOPS.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT SUBSTR(opname,1,30) opname, sofar, totalwork,
+  2         ROUND(sofar/GREATEST(totalwork,1)*100) pct
+  3       FROM  v$session_longops
+  4       WHERE rownum <= 6;
+
+OPNAME                          SOFAR  TOTALWORK  PCT
+------------------------------ ------- ---------- ----
+RMAN: incremental datafile bac  120320     120320  100
+RMAN: incremental datafile bac  104922     104922  100
+RMAN: incremental datafile bac  115200     115200  100
+RMAN: incremental datafile bac   91945      91945  100
+RMAN: incremental datafile bac  264800     264800  100
+RMAN: incremental datafile bac  219725     219725  100
+
+-- 해석: 모든 행 SOFAR=TOTALWORK → 진행률 100% = 이미 완료된 백업이 잠시 남은 것.
+--   LONGOPS 행은 작업이 끝나도 잠시 유지된다. '진행 중'이 아니다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) '진행 중'만 골라 남은 시간을 본다 — sofar < totalwork.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sid, SUBSTR(opname,1,26) opname,
+  2         ROUND(sofar/GREATEST(totalwork,1)*100) pct,
+  3         elapsed_seconds elapsed, time_remaining remain, sql_id
+  4       FROM  v$session_longops
+  5       WHERE sofar < totalwork
+  6       ORDER BY time_remaining DESC;
+
+  SID OPNAME                     PCT ELAPSED REMAIN SQL_ID
+----- -------------------------- --- ------- ------ -------------
+ <환경값> Table Scan                  <환경값> <환경값>  <환경값> <환경값>
+
+-- 해석: 진행 중 작업만 남는다. TIME_REMAINING으로 완료 예정 시각을 계산한다.
+--   SQL_ID로 어떤 SQL이 이 작업을 유발했는지 추적할 수 있다.
+--   주의: TIME_REMAINING은 현재 속도 유지 가정의 추정치라 후반 I/O 몰림엔 낙관적.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: '오후에 느리다' 신고. 장기 작업(백업)이 업무 시간에 돌았다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: RMAN 증분 백업은 대량 물리 I/O를 유발한다.
+SYS@orcl> --   백업 창이 업무 피크와 겹치면 db file 계열 대기가 늘어 전반이 느려진다.
+SYS@orcl> SELECT TO_CHAR(start_time,'HH24:MI') started,
+  2         SUBSTR(opname,1,26) opname
+  3       FROM  v$session_longops
+  4       WHERE opname LIKE 'RMAN%'
+  5       ORDER BY start_time DESC FETCH FIRST 3 ROWS ONLY;
+
+STARTED OPNAME
+------- --------------------------
+14:10   RMAN: incremental datafile
+14:02   RMAN: incremental datafile
+
+-- 조치: 백업 창을 업무 저부하 시간대로 옮기거나, 병렬도·속도를 제한한다.
+--   (스케줄 조정은 DBA와 협의. 여기서는 원인 지목까지 수행.)
+SYS@orcl> -- 재확인: 다음 날 같은 시간대의 Wait Ratio가 내려갔는지 대조한다.
+SYS@orcl> SELECT ROUND(value,2) wait_ratio_now FROM v$sysmetric
+  2       WHERE metric_name='Database Wait Time Ratio'
+  3         AND intsize_csec BETWEEN 5900 AND 6100;
+
+WAIT_RATIO_NOW
+--------------
+          <환경값>
+
+-- 재확인: 백업이 없는 시간대에는 Wait Ratio가 평시(≈3.2%) 수준으로 돌아온다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 활성 세션은 work(ON CPU)와 wait(대기)로 가른다 — 용량 vs 경합.
+-- 2) LONGOPS의 PCT=100은 완료된 잔여 행. 진행 중은 sofar<totalwork로 본다.
+-- 3) TIME_REMAINING으로 완료 예정을 답하되, 추정치임을 감안한다.
+-- 4) 대량 작업이 업무 시간과 겹치면 그 자체가 부하 원인 — 스케줄을 점검한다.
+
+SYS@orcl> EXIT
+================================================================================

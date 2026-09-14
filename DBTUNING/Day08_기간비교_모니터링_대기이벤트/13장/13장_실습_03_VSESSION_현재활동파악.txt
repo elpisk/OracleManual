@@ -1,0 +1,115 @@
+================================================================================
+ 13장 실습 03 — V$SESSION·V$SESSION_WAIT로 현재 활동 파악
+ 목표: 현재 세션의 상태·대기·블로킹을 읽고, Idle 대기를 걸러 실제 활동을
+       파악한다. Idle 이벤트를 병목으로 오판하는 흐름을 재현하고 교정한다.
+       ROW_WAIT_OBJ#로 경합 객체를 특정하는 법을 익힌다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 부하: 다른 세션에서 WL_06_mixed.sql(종합 부하) 실행 중 실시간 관측.
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회. V$ 조회는 라이선스 불필요.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 현재 세션 수를 상태별로 개관한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT status, COUNT(*) cnt
+  2       FROM  v$session
+  3       WHERE type='USER'
+  4       GROUP BY status;
+
+STATUS          CNT
+-------- ----------
+ACTIVE            4
+INACTIVE         12
+
+-- 해석: ACTIVE 4, INACTIVE 12. INACTIVE는 지금 SQL을 실행하지 않는 세션이다.
+--   진단은 ACTIVE 세션에 집중한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) ACTIVE 세션이 무엇을 물고 무엇을 기다리는지 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sid, username, SUBSTR(event,1,28) event,
+  2         wait_class, SUBSTR(sql_id,1,13) sql_id, blocking_session blk
+  3       FROM  v$session
+  4       WHERE status='ACTIVE' AND type='USER'
+  5       ORDER BY wait_class;
+
+SID USERNAME EVENT                        WAIT_CLASS SQL_ID        BLK
+--- -------- ---------------------------- ---------- ------------- ---
+692 SQLT     SQL*Net message from client  Idle       9vmszgd1ft9x0
+694 SQLT     SQL*Net message from client  Idle       9vmszgd1ft9x0
+711 SQLT     db file scattered read       User I/O   9vmszgd1ft9x0
+708 SQLT     db file scattered read       User I/O   9vmszgd1ft9x0
+
+-- 이상 징후(오판 재현): 목록에 SQL*Net message from client가 보이자
+--   한 엔지니어가 "네트워크 대기 세션이 있다. 회선을 늘리자"고 말한다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인)
+--     원인 파악: 대기를 클래스별로 집계해 Idle과 non-Idle을 가른다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT wait_class, COUNT(*) cnt
+  2       FROM  v$session
+  3       WHERE status='ACTIVE' AND type='USER'
+  4       GROUP BY wait_class
+  5       ORDER BY cnt DESC;
+
+WAIT_CLASS        CNT
+---------- ----------
+Idle                2
+User I/O            2
+
+-- 원인 확정: SQL*Net message from client는 Idle 클래스다. 서버가 클라이언트의
+--   다음 명령을 기다리는 '할 일 없음' 상태로 병목이 아니다. 실제 경합은
+--   User I/O(db file scattered read) 2건이다.
+-- 조치: 진단 대상을 Idle 제외 → non-Idle 세션(711,708)으로 좁힌다.
+-- 재확인: '네트워크 대기'는 오판이었다. 회선 증설 근거 없음.
+
+--------------------------------------------------------------------------------
+-- [4] (조회) V$SESSION_WAIT으로 non-Idle 대기의 세부(P1·P2)를 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sid, SUBSTR(event,1,28) event, p1 file#, p2 block#,
+  2         seconds_in_wait secs
+  3       FROM  v$session_wait
+  4       WHERE wait_class <> 'Idle'
+  5       ORDER BY seconds_in_wait DESC;
+
+SID EVENT                          FILE#     BLOCK#       SECS
+--- ------------------------------ ----- ---------- ----------
+711 db file scattered read             7    <환경값>          2
+708 db file scattered read             8    <환경값>          1
+
+-- 해석: db file scattered read는 다중 블록 읽기(대개 풀 스캔)다. P1=파일 번호,
+--   P2=블록 번호로 어느 데이터파일을 읽는지 특정된다(블록 번호는 <환경값>).
+--   → 이 방향(풀 스캔)을 들고 SQL·세그먼트 칸으로 이어 간다(실습 01·04).
+
+--------------------------------------------------------------------------------
+-- [5] (참고) 블로킹이 있는 경우의 확인 경로.
+--------------------------------------------------------------------------------
+SYS@orcl> -- BLOCKING_SESSION이 채워진 세션이 있으면, 잠금 경합을 추적한다.
+SYS@orcl> SELECT sid, blocking_session blk, row_wait_obj# obj#
+  2       FROM  v$session
+  3       WHERE blocking_session IS NOT NULL;
+
+no rows selected
+
+-- 해석: 지금은 블로킹 세션이 없다. 만약 있었다면 ROW_WAIT_OBJ#를 아래처럼
+--   DBA_OBJECTS와 조인해 경합 객체 이름을 얻는다.
+--     SELECT object_name, object_type FROM dba_objects
+--      WHERE object_id = &row_wait_obj;
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 진단은 ACTIVE 세션에 집중한다(INACTIVE는 지금 일하지 않는다).
+-- 2) SQL*Net message from client는 Idle — 병목이 아니다. wait_class로 거른다.
+-- 3) non-Idle 대기(scattered read)의 P1·P2로 대기 대상을 특정한다.
+-- 4) 블로킹이 있으면 BLOCKING_SESSION·ROW_WAIT_OBJ#로 경합 세션·객체를 좁힌다.
+-- ※ 값 중 블록 번호 등은 환경·시점에 따라 다른 <환경값>이다.
+
+SYS@orcl> EXIT
+================================================================================

@@ -1,0 +1,115 @@
+================================================================================
+ 13장 실습 05 — 절대값 오판을 델타·비율로 교정
+ 목표: buffer_gets 절대값 상위만 보고 상위 SQL을 선별하는 오판을 재현하고,
+       ① 실행당 비용 ② 문장 시그니처로 묶기 ③ 하드 파싱 비율로 교정한다.
+       '절대값 기준 상위 SQL 선별'(Common Error)이 왜 진짜 문제를 놓치는지 본다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 부하: WL_01_parse.sql(리터럴 파싱 폭증) + WL_06_mixed.sql을 돌린 뒤 관측.
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회. V$ 조회는 라이선스 불필요.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태 = 오판 재현) buffer_gets 절대값 상위만 뽑아 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sql_id, executions execs, buffer_gets,
+  2         SUBSTR(sql_text,1,40) txt
+  3       FROM (SELECT sql_id, executions, buffer_gets, sql_text
+  4             FROM   v$sql WHERE parsing_schema_name='SQLT'
+  5             ORDER BY buffer_gets DESC)
+  6       WHERE ROWNUM<=2;
+
+SQL_ID        EXECS BUFFER_GETS TXT
+------------- ----- ----------- ----------------------------------------
+9vmszgd1ft9x0  1290     8494906 select /*+ full(d) */ count(*), sum(d.am
+ddukvcz4gwcad   631     1946786 select hosp_id, count(*), avg(total_amt)
+
+-- 오판: "상위 2개(9vmsz, dduk)만 튜닝하면 끝"이라고 결론짓는다.
+--   → 이 결론은 그럴듯하지만 불완전하다. 아래에서 교정한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회 → 이상 징후) 순위표 아래쪽을 마저 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sql_id, executions execs, buffer_gets,
+  2         ROUND(buffer_gets/GREATEST(executions,1)) per_exec,
+  3         SUBSTR(sql_text,1,40) txt
+  4       FROM (SELECT sql_id, executions, buffer_gets, sql_text
+  5             FROM   v$sql WHERE parsing_schema_name='SQLT'
+  6             ORDER BY buffer_gets DESC)
+  7       WHERE ROWNUM BETWEEN 3 AND 8;
+
+SQL_ID        EXECS BUFFER_GETS PER_EXEC TXT
+------------- ----- ----------- -------- ----------------------------------------
+2hwjffuh4cs8t     2        6188     3094 select count(*) from medical_claims wher
+6jwvu6btpjhnu     2        6188     3094 select count(*) from medical_claims wher
+b85cymcwbd1qj     2        6188     3094 select count(*) from medical_claims wher
+13ywm87qcw0by     2        6180     3090 select count(*) from medical_claims wher
+fq4sycqx841ht     2        6180     3090 select count(*) from medical_claims wher
+fxj7b9gx2w1ay     2        6180     3090 select count(*) from medical_claims wher
+
+-- 이상 징후: sql_text가 모두 'select count(*) from medical_claims where ...'로
+--   사실상 같은데 SQL_ID가 여섯 개로 갈라졌다. 각각은 작아 보여(6,188) 절대값
+--   순위표에서 무시되기 쉽다. 하지만 정말 무시해도 되는가?
+
+--------------------------------------------------------------------------------
+-- [3] (원인 파악) 문장 시그니처로 묶어 합산 부하를 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT force_matching_signature sig, COUNT(*) child_cnt,
+  2         SUM(executions) tot_execs, SUM(buffer_gets) tot_gets
+  3       FROM  v$sql
+  4       WHERE parsing_schema_name='SQLT'
+  5         AND sql_text LIKE 'select count(*) from medical_claims%'
+  6       GROUP BY force_matching_signature
+  7       ORDER BY tot_gets DESC;
+
+SIG                   CHILD_CNT  TOT_EXECS   TOT_GETS
+--------------------- --------- ---------- ----------
+ 14738201956... <환경값>      6         12      37112
+
+-- 원인 확정: FORCE_MATCHING_SIGNATURE로 묶으면 리터럴만 다른 여섯 문장이
+--   하나의 시그니처로 합쳐진다. 개별로는 6,188씩이라 작아 보였지만, 이들은
+--   '같은 문장'이며 매번 하드 파싱을 일으킨 주범이다. 절대값 순위표는 이
+--   '공유되지 못하는 다발'을 보여 주지 못한다.
+
+--------------------------------------------------------------------------------
+-- [4] (해석) 하드 파싱 비율로 시스템 전역 영향을 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value FROM v$sysstat
+  2       WHERE name IN ('parse count (hard)','parse count (total)');
+
+NAME                             VALUE
+------------------------------ ---------
+parse count (hard)                112198
+parse count (total)               185227
+
+-- 하드 파싱 비율 = 112,198 / 185,227 ≈ 0.606 → 60.6% (비정상적으로 높음)
+-- 해석: [2]~[3]의 리터럴 SQL 다발이 이 60.6%를 만든다. buffer_gets 절대값
+--   1·2위를 튜닝해도 이 하드 파싱이 만든 공유 풀·라이브러리 캐시 래치 경합은
+--   그대로 남아, 피크 성능은 크게 나아지지 않는다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치 → 재확인) 교정된 결론.
+--------------------------------------------------------------------------------
+-- * 조치 1: 9vmsz…의 강제 풀 스캔 힌트 제거(진짜 무거운 개별 문장).
+-- * 조치 2: 리터럴 SQL 다발은 바인드 변수화(또는 CURSOR_SHARING 검토)로
+--     커서를 공유시켜 하드 파싱을 없앤다.
+-- * 재확인(개념): 조치 후 (a) 하드 파싱 비율(hard/total)이 크게 낮아지고,
+--     (b) 같은 시그니처의 child_cnt가 1로 수렴하며,
+--     (c) 초당 하드 파싱·라이브러리 캐시 래치 대기가 감소하는지 델타로 확인.
+-- → '절대값 → 실행당 → 시그니처 → 파싱 비율'의 순서로 오판이 교정되었다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) buffer_gets 절대값 상위만 보면 순위표 아래 흩어진 리터럴 SQL을 놓친다.
+-- 2) FORCE_MATCHING_SIGNATURE로 묶으면 '같은 문장의 다발'이 드러난다.
+-- 3) 하드 파싱 비율 60.6%가 그 다발이 만든 시스템 전역 문제를 증명한다.
+-- 4) 교정 원칙: 절대값 → 실행당 비용 → 문장 시그니처 → 파생 비율.
+-- ※ 시그니처 값 등은 환경·시점에 따라 다른 <환경값>이다. 판정 절차가 핵심이다.
+
+SYS@orcl> EXIT
+================================================================================

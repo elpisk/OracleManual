@@ -1,0 +1,113 @@
+================================================================================
+ 16장 실습 01 — 현재 메모리 관리 방식 판별(AMM / ASMM / 수동)과 관련 파라미터 확인
+ 목표: 핵심 초기화 파라미터를 읽어 이 인스턴스의 메모리 관리 방식을 판정한다.
+       ① MEMORY_TARGET ② SGA_TARGET ③ 개별 풀 파라미터의 값 조합으로 판별한다.
+       실제 배분(V$SGAINFO·V$SGA_DYNAMIC_COMPONENTS)이 파라미터와 다를 수 있음을 본다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행), 조회 위주.
+ 주의: 이 실습은 조회만 한다. 파라미터 변경·재기동은 실습 02·03·05에서 개인 환경 전용.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 아직 이 DB의 메모리 관리 방식을 모른다. 핵심 파라미터부터 읽는다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, display_value FROM v$parameter
+  2       WHERE name IN ('memory_target','memory_max_target',
+  3         'sga_target','sga_max_size','pga_aggregate_target',
+  4         'pga_aggregate_limit','db_cache_size','shared_pool_size')
+  5       ORDER BY name;
+
+NAME                   DISPLAY_VALUE
+---------------------- --------------
+db_cache_size          0
+memory_max_target      0
+memory_target          0
+pga_aggregate_limit    2G
+pga_aggregate_target   700M
+sga_max_size           2G
+sga_target             1504M
+shared_pool_size       0
+
+--------------------------------------------------------------------------------
+-- [2] (판정) 판별 규칙에 대입한다.
+--------------------------------------------------------------------------------
+-- 규칙 ① MEMORY_TARGET > 0            → AMM
+-- 규칙 ② MEMORY_TARGET=0, SGA_TARGET>0 → ASMM
+-- 규칙 ③ MEMORY_TARGET=0, SGA_TARGET=0 → 수동
+--
+-- 대입: memory_target=0 → AMM 아님.
+--       sga_target=1504M(>0) → ASMM 확정.
+-- 결론: 이 인스턴스는 ASMM(자동 공유 메모리 관리)이다.
+--       SGA는 SGA_TARGET(1504M)로, PGA는 PGA_AGGREGATE_TARGET(700M)로 각각 자동 관리.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 → 원인 → 조치 → 재확인) db_cache_size=0을 '버퍼 캐시가 없다'로 오해할 뻔했다.
+--------------------------------------------------------------------------------
+-- * 이상 징후: db_cache_size=0, shared_pool_size=0으로 조회된다.
+--     초심자는 "버퍼 캐시·공유 풀이 0이라 메모리가 없다"고 오해하기 쉽다.
+-- * 원인: ASMM에서 개별 풀 파라미터 0은 '없음'이 아니라 '관리자가 최소 보장치(하한)를
+--     두지 않아 오라클이 SGA_TARGET 안에서 자동 분배한다'는 뜻이다. 파라미터는
+--     '지시'일 뿐, 실제 배분은 다른 뷰로 확인해야 한다.
+-- * 조치: 실제 배분을 V$SGAINFO와 V$SGA_DYNAMIC_COMPONENTS로 확인한다.
+
+SYS@orcl> SELECT name, ROUND(bytes/1024/1024,1) mb, resizeable
+  2       FROM v$sgainfo ORDER BY bytes DESC;
+
+NAME                              MB    RESIZEABLE
+-------------------------------- ------ ----------
+Maximum SGA Size                 2048   No
+Buffer Cache Size                1024   Yes
+Free SGA Memory Available         544
+Shared Pool Size                  416   Yes
+Startup overhead in Shared Pool   249.3 No
+Shared IO Pool Size                64   Yes
+Streams Pool Size                  32   Yes
+Granule Size                       16   No
+Large Pool Size                    16   Yes
+Fixed SGA Size                      8.5 No
+Redo Buffers                        7.5 No
+Data Transfer Cache Size            0   Yes
+In-Memory Area Size                 0   No
+Java Pool Size                      0   Yes
+
+SYS@orcl> SELECT component, ROUND(current_size/1024/1024,1) cur_mb
+  2       FROM v$sga_dynamic_components
+  3       WHERE current_size>0 ORDER BY current_size DESC;
+
+COMPONENT                CUR_MB
+------------------------ -------
+DEFAULT buffer cache      864
+shared pool               416
+Shared IO Pool             64
+KEEP buffer cache          48
+DEFAULT 4K buffer cache    48
+streams pool               32
+large pool                 16
+
+-- * 재확인: 파라미터가 0이어도 버퍼 캐시(Buffer Cache Size 1024MB = DEFAULT 864 +
+--     KEEP 48 + 4K 48 등)와 공유 풀(416MB)이 실제로 배분돼 있다. 오해가 교정됐다.
+--     또한 Maximum SGA(2048) - Free SGA(544) ≈ 1504로 SGA_TARGET과 맞아떨어진다.
+
+--------------------------------------------------------------------------------
+-- [4] (해석) 그래뉼과 자동 조정 대상 구분.
+--------------------------------------------------------------------------------
+-- - Granule Size=16MB: SGA가 1GB를 넘어 그래뉼이 16MB다. 모든 자동 조정은 16의 배수.
+-- - RESIZEABLE=Yes 풀(버퍼 캐시·공유 풀·라지 풀·스트림 풀·자바 풀)이 ASMM 자동 조정 대상.
+-- - RESIZEABLE=No(고정 SGA·리두 버퍼·그래뉼·부팅 오버헤드)는 자동 조정에서 빠진다.
+-- - In-Memory Area Size=0 → In-Memory 옵션(별도 라이선스)은 꺼져 있다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 판별 3규칙에 대입: memory_target=0 + sga_target=1504M → ASMM.
+-- 2) 개별 풀 0은 '없음'이 아니라 '자동 분배(하한 미설정)'이다.
+-- 3) 파라미터(지시)와 실제 배분(V$SGAINFO·동적 구성)은 다를 수 있어 반드시 교차 확인.
+-- 4) SGA는 SGA_TARGET, PGA는 PGA_AGGREGATE_TARGET로 각각 자동 관리되는 ASMM 구성.
+-- ※ 절대값(1504M·2048 등)은 환경에 따라 다른 <환경값>이다. 핵심은 판별·확인 절차다.
+
+SYS@orcl> EXIT
+================================================================================

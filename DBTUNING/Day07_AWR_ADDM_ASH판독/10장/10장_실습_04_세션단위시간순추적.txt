@@ -1,0 +1,135 @@
+================================================================================
+ 10장 실습 04 — 세션 단위 추적: 한 세션이 무엇을 기다렸는지 시간순 재구성
+ 목표: 상위 세션 하나를 골라 SAMPLE_TIME 순으로 상태 변화를 펼쳐, '언제 무엇
+       때문에 멈췄나'를 복원한다. 블로킹이 의심될 때 BLOCKING_SESSION으로
+       역추적하는 절차를 익힌다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 라이선스: 🔒 Diagnostics Pack 필요. 미보유 시 대안은 실습 후반 [5] 참조.
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 추적 대상 세션을 고른다 — 상위 세션 + SERIAL# 확보.
+--     세션 번호는 재사용되므로 SERIAL#를 함께 잡아 다른 접속과 섞이지 않게 한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT session_id, session_serial#, COUNT(*) AS samples
+  2       FROM  v$active_session_history
+  3       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
+  4       GROUP BY session_id, session_serial#
+  5       ORDER BY samples DESC FETCH FIRST 3 ROWS ONLY;
+
+SESSION_ID  SESSION_SERIAL#   SAMPLES
+---------- ---------------- ----------
+        45            41003        128
+        52            38771        121
+        48            52190         99
+
+-- 해석: 세션 45(serial 41003)가 가장 활성 시간이 길었다. 이 세션을 추적한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 세션 45의 10초를 SAMPLE_TIME 순으로 펼친다 — 시간순 재구성.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sample_time, session_state AS st, event, sql_id
+  2       FROM  v$active_session_history
+  3       WHERE session_id=45 AND session_serial#=41003
+  4         AND sample_time BETWEEN TIMESTAMP '2026-08-25 12:16:00'
+  5                             AND TIMESTAMP '2026-08-25 12:16:10'
+  6       ORDER BY sample_time;
+
+SAMPLE_TIME               ST       EVENT                    SQL_ID
+------------------------- -------- ------------------------ -------------
+25-AUG-26 12.16.01.128    ON CPU                            9vmszgd1ft9x0
+25-AUG-26 12.16.02.130    ON CPU                            9vmszgd1ft9x0
+25-AUG-26 12.16.03.131    ON CPU                            9vmszgd1ft9x0
+25-AUG-26 12.16.04.133    WAITING  log file sync            50kad7809jyj8
+25-AUG-26 12.16.05.135    ON CPU                            9vmszgd1ft9x0
+25-AUG-26 12.16.06.137    ON CPU                            9vmszgd1ft9x0
+
+-- 해석: 세션 45는 대부분 9vmszgd1ft9x0을 CPU에서 수행했고, 12:16:04에 커밋
+--   (50kad7809jyj8)을 하며 log file sync를 1초 기다렸다가 CPU로 복귀했다.
+--   집계로는 안 보이던 '언제 무엇 때문에 멈췄나'가 시간축에 드러난다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 12:16:00~12:16:10 중 특정 초의 샘플이 비어 있다며
+--       "ASH가 샘플을 놓쳤다(버그)"고 의심한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: 빈 초에 그 세션이 '활성'이었는지 확인한다. ASH는 활성
+SYS@orcl> --   세션만 담으므로, 빈 초는 그 순간 세션이 Idle이었다는 뜻일 수 있다.
+SYS@orcl> SELECT COUNT(*) AS samples_0710
+  2       FROM  v$active_session_history
+  3       WHERE session_id=45 AND session_serial#=41003
+  4         AND sample_time BETWEEN TIMESTAMP '2026-08-25 12:16:07'
+  5                             AND TIMESTAMP '2026-08-25 12:16:10';
+
+SAMPLES_0710
+------------
+           2
+
+-- 원인 확정: 그 구간 4초 중 2개만 샘플이 있다 = 나머지 초에는 세션이 활성이
+--   아니었다(Idle). 버그가 아니라 정상이다. ASH의 '빈칸'도 정보다.
+-- 조치: 빈 초를 '샘플 누락'이 아니라 'Idle 구간'으로 해석한다. 필요하면
+--   V$SESSION으로 그 세션의 현재 상태를 교차 확인한다.
+
+SYS@orcl> -- 재확인: 세션의 활성/비활성 경계가 이야기와 맞는지 상태 흐름 재확인.
+SYS@orcl> SELECT session_state AS st, COUNT(*) AS samples
+  2       FROM  v$active_session_history
+  3       WHERE session_id=45 AND session_serial#=41003
+  4         AND sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
+  5       GROUP BY session_state;
+
+ST        SAMPLES
+-------- ----------
+ON CPU        119
+WAITING         9
+
+-- 재확인 완료: 세션 45는 대부분 ON CPU(119), 잠깐씩 WAITING(9)이었다. 빈 초는
+--   활성 아님(Idle) 구간이며 누락이 아니다.
+
+--------------------------------------------------------------------------------
+-- [4] (조회) 블로킹 추적 — 이 세션이 다른 세션에 막혔던 적이 있나.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT event, blocking_session, COUNT(*) AS samples
+  2       FROM  v$active_session_history
+  3       WHERE session_id=45 AND session_serial#=41003
+  4         AND blocking_session IS NOT NULL
+  5         AND sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
+  6       GROUP BY event, blocking_session ORDER BY samples DESC;
+
+no rows selected
+
+-- 해석: blocking_session이 채워진 샘플이 없다 = 이 세션은 다른 세션에 막히지
+--   않고 스스로 CPU를 태웠다. ON CPU 지배형과 정합적이다. 만약 여기서 특정
+--   블로커가 잡혔다면 그 세션 번호로 넘어가 역추적했을 것이다(14장 잠금 경합).
+
+--------------------------------------------------------------------------------
+-- [5] (라이선스 대안 경로) V$SESSION으로 지금 그 세션을 실시간 추적.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 과거 재구성은 ASH만 가능하지만, '지금 이 순간'의 세션 상태·블로커는
+SYS@orcl> -- V$SESSION으로 라이선스 없이 볼 수 있다. 반복 조회하면 근사 추적이 된다.
+SYS@orcl> SELECT sid, state, event, sql_id, blocking_session
+  2       FROM  v$session WHERE sid=45;
+
+  SID STATE      EVENT               SQL_ID          BLOCKING_SESSION
+----- ---------- ------------------- ------------- ----------------
+   45 WAITED ... log file sync       9vmszgd1ft9x0
+              (blocking_session NULL → 막힌 세션 없음)
+
+-- 대안 해석: V$SESSION은 현재 상태만 보여준다. 과거의 시간순 재구성은 못 하지만,
+--   짧은 주기로 반복 조회해 적재하면 '수제 세션 추적'이 된다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 세션 추적은 SESSION_ID + SESSION_SERIAL#로 대상을 특정한 뒤 시작한다.
+-- 2) SAMPLE_TIME 순으로 펼치면 ON CPU/WAITING 상태 변화가 이야기로 보인다.
+-- 3) 빈 초는 샘플 누락이 아니라 그 순간 Idle이었다는 신호다(빈칸도 정보).
+-- 4) BLOCKING_SESSION으로 블로커를 역추적한다. 없으면 '블로킹 없음'이 결론.
+
+SYS@orcl> EXIT
+================================================================================

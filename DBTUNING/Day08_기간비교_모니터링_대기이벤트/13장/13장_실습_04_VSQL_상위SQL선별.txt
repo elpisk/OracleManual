@@ -1,0 +1,119 @@
+================================================================================
+ 13장 실습 04 — V$SQL 정렬 기준별 상위 SQL 선별
+ 목표: V$SQL을 실행시간·논리읽기·실행횟수·실행당으로 각각 정렬해 '상위'의
+       정의가 기준에 따라 달라짐을 확인한다. 총량과 실행당을 함께 보고, 총량이
+       큰 두 부류(무거운 문장 / 자주 불리는 문장)를 구분한다.
+ 환경: non-CDB=orcl 19.3 (부하 세션 소유자 SQLT@orcl>로 수행)
+ 부하: WL_06_mixed.sql(전체 스캔 포함) + WL_01_parse.sql(리터럴 파싱)을 돌린 뒤 관측.
+ 주의: 개인 실습 환경 전용. 읽기 전용 조회. V$ 조회는 라이선스 불필요.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태 · 이상/오류 → 원인 → 조치 → 재확인)
+--     조치 전: SQLT로 V$SQL을 조회하자 권한 오류가 난다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT sql_id, buffer_gets FROM v$sql WHERE ROWNUM<=1;
+SELECT sql_id, buffer_gets FROM v$sql WHERE ROWNUM<=1
+                                *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- 원인 파악: SQLT 계정에 V$SQL(V_$SQL) 조회 권한이 없다. V$ 뷰 조회에는
+--   SELECT_CATALOG_ROLE(또는 개별 SELECT 권한)이 필요하다.
+-- 조치: SYS에서 1회 권한을 부여한다.
+--     SYS@orcl> GRANT SELECT_CATALOG_ROLE TO SQLT;
+-- 재확인: 재접속 후 다시 조회하면 정상 동작한다(아래 [2]부터 진행).
+SQLT@orcl> -- (SYS가 권한 부여 후) 재접속하여 진행한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회 A) 논리읽기(buffer_gets) 기준 상위. 실행당도 함께 본다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT sql_id, executions execs, buffer_gets,
+  2         ROUND(buffer_gets/GREATEST(executions,1)) per_exec,
+  3         SUBSTR(sql_text,1,38) txt
+  4       FROM (SELECT sql_id, executions, buffer_gets, sql_text
+  5             FROM   v$sql WHERE parsing_schema_name='SQLT'
+  6             ORDER BY buffer_gets DESC)
+  7       WHERE ROWNUM<=5;
+
+SQL_ID        EXECS BUFFER_GETS PER_EXEC TXT
+------------- ----- ----------- -------- --------------------------------------
+9vmszgd1ft9x0  1290     8494906     6585 select /*+ full(d) */ count(*), sum(d.
+ddukvcz4gwcad   631     1946786     3085 select hosp_id, count(*), avg(total_am
+2hwjffuh4cs8t     2        6188     3094 select count(*) from medical_claims wh
+6jwvu6btpjhnu     2        6188     3094 select count(*) from medical_claims wh
+b85cymcwbd1qj     2        6188     3094 select count(*) from medical_claims wh
+
+-- 해석: 1위 9vmsz…는 총량(849만)도, 실행당(6,585)도 커서 두 축 모두 나쁜
+--   진짜 상위 부하다(강제 풀 스캔). 3~5위는 sql_text가 사실상 같은데
+--   SQL_ID가 제각각이다 → 리터럴 SQL(실습 05에서 교정).
+
+--------------------------------------------------------------------------------
+-- [3] (조회 B) 실행시간(elapsed_time) 기준 상위. 실행당 ms도 본다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT sql_id, executions execs,
+  2         ROUND(elapsed_time/1e6,2) elapsed_s,
+  3         ROUND(elapsed_time/GREATEST(executions,1)/1000,2) ms_per_exec
+  4       FROM (SELECT sql_id, executions, elapsed_time
+  5             FROM   v$sql WHERE parsing_schema_name='SQLT'
+  6             ORDER BY elapsed_time DESC)
+  7       WHERE ROWNUM<=5;
+
+SQL_ID        EXECS  ELAPSED_S  MS_PER_EXEC
+------------- ----- ---------- ------------
+9vmszgd1ft9x0  1290    <환경값>      <환경값>
+ddukvcz4gwcad   631    <환경값>      <환경값>
+...
+
+-- 해석: elapsed_time은 마이크로초 누적이다. 실행당 ms로 나눠 문장 효율을 본다.
+--   buffer_gets 상위와 elapsed_time 상위가 대개 비슷하지만, 어긋나는 문장이
+--   있으면 그 문장은 CPU가 아니라 대기(예: I/O)가 문제라는 단서다.
+--   → 어긋남을 보면 대기 칸(실습 03)으로 되돌아가 확인한다.
+
+--------------------------------------------------------------------------------
+-- [4] (조회 C) 실행횟수(executions) 기준 상위.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT sql_id, executions execs,
+  2         ROUND(buffer_gets/GREATEST(executions,1)) per_exec,
+  3         SUBSTR(sql_text,1,38) txt
+  4       FROM (SELECT sql_id, executions, buffer_gets, sql_text
+  5             FROM   v$sql WHERE parsing_schema_name='SQLT'
+  6             ORDER BY executions DESC)
+  7       WHERE ROWNUM<=3;
+
+SQL_ID        EXECS PER_EXEC TXT
+------------- ----- -------- --------------------------------------
+9vmszgd1ft9x0  1290     6585 select /*+ full(d) */ count(*), sum(d.
+ddukvcz4gwcad   631     3085 select hosp_id, count(*), avg(total_am
+...
+
+-- 해석: 실행횟수 상위는 '자주 불리는 문장'을 잡는다. 실행당이 작으면 총 부하는
+--   낮을 수 있으니, 실행당(per_exec)을 함께 봐야 실체가 보인다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치 후 관점) 세 기준을 교차해 판정한다.
+--------------------------------------------------------------------------------
+-- * elapsed_time: 총 소요 시간이 큰 문장(대개 최우선 튜닝 대상)
+-- * buffer_gets : 논리읽기가 많은 CPU·캐시 부하원
+-- * executions  : 자주 불리는 문장(소프트 파싱·왕복 부하)
+-- * per_exec(=buffer_gets/executions): 문장 자체의 무게
+-- → 한 기준만 보면 그림이 왜곡된다. 총량이 큰 문장은 '무거운 문장'과
+--   '자주 불리는 문장'으로 나뉘고, 조치가 다르다(전자=SQL·계획 수정,
+--   후자=호출 횟수 감소). 실측 9vmsz…는 두 축 모두 나쁜 진짜 상위 부하다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) V$SQL 조회에는 SELECT_CATALOG_ROLE이 필요하다(ORA-00942 → 권한 부여).
+-- 2) '상위'의 정의는 정렬 기준(elapsed_time·buffer_gets·executions)에 따라 다르다.
+-- 3) 총량과 실행당을 함께 봐야 무거운 문장과 자주 불리는 문장을 가른다.
+-- 4) elapsed vs buffer_gets 순위 어긋남 = 대기가 문제라는 단서.
+-- ※ 실행시간 등 일부 값은 환경·시점에 따라 다른 <환경값>이다.
+
+SQLT@orcl> EXIT
+================================================================================

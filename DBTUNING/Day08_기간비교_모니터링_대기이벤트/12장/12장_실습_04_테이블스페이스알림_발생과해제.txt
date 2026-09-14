@@ -1,0 +1,150 @@
+================================================================================
+ 12장 실습 04 — 테이블스페이스 사용률 알림 발생·해제 전 과정 재현
+ 목표: Stateful 알림(테이블스페이스 사용률)이 발생해 DBA_OUTSTANDING_ALERTS에
+       나타났다가, 공간 확보 후 자동 해소되어 DBA_ALERT_HISTORY로 넘어가는
+       전 과정을 재현한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA)
+ 라이선스: 서버 생성 알림은 기본 기능(라이선스 무관).
+ 주의: 개인 실습 환경 전용. 실습용 소형 테이블스페이스에서만 수행한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 실습용 소형 테이블스페이스를 만든다 — 자동 확장 OFF.
+--     자동 확장을 끄면 사용률이 쉽게 올라가 알림을 재현할 수 있다.
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLESPACE ts_alert_demo
+  2       DATAFILE '/u01/app/oracle/oradata/orcl/ts_alert_demo01.dbf'
+  3       SIZE 10M AUTOEXTEND OFF;
+
+Tablespace created.
+
+SYS@orcl> -- 이 TS만 경고 75% / 위험 90%로 낮춰 빨리 울리게 한다(다른 TS는 기본 유지).
+SYS@orcl> BEGIN
+  2    DBMS_SERVER_ALERT.SET_THRESHOLD(
+  3      metrics_id=>DBMS_SERVER_ALERT.TABLESPACE_PCT_FULL,
+  4      warning_operator=>DBMS_SERVER_ALERT.OPERATOR_GE, warning_value=>'75',
+  5      critical_operator=>DBMS_SERVER_ALERT.OPERATOR_GE, critical_value=>'90',
+  6      observation_period=>1, consecutive_occurrences=>1,
+  7      instance_name=>'orcl',
+  8      object_type=>DBMS_SERVER_ALERT.OBJECT_TYPE_TABLESPACE,
+  9      object_name=>'TS_ALERT_DEMO');
+ 10  END;
+ 11  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT tablespace_name, ROUND(used_percent,1) used_pct
+  2       FROM  dba_tablespace_usage_metrics
+  3       WHERE tablespace_name='TS_ALERT_DEMO';
+
+TABLESPACE_NAME  USED_PCT
+---------------- --------
+TS_ALERT_DEMO         1.0
+
+-- 해석: 지금은 사용률 1%. 미해소 알림도 없어야 정상이다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) 공간을 채워 사용률을 위험 임계값(90%) 위로 올린다.
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE t_fill (id NUMBER, pad CHAR(2000)) TABLESPACE ts_alert_demo;
+
+Table created.
+
+SYS@orcl> BEGIN
+  2    FOR i IN 1..4200 LOOP
+  3      INSERT INTO t_fill VALUES (i, 'x');
+  4    END LOOP;
+  5    COMMIT;
+  6  END;
+  7  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT tablespace_name, ROUND(used_percent,1) used_pct
+  2       FROM  dba_tablespace_usage_metrics
+  3       WHERE tablespace_name='TS_ALERT_DEMO';
+
+TABLESPACE_NAME  USED_PCT
+---------------- --------
+TS_ALERT_DEMO        94.6
+
+-- 해석: 사용률 94.6%로 위험 임계값(90%)을 넘었다. 다음 MMON 감시 주기에 알림 발생.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 미해소 알림 발생 확인 — Stateful이라 OUTSTANDING에 나타난다.
+--     (MMON 주기를 기다린다. 실습에서는 수동으로 flush 후 조회한다.)
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_SERVER_ALERT.EXPAND_MESSAGE(0,0,0);  -- 주기 대기 대용(개념)
+SYS@orcl> SELECT reason, message_level,
+  2         TO_CHAR(creation_time,'MM-DD HH24:MI') created
+  3       FROM  dba_outstanding_alerts
+  4       WHERE object_name='TS_ALERT_DEMO';
+
+REASON                                      MESSAGE_LEVEL CREATED
+------------------------------------------- ------------- -----------
+Tablespace [TS_ALERT_DEMO] is [94 percent] full           1 08-25 11:05
+
+-- 해석: 위험(MESSAGE_LEVEL=1) 미해소 알림이 떴다. 실측 RTBS 사례와 같은 형태다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 데이터파일을 '추가'했는데도 알림이 사라지지 않는다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- (잘못된 조치) 사용률은 '비율'이라 파일만 키우지 않으면 안 내려간다고 오해.
+SYS@orcl> -- 실제로는 파일을 키우면 분모가 커져 사용률이 내려간다. 확인해 보자.
+SYS@orcl> ALTER DATABASE DATAFILE
+  2       '/u01/app/oracle/oradata/orcl/ts_alert_demo01.dbf' RESIZE 30M;
+
+Database altered.
+
+SYS@orcl> SELECT tablespace_name, ROUND(used_percent,1) used_pct
+  2       FROM dba_tablespace_usage_metrics WHERE tablespace_name='TS_ALERT_DEMO';
+
+TABLESPACE_NAME  USED_PCT
+---------------- --------
+TS_ALERT_DEMO        31.5
+
+-- 원인 파악: 사용률은 31.5%로 임계값 아래로 내려갔다. 그런데도 OUTSTANDING에
+--   아직 남아 있다면, 그것은 오류가 아니라 'MMON이 다음 감시 주기에 재계산해야
+--   자동 해소된다'는 특성 때문이다(Stateful).
+SYS@orcl> -- 조치: 다음 감시 주기를 기다린 뒤 재확인한다.
+
+--------------------------------------------------------------------------------
+-- [5] (재확인) 알림 자동 해소 — OUTSTANDING에서 빠지고 HISTORY로 이동.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT COUNT(*) still_open FROM dba_outstanding_alerts
+  2       WHERE object_name='TS_ALERT_DEMO';
+
+ STILL_OPEN
+-----------
+          0
+
+SYS@orcl> SELECT SUBSTR(reason,1,40) reason,
+  2         TO_CHAR(creation_time,'MM-DD HH24:MI') created
+  3       FROM  dba_alert_history WHERE object_name='TS_ALERT_DEMO'
+  4       ORDER BY creation_time DESC;
+
+REASON                                   CREATED
+---------------------------------------- -----------
+Tablespace [TS_ALERT_DEMO] is [94 percen 08-25 11:05
+
+-- 재확인: 미해소 0건, 이력으로 이동 완료. Stateful 알림의 '발생→해소' 전 과정 확인.
+
+--------------------------------------------------------------------------------
+-- [6] (원복) 실습 오브젝트를 정리한다.
+--------------------------------------------------------------------------------
+SYS@orcl> DROP TABLESPACE ts_alert_demo INCLUDING CONTENTS AND DATAFILES;
+
+Tablespace dropped.
+
+-- 정리: 1) Stateful 알림은 조건 성립 시 OUTSTANDING에 발생.
+--   2) 사용률은 비율이라 공간을 늘리면 내려간다.
+--   3) 해소는 즉시가 아니라 다음 MMON 감시 주기 후 자동으로 일어난다.
+--   4) 해소되면 OUTSTANDING→HISTORY로 이동한다.
+
+SYS@orcl> EXIT
+================================================================================

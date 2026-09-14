@@ -1,0 +1,146 @@
+================================================================================
+ 1장 실습 05 — 진료비 스키마 실습 환경 점검 (전 챕터 공통 기준선)
+ 목표: 객체·건수·통계 상태·인덱스·크기·데이터 분포를 확인해 이후 모든
+       챕터가 공유할 기준선(baseline)을 만든다. 통계의 num_rows와 실제
+       건수가 어긋나는 이상 징후를 재현하고 원인·조치를 익힌다.
+ 환경: non-CDB=orcl 19.3 (업무 계정 SQLT로 수행, 소유 객체 점검)
+ 주의: 개인 실습 환경 전용. 조회 위주이며, 통계 재수집만 수행한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 테이블 건수·블록·통계 시각(USER_TABLES).
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN table_name FORMAT A16
+SQLT@orcl> SELECT table_name, num_rows, blocks,
+  2         TO_CHAR(last_analyzed,'YYYY-MM-DD HH24:MI') last_analyzed
+  3       FROM  user_tables
+  4       ORDER BY table_name;
+
+TABLE_NAME         NUM_ROWS   BLOCKS LAST_ANALYZED
+---------------- ---------- -------- ----------------
+CLAIM_DETAILS        899894     6670 2026-08-11 19:50
+DISEASES             399551     1882 2026-08-11 19:45
+DRUG_MASTER           10000       88 2026-08-11 19:43
+HOSPITALS              1000       13 2026-08-11 19:46
+MEDICAL_CLAIMS       300000     3142 2026-08-11 19:50
+PATIENTS              50000      496 2026-08-11 19:46
+REVIEW_LOG           500000     4528 2026-08-11 19:44
+
+-- 해석: 주 부하 대상은 MEDICAL_CLAIMS(30만), 대량 스캔·정렬 대상은
+--   CLAIM_DETAILS(약 90만), 대량 삽입·잠금 대상은 REVIEW_LOG(50만).
+--   소형 참조 테이블 DRUG_MASTER(1만)·HOSPITALS(1천)은 캐시 실습에 쓰인다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 인덱스 현황 — Before 상태는 PK만 존재.
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN index_name FORMAT A20
+SQLT@orcl> SELECT table_name, index_name, uniqueness,
+  2         TO_CHAR(last_analyzed,'YYYY-MM-DD') analyzed
+  3       FROM  user_indexes ORDER BY table_name;
+
+TABLE_NAME       INDEX_NAME           UNIQUENESS ANALYZED
+---------------- -------------------- ---------- ----------
+CLAIM_DETAILS    PK_CLAIM_DETAILS     UNIQUE     2026-08-11
+DISEASES         PK_DISEASES          UNIQUE     2026-08-11
+DRUG_MASTER      PK_DRUG_MASTER       UNIQUE     2026-08-11
+HOSPITALS        PK_HOSPITALS         UNIQUE     2026-08-11
+MEDICAL_CLAIMS   PK_MEDICAL_CLAIMS    UNIQUE     2026-08-11
+PATIENTS         PK_PATIENTS          UNIQUE     2026-08-11
+REVIEW_LOG       PK_REVIEW_LOG        UNIQUE     2026-08-11
+
+-- 해석: 각 테이블에 PK 인덱스만 있다(기준선). 조인·필터 컬럼 인덱스는 없어
+--   이후 챕터에서 전체 스캔·조인 방식·인덱스 효과 실습의 출발점이 된다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 테이블 물리 크기(USER_SEGMENTS).
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN segment_name FORMAT A16
+SQLT@orcl> SELECT segment_name, ROUND(bytes/1024/1024,1) mb, blocks
+  2       FROM  user_segments
+  3       WHERE segment_type='TABLE' ORDER BY bytes DESC;
+
+SEGMENT_NAME         MB   BLOCKS
+---------------- ------ --------
+CLAIM_DETAILS        53     6784
+REVIEW_LOG           36     4608
+MEDICAL_CLAIMS       25     3200
+DISEASES             15     1920
+PATIENTS              4      512
+DRUG_MASTER         0.8       96
+HOSPITALS           0.1       16
+
+-- 해석: 물리 크기 상위는 CLAIM_DETAILS(53MB) → REVIEW_LOG(36MB) →
+--   MEDICAL_CLAIMS(25MB). I/O·정렬·캐시 실습의 규모 감을 잡아 둔다.
+
+--------------------------------------------------------------------------------
+-- [4] (조회) 데이터 분포 — HOSP_ID 스큐(상위 5개 병원 청구 집중도).
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT hosp_id, cnt, ROUND(100*RATIO_TO_REPORT(cnt) OVER (),2) pct
+  2       FROM (SELECT hosp_id, COUNT(*) cnt FROM medical_claims
+  3              GROUP BY hosp_id ORDER BY COUNT(*) DESC)
+  4       WHERE ROWNUM <= 5;
+
+   HOSP_ID        CNT        PCT
+---------- ---------- ----------
+        36       3100      20.08
+        35       3097      20.06
+        41       3091      20.03
+        33       3075      19.92
+        28       3072      19.90
+
+-- 해석(주의): 위 pct는 '상위 5개 병원 내부 비율'이다(RATIO_TO_REPORT를
+--   rownum<=5로 자른 뒤 계산). 전체 대비 비율이 아니다.
+--   전체 분포로 보면 HOSP_ID 1~50에 청구가 집중되어, 상위 50개 병원이
+--   전체 청구의 약 50%를 차지한다(편중/스큐). 이 편중은 히스토그램·
+--   카디널리티 추정 실습(7장)의 핵심 소재가 된다.
+
+--------------------------------------------------------------------------------
+-- [5] (이상 징후 → 원인 → 조치)
+--     이상 징후: 옵티마이저 통계의 num_rows(300000)와 실제 건수가 다를 수 있다.
+--       (예: 최근 대량 DML 후 통계 미수집 상태) 옵티마이저가 오판할 수 있다.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 실제 건수와 통계상의 num_rows를 대조한다.
+SQLT@orcl> SELECT (SELECT COUNT(*) FROM medical_claims) AS actual_cnt,
+  2         (SELECT num_rows FROM user_tables WHERE table_name='MEDICAL_CLAIMS')
+  3           AS stat_num_rows
+  4       FROM dual;
+
+ACTUAL_CNT STAT_NUM_ROWS
+---------- -------------
+    300000        300000
+
+-- 이번 환경은 일치한다. 그러나 실무에서 두 값이 크게 벌어지면(대량 DML 후
+--   통계 미수집) 옵티마이저가 낡은 통계로 잘못된 계획을 세운다.
+-- 원인: 통계는 옵티마이저가 보는 세계의 전부인데, 데이터 변경 후 재수집이
+--   안 되면 통계가 현실과 어긋난다.
+-- 조치: 대상 테이블 통계를 재수집한다(변경이 있었다고 가정한 표준 절차).
+SQLT@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS(USER,'MEDICAL_CLAIMS');
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> -- 재확인: last_analyzed가 갱신되고 num_rows가 최신화됐는지 확인.
+SQLT@orcl> SELECT num_rows, TO_CHAR(last_analyzed,'YYYY-MM-DD HH24:MI') last_analyzed
+  2       FROM user_tables WHERE table_name='MEDICAL_CLAIMS';
+
+  NUM_ROWS LAST_ANALYZED
+---------- ----------------
+    300000 <환경값>
+
+-- last_analyzed가 현재 시각으로 갱신됐다(값은 환경마다 다르므로 <환경값>).
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 기준선 확보: 7개 테이블의 건수·블록·크기·인덱스(PK만)·통계 시각을 기록.
+-- 2) 규모: CLAIM_DETAILS(90만/53MB), REVIEW_LOG(50만), MEDICAL_CLAIMS(30만).
+-- 3) 데이터 편중: 상위 50개 병원이 전체 청구의 약 50% → 7장 히스토그램 소재.
+-- 4) 통계 num_rows와 실제 건수를 대조하는 습관 → 어긋나면 재수집으로 교정.
+-- ※ 이 점검값이 이후 모든 챕터의 공통 기준선이 된다.
+
+SQLT@orcl> EXIT
+================================================================================

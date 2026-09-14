@@ -1,0 +1,142 @@
+================================================================================
+ 10장 실습 02 — ASH 보고서 생성(ashrpt.sql)과 구간 지정
+ 목표: ashrpt.sql로 텍스트 ASH 보고서를 생성하고, begin_time·duration으로
+       분석 구간을 지정하는 법을 익힌다. 구간을 너무 넓게 잡아 스파이크가
+       희석되는 이상 상황을 재현하고, 구간을 좁혀 교정한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 라이선스: 🔒 Diagnostics Pack 필요. 미보유 시 대안은 실습 후반 [6] 참조.
+ 주의: 개인 실습 환경 전용. 보고서 생성은 읽기 조회이며 데이터를 바꾸지 않는다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 지금 ASH에 데이터가 있는지, 어느 구간이 남아 있는지 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT MIN(sample_time) AS oldest, MAX(sample_time) AS newest,
+  2         COUNT(*) AS total_samples
+  3       FROM  v$active_session_history;
+
+OLDEST                    NEWEST                    TOTAL_SAMPLES
+------------------------- ------------------------- -------------
+25-AUG-26 11.42.10.***    25-AUG-26 12.17.30.***        <환경값>
+
+-- 해석: oldest~newest가 메모리 ASH로 되짚을 수 있는 최대 구간이다. 이 구간을
+--   벗어난 과거는 디스크 ASH(DBA_HIST_)로 봐야 한다(실습 05).
+
+--------------------------------------------------------------------------------
+-- [2] (조회) ashrpt.sql 실행 — 텍스트, 10분 전부터 현재까지.
+--------------------------------------------------------------------------------
+SYS@orcl> @?/rdbms/admin/ashrpt.sql
+
+Enter value for report_type: text
+Type Specified:  text
+
+Enter value for begin_time: -10
+Note: Entering -10 as begin_time
+
+Enter value for duration:
+Using 0 duration (SYSDATE - begin_time)
+
+Enter value for report_name:
+Using the report name ashrpt_1_0825_1217.txt
+
+... (보고서 생성 중) ...
+Report written to ashrpt_1_0825_1217.txt
+
+-- 해석: begin_time에 -10(10분 전), duration은 공백(현재까지)을 주었다.
+--   report_name 공백 → 기본 이름 ashrpt_1_0825_1217.txt로 저장된다.
+
+--------------------------------------------------------------------------------
+-- [3] (조회) 생성된 보고서 머리를 확인한다(헤더의 요약 수치).
+--------------------------------------------------------------------------------
+SYS@orcl> HOST head -20 ashrpt_1_0825_1217.txt
+
+ASH Report For ORCL/orcl
+
+          Analysis Begin Time:   25-Aug-26 12:15:20
+            Analysis End Time:   25-Aug-26 12:17:30
+                 Elapsed Time:         2.2 (mins)
+            Begin Data Source:   V$ACTIVE_SESSION_HISTORY
+                 Sample Count:         582
+      Average Active Sessions:        4.48
+  Avg. Active Session per CPU:        0.56
+
+-- 해석: Sample Count 582, Average Active Sessions 4.48. 이 헤더 수치가
+--   직접 조회 결과(실습 03)와 일치하는지 대조하는 것이 판독의 시작이다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: "짧게 튀었다는 스파이크를 찾으려고 begin_time을 -120(2시간)
+--       으로 넓게 잡았더니, 상위 이벤트가 밋밋해 스파이크가 안 보인다."
+--------------------------------------------------------------------------------
+SYS@orcl> -- 넓은 구간(최근 120분)을 직접 조회로 흉내 내 본다.
+SYS@orcl> SELECT NVL(event,'ON CPU') AS event,
+  2         ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS pct
+  3       FROM  v$active_session_history
+  4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '120' MINUTE
+  5       GROUP BY NVL(event,'ON CPU') ORDER BY pct DESC FETCH FIRST 3 ROWS ONLY;
+
+EVENT                              PCT
+--------------------------------- -----
+ON CPU                             38.2
+SQL*Net message from client        NULL
+db file sequential read           12.4
+
+-- 원인 파악: 120분에는 부하가 없던 시간까지 섞여 있어, 2분짜리 부하 구간의
+--   ON CPU 90.7%가 38.2%로 희석됐다. 구간이 넓을수록 스파이크가 평균에 묻힌다.
+-- 조치: 문제가 난 구간만 좁혀 지정한다. begin_time을 부하 시점 근처로,
+--   duration을 짧게(예: 2~3분) 준다.
+
+SYS@orcl> -- 재확인: 부하 구간만 130초로 좁혀 다시 본다.
+SYS@orcl> SELECT NVL(event,'ON CPU') AS event,
+  2         ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS pct
+  3       FROM  v$active_session_history
+  4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
+  5       GROUP BY NVL(event,'ON CPU') ORDER BY pct DESC FETCH FIRST 3 ROWS ONLY;
+
+EVENT                              PCT
+--------------------------------- -----
+ON CPU                             90.7
+log file sync                       2.9
+log file parallel write             2.4
+
+-- 재확인 완료: 구간을 좁히니 ON CPU 90.7%가 선명하게 드러난다. ashrpt.sql로도
+--   begin_time·duration을 이 구간에 맞춰야 같은 그림을 얻는다.
+
+--------------------------------------------------------------------------------
+-- [5] (참고) 특정 인스턴스·차원 지정은 ashrpti.sql을 쓴다.
+--------------------------------------------------------------------------------
+-- * ashrpti.sql은 dbid·inst_num, slot_width, 그리고 target_sql_id 등
+--   차원(target)을 추가로 물어 범위를 좁힐 수 있다.
+--   예: target_sql_id에 9vmszgd1ft9x0을 주면 그 SQL 관련 활동만 추린다.
+-- * 구간 지정이 '언제'를 좁힌다면 target 지정은 '무엇을'을 좁힌다.
+
+--------------------------------------------------------------------------------
+-- [6] (라이선스 대안 경로) 보고서 없이 같은 요약을 직접 조회로 만든다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- Diagnostics Pack이 없으면 ashrpt.sql을 못 쓴다. 대신 V$SESSION을
+SYS@orcl> -- 폴링해 적재한 '수제 ASH' 테이블을 같은 방식으로 GROUP BY 하면 된다.
+SYS@orcl> -- (여기서는 원리만: 지금 활성 세션의 상위 이벤트를 즉석 요약)
+SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS active_now
+  2       FROM  v$session WHERE status='ACTIVE' AND wait_class<>'Idle'
+  3       GROUP BY NVL(event,'ON CPU') ORDER BY active_now DESC;
+
+EVENT                             ACTIVE_NOW
+--------------------------------- ----------
+ON CPU                                     5
+log file sync                              1
+
+-- 대안 해석: 보고서의 자동 집계·구간 지정은 사라지지만, '무엇을 보는가(활성
+--   세션의 상태 비율)'는 동일하다. 구간은 적재 테이블의 타임스탬프로 필터한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) ashrpt.sql은 report_type·begin_time·duration·report_name을 묻는다.
+-- 2) 구간을 넓게 잡으면 스파이크가 평균에 희석된다 → 문제 구간만 좁힌다.
+-- 3) 헤더 요약(Sample Count·AAS)을 직접 조회와 대조해 신뢰도를 확인한다.
+-- 4) 라이선스가 없으면 V$SESSION 폴링 적재로 근사한다(자동화·정밀도만 다름).
+
+SYS@orcl> EXIT
+================================================================================

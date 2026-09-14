@@ -1,0 +1,94 @@
+================================================================================
+ 14장 실습 05 — latch / mutex 경합 관찰 (라이브러리 캐시 경합)
+ 목표: 리터럴 SQL을 반복 실행해 하드 파싱을 폭증시키고, 그 배후에서
+       latch: shared pool · library cache: mutex X · cursor: pin S wait on X
+       경합이 오르는 것을 관찰한다. 경합의 근본이 하드 파싱임을 확인한다.
+ 환경: non-CDB=orcl 19.3 (진단 SYS AS SYSDBA / 부하 SQLT@orcl 여러 세션)
+ 라이선스: V$ 실시간 조회는 라이선스 무관.
+ 부하: WL_01_parse.sql — 리터럴 SQL 반복(하드 파싱 유발). SELECT만, 원본 불변.
+ 주의: 개인 실습 환경 전용. 조회 위주라 원본 데이터를 변경하지 않는다.
+================================================================================
+
+-- [터미널 B, C] 업무 계정 여러 세션이 리터럴 SQL을 반복 실행한다.
+$ sqlplus sqlt/****@orcl
+SQLT@orcl> -- 값을 바인드하지 않고 리터럴로 박은 SQL을 반복 → 하드 파싱 폭증
+SQLT@orcl> @?/../부하스크립트/WL_01_parse.sql
+... (SELECT ... WHERE claim_id = 1001 / = 1002 / ... 매번 새 커서) ...
+
+-- [터미널 A] 진단 계정으로 관찰한다.
+$ sqlplus / as sysdba
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) latch/mutex 계열 이벤트의 누적 대기를 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT SUBSTR(event,1,30) event, total_waits, wait_class
+  2       FROM  v$system_event
+  3       WHERE event IN ('latch: shared pool','cursor: pin S wait on X',
+  4                       'library cache: mutex X','latch free')
+  5       ORDER BY total_waits DESC;
+
+EVENT                          TOTAL_WAITS  WAIT_CLASS
+------------------------------ ----------- -----------
+latch free                           17174  Other
+latch: shared pool                   13156  Concurrency
+cursor: pin S wait on X               1077  Concurrency
+library cache: mutex X                 387  Concurrency
+
+-- 해석: latch: shared pool(13156)이 두드러진다. 공유 풀 래치 경합은 거의 언제나
+--   하드 파싱과 짝을 이룬다. cursor: pin S wait on X, library cache: mutex X도
+--   같은 뿌리(커서 파싱·무효화 중의 mutex 경합)다. latch free는 spin이 CPU를
+--   태워 대기와 CPU를 함께 올린다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 배후를 확인한다 — 파싱 통계.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT n.name, s.value
+  2       FROM  v$sysstat s JOIN v$statname n ON n.statistic#=s.statistic#
+  3       WHERE n.name IN ('parse count (total)','parse count (hard)',
+  4                        'execute count');
+
+NAME                    VALUE
+----------------------- ----------
+parse count (total)       <환경값>
+parse count (hard)        <환경값>   -- (하드 파싱 비율이 높다)
+execute count             <환경값>
+
+-- 해석: parse count(hard)가 execute count 대비 크게 높다. 실행마다 새로 파싱
+--   한다는 뜻이고, 이것이 공유 풀 래치/mutex 경합의 원천이다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: CPU 사용률이 높은데 특정 SQL이 유난히 무거운 것도 아니다.
+--       담당자가 "CPU가 부족하니 코어를 늘리자"고 한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: 래치 경합의 spin이 CPU를 태운다. 파싱을 많이 부른 SQL을 찾는다.
+SYS@orcl> SELECT sql_id, parse_calls, executions, version_count,
+  2         SUBSTR(sql_text,1,34) txt
+  3       FROM  v$sqlarea
+  4       ORDER BY parse_calls DESC FETCH FIRST 5 ROWS ONLY;
+
+SQL_ID          PARSE_CALLS EXECUTIONS VERSION_COUNT  TXT
+--------------- ----------- ---------- ------------- ----------------------------------
+<환경값>            <환경값>   <환경값>       <환경값>  SELECT ... WHERE claim_id = 1001 ...
+<환경값>            <환경값>   <환경값>       <환경값>  SELECT ... WHERE claim_id = 1002 ...
+...
+
+-- 원인 확정: 값만 다른 리터럴 SQL이 각각 별개 커서로 쌓였다(parse_calls·
+--   version_count 높음). 매번 하드 파싱하며 shared pool 래치를 잡은 것이다.
+--   CPU 부족이 아니라 하드 파싱이 문제다.
+-- 조치: 근본 처방은 바인드 변수화(WHERE claim_id = :b1). 즉시 완화가 필요하면
+--   부작용을 이해한 뒤 CURSOR_SHARING 조정을 검토한다.
+SYS@orcl> -- 재확인: 바인드 변수로 바꾼 부하를 다시 걸면 parse count(hard)가 급감하고
+SYS@orcl> --   latch: shared pool 증가분도 함께 줄어드는지 델타로 확인한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) latch/mutex는 공유 메모리 구조를 지키는 경량 잠금 — 경합=줄이 길어짐.
+-- 2) 라이브러리 캐시/공유 풀 경합의 배후는 대개 과도한 하드 파싱.
+-- 3) S=공유·X=배타. cursor: pin S wait on X=커서를 S로 잡으려는데 X가 점유.
+-- 4) 근본 처방은 바인드 변수. latch/mutex 수치가 아니라 파싱을 고친다.
+
+SYS@orcl> EXIT
+================================================================================

@@ -1,0 +1,99 @@
+================================================================================
+ 14장 실습 04 — log file sync 재현, 커밋 빈도와의 관계 (WL_05_commit.sql)
+ 목표: 같은 양의 DML을 '건당 커밋'과 '배치 커밋'으로 각각 실행해, 바뀐
+       데이터 양(redo size)은 비슷한데 log file sync 대기 횟수·시간만 크게
+       달라짐을 확인한다. '일의 양'과 '대기'를 분리해 해석한다.
+ 환경: non-CDB=orcl 19.3 (진단 SYS AS SYSDBA / 부하 SQLT@orcl)
+ 라이선스: V$ 실시간 조회는 라이선스 무관.
+ 부하: WL_05_commit.sql — 복제 테이블 REVIEW_LOG_CMT_WL에서만 DML(원본 불변).
+ 주의: 개인 실습 환경 전용. 원본 REVIEW_LOG은 갱신하지 않는다.
+================================================================================
+
+-- [터미널 A] 진단 계정에서 부하 전 기준선을 잡는다.
+$ sqlplus / as sysdba
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> COLUMN event FORMAT A34
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) log file sync와 그 짝(parallel write)의 부하 전 누적.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT event, total_waits, ROUND(time_waited/100) sec
+  2       FROM  v$system_event
+  3       WHERE event IN ('log file sync','log file parallel write');
+
+EVENT                              TOTAL_WAITS   SEC
+---------------------------------- ----------- -----
+log file sync                         <환경값> <환경값>   -- 부하 전 기준선
+log file parallel write               <환경값> <환경값>
+
+-- [터미널 B] 업무 계정으로 '건당 커밋' 구획을 실행한다.
+$ sqlplus sqlt/****@orcl
+SQLT@orcl> @?/../부하스크립트/WL_05_commit.sql   -- 구획1: 건당 커밋 5000회
+... (1행 UPDATE → COMMIT 을 5,000회 반복) ...
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 건당 커밋 직후 델타를 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT SUBSTR(event,1,34) event, total_waits,
+  2         ROUND(time_waited/100) sec, wait_class
+  3       FROM  v$system_event
+  4       WHERE event IN ('log file sync','log file parallel write')
+  5       ORDER BY time_waited DESC;
+
+EVENT                          TOTAL_WAITS   SEC  WAIT_CLASS
+------------------------------ ----------- ----- -----------
+log file sync                        63826    53  Commit
+log file parallel write              64602    52  System I/O
+
+-- 해석: log file sync(63826회·53초)와 log file parallel write(64602회·52초)의
+--   대기 시간이 거의 같다. 커밋 세션이 기다린 시간의 대부분이 '실제 리두 디스크
+--   쓰기 시간'이라는 뜻이다. 커밋 횟수가 폭증하면 이 대기도 함께 폭증한다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 담당자가 log file sync가 상위라며 "리두 디스크가 느리다,
+--       스토리지를 교체하자"고 한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 원인 파악: 평균 대기 시간과 커밋 횟수를 본다.
+SYS@orcl> SELECT total_waits, time_waited,
+  2         ROUND(time_waited*10/total_waits,3) avg_ms
+  3       FROM  v$system_event WHERE event='log file sync';
+
+TOTAL_WAITS TIME_WAITED  AVG_MS
+----------- ----------- -------
+      63826        5300   0.830
+
+SYS@orcl> SELECT n.name, s.value
+  2       FROM  v$sysstat s JOIN v$statname n ON n.statistic#=s.statistic#
+  3       WHERE n.name = 'user commits';
+
+NAME             VALUE
+---------------- ----------
+user commits       <환경값>   -- (매우 큼: 건당 커밋의 흔적)
+
+-- 원인 확정: 평균 대기(약 0.83ms)는 작은데 total_waits(63826)와 user commits가
+--   폭발적이다. 디스크가 느린 게 아니라 '너무 자주 커밋'하는 것이 원인이다.
+-- 조치: 애플리케이션의 루프 안 COMMIT을 제거하고 N건마다 배치 커밋한다.
+--   (WL_05의 구획2가 바로 그 대조군이다.)
+SQLT@orcl> @?/../부하스크립트/WL_05_commit.sql   -- 구획2: 배치 커밋(N행 후 1회)
+SYS@orcl> -- 재확인: 배치 커밋 구획 후 델타를 다시 본다.
+SYS@orcl> SELECT event, total_waits FROM v$system_event
+  2       WHERE event='log file sync';
+
+EVENT           TOTAL_WAITS
+--------------- -----------
+log file sync      <환경값>   -- 증가분이 구획1보다 훨씬 작다
+
+-- 재확인 완료: 같은 양의 데이터를 바꿨는데도 커밋을 모으니 log file sync 증가분이
+--   급감했다. redo size(일의 양)는 비슷한데 대기만 달라진 것 — '일'과 '대기'는 다르다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) log file sync는 커밋 세션이 리두 기록 완료를 기다리는 Commit 클래스 이벤트.
+-- 2) 짝 이벤트 log file parallel write와 평균 대기 시간으로 원인을 가른다.
+-- 3) 평균 작고 횟수 폭발 → 과도한 커밋(디스크 아님) → 배치 커밋이 처방.
+-- 4) 원본 불변, 복제본 REVIEW_LOG_CMT_WL에서만 DML 했다.
+
+SYS@orcl> EXIT
+================================================================================

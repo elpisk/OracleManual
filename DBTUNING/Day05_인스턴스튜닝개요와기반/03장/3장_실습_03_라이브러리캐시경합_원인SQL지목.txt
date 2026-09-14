@@ -1,0 +1,108 @@
+================================================================================
+ 3장 실습 03 — 라이브러리 캐시 경합 상황에서 원인 SQL 지목
+ 목표: 공유 풀·라이브러리 캐시 관련 대기(Concurrency)가 상위일 때,
+       원인이 되는 SQL 을 V$SQL·V$SQLSTATS 로 지목하는 절차를 익힌다.
+       리터럴 SQL 이 자식 커서를 양산해 경합을 키우는 이상 징후를 다룬다.
+ 환경: non-CDB=orcl 19.3. 진단은 SYS@orcl>. (부하 예시로 WL_01_parse.sql 참조)
+ 라이선스: ASH(V$ACTIVE_SESSION_HISTORY)는 Diagnostics Pack(🔒) 필요.
+           대안 경로(V$SESSION 폴링·V$SQL 직접 조회)를 함께 싣는다.
+ 주의: 개인 실습 환경 전용. 조회 위주다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (증상) 활성 대기가 Concurrency 클래스에 몰려 있는지 확인.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT event, wait_class, COUNT(*) sessions
+  2       FROM  v$session
+  3       WHERE type='USER' AND status='ACTIVE' AND wait_class <> 'Idle'
+  4       GROUP BY event, wait_class ORDER BY sessions DESC;
+
+EVENT                            WAIT_CLASS    SESSIONS
+-------------------------------- ------------ ---------
+library cache: mutex X           Concurrency   <환경값>
+cursor: pin S wait on X          Concurrency   <환경값>
+
+-- 해석: Idle 을 제외한 상위 대기가 Concurrency(라이브러리 캐시 mutex/커서 핀)다.
+--   이는 잠금 경합(Application)이 아니라 공유 풀/커서 공유 문제 신호다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 라이브러리 캐시 재파싱 지표를 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT namespace, gets, pins, reloads, invalidations
+  2       FROM  v$librarycache
+  3       WHERE namespace IN ('SQL AREA','TABLE/PROCEDURE');
+
+NAMESPACE          GETS    PINS RELOADS INVALIDATIONS
+--------------- ------- ------- ------- -------------
+SQL AREA        <환경값> <환경값> <환경값>      <환경값>
+TABLE/PROCEDURE <환경값> <환경값> <환경값>      <환경값>
+
+-- 판정 기준: reloads/pins 비율이 높으면 커서가 자꾸 밀려났다 다시 로드된 것.
+--   공유 풀 부족 또는 커서 미공유(리터럴)를 의심한다.
+
+--------------------------------------------------------------------------------
+-- [3] (원인 SQL 지목) 자식 커서가 많은 SQL — 커서 미공유 후보.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sql_id, version_count, executions execs, parse_calls,
+  2         SUBSTR(sql_text,1,34) sql_text
+  3       FROM  v$sqlarea
+  4       WHERE parsing_schema_name='SQLT'
+  5       ORDER BY version_count DESC FETCH FIRST 5 ROWS ONLY;
+
+SQL_ID        VERSION_COUNT  EXECS PARSE_CALLS SQL_TEXT
+------------- ------------- ------ ----------- ----------------------------------
+<환경값>          <환경값>   ...       ...     select ... where hosp_id = ...
+
+-- 해석: VERSION_COUNT(자식 커서 수)가 큰 SQL 이 원인 후보다. 텍스트만 다르고
+--   구조가 같은 리터럴 SQL 이 다수면 각기 다른 커서로 잡혀 경합을 키운다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인) 리터럴 SQL 이 원인일 때.
+--     이상 징후: 같은 형태의 SQL 이 hosp_id 값만 바뀌며 수백 개 커서로 존재.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sql_text FROM v$sql
+  2       WHERE sql_id='<환경값>' AND ROWNUM<=1;   -- 대표 텍스트 확인
+SQL_TEXT
+----------------------------------------------------------------
+select count(*) from medical_claims where hosp_id = 37
+
+-- 원인: 바인드 변수 대신 리터럴(37, 38, ...)을 써서 매번 하드 파싱 →
+--   라이브러리 캐시 경합. (열 가지 실수 2번: 커서·공유 풀 오용)
+-- 조치(개발/설정): 애플리케이션에 바인드 변수 적용. 즉시 완화가 필요하면
+--   세션/시스템에서 CURSOR_SHARING=FORCE 검토(부작용 유의, 18장에서 상술).
+SYS@orcl> -- 예: ALTER SESSION SET cursor_sharing = FORCE;  (검증 환경에서만)
+-- 재확인: 조치 후 같은 형태 SQL 의 VERSION_COUNT 와 parse_calls, 그리고
+--   Concurrency 대기의 델타가 줄었는지 확인한다(전후 비교).
+
+--------------------------------------------------------------------------------
+-- [5] (라이선스 대안) 사건이 지나간 뒤 원인 세션을 되짚으려면.
+--------------------------------------------------------------------------------
+SYS@orcl> -- Diagnostics Pack 有: ASH 로 사후 재구성
+SYS@orcl> -- SELECT sql_id, COUNT(*) FROM v$active_session_history   -- 🔒 Diagnostics Pack
+SYS@orcl> --  WHERE sample_time > SYSTIMESTAMP - INTERVAL '10' MINUTE
+SYS@orcl> --    AND event LIKE 'library cache%' GROUP BY sql_id;
+SYS@orcl> -- Diagnostics Pack 無(대안): 사건 도중 V$SESSION 을 짧은 주기로 폴링해
+SYS@orcl> --   EVENT LIKE 'library cache%' 인 세션의 SQL_ID 를 반복 수집한다.
+SYS@orcl> SELECT sid, sql_id, event FROM v$session
+  2       WHERE event LIKE 'library cache%' OR event LIKE 'cursor:%';
+       SID SQL_ID        EVENT
+---------- ------------- --------------------------------
+   <환경값> <환경값>      library cache: mutex X
+
+-- 해석: 원천은 언제나 V$ 에 있다. 라이선스는 '얼마나 편하게 자동으로 보느냐'의
+--   차이일 뿐, V$SESSION 폴링으로 같은 원인 SQL 을 지목할 수 있다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) Concurrency 대기 상위 → 잠금이 아니라 공유 풀/커서 공유 문제 신호.
+-- 2) V$LIBRARYCACHE 의 reloads/invalidations 로 재파싱 압박을 확인.
+-- 3) 원인 SQL 은 VERSION_COUNT(자식 커서 수)가 큰 것부터 의심.
+-- 4) 리터럴 SQL → 바인드 변수(또는 CURSOR_SHARING) → 전후 델타로 재확인.
+-- 5) 라이선스 없으면 ASH 대신 V$SESSION 폴링으로 원인 SQL 지목.
+SYS@orcl> EXIT
+================================================================================

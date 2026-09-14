@@ -1,0 +1,98 @@
+================================================================================
+ 17장 실습 06 - 리두 로그 버퍼 크기와 log buffer space 대기 관찰
+ 목표: 리두 로그 버퍼 크기와 리두 통계를 조회해, 버퍼가 현재 워크로드에
+       충분한지 판정한다. redo buffer allocation retries를 redo entries와
+       비교하는 규율을 익히고, '재시도 적은데 버퍼 확대'라는 오판을 피한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA). 읽기 전용 조회.
+ 주의: 개인 실습 환경 전용. log_buffer 변경은 재기동이 필요하므로 개인
+       환경에서만 수행한다. 절대값은 <환경값>으로 읽는다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 리두 로그 버퍼 크기와 리두 통계를 함께 캡처한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT 'log_buffer' name, display_value val
+  2       FROM  v$parameter WHERE name='log_buffer'
+  3       UNION ALL
+  4       SELECT stat.name, TO_CHAR(stat.value)
+  5       FROM  v$sysstat stat
+  6       WHERE stat.name IN ('redo size','redo entries',
+  7              'redo buffer allocation retries');
+
+NAME                             VAL
+------------------------------ -----------
+log_buffer                     7360K
+redo size                      129961816
+redo entries                   249457
+redo buffer allocation retries 3
+
+-- 해석: log_buffer는 7360K. redo entries 249,457, 재시도 3회.
+--   재시도 비율 = 3 / 249,457 = 0.0012% -> 무시할 수준이다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) log buffer space 대기가 상위에 있는지 시스템 이벤트로 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT event, total_waits, time_waited
+  2       FROM  v$system_event
+  3       WHERE event IN ('log buffer space','log file parallel write')
+  4       ORDER BY event;
+
+EVENT                      TOTAL_WAITS   TIME_WAITED
+------------------------- ------------ -------------
+log buffer space              <환경값>      <환경값>
+log file parallel write       <환경값>      <환경값>
+
+-- 해석: log buffer space가 상위 대기가 아니고 재시도도 3회뿐이라면,
+--   리두 로그 버퍼는 현재 워크로드에 충분하다.
+
+--------------------------------------------------------------------------------
+-- [3] (해석/판정) 절대값이 아니라 '비율'로 판정한다.
+--------------------------------------------------------------------------------
+-- * 판정 규율: redo buffer allocation retries / redo entries.
+--     - 무시할 수준(< 약 1%): 버퍼 충분 -> 손대지 않는다.
+--     - 높음 + log buffer space 상위: 버퍼 부족 또는 리두 I/O 지연 의심.
+-- * 실측(3 / 249,457 = 0.0012%)은 충분. 여기서 log_buffer를 키우는 것은
+--   근거 없는 조치(오판)다. 자동 산정값 7360K가 합리적이다.
+
+--------------------------------------------------------------------------------
+-- [4] (가정) 만약 재시도 비율이 높았다면 - 버퍼냐 I/O냐를 가른다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- log file parallel write(LGWR의 디스크 기록 시간)가 함께 높으면
+SYS@orcl> --   병목은 버퍼가 아니라 리두 I/O다. 이때는 log_buffer 확대만으론
+SYS@orcl> --   근본이 안 풀린다 -> 리두 로그를 빠른 디스크로 옮기거나 커밋을
+SYS@orcl> --   조정한다. 재시도만 높고 I/O는 빠르면 그때 log_buffer 확대를 검토.
+SYS@orcl> -- (개인 환경 전용) 확대를 시도하며 정적 파라미터 오류를 재현한다.
+SYS@orcl> -- 이상/오류 -> 원인 -> 조치 -> 재확인
+SYS@orcl> ALTER SYSTEM SET log_buffer=16777216 SCOPE=BOTH;
+ALTER SYSTEM SET log_buffer=16777216 SCOPE=BOTH
+*
+ERROR at line 1:
+ORA-02095: specified initialization parameter cannot be modified
+
+SYS@orcl> -- 원인: log_buffer는 정적 파라미터라 실행 중(MEMORY/BOTH) 변경 불가.
+SYS@orcl> -- 조치: SCOPE=SPFILE로 바꾸고 재기동해야 한다(개인 환경 전용).
+SYS@orcl> ALTER SYSTEM SET log_buffer=16777216 SCOPE=SPFILE;
+System altered.
+SYS@orcl> -- 재확인: 값은 spfile에만 반영됐고, 재기동 후 적용된다.
+SYS@orcl> SHOW PARAMETER log_buffer
+NAME         TYPE     VALUE
+------------ -------- -------
+log_buffer   big integer 7360K   -- 현재 인스턴스는 아직 예전 값(재기동 전)
+SYS@orcl> -- SHUTDOWN IMMEDIATE; STARTUP; 이후 log_buffer=16M 적용, 재시도 재측정.
+SYS@orcl> -- (주의) 실측처럼 재시도가 무시할 수준이면 이 확대 자체가 불필요하다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 리두 로그 버퍼 충분성은 절대값이 아니라 retries/entries 비율로 본다.
+-- 2) 실측 3/249,457=0.0012% -> 충분. 근거 없는 확대는 오판이다.
+-- 3) log buffer space 상위 시 log file parallel write로 버퍼/I-O를 가른다.
+-- 4) log_buffer 변경은 재기동이 필요하며 개인 환경 전용이다.
+-- * V$PARAMETER.V$SYSSTAT.V$SYSTEM_EVENT 조회는 라이선스와 무관하다.
+
+SYS@orcl> EXIT
+================================================================================

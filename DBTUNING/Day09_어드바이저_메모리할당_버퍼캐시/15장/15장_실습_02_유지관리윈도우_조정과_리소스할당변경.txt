@@ -1,0 +1,183 @@
+================================================================================
+ 15장 실습 02 — 유지관리 윈도우 조정과 리소스 할당 변경
+ 목표: 자동 유지관리 작업이 업무 시간과 겹치는 상황을 재현하고,
+       (1) 윈도우 시간 조정과 (2) ORA$AUTOTASK 자원 조임 두 방향으로 해소한다.
+       대기 영역(Pending Area) 4단계 워크플로우와 검증 실패를 다뤄 본다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
+ 라이선스: 윈도우 조정·리소스 할당 변경은 관리 팩과 무관하다.
+ 주의: 개인 실습 환경 전용. 변경 후 반드시 원복한다(마지막 절 참조).
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [상황] 야간 배치가 새벽 1시까지 도는데, 평일 윈도우가 밤 10시에 열려 4시간
+--        동안 자동 작업이 CPU·I/O를 다툰다. 배치가 20% 느려졌다는 신고.
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 문제 윈도우의 현재 스케줄을 기록한다(롤백 근거).
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN window_name FORMAT A16
+SYS@orcl> SELECT window_name, repeat_interval, duration
+  2       FROM  dba_scheduler_windows
+  3       WHERE window_name = 'MONDAY_WINDOW';
+
+WINDOW_NAME      REPEAT_INTERVAL                                DURATION
+---------------- ---------------------------------------------- ---------------
+MONDAY_WINDOW    freq=daily;byday=MON;byhour=22;byminute=0;...  +000 04:00:00
+
+-- 조치 전: 월요일 밤 22시 시작, 4시간. 배치(22~01시)와 정면으로 겹친다.
+
+--------------------------------------------------------------------------------
+-- [2] (해소 방향 1) 윈도우 시작 시각을 새벽 3시로 옮긴다.
+--     작업을 끄지 않고 시간만 옮기므로 통계는 계속 최신으로 유지된다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2         DBMS_SCHEDULER.SET_ATTRIBUTE(
+  3           name      => 'MONDAY_WINDOW',
+  4           attribute => 'REPEAT_INTERVAL',
+  5           value     => 'freq=daily;byday=MON;byhour=3;byminute=0;bysecond=0');
+  6       END;
+  7       /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT window_name, repeat_interval
+  2       FROM  dba_scheduler_windows WHERE window_name='MONDAY_WINDOW';
+
+WINDOW_NAME      REPEAT_INTERVAL
+---------------- ----------------------------------------------
+MONDAY_WINDOW    freq=daily;byday=MON;byhour=3;byminute=0;bysecond=0
+
+-- 재확인: byhour=3. 이제 배치(22~01시)가 끝난 뒤에 자동 작업이 열린다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 전 상태) 해소 방향 2를 위해 현재 자원 배분을 기록한다.
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN plan             FORMAT A26
+SYS@orcl> COLUMN group_or_subplan FORMAT A22
+SYS@orcl> SELECT plan, group_or_subplan, mgmt_p1
+  2       FROM  dba_rsrc_plan_directives
+  3       WHERE plan = 'DEFAULT_MAINTENANCE_PLAN'
+  4       ORDER BY group_or_subplan;
+
+PLAN                       GROUP_OR_SUBPLAN       MGMT_P1
+-------------------------- ---------------------- -------
+DEFAULT_MAINTENANCE_PLAN   ORA$AUTOTASK                25
+DEFAULT_MAINTENANCE_PLAN   ORA$DIAGNOSTICS              5
+DEFAULT_MAINTENANCE_PLAN   OTHER_GROUPS                70
+
+-- 조치 전: ORA$AUTOTASK=25, ORA$DIAGNOSTICS=5, OTHER_GROUPS=70 (합 100).
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치) 대기 영역 없이 곧바로 변경을 시도한다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  3           plan             => 'DEFAULT_MAINTENANCE_PLAN',
+  4           group_or_subplan => 'ORA$AUTOTASK',
+  5           new_mgmt_p1      => 15);
+  6       END;
+  7       /
+BEGIN
+*
+ERROR at line 1:
+ORA-29371: pending area is not active
+ORA-06512: at "SYS.DBMS_RMIN", line 444
+ORA-06512: at "SYS.DBMS_RESOURCE_MANAGER", line 108
+ORA-06512: at line 2
+
+SYS@orcl> -- 원인 파악: 리소스 플랜 변경은 반드시 대기 영역을 연 뒤에만 가능하다.
+SYS@orcl> --   대기 영역이 없어 ORA-29371이 발생했다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치) 올바른 4단계 워크플로우로 변경한다.
+--     ORA$AUTOTASK 25→15, OTHER_GROUPS 70→80 으로 합계 100 유지.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2         DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+  3         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  4           plan=>'DEFAULT_MAINTENANCE_PLAN', group_or_subplan=>'ORA$AUTOTASK',
+  5           new_mgmt_p1=>15);
+  6         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  7           plan=>'DEFAULT_MAINTENANCE_PLAN', group_or_subplan=>'OTHER_GROUPS',
+  8           new_mgmt_p1=>80);
+  9         DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+ 10         DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+ 11       END;
+ 12       /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 재확인
+SYS@orcl> SELECT group_or_subplan, mgmt_p1 FROM dba_rsrc_plan_directives
+  2       WHERE plan='DEFAULT_MAINTENANCE_PLAN' ORDER BY group_or_subplan;
+
+GROUP_OR_SUBPLAN       MGMT_P1
+---------------------- -------
+ORA$AUTOTASK                15
+ORA$DIAGNOSTICS              5
+OTHER_GROUPS                80
+
+-- 재확인: ORA$AUTOTASK 상한이 15%로 낮아졌다(경합 시 자동 작업에 덜 배정).
+--   ※ mgmt_p1은 '상한'이 아니라 '경합 시 보장 최소치'다. 경합이 없으면 더 쓸 수 있다.
+
+--------------------------------------------------------------------------------
+-- [6] (검증 실패 재확인) 합계가 100을 넘도록 잘못 변경하면 VALIDATE가 막는다.
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2         DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+  3         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  4           plan=>'DEFAULT_MAINTENANCE_PLAN', group_or_subplan=>'ORA$AUTOTASK',
+  5           new_mgmt_p1=>60);   -- 60+5+80 = 145 > 100
+  6         DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+  7       END;
+  8       /
+BEGIN
+*
+ERROR at line 1:
+ORA-29382: validation of pending area failed
+ORA-29377: consumer group OTHER_GROUPS is not part of top-plan ...
+             (or) percentages exceed 100
+
+SYS@orcl> -- 원인: 그룹 합이 100을 넘었다. VALIDATE가 SUBMIT 전에 잡아낸다.
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CLEAR_PENDING_AREA();   -- 잘못된 대기영역 폐기
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [7] (원복) 실습 환경을 원래대로 되돌린다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- 윈도우 시각 원복
+SYS@orcl> EXEC DBMS_SCHEDULER.SET_ATTRIBUTE('MONDAY_WINDOW','REPEAT_INTERVAL', -
+>   'freq=daily;byday=MON;byhour=22;byminute=0;bysecond=0');
+SYS@orcl> -- 자원 배분 원복 (25 / 70)
+SYS@orcl> BEGIN
+  2         DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+  3         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  4           plan=>'DEFAULT_MAINTENANCE_PLAN', group_or_subplan=>'ORA$AUTOTASK',
+  5           new_mgmt_p1=>25);
+  6         DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(
+  7           plan=>'DEFAULT_MAINTENANCE_PLAN', group_or_subplan=>'OTHER_GROUPS',
+  8           new_mgmt_p1=>70);
+  9         DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+ 10         DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+ 11       END;
+ 12       /
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 자동 작업이 업무와 겹치면: 먼저 윈도우 시간을 옮기고(안전), 그 다음 자원을 조인다.
+-- 2) 리소스 변경은 CREATE_PENDING_AREA → UPDATE → VALIDATE → SUBMIT 4단계.
+--    대기 영역 없이 바꾸면 ORA-29371, 합계 초과는 VALIDATE가 ORA-29382로 막는다.
+-- 3) mgmt_p1은 상한이 아니라 경합 시 보장 최소치다.
+-- 4) 통계 수집을 아예 끄는 것은 최후의 수단(끄면 계획 품질 저하). 끄면 수동 수집 계획 필수.
+
+SYS@orcl> EXIT
+================================================================================

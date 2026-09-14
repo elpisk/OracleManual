@@ -1,0 +1,152 @@
+================================================================================
+ 7장 실습 07 — Optimizer Statistics Advisor 실행과 권고 해석 (ADMIN 33장 심화)
+ 목표: 통계 운영을 룰로 점검하는 Statistics Advisor 태스크를 만들어 실행하고,
+       권고 보고서를 해석해 통계 부재·과다 오차를 근거 있게 해소한다.
+ 환경: non-CDB=orcl 19.3 (SYS로 수행)
+ 주의: ★개인 실습 환경 전용★. Statistics Advisor는 무료 기본 기능이며
+       Tuning Pack이 아니다. 진단 목적으로 특정 테이블 통계를 지웠다가
+       실습 끝에 재수집으로 원복하고, 생성한 어드바이저 태스크도 제거한다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+SYS@orcl> SET LONG 200000
+SYS@orcl> SET LONGCHUNKSIZE 200000
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 진단 소재를 만든다 — 한 테이블의 통계를 일부러 지운다.
+--     (Advisor가 '통계 없는 객체'를 잡아내는지 보기 위함. 실습용 의도적 조작)
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT table_name, num_rows,
+  2         TO_CHAR(last_analyzed,'YYYY-MM-DD HH24:MI') last_analyzed
+  3       FROM dba_tables
+  4       WHERE owner='SQLT' AND table_name='DRUG_MASTER';
+
+TABLE_NAME    NUM_ROWS LAST_ANALYZED
+------------- -------- ----------------
+DRUG_MASTER      10000 <환경값>
+
+SYS@orcl> EXEC DBMS_STATS.DELETE_TABLE_STATS('SQLT','DRUG_MASTER');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT table_name, num_rows, last_analyzed
+  2       FROM dba_tables
+  3       WHERE owner='SQLT' AND table_name='DRUG_MASTER';
+
+TABLE_NAME    NUM_ROWS LAST_ANALYZED
+------------- -------- -------------
+DRUG_MASTER
+
+-- 해석: DRUG_MASTER의 통계를 지웠다(num_rows·last_analyzed가 비었다).
+--   이제 Advisor가 이 '통계 없는 객체'를 발견하는지 확인한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) Advisor 태스크를 만들고 실행한다.
+--------------------------------------------------------------------------------
+SYS@orcl> DECLARE
+  2    v_task VARCHAR2(64);
+  3  BEGIN
+  4    v_task := DBMS_STATS.CREATE_ADVISOR_TASK('stat_adv_ch7');
+  5    v_task := DBMS_STATS.EXECUTE_ADVISOR_TASK('stat_adv_ch7');
+  6  END;
+  7  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 재확인: 태스크가 완료됐는지 상태를 본다.
+SYS@orcl> SELECT task_name, status
+  2       FROM dba_advisor_tasks
+  3       WHERE task_name='stat_adv_ch7';
+
+TASK_NAME       STATUS
+--------------- -----------
+stat_adv_ch7    COMPLETED
+
+--------------------------------------------------------------------------------
+-- [3] (해석) 권고 보고서를 뽑아 Finding·Recommendation·Rationale을 읽는다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT DBMS_STATS.REPORT_ADVISOR_TASK('stat_adv_ch7',
+  2         'TEXT','ALL') FROM dual;
+
+DBMS_STATS.REPORT_ADVISOR_TASK('STAT_ADV_CH7','TEXT','ALL')
+--------------------------------------------------------------------------------
+GENERAL INFORMATION
+-------------------------------------------------------------------------------
+ Task Name : stat_adv_ch7
+ ...
+Rule Name: UseAutoJob
+ Finding  : 자동 통계 수집 작업이 활성화되어 있는가를 점검
+ Recommendation : (환경에 따라 표시)
+Rule Name: MaintainStatsHistory / UseDefaultParams / UseGatherSchemaStats ...
+Rule Name: AvoidStaleStats
+ Finding  : 오래되었거나 없는 통계를 가진 객체가 있는지 점검
+ Recommendation : SQLT.DRUG_MASTER 등 통계가 없는 객체의 통계를 수집하라
+ Rationale : 통계가 없으면 옵티마이저가 동적 샘플링에 의존해 계획이 불안정
+--------------------------------------------------------------------------------
+
+-- 해석: Advisor가 룰별로 Finding/Recommendation/Rationale을 제시한다.
+--   방금 통계를 지운 DRUG_MASTER가 '통계 없는 객체' 권고에 잡혔다.
+--   (표시 문구·룰 구성은 버전/환경에 따라 다르므로 요지만 <환경값>으로 표기.)
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 권고를 '전부 자동 적용(IMPLEMENT)'하려다, 통계가 의도적으로
+--       잠긴 객체까지 건드릴 위험을 발견한다. 잠금 여부를 먼저 확인한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT table_name, stattype_locked
+  2       FROM dba_tab_statistics
+  3       WHERE owner='SQLT' AND stattype_locked IS NOT NULL;
+
+no rows selected
+
+-- 이상 징후: 만약 잠긴 통계가 있었다면 IMPLEMENT가 이를 건드릴 수 있다.
+-- 원인: 권고는 결론이 아니라 가설이다. 잠금이 의도된 것(휘발성 테이블의
+--   대표 통계 고정 등)이면 자동 적용이 오히려 해가 된다.
+-- 조치: 이 환경엔 잠긴 통계가 없음을 확인했으므로, 권고 중 'DRUG_MASTER
+--   통계 수집'만 근거를 확인하고 국소적으로 채택한다(전체 자동 적용 아님).
+SYS@orcl> EXEC DBMS_STATS.GATHER_TABLE_STATS('SQLT','DRUG_MASTER');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> -- 재확인: 통계가 복구됐는지 본다.
+SYS@orcl> SELECT table_name, num_rows,
+  2         TO_CHAR(last_analyzed,'YYYY-MM-DD HH24:MI') last_analyzed
+  3       FROM dba_tables
+  4       WHERE owner='SQLT' AND table_name='DRUG_MASTER';
+
+TABLE_NAME    NUM_ROWS LAST_ANALYZED
+------------- -------- ----------------
+DRUG_MASTER      10000 <환경값>
+
+-- 재확인 완료: DRUG_MASTER 통계가 num_rows=10000으로 복구됨(원복).
+
+--------------------------------------------------------------------------------
+-- [5] (조치) 실습 원복 — 생성한 Advisor 태스크를 제거한다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_STATS.DROP_ADVISOR_TASK('stat_adv_ch7');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT COUNT(*) task_cnt FROM dba_advisor_tasks
+  2       WHERE task_name='stat_adv_ch7';
+
+  TASK_CNT
+----------
+         0
+
+-- 재확인: 태스크가 제거됐다. 실습 흔적 없음.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) Statistics Advisor는 통계 운영을 룰로 점검(무료, Tuning Pack 아님).
+-- 2) CREATE → EXECUTE → REPORT 순으로 실행, Finding/Recommendation/Rationale 해석.
+-- 3) 의도적으로 지운 DRUG_MASTER 통계를 '통계 없는 객체'로 정확히 지목.
+-- 4) 권고는 가설 — 전체 자동 적용 대신 근거·맥락(잠금 등) 확인 후 국소 채택.
+-- ※ 원복 완료: DRUG_MASTER 통계 재수집 + Advisor 태스크 제거.
+
+SYS@orcl> EXIT
+================================================================================

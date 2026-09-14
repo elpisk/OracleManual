@@ -1,0 +1,118 @@
+================================================================================
+ 14장 실습 01 — 대기 이벤트 분류 체계 확인 (V$EVENT_NAME, 클래스별)
+ 목표: 대기 이벤트가 어떤 클래스로 묶이는지 V$EVENT_NAME으로 확인하고,
+       V$SYSTEM_EVENT를 wait_class<>'Idle'로 걸러 총 대기 시간 기준으로
+       상위 병목을 읽는 '분석의 기본 자세'를 익힌다.
+ 환경: non-CDB=orcl 19.3 (진단 SYS AS SYSDBA)
+ 라이선스: V$ 실시간 조회는 Diagnostics Pack과 무관하게 사용 가능.
+           (과거 구간 DBA_HIST_ / AWR Wait Events 섹션은 🔒)
+ 주의: 개인 실습 환경 전용. 조회 위주라 원본 데이터를 변경하지 않는다.
+================================================================================
+
+$ sqlplus / as sysdba
+SYS@orcl> SET LINESIZE 200
+SYS@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 오라클이 대기 이벤트를 어떤 클래스로 나누는지 지형을 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT wait_class, COUNT(*) events
+  2       FROM  v$event_name
+  3       GROUP BY wait_class ORDER BY COUNT(*) DESC;
+
+WAIT_CLASS          EVENTS
+------------------- ------
+Other                 1394
+Idle                   140
+Cluster                 73
+Administrative          59
+User I/O                59
+Concurrency             56
+System I/O              40
+Network                 30
+Configuration           28
+Application             17
+Scheduler               10
+Queueing                 9
+Commit                   5
+
+-- 해석: 개수 1위는 Other(1394)지만 이는 '이벤트가 많다'는 뜻일 뿐 대기 시간이
+--   크다는 뜻이 아니다. Other는 분류가 애매한 내부용 서랍이다. 실제 진단에서
+--   주목하는 클래스는 User I/O · System I/O · Concurrency · Commit · Application
+--   다섯이며, Idle(140개)은 '노는 시간'이라 병목 분석에서 제외한다.
+
+--------------------------------------------------------------------------------
+-- [2] (조회) 지금 이 순간 non-Idle 대기 중인 세션을 이벤트·클래스로 집계한다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT SUBSTR(event,1,34) event, wait_class, COUNT(*) sessions
+  2       FROM  v$session
+  3       WHERE wait_class <> 'Idle' AND wait_class IS NOT NULL
+  4       GROUP BY event, wait_class
+  5       ORDER BY COUNT(*) DESC;
+
+EVENT                        WAIT_CLASS      SESSIONS
+---------------------------- --------------- --------
+log file single write        System I/O             1
+log file switch completion   Configuration          1
+buffer busy waits            Concurrency            1
+SQL*Net message to client    Network                1
+
+-- 해석: 이 스냅사진은 '지금 이 순간'의 것이라 매초 바뀐다. 몇 개 세션이 무엇을
+--   기다리는지는 보이지만 그동안 누적된 영향은 알 수 없다. 누적은 [3]에서 본다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인)
+--     이상 징후: 신입 담당자가 V$SYSTEM_EVENT를 '있는 그대로' 총 대기 시간으로
+--       정렬했더니 맨 위에 SQL*Net message from client가 거대한 값으로 떴고,
+--       "최대 병목은 네트워크"라는 진단서를 올리려 한다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- (필터 없이) 잘못된 조회 — Idle이 상위를 점령한다.
+SYS@orcl> SELECT SUBSTR(event,1,30) event, ROUND(time_waited/100) sec
+  2       FROM  v$system_event
+  3       ORDER BY time_waited DESC FETCH FIRST 3 ROWS ONLY;
+
+EVENT                             SEC
+------------------------------ ------
+SQL*Net message from client    <환경값>   -- (매우 큼)
+Streams AQ: waiting for messag <환경값>
+rdbms ipc message              <환경값>
+
+-- 원인 파악: 위 세 이벤트는 모두 Idle 클래스다. DB가 '할 일이 없어 논' 유휴
+--   시간이라 값이 거대한 것이 정상이며, 병목이 아니다. wait_class 필터를 빠뜨렸다.
+SYS@orcl> -- 확인: 정말 Idle인지 사전 뷰로 검증한다.
+SYS@orcl> SELECT name, wait_class FROM v$event_name
+  2       WHERE name = 'SQL*Net message from client';
+
+NAME                          WAIT_CLASS
+----------------------------- ----------
+SQL*Net message from client   Idle
+
+-- 조치: wait_class<>'Idle'을 걸어 다시 집계한다.
+SYS@orcl> SELECT SUBSTR(event,1,34) event, total_waits,
+  2         ROUND(time_waited/100) sec, wait_class
+  3       FROM  v$system_event
+  4       WHERE wait_class <> 'Idle'
+  5       ORDER BY time_waited DESC FETCH FIRST 6 ROWS ONLY;
+
+EVENT                          TOTAL_WAITS   SEC  WAIT_CLASS
+------------------------------ ----------- ----- -----------
+SQL*Net vector data to client         3974   358  Network
+log file sync                        63826    53  Commit
+log file parallel write              64602    52  System I/O
+db file sequential read              17097    52  User I/O
+RMAN backup & recovery I/O            4385    40  System I/O
+control file parallel write          13958    24  System I/O
+
+-- 재확인 완료: 필터를 걸자 진짜 상위 병목(vector data 전송, 커밋 대기, 리두/단일
+--   블록 I/O)이 드러났다. '맨 위가 Idle이면 병목의 발견이 아니라 필터 누락 신호'다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) V$EVENT_NAME=사전(클래스 정의), V$SESSION=현재, V$SYSTEM_EVENT=누적.
+-- 2) 대기 이벤트는 '총 대기 시간(time_waited)'으로 정렬한다(횟수 아님).
+-- 3) 조회의 첫 규율은 WHERE wait_class<>'Idle' — Idle이 상위를 가리지 않게.
+-- 4) 주목 클래스: User I/O·System I/O·Concurrency·Commit·Application.
+
+SYS@orcl> EXIT
+================================================================================

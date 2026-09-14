@@ -1,0 +1,154 @@
+================================================================================
+ 2장 실습 05 — 시퀀스 경합 재현: 오류 없이 대기로만 드러나는 확장성 문제
+ 목표: NOCACHE(또는 캐시가 작은) 시퀀스를 동시 삽입 부하에서 사용하면
+       오류 없이 '대기'로만 나타나는 확장성 문제를 재현한다. 원인을 대기
+       이벤트로 지목하고 CACHE 조정으로 해소한 뒤 재확인한다.
+ 환경: non-CDB=orcl 19.3. 객체 생성/부하는 SQLT, 대기 관찰은 SYS로 수행.
+ 주의: 개인 실습 환경 전용. REVIEW_LOG 등에 대량 삽입 부하를 유발한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+
+--------------------------------------------------------------------------------
+-- [1] (이상 → 원인 → 조치 → 재확인) 실습용 시퀀스 준비.
+--------------------------------------------------------------------------------
+SQLT@orcl> CREATE SEQUENCE seq_review_demo START WITH 1 INCREMENT BY 1 NOCACHE;
+CREATE SEQUENCE seq_review_demo START WITH 1 INCREMENT BY 1 NOCACHE
+*
+ERROR at line 1:
+ORA-00955: name is already used by an existing object
+
+-- 이상 징후: 시퀀스 생성이 거부된다(ORA-00955).
+-- 원인 파악: 이전 실습에서 만든 동명 시퀀스가 남아 있다.
+-- 조치: 기존 시퀀스를 삭제하고 다시 만든다.
+
+SQLT@orcl> DROP SEQUENCE seq_review_demo;
+Sequence dropped.
+
+SQLT@orcl> CREATE SEQUENCE seq_review_demo START WITH 1 INCREMENT BY 1 NOCACHE;
+Sequence created.
+
+-- 재확인: NOCACHE 시퀀스가 생성되었다. 이제 이 시퀀스로 경합을 재현한다.
+SQLT@orcl> SELECT sequence_name, cache_size FROM user_sequences
+  2         WHERE sequence_name = 'SEQ_REVIEW_DEMO';
+
+SEQUENCE_NAME              CACHE_SIZE
+------------------------- ----------
+SEQ_REVIEW_DEMO                    0
+
+-- 해석: CACHE_SIZE=0(NOCACHE)이면 NEXTVAL을 요청할 때마다 데이터 딕셔너리를
+--   갱신해야 하므로, 동시 삽입이 몰리면 그 지점이 직렬화 병목이 된다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 관련 대기 이벤트의 현재 누적값을 캡처한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 별도 세션(SYS)에서 조치 전 대기 스냅샷을 잡는다.
+$ sqlplus / as sysdba
+SYS@orcl> SELECT event, total_waits, ROUND(time_waited_micro/1000) ms
+  2         FROM v$system_event
+  3        WHERE event IN ('enq: SQ - contention','row cache lock','DFS lock handle')
+  4        ORDER BY event;
+
+EVENT                          TOTAL_WAITS         MS
+------------------------------ ----------- ----------
+enq: SQ - contention              <환경값>   <환경값>
+row cache lock                    <환경값>   <환경값>
+
+-- 해석: 이 값을 기준선으로 둔다. 아래 동시 부하 후 델타를 비교한다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치/조회) 여러 세션에서 NOCACHE 시퀀스로 동시 삽입 부하를 준다.
+--------------------------------------------------------------------------------
+SYS@orcl> -- OS 셸에서 SQLT 세션 여러 개를 동시에 띄워 삽입을 반복시킨다.
+$ for s in 1 2 3 4 5 6; do
+    sqlplus -s sqlt/sqlt@orcl <<'EOF' &
+      BEGIN
+        FOR i IN 1..20000 LOOP
+          INSERT INTO review_log(log_id, review_dt, note)
+          VALUES (seq_review_demo.NEXTVAL, SYSDATE, 'demo');
+        END LOOP;
+        COMMIT;
+      END;
+      /
+EOF
+  done; wait
+
+-- 관찰 포인트: 이 부하는 오류 없이 완료된다. 그러나 '느리다'. 문제는
+--   에러 메시지가 아니라 대기로만 드러난다 = 확장성 문제의 전형적 모습.
+
+--------------------------------------------------------------------------------
+-- [4] (조회) 부하 중/직후 현재 활성 세션이 무엇을 기다리는지 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT event, COUNT(*) sessions
+  2         FROM v$session
+  3        WHERE username = 'SQLT' AND status = 'ACTIVE'
+  4        GROUP BY event ORDER BY sessions DESC;
+
+EVENT                                    SESSIONS
+--------------------------------------- ---------
+enq: SQ - contention                     <환경값>
+row cache lock                           <환경값>
+
+-- 해석: 여러 세션이 'enq: SQ - contention'(시퀀스 큐 잠금 경합)과
+--   'row cache lock'(딕셔너리 캐시 잠금)을 기다린다. NOCACHE라 NEXTVAL이
+--   매번 딕셔너리를 갱신하며 세션들이 같은 지점에서 직렬화된 것이다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치) 시퀀스에 CACHE를 부여해 경합을 해소한다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXIT
+$ sqlplus sqlt/sqlt@orcl
+SQLT@orcl> ALTER SEQUENCE seq_review_demo CACHE 1000;
+Sequence altered.
+
+SQLT@orcl> SELECT sequence_name, cache_size FROM user_sequences
+  2         WHERE sequence_name = 'SEQ_REVIEW_DEMO';
+
+SEQUENCE_NAME              CACHE_SIZE
+------------------------- ----------
+SEQ_REVIEW_DEMO                 1000
+
+-- 해석: CACHE 1000이면 각 인스턴스가 시퀀스 값 1000개를 미리 메모리에 확보해
+--   두고 나눠 주므로, NEXTVAL 대부분이 딕셔너리 갱신 없이 처리된다.
+
+--------------------------------------------------------------------------------
+-- [6] (재확인) 같은 동시 부하를 다시 준 뒤 대기 델타를 비교한다.
+--------------------------------------------------------------------------------
+SQLT@orcl> -- [3]과 동일한 동시 삽입 부하를 재실행(생략 표기)
+$ (동일 부하 재실행)
+
+$ sqlplus / as sysdba
+SYS@orcl> SELECT event, total_waits FROM v$system_event
+  2         WHERE event = 'enq: SQ - contention';
+
+EVENT                          TOTAL_WAITS
+------------------------------ -----------
+enq: SQ - contention              <환경값>   -- [2] 기준선 대비 증가폭 급감
+
+-- 재확인: CACHE 조정 후 'enq: SQ - contention' 증가폭이 크게 줄었다.
+--   같은 부하인데 대기가 줄었다 = 경합이 해소되어 확장성이 개선된 것이다.
+
+--------------------------------------------------------------------------------
+-- [7] (되돌리기) 실습 객체를 정리한다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXIT
+$ sqlplus sqlt/sqlt@orcl
+SQLT@orcl> DELETE FROM review_log WHERE note = 'demo';
+SQLT@orcl> COMMIT;
+SQLT@orcl> DROP SEQUENCE seq_review_demo;
+Sequence dropped.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 확장성 문제는 오류가 아니라 '대기'로만 드러나기도 한다(에러 없음).
+-- 2) NOCACHE 시퀀스는 동시 삽입에서 enq: SQ - contention·row cache lock을 부른다.
+-- 3) CACHE를 키우면 딕셔너리 갱신 없이 값을 나눠 주어 경합이 준다.
+-- 4) 진단은 V$SESSION·V$SYSTEM_EVENT 조회로 충분(라이선스 불필요).
+-- ※ ORA-00955(동명 객체)는 조치 전 정리 단계의 오류 흐름으로, 본 경합 자체는
+--   오류 없이 대기로만 나타난다는 점이 이 실습의 핵심이다.
+
+SQLT@orcl> EXIT
+================================================================================
