@@ -1,0 +1,124 @@
+================================================================================
+ Ch04 실습 03 — Index-Only: 표를 읽을 필요가 없으면 선택도 49% 에서도 인덱스가 유지된다
+ 목표: 실습 02 와 같은 6개월 범위(148,028건, 49%)를 SUM(total_amt) 대신 COUNT(*) 로 바꾸면
+       Full Scan(3,090)이 INDEX RANGE SCAN(910)으로 돌아오는 것을 실측한다. "인덱스 컬럼이
+       아닌 컬럼 하나" 를 SELECT 에 넣는 순간 다시 Full Scan 이 되는 이상 징후로 원리를 굳힌다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. 바인드 변수 :end_id 사용.
+ 주의: 개인 실습 환경 전용. 조회만 수행한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+SQLT@orcl> VARIABLE end_id VARCHAR2(20)
+SQLT@orcl> EXEC :end_id := '20240701-0000000'            -- 약 6개월, 49%
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 같은 범위, COUNT(*) — 표를 읽을 이유가 없다
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*)
+  2       FROM   medical_claims
+  3       WHERE  claim_id BETWEEN '20240101-0000000' AND :end_id;
+
+  COUNT(*)
+----------
+    148028
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------
+| Id  | Operation          | Name              | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                   |      1 |        |      1 |     910 |
+|   1 |  SORT AGGREGATE    |                   |      1 |      1 |      1 |     910 |
+|*  2 |   FILTER           |                   |      1 |        | 148028 |     910 |
+|*  3 |    INDEX RANGE SCAN| PK_MEDICAL_CLAIMS |      1 |  <환경값> | 148028 |     910 |
+------------------------------------------------------------------------------------------------
+   3 - access("CLAIM_ID">='20240101-0000000' AND "CLAIM_ID"<=:END_ID)
+
+-- 해석: 실습 02 에서 같은 범위의 SUM(total_amt) 는 Full Scan 3,090 이었다. COUNT(*) 는 인덱스만
+--   읽어 910. TABLE ACCESS 단계 자체가 없다 — 필요한 정보(행이 있다는 사실)가 인덱스 안에 있다.
+--   49% 를 읽는데도 인덱스가 유리한 이유: 인덱스 리프 블록을 순서대로 읽는 비용(910)이 표 전체(3,090)
+--   보다 싸고, 표로 갈 일이 없으니 "흩어짐" 비용이 0 이다.
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 조치 → 재확인) 컬럼 하나 추가했더니 다시 3,090
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 화면에 "건수와 최대 금액" 을 같이 보여 달라는 요구가 들어왔다.
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*), MAX(total_amt)
+  2       FROM   medical_claims
+  3       WHERE  claim_id BETWEEN '20240101-0000000' AND :end_id;
+
+  COUNT(*) MAX(TOTAL_AMT)
+---------- --------------
+    148028       <환경값>
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------------------------
+|   1 |  SORT AGGREGATE    |                |      1 |      1 |      1 |    3090 |
+|*  2 |   FILTER           |                |      1 |        | 148028 |    3090 |
+|*  3 |    TABLE ACCESS FULL| MEDICAL_CLAIMS|      1 |  <환경값> | 148028 |    3090 |
+------------------------------------------------------------------------------------------
+
+SQLT@orcl> -- 이상 징후: MAX(total_amt) 하나 붙였더니 910 → 3,090. "집계 하나 더 했을 뿐인데".
+SQLT@orcl> -- 원인 파악: TOTAL_AMT 는 PK 인덱스에 없다. 값을 얻으려면 148,028행마다 표 블록을 찾아가야
+SQLT@orcl> --   하는데, 49% 를 ROWID 로 하나씩 찾는 것(실습 02 기준 838건에 725블록 → 14만 건이면 수만
+SQLT@orcl> --   블록)보다 표 전체 3,090 이 싸다. 옵티마이저의 판단이 맞다.
+SQLT@orcl> -- 조치: 요구가 잦다면 인덱스에 TOTAL_AMT 를 포함시켜 다시 Index-Only 로 만들 수 있다
+SQLT@orcl> --   (커버링 인덱스). 만들고 재고 지운다 — 인스턴스 부문은 PK 만 있는 상태를 전제한다.
+SQLT@orcl> CREATE INDEX ix_ch04_cover ON medical_claims(claim_id, total_amt);
+
+Index created.
+
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*), MAX(total_amt)
+  2       FROM   medical_claims
+  3       WHERE  claim_id BETWEEN '20240101-0000000' AND :end_id;
+
+  COUNT(*) MAX(TOTAL_AMT)
+---------- --------------
+    148028       <환경값>
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------
+| Id  | Operation          | Name          | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------------------------------
+|   1 |  SORT AGGREGATE    |               |      1 |      1 |      1 |  <환경값> |
+|*  2 |   FILTER           |               |      1 |        | 148028 |  <환경값> |
+|*  3 |    INDEX RANGE SCAN| IX_CH04_COVER |      1 |  <환경값> | 148028 |  <환경값> |
+------------------------------------------------------------------------------------------------
+
+-- 재확인: 다시 INDEX RANGE SCAN, 표 접근 없음. Buffers 는 910 보다 조금 크다(<환경값>: 인덱스
+--   엔트리가 TOTAL_AMT 만큼 길어져 리프 블록이 늘었다) — 그래도 3,090 보다 훨씬 작다.
+SQLT@orcl> DROP INDEX ix_ch04_cover;
+
+Index dropped.
+
+SQLT@orcl> SELECT index_name FROM user_indexes WHERE table_name = 'MEDICAL_CLAIMS';
+
+INDEX_NAME
+--------------------
+PK_MEDICAL_CLAIMS
+
+-- 원복 확인: PK 만 남았다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 인덱스만으로 답이 나오면(Index-Only) 선택도 49% 에서도 인덱스가 유지된다(910 vs 3,090).
+-- 2) SELECT·WHERE·ORDER BY 에 인덱스에 없는 컬럼이 하나라도 있으면 표를 읽어야 하고, 그 순간
+--    "선택도 교차점" 규칙(실습 02)이 적용된다.
+-- 3) 자주 쓰는 컬럼을 인덱스에 포함시키면(커버링) 다시 Index-Only 가 된다 — 대신 인덱스가 커진다(Ch05).
+-- 4) 만든 인덱스는 지우고 USER_INDEXES 로 확인한다. Day 5 부터는 PK 만 있어야 한다.
+
+SQLT@orcl> EXIT
+================================================================================

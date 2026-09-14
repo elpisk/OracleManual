@@ -1,0 +1,121 @@
+================================================================================
+ Ch14 실습 02 — DISPLAY_CURSOR 형식 옵션: ALLSTATS LAST 와 ALL 의 차이, 누적값 오판 교정
+ 목표: 같은 커서를 'ALLSTATS ALL' 로 보면 Buffers·A-Time 이 실행 횟수만큼 누적돼 나온다는
+       것을 확인하고, 이를 "한 번에 3만 블록 읽는 SQL" 로 오판하는 이상 징후를 재현·교정한다.
+       +MEMSTATS, +PREDICATE, +COST 등 자주 쓰는 형식 토큰을 정리한다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. 실습 01 의 커서가 공유 풀에 남아 있는 상태에서 시작.
+ 주의: 개인 실습 환경 전용. 조회만 수행한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 같은 SQL 을 10회 더 실행해 둔다
+--------------------------------------------------------------------------------
+SQLT@orcl> BEGIN
+  2         FOR i IN 1..10 LOOP
+  3           FOR r IN (SELECT /*+ GATHER_PLAN_STATISTICS */ claim_id, total_amt
+  4                     FROM   medical_claims
+  5                     WHERE  claim_id BETWEEN '20240601-0000000' AND '20240602-0000000') LOOP
+  6             NULL;
+  7           END LOOP;
+  8         END LOOP;
+  9       END;
+ 10       /
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> COLUMN sql_id NEW_VALUE v_sqlid
+SQLT@orcl> SELECT sql_id, child_number, executions, buffer_gets
+  2       FROM   v$sql
+  3       WHERE  sql_text LIKE 'SELECT /*+ GATHER_PLAN_STATISTICS */ CLAIM_ID, TOTAL_AMT FROM MEDICAL_CLAIMS WHERE CLAIM_ID BETWEEN%';
+
+SQL_ID        CHILD_NUMBER EXECUTIONS BUFFER_GETS
+------------- ------------ ---------- -----------
+<환경값>                 0         10       31440
+
+-- 해석: PL/SQL 안의 SQL 은 대문자로 정규화돼 별개 커서(SQL_ID)가 된다. 10회 실행, 누적 31,440 = 3,144 × 10.
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 조치 → 재확인) 'ALLSTATS ALL' 을 보고 "3만 블록 읽는 SQL" 로 오판
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('&v_sqlid', 0, 'ALLSTATS ALL'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |     10 |        |   8040 |00:00:00.12 |   31440 |
+|*  1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS |     10 |  <환경값> |   8040 |00:00:00.12 |   31440 |
+------------------------------------------------------------------------------------------------
+
+SQLT@orcl> -- 이상 징후: Buffers 31,440, A-Rows 8,040. "804행 가져오는 데 3만 블록을 읽는다" 고 읽기 쉽다.
+SQLT@orcl> -- 원인 파악: 'ALLSTATS ALL' 은 이 커서가 적재된 이후 모든 실행의 합계다. Starts=10 이 단서다.
+SQLT@orcl> --   실행당 값은 합계 ÷ Starts: 31,440 ÷ 10 = 3,144, 8,040 ÷ 10 = 804. 실습 01 과 같다.
+SQLT@orcl> --   TUN 5장 실습 06 의 "누적값 오판" 과 정확히 같은 함정이다 — 단위가 블록이냐 시간이냐만 다르다.
+SQLT@orcl> -- 조치: 실행당 값이 필요하면 'ALLSTATS LAST'(마지막 실행 1회분)를 쓴다.
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('&v_sqlid', 0, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |    804 |00:00:00.01 |    3144 |
+|*  1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |  <환경값> |    804 |00:00:00.01 |    3144 |
+------------------------------------------------------------------------------------------------
+
+-- 재확인: Starts=1, Buffers 3,144, A-Rows 804 — 실행 1회분이다.
+--   ALL 이 쓸모없는 것은 아니다: "이 커서가 지금까지 인스턴스에 준 부담의 합" 을 볼 때는 ALL 이 맞다.
+--   질문이 "한 번에 얼마" 면 LAST, "지금까지 총 얼마" 면 ALL(또는 V$SQL.BUFFER_GETS).
+
+--------------------------------------------------------------------------------
+-- [3] (조치 후 관점) 자주 쓰는 형식 토큰
+--------------------------------------------------------------------------------
+SQLT@orcl> -- +MEMSTATS: 정렬·해시 작업 영역(OMem/1Mem/Used-Mem). Full Scan 만 있는 이 SQL 에는 열이 없다.
+SQLT@orcl> --           정렬이 있는 SQL 로 확인한다.
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ claim_id, total_amt
+  2       FROM   medical_claims
+  3       WHERE  claim_id BETWEEN '20240601-0000000' AND '20240602-0000000'
+  4       ORDER  BY total_amt DESC;
+
+804 rows selected.
+(출력 생략)
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +MEMSTATS'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | A-Rows | Buffers |  OMem |  1Mem | Used-Mem |
+------------------------------------------------------------------------------------------------
+|   1 |  SORT ORDER BY     |                |    804 |    3144 | <환경값> | <환경값> |  <환경값> (0)|
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |    804 |    3144 |       |       |          |
+------------------------------------------------------------------------------------------------
+
+-- 해석: OMem = 메모리 안에서 끝내는 데 필요한 추정 크기, 1Mem = 1-pass 로 끝낼 최소 크기,
+--   Used-Mem = 실제 사용량, 괄호의 (0) = 디스크로 넘친 횟수(0 이면 메모리 안에서 끝남).
+--   TUN 19장 실습 05 는 이 값을 PGA 를 줄여 (1)·(2) 로 만들어 본다.
+
+SQLT@orcl> -- 형식 토큰 정리
+SQLT@orcl> --   'BASIC'                 Id·Operation·Name 만
+SQLT@orcl> --   'TYPICAL'(기본)         + Rows·Bytes·Cost·Predicate
+SQLT@orcl> --   'ALLSTATS LAST'         실행 통계 1회분 (이 과정의 표준)
+SQLT@orcl> --   'ALLSTATS ALL'          실행 통계 누적 — Starts 로 나눠 읽는다
+SQLT@orcl> --   '+MEMSTATS'             작업 영역 열 추가
+SQLT@orcl> --   '+PREDICATE' / '-PREDICATE'   Predicate Information 표시/생략
+SQLT@orcl> --   '+COST'                 실행 통계와 함께 Cost 열도 표시
+SQLT@orcl> --   '+HINT_REPORT'          힌트 적용 여부 보고서(19c, Ch03 실습 03)
+SQLT@orcl> --   '+OUTLINE'              계획을 고정하는 힌트 집합 — 실습 시험에서 계획 재현용
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) ALLSTATS ALL 은 커서 적재 이후 누적, LAST 는 마지막 1회. Starts 를 먼저 보고 어느 쪽인지 안다.
+-- 2) 누적을 실행당으로 오판하면 Buffers 가 10배로 보인다 — 합계 ÷ Starts 로 나누거나 LAST 를 쓴다.
+-- 3) PL/SQL 안의 SQL 은 대문자로 정규화돼 SQL*Plus 에서 친 같은 SQL 과 다른 SQL_ID 를 받는다.
+-- 4) 이 과정의 표준 형식은 'ALLSTATS LAST', 정렬·해시가 있으면 '+MEMSTATS' 를 더한다.
+
+SQLT@orcl> EXIT
+================================================================================

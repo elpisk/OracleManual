@@ -1,0 +1,158 @@
+================================================================================
+ Ch12 실습 03 — 완화책: CLAIM_DETAILS(CLAIM_ID) 인덱스로 회당 비용을 줄인다, 그리고 SQL 부문 원복 확인
+ 목표: 조인이 당장 어려운 응용을 가정해 CLAIM_DETAILS.CLAIM_ID 에 인덱스를 만들고, N+1 의 회당 비용이
+       6,623 에서 수 블록으로 주는 것을 V$SQL 델타로 확인한다. 그래도 반복 구조는 남아 N 에 정비례함을
+       보고, 조인 1회 쪽도 인덱스로 어떻게 바뀌는지 본다. 마지막에 인덱스를 지우고 SQL 부문 전체 원복
+       (PK 만, 통계 원상)을 검증한다 — 이것이 Day 5 인스턴스 부문의 전제다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. DDL 포함.
+ 주의: 개인 실습 환경 전용. 이 실습의 [4] 는 Day 4 종료 점검이기도 하다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치) FK 컬럼 인덱스
+--------------------------------------------------------------------------------
+SQLT@orcl> CREATE INDEX ix_ch12_detail_claim ON claim_details(claim_id);
+
+Index created.
+
+SQLT@orcl> -- 통계가 바뀌었으므로 기존 커서(cq8zvf7njas01)는 무효화돼 다음 실행에서 다시 최적화된다.
+SQLT@orcl> SELECT sql_id, executions, buffer_gets, invalidations FROM v$sql WHERE sql_id = 'cq8zvf7njas01';
+
+SQL_ID        EXECUTIONS BUFFER_GETS INVALIDATIONS
+------------- ---------- ----------- -------------
+cq8zvf7njas01         60      397404      <환경값>
+
+--------------------------------------------------------------------------------
+-- [2] (재확인) N+1 을 다시 — 회당 비용
+--------------------------------------------------------------------------------
+SQLT@orcl> DECLARE
+  2         v_cnt NUMBER;
+  3       BEGIN
+  4         FOR r IN (SELECT claim_id FROM medical_claims WHERE hosp_id = 1 AND ROWNUM <= 20) LOOP
+  5           SELECT /* N1_DETAIL */ COUNT(*) INTO v_cnt FROM claim_details WHERE claim_id = r.claim_id;
+  6         END LOOP;
+  7       END;
+  8       /
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> SELECT sql_id, child_number, executions, buffer_gets, ROUND(buffer_gets/executions,1) avg_buffers
+  2       FROM   v$sql WHERE sql_id = 'cq8zvf7njas01' ORDER BY child_number;
+
+SQL_ID        CHILD_NUMBER EXECUTIONS BUFFER_GETS AVG_BUFFERS
+------------- ------------ ---------- ----------- -----------
+cq8zvf7njas01            0         20      <환경값>     <환경값>      -- 새 자식 커서(또는 재적재): 회당 3~4
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('cq8zvf7njas01', NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+| Id  | Operation         | Name                 | Starts | A-Rows | Buffers |
+------------------------------------------------------------------------------------------
+|   1 |  SORT AGGREGATE   |                      |      1 |      1 |  <환경값> |
+|*  2 |   INDEX RANGE SCAN| IX_CH12_DETAIL_CLAIM |      1 |  <환경값> |  <환경값> |    -- 3~4 블록
+------------------------------------------------------------------------------------------
+   2 - access("CLAIM_ID"=:B1)
+
+-- 재확인: 회당 6,623 → 3~4 Buffers. 20회 합 60~80. Full Scan 이 INDEX RANGE SCAN(Index-Only)이 됐다.
+--   그러나 EXECUTIONS 는 여전히 20 — 반복 구조는 그대로다. N 이 10,000 이면 30,000~40,000 Buffers 에
+--   왕복 10,000회. 인덱스는 "회당" 을 줄일 뿐 "회수" 를 줄이지 못한다.
+
+--------------------------------------------------------------------------------
+-- [3] (재확인) 조인 1회 쪽은 — 인덱스가 있으니 NL 이 후보가 된다
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ c.claim_id, COUNT(d.detail_id) cnt
+  2       FROM  (SELECT claim_id FROM medical_claims WHERE hosp_id = 1 AND ROWNUM <= 20) c,
+  3              claim_details d
+  4       WHERE  c.claim_id = d.claim_id(+)
+  5       GROUP  BY c.claim_id;
+(20 rows)
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name                 | Starts | A-Rows | Buffers |
+------------------------------------------------------------------------------------------------
+|   1 |  HASH GROUP BY        |                      |      1 |     20 |  <환경값> |
+|   2 |   NESTED LOOPS OUTER  |                      |      1 |     65 |  <환경값> |    -- 100 안팎
+|   3 |    VIEW               |                      |      1 |     20 |      23 |
+|*  5 |      TABLE ACCESS FULL| MEDICAL_CLAIMS       |      1 |     20 |      23 |
+|*  6 |    INDEX RANGE SCAN   | IX_CH12_DETAIL_CLAIM |     20 |     65 |  <환경값> |    -- Starts=20
+------------------------------------------------------------------------------------------------
+
+-- 재확인: HASH JOIN OUTER(6,645) → NESTED LOOPS OUTER(<환경값>, 100 안팎). Id 6 의 Starts=20 — 조인 안에서
+--   20번 인덱스를 탐색했다. "N+1 과 같은 20번" 이지만 세션 왕복 없이 서버 안에서 도는 것이 다르다.
+--   결국 최선은 조인 1회 + FK 인덱스다: 왕복 1회, 표 접근 최소.
+
+--   ┌──────────────────────────────┬──────────┬───────────┬──────────────────────┐
+--   │ 방식                         │ 왕복     │ Buffers   │ 구조                 │
+--   ├──────────────────────────────┼──────────┼───────────┼──────────────────────┤
+--   │ N+1, 인덱스 없음 (실습 01)   │ 20       │ 132,468   │ Full × 20            │
+--   │ 조인 1회, 인덱스 없음(실습 02)│ 1        │   6,645   │ HASH JOIN, Full × 1  │
+--   │ N+1, 인덱스 있음 (이 실습)   │ 20       │  60~80    │ RANGE SCAN × 20      │
+--   │ 조인 1회, 인덱스 있음        │ 1        │ 100 안팎  │ NL, RANGE SCAN × 20  │
+--   └──────────────────────────────┴──────────┴───────────┴──────────────────────┘
+
+--------------------------------------------------------------------------------
+-- [4] (원복 → 검증) SQL 부문 종료 점검 — 인스턴스 부문의 전제
+--------------------------------------------------------------------------------
+SQLT@orcl> -- (오류 → 원인 → 조치 → 재확인) "인덱스를 다 지운다" 고 PK 인덱스까지 지우려 하면
+SQLT@orcl> DROP INDEX pk_claim_details;
+DROP INDEX pk_claim_details
+           *
+ERROR at line 1:
+ORA-02429: cannot drop index used for enforcement of unique/primary key
+
+SQLT@orcl> -- 원인 파악: PK_CLAIM_DETAILS 는 PRIMARY KEY 제약이 유일성을 강제하는 데 쓰는 인덱스다. 제약이
+SQLT@orcl> --   살아 있는 한 인덱스를 따로 지울 수 없다 — Oracle 이 막아 준 것이지 실수가 아니다.
+SQLT@orcl> --   원복 대상은 "이 과정에서 만든 것" 이지 "모든 인덱스" 가 아니다. 이름 규칙(IX_)으로 가른다.
+SQLT@orcl> -- 조치: 이 과정에서 만든 인덱스만 지운다.
+SQLT@orcl> DROP INDEX ix_ch12_detail_claim;
+
+Index dropped.
+
+SQLT@orcl> -- 재확인 ① PK 외 인덱스 0건
+SQLT@orcl> SELECT table_name, index_name FROM user_indexes WHERE index_name NOT LIKE 'PK%';
+
+no rows selected
+
+SQLT@orcl> -- ② 복제 표(_WL) 0건
+SQLT@orcl> SELECT table_name FROM user_tables WHERE table_name LIKE '%\_WL' ESCAPE '\';
+
+no rows selected
+
+SQLT@orcl> -- ③ HOSP_ID 히스토그램 원상(Ch13 실습 03 복원)
+SQLT@orcl> SELECT column_name, histogram, num_buckets FROM user_tab_col_statistics
+  2       WHERE  table_name = 'MEDICAL_CLAIMS' AND column_name = 'HOSP_ID';
+
+COLUMN_NAME    HISTOGRAM  NUM_BUCKETS
+-------------- ---------- -----------
+HOSP_ID        HYBRID             254
+
+SQLT@orcl> -- ④ 7개 표 건수 원상(Ch01 실습 01 과 동일)
+SQLT@orcl> SELECT (SELECT COUNT(*) FROM medical_claims) mc, (SELECT COUNT(*) FROM claim_details) cd,
+  2              (SELECT COUNT(*) FROM patients) p, (SELECT COUNT(*) FROM hospitals) h FROM dual;
+
+        MC         CD          P          H
+---------- ---------- ---------- ----------
+    300000     899894      50000       1000
+
+-- 네 항목이 모두 원상이면 Day 5 부터의 인스턴스 부문 트랜스크립트(TUN 1장 실습 05 의 기준선)와
+--   종합 평가("PK 인덱스만 존재" 전제, 위반 시 0점)가 성립한다. 하나라도 어긋나면 지금 고친다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) FK 컬럼 인덱스는 N+1 의 회당 비용을 6,623 → 3~4 로 줄인다. 그러나 회수(왕복)는 그대로다.
+-- 2) 근본 해법은 조인 1회, 완화책은 인덱스, 최선은 둘 다(NL + RANGE SCAN, 왕복 1회).
+-- 3) Starts=20 인 NL 과 왕복 20회인 N+1 은 "20번" 이 같아도 비용이 다르다 — 왕복이 비싸다.
+-- 4) PK 인덱스는 제약이 쓰고 있어 지울 수 없다(ORA-02429). 원복 대상은 IX_ 로 시작하는 것뿐.
+-- 5) SQL 부문 종료 점검 4항목: PK 외 인덱스 0, _WL 표 0, HOSP_ID HYBRID 254, 표 건수 원상.
+
+SQLT@orcl> EXIT
+================================================================================

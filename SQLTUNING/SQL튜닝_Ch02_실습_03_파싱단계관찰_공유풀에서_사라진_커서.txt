@@ -1,0 +1,152 @@
+================================================================================
+ Ch02 실습 03 — Parse/Bind/Execute/Fetch 단계 관찰과 공유 풀에서 사라진 커서 (ORA-01031 교정)
+ 목표: 세션 통계로 네 단계의 흔적(parse count / execute count / fetch)을 델타로 관찰한다.
+       SQLT 로 ALTER SYSTEM FLUSH SHARED_POOL 을 시도해 ORA-01031 을 재현하고, SYS 로 수행한
+       뒤 같은 SQL 이 다시 하드 파싱되는(LOADS 증가) 것을 확인한다. 배열 크기(arraysize)에
+       따라 Fetch 횟수가 달라지는 것도 함께 본다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT + SYS AS SYSDBA (별도 터미널).
+ 주의: 개인 실습 환경 전용. FLUSH SHARED_POOL 은 모든 세션의 커서를 버려 운영에서는 금지다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 네 단계의 흔적을 세션 통계로 잰다 — 반드시 델타로
+--------------------------------------------------------------------------------
+SQLT@orcl> -- T0 기록
+SQLT@orcl> COLUMN name FORMAT A26
+SQLT@orcl> SELECT n.name, s.value FROM v$mystat s, v$statname n
+  2       WHERE  s.statistic# = n.statistic#
+  3       AND    n.name IN ('parse count (total)','parse count (hard)','execute count',
+  4                         'SQL*Net roundtrips to/from client')
+  5       ORDER  BY n.name;
+
+NAME                            VALUE
+-------------------------- ----------
+SQL*Net roundtrips to/from  <환경값>                        -- (T0)
+execute count               <환경값>
+parse count (hard)          <환경값>
+parse count (total)         <환경값>
+
+SQLT@orcl> -- 처음 보는 SQL 을 1회 실행한다(결과 3,058행을 화면에 다 흘리지 않도록 AUTOTRACE 로 억제).
+SQLT@orcl> -- AUTOTRACE 는 PLUSTRACE 롤이 있어야 켜진다(실습 환경의 SQLT 에는 부여돼 있다).
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT claim_id, total_amt FROM medical_claims WHERE hosp_id = 1;
+
+3058 rows selected.
+
+Statistics
+----------------------------------------------------------
+          1  recursive calls
+          0  db block gets
+       3290  consistent gets
+          0  physical reads
+          0  redo size
+      <환경값>  bytes sent via SQL*Net to client
+      <환경값>  bytes received via SQL*Net from client
+        205  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+       3058  rows processed
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT n.name, s.value FROM v$mystat s, v$statname n
+  2       WHERE  s.statistic# = n.statistic#
+  3       AND    n.name IN ('parse count (total)','parse count (hard)','execute count',
+  4                         'SQL*Net roundtrips to/from client')
+  5       ORDER  BY n.name;
+
+NAME                            VALUE
+-------------------------- ----------
+SQL*Net roundtrips to/from  <환경값>                        -- (T1) 델타 ≈ 205
+execute count               <환경값>                        --      델타 ≈ 1 (+AUTOTRACE 내부 실행)
+parse count (hard)          <환경값>                        --      델타 = 1
+parse count (total)         <환경값>                        --      델타 ≈ 1 (+AUTOTRACE 내부 파싱)
+
+-- 해석: Parse 1회(그중 하드 1회) → Execute 1회 → Fetch 는 왕복 205회.
+--   3,058행 ÷ SQL*Plus 기본 arraysize 15 = 203.9 → 약 204~205 왕복. Fetch 는 "한 번" 이 아니라
+--   배열 크기 단위로 반복된다. consistent gets 3,290 은 Full Scan 3,090 + 배열 경계마다 다시 읽는
+--   블록 약 200 개다.
+
+SQLT@orcl> -- arraysize 를 올리면 Fetch 왕복과 consistent gets 가 같이 준다(TUN 2장 실습 04 의 소재).
+SQLT@orcl> SET ARRAYSIZE 500
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT claim_id, total_amt FROM medical_claims WHERE hosp_id = 1;
+
+3058 rows selected.
+
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+       3097  consistent gets
+          8  SQL*Net roundtrips to/from client
+       3058  rows processed
+(관심 항목만 발췌)
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SET ARRAYSIZE 15
+
+-- 재확인: 왕복 205 → 8 (3,058 ÷ 500 = 6.1 → 7~8), consistent gets 3,290 → 3,097.
+--   같은 SQL·같은 계획인데 Fetch 방식만으로 논리 읽기가 6% 줄었다.
+
+--------------------------------------------------------------------------------
+-- [2] (오류 → 원인 → 조치 → 재확인) 공유 풀을 비워 하드 파싱을 다시 일으키려다 ORA-01031
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT sql_id, executions, loads, invalidations FROM v$sql
+  2       WHERE  sql_text = 'SELECT claim_id, total_amt FROM medical_claims WHERE hosp_id = 1';
+
+SQL_ID        EXECUTIONS      LOADS INVALIDATIONS
+------------- ---------- ---------- -------------
+<환경값>               2          1             0
+
+SQLT@orcl> ALTER SYSTEM FLUSH SHARED_POOL;
+ALTER SYSTEM FLUSH SHARED_POOL
+*
+ERROR at line 1:
+ORA-01031: insufficient privileges
+
+SQLT@orcl> -- 원인 파악: ALTER SYSTEM 은 인스턴스 전체에 영향을 주는 명령이라 ALTER SYSTEM 시스템
+SQLT@orcl> --   권한이 필요하다. 업무 스키마(SQLT)에는 없다. 이 오류는 Parse 단계의 권한 검사에서 난다.
+SQLT@orcl> -- 조치: 별도 터미널에서 SYS 로 수행한다. (SQLT 에 ALTER SYSTEM 을 부여하지 않는다 —
+SQLT@orcl> --   업무 계정이 인스턴스를 흔들 수 있게 되므로.)
+
+$ sqlplus / as sysdba
+SYS@orcl> ALTER SYSTEM FLUSH SHARED_POOL;
+
+System altered.
+
+SYS@orcl> EXIT
+
+SQLT@orcl> -- 재확인: 같은 SQL 을 다시 실행하면 공유 풀에 없으므로 다시 적재(LOADS 증가)된다.
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT claim_id, total_amt FROM medical_claims WHERE hosp_id = 1;
+
+3058 rows selected.
+(통계 생략)
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT sql_id, executions, loads, invalidations FROM v$sql
+  2       WHERE  sql_text = 'SELECT claim_id, total_amt FROM medical_claims WHERE hosp_id = 1';
+
+SQL_ID        EXECUTIONS      LOADS INVALIDATIONS
+------------- ---------- ---------- -------------
+<환경값>               1          1             0
+
+-- 재확인: EXECUTIONS 가 2 → 1 로 돌아갔다 — 이전 커서는 버려지고 새 커서가 적재됐다는 뜻이다
+--   (V$SQL 의 통계는 커서 단위라 커서가 사라지면 함께 사라진다). 이 SQL 은 다시 하드 파싱을 치렀다.
+--   운영에서 공유 풀을 비우면 모든 SQL 이 이 비용을 동시에 치른다 — 그래서 금지한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) Parse → Bind → Execute → Fetch 의 흔적은 v$mystat 델타로 보인다. 누적값은 쓰지 않는다.
+-- 2) Fetch 는 배열 크기 단위로 반복된다. arraysize 15 → 500 에서 왕복 205 → 8, 논리 읽기 6% 감소.
+-- 3) ALTER SYSTEM 은 업무 계정에 없다(ORA-01031). 인스턴스 명령은 SYS 로, 그것도 개인 환경에서만.
+-- 4) 공유 풀에서 커서가 사라지면 V$SQL 통계도 사라지고 다음 실행은 하드 파싱이다.
+--    TUN 18장에서 이 현상을 공유 풀 크기·ORA-04031 관점으로 다시 본다.
+
+SQLT@orcl> EXIT
+================================================================================

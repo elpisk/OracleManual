@@ -1,0 +1,176 @@
+================================================================================
+ Ch01 실습 01 — 실습 환경 점검과 측정 준비 (Before 상태 확인, DISPLAY_CURSOR 실행 통계)
+ 목표: 진료비청구심사 스키마 7개 테이블의 건수와 "PK 외 인덱스 없음" 상태를 확인해
+       이후 모든 실측의 기준선을 잡는다. DBMS_XPLAN.DISPLAY_CURSOR 로 실행 통계
+       (A-Rows·Buffers)를 보는 준비를 하고, 통계 열이 비어 나오는 이상 징후를 재현해
+       원인(GATHER_PLAN_STATISTICS 힌트 부재)을 교정한다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT (sqlplus sqlt/sqlt@orcl). 관리 팩 라이선스 불필요.
+ 주의: 개인 실습 환경 전용. 이 실습은 조회만 수행하며 DDL 변경이 없다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 7개 테이블 건수 — 이후 모든 챕터가 이 숫자를 전제한다
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT 'HOSPITALS'      t, COUNT(*) FROM hospitals      UNION ALL
+  2       SELECT 'PATIENTS',         COUNT(*) FROM patients       UNION ALL
+  3       SELECT 'DRUG_MASTER',      COUNT(*) FROM drug_master    UNION ALL
+  4       SELECT 'MEDICAL_CLAIMS',   COUNT(*) FROM medical_claims UNION ALL
+  5       SELECT 'CLAIM_DETAILS',    COUNT(*) FROM claim_details  UNION ALL
+  6       SELECT 'DISEASES',         COUNT(*) FROM diseases       UNION ALL
+  7       SELECT 'REVIEW_LOG',       COUNT(*) FROM review_log;
+
+T                  COUNT(*)
+---------------- ----------
+HOSPITALS              1000
+PATIENTS              50000
+DRUG_MASTER           10000
+MEDICAL_CLAIMS       300000
+CLAIM_DETAILS        899894
+DISEASES             399551
+REVIEW_LOG           500000
+
+7 rows selected.
+
+-- 해석: 큰 표는 CLAIM_DETAILS(약 90만)·REVIEW_LOG(50만)·DISEASES(40만)·MEDICAL_CLAIMS(30만),
+--   작은 표는 HOSPITALS(1,000). Full Scan 비용은 결과 건수가 아니라 표 크기로 결정되므로
+--   (Ch04) 이 크기 차이가 이후 모든 실행계획 판독의 배경이 된다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 인덱스 현황 — PK 만 있어야 한다. 이것이 의도된 Before 상태다.
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN table_name FORMAT A16
+SQLT@orcl> COLUMN index_name FORMAT A20
+SQLT@orcl> SELECT table_name, index_name, uniqueness, TO_CHAR(last_analyzed,'YYYY-MM-DD') analyzed
+  2       FROM  user_indexes ORDER BY table_name;
+
+TABLE_NAME       INDEX_NAME           UNIQUENES ANALYZED
+---------------- -------------------- --------- ----------
+CLAIM_DETAILS    PK_CLAIM_DETAILS     UNIQUE    <환경값>
+DISEASES         PK_DISEASES          UNIQUE    <환경값>
+DRUG_MASTER      PK_DRUG_MASTER       UNIQUE    <환경값>
+HOSPITALS        PK_HOSPITALS         UNIQUE    <환경값>
+MEDICAL_CLAIMS   PK_MEDICAL_CLAIMS    UNIQUE    <환경값>
+PATIENTS         PK_PATIENTS          UNIQUE    <환경값>
+REVIEW_LOG       PK_REVIEW_LOG        UNIQUE    <환경값>
+
+7 rows selected.
+
+-- 해석: PK 7개뿐이다. 만약 IX_ 로 시작하는 인덱스가 보이면 이전 실습의 원복이 빠진 것이다.
+--   그대로 두면 이 과정의 모든 Buffers 실측값이 교안과 달라진다 → 소유자가 DROP 한 뒤 진행.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인) 실행 통계 열이 비어 나온다
+--     이상 징후: DISPLAY_CURSOR 를 ALLSTATS LAST 로 봤는데 A-Rows·Buffers 열이 없다.
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT COUNT(*) FROM medical_claims WHERE hosp_id = 1;
+
+  COUNT(*)
+----------
+      3058
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+SQL_ID  <환경값>, child number 0
+-------------------------------------
+SELECT COUNT(*) FROM medical_claims WHERE hosp_id = 1
+
+Plan hash value: <환경값>
+
+-------------------------------------------------------------
+| Id  | Operation          | Name           | E-Rows |  OMem |
+-------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                |        |       |
+|   1 |  SORT AGGREGATE    |                |      1 |       |
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |   3039 |       |
+-------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - filter("HOSP_ID"=1)
+
+Note
+-----
+   - Warning: basic plan statistics not available. These are only collected when:
+       * hint 'gather_plan_statistics' is used for the statement or
+       * parameter 'statistics_level' is set to 'ALL', at session or system level
+
+SQLT@orcl> -- 원인 파악: Note 절이 답을 말해 준다. 실행 통계(A-Rows·A-Time·Buffers)는
+SQLT@orcl> --   커서를 실행할 때 수집돼야 하는데, 기본 STATISTICS_LEVEL=TYPICAL 에서는
+SQLT@orcl> --   수집하지 않는다. E-Rows(추정)만 남고 A-Rows(실제)가 빈 이유다.
+SQLT@orcl> SHOW PARAMETER statistics_level
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+statistics_level                     string      TYPICAL
+
+SQLT@orcl> -- 조치: 문장 단위로 힌트를 붙인다. 세션 전체를 ALL 로 올리는 방법도 있으나
+SQLT@orcl> --   모든 SQL 의 실행 통계를 수집해 세션이 느려지므로 이 과정은 힌트 방식을 표준으로 쓴다.
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE hosp_id = 1;
+
+  COUNT(*)
+----------
+      3058
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+SQL_ID  92p460f4hj858, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE hosp_id = 1
+
+Plan hash value: <환경값>
+
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                |      1 |        |      1 |00:00:01.92 |    3090 |
+|   1 |  SORT AGGREGATE    |                |      1 |      1 |      1 |00:00:01.92 |    3090 |
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |   3039 |   3058 |00:00:01.92 |    3090 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - filter("HOSP_ID"=1)
+
+-- 재확인: 이제 Starts·A-Rows·A-Time·Buffers 열이 나온다.
+--   E-Rows 3,039 vs A-Rows 3,058 — 추정이 실제에 근접한다(HOSP_ID 히스토그램, Ch13).
+--   Buffers 3,090 — 인덱스가 없어 MEDICAL_CLAIMS 전체를 읽은 논리 읽기 블록 수. 이 3,090 이
+--   이후 챕터에서 "Full Scan 베이스라인" 으로 반복해 등장한다.
+
+--------------------------------------------------------------------------------
+-- [4] (조치 후 관점) 힌트 없이 실행한 이전 커서는 어떻게 되나
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN sql_text FORMAT A60
+SQLT@orcl> SELECT sql_id, child_number, executions, buffer_gets, sql_text
+  2       FROM  v$sql
+  3       WHERE sql_text LIKE '%medical_claims WHERE hosp_id = 1'
+  4       AND   sql_text NOT LIKE '%v$sql%';
+
+SQL_ID        CHILD_NUMBER EXECUTIONS BUFFER_GETS SQL_TEXT
+------------- ------------ ---------- ----------- ------------------------------------------------------------
+<환경값>                 0          1        3090 SELECT COUNT(*) FROM medical_claims WHERE hosp_id = 1
+92p460f4hj858            0          1        3090 SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_c
+
+-- 해석: 힌트는 SQL 텍스트의 일부이므로 힌트 유무에 따라 SQL_ID 가 달라진다(Ch02 의 리터럴과 같은
+--   원리). V$SQL.BUFFER_GETS 는 힌트 없이도 항상 누적되므로, 행 단위 A-Rows 가 필요 없을 때는
+--   V$SQL 만으로도 Buffers 를 볼 수 있다(Ch14 실습 03).
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 7개 표 건수와 "PK 만 존재" 가 이 과정의 Before 상태다. IX_ 인덱스가 남아 있으면 먼저 지운다.
+-- 2) DISPLAY_CURSOR('ALLSTATS LAST') 에 A-Rows·Buffers 가 없으면 Note 절을 읽는다 —
+--    실행 통계는 GATHER_PLAN_STATISTICS 힌트(또는 STATISTICS_LEVEL=ALL)로만 수집된다.
+-- 3) 이 과정의 측정 표준: 힌트를 붙여 1회 실행 → DISPLAY_CURSOR(NULL,NULL,'ALLSTATS LAST').
+-- 4) MEDICAL_CLAIMS Full Scan = Buffers 3,090. 이 숫자를 기억해 둔다.
+
+SQLT@orcl> EXIT
+================================================================================

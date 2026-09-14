@@ -127,7 +127,7 @@ SYS@orcl> SELECT r.rec_id, r.type, r.rank, r.benefit
 
 | 항목 | 내 조치 (Day 4) | STA 권고 | 판정 |
 |---|---|---|---|
-| 인덱스 컬럼·순서 | 예) `(HOSP_ID, RECEIPT_DATE)` | 예) `(HOSP_ID, RECEIPT_DATE, CLAIM_STATUS)` | 같음 / 권고가 더 좋음 / 내 것이 더 좋음 |
+| 인덱스 컬럼·순서 | 예) `(HOSP_ID, RECEIPT_DATE)` | 예) `(HOSP_ID, RECEIPT_DATE, REVIEW_STATUS)` | 같음 / 권고가 더 좋음 / 내 것이 더 좋음 |
 | 재작성 지점 | | | |
 | 통계 | | | |
 | 프로파일 제안 여부·개선율 | — | | |
@@ -206,6 +206,6 @@ STA 없이도 대조의 절반은 할 수 있다.
 | 항목 | 내용 |
 |---|---|
 | 최종 판정 | 손 튜닝 유지 / 권고 일부 반영(무엇을) / 권고 전면 반영 |
-| 근거 한 문장 | 예) "권고 인덱스의 세 번째 컬럼 CLAIM_STATUS 는 SELECT 목록에 있어 커버링이 되므로 반영" |
+| 근거 한 문장 | 예) "권고 인덱스의 세 번째 컬럼 REVIEW_STATUS 는 SELECT 목록에 있어 커버링이 되므로 반영" |
 
 이 양식은 Day 10 종합 평가에서 "권고를 채택할 것인가" 문항의 채점 기준과 같다.

@@ -1,0 +1,114 @@
+================================================================================
+ Ch13 실습 01 — HOSP_ID 히스토그램 확인과 베이스라인: 쏠린 병원 3,470 / 일반 병원 159
+ 목표: USER_TAB_COL_STATISTICS 로 HOSP_ID 에 HYBRID 히스토그램(254 버킷)이 있음을 확인하고,
+       hosp_id=1(스큐)·500(일반)의 E-Rows 가 실제 분포를 반영해 다르게 나오는 베이스라인을 잡는다.
+       "E-Rows 는 왜 A-Rows 와 정확히 같지 않은가" 라는 이상 징후를 표본 통계로 설명한다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. 조회만.
+ 주의: 개인 실습 환경 전용. 실습 02 에서 통계를 바꾸므로 이 실습의 값을 기록해 둔다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 데이터 분포 — 스큐가 실제로 있는가
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT CASE WHEN hosp_id <= 50 THEN '1~50 (대형)' ELSE '51~1000' END grp,
+  2              COUNT(*) claims, ROUND(COUNT(*)*100/300000, 1) pct
+  3       FROM   medical_claims GROUP BY CASE WHEN hosp_id <= 50 THEN '1~50 (대형)' ELSE '51~1000' END;
+
+GRP              CLAIMS        PCT
+------------ ---------- ----------
+1~50 (대형)     <환경값>       ~50
+51~1000         <환경값>       ~50
+
+SQLT@orcl> SELECT hosp_id, COUNT(*) FROM medical_claims WHERE hosp_id IN (1, 500) GROUP BY hosp_id;
+
+   HOSP_ID   COUNT(*)
+---------- ----------
+         1       3058
+       500        177
+
+-- 해석: 병원 5% 가 청구의 절반을 낸다. 균등 분포라면 병원당 300건(300,000 ÷ 1,000)인데
+--   1번 병원은 3,058, 500번 병원은 177 — 10배 넘게 갈린다. 이것이 스큐다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 컬럼 통계 — 히스토그램이 있는가
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN column_name FORMAT A14
+SQLT@orcl> COLUMN histogram FORMAT A10
+SQLT@orcl> SELECT column_name, num_distinct, num_nulls, histogram, num_buckets,
+  2              TO_CHAR(last_analyzed,'YYYY-MM-DD HH24:MI') analyzed
+  3       FROM   user_tab_col_statistics
+  4       WHERE  table_name = 'MEDICAL_CLAIMS' AND column_name IN ('HOSP_ID','CLAIM_TYPE','TOTAL_AMT')
+  5       ORDER  BY column_name;
+
+COLUMN_NAME    NUM_DISTINCT  NUM_NULLS HISTOGRAM  NUM_BUCKETS ANALYZED
+-------------- ------------ ---------- ---------- ----------- ----------------
+CLAIM_TYPE                2          0 <환경값>      <환경값>  <환경값>
+HOSP_ID                1000          0 HYBRID             254 <환경값>
+TOTAL_AMT           <환경값>         0 <환경값>      <환경값>  <환경값>
+
+-- 해석: HOSP_ID 는 고유값 1,000개, 버킷 254개의 HYBRID 히스토그램. 고유값이 버킷보다 많으면 빈도
+--   (FREQUENCY) 대신 HYBRID 가 만들어진다 — 자주 나오는 값은 정확히, 나머지는 구간으로 기록한다.
+--   1번 병원처럼 튀는 값은 "popular value" 로 버킷에 직접 잡힌다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 재확인) 베이스라인 E-Rows — 왜 정확히 3,058 이 아닌가
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE hosp_id = 1;
+(결과 3058)
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |   3470 |   3058 |    3090 |
+------------------------------------------------------------------------------------------
+
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE hosp_id = 500;
+(결과 177)
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |    159 |    177 |    3090 |
+------------------------------------------------------------------------------------------
+
+SQLT@orcl> -- 이상 징후: E-Rows 3,470 vs 실제 3,058, 159 vs 177 — "히스토그램이 있는데 왜 안 맞나".
+SQLT@orcl> -- 원인 파악: 통계는 표본으로 모은다(기본 AUTO_SAMPLE_SIZE). 히스토그램 버킷 경계도 표본 기준
+SQLT@orcl> --   이라 ±10~20% 오차는 정상이다. 중요한 것은 두 값이 "서로 다르게" 추정됐고 실제와 같은
+SQLT@orcl> --   자릿수라는 점이다(1.13배, 0.90배). Ch03 실습 01 의 190배와 비교하면 이것은 정확한 추정이다.
+SQLT@orcl> -- 재확인: 어느 버킷에 1번 병원이 잡혀 있는지 본다(popular value 는 endpoint_repeat_count 가 크다).
+SQLT@orcl> SELECT endpoint_number, endpoint_value, endpoint_repeat_count
+  2       FROM   user_tab_histograms
+  3       WHERE  table_name = 'MEDICAL_CLAIMS' AND column_name = 'HOSP_ID'
+  4       AND    endpoint_value IN (1, 500);
+
+ENDPOINT_NUMBER ENDPOINT_VALUE ENDPOINT_REPEAT_COUNT
+--------------- -------------- ---------------------
+      <환경값>              1              <환경값>      -- 1번은 popular value: 반복 수가 크다
+      <환경값>            500              <환경값>      -- 500번은 구간 안의 값: 반복 수 작거나 없음
+
+-- 재확인: 1번 병원은 버킷 끝점에 직접 잡혀 있고 반복 수가 크다. 이 반복 수 ÷ 표본 크기 × 행 수가
+--   E-Rows 3,470 의 출처다. 500번은 popular 가 아니라 구간 밀도로 추정돼 159 가 됐다.
+
+--   기록 (실습 02·03 에서 이 값과 비교한다)
+--   ┌──────────────┬────────┬────────┬──────────┐
+--   │ 조건         │ E-Rows │ A-Rows │ 비율     │
+--   ├──────────────┼────────┼────────┼──────────┤
+--   │ hosp_id=1    │ 3,470  │ 3,058  │ 1.13배   │
+--   │ hosp_id=500  │   159  │   177  │ 0.90배   │
+--   └──────────────┴────────┴────────┴──────────┘
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 스큐: 병원 5% 가 청구 50%. 균등 가정(300건/병원)과 10배 어긋난다.
+-- 2) HOSP_ID 에 HYBRID 254 버킷 히스토그램이 있어 값별 E-Rows 가 다르게 나온다(3,470 / 159).
+-- 3) 표본 통계라 ±10~20% 오차는 정상. 자릿수가 맞고 값끼리 구분되면 정확한 추정이다.
+-- 4) popular value 는 USER_TAB_HISTOGRAMS 의 endpoint_repeat_count 로 확인한다.
+
+SQLT@orcl> EXIT
+================================================================================

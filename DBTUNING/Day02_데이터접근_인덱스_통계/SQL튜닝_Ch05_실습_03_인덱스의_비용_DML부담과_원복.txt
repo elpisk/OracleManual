@@ -1,0 +1,137 @@
+================================================================================
+ Ch05 실습 03 — 인덱스의 비용: 크기·DML 부담을 재고, PK 만 남기고 원복한다 (ORA-01418 교정)
+ 목표: 인덱스 B 가 차지하는 블록 수를 확인하고, 복제 표에 인덱스가 있을 때와 없을 때
+       UPDATE/INSERT 의 논리 읽기·리두 발생량을 세션 통계 델타로 대조한다. 없는 인덱스를 지우다
+       나는 ORA-01418 을 재현·교정하고, USER_INDEXES 로 PK 만 남았음을 증명한다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. 실습 02 의 IX_RECEIPT_HOSP 가 있는 상태에서 시작.
+ 주의: 개인 실습 환경 전용. 원본 표에는 DML 을 하지 않는다 — 복제 표(MEDICAL_CLAIMS_WL)에서만.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 인덱스가 차지하는 공간 — 표 대비 비율
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN segment_name FORMAT A18
+SQLT@orcl> SELECT segment_name, segment_type, blocks, ROUND(bytes/1024/1024,1) mb
+  2       FROM   user_segments
+  3       WHERE  segment_name IN ('MEDICAL_CLAIMS','PK_MEDICAL_CLAIMS','IX_RECEIPT_HOSP')
+  4       ORDER  BY blocks DESC;
+
+SEGMENT_NAME       SEGMENT_TYPE           BLOCKS         MB
+------------------ ------------------ ---------- ----------
+MEDICAL_CLAIMS     TABLE                <환경값>   <환경값>     -- 약 3,100 블록
+PK_MEDICAL_CLAIMS  INDEX                <환경값>   <환경값>     -- 약 1,900 블록 (실습 Q5 의 1,891 과 대응)
+IX_RECEIPT_HOSP    INDEX                <환경값>   <환경값>     -- 약 950 블록 (실습 02 (b) 의 954 와 대응)
+
+-- 해석: FAST FULL SCAN 의 Buffers 가 인덱스 세그먼트 블록 수와 거의 같다. 인덱스 하나가 표의 약 1/3
+--   공간이다. 인덱스가 5개면 표보다 인덱스가 더 클 수 있다.
+
+--------------------------------------------------------------------------------
+-- [2] (실측) DML 부담 — 복제 표에서 인덱스 유무별 UPDATE
+--------------------------------------------------------------------------------
+SQLT@orcl> CREATE TABLE medical_claims_wl AS SELECT * FROM medical_claims;
+
+Table created.
+
+SQLT@orcl> -- (a) 인덱스 없이 UPDATE — 세션 통계 델타를 잰다
+SQLT@orcl> COLUMN name FORMAT A22
+SQLT@orcl> SELECT n.name, s.value FROM v$mystat s, v$statname n
+  2       WHERE  s.statistic# = n.statistic# AND n.name IN ('db block gets','redo size');
+
+NAME                        VALUE
+---------------------- ----------
+db block gets            <환경값>                                -- (T0)
+redo size                <환경값>
+
+SQLT@orcl> UPDATE medical_claims_wl SET receipt_date = receipt_date + 1 WHERE hosp_id = 1;
+
+3058 rows updated.
+
+SQLT@orcl> SELECT n.name, s.value FROM v$mystat s, v$statname n
+  2       WHERE  s.statistic# = n.statistic# AND n.name IN ('db block gets','redo size');
+
+NAME                        VALUE
+---------------------- ----------
+db block gets            <환경값>                                -- (T1) 델타 = 표 블록 변경분만
+redo size                <환경값>                                --      델타 ≈ 수백 KB
+
+SQLT@orcl> ROLLBACK;
+
+Rollback complete.
+
+SQLT@orcl> -- (b) 같은 인덱스를 복제 표에 만들고 같은 UPDATE
+SQLT@orcl> CREATE INDEX ix_wl_receipt_hosp ON medical_claims_wl(receipt_date, hosp_id);
+
+Index created.
+
+SQLT@orcl> SELECT n.name, s.value FROM v$mystat s, v$statname n
+  2       WHERE  s.statistic# = n.statistic# AND n.name IN ('db block gets','redo size');
+(T0' 기록)
+SQLT@orcl> UPDATE medical_claims_wl SET receipt_date = receipt_date + 1 WHERE hosp_id = 1;
+
+3058 rows updated.
+
+SQLT@orcl> SELECT n.name, s.value FROM v$mystat s, v$statname n
+  2       WHERE  s.statistic# = n.statistic# AND n.name IN ('db block gets','redo size');
+
+NAME                        VALUE
+---------------------- ----------
+db block gets            <환경값>                                -- (T1') 델타가 (a) 의 약 2~3배
+redo size                <환경값>                                --       델타가 (a) 의 약 2~3배
+
+SQLT@orcl> ROLLBACK;
+
+Rollback complete.
+
+-- 해석: 인덱스 컬럼(RECEIPT_DATE)을 바꾸면 행마다 인덱스 엔트리를 지우고 다시 넣는다 — 표 블록 변경에
+--   더해 인덱스 리프 블록 변경·리두가 붙는다. 인덱스가 조회를 3,090 → 5 로 줄이는 대가가 이것이다.
+--   조회가 잦고 변경이 드문 컬럼이면 이익, 변경이 잦은 컬럼(상태 코드, 최종 수정 시각)이면 손해.
+
+--------------------------------------------------------------------------------
+-- [3] (오류 → 원인 → 조치 → 재확인) 원복 — 없는 인덱스를 지우려다 ORA-01418
+--------------------------------------------------------------------------------
+SQLT@orcl> DROP TABLE medical_claims_wl PURGE;
+
+Table dropped.
+
+SQLT@orcl> DROP INDEX ix_hosp_receipt;                    -- 실습 02 에서 이미 지운 A
+DROP INDEX ix_hosp_receipt
+           *
+ERROR at line 1:
+ORA-01418: specified index does not exist
+
+SQLT@orcl> -- 원인 파악: A(IX_HOSP_RECEIPT)는 실습 02 [1] 에서 이미 지웠다. 기억에 의존해 지우면 이렇게
+SQLT@orcl> --   되거나, 반대로 남아 있는 것을 놓친다. 원복은 딕셔너리를 보고 한다.
+SQLT@orcl> -- 조치: 지금 남아 있는 것을 조회해서 그것만 지운다.
+SQLT@orcl> SELECT index_name FROM user_indexes
+  2       WHERE  table_name = 'MEDICAL_CLAIMS' AND index_name NOT LIKE 'PK%';
+
+INDEX_NAME
+------------------
+IX_RECEIPT_HOSP
+
+SQLT@orcl> DROP INDEX ix_receipt_hosp;
+
+Index dropped.
+
+SQLT@orcl> -- 재확인: 7개 표 전체에서 PK 외 인덱스가 0건이어야 한다.
+SQLT@orcl> SELECT table_name, index_name FROM user_indexes WHERE index_name NOT LIKE 'PK%';
+
+no rows selected
+
+-- 재확인 완료: PK 만 남았다. Ch06 부터는 각 실습이 스스로 인덱스를 만들고 지운다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 인덱스는 공간을 쓴다 — IX_RECEIPT_HOSP ≈ 950 블록, 표의 약 1/3.
+-- 2) 인덱스 컬럼을 바꾸는 DML 은 표 변경 + 인덱스 변경 + 리두가 붙어 2~3배 무거워진다.
+-- 3) 인덱스는 "조회 빈도 ÷ 변경 빈도" 로 정당화한다. 조회 3,090 → 5 가 DML 부담을 넘어서야 한다.
+-- 4) 원복은 기억이 아니라 USER_INDEXES 로. ORA-01418 은 "이미 지웠다" 는 뜻이지 "괜찮다" 는 뜻이 아니다.
+
+SQLT@orcl> EXIT
+================================================================================

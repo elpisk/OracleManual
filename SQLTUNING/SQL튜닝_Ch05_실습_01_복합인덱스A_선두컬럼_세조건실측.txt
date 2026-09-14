@@ -1,0 +1,153 @@
+================================================================================
+ Ch05 실습 01 — 복합 인덱스 A (HOSP_ID, RECEIPT_DATE): 선두 컬럼 유무에 따른 세 조건 실측
+ 목표: 인덱스 A 를 만들고 "둘 다 / 선두만 / 후행만" 세 조건의 Operation 과 Buffers(3 / 12 / 953)
+       를 실측한다. 인덱스가 이미 있는데 다시 만들다 나는 ORA-00955 를 재현·교정하고, 후행 컬럼만
+       조건에 있을 때 INDEX FAST FULL SCAN 이 되는 이유를 Predicate 로 확인한다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. DDL 포함(실습 02 에서 이 인덱스를 지우고 B 로 바꾼다).
+ 주의: 개인 실습 환경 전용. Ch05 실습 03 마지막에 반드시 PK 만 남기고 원복한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 베이스라인 — 인덱스 없이 두 조건
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*)
+  2       FROM   medical_claims
+  3       WHERE  hosp_id = 1 AND receipt_date = DATE '2024-06-15';
+
+  COUNT(*)
+----------
+        11
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------------------------
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |      6 |     11 |    3090 |
+------------------------------------------------------------------------------------------
+   2 - filter(("HOSP_ID"=1 AND "RECEIPT_DATE"=TO_DATE(' 2024-06-15 00:00:00', 'syyyy-mm-dd hh24:mi:ss')))
+
+-- 해석: 11건 찾는 데 3,090. Ch14 실습 03 기록 양식의 "튜닝 전" 이 이것이다(E-Rows 6, A-Rows 11).
+
+--------------------------------------------------------------------------------
+-- [2] (오류 → 원인 → 조치 → 재확인) 인덱스 A 생성 — ORA-00955
+--------------------------------------------------------------------------------
+SQLT@orcl> CREATE INDEX ix_hosp_receipt ON medical_claims(hosp_id, receipt_date);
+
+Index created.
+
+SQLT@orcl> -- (수강생이 "만들어졌나?" 확인하려고 같은 문장을 한 번 더 실행)
+SQLT@orcl> CREATE INDEX ix_hosp_receipt ON medical_claims(hosp_id, receipt_date);
+CREATE INDEX ix_hosp_receipt ON medical_claims(hosp_id, receipt_date)
+             *
+ERROR at line 1:
+ORA-00955: name is already used by an existing object
+
+SQLT@orcl> -- 원인 파악: 같은 이름의 객체(방금 만든 인덱스)가 이미 있다. 인덱스 이름은 스키마 안에서
+SQLT@orcl> --   표·뷰·시퀀스와 함께 하나의 이름 공간을 쓴다. 만들어졌는지는 CREATE 를 반복하지 말고
+SQLT@orcl> --   USER_INDEXES / USER_IND_COLUMNS 로 확인한다.
+SQLT@orcl> -- 조치: 딕셔너리로 확인한다.
+SQLT@orcl> COLUMN index_name FORMAT A18
+SQLT@orcl> COLUMN column_name FORMAT A14
+SQLT@orcl> SELECT index_name, column_position, column_name
+  2       FROM   user_ind_columns
+  3       WHERE  index_name = 'IX_HOSP_RECEIPT' ORDER BY column_position;
+
+INDEX_NAME         COLUMN_POSITION COLUMN_NAME
+------------------ --------------- --------------
+IX_HOSP_RECEIPT                  1 HOSP_ID
+IX_HOSP_RECEIPT                  2 RECEIPT_DATE
+
+-- 재확인: 컬럼 순서가 (HOSP_ID, RECEIPT_DATE) 다. 이 순서가 이 실습의 핵심 변수다.
+--   (같은 컬럼 조합을 다른 이름으로 또 만들면 ORA-01408 "such column list already indexed" 가 난다.)
+
+--------------------------------------------------------------------------------
+-- [3] (재확인) 세 조건 실측
+--------------------------------------------------------------------------------
+SQLT@orcl> -- (a) 둘 다 — 선두 포함
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*)
+  2       FROM   medical_claims WHERE hosp_id = 1 AND receipt_date = DATE '2024-06-15';
+
+  COUNT(*)
+----------
+        11
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+| Id  | Operation         | Name            | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------------------------
+|   1 |  SORT AGGREGATE   |                 |      1 |      1 |      1 |       3 |
+|*  2 |   INDEX RANGE SCAN| IX_HOSP_RECEIPT |      1 |      7 |     11 |       3 |
+------------------------------------------------------------------------------------------
+   2 - access("HOSP_ID"=1 AND "RECEIPT_DATE"=TO_DATE(' 2024-06-15 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+
+SQLT@orcl> -- (b) 선두 컬럼만
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE hosp_id = 1;
+
+  COUNT(*)
+----------
+      3058
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+| Id  | Operation         | Name            | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------------------------
+|   1 |  SORT AGGREGATE   |                 |      1 |      1 |      1 |      12 |
+|*  2 |   INDEX RANGE SCAN| IX_HOSP_RECEIPT |      1 |   3039 |   3058 |      12 |
+------------------------------------------------------------------------------------------
+   2 - access("HOSP_ID"=1)
+
+SQLT@orcl> -- (c) 후행 컬럼만
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE receipt_date = DATE '2024-06-15';
+
+  COUNT(*)
+----------
+       789
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+| Id  | Operation             | Name            | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------------------------
+|   1 |  SORT AGGREGATE       |                 |      1 |      1 |      1 |     953 |
+|*  2 |   INDEX FAST FULL SCAN| IX_HOSP_RECEIPT |      1 |  <환경값> |    789 |     953 |
+------------------------------------------------------------------------------------------
+   2 - filter("RECEIPT_DATE"=TO_DATE(' 2024-06-15 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+
+-- 해석: (a)(b) 는 access — 선두 컬럼 HOSP_ID 로 인덱스 안에서 "찾아갔다". Buffers 3, 12.
+--   (c) 는 filter — 인덱스가 HOSP_ID 순으로 정렬돼 있어 RECEIPT_DATE 만으로는 어디서 시작할지 모른다.
+--   그래서 인덱스 전체를 훑고(FAST FULL SCAN) 걸러 냈다. 953 은 인덱스 전체 크기다.
+--   그래도 표 전체(3,090)보다 싸다 — 인덱스 엔트리가 행보다 작아서다. 하지만 "인덱스를 탔다" 고
+--   말하면 안 된다: 조건이 filter 면 인덱스의 정렬을 쓰지 못한 것이다(Ch03 실습 02 의 판독 규칙).
+
+--   ┌─────────────────────────────┬───────────────────────┬─────────┬────────┐
+--   │ 조건                        │ Operation             │ Buffers │ A-Rows │
+--   ├─────────────────────────────┼───────────────────────┼─────────┼────────┤
+--   │ HOSP_ID=1 AND RECEIPT_DATE= │ INDEX RANGE SCAN      │      3  │    11  │
+--   │ HOSP_ID=1 (선두만)          │ INDEX RANGE SCAN      │     12  │ 3,058  │
+--   │ RECEIPT_DATE= (후행만)      │ INDEX FAST FULL SCAN  │    953  │   789  │
+--   └─────────────────────────────┴───────────────────────┴─────────┴────────┘
+
+-- ※ 인덱스 A 는 실습 02 에서 지우고 B 로 바꾼다. 여기서는 그대로 둔 채 EXIT 한다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 복합 인덱스는 선두 컬럼이 조건에 있어야 access(RANGE SCAN)가 된다. 후행 컬럼만이면 filter.
+-- 2) 후행 컬럼만의 FAST FULL SCAN(953)은 Full Scan(3,090)보다 싸지만 "인덱스를 탄" 것은 아니다.
+-- 3) 인덱스가 만들어졌는지는 CREATE 반복이 아니라 USER_IND_COLUMNS 로 확인한다(ORA-00955).
+-- 4) 튜닝 전 3,090 → 후 3. Ch14 실습 03 양식의 "튜닝 후" 열을 이 값으로 채운다.
+
+SQLT@orcl> EXIT
+================================================================================

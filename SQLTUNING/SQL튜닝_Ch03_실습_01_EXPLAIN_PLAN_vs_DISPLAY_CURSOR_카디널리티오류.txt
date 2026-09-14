@@ -1,0 +1,151 @@
+================================================================================
+ Ch03 실습 01 — EXPLAIN PLAN(추정) vs DISPLAY_CURSOR(실측), 그리고 190배 카디널리티 추정 오류
+ 목표: 같은 SQL 을 EXPLAIN PLAN 으로 본 추정 계획과 실제 실행 후 실행 통계로 대조한다.
+       PLAN_TABLE 이 비어 있을 때 DBMS_XPLAN.DISPLAY 가 내는 오류를 재현·교정하고,
+       E-Rows 77,946 vs A-Rows 411 의 원인(독립 가정 곱셈)을 단일 조건 추정으로 분해한다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. PLAN_TABLE 은 SYS 의 공용 PLAN_TABLE$ 동의어를 쓴다.
+ 주의: 개인 실습 환경 전용. 조회만 수행한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (오류 → 원인 → 조치 → 재확인) 추정 계획을 보려다 "cannot fetch last explain plan"
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------
+Error: cannot fetch last explain plan from PLAN_TABLE
+
+SQLT@orcl> -- 원인 파악: DBMS_XPLAN.DISPLAY 는 "PLAN_TABLE 에 마지막으로 저장된 계획" 을 보여 준다.
+SQLT@orcl> --   EXPLAIN PLAN FOR 를 아직 한 번도 실행하지 않아 이 세션의 PLAN_TABLE 이 비어 있다.
+SQLT@orcl> --   (DISPLAY_CURSOR 가 공유 풀의 커서를 읽는 것과 달리, DISPLAY 는 EXPLAIN PLAN 이 써 둔
+SQLT@orcl> --   표를 읽는다 — 두 함수의 데이터 출처가 다르다.)
+SQLT@orcl> -- 조치: EXPLAIN PLAN FOR 로 추정 계획을 먼저 저장한다. SQL 은 실행되지 않는다.
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT claim_id, total_amt
+  3       FROM   medical_claims
+  4       WHERE  claim_type = '입원' AND total_amt > 500000;
+
+Explained.
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------
+Plan hash value: <환경값>
+
+------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                | 77946 |  2207K|   857   (1)| 00:00:01 |
+|*  1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS | 77946 |  2207K|   857   (1)| 00:00:01 |
+------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - filter("CLAIM_TYPE"='입원' AND "TOTAL_AMT">500000)
+
+-- 재확인: 추정 계획이 나온다. Rows·Bytes·Cost·Time 은 전부 실행 전 추정치다.
+--   Cost 857 은 초가 아니라 무차원 상대값 — 다른 SQL 의 Cost 와 비교하면 틀린다.
+--   Predicate 가 filter 뿐이다: 두 컬럼 모두 인덱스가 없어 "찾아가는(access)" 조건이 없다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 실제로 실행해 실측치를 얻는다
+--------------------------------------------------------------------------------
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS          -- 411행 출력을 억제
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ claim_id, total_amt
+  2       FROM   medical_claims
+  3       WHERE  claim_type = '입원' AND total_amt > 500000;
+
+411 rows selected.
+(통계 생략)
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+SQL_ID  <환경값>, child number 0
+-------------------------------------
+------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |    411 |00:00:00.02 |    3117 |
+|*  1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |  77946 |    411 |00:00:00.02 |    3117 |
+------------------------------------------------------------------------------------------
+
+   1 - filter(("CLAIM_TYPE"='입원' AND "TOTAL_AMT">500000))
+
+-- 해석: E-Rows 77,946 vs A-Rows 411 — 약 190배 과대 추정. 계획 자체(Full Scan)는 인덱스가
+--   없으니 어차피 같지만, 이 SQL 이 조인의 한쪽이었다면 77,946 이라는 잘못된 크기를 근거로
+--   조인 순서·방식이 잘못 정해진다. 추정 오류는 그 자리에서 끝나지 않고 전파된다.
+--   Buffers 3,117 (Ch01 의 3,090 과 약간 다른 것은 411행을 배열 단위로 fetch 하며 경계 블록을
+--   다시 읽은 몫 — Ch02 실습 03 의 arraysize 효과).
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 재확인) 190배는 어디서 왔나 — 조건을 하나씩 떼어 본다
+--------------------------------------------------------------------------------
+SQLT@orcl> EXPLAIN PLAN FOR SELECT claim_id FROM medical_claims WHERE claim_type = '입원';
+
+Explained.
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL, NULL, 'BASIC +ROWS'));
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------
+| Id  | Operation         | Name           | Rows  |
+----------------------------------------------------------
+|   1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS | <환경값> |     -- (a) claim_type 단독 추정
+----------------------------------------------------------
+
+SQLT@orcl> EXPLAIN PLAN FOR SELECT claim_id FROM medical_claims WHERE total_amt > 500000;
+
+Explained.
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY(NULL, NULL, 'BASIC +ROWS'));
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------
+| Id  | Operation         | Name           | Rows  |
+----------------------------------------------------------
+|   1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS | <환경값> |     -- (b) total_amt 단독 추정
+----------------------------------------------------------
+
+SQLT@orcl> -- 원인 파악: 옵티마이저는 두 조건을 독립으로 보고 선택도를 곱한다.
+SQLT@orcl> --   (a)/300,000 × (b)/300,000 × 300,000 ≈ 77,946 이 나온다(각 단독 추정치를 대입해 확인).
+SQLT@orcl> --   실제로는 "입원" 과 "고액" 이 서로 상관돼 있어 동시에 만족하는 행이 곱셈 추정치보다
+SQLT@orcl> --   훨씬 적다(411). 옵티마이저는 컬럼 간 상관관계를 스스로 알지 못한다.
+SQLT@orcl> -- 실제 값과 대조
+SQLT@orcl> SELECT COUNT(*) FROM medical_claims WHERE claim_type = '입원';
+
+  COUNT(*)
+----------
+     59511
+
+SQLT@orcl> SELECT COUNT(*) FROM medical_claims WHERE total_amt > 500000;
+
+  COUNT(*)
+----------
+  <환경값>
+
+-- 재확인: 입원 59,511(19.8%) 은 추정 (a) 와 견줘 본다. 두 조건이 독립이라면 동시 만족은
+--   59,511 × (b)/300,000 ≈ 77,946 부근이어야 하는데 실제는 411 — 강한 음의 상관이다.
+--   이런 경우의 처방(컬럼 그룹 확장 통계)은 Ch13 과 TUN 7장 실습 03 에서 다룬다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) EXPLAIN PLAN + DISPLAY = 실행 전 추정(Rows·Cost). DISPLAY_CURSOR = 실행 후 실측(A-Rows·Buffers).
+--    DISPLAY 는 PLAN_TABLE 을 읽으므로 EXPLAIN PLAN 이 먼저다.
+-- 2) Cost 는 같은 SQL 의 대안 계획끼리만 비교한다. 다른 SQL 과 비교하지 않는다.
+-- 3) E-Rows/A-Rows 가 수십 배 이상 어긋나면 카디널리티 추정 오류 — 원인은 대개 컬럼 간 상관,
+--    히스토그램 부재, 오래된 통계 중 하나다.
+-- 4) 조건을 하나씩 떼어 EXPLAIN PLAN 하면 어느 가정(독립 곱셈)이 깨졌는지 보인다.
+
+SQLT@orcl> EXIT
+================================================================================

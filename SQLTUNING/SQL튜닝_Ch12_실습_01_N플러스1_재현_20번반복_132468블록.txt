@@ -1,0 +1,115 @@
+================================================================================
+ Ch12 실습 01 — N+1 재현: 청구 20건에 상세를 건별로 조회하면 132,468 Buffers (PLS-00428 교정)
+ 목표: PL/SQL 로 "목록 1회 + 건별 상세 20회" 의 N+1 패턴을 재현하고, V$SQL 에서 상세 SQL 이 20번 실행돼
+       BUFFER_GETS 132,468(회당 6,623)이 누적된 것을 확인한다. SELECT INTO 를 빼먹어 나는 PLS-00428 을
+       교정하고, 화면에서는 왜 이 문제가 안 보이는지(건당 0.02초) 시간과 블록을 함께 본다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. PK 외 인덱스 없음(CLAIM_DETAILS.CLAIM_ID 에 인덱스 없음).
+ 주의: 개인 실습 환경 전용. 조회만 수행한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+SQLT@orcl> SET SERVEROUTPUT ON
+
+--------------------------------------------------------------------------------
+-- [1] (오류 → 원인 → 조치) PL/SQL 안의 SELECT — PLS-00428
+--------------------------------------------------------------------------------
+SQLT@orcl> DECLARE
+  2         v_cnt NUMBER;
+  3       BEGIN
+  4         FOR r IN (SELECT claim_id FROM medical_claims WHERE hosp_id = 1 AND ROWNUM <= 20) LOOP
+  5           SELECT COUNT(*) FROM claim_details WHERE claim_id = r.claim_id;
+  6         END LOOP;
+  7       END;
+  8       /
+    SELECT COUNT(*) FROM claim_details WHERE claim_id = r.claim_id;
+    *
+ERROR at line 5:
+ORA-06550: line 5, column 5:
+PLS-00428: an INTO clause is expected in this SELECT statement
+
+SQLT@orcl> -- 원인 파악: PL/SQL 블록 안의 SELECT 는 결과를 받을 변수(INTO)가 있어야 한다. SQL*Plus 에서
+SQLT@orcl> --   치듯 결과를 화면에 흘릴 수 없다. PLS- 는 컴파일 단계 오류라 한 줄도 실행되지 않았다.
+SQLT@orcl> -- 조치: INTO v_cnt 를 넣는다. (실제 응용은 이 자리에서 상세를 화면에 그린다.)
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) N+1 실행 — 목록 1회 + 상세 20회
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 측정을 위해 상세 SQL 에 태그를 붙인다(주석은 SQL 텍스트의 일부라 V$SQL 에서 찾기 쉽다).
+SQLT@orcl> DECLARE
+  2         v_cnt NUMBER;
+  3       BEGIN
+  4         FOR r IN (SELECT claim_id FROM medical_claims WHERE hosp_id = 1 AND ROWNUM <= 20) LOOP
+  5           SELECT /* N1_DETAIL */ COUNT(*) INTO v_cnt FROM claim_details WHERE claim_id = r.claim_id;
+  6         END LOOP;
+  7       END;
+  8       /
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> -- 화면에서는 이렇게 보인다: 20건 목록에 상세 건수가 붙어 "금방" 나온다(합계 0.37초).
+SQLT@orcl> --   개발자는 문제를 못 느낀다.
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 재확인) V$SQL 에 쌓인 누적 비용
+--------------------------------------------------------------------------------
+SQLT@orcl> COLUMN sql_text FORMAT A60
+SQLT@orcl> SELECT sql_id, executions, buffer_gets,
+  2              ROUND(buffer_gets/executions, 1)     avg_buffers,
+  3              elapsed_time                          elapsed_us,
+  4              ROUND(elapsed_time/executions/1e3, 1) ms_per_exec,
+  5              sql_text
+  6       FROM   v$sql
+  7       WHERE  sql_text LIKE '%N1_DETAIL%' AND sql_text NOT LIKE '%v$sql%';
+
+SQL_ID        EXECUTIONS BUFFER_GETS AVG_BUFFERS ELAPSED_US MS_PER_EXEC SQL_TEXT
+------------- ---------- ----------- ----------- ---------- ----------- ------------------------------------------------------------
+cq8zvf7njas01         20      132468      6623.4     374094        18.7 SELECT /* N1_DETAIL */ COUNT(*) FROM CLAIM_DETAILS WHERE CLAIM_ID = :B1
+
+SQLT@orcl> -- 이상 징후: SQL 하나가 EXECUTIONS 20, BUFFER_GETS 132,468. 회당 6,623 — Ch04 실습 01 에서 본
+SQLT@orcl> --   CLAIM_DETAILS Full Scan(6,621) 그대로다. 20건 목록 하나 그리는 데 90만 행짜리 표를 20번 읽었다.
+SQLT@orcl> -- 원인 파악: (1) CLAIM_DETAILS.CLAIM_ID 에 인덱스가 없어 회당 Full Scan, (2) 그것을 목록 건수만큼
+SQLT@orcl> --   반복. 비용 = 회당 비용 × N. 바인드 변수(:B1)라 SQL_ID 는 하나 — 파싱은 문제가 아니다. 실행 횟수가 문제다.
+SQLT@orcl> --   회당 18.7ms 라 화면은 0.37초에 끝난다. 목록이 100건이면 1.9초, 1,000건이면 19초 — 선형으로 나빠진다.
+SQLT@orcl> -- 재확인: "N" 을 바꿔 선형임을 본다 — 40건으로 다시 실행.
+SQLT@orcl> DECLARE
+  2         v_cnt NUMBER;
+  3       BEGIN
+  4         FOR r IN (SELECT claim_id FROM medical_claims WHERE hosp_id = 1 AND ROWNUM <= 40) LOOP
+  5           SELECT /* N1_DETAIL */ COUNT(*) INTO v_cnt FROM claim_details WHERE claim_id = r.claim_id;
+  6         END LOOP;
+  7       END;
+  8       /
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> SELECT executions, buffer_gets, ROUND(buffer_gets/executions,1) avg_buffers
+  2       FROM   v$sql WHERE sql_id = 'cq8zvf7njas01';
+
+EXECUTIONS BUFFER_GETS AVG_BUFFERS
+---------- ----------- -----------
+        60      397404      6623.4
+
+-- 재확인: 실행 60(20+40), 누적 397,404 = 6,623.4 × 60. 회당 비용은 고정, 총비용은 N 에 정비례.
+--   (실행 통계는 누적이므로 델타 = 397,404 − 132,468 = 264,936 = 6,623.4 × 40.)
+
+--------------------------------------------------------------------------------
+-- [4] (조치 후 관점) 두 갈래 처방 — 실습 02·03
+--------------------------------------------------------------------------------
+-- * 근본: 반복을 없앤다 — 목록과 상세를 조인 1회로(실습 02). N 이 커져도 표는 한 번.
+-- * 완화: 회당 비용을 줄인다 — CLAIM_DETAILS(CLAIM_ID) 인덱스(실습 03). 6,623 → 수 블록. 반복 구조는 남는다.
+-- * 인스턴스 부문에서는 이 SQL 이 AWR "SQL ordered by Executions·Gets" 상위에 오른다(TUN 8장 실습 04).
+--   회당은 싸 보이는데 합이 큰 SQL — 그것이 N+1 의 시스템 관점 지문이다(브리지 02 의 마지막 행).
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) PL/SQL 안의 SELECT 는 INTO 가 필수(PLS-00428, 컴파일 오류).
+-- 2) N+1 = 회당 비용 × N. 20건에 132,468 Buffers, 60건에 397,404 — 정비례.
+-- 3) 화면 시간(0.37초)으론 안 보인다. V$SQL 의 EXECUTIONS × AVG_BUFFERS 로 본다.
+-- 4) 바인드 변수를 써도 N+1 은 N+1 이다 — 파싱이 아니라 실행 횟수의 문제.
+
+SQLT@orcl> EXIT
+================================================================================

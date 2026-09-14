@@ -1,0 +1,132 @@
+================================================================================
+ Ch14 실습 03 — V$SQL 로 실행당 지표 뽑기와 튜닝 전후 기록 양식 (ORA-01476 교정 포함)
+ 목표: DISPLAY_CURSOR 없이도 V$SQL 의 누적 통계(BUFFER_GETS·ELAPSED_TIME·CPU_TIME·DISK_READS)
+       를 EXECUTIONS 로 나눠 실행당 지표를 만든다. EXECUTIONS=0 인 커서에서 나는 ORA-01476 을
+       재현·교정하고, 이 과정 전체에서 쓸 "튜닝 전/후 기록 양식" 을 한 SQL 로 채워 본다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT.
+ 주의: 개인 실습 환경 전용. 조회만 수행한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (오류 → 원인 → 조치 → 재확인) 실행당 지표를 구하다 ORA-01476
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 관심 SQL 들: 이 과정에서 medical_claims 를 읽은 커서
+SQLT@orcl> COLUMN sql_text FORMAT A50
+SQLT@orcl> SELECT sql_id, executions,
+  2              ROUND(buffer_gets  / executions)       gets_per_exec,
+  3              ROUND(elapsed_time / executions / 1e3) ms_per_exec,
+  4              SUBSTR(sql_text, 1, 50) sql_text
+  5       FROM   v$sql
+  6       WHERE  parsing_schema_name = 'SQLT'
+  7       AND    UPPER(sql_text) LIKE '%MEDICAL_CLAIMS%'
+  8       AND    UPPER(sql_text) NOT LIKE '%V$SQL%'
+  9       ORDER  BY buffer_gets DESC;
+       ROUND(buffer_gets  / executions)       gets_per_exec,
+                          *
+ERROR at line 2:
+ORA-01476: divisor is equal to zero
+
+SQLT@orcl> -- 원인 파악: EXECUTIONS=0 인 커서가 있다. EXPLAIN PLAN 만 한 SQL(Ch03 실습 01·02), 파싱은
+SQLT@orcl> --   됐지만 실행 전에 취소된 SQL 은 V$SQL 에 행이 있어도 EXECUTIONS 가 0 이다.
+SQLT@orcl> SELECT sql_id, executions, parse_calls, SUBSTR(sql_text,1,50) sql_text
+  2       FROM   v$sql
+  3       WHERE  parsing_schema_name = 'SQLT' AND executions = 0
+  4       AND    UPPER(sql_text) LIKE '%MEDICAL_CLAIMS%';
+
+SQL_ID        EXECUTIONS PARSE_CALLS SQL_TEXT
+------------- ---------- ----------- --------------------------------------------------
+<환경값>               0           1 EXPLAIN PLAN FOR SELECT claim_id, total_amt FROM m
+<환경값>               0           1 EXPLAIN PLAN FOR SELECT h.hosp_type, COUNT(*) cnt
+
+SQLT@orcl> -- 조치: 0 으로 나누지 않게 NULLIF 로 막는다. 실행 0회 커서는 실행당 지표가 NULL 이 된다.
+SQLT@orcl> SELECT sql_id, executions,
+  2              ROUND(buffer_gets  / NULLIF(executions,0))       gets_per_exec,
+  3              ROUND(elapsed_time / NULLIF(executions,0) / 1e3) ms_per_exec,
+  4              ROUND(cpu_time     / NULLIF(executions,0) / 1e3) cpu_ms_per_exec,
+  5              ROUND(disk_reads   / NULLIF(executions,0))       reads_per_exec,
+  6              SUBSTR(sql_text, 1, 50) sql_text
+  7       FROM   v$sql
+  8       WHERE  parsing_schema_name = 'SQLT'
+  9       AND    UPPER(sql_text) LIKE '%MEDICAL_CLAIMS%'
+ 10       AND    UPPER(sql_text) NOT LIKE '%V$SQL%'
+ 11       ORDER  BY buffer_gets DESC;
+
+SQL_ID        EXECUTIONS GETS_PER_EXEC MS_PER_EXEC CPU_MS_PER_EXEC READS_PER_EXEC SQL_TEXT
+------------- ---------- ------------- ----------- --------------- -------------- --------------------------------------------------
+<환경값>              10          3144    <환경값>       <환경값>              0 SELECT /*+ GATHER_PLAN_STATISTICS */ CLAIM_ID, TOT
+cmm0gaqr7whs5          2          8604    <환경값>       <환경값>        <환경값> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM
+b0r8p72bjvc2f          1          8604         130       <환경값>              0 SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM
+a3nqx088zkzhq          1          6713          40       <환경값>              0 SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(DISTINCT
+92p460f4hj858          1          3090        1920       <환경값>        <환경값> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM
+5awbw1wcprrj2          1          3090          10       <환경값>              0 SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM
+<환경값>               0          (null)      (null)         (null)         (null) EXPLAIN PLAN FOR SELECT claim_id, total_amt FROM m
+...
+
+-- 재확인: 실행당 Buffers 가 DISPLAY_CURSOR 의 Buffers 와 같다(3,144 / 8,604 / 6,713 / 3,090).
+--   ms_per_exec 는 A-Time 과 같은 값이다(b0r8p72bjvc2f 130ms = 0.13초, 92p460f4hj858 1,920ms = 1.92초).
+--   V$SQL 만으로도 "실행당 얼마" 를 알 수 있다 — 단, 행 단위(어느 단계가 비싼가)는 DISPLAY_CURSOR 로.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) 튜닝 전 기록 — 이 과정의 표준 양식
+--------------------------------------------------------------------------------
+-- 인덱스 설계(Ch05)·재작성(Ch08~12)·평가(Day 4) 에서 매번 이 양식을 채운다. 여기서는 Ch03 의
+-- 카디널리티 오류 SQL 을 "튜닝 전" 으로 기록한다.
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS BEFORE_CH14 */ claim_id, total_amt
+  2       FROM   medical_claims
+  3       WHERE  claim_type = '입원' AND total_amt > 500000;
+
+411 rows selected.
+(통계 생략)
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +COST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |   857 (100)|    411 |00:00:00.02 |    3117 |
+|*  1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |  77946 |   857   (1)|    411 |00:00:00.02 |    3117 |
+------------------------------------------------------------------------------------------------
+
+--   기록 양식 (채운 예)
+--   ┌─────────────────────┬───────────────────────────────┬──────────────────┐
+--   │ 항목                │ 튜닝 전                       │ 튜닝 후          │
+--   ├─────────────────────┼───────────────────────────────┼──────────────────┤
+--   │ SQL_ID / PHV        │ <환경값> / <환경값>           │                  │
+--   │ 최상위 Cost         │ 857                           │                  │
+--   │ 최상위 E-Rows       │ 77,946                        │                  │
+--   │ A-Rows              │ 411                           │                  │
+--   │ Buffers (LAST)      │ 3,117                         │                  │
+--   │ A-Time              │ 0.02초 (웜 캐시)              │                  │
+--   │ 핵심 Operation      │ TABLE ACCESS FULL             │                  │
+--   │ access / filter     │ filter 만 (인덱스 없음)       │                  │
+--   │ 캐시 상태           │ 웜 (직전에 같은 표 읽음)      │                  │
+--   └─────────────────────┴───────────────────────────────┴──────────────────┘
+--   "튜닝 후" 열은 Ch05 에서 인덱스를 만든 뒤 같은 SQL 로 채운다. 계획이 바뀌면 PHV 가 달라진다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 후 관점) SQL 한 문장의 지표가 인스턴스 부문으로 이어지는 자리
+--------------------------------------------------------------------------------
+-- * 이 실습의 V$SQL 조회가 TUN 13장 실습 04(상위 SQL 선별)와 같은 조회다. 거기서는 스키마를
+--   가리지 않고 인스턴스 전체에서 BUFFER_GETS·ELAPSED_TIME 상위를 뽑는다.
+-- * ELAPSED_TIME 합계를 인스턴스 DB Time 으로 나누면 "이 SQL 이 DB Time 의 몇 %" 가 된다 —
+--   브리지 01 의 징후 ②, 브리지 02 의 1 단계가 바로 이 계산이다.
+-- * 둘 다 누적값이다. 구간 비교는 두 번 조회해 뺀다(TUN 5장) — 이 실습 02 의 ALL/LAST 와 같은 원칙.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) V$SQL 의 누적 ÷ EXECUTIONS = 실행당 지표. EXECUTIONS=0 커서가 있으니 NULLIF 로 나눈다.
+-- 2) 실행당 BUFFER_GETS 는 DISPLAY_CURSOR 의 Buffers 와 같다. 단계별 분해가 필요할 때만 DISPLAY_CURSOR.
+-- 3) 튜닝 전/후 양식: SQL_ID·PHV·Cost·E-Rows·A-Rows·Buffers·A-Time·핵심 Operation·access/filter·캐시 상태.
+-- 4) 같은 V$SQL 조회가 인스턴스 부문(TUN 13장, 브리지 02)에서 "상위 SQL 지목" 으로 쓰인다.
+
+SQLT@orcl> EXIT
+================================================================================

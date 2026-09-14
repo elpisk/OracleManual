@@ -1,0 +1,115 @@
+================================================================================
+ Ch08 실습 01 — 스칼라 서브쿼리 캐싱: 15,029행에 5번만 실행된다 (4,081 vs JOIN 4,083)
+ 목표: 청구마다 병원명을 붙이는 스칼라 서브쿼리와 JOIN 을 실측해 Buffers 가 거의 같음을 확인한다.
+       "행마다 서브쿼리가 15,029번 돈다" 는 통념이 Starts=5 로 깨지는 것(입력값 캐싱)을 보고,
+       캐싱이 깨지는 조건(distinct 값이 많을 때)을 hosp_id 범위를 넓혀 재현한다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. PK 외 인덱스 없음.
+ 주의: 개인 실습 환경 전용. 조회만 수행한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS          -- 15,029행 출력을 억제
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) Q1 — 스칼라 서브쿼리
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ c.claim_id, c.total_amt,
+  2              (SELECT h.hosp_name FROM hospitals h WHERE h.hosp_id = c.hosp_id) hosp_name
+  3       FROM   medical_claims c
+  4       WHERE  c.hosp_id <= 5;
+
+15029 rows selected.
+(통계 생략)
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                   | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |                |      1 |        |  15029 |00:00:00.09 |    4081 |
+|   1 |  TABLE ACCESS BY INDEX ROWID| HOSPITALS      |      5 |      1 |      5 |00:00:00.01 |      13 |
+|*  2 |   INDEX UNIQUE SCAN         | PK_HOSPITALS   |      5 |      1 |      5 |00:00:00.01 |       8 |
+|*  3 |  TABLE ACCESS FULL          | MEDICAL_CLAIMS |      1 |  14397 |  15029 |00:00:00.09 |    4081 |
+--------------------------------------------------------------------------------------------------------
+   2 - access("H"."HOSP_ID"=:B1)
+   3 - filter("C"."HOSP_ID"<=5)
+
+-- 해석: 스칼라 서브쿼리(Id 1~2)가 메인 쿼리(Id 3)와 같은 깊이에 있다 — 조인이 아니라 "메인 행마다
+--   호출되는 함수" 처럼 실행된다. 그런데 Starts=5 다. 15,029행인데 5번만 실행됐다.
+--   :B1 은 c.hosp_id 를 서브쿼리에 넘길 때 Oracle 이 붙인 내부 바인드다. 입력값(1~5)별로 결과를
+--   캐시해 같은 값이 오면 다시 실행하지 않는다 — 그래서 distinct 값 수(5)만큼만 Starts 가 생긴다.
+--   Buffers 4,081 = MEDICAL_CLAIMS 4,068(3,090 + 15,029행 fetch 경계) + HOSPITALS 13.
+
+--------------------------------------------------------------------------------
+-- [2] (재확인) Q2 — JOIN 으로 같은 결과
+--------------------------------------------------------------------------------
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ c.claim_id, c.total_amt, h.hosp_name
+  2       FROM   medical_claims c, hospitals h
+  3       WHERE  c.hosp_id = h.hosp_id AND c.hosp_id <= 5;
+
+15029 rows selected.
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                |      1 |        |  15029 |00:00:00.02 |    4083 |
+|*  1 |  HASH JOIN                           |                |      1 |     72 |  15029 |00:00:00.02 |    4083 |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| HOSPITALS      |      1 |      5 |      5 |00:00:00.01 |       3 |
+|*  3 |    INDEX RANGE SCAN                  | PK_HOSPITALS   |      1 |      5 |      5 |00:00:00.01 |       2 |
+|*  4 |   TABLE ACCESS FULL                  | MEDICAL_CLAIMS |      1 |  14397 |  15029 |00:00:00.02 |    4080 |
+--------------------------------------------------------------------------------------------------------
+
+-- 재확인: Buffers 4,081 vs 4,083 — 사실상 같다. "스칼라 서브쿼리는 조인보다 항상 느리다" 는 이 사례에서
+--   성립하지 않는다. 캐싱이 잘 되는 조건(입력값 종류가 적음)에서는 스칼라 서브쿼리도 조인만큼 싸다.
+--   E-Rows 72 vs A-Rows 15,029 — 조인 결과 추정이 200배 어긋났다(hosp_id 1~5 가 스큐 병원, Ch13).
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 재확인) 캐싱이 깨지면 — 입력값 종류를 늘린다
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 병원 1~5(5종) 대신 전체 병원(1,000종)을 대상으로 같은 스칼라 서브쿼리
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ c.claim_id,
+  2              (SELECT h.hosp_name FROM hospitals h WHERE h.hosp_id = c.hosp_id) hosp_name
+  3       FROM   medical_claims c
+  4       WHERE  c.claim_id BETWEEN '20240601-0000000' AND '20240602-0000000';   -- 804행, 병원 수백 종
+
+804 rows selected.
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                   | Name           | Starts | A-Rows | Buffers |
+--------------------------------------------------------------------------------------------------------
+|   1 |  TABLE ACCESS BY INDEX ROWID| HOSPITALS      |  <환경값> |  <환경값> |  <환경값> |    -- Starts 가 수백
+|*  2 |   INDEX UNIQUE SCAN         | PK_HOSPITALS   |  <환경값> |  <환경값> |  <환경값> |
+|*  3 |  TABLE ACCESS FULL          | MEDICAL_CLAIMS |      1 |    804 |    3144 |
+--------------------------------------------------------------------------------------------------------
+
+SQLT@orcl> -- 이상 징후: 804행뿐인데 HOSPITALS 쪽 Starts 가 수백(<환경값>)이다. [1] 은 15,029행에 5번이었다.
+SQLT@orcl> -- 원인 파악: 캐시는 입력값 종류(distinct hosp_id)에 비례해 적중한다. 804건이 수백 개 병원에
+SQLT@orcl> --   흩어져 있으면 거의 매번 새 값이라 캐시가 빗나간다(캐시 크기 한계도 있다). 이때는 Starts 가
+SQLT@orcl> --   행 수에 근접하고, 한 번에 3~4 Buffers 씩 곱해진다 — 조인이 유리해지는 지점이다.
+SQLT@orcl> -- 재확인: 판단 기준은 "메인 행 수" 가 아니라 "서브쿼리 입력값의 종류 수" 다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 스칼라 서브쿼리는 입력값별로 결과를 캐시한다. Starts = distinct 입력값 수(5), 행 수(15,029)가 아니다.
+-- 2) 입력값 종류가 적으면 조인과 비용이 같다(4,081 vs 4,083).
+-- 3) 입력값 종류가 많으면 캐시가 빗나가 Starts 가 행 수에 근접한다 — 조인으로 바꾼다.
+-- 4) 계획에서 스칼라 서브쿼리는 메인과 같은 깊이의 형제 노드로 보인다. Starts 열을 먼저 본다.
+
+SQLT@orcl> EXIT
+================================================================================

@@ -1,0 +1,121 @@
+================================================================================
+ Ch03 실습 02 — 실행 순서 판독과 access / filter 구분 (HOSPITALS + MEDICAL_CLAIMS 조인)
+ 목표: 조인 + GROUP BY 계획을 놓고 "Id 순서로 읽어 실행 순서를 거꾸로 해석하는" 오판을
+       재현한 뒤 들여쓰기 규칙으로 교정한다. 같은 hosp_id<=10 조건이 한 표에서는 access,
+       다른 표에서는 filter 로 나타나는 이유(인덱스 유무)를 Predicate Information 으로 확인한다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT.
+ 주의: 개인 실습 환경 전용. 조회만 수행한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 조인 + GROUP BY 의 추정 계획
+--------------------------------------------------------------------------------
+SQLT@orcl> EXPLAIN PLAN FOR
+  2       SELECT h.hosp_type, COUNT(*) cnt
+  3       FROM   hospitals h, medical_claims m
+  4       WHERE  h.hosp_id = m.hosp_id
+  5       AND    h.hosp_id <= 10
+  6       GROUP  BY h.hosp_type;
+
+Explained.
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------
+Plan hash value: <환경값>
+
+----------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name           | Rows  | Bytes | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                |     4 |    84 |   860   (1)| 00:00:01 |
+|   1 |  HASH GROUP BY                       |                |     4 |    84 |   860   (1)| 00:00:01 |
+|*  2 |   HASH JOIN                          |                |   297 |  6237 |   859   (1)| 00:00:01 |
+|   3 |    TABLE ACCESS BY INDEX ROWID BATCHED| HOSPITALS     |    10 |   120 |     3   (0)| 00:00:01 |
+|*  4 |     INDEX RANGE SCAN                 | PK_HOSPITALS   |    10 |       |     2   (0)| 00:00:01 |
+|*  5 |    TABLE ACCESS FULL                 | MEDICAL_CLAIMS | 29631 |   260K|   855   (1)| 00:00:01 |
+----------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - access("H"."HOSP_ID"="M"."HOSP_ID")
+   4 - access("H"."HOSP_ID"<=10)
+   5 - filter("M"."HOSP_ID"<=10)
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 조치 → 재확인) "Id 0 부터 실행된다" 는 오판
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 이상 징후: 수강생 해석 — "먼저 SELECT(0) 하고, GROUP BY(1) 하고, HASH JOIN(2) 한 뒤
+SQLT@orcl> --   HOSPITALS(3)를 읽고 마지막에 MEDICAL_CLAIMS(5)를 읽는다." → 읽지도 않은 표를 조인한다는
+SQLT@orcl> --   말이 되므로 모순이다.
+SQLT@orcl> -- 원인 파악: Id 는 트리 노드의 생성 번호일 뿐 실행 순서가 아니다.
+SQLT@orcl> --   규칙: (1) 들여쓰기가 가장 깊은 노드가 먼저, (2) 같은 깊이면 위쪽이 먼저(부모의 자식 순서),
+SQLT@orcl> --         (3) 자식이 끝나야 부모가 완성된다.
+SQLT@orcl> -- 조치: 규칙대로 다시 읽는다.
+SQLT@orcl> --   Id 4 INDEX RANGE SCAN PK_HOSPITALS (hosp_id<=10 로 10건의 ROWID)
+SQLT@orcl> --   → Id 3 그 ROWID 로 HOSPITALS 10행 (hosp_type 확보)           ← 해시 테이블(build) 쪽
+SQLT@orcl> --   → Id 5 MEDICAL_CLAIMS Full Scan, 읽으며 hosp_id<=10 필터    ← probe 쪽
+SQLT@orcl> --   → Id 2 HASH JOIN: probe 각 행을 build 해시에서 찾아 결합(297행 추정)
+SQLT@orcl> --   → Id 1 HASH GROUP BY hosp_type → Id 0 반환
+SQLT@orcl> -- 재확인: 실행 통계의 Starts·A-Time 누적 방향이 이 순서와 맞는지 실제 실행으로 본다.
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ h.hosp_type, COUNT(*) cnt
+  2       FROM   hospitals h, medical_claims m
+  3       WHERE  h.hosp_id = m.hosp_id
+  4       AND    h.hosp_id <= 10
+  5       GROUP  BY h.hosp_type;
+
+HOSP_TYPE         CNT
+---------- ----------
+<환경값>      <환경값>
+<환경값>      <환경값>
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                |      1 |        |  <환경값> |00:00:00.02 |    3093 |
+|   1 |  HASH GROUP BY                       |                |      1 |      4 |  <환경값> |00:00:00.02 |    3093 |
+|*  2 |   HASH JOIN                          |                |      1 |    297 |  <환경값> |00:00:00.02 |    3093 |
+|   3 |    TABLE ACCESS BY INDEX ROWID BATCHED| HOSPITALS     |      1 |     10 |     10 |00:00:00.01 |       3 |
+|*  4 |     INDEX RANGE SCAN                 | PK_HOSPITALS   |      1 |     10 |     10 |00:00:00.01 |       2 |
+|*  5 |    TABLE ACCESS FULL                 | MEDICAL_CLAIMS |      1 |  29631 |  <환경값> |00:00:00.02 |    3090 |
+----------------------------------------------------------------------------------------------------
+
+-- 재확인: Buffers 가 자식에서 부모로 합산된다 — Id 4(2) ⊂ Id 3(3), Id 3(3) + Id 5(3,090) = Id 2(3,093).
+--   부모의 Buffers 는 자식들의 합이므로 "자식이 먼저 실행돼 부모에 올라간다" 는 방향이 숫자로 보인다.
+--   E-Rows 297 vs A-Rows <환경값>: hosp_id 1~10 은 쏠린 병원이라 실제가 훨씬 많다(Ch13 히스토그램).
+
+--------------------------------------------------------------------------------
+-- [3] (판독) 같은 조건이 왜 한쪽은 access, 다른 쪽은 filter 인가
+--------------------------------------------------------------------------------
+-- Predicate Information 을 다시 본다.
+--   4 - access("H"."HOSP_ID"<=10)   ← HOSPITALS: PK_HOSPITALS 인덱스로 "찾아간다"
+--   5 - filter("M"."HOSP_ID"<=10)   ← MEDICAL_CLAIMS: 인덱스가 없어 다 읽고 "걸러낸다"
+--   2 - access("H"."HOSP_ID"="M"."HOSP_ID") ← 조인 조건은 해시 탐색 키이므로 access
+--
+-- 같은 hosp_id<=10 인데 표마다 다른 이유는 인덱스 유무 하나다. 이 조건은 옵티마이저가 조인
+-- 조건(h.hosp_id = m.hosp_id)을 통해 M 쪽으로 옮겨 적은 것(transitive predicate)이며,
+-- M 에 인덱스가 생기면 5번도 access 로 바뀐다 — Ch07 실습 03 에서 실제로 확인한다.
+--
+-- 판독 요령: "이 조건이 인덱스를 타는가?" 는 계획의 Operation 이름이 아니라 Predicate 의
+-- access/filter 로 판정한다. INDEX RANGE SCAN 아래에 filter 만 있으면 인덱스를 읽되 조건은
+-- 못 쓴 것이다(Ch05 실습 02 의 후행 컬럼 사례).
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 실행 순서 = 들여쓰기 깊은 것부터, 같은 깊이면 위쪽부터. Id 번호 순서가 아니다.
+-- 2) 부모 Buffers = 자식 Buffers 의 합. 이 합산 방향이 실행 방향의 증거다.
+-- 3) access = 찾아가는 조건(인덱스·해시 키), filter = 읽은 뒤 걸러내는 조건.
+--    같은 조건도 인덱스가 있으면 access, 없으면 filter.
+-- 4) 조인 조건을 통해 옮겨진 조건(transitive)이 상대 표에 filter 로 붙는다.
+
+SQLT@orcl> EXIT
+================================================================================

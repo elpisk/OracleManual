@@ -1,0 +1,127 @@
+================================================================================
+ Ch11 실습 03 — Keyset 의 제약: 동률(같은 날짜) 처리와 임의 페이지 점프, 그리고 원복
+ 목표: receipt_date 가 같은 행이 하루 800건이나 있어 "receipt_date < :last_seen" 만으로는 페이지가
+       겹치거나 빠지는 이상 징후를 재현하고, (receipt_date, claim_id) 복합 키 비교로 교정한다.
+       그에 맞는 복합 인덱스로 계획을 확인하고, 임의 페이지 점프가 필요한 화면의 절충안을 정리한다.
+       마지막에 인덱스를 지워 PK 만 남긴다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. IX_RECEIPT 가 있는 상태에서 시작. DDL 포함.
+ 주의: 개인 실습 환경 전용.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (이상 징후) 같은 날짜가 수백 건 — 날짜만으로는 경계가 안 선다
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT receipt_date, COUNT(*) FROM medical_claims
+  2       WHERE  receipt_date >= DATE '2024-06-14' AND receipt_date < DATE '2024-06-16'
+  3       GROUP  BY receipt_date ORDER BY receipt_date;
+
+RECEIPT_DATE   COUNT(*)
+------------ ----------
+<환경값>         <환경값>                    -- 하루 700~900건 (Ch05 실습 01: 6/15 = 789건)
+<환경값>         <환경값>
+
+SQLT@orcl> -- 이상 징후: 페이지 크기 20 인데 같은 receipt_date 가 789건이다. 1페이지 마지막 행의 날짜를
+SQLT@orcl> --   :last_seen 으로 넘기면, 2페이지는 "그 날짜보다 작은 것" 부터 시작하므로 같은 날짜의 나머지
+SQLT@orcl> --   769건을 건너뛴다. 반대로 <= 로 쓰면 이미 본 20건을 다시 본다. 동률(ties)이 있으면 단일 컬럼
+SQLT@orcl> --   Keyset 은 성립하지 않는다.
+SQLT@orcl> -- 원인 파악: Keyset 의 커서는 정렬 키가 "유일" 해야 한다. receipt_date 는 유일하지 않다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) 정렬 키를 유일하게 — (receipt_date, claim_id) 와 행 값 비교
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 1페이지: 마지막 행의 (receipt_date, claim_id) 를 커서로 보관한다
+SQLT@orcl> SELECT claim_id, receipt_date FROM medical_claims
+  2       ORDER  BY receipt_date DESC, claim_id DESC
+  3       FETCH FIRST 20 ROWS ONLY;
+(20 rows — 마지막 행: receipt_date=<환경값>, claim_id=<환경값>)
+
+SQLT@orcl> VARIABLE last_dt VARCHAR2(20)
+SQLT@orcl> VARIABLE last_id VARCHAR2(20)
+SQLT@orcl> EXEC :last_dt := '<환경값 YYYY-MM-DD>'; :last_id := '<환경값>'
+
+SQLT@orcl> -- 2페이지: "날짜가 더 작거나, 같은 날짜면 claim_id 가 더 작은 것" — 두 컬럼 사전식 비교
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ claim_id, receipt_date
+  2       FROM   medical_claims
+  3       WHERE  receipt_date < TO_DATE(:last_dt,'YYYY-MM-DD')
+  4          OR (receipt_date = TO_DATE(:last_dt,'YYYY-MM-DD') AND claim_id < :last_id)
+  5       ORDER  BY receipt_date DESC, claim_id DESC
+  6       FETCH FIRST 20 ROWS ONLY;
+
+20 rows selected.
+(출력 생략 — 1페이지와 겹치지 않고 빠진 행도 없다)
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name           | Starts | A-Rows | Buffers |
+--------------------------------------------------------------------------------------------------------
+|*  2 |   WINDOW SORT PUSHED RANK     |                |      1 |     20 |  <환경값> |    -- 정렬이 되살아났다
+|   3 |    TABLE ACCESS BY INDEX ROWID| MEDICAL_CLAIMS |      1 |  <환경값> |  <환경값> |
+|*  4 |     INDEX RANGE SCAN DESCENDING| IX_RECEIPT    |      1 |  <환경값> |  <환경값> |
+--------------------------------------------------------------------------------------------------------
+
+-- 해석: 결과는 맞지만 NOSORT STOPKEY 가 아니라 SORT PUSHED RANK 로 돌아갔다. 인덱스가 receipt_date 만이라
+--   같은 날짜 안의 claim_id 순서를 보장하지 못하므로 정렬이 필요하다. 커서 조건의 OR 도 인덱스 범위를
+--   둘로 쪼갠다. 정렬 키가 바뀌었으면 인덱스도 그 키여야 한다.
+
+--------------------------------------------------------------------------------
+-- [3] (재확인) 정렬 키와 같은 복합 인덱스
+--------------------------------------------------------------------------------
+SQLT@orcl> DROP INDEX ix_receipt;
+SQLT@orcl> CREATE INDEX ix_receipt_claim ON medical_claims(receipt_date, claim_id);
+
+Index created.
+
+SQLT@orcl> (위 2페이지 SQL 재실행)
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                       | Name             | Starts | A-Rows | Buffers |
+--------------------------------------------------------------------------------------------------------
+|*  2 |   WINDOW NOSORT STOPKEY         |                  |      1 |     20 |  <환경값> |    -- 다시 NOSORT
+|   3 |    TABLE ACCESS BY INDEX ROWID  | MEDICAL_CLAIMS   |      1 |     20 |  <환경값> |
+|*  4 |     INDEX RANGE SCAN DESCENDING | IX_RECEIPT_CLAIM |      1 |     20 |  <환경값> |
+--------------------------------------------------------------------------------------------------------
+
+-- 재확인: 인덱스가 (receipt_date, claim_id) 순으로 정렬돼 있으니 ORDER BY 와 일치해 NOSORT STOPKEY 로
+--   돌아왔다. A-Rows 20 — 20건만 읽고 멈춘다. Buffers 는 실습 02 의 25 안팎(<환경값>).
+--   (OR 조건은 옵티마이저가 두 범위로 나눠 처리하거나, 19c 에서는 행 값 비교로 최적화한다.
+--    계획에 CONCATENATION 이 보이면 두 범위로 나눈 것이다 — 결과와 STOPKEY 는 같다.)
+
+--------------------------------------------------------------------------------
+-- [4] (조치 후 관점) 임의 페이지 점프가 꼭 필요하다면
+--------------------------------------------------------------------------------
+-- * Keyset 은 "다음/이전" 만 된다. "500페이지로 이동" 은 500페이지 앞의 커서를 모른다.
+-- * 절충 ①: 깊이 제한 — OFFSET 을 허용하되 최대 N 페이지까지만(그 뒤는 검색 조건을 더 넣게 안내).
+-- * 절충 ②: 페이지 번호 대신 구간 점프 — 날짜 선택으로 그 날짜의 첫 페이지로 이동(WHERE 가 생긴다).
+-- * 절충 ③: 전체 건수 표시를 없애거나 캐시 — COUNT(*) 로 30만 행을 세는 것이 페이징보다 비쌀 때가 많다.
+-- * OFFSET 을 남긴다면 실습 01 의 비용(깊이 × 20 행 정렬)을 알고 남긴다.
+
+--------------------------------------------------------------------------------
+-- [5] 원복
+--------------------------------------------------------------------------------
+SQLT@orcl> DROP INDEX ix_receipt_claim;
+
+Index dropped.
+
+SQLT@orcl> SELECT table_name, index_name FROM user_indexes WHERE index_name NOT LIKE 'PK%';
+
+no rows selected
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) Keyset 의 정렬 키는 유일해야 한다. 동률이 있으면 (날짜, PK) 로 키를 확장하고 사전식 비교로 커서를 잡는다.
+-- 2) 인덱스는 ORDER BY 와 같은 컬럼·순서여야 NOSORT STOPKEY 가 유지된다 — 키를 바꾸면 인덱스도 바꾼다.
+-- 3) 임의 페이지 점프는 Keyset 으로 안 된다. 깊이 제한·구간 점프·건수 표시 제거로 절충한다.
+-- 4) 인덱스를 지우고 PK 만 남았음을 확인했다.
+
+SQLT@orcl> EXIT
+================================================================================

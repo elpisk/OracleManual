@@ -1,0 +1,106 @@
+================================================================================
+ Ch10 실습 02 — 넓은 범위(8.5%)의 ORDER BY: PK 컬럼으로 정렬해도 SORT ORDER BY 가 생긴다 (3,090)
+ 목표: 1개월 범위(25,406건)를 total_amt(비인덱스)와 claim_id(PK)로 각각 정렬해 두 경우 모두
+       SORT ORDER BY + TABLE ACCESS FULL 인 것을 실측한다. "PK 로 정렬했는데 왜 정렬하나" 는 이상 징후를
+       Ch04 의 선택도 전환으로 설명하고, +MEMSTATS 로 정렬 작업 영역과 넘침 여부를 본다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. 조회만. 바인드 :end_id 사용.
+ 주의: 개인 실습 환경 전용.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+SQLT@orcl> VARIABLE end_id VARCHAR2(20)
+SQLT@orcl> EXEC :end_id := '20240201-0000000'            -- 약 1개월, 25,406건, 8.5%
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 비인덱스 컬럼 정렬 — 정렬이 필요한 것이 당연
+--------------------------------------------------------------------------------
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ claim_id, total_amt
+  2       FROM   medical_claims
+  3       WHERE  claim_id BETWEEN '20240101-0000000' AND :end_id
+  4       ORDER  BY total_amt;
+
+25406 rows selected.
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +MEMSTATS'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation           | Name           | Starts | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+--------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |                |      1 |  25406 |  <환경값>  |    3090 |       |       |          |
+|   1 |  SORT ORDER BY      |                |      1 |  25406 |  <환경값>  |    3090 | <환경값> | <환경값> | <환경값> (0)|
+|*  2 |   FILTER            |                |      1 |  25406 |  <환경값>  |    3090 |       |       |          |
+|*  3 |    TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |  25406 |  <환경값>  |    3090 |       |       |          |
+--------------------------------------------------------------------------------------------------------
+
+-- 해석: 25,406행을 메모리에서 정렬했다(Used-Mem <환경값>, (0) = 넘치지 않음). Buffers 3,090 은 Full Scan 몫.
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 재확인) PK 컬럼으로 정렬해도 SORT ORDER BY
+--------------------------------------------------------------------------------
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ claim_id, total_amt
+  2       FROM   medical_claims
+  3       WHERE  claim_id BETWEEN '20240101-0000000' AND :end_id
+  4       ORDER  BY claim_id;
+
+25406 rows selected.
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +MEMSTATS'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation           | Name           | Starts | A-Rows | Buffers | Used-Mem |
+--------------------------------------------------------------------------------------------------------
+|   1 |  SORT ORDER BY      |                |      1 |  25406 |    3090 | <환경값> (0)|
+|*  2 |   FILTER            |                |      1 |  25406 |    3090 |          |
+|*  3 |    TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |  25406 |    3090 |          |
+--------------------------------------------------------------------------------------------------------
+
+SQLT@orcl> -- 이상 징후: claim_id 는 PK 이고 인덱스가 그 순서로 정렬돼 있다. 그런데 SORT ORDER BY 가 있다.
+SQLT@orcl> -- 원인 파악: 정렬을 인덱스가 대신하려면 그 인덱스가 "이 쿼리의 접근 경로" 여야 한다. 8.5% 선택도
+SQLT@orcl> --   에서는 옵티마이저가 Full Scan 을 골랐고(Ch04 실습 02), Full Scan 은 어떤 순서도 보장하지
+SQLT@orcl> --   않는다. 인덱스가 정렬돼 있어도 안 읽었으면 소용없다.
+SQLT@orcl> -- 재확인: 인덱스로 읽게 강제하면 정렬이 사라지는지 — 대신 Buffers 가 어떻게 되는지 본다.
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS INDEX(m PK_MEDICAL_CLAIMS) */ claim_id, total_amt
+  2       FROM   medical_claims m
+  3       WHERE  claim_id BETWEEN '20240101-0000000' AND :end_id
+  4       ORDER  BY claim_id;
+
+25406 rows selected.
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name              | Starts | A-Rows | Buffers |
+--------------------------------------------------------------------------------------------------------
+|*  1 |  FILTER                              |                   |      1 |  25406 |  <환경값> |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| MEDICAL_CLAIMS    |      1 |  25406 |  <환경값> |
+|*  3 |    INDEX RANGE SCAN                  | PK_MEDICAL_CLAIMS |      1 |  25406 |  <환경값> |
+--------------------------------------------------------------------------------------------------------
+
+-- 재확인: SORT ORDER BY 가 사라졌다 — 인덱스 순서로 읽었으니 정렬이 필요 없다. 그러나 Buffers 는
+--   <환경값>: 25,406행을 ROWID 로 하나씩 표에서 읽어 3,090 을 훨씬 넘는다(실습 Ch04-02 의 838건 → 725블록
+--   비율이면 2만 블록 안팎). 정렬을 없앤 대가로 읽기가 몇 배 늘었다. 옵티마이저가 정렬을 택한 것이 맞다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 정렬 생략 조건은 두 가지: ① 정렬 컬럼이 인덱스 컬럼 ② 그 인덱스가 실제 접근 경로. 하나라도 빠지면 정렬.
+-- 2) 넓은 범위(8.5%)에서는 ②가 깨진다 — Full Scan 은 순서를 보장하지 않으므로 PK 컬럼이라도 정렬.
+-- 3) 인덱스를 강제해 정렬을 없애면 읽기가 폭증한다. 정렬 비용(메모리·CPU)과 읽기 비용(Buffers)의 교환.
+-- 4) 정렬은 +MEMSTATS 로 본다. (0) 이면 메모리 안, (1)·(2) 면 임시 세그먼트로 넘친 것 — TUN 19장.
+
+SQLT@orcl> EXIT
+================================================================================

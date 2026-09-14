@@ -1,0 +1,130 @@
+================================================================================
+ Ch01 실습 03 — JOIN+DISTINCT 버전: 계획에서 사라진 테이블(조인 제거)과 자원 종합 비교
+ 목표: 같은 답을 내는 세 번째 방식(JOIN + COUNT(DISTINCT))을 실측해 Buffers 가 가장 적은
+       이유(MEDICAL_CLAIMS 접근이 계획에서 아예 사라짐)를 확인한다. ORA-00918 을 재현해
+       조인에서 컬럼 한정이 필요한 이유를 익히고, Buffers·Memory·시간을 한 표로 비교해
+       "자원 절약은 다차원" 임을 정리한다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. 실습 02 를 마친 상태(캐시 웜).
+ 주의: 개인 실습 환경 전용. 조회만 수행한다.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (오류 → 원인 → 조치 → 재확인) 조인 버전 작성 중 ORA-00918
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(DISTINCT claim_id)
+  2       FROM   medical_claims mc, claim_details cd, drug_master dm
+  3       WHERE  mc.claim_id  = cd.claim_id
+  4       AND    cd.drug_code = dm.drug_code
+  5       AND    dm.category  = '주사제';
+SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(DISTINCT claim_id)
+                                                    *
+ERROR at line 1:
+ORA-00918: column ambiguously defined
+
+SQLT@orcl> -- 원인 파악: CLAIM_ID 가 MEDICAL_CLAIMS 와 CLAIM_DETAILS 양쪽에 있다. FROM 에 표가 둘
+SQLT@orcl> --   이상이면 어느 쪽 컬럼인지 파서가 정할 수 없어 실행 전에 거부한다(Parse 단계 오류, Ch02).
+SQLT@orcl> -- 조치: 별칭으로 한정한다. 어느 쪽을 세든 조인 조건(mc.claim_id = cd.claim_id) 때문에 값은 같다.
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(DISTINCT mc.claim_id)
+  2       FROM   medical_claims mc, claim_details cd, drug_master dm
+  3       WHERE  mc.claim_id  = cd.claim_id
+  4       AND    cd.drug_code = dm.drug_code
+  5       AND    dm.category  = '주사제';
+
+COUNT(DISTINCTMC.CLAIM_ID)
+--------------------------
+                     79342
+
+-- 재확인: 실습 02 의 IN·EXISTS 와 같은 79,342 건. 세 방식은 논리적으로 동등하다.
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 재확인) FROM 절에 있는 MEDICAL_CLAIMS 가 계획에 없다
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------
+SQL_ID  a3nqx088zkzhq, child number 0
+-------------------------------------
+Plan hash value: <환경값>
+
+--------------------------------------------------------------------------------------------
+| Id  | Operation             | Name          | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |               |      1 |        |      1 |00:00:00.04 |    6713 |
+|   1 |  SORT AGGREGATE       |               |      1 |      1 |      1 |00:00:00.04 |    6713 |
+|   2 |   VIEW                | VW_DAG_0      |      1 |    296K|  79342 |00:00:00.04 |    6713 |
+|   3 |    HASH GROUP BY      |               |      1 |    296K|  79342 |00:00:00.04 |    6713 |
+|*  4 |     HASH JOIN         |               |      1 |    299K|  90430 |00:00:00.03 |    6713 |
+|*  5 |      TABLE ACCESS FULL| DRUG_MASTER   |      1 |   3333 |   1000 |00:00:00.01 |      91 |
+|   6 |      TABLE ACCESS FULL| CLAIM_DETAILS |      1 |    899K|    899K|00:00:00.02 |    6621 |
+--------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   4 - access("CD"."DRUG_CODE"="DM"."DRUG_CODE")
+   5 - filter("DM"."CATEGORY"='주사제')
+
+SQLT@orcl> -- 이상 징후: FROM 절에 medical_claims mc 를 분명히 썼는데 계획에 MEDICAL_CLAIMS 도
+SQLT@orcl> --   PK_MEDICAL_CLAIMS 도 없다. 실습 02 의 A·B 에는 Id 7 에 PK_MEDICAL_CLAIMS 가 있었다.
+SQLT@orcl> -- 원인 파악: 이 SQL 에서 MEDICAL_CLAIMS 는 (1) SELECT 목록에 mc.claim_id 만 쓰이고
+SQLT@orcl> --   (2) 그 값은 조인 조건으로 cd.claim_id 와 같으며 (3) CLAIM_DETAILS.CLAIM_ID 는
+SQLT@orcl> --   MEDICAL_CLAIMS 를 참조하는 FK 라서 "짝이 반드시 존재" 한다. 옵티마이저는 이 세 가지로
+SQLT@orcl> --   MEDICAL_CLAIMS 를 읽지 않아도 답이 같음을 증명하고 조인을 제거했다(join elimination).
+SQLT@orcl> -- 제약 조건을 확인한다 — FK 가 ENABLE/VALIDATE 여야 이 판단이 가능하다.
+SQLT@orcl> COLUMN constraint_name FORMAT A22
+SQLT@orcl> COLUMN r_constraint_name FORMAT A20
+SQLT@orcl> SELECT constraint_name, constraint_type, r_constraint_name, status, validated
+  2       FROM   user_constraints
+  3       WHERE  table_name = 'CLAIM_DETAILS' AND constraint_type = 'R';
+
+CONSTRAINT_NAME        C R_CONSTRAINT_NAME    STATUS   VALIDATED
+---------------------- - -------------------- -------- -------------
+<환경값>               R PK_MEDICAL_CLAIMS    ENABLED  VALIDATED
+<환경값>               R PK_DRUG_MASTER       ENABLED  VALIDATED
+
+-- 재확인: FK 가 ENABLED·VALIDATED 다. 그래서 Buffers 가 6,713 — 실습 02 의 8,604 에서 정확히
+--   PK_MEDICAL_CLAIMS 읽기 1,891 만큼 줄었다(8,604 − 1,891 = 6,713). 상세 원리는 Ch07.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 후 관점) 자원 종합 — Buffers 만 보면 놓치는 것
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 메모리 열(OMem/1Mem/Used-Mem)까지 보려면 형식에 +MEMSTATS 를 더한다.
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR('a3nqx088zkzhq', NULL, 'ALLSTATS LAST +MEMSTATS'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name          | A-Rows | Buffers |  OMem |  1Mem | Used-Mem |
+------------------------------------------------------------------------------------------------
+|   3 |    HASH GROUP BY      |               |  79342 |    6713 |   <환경값> |  <환경값> |   12M (0)|
+|*  4 |     HASH JOIN         |               |  90430 |    6713 |   <환경값> |  <환경값> | 6694K (0)|
+------------------------------------------------------------------------------------------------
+(관심 행만 발췌)
+
+-- 해석: C 버전은 Buffers 가 가장 적지만 HASH GROUP BY(중복 제거)에 12M 의 작업 영역을 쓴다.
+--   A·B 는 HASH JOIN 6,694K 뿐이다. (0) 은 디스크로 넘치지 않고 메모리 안에서 끝났다는 뜻.
+
+--   세 버전 종합
+--   ┌──────────────────┬─────────┬─────────┬────────────────────┬──────────────────────────┐
+--   │ 버전             │ Buffers │ A-Time  │ Used-Mem(최대)     │ 비고                     │
+--   ├──────────────────┼─────────┼─────────┼────────────────────┼──────────────────────────┤
+--   │ A. IN            │  8,604  │ 3.04초  │ 6,694K             │ 캐시 없이 측정(실습 02)  │
+--   │ B. EXISTS        │  8,604  │ 0.13초  │ 6,694K             │ 캐시 있이 측정           │
+--   │ C. JOIN+DISTINCT │  6,713  │ 0.04초  │ 12M (HASH GROUP BY)│ MEDICAL_CLAIMS 접근 없음 │
+--   └──────────────────┴─────────┴─────────┴────────────────────┴──────────────────────────┘
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 조인에서 양쪽에 있는 컬럼은 반드시 별칭으로 한정한다(ORA-00918 은 Parse 단계에서 난다).
+-- 2) FK 가 ENABLED·VALIDATED 면 옵티마이저가 읽지 않아도 되는 표를 계획에서 제거한다.
+--    FROM 절과 계획이 다르다고 당황하지 말고 제약 조건을 본다(Ch07 에서 상세).
+-- 3) Buffers 6,713 = 8,604 − 1,891. 줄어든 양이 정확히 사라진 단계의 Buffers 와 같다.
+-- 4) Buffers 를 아꼈다고 메모리도 아낀 것은 아니다(12M vs 6,694K). 어떤 자원을 절약했는지 구분한다.
+
+SQLT@orcl> EXIT
+================================================================================

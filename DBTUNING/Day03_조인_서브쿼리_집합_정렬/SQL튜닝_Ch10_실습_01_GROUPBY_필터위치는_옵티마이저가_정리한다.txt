@@ -1,0 +1,127 @@
+================================================================================
+ Ch10 실습 01 — GROUP BY 키에 대한 필터는 위치가 달라도 같은 계획 (Plan hash 3971657403, ORA-00979 교정)
+ 목표: "WHERE 로 먼저 거른 뒤 집계" 와 "더 잘게 집계한 뒤 바깥에서 거름" 이 완전히 같은 계획·Buffers
+       (3,090)가 되는 것을 실측하고, 그것이 실습 Ch08-03 의 뷰 병합 + 조건 내림(predicate pushdown)
+       때문임을 확인한다. GROUP BY 에 없는 컬럼을 SELECT 해 나는 ORA-00979 를 교정한다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. 조회만.
+ 주의: 개인 실습 환경 전용.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+
+--------------------------------------------------------------------------------
+-- [1] (오류 → 원인 → 조치) 집계 SQL 작성 중 ORA-00979
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT hosp_id, claim_type, COUNT(*), SUM(total_amt)
+  2       FROM   medical_claims
+  3       WHERE  claim_type = '입원'
+  4       GROUP  BY hosp_id;
+SELECT hosp_id, claim_type, COUNT(*), SUM(total_amt)
+                *
+ERROR at line 1:
+ORA-00979: not a GROUP BY expression
+
+SQLT@orcl> -- 원인 파악: hosp_id 로 묶은 그룹 하나에는 여러 행이 들어 있다. claim_type 은 그룹당 값이 하나로
+SQLT@orcl> --   정해지지 않으므로(옵티마이저는 WHERE 로 '입원' 뿐임을 알지만 문법 검사는 그것을 보지 않는다)
+SQLT@orcl> --   SELECT 에 쓸 수 없다. GROUP BY 에 넣거나 SELECT 에서 뺀다.
+SQLT@orcl> -- 조치: 두 방식 모두로 써서 비교한다 — 이것이 이 실습의 Q1·Q2 다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치 전 상태) Q1 — WHERE 로 먼저 거른 뒤 hosp_id 로 집계
+--------------------------------------------------------------------------------
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ hosp_id, COUNT(*), SUM(total_amt)
+  2       FROM   medical_claims
+  3       WHERE  claim_type = '입원'
+  4       GROUP  BY hosp_id;
+
+1000 rows selected.
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+Plan hash value: 3971657403
+
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | Starts | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                |      1 |   1000 |00:00:00.03 |    3090 |
+|   1 |  HASH GROUP BY     |                |      1 |   1000 |00:00:00.03 |    3090 |
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |  59511 |00:00:00.03 |    3090 |
+------------------------------------------------------------------------------------------
+   2 - filter("CLAIM_TYPE"='입원')
+
+--------------------------------------------------------------------------------
+-- [3] (재확인) Q2 — 일부러 비효율적으로: claim_type 까지 묶은 뒤 바깥에서 거름
+--------------------------------------------------------------------------------
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ hosp_id, cnt, total
+  2       FROM  (SELECT hosp_id, claim_type, COUNT(*) cnt, SUM(total_amt) total
+  3              FROM   medical_claims
+  4              GROUP  BY hosp_id, claim_type)
+  5       WHERE  claim_type = '입원';
+
+1000 rows selected.
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+Plan hash value: 3971657403
+
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | Starts | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                |      1 |   1000 |00:00:00.03 |    3090 |
+|   1 |  HASH GROUP BY     |                |      1 |   1000 |00:00:00.03 |    3090 |
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |  59511 |00:00:00.03 |    3090 |
+------------------------------------------------------------------------------------------
+   2 - filter("CLAIM_TYPE"='입원')
+
+-- 재확인: Plan hash 3971657403 — Q1 과 완전히 같다. Id 2 의 A-Rows 도 59,511 — 2,000개 그룹
+--   (hosp_id × claim_type)을 만든 뒤 거른 것이 아니라, '입원' 조건이 Full Scan 단계로 내려가 59,511행만
+--   집계했다. 뷰가 병합되고(Ch08 실습 03) 바깥 조건이 GROUP BY 앞으로 내려갔다(predicate pushdown).
+--   조건이 그룹 키(claim_type) 자체에 대한 것이라 이렇게 내릴 수 있었다.
+
+--------------------------------------------------------------------------------
+-- [4] (이상 징후 → 원인) 내려가지 못하는 조건 — 집계 결과에 대한 조건
+--------------------------------------------------------------------------------
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ hosp_id, cnt
+  2       FROM  (SELECT hosp_id, COUNT(*) cnt FROM medical_claims GROUP BY hosp_id)
+  3       WHERE  cnt > 1000;
+(<환경값> rows)
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+| Id  | Operation           | Name           | Starts | A-Rows | Buffers |
+------------------------------------------------------------------------------------------
+|*  1 |  FILTER             |                |      1 |  <환경값> |    3090 |
+|   2 |   HASH GROUP BY     |                |      1 |   1000 |    3090 |
+|   3 |    TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |   300K |    3090 |
+------------------------------------------------------------------------------------------
+   1 - filter(COUNT(*)>1000)
+
+SQLT@orcl> -- 이상 징후: 이번엔 Id 3 이 300K 를 전부 통과시키고 FILTER 가 GROUP BY 위에 남았다.
+SQLT@orcl> -- 원인 파악: cnt > 1000 은 집계 결과(COUNT)에 대한 조건이라 집계 전에는 판정할 수 없다.
+SQLT@orcl> --   내릴 수 있는 조건은 "그룹 키 또는 원본 컬럼" 에 대한 것뿐이다. 이건 옵티마이저의 한계가
+SQLT@orcl> --   아니라 논리의 한계다 — 어떻게 써도 30만 행을 집계해야 한다.
+SQLT@orcl> --   Buffers 는 어차피 3,090(Full Scan 1회)이다. 차이는 HASH GROUP BY 가 처리하는 행 수(59,511 vs 300K)
+SQLT@orcl> --   = CPU·메모리다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 그룹 키에 대한 조건은 WHERE 에 쓰든 뷰 바깥에 쓰든 옵티마이저가 Full Scan 단계로 내린다(Plan hash 동일).
+-- 2) 집계 결과에 대한 조건(cnt > 1000)은 내려갈 수 없다 — 전체 집계 후 FILTER. 논리적 한계.
+-- 3) SELECT 에 그룹 키·집계 함수 외의 컬럼을 쓰면 ORA-00979.
+-- 4) "필터 위치" 보다 "그 필터가 집계 전에 판정 가능한가" 가 비용을 정한다.
+
+SQLT@orcl> EXIT
+================================================================================

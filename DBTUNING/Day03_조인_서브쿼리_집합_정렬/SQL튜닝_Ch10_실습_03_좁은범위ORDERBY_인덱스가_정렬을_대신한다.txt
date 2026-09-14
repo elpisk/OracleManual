@@ -1,0 +1,131 @@
+================================================================================
+ Ch10 실습 03 — 좁은 범위(0.27%)의 ORDER BY: 인덱스가 정렬을 대신한다 (776 vs 717)
+ 목표: 1일 범위(약 800건)에서 ORDER BY claim_id 는 INDEX RANGE SCAN 만으로 정렬 없이(776),
+       ORDER BY total_amt 는 SORT ORDER BY 가 붙는(717) 것을 실측한다. "정렬이 없는데 Buffers 가 더 큰"
+       이상 징후를 fetch 경계로 설명하고, 상위 N 건(FETCH FIRST)에서 정렬 생략이 만드는 차이를 본다.
+ 환경: non-CDB=orcl 19.3, 스키마 SQLT. 조회만. 바인드 :end_id 사용.
+ 주의: 개인 실습 환경 전용.
+================================================================================
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+SQLT@orcl> SET PAGESIZE 100
+SQLT@orcl> VARIABLE end_id VARCHAR2(20)
+SQLT@orcl> EXEC :end_id := '20240102-0000000'            -- 약 1일, 0.27%
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) ORDER BY claim_id — 인덱스 순서 그대로
+--------------------------------------------------------------------------------
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ claim_id, total_amt
+  2       FROM   medical_claims
+  3       WHERE  claim_id BETWEEN '20240101-0000000' AND :end_id
+  4       ORDER  BY claim_id;
+
+<환경값> rows selected.                                   -- 800건 안팎
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name              | Starts | A-Rows | Buffers |
+--------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                   |      1 |  <환경값> |     776 |
+|*  1 |  FILTER                              |                   |      1 |  <환경값> |     776 |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| MEDICAL_CLAIMS    |      1 |  <환경값> |     776 |
+|*  3 |    INDEX RANGE SCAN                  | PK_MEDICAL_CLAIMS |      1 |  <환경값> |  <환경값> |
+--------------------------------------------------------------------------------------------------------
+
+-- 해석: SORT ORDER BY 가 없다. 좁은 범위라 인덱스가 접근 경로로 채택됐고(실습 02 의 조건 ②), 인덱스가
+--   claim_id 순으로 돌려주므로 정렬이 필요 없다. 실습 02 의 두 조건이 모두 만족된 경우다.
+
+--------------------------------------------------------------------------------
+-- [2] (재확인) ORDER BY total_amt — 같은 접근 경로, 정렬은 필요
+--------------------------------------------------------------------------------
+SQLT@orcl> SET AUTOTRACE TRACEONLY STATISTICS
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ claim_id, total_amt
+  2       FROM   medical_claims
+  3       WHERE  claim_id BETWEEN '20240101-0000000' AND :end_id
+  4       ORDER  BY total_amt;
+
+<환경값> rows selected.
+
+SQLT@orcl> SET AUTOTRACE OFF
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST +MEMSTATS'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                             | Name              | Starts | A-Rows | Buffers | Used-Mem |
+--------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                      |                   |      1 |  <환경값> |     717 |          |
+|   1 |  SORT ORDER BY                        |                   |      1 |  <환경값> |     717 | <환경값> (0)|
+|*  2 |   FILTER                              |                   |      1 |  <환경값> |     717 |          |
+|   3 |    TABLE ACCESS BY INDEX ROWID BATCHED| MEDICAL_CLAIMS    |      1 |  <환경값> |     717 |          |
+|*  4 |     INDEX RANGE SCAN                  | PK_MEDICAL_CLAIMS |      1 |  <환경값> |  <환경값> |
+--------------------------------------------------------------------------------------------------------
+
+SQLT@orcl> -- 이상 징후: 정렬이 "추가" 됐는데 Buffers 는 776 → 717 로 오히려 줄었다.
+SQLT@orcl> -- 원인 파악: SORT ORDER BY 는 블록을 읽지 않는다(Ch09 실습 01 과 같은 원리). 줄어든 59 는 fetch
+SQLT@orcl> --   경계 효과다 — [1] 은 정렬 없이 행을 배열(15행)씩 흘려보내며 매 fetch 마다 다음 블록을 다시
+SQLT@orcl> --   잡지만, [2] 는 SORT 가 모든 행을 먼저 모아 두고(표 읽기는 한 번에 끝) 정렬된 결과를 fetch 하므로
+SQLT@orcl> --   경계 재읽기가 없다. 정렬의 비용은 Buffers 가 아니라 Used-Mem 과 CPU 에 있다.
+SQLT@orcl> -- 재확인: Buffers 차이(59)로 우열을 말하지 않는다. 비교할 것은 "정렬 단계의 유무" 와 그 메모리다.
+
+--------------------------------------------------------------------------------
+-- [3] (조치 후 관점) 정렬 생략이 진짜 값을 하는 곳 — 상위 N 건
+--------------------------------------------------------------------------------
+SQLT@orcl> -- "가장 이른 청구 5건" — 정렬 컬럼이 인덱스면 5건만 읽고 멈춘다.
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ claim_id, total_amt
+  2       FROM   medical_claims
+  3       WHERE  claim_id BETWEEN '20240101-0000000' AND :end_id
+  4       ORDER  BY claim_id
+  5       FETCH FIRST 5 ROWS ONLY;
+(5 rows)
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name              | Starts | A-Rows | Buffers |
+--------------------------------------------------------------------------------------------------------
+|*  1 |  VIEW                                |                   |      1 |      5 |  <환경값> |
+|*  2 |   WINDOW NOSORT STOPKEY              |                   |      1 |      5 |  <환경값> |   -- 5건에서 중단
+|*  3 |    FILTER                            |                   |      1 |      5 |  <환경값> |
+|   4 |     TABLE ACCESS BY INDEX ROWID BATCHED| MEDICAL_CLAIMS  |      1 |      5 |  <환경값> |   -- 5행만 읽음
+|*  5 |      INDEX RANGE SCAN                | PK_MEDICAL_CLAIMS |      1 |      5 |  <환경값> |
+--------------------------------------------------------------------------------------------------------
+
+SQLT@orcl> -- 같은 것을 total_amt 로 — 전부 읽고 정렬해야 상위 5건을 안다.
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ claim_id, total_amt
+  2       FROM   medical_claims
+  3       WHERE  claim_id BETWEEN '20240101-0000000' AND :end_id
+  4       ORDER  BY total_amt
+  5       FETCH FIRST 5 ROWS ONLY;
+(5 rows)
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name              | Starts | A-Rows | Buffers |
+--------------------------------------------------------------------------------------------------------
+|*  2 |   WINDOW SORT PUSHED RANK            |                   |      1 |      5 |     717 |   -- 전부 정렬
+|   4 |     TABLE ACCESS BY INDEX ROWID BATCHED| MEDICAL_CLAIMS  |      1 |  <환경값> |     717 |   -- 800여 행 읽음
+--------------------------------------------------------------------------------------------------------
+
+-- 재확인: 인덱스 컬럼 정렬 + 상위 N = A-Rows 5, Buffers 몇 개. 비인덱스 컬럼 정렬 + 상위 N = 800여 행 읽고
+--   전부 순위 매김(717). 전체를 가져올 때(776 vs 717)는 차이가 없어 보이던 것이 상위 N 에서 100배로 벌어진다.
+--   이것이 Ch11 페이징의 핵심이다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) 좁은 범위에서는 인덱스가 접근 경로가 되므로 인덱스 컬럼 ORDER BY 는 정렬이 생략된다(776, SORT 없음).
+-- 2) 비인덱스 컬럼 ORDER BY 는 정렬이 붙지만 Buffers 는 오히려 작을 수 있다(717) — 정렬은 블록을 안 읽는다.
+-- 3) 정렬 생략의 진짜 가치는 상위 N 에서 나온다: 5건만 읽고 멈춘다(WINDOW NOSORT STOPKEY).
+-- 4) 판정은 Buffers 숫자가 아니라 "SORT 단계 유무 + 그 아래 A-Rows" 로 한다.
+
+SQLT@orcl> EXIT
+================================================================================
