@@ -127,13 +127,18 @@ NO
 --------------------------------------------------------------------------------
 SYS@orcl> SELECT sequence#, first_change#, next_change#,
   2         TO_CHAR(first_time, 'HH24:MI:SS') AS first_time
-  3  FROM   v$log_history ORDER BY sequence# DESC FETCH FIRST 4 ROWS ONLY;
+  3  FROM   v$log_history
+  4  WHERE  resetlogs_change# = (SELECT resetlogs_change# FROM v$database)
+  5  ORDER BY sequence# DESC FETCH FIRST 4 ROWS ONLY;
 
  SEQUENCE# FIRST_CHANGE# NEXT_CHANGE# FIRST_TIME
 ---------- ------------- ------------ ----------
-         3       2428000      2428400 14:14:30
+         3       2428000      2428400 14:08:40
          2       2427600      2428000 14:08:08
-         1       2427200      2427600 14:02:30
+         1       2426740      2427600 13:31:05
+
+-- 시퀀스 1 은 10-5 의 RESETLOGS 부터 이 실습의 첫 스위치까지다.
+-- Cold Backup 시점(2427200)과 TRUNCATE(14:14:36, 시퀀스 3)가 모두 그 안팎에 있다.
 
 SYS@orcl> !ls -l /home/oracle/backup/cold10/*.dbf | wc -l
 7
@@ -168,6 +173,13 @@ SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER B
 
 -- 복구 없이 바로 열어 본다.
 
+SYS@orcl> ALTER DATABASE OPEN;
+ALTER DATABASE OPEN
+*
+ERROR at line 1:
+ORA-01113: file 1 needs media recovery
+ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
+
 SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
 ALTER DATABASE OPEN RESETLOGS
 *
@@ -175,31 +187,72 @@ ERROR at line 1:
 ORA-01139: RESETLOGS option only valid after an incomplete database recovery
 
 -- << 원인 파악 >>
--- 일관성 있는 상태이므로 RESETLOGS를 요구할 이유가 없다는 뜻이다.
--- 복구를 한 번도 수행하지 않았기 때문에 RESETLOGS 옵션이 거부되었다.
--- Cold Backup은 그대로 열 수 있지만 그러면 백업 시점(14:02:04)으로 끝난다.
--- 14:08의 정상 업무까지 잃게 되므로 목표 지점까지 복구해야 한다.
+-- 파일끼리는 일관적이지만 컨트롤파일은 현재 것이라 파일이 그보다 뒤처져 있다.
+-- 그래서 그냥 OPEN 은 "복구가 필요하다"(ORA-01113)로 막히고,
+-- RESETLOGS 는 "불완전 복구를 한 적이 없다"(ORA-01139)로 막힌다.
+-- Cold Backup 을 복구 없이 그대로 여는 것은 컨트롤파일·리두까지 함께
+-- 복원했을 때(4장·9장의 전체 복원)의 이야기다. 그때는 백업 시점으로 끝난다.
+-- 여기서는 14:08의 정상 업무까지 살리려고 목표 지점까지 복구한다.
 
-SYS@orcl> SELECT * FROM v$recover_file;
+SYS@orcl> SELECT file#, error, change# FROM v$recover_file ORDER BY file#;
 
-no rows selected
+     FILE# ERROR                    CHANGE#
+---------- -------------------- -----------
+         1                          2427200
+         3                          2427200
+         4                          2427200
+         7                          2427200
+        10                          2427200
+        11                          2427200
+        12                          2427200
 
--- 복구 대상이 없다. 일관성 있는 상태의 특징이다.
+-- 모든 파일이 백업 시점(2427200)부터 복구 대상이다.
 
 -- << 수정 >>
 -- 목표 지점까지 불완전 복구를 수행한 뒤 RESETLOGS로 연다.
+-- READ ONLY 로 검증할 것이므로 USING BACKUP CONTROLFILE 을 붙인다(10-2).
 
 SYS@orcl> SET AUTORECOVERY ON
-SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 14:14:30';
-ORA-00279: change 2427200 generated at 05/12/2025 14:02:04 needed for thread 1
+SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 14:14:30' USING BACKUP CONTROLFILE;
+ORA-00279: change 2427200 generated at 05/12/2025 14:02:30 needed for thread 1
 ORA-00289: suggestion : /home/oracle/arch1/arch_1_1_1200562204.arc
 ORA-00280: change 2427200 for thread 1 is in sequence #1
 
-Log applied.
+
+ORA-00279: change 2427600 generated at 05/12/2025 14:08:08 needed for thread 1
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_2_1200562204.arc
+ORA-00280: change 2427600 for thread 1 is in sequence #2
+ORA-00278: log file '/home/oracle/arch1/arch_1_1_1200562204.arc' no longer needed for this recovery
+
+
+ORA-00279: change 2428000 generated at 05/12/2025 14:08:40 needed for thread 1
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_3_1200562204.arc
+ORA-00280: change 2428000 for thread 1 is in sequence #3
+ORA-00278: log file '/home/oracle/arch1/arch_1_2_1200562204.arc' no longer needed for this recovery
+
+
 Log applied.
 Media recovery complete.
 
+SYS@orcl> SELECT file#, checkpoint_change#,
+  2         TO_CHAR(checkpoint_time, 'HH24:MI:SS') AS ckpt_time, fuzzy
+  3  FROM   v$datafile_header ORDER BY file#;
+
+     FILE# CHECKPOINT_CHANGE# CKPT_TIME FUZ
+---------- ------------------ --------- ---
+         1            2428019 14:14:35  NO
+         3            2428019 14:14:35  NO
+         4            2428019 14:14:35  NO
+         7            2428019 14:14:35  NO
+        10            2428019 14:14:35  NO
+        11            2428019 14:14:35  NO
+        12            2428019 14:14:35  NO
+
+-- 백업 시점부터 목표 지점 사이라면 어디서 멈춰도 일관적이다.
+
 SYS@orcl> ALTER DATABASE OPEN READ ONLY;
+
+Database altered.
 
 SYS@orcl> SELECT id, memo FROM hr.emp106 ORDER BY id;
 
@@ -230,13 +283,14 @@ SYS@orcl> SELECT id, memo FROM hr.emp106 ORDER BY id;
          1 first
          2 second
 
-SYS@orcl> SELECT checkpoint_change# AS recovered_scn,
-  2         TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS recovered_time
-  3  FROM   v$database;
+SYS@orcl> SELECT resetlogs_change#, TO_CHAR(resetlogs_time, 'HH24:MI:SS') AS resetlogs_time
+  2  FROM   v$database;
 
-RECOVERED_SCN RECOVERED_TIME
-------------- --------------
-      2428020 14:14:28
+RESETLOGS_CHANGE# RESETLOGS_TIME
+----------------- --------------
+          2428020 14:26:42
+
+-- 새 인카네이션은 멈춘 지점 다음 SCN(2428019 + 1)에서 시작한다.
 
 SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
   2  WHERE  status = 'CURRENT';
@@ -263,10 +317,10 @@ SYS@orcl> SELECT 'Cold' AS backup_type, '일관적(FUZZY NO)' AS restore_state,
   3  UNION ALL
   4  SELECT 'Hot', '비일관적(FUZZY YES)', 'END BACKUP 이후' FROM dual;
 
-BACKUP_TYPE RESTORE_STATE        MIN_POINT
------------ -------------------- ---------------
-Cold        일관적(FUZZY NO)     제약 없음
-Hot         비일관적(FUZZY YES)  END BACKUP 이후
+BACK RESTORE_STATE           MIN_POINT
+---- ----------------------- -----------------
+Cold 일관적(FUZZY NO)        제약 없음
+Hot  비일관적(FUZZY YES)     END BACKUP 이후
 
 SYS@orcl> SHUTDOWN IMMEDIATE
 SYS@orcl> !rm -rf /home/oracle/backup/ch10; mkdir -p /home/oracle/backup/ch10
@@ -279,11 +333,11 @@ SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO
 -- 실무 포인트
 -- 1) Cold Backup은 복원 직후 상태가 일관적이다.
 --    모든 파일이 같은 SCN이고 FUZZY가 NO다.
---    복구 없이 열 수 있지만 그러면 백업 시점으로 끝난다.
+--    그래도 컨트롤파일이 현재 것이면 복구 없이는 열리지 않는다(ORA-01113).
+--    복구 없이 그대로 여는 것은 컨트롤파일까지 함께 복원한 전체 복원의 경우다.
 --
 -- 2) 복구 없이 RESETLOGS로 열면 ORA-01139가 발생한다.
 --    불완전 복구를 수행한 뒤에만 RESETLOGS 옵션이 유효하다.
---    일관성 있는 상태에서는 그냥 OPEN 하면 된다.
 --
 -- 3) Cold Backup 기반에는 최소 복구 지점 제약이 없다.
 --    백업 시점부터 아카이브가 있는 어느 지점이든 지정할 수 있다.

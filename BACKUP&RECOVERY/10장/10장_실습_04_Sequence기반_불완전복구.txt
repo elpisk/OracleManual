@@ -9,15 +9,15 @@
 [1] 시나리오 개요
 --------------------------------------------------------------------------------
 -- 아카이브 정리 스크립트가 필요한 시퀀스까지 지웠다.
--- 빠진 시퀀스 번호를 그대로 UNTIL SEQUENCE 에 지정한다.
--- 프롬프트 조작이 없어 Cancel 방식보다 실수 여지가 적다.
+-- 첫 결손 시퀀스의 시작 SCN 을 복구 한계로 삼는다.
+-- 시퀀스 경계는 SCN 으로 정확히 정해지므로 Cancel 방식보다 실수 여지가 적다.
 -- 결손 구간을 찾는 점검 쿼리도 함께 다룬다.
 -- 복구 유형 : 불완전 복구(Sequence-based)
 
 --------------------------------------------------------------------------------
 [2] 사전 조건
 --------------------------------------------------------------------------------
--- 실습 10-3을 마친 상태에서 이어서 진행한다.
+-- 실습 10-3을 마친 상태에서 이어서 진행한다. 10-3 끝에 받은 전체 백업을 쓴다.
 
 [oracle@oel7v9 ~]$ sqlplus / as sysdba
 
@@ -53,16 +53,45 @@ SYS@orcl> COMMIT;
 SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
 System altered.
 
+SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1          4 ACTIVE
+         3          5 CURRENT
+         4          3 ACTIVE
+
+-- 지울 시퀀스 3·4 가 아직 온라인 리두에 남아 있다. 이대로면 아카이브를 지워도
+-- RECOVER 가 온라인 리두로 완전 복구를 끝내 버린다(10-1). 두 번 더 스위치해 밀어낸다.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# STATUS
+---------- ---------- ----------------
+         1          7 CURRENT
+         3          5 ACTIVE
+         4          6 ACTIVE
+
 SYS@orcl> SELECT sequence#, first_change#, next_change#,
   2         TO_CHAR(first_time, 'HH24:MI:SS') AS first_time
-  3  FROM   v$log_history WHERE sequence# BETWEEN 1 AND 5 ORDER BY sequence#;
+  3  FROM   v$log_history
+  4  WHERE  resetlogs_change# = (SELECT resetlogs_change# FROM v$database)
+  5  ORDER BY sequence#;
 
  SEQUENCE# FIRST_CHANGE# NEXT_CHANGE# FIRST_TIME
 ---------- ------------- ------------ ----------
-         1       2423418      2424200 11:20:04
-         2       2424200      2424560 11:24:18
-         3       2424560      2424900 11:28:32
+         1       2423418      2424200 11:15:40
+         2       2424200      2424559 11:24:18
+         3       2424559      2424900 11:28:32
          4       2424900      2425240 11:32:46
+         5       2425240      2425250 11:32:50
+         6       2425250      2425260 11:32:53
+
+-- 1~4번 행은 각각 시퀀스 1~4 에 있다. 5·6 은 밀어내기용 빈 스위치다.
 
 SYS@orcl> SELECT COUNT(*) FROM hr.emp104;
 
@@ -75,13 +104,21 @@ SYS@orcl> SELECT COUNT(*) FROM hr.emp104;
 --------------------------------------------------------------------------------
 SYS@orcl> !rm -f /u01/app/oracle/oradata/orcl/users01.dbf
 
--- 정리 스크립트가 시퀀스 3 이후를 지웠다고 가정한다.
+-- 정리 스크립트가 시퀀스 3·4 를 지웠다고 가정한다.
 
 SYS@orcl> !rm -f /home/oracle/arch1/arch_1_3_*.arc /home/oracle/arch1/arch_1_4_*.arc
 
 SYS@orcl> !ls /home/oracle/arch1/ | tail -4
 arch_1_1_1200553402.arc
 arch_1_2_1200553402.arc
+arch_1_5_1200553402.arc
+arch_1_6_1200553402.arc
+
+SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+System altered.
+
+-- 지운 파일의 블록이 버퍼 캐시에 남아 있으면 조회가 그대로 성공한다.
+-- 증상을 보려면 캐시를 비워 디스크를 읽게 한다.
 
 --------------------------------------------------------------------------------
 [5] 증상 관찰
@@ -100,25 +137,39 @@ SYS@orcl> SELECT file#, status FROM v$datafile WHERE file# = 7;
 
      FILE# STATUS
 ---------- -------
-         7 RECOVER
+         7 ONLINE
+
+SYS@orcl> SELECT file#, status, error FROM v$datafile_header WHERE file# = 7;
+
+     FILE# STATUS  ERROR
+---------- ------- --------------------
+         7 ONLINE  CANNOT OPEN FILE
+
+-- 컨트롤파일(v$datafile)은 아직 ONLINE 으로 알고 있다. 파일이 없다는 사실은
+-- 헤더를 읽으려는 v$datafile_header 의 ERROR 로 드러난다.
 
 --------------------------------------------------------------------------------
 [6] 진단 : 결손 구간 확인
 --------------------------------------------------------------------------------
 SYS@orcl> SELECT MIN(sequence#) AS oldest, MAX(sequence#) AS newest, COUNT(*) AS cnt,
   2         MAX(sequence#) - MIN(sequence#) + 1 AS expected
-  3  FROM   v$archived_log WHERE status = 'A';
+  3  FROM   v$archived_log
+  4  WHERE  status = 'A'
+  5  AND    resetlogs_change# = (SELECT resetlogs_change# FROM v$database);
 
     OLDEST     NEWEST        CNT   EXPECTED
 ---------- ---------- ---------- ----------
-         1          4          4          4
+         1          6          6          6
 
--- 컨트롤파일에는 네 개가 모두 있는 것으로 되어 있다. OS에서 지웠기 때문이다.
+-- 컨트롤파일에는 여섯 개가 모두 있는 것으로 되어 있다. OS에서 지웠기 때문이다.
 
 [oracle@oel7v9 ~]$ rman target /
 
 RMAN> CROSSCHECK ARCHIVELOG ALL;
 
+using target database control file instead of recovery catalog
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=397 device type=DISK
 validation succeeded for archived log
 archived log file name=/home/oracle/arch1/arch_1_1_1200553402.arc RECID=1 STAMP=1200553500
 validation succeeded for archived log
@@ -127,11 +178,17 @@ validation failed for archived log
 archived log file name=/home/oracle/arch1/arch_1_3_1200553402.arc RECID=3 STAMP=1200554020
 validation failed for archived log
 archived log file name=/home/oracle/arch1/arch_1_4_1200553402.arc RECID=4 STAMP=1200554280
-Crosschecked 4 objects
+validation succeeded for archived log
+archived log file name=/home/oracle/arch1/arch_1_5_1200553402.arc RECID=5 STAMP=1200554284
+validation succeeded for archived log
+archived log file name=/home/oracle/arch1/arch_1_6_1200553402.arc RECID=6 STAMP=1200554287
+Crosschecked 6 objects
 
 RMAN> EXIT
 
-SYS@orcl> SELECT sequence#, status FROM v$archived_log ORDER BY sequence#;
+SYS@orcl> SELECT sequence#, status FROM v$archived_log
+  2  WHERE  resetlogs_change# = (SELECT resetlogs_change# FROM v$database)
+  3  ORDER BY sequence#;
 
  SEQUENCE# S
 ---------- -
@@ -139,11 +196,14 @@ SYS@orcl> SELECT sequence#, status FROM v$archived_log ORDER BY sequence#;
          2 A
          3 X
          4 X
+         5 A
+         6 A
 
 -- CROSSCHECK 후 상태가 X(EXPIRED)로 바뀌었다. 실제로 없다는 뜻이다.
 
 SYS@orcl> SELECT MIN(sequence#) AS first_missing FROM v$archived_log
-  2  WHERE  status <> 'A';
+  2  WHERE  status <> 'A'
+  3  AND    resetlogs_change# = (SELECT resetlogs_change# FROM v$database);
 
 FIRST_MISSING
 -------------
@@ -155,15 +215,23 @@ OLDEST_ONLINE
 -------------
       2425240
 
--- 온라인 리두의 최소 SCN이 시퀀스 3의 시작보다 크다. 대체 불가다.
+-- 온라인 리두의 최소 SCN(시퀀스 5)이 시퀀스 3의 시작보다 크다. 대체 불가다.
+
+SYS@orcl> SELECT first_change# AS limit_scn FROM v$archived_log
+  2  WHERE  sequence# = 3
+  3  AND    resetlogs_change# = (SELECT resetlogs_change# FROM v$database);
+
+ LIMIT_SCN
+----------
+   2424559
 
 -- 판정
 --   ① 첫 결손 시퀀스 : 3
 --   ② 적용 가능 : 시퀀스 1~2
---   ③ 복구 한계 : 시퀀스 2의 NEXT_CHANGE# 직전 = SCN 2424559
---   → UNTIL SEQUENCE 3 THREAD 1 로 지정
+--   ③ 복구 한계 : 시퀀스 3 의 FIRST_CHANGE# = 2424559 (= 시퀀스 2 의 NEXT_CHANGE#)
+--   → 이 SCN 직전까지 적용한다
 
-SYS@orcl> SELECT SCN_TO_TIMESTAMP(2424559) AS max_recover_point FROM dual;
+SYS@orcl> SELECT SCN_TO_TIMESTAMP(2424558) AS max_recover_point FROM dual;
 
 MAX_RECOVER_POINT
 ---------------------------------------------------------
@@ -176,45 +244,76 @@ SYS@orcl> SHUTDOWN ABORT
 SYS@orcl> !cp -p /home/oracle/backup/ch10/*.dbf /u01/app/oracle/oradata/orcl/
 SYS@orcl> STARTUP MOUNT
 
--- 결손 시퀀스보다 뒤 번호를 지정해 본다.
+-- 시퀀스 번호를 그대로 지정해 본다.
 
 SYS@orcl> SET AUTORECOVERY ON
-SYS@orcl> RECOVER DATABASE UNTIL SEQUENCE 5 THREAD 1;
-ORA-00279: change 2423418 generated at 05/12/2025 11:20:04 needed for thread 1
-ORA-00289: suggestion : /home/oracle/arch1/arch_1_1_1200553402.arc
-ORA-00280: change 2423418 for thread 1 is in sequence #1
+SYS@orcl> RECOVER DATABASE UNTIL SEQUENCE 3 THREAD 1;
+ORA-00277: illegal option to the UNTIL recovery flag SEQUENCE
 
-Log applied.
-Log applied.
+-- << 원인 파악 >>
+-- SQL*Plus 의 RECOVER(와 ALTER DATABASE RECOVER)가 받는 UNTIL 은
+-- CANCEL / TIME / CHANGE / CONSISTENT 네 가지뿐이다.
+-- UNTIL SEQUENCE 는 RMAN 의 SET UNTIL SEQUENCE 구문이다(13장 이후).
+-- 사용자 관리 복구에서 시퀀스 경계는 SCN 으로 지정한다.
+-- "시퀀스 n 직전까지" = UNTIL CHANGE <시퀀스 n 의 FIRST_CHANGE#> 이다.
+-- 결손이 3 이면 v$archived_log 에서 읽은 2424559 를 지정하면 된다.
+
+-- 먼저 결손 뒤의 SCN(시퀀스 5 의 시작 2425240)을 지정하면 어떻게 되는지 본다.
+-- READ ONLY 로 검증할 것이므로 USING BACKUP CONTROLFILE 을 붙인다(10-2).
+
+SYS@orcl> RECOVER DATABASE UNTIL CHANGE 2425240 USING BACKUP CONTROLFILE;
+ORA-00279: change 2424000 generated at 05/12/2025 11:16:30 needed for thread 1
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_1_1200553402.arc
+ORA-00280: change 2424000 for thread 1 is in sequence #1
+
+
+ORA-00279: change 2424200 generated at 05/12/2025 11:24:18 needed for thread 1
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_2_1200553402.arc
+ORA-00280: change 2424200 for thread 1 is in sequence #2
+ORA-00278: log file '/home/oracle/arch1/arch_1_1_1200553402.arc' no longer needed for this recovery
+
+
+ORA-00279: change 2424559 generated at 05/12/2025 11:28:32 needed for thread 1
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_3_1200553402.arc
+ORA-00280: change 2424559 for thread 1 is in sequence #3
+ORA-00278: log file '/home/oracle/arch1/arch_1_2_1200553402.arc' no longer needed for this recovery
+
 
 ORA-00308: cannot open archived log '/home/oracle/arch1/arch_1_3_1200553402.arc'
 ORA-27037: unable to obtain file status
 Linux-x86_64 Error: 2: No such file or directory
-
-ORA-00283: recovery session canceled due to errors
+Additional information: 7
 
 -- << 원인 파악 >>
--- 시퀀스 5까지 적용하라고 지시했으나 3이 없어 그 지점에서 막혔다.
--- 지정한 시퀀스에 도달하지 못하면 오류로 끝난다.
--- 지정할 번호는 '적용하고 싶은 마지막 시퀀스의 다음 번호'다.
--- 결손이 3이면 2까지 적용하겠다는 뜻으로 3을 지정해야 한다.
+-- 2425240 까지 적용하라고 지시했으나 시퀀스 3 이 없어 그 지점에서 막혔다.
+-- 지정한 SCN 에 도달하지 못하면 오류로 끝난다.
+-- 다만 1·2 는 이미 적용되었다.
 
 SYS@orcl> SELECT file#, error, change# FROM v$recover_file WHERE file# = 1;
 
      FILE# ERROR                    CHANGE#
 ---------- -------------------- -----------
-         1                          2424560
+         1                          2424559
 
--- 시퀀스 2까지는 적용되었다.
+-- 시퀀스 2까지는 적용되었다. 파일 헤더가 시퀀스 3 의 시작에 서 있다.
 
 -- << 수정 >>
 
-SYS@orcl> RECOVER DATABASE UNTIL SEQUENCE 3 THREAD 1;
+SYS@orcl> RECOVER DATABASE UNTIL CHANGE 2424559 USING BACKUP CONTROLFILE;
 Media recovery complete.
 
--- 이미 적용한 구간은 다시 적용하지 않고 즉시 완료되었다.
+-- 이미 그 지점까지 적용되어 있어 읽을 로그 없이 즉시 완료되었다.
+
+SYS@orcl> SELECT checkpoint_change#, TO_CHAR(checkpoint_time, 'HH24:MI:SS') AS stopped_at
+  2  FROM   v$datafile_header WHERE file# = 1;
+
+CHECKPOINT_CHANGE# STOPPED_AT
+------------------ ----------
+           2424559 11:28:32
 
 SYS@orcl> ALTER DATABASE OPEN READ ONLY;
+
+Database altered.
 
 SYS@orcl> SELECT id, memo FROM hr.emp104 ORDER BY id;
 
@@ -247,13 +346,14 @@ SYS@orcl> SELECT id, memo FROM hr.emp104 ORDER BY id;
 
 -- 3번과 4번은 결손 구간의 데이터라 사라졌다.
 
-SYS@orcl> SELECT checkpoint_change# AS recovered_scn,
-  2         TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS recovered_time
-  3  FROM   v$database;
+SYS@orcl> SELECT resetlogs_change#, TO_CHAR(resetlogs_time, 'HH24:MI:SS') AS resetlogs_time
+  2  FROM   v$database;
 
-RECOVERED_SCN RECOVERED_TIME
-------------- --------------
-      2424560 11:28:30
+RESETLOGS_CHANGE# RESETLOGS_TIME
+----------------- --------------
+          2424560 11:41:20
+
+-- 새 인카네이션은 복구 한계 다음 SCN(2424559 + 1)에서 시작한다.
 
 SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
   2  WHERE  status = 'CURRENT';
@@ -279,6 +379,9 @@ SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
 
 RMAN> DELETE NOPROMPT EXPIRED ARCHIVELOG ALL;
 
+using target database control file instead of recovery catalog
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=595 device type=DISK
 deleted archived log
 archived log file name=/home/oracle/arch1/arch_1_3_1200553402.arc RECID=3 STAMP=1200554020
 deleted archived log
@@ -287,11 +390,26 @@ Deleted 2 EXPIRED objects
 
 RMAN> EXIT
 
-SYS@orcl> SELECT COUNT(*) FROM v$archived_log WHERE status <> 'A';
+SYS@orcl> SELECT sequence#, status FROM v$archived_log
+  2  WHERE  resetlogs_change# = 2423418 ORDER BY sequence#;
+
+ SEQUENCE# S
+---------- -
+         1 A
+         2 A
+         3 D
+         4 D
+         5 A
+         6 A
+
+SYS@orcl> SELECT COUNT(*) FROM v$archived_log WHERE status = 'X';
 
   COUNT(*)
 ----------
          0
+
+-- X(EXPIRED)는 사라지고 D(DELETED)로 남는다. 기록 자체는 지워지지 않고
+-- "정리했다" 는 표시만 붙는다. 방금 정리한 인카네이션(2423418)만 걸러서 봤다.
 
 -- RESETLOGS 로 인카네이션이 올라갔다. 이전 백업본과 아카이브는 그대로 쓸 수 없다.
 -- 즉시 전체 백업을 받는다.
@@ -305,11 +423,13 @@ SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO
   2    '/home/oracle/backup/control_ch10.bkp' REUSE;
 
 -- 실무 포인트
--- 1) UNTIL SEQUENCE 는 지정한 시퀀스 직전까지 적용한다.
---    결손 시퀀스 번호를 그대로 지정하면 그 앞까지 적용되어 의도와 일치한다.
---    뒤 번호를 지정하면 결손 지점에서 오류로 끝난다.
+-- 1) 사용자 관리 복구에는 UNTIL SEQUENCE 가 없다(ORA-00277).
+--    시퀀스 경계는 그 시퀀스의 FIRST_CHANGE# 를 UNTIL CHANGE 로 준다.
+--    UNTIL CHANGE 는 지정한 SCN 직전까지 적용하므로 결손 시퀀스의 시작 SCN 을
+--    그대로 지정하면 그 앞 시퀀스까지 적용되어 의도와 일치한다.
+--    RMAN 에서는 SET UNTIL SEQUENCE n THREAD 1 이 같은 뜻이다(13장 이후).
 --
--- 2) 프롬프트 조작이 없어 Cancel 방식보다 실수 여지가 적다.
+-- 2) SCN 경계는 프롬프트 조작이 없어 Cancel 방식보다 실수 여지가 적다.
 --    결손 지점이 명확할 때 가장 간단한 방법이다.
 --
 -- 3) OS로 아카이브를 지우면 컨트롤파일 기록과 어긋난다.
@@ -318,9 +438,10 @@ SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO
 --
 -- 4) CROSSCHECK 후 STATUS가 X(EXPIRED)로 바뀐다.
 --    그 값을 기준으로 첫 결손 시퀀스를 찾을 수 있다.
+--    RESETLOGS 뒤에는 시퀀스가 1부터 다시 시작하므로 resetlogs_change# 로 걸러 본다.
 --
 -- 5) 복구를 다시 수행해도 이미 적용한 구간은 반복되지 않는다.
---    이 실습에서 첫 시도가 실패한 뒤 바로 다시 수행해 즉시 완료되었다.
+--    이 실습에서 결손 뒤의 SCN 을 지정한 시도가 실패한 뒤 바로 다시 수행해 즉시 완료되었다.
 --    복원부터 다시 할 필요가 없었다.
 --
 -- 6) 원인은 아카이브 정리 정책이다.

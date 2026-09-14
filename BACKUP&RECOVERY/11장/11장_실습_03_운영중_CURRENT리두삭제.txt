@@ -8,17 +8,17 @@
 --------------------------------------------------------------------------------
 [1] 시나리오 개요
 --------------------------------------------------------------------------------
--- 데이터베이스가 열린 상태에서 CURRENT 그룹의 멤버가 모두 사라졌다.
--- LGWR가 기록할 곳을 잃어 인스턴스가 중단된다.
--- 사실상 비정상 종료와 같은 상황이 되며 같은 절차로 처리한다.
--- 다만 인스턴스가 살아 있는 동안 대응하면 손실을 줄일 수 있다.
--- 복구 유형 : 불완전 복구 또는 손실 회피(대응 시점에 따라)
+-- 데이터베이스가 열린 상태에서 CURRENT 그룹의 멤버가 사라진다.
+-- 멤버 하나가 남으면 서비스가 이어지고, 멤버 교체로 손실 없이 고친다.
+-- 멤버가 모두 사라져도 Linux 에서는 LGWR 가 열어 둔 파일 핸들로 계속 쓴다.
+-- 인스턴스가 살아 있는 동안 대응하면 아카이브 하나만 잃고 데이터는 지킨다.
+-- 재기동해 버리면 실습 11-2 와 같은 불완전 복구가 된다.
+-- 복구 유형 : 손실 회피(멤버 교체) 또는 아카이브 구간 손실(CLEAR UNARCHIVED)
 
 --------------------------------------------------------------------------------
 [2] 사전 조건
 --------------------------------------------------------------------------------
 -- 실습 11-2를 마친 상태에서 이어서 진행한다.
--- 별도 터미널 두 개가 필요하다.
 
 [oracle@oel7v9 ~]$ sqlplus / as sysdba
 
@@ -28,13 +28,23 @@ SYS@orcl> COL member FOR a44
 --------------------------------------------------------------------------------
 [3] 초기 상태 확인
 --------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp113(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.emp113 VALUES (1, 'running');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+-- 1번 행은 아카이브에 남겼다.
+
 SYS@orcl> SELECT l.group#, l.sequence#, l.archived, l.status, f.member
   2  FROM   v$log l, v$logfile f WHERE l.group# = f.group# ORDER BY l.group#;
 
     GROUP#  SEQUENCE# ARC STATUS     MEMBER
 ---------- ---------- --- ---------- --------------------------------------------
-         1          1 YES INACTIVE   /u01/app/oracle/oradata/orcl/redo01.log
-         1          1 YES INACTIVE   /u02/oradata/orcl/redo01b.log
+         1          1 YES ACTIVE     /u01/app/oracle/oradata/orcl/redo01.log
+         1          1 YES ACTIVE     /u02/oradata/orcl/redo01b.log
          3          2 NO  CURRENT    /u01/app/oracle/oradata/orcl/redo03.log
          3          2 NO  CURRENT    /u02/oradata/orcl/redo03b.log
          4          0 YES UNUSED     /u01/app/oracle/oradata/orcl/redo04.log
@@ -42,16 +52,9 @@ SYS@orcl> SELECT l.group#, l.sequence#, l.archived, l.status, f.member
 
 6 rows selected.
 
-SYS@orcl> CREATE TABLE hr.emp113(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
-SYS@orcl> INSERT INTO hr.emp113 VALUES (1, 'running');
-SYS@orcl> COMMIT;
-Commit complete.
-
 --------------------------------------------------------------------------------
-[4] 장애 유발 : 운영 중 CURRENT 그룹 멤버 삭제
+[4] 장애 유발 (1) : CURRENT 그룹의 멤버 하나 삭제
 --------------------------------------------------------------------------------
--- 먼저 멤버 하나만 지워 증상을 관찰한다.
-
 SYS@orcl> !rm -f /u02/oradata/orcl/redo03b.log
 
 SYS@orcl> INSERT INTO hr.emp113 VALUES (2, 'one member lost');
@@ -65,199 +68,178 @@ SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE group# = 3;
     GROUP# MEMBER                                       STATUS
 ---------- -------------------------------------------- -------
          3 /u01/app/oracle/oradata/orcl/redo03.log
-         3 /u02/oradata/orcl/redo03b.log                INVALID
+         3 /u02/oradata/orcl/redo03b.log
 
-SYS@orcl> !tail -4 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
-Errors in file .../orcl_lgwr_24580.trc:
-ORA-00321: log 3 of thread 1, cannot update log file header
-ORA-00312: online log 3 thread 1: '/u02/oradata/orcl/redo03b.log'
-ORA-27041: unable to open file
-Linux-x86_64 Error: 2: No such file or directory
-Additional information: 3
+-- v$logfile 은 여전히 비어 있다. 이 뷰는 파일 존재를 확인하지 않는다.
 
--- alert log에 경고만 남고 서비스는 유지된다.
+SYS@orcl> !grep -n -A3 'orcl_lg00' \
+          /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -4
+20702:Errors in file /u01/app/oracle/diag/rdbms/orcl/orcl/trace/orcl_lg00_31627.trc:
+20703-ORA-27041: unable to open file
+20704-Linux-x86_64 Error: 2: No such file or directory
+20705-Additional information: 3
 
--- 이 시점에 복사로 되살릴 수 있다.
+-- LGWR 의 작업 프로세스(lg00)가 그 멤버를 다시 열려다 실패한 기록만 남는다.
+-- alert 로그 감시가 없으면 아무도 모른 채 지나간다.
 
-SYS@orcl> !cp -p /u01/app/oracle/oradata/orcl/redo03.log /u02/oradata/orcl/redo03b.log
-
--- 이번에는 남은 멤버까지 지운다.
-
-SYS@orcl> !rm -f /u01/app/oracle/oradata/orcl/redo03.log /u02/oradata/orcl/redo03b.log
-
-SYS@orcl> INSERT INTO hr.emp113 VALUES (3, 'all members lost');
-SYS@orcl> COMMIT;
-Commit complete.
-
--- 아직 버퍼에 있어 성공한다. 파일에 쓰는 순간 문제가 된다.
+-- << 올바른 처리 >> 스위치로 그룹을 비운 뒤 멤버를 교체한다.
+-- 남은 멤버를 cp 로 복사해 넣는 것은 안 된다. LGWR 는 이미 지워진 원본의 핸들에
+-- 계속 쓰고 있어 복사본은 곧 낡은 파일이 되고, 다음 기동 때 헤더가 어긋난다.
 
 SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
 System altered.
-
---------------------------------------------------------------------------------
-[5] 증상 관찰
---------------------------------------------------------------------------------
-SYS@orcl> SELECT COUNT(*) FROM hr.emp113;
-SELECT COUNT(*) FROM hr.emp113
-*
-ERROR at line 1:
-ORA-03113: end-of-file on communication channel
-Process ID: 24602
-Session ID: 41 Serial number: 3
-
--- 인스턴스가 중단되었다.
-
-[oracle@oel7v9 ~]$ sqlplus / as sysdba
-
-SYS@orcl> SELECT status FROM v$instance;
-SELECT status FROM v$instance
-*
-ERROR at line 1:
-ORA-01034: ORACLE not available
-
-SYS@orcl> !tail -8 /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
-Errors in file .../orcl_lgwr_24580.trc:
-ORA-00313: open failed for members of log group 3 of thread 1
-ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/orcl/redo03.log'
-ORA-27037: unable to obtain file status
-Linux-x86_64 Error: 2: No such file or directory
-Additional information: 7
-LGWR (ospid: 24580): terminating the instance due to error 313
-Instance terminated by LGWR, pid = 24580
-
--- LGWR가 기록할 곳을 잃어 인스턴스를 종료시켰다.
-
---------------------------------------------------------------------------------
-[6] 진단
---------------------------------------------------------------------------------
-SYS@orcl> STARTUP MOUNT
-ORACLE instance started.
-Database mounted.
 
 SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
 
     GROUP#  SEQUENCE# ARC STATUS
 ---------- ---------- --- ----------------
          1          1 YES INACTIVE
-         3          2 NO  ACTIVE
+         3          2 YES ACTIVE
          4          3 NO  CURRENT
 
--- 스위치가 일어나 그룹 4가 CURRENT가 되었다.
--- 손상된 그룹 3은 ACTIVE다. 인스턴스 복구에 필요하다는 뜻이다.
+SYS@orcl> ALTER DATABASE DROP LOGFILE MEMBER '/u02/oradata/orcl/redo03b.log';
 
-SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE status = 'INVALID';
+Database altered.
+
+SYS@orcl> ALTER DATABASE ADD LOGFILE MEMBER '/u02/oradata/orcl/redo03b.log' TO GROUP 3;
+
+Database altered.
+
+SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE group# = 3;
 
     GROUP# MEMBER                                       STATUS
 ---------- -------------------------------------------- -------
-         3 /u01/app/oracle/oradata/orcl/redo03.log      INVALID
+         3 /u01/app/oracle/oradata/orcl/redo03.log
          3 /u02/oradata/orcl/redo03b.log                INVALID
 
-SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+-- 새 멤버는 처음 쓰일 때까지 INVALID 로 표시된다. 다음 순환에서 정상이 된다.
+-- 손실도 중단도 없었다.
 
-     FILE# CHECKPOINT_CHANGE# FUZ
----------- ------------------ ---
-         1            2432200 YES
-         3            2432200 YES
-         7            2432180 YES
+--------------------------------------------------------------------------------
+[5] 장애 유발 (2) : CURRENT 그룹의 멤버 전부 삭제
+--------------------------------------------------------------------------------
+SYS@orcl> !rm -f /u01/app/oracle/oradata/orcl/redo04.log /u02/oradata/orcl/redo04b.log
 
--- FUZZY가 YES다. 인스턴스가 강제 종료되었기 때문이다.
+SYS@orcl> INSERT INTO hr.emp113 VALUES (3, 'all members lost');
+SYS@orcl> COMMIT;
+Commit complete.
+
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+System altered.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp113;
+
+  COUNT(*)
+----------
+         3
+
+SYS@orcl> SELECT status FROM v$instance;
+
+STATUS
+------------
+OPEN
+
+-- 멤버가 하나도 없는데 커밋도 스위치도 되고 인스턴스도 살아 있다.
+-- Linux 는 열려 있는 파일을 지워도 핸들을 가진 프로세스가 닫을 때까지 내용을 유지한다.
+-- LGWR 가 기동 때 열어 둔 핸들로 계속 쓰고 있는 것이다.
+
+--------------------------------------------------------------------------------
+[6] 진단
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1          4 NO  CURRENT
+         3          2 YES INACTIVE
+         4          3 NO  ACTIVE
+
+-- 스위치가 일어나 그룹 1이 CURRENT가 되었다.
+-- 지운 그룹 4는 ACTIVE 이고 ARCHIVED가 NO다. 아카이버는 파일 이름으로 열기 때문에
+-- 핸들이 없어 시퀀스 3을 아카이브하지 못한다.
+
+SYS@orcl> !grep -n 'ORA-00313' \
+          /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -1
+20740:ORA-00313: open failed for members of log group 4 of thread 1
+
+SYS@orcl> COL error FOR a40
+SYS@orcl> SELECT dest_id, status, error FROM v$archive_dest WHERE dest_id = 1;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ----------------------------------------
+         1 VALID
+
+-- 대상은 정상이다. 원본이 없는 것이다.
 
 -- 판정
---   ① 멤버 : 그룹 3 전손
---   ② 그룹 상태 : ACTIVE, ARCHIVED NO → 인스턴스 복구에 필요
---   ③ 종료 : LGWR에 의한 강제 종료 → 비정상 종료와 동일
---   ④ FUZZY : YES → 미적용 리두 존재
---   → 실습 11-2와 같은 절차. 불완전 복구로 전환한다.
+--   ① 멤버 : 그룹 4 전손 (핸들로만 살아 있음)
+--   ② 그룹 상태 : ACTIVE, ARCHIVED NO → 아카이브 불가
+--   ③ 인스턴스 : 열려 있음. 데이터는 버퍼와 데이터파일에 있다.
+--   ④ 방치하면 : 순환이 그룹 4 차례에 오면 "cannot allocate new log, archival required" 로 멈춘다.
+--                재기동하면 핸들이 사라져 실습 11-2 와 같은 불완전 복구가 된다.
+--   → 지금 CLEAR UNARCHIVED 로 처리한다. 잃는 것은 시퀀스 3 의 아카이브뿐이다.
 
 --------------------------------------------------------------------------------
-[7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
+[7] 복구 절차
 --------------------------------------------------------------------------------
--- 손상된 그룹만 CLEAR 하고 열어 본다.
-
-SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 3;
+SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 4;
 
 Database altered.
 
-SYS@orcl> ALTER DATABASE OPEN;
-ALTER DATABASE OPEN
-*
-ERROR at line 1:
-ORA-01113: file 1 needs media recovery
-ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
+-- 열린 상태에서는 ACTIVE 그룹도 비울 수 있다. 체크포인트를 먼저 끝내고 비운다.
+-- (MOUNT 에서 크래시 복구에 필요한 그룹이면 ORA-01624 로 거부된다. 11-2)
 
--- << 원인 파악 >>
--- 그룹 3은 ACTIVE였다. 인스턴스 복구에 필요한 리두를 담고 있었다.
--- CLEAR로 그것을 버렸으므로 인스턴스 복구를 완료할 수 없다.
--- 운영 중 손상은 체크포인트 없이 멈추므로 비정상 종료와 같다.
--- 실습 11-1처럼 손실 없이 끝나는 경로가 아니다.
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
 
-SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1          4 NO  CURRENT
+         3          2 YES INACTIVE
+         4          0 YES UNUSED
 
-     FILE# ERROR                    CHANGE#
----------- -------------------- -----------
-         1                          2432200
-         3                          2432200
-         7                          2432180
+SYS@orcl> !ls -l /u01/app/oracle/oradata/orcl/redo04.log /u02/oradata/orcl/redo04b.log
+-rw-r-----. 1 oracle dba 209715712 May 13 11:12 /u01/app/oracle/oradata/orcl/redo04.log
+-rw-r-----. 1 oracle dba 209715712 May 13 11:12 /u02/oradata/orcl/redo04b.log
 
--- << 수정 >>
+-- 멤버 파일이 새로 만들어졌다.
 
-SYS@orcl> SHUTDOWN ABORT
-SYS@orcl> !cp -p /home/oracle/backup/ch11/*.dbf /u01/app/oracle/oradata/orcl/
-SYS@orcl> STARTUP MOUNT
+SYS@orcl> SELECT COUNT(*) FROM hr.emp113;
 
-SYS@orcl> SET AUTORECOVERY OFF
-SYS@orcl> RECOVER DATABASE UNTIL CANCEL;
-ORA-00279: change 2431520 generated at 05/13/2025 11:02:10 needed for thread 1
-ORA-00289: suggestion : /home/oracle/arch1/arch_1_1_1200576220.arc
-ORA-00280: change 2431520 for thread 1 is in sequence #1
+  COUNT(*)
+----------
+         3
 
-Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+-- 3번 행도 그대로다. 시퀀스 3 의 변경은 이미 데이터파일에 반영되었다.
 
-Log applied.
-
-ORA-00279: change 2432040 generated at 05/13/2025 11:08:44 needed for thread 1
-ORA-00289: suggestion : /home/oracle/arch1/arch_1_2_1200576220.arc
-ORA-00280: change 2432040 for thread 1 is in sequence #2
-
-Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
-CANCEL
-Media recovery cancelled.
-
--- 시퀀스 2가 손상된 그룹의 것이라 적용할 수 없다.
-
-SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
-
-Database altered.
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
 
 --------------------------------------------------------------------------------
 [8] 검증 및 실무 포인트
 --------------------------------------------------------------------------------
-SYS@orcl> SELECT * FROM v$recover_file;
+SYS@orcl> SELECT sequence#, status FROM v$archived_log
+  2  WHERE  resetlogs_change# = (SELECT resetlogs_change# FROM v$database)
+  3  ORDER BY sequence#;
 
-no rows selected
+ SEQUENCE# S
+---------- -
+         1 A
+         2 A
+         3 D
+         4 A
+         5 A
 
-SYS@orcl> SELECT id, memo FROM hr.emp113 ORDER BY id;
-
-        ID MEMO
----------- ------------------------------
-         1 running
-
--- 2번과 3번이 사라졌다. 시퀀스 2 구간의 변경이다.
-
-SYS@orcl> SELECT checkpoint_change# AS recovered_scn,
-  2         TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS recovered_time
-  3  FROM   v$database;
-
-RECOVERED_SCN RECOVERED_TIME
-------------- --------------
-      2432040 11:08:42
+-- 시퀀스 3 만 D 다. 이 구간을 지나는 복구는 불가능하다.
 
 SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation
   2  WHERE  status = 'CURRENT';
 
 INCARNATION# RESETLOGS_CHANGE# STATUS
 ------------ ----------------- -------
-          10           2432040 CURRENT
+           8           2431521 CURRENT
+
+-- RESETLOGS 도 인카네이션 변화도 없다.
 
 SYS@orcl> SELECT group#, member, status FROM v$logfile ORDER BY group#;
 
@@ -272,16 +254,15 @@ SYS@orcl> SELECT group#, member, status FROM v$logfile ORDER BY group#;
 
 6 rows selected.
 
+-- 교체한 멤버도 한 번 쓰인 뒤라 INVALID 가 사라졌다.
+
 SYS@orcl> SELECT COUNT(*) FROM v$tempfile;
 
   COUNT(*)
 ----------
          1
 
--- 템프파일은 그대로다. 컨트롤파일을 되돌리거나 다시 만들지 않았기 때문이다.
--- RESETLOGS 오픈은 템프파일 기록을 지우지 않는다.
--- 여기서 ADD TEMPFILE 을 하면 ORA-01537(file already part of database)로 거부된다.
--- 컨트롤파일을 재생성한 경우에만 템프파일이 사라지며 그때 다시 만든다(11-6, 11-7).
+-- 아카이브 사슬이 끊겼으므로 즉시 전체 백업을 받는다.
 
 SYS@orcl> SHUTDOWN IMMEDIATE
 SYS@orcl> !rm -rf /home/oracle/backup/ch11; mkdir -p /home/oracle/backup/ch11
@@ -293,26 +274,23 @@ SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO
 
 -- 실무 포인트
 -- 1) 멤버 하나 손상은 서비스에 영향이 없다.
---    alert log에 ORA-00321 경고만 남고 남은 멤버로 기록이 계속된다.
---    이 시점에 복사로 되살리면 손실이 전혀 없다.
+--    alert 로그에 lg00 의 ORA-27041 만 남고 남은 멤버로 기록이 계속된다.
+--    스위치로 그룹을 비운 뒤 DROP/ADD LOGFILE MEMBER 로 교체하면 손실이 없다.
+--    남은 멤버를 cp 로 복사해 넣는 것은 해결이 아니다.
 --
--- 2) 그룹 전손 시 LGWR가 인스턴스를 종료시킨다.
---    alert log에 terminating the instance due to error 313 이 기록된다.
---    사용자에게는 ORA-03113으로 보인다.
+-- 2) 그룹 전손도 Linux 에서는 인스턴스를 바로 죽이지 않는다.
+--    LGWR 가 기동 때 연 핸들로 계속 쓰기 때문이다. 다만 아카이버는 이름으로 열므로
+--    그 시퀀스를 아카이브하지 못하고, 순환이 그 그룹에 다시 오면 멈춘다.
 --
--- 3) 운영 중 손상은 비정상 종료와 같다.
---    체크포인트 없이 멈추므로 FUZZY가 YES가 되고 미적용 리두가 남는다.
---    실습 11-1처럼 손실 없이 끝나는 경로가 아니다.
+-- 3) 살아 있는 동안이 기회다.
+--    열린 상태의 CLEAR UNARCHIVED 는 그 시퀀스의 아카이브만 잃고 데이터는 지킨다.
+--    재기동하면 핸들이 사라져 크래시 복구가 그 그룹을 찾고(ORA-00313),
+--    비우지도 못해(ORA-01624) 실습 11-2 의 전체 복원·불완전 복구가 된다.
 --
--- 4) 손상 그룹이 ACTIVE인 것에 주목한다.
---    스위치가 일어나 CURRENT는 다른 그룹으로 넘어갔지만
---    ACTIVE 그룹도 인스턴스 복구에 필요하므로 잃으면 같은 결과가 된다.
+-- 4) alert 로그 감시가 그 기회를 만든다.
+--    ORA-27041, ORA-00313 이 보이면 v$log 의 ARCHIVED 와 STATUS 를 바로 본다.
 --
--- 5) 즉시 대응이 손실을 줄인다.
---    멤버 하나가 남아 있는 동안 복사하면 그룹 전손을 막을 수 있다.
---    alert log 감시가 그 기회를 만든다.
---
--- 6) 근본 대책은 멤버를 서로 다른 디스크에 두는 것이다.
+-- 5) 근본 대책은 멤버를 서로 다른 디스크에 두는 것이다.
 --    이 실습에서는 두 멤버를 순차로 지웠지만 실제로는 디스크 하나가 사라지면
 --    같은 디스크의 멤버가 동시에 없어진다.
 

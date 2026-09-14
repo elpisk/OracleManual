@@ -24,26 +24,30 @@
 
 SYS@orcl> SET LINESIZE 200
 SYS@orcl> COL destination FOR a20
+SYS@orcl> COL error FOR a40
+SYS@orcl> COL member FOR a44
 
 --------------------------------------------------------------------------------
 [3] 초기 상태 확인
 --------------------------------------------------------------------------------
 SYS@orcl> SELECT MIN(sequence#) AS oldest, MAX(sequence#) AS newest, COUNT(*) AS cnt,
   2         MAX(sequence#) - MIN(sequence#) + 1 AS expected
-  3  FROM   v$archived_log WHERE status = 'A';
+  3  FROM   v$archived_log
+  4  WHERE  status = 'A'
+  5  AND    resetlogs_change# = (SELECT resetlogs_change# FROM v$database);
 
     OLDEST     NEWEST        CNT   EXPECTED
 ---------- ---------- ---------- ----------
-         1          3          3          3
+         1          5          4          5
 
--- 아카이브가 연속이다.
+-- 시퀀스 3 은 실습 11-3 에서 버린 구간이다. 그 뒤로는 연속이다.
 
 SYS@orcl> SELECT dest_id, destination, status, error FROM v$archive_dest
   2  WHERE  destination IS NOT NULL;
 
-   DEST_ID DESTINATION          STATUS  ERROR
----------- -------------------- ------- --------------------
-         1 /home/oracle/arch1           VALID
+   DEST_ID DESTINATION          STATUS    ERROR
+---------- -------------------- --------- ----------------------------------------
+         1 /home/oracle/arch1   VALID
 
 SYS@orcl> CREATE TABLE hr.emp114(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
 SYS@orcl> INSERT INTO hr.emp114 VALUES (1, 'archived ok');
@@ -74,9 +78,9 @@ SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
 
     GROUP#  SEQUENCE# ARC STATUS
 ---------- ---------- --- ----------------
-         1          6 NO  CURRENT
-         3          4 NO  ACTIVE
-         4          5 NO  ACTIVE
+         1          7 NO  ACTIVE
+         3          8 NO  ACTIVE
+         4          9 NO  CURRENT
 
 -- 아카이브가 밀려 모두 NO다.
 
@@ -87,33 +91,29 @@ SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
 
     GROUP#  SEQUENCE# ARC STATUS
 ---------- ---------- --- ----------------
-         1          6 NO  CURRENT
-         3          4 NO  INACTIVE
-         4          5 NO  INACTIVE
+         1          7 NO  INACTIVE
+         3          8 NO  INACTIVE
+         4          9 NO  CURRENT
 
 -- 체크포인트로 INACTIVE가 되었지만 아카이브는 여전히 안 되었다.
+-- ACTIVE 인 채로는 CLEAR 가 ORA-01624 로 거부되므로 이 단계가 필요하다.
 
-SYS@orcl> !rm -f /u01/app/oracle/oradata/orcl/redo03.log /u02/oradata/orcl/redo03b.log
+SYS@orcl> !rm -f /u01/app/oracle/oradata/orcl/redo01.log /u02/oradata/orcl/redo01b.log
 
 --------------------------------------------------------------------------------
 [5] 증상 관찰
 --------------------------------------------------------------------------------
-SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE status = 'INVALID';
+SYS@orcl> SELECT group#, member, status FROM v$logfile WHERE group# = 1;
 
     GROUP# MEMBER                                       STATUS
----------- -------------------------------------------- -------
-         3 /u01/app/oracle/oradata/orcl/redo03.log      INVALID
-         3 /u02/oradata/orcl/redo03b.log                INVALID
+---------- -------------------- ----------------------- -------
+         1 /u01/app/oracle/oradata/orcl/redo01.log
+         1 /u02/oradata/orcl/redo01b.log
 
-SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
-ALTER SYSTEM SWITCH LOGFILE
-*
-ERROR at line 1:
-ORA-16038: log 4 sequence# 5 cannot be archived
-ORA-19502: write error on file "", block number  (block size=)
-ORA-00312: online log 4 thread 1: '/u01/app/oracle/oradata/orcl/redo04.log'
-
--- 스위치도 막혔다. 아카이브가 되지 않기 때문이다.
+-- v$logfile 은 파일 존재를 확인하지 않는다. STATUS 가 비어 있어도 파일은 없다.
+-- 여기서 스위치를 한 번 더 하면 그룹 1 차례가 되어 LGWR 가 멈춘다.
+-- alert 로그에 "Thread 1 cannot allocate new log ... All online logs need archiving"
+-- 이 남고 모든 세션이 대기한다. 그 전에 원인을 찾는다.
 
 --------------------------------------------------------------------------------
 [6] 진단
@@ -121,9 +121,9 @@ ORA-00312: online log 4 thread 1: '/u01/app/oracle/oradata/orcl/redo04.log'
 SYS@orcl> SELECT dest_id, destination, status, error FROM v$archive_dest
   2  WHERE  destination IS NOT NULL;
 
-   DEST_ID DESTINATION          STATUS  ERROR
----------- -------------------- ------- ----------------------------------
-         1 /home/oracle/arch1           ERROR   ORA-19504: failed to create file
+   DEST_ID DESTINATION          STATUS    ERROR
+---------- -------------------- --------- ----------------------------------------
+         1 /home/oracle/arch1   ERROR     ORA-19504: failed to create file ""
 
 SYS@orcl> !ls -ld /home/oracle/arch1
 dr-x------. 2 oracle dba 4096 May 13 11:40 /home/oracle/arch1
@@ -134,39 +134,41 @@ SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
 
     GROUP#  SEQUENCE# ARC STATUS
 ---------- ---------- --- ----------------
-         1          6 NO  CURRENT
-         3          4 NO  INACTIVE
-         4          5 NO  INACTIVE
+         1          7 NO  INACTIVE
+         3          8 NO  INACTIVE
+         4          9 NO  CURRENT
 
 -- 판정
---   ① 손상 그룹 : 3 (INACTIVE, ARCHIVED NO)
---   ② ARCHIVED NO의 원인 : 대상 권한 문제(그룹 4·1은 파일이 멀쩡)
---   ③ 그룹 3은 파일이 없어 아카이브할 원본이 없다
---   → 대상을 먼저 고쳐 나머지를 아카이브하고, 그룹 3만 UNARCHIVED로 처리
+--   ① 손상 그룹 : 1 (INACTIVE, ARCHIVED NO)
+--   ② ARCHIVED NO의 원인 : 대상 권한 문제(그룹 3·4는 파일이 멀쩡)
+--   ③ 그룹 1은 파일이 없어 아카이브할 원본이 없다
+--   → 대상을 먼저 고쳐 나머지를 아카이브하고, 그룹 1만 UNARCHIVED로 처리
 
 --------------------------------------------------------------------------------
 [7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
 --------------------------------------------------------------------------------
--- 확인 없이 세 그룹을 모두 UNARCHIVED로 처리하려 한다(잘못된 접근).
+-- 확인 없이 NO 인 그룹을 모두 UNARCHIVED로 처리하려 한다(잘못된 접근).
 
-SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 4;
+SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 3;
 
 Database altered.
 
 SYS@orcl> SELECT MIN(sequence#) AS oldest, MAX(sequence#) AS newest, COUNT(*) AS cnt,
   2         MAX(sequence#) - MIN(sequence#) + 1 AS expected
-  3  FROM   v$archived_log WHERE status = 'A';
+  3  FROM   v$archived_log
+  4  WHERE  status = 'A'
+  5  AND    resetlogs_change# = (SELECT resetlogs_change# FROM v$database);
 
     OLDEST     NEWEST        CNT   EXPECTED
 ---------- ---------- ---------- ----------
-         1          3          3          3
+         1          6          5          6
 
--- 시퀀스 5의 아카이브가 영원히 만들어지지 않게 되었다.
+-- 시퀀스 8의 아카이브가 영원히 만들어지지 않게 되었다.
 
 -- << 원인 파악 >>
--- 그룹 4는 파일이 멀쩡했다. 아카이브가 밀린 것은 대상 권한 문제였다.
--- 권한을 고치고 ARCHIVE LOG ALL 만 했으면 손실 없이 아카이브되었을 것이다.
--- UNARCHIVED로 비운 탓에 시퀀스 5 구간의 리두를 영구히 잃었다.
+-- 그룹 3은 파일이 멀쩡했다. 아카이브가 밀린 것은 대상 권한 문제였다.
+-- 권한을 고치고 아카이버를 되살렸으면 손실 없이 아카이브되었을 것이다.
+-- UNARCHIVED로 비운 탓에 시퀀스 8 구간의 리두를 영구히 잃었다.
 -- ARCHIVED가 NO인 이유를 먼저 확인해야 하는 이유가 이것이다.
 -- 명령이 성공한다는 것과 그것이 옳은 선택이라는 것은 다른 문제다.
 
@@ -174,12 +176,12 @@ SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
 
     GROUP#  SEQUENCE# ARC STATUS
 ---------- ---------- --- ----------------
-         1          6 NO  CURRENT
-         3          4 NO  INACTIVE
-         4          0 YES UNUSED
+         1          7 NO  INACTIVE
+         3          0 YES UNUSED
+         4          9 NO  CURRENT
 
 -- << 수정 >>
--- 남은 그룹은 대상을 고쳐 정상 처리한다.
+-- 대상을 고치고 남은 그룹은 정상 처리한다.
 
 SYS@orcl> !chmod 700 /home/oracle/arch1
 
@@ -187,60 +189,101 @@ SYS@orcl> ALTER SYSTEM ARCHIVE LOG ALL;
 ALTER SYSTEM ARCHIVE LOG ALL
 *
 ERROR at line 1:
-ORA-16038: log 3 sequence# 4 cannot be archived
-ORA-00312: online log 3 thread 1: '/u01/app/oracle/oradata/orcl/redo03.log'
+ORA-00313: open failed for members of log group 1 of thread 1
+ORA-00312: online log 1 thread 1: '/u02/oradata/orcl/redo01b.log'
+ORA-27037: unable to obtain file status
+Linux-x86_64 Error: 2: No such file or directory
+Additional information: 7
+ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/orcl/redo01.log'
+ORA-27037: unable to obtain file status
+Linux-x86_64 Error: 2: No such file or directory
+Additional information: 7
 
--- 그룹 3은 파일이 없어 여전히 아카이브할 수 없다.
+-- ARCHIVE LOG ALL 은 가장 오래된 시퀀스부터 처리하므로 파일이 없는 그룹 1 에서 멈춘다.
 
-SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+SYS@orcl> SELECT dest_id, status, error, reopen_secs FROM v$archive_dest WHERE dest_id = 1;
 
-    GROUP#  SEQUENCE# ARC STATUS
----------- ---------- --- ----------------
-         1          6 YES CURRENT
-         3          4 NO  INACTIVE
-         4          0 YES UNUSED
+   DEST_ID STATUS    ERROR                                    REOPEN_SECS
+---------- --------- ---------------------------------------- -----------
+         1 ERROR     ORA-19504: failed to create file ""              300
 
--- 그룹 1은 아카이브되었다. 대상을 고친 효과다.
+-- 권한을 고쳐도 대상은 ERROR 로 남아 있다. REOPEN(기본 300초)이 지나야 재시도한다.
+-- 상태를 다시 ENABLE 로 주면 즉시 되살아난다.
 
-SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 3;
+SYS@orcl> ALTER SYSTEM SET log_archive_dest_state_1 = ENABLE;
+
+System altered.
+
+SYS@orcl> SELECT dest_id, status, error FROM v$archive_dest WHERE dest_id = 1;
+
+   DEST_ID STATUS    ERROR
+---------- --------- ----------------------------------------
+         1 VALID
+
+SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 1;
 
 Database altered.
 
--- 그룹 3만 UNARCHIVED로 처리했다. 파일이 없어 다른 방법이 없었다.
+-- 그룹 1만 UNARCHIVED로 처리했다. 파일이 없어 다른 방법이 없었다.
 
 SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
 
     GROUP#  SEQUENCE# ARC STATUS
 ---------- ---------- --- ----------------
-         1          6 YES CURRENT
+         1          0 YES UNUSED
          3          0 YES UNUSED
-         4          0 YES UNUSED
+         4          9 NO  CURRENT
 
 --------------------------------------------------------------------------------
 [8] 검증 및 실무 포인트
 --------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
+System altered.
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1         10 YES ACTIVE
+         3         11 NO  CURRENT
+         4          9 YES ACTIVE
+
+-- 대상이 살아나 시퀀스 9·10 은 정상 아카이브되었다.
+
 SYS@orcl> SELECT MIN(sequence#) AS oldest, MAX(sequence#) AS newest, COUNT(*) AS cnt,
   2         MAX(sequence#) - MIN(sequence#) + 1 AS expected
-  3  FROM   v$archived_log WHERE status = 'A';
+  3  FROM   v$archived_log
+  4  WHERE  status = 'A'
+  5  AND    resetlogs_change# = (SELECT resetlogs_change# FROM v$database);
 
     OLDEST     NEWEST        CNT   EXPECTED
 ---------- ---------- ---------- ----------
-         1          6          4          6
+         1         10          7         10
 
--- 개수 4, 기대값 6이다. 두 구간이 빠졌다.
+-- 개수 7, 기대값 10이다. 세 구간이 빠졌다.
 
-SYS@orcl> SELECT sequence# FROM v$archived_log WHERE status = 'A' ORDER BY sequence#;
+SYS@orcl> SELECT sequence#, status FROM v$archived_log
+  2  WHERE  resetlogs_change# = (SELECT resetlogs_change# FROM v$database)
+  3  ORDER BY sequence#;
 
- SEQUENCE#
-----------
-         1
-         2
-         3
-         6
+ SEQUENCE# S
+---------- -
+         1 A
+         2 A
+         3 D
+         4 A
+         5 A
+         6 A
+         7 D
+         8 D
+         9 A
+        10 A
 
--- 시퀀스 4와 5가 없다.
---   4 : 파일이 없어 불가피하게 버린 구간
---   5 : 확인 없이 UNARCHIVED로 처리해 불필요하게 버린 구간
+-- 시퀀스 7과 8이 D 다.
+--   7 : 파일이 없어 불가피하게 버린 구간
+--   8 : 확인 없이 UNARCHIVED로 처리해 불필요하게 버린 구간
+--   (3 은 실습 11-3 의 것)
 
 SYS@orcl> SELECT COUNT(*) FROM hr.emp114;
 
@@ -253,13 +296,9 @@ SYS@orcl> SELECT COUNT(*) FROM hr.emp114;
 
 SYS@orcl> SELECT dest_id, status, error FROM v$archive_dest WHERE dest_id = 1;
 
-   DEST_ID STATUS  ERROR
----------- ------- --------------------
+   DEST_ID STATUS    ERROR
+---------- --------- ----------------------------------------
          1 VALID
-
-SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
-SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
-System altered.
 
 -- 버린 구간이 있으므로 즉시 전체 백업을 받는다.
 
@@ -285,22 +324,27 @@ NEW_BASELINE
 --    파일이 이미 없어 아카이브할 수 없는 경우에만 UNARCHIVED가 정당하다.
 --
 -- 2) 확인 없이 UNARCHIVED를 붙이면 불필요한 손실이 생긴다.
---    이 실습에서 그룹 4는 파일이 멀쩡했는데도 리두를 버렸다.
+--    이 실습에서 그룹 3은 파일이 멀쩡했는데도 리두를 버렸다.
 --    권한 한 줄만 고쳤으면 정상 아카이브되었을 구간이다.
 --
 -- 3) 확인 순서는 세 가지다.
 --    v$archive_dest 의 STATUS와 ERROR, OS 레벨의 권한과 공간, 그리고 파일 존재 여부다.
---    ARCHIVE LOG ALL 을 시도해 어느 그룹이 실패하는지 보는 것도 방법이다.
+--    ARCHIVE LOG ALL 은 가장 오래된 그룹부터 처리하므로 그 그룹이 없으면 거기서 멈춘다.
 --
--- 4) 버린 구간은 연속성 점검에서 드러난다.
+-- 4) 대상을 고쳐도 아카이버는 바로 돌아오지 않는다.
+--    v$archive_dest 가 ERROR 면 REOPEN(기본 300초) 뒤에 재시도한다.
+--    log_archive_dest_state_n 을 ENABLE 로 다시 주면 즉시 VALID 가 되고
+--    밀린 그룹은 다음 스위치 때 아카이브된다.
+--
+-- 5) 버린 구간은 연속성 점검에서 드러난다.
 --    개수와 기대값이 달라지며 그 시점 이전의 백업본이 무효가 된다.
 --    작업 기록에 남기지 않으면 나중에 원인을 오판한다.
 --
--- 5) 리두를 버려도 현재 데이터는 사라지지 않는다.
+-- 6) 리두를 버려도 현재 데이터는 사라지지 않는다.
 --    커밋된 변경은 이미 데이터파일에 반영되어 있다.
 --    잃는 것은 그 구간을 재현할 수 있는 미래의 복구 수단이다.
 --
--- 6) CLEAR UNARCHIVED 직후 전체 백업이 필수다.
+-- 7) CLEAR UNARCHIVED 직후 전체 백업이 필수다.
 --    새 백업이 새로운 복구 기준점이 되며 이전 백업본은 라벨을 붙여 구분한다.
 
 SYS@orcl> EXIT

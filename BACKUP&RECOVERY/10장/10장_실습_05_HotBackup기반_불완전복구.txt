@@ -76,6 +76,7 @@ SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
 System altered.
 
 -- 백업 구간 : 13:02:12 ~ 13:08:44
+-- END BACKUP 뒤의 스위치로 백업 구간의 리두가 아카이브에 남는다. 이것까지가 백업이다.
 
 --------------------------------------------------------------------------------
 [4] 작업 수행 : 백업 이후 업무와 사고
@@ -118,14 +119,18 @@ SYS@orcl> SELECT id, memo FROM hr.emp104 ORDER BY id;
 
 SYS@orcl> SELECT sequence#, first_change#, next_change#,
   2         TO_CHAR(first_time, 'HH24:MI:SS') AS first_time
-  3  FROM   v$log_history ORDER BY sequence# DESC FETCH FIRST 4 ROWS ONLY;
+  3  FROM   v$log_history
+  4  WHERE  resetlogs_change# = (SELECT resetlogs_change# FROM v$database)
+  5  ORDER BY sequence# DESC FETCH FIRST 4 ROWS ONLY;
 
  SEQUENCE# FIRST_CHANGE# NEXT_CHANGE# FIRST_TIME
 ---------- ------------- ------------ ----------
-         4       2426400      2426800 13:14:18
-         3       2426000      2426400 13:08:40
-         2       2425600      2426000 13:02:08
-         1       2424560      2425600 12:55:02
+         3       2426400      2426800 13:14:18
+         2       2426000      2426400 13:08:50
+         1       2424560      2426000 11:41:20
+
+-- 백업 구간(13:02:12~13:08:44)은 통째로 시퀀스 1 안에 있다.
+-- 10-4 의 RESETLOGS 이후 첫 스위치가 END BACKUP 뒤의 것이기 때문이다.
 
 --------------------------------------------------------------------------------
 [6] 진단
@@ -135,11 +140,13 @@ SYS@orcl> !ls -l /home/oracle/backup/hot10/*.dbf | wc -l
 
 SYS@orcl> SELECT MIN(sequence#), MAX(sequence#), COUNT(*),
   2         MAX(sequence#) - MIN(sequence#) + 1 AS expected
-  3  FROM   v$archived_log WHERE status = 'A';
+  3  FROM   v$archived_log
+  4  WHERE  status = 'A'
+  5  AND    resetlogs_change# = (SELECT resetlogs_change# FROM v$database);
 
 MIN(SEQUENCE#) MAX(SEQUENCE#)   COUNT(*)   EXPECTED
 -------------- -------------- ---------- ----------
-             1              4          4          4
+             1              3          3          3
 
 -- 아카이브는 연속이다.
 
@@ -174,10 +181,21 @@ SYS@orcl> SELECT file#, checkpoint_change#,
         12            2425600 13:02:12  YES
 
 -- FUZZY가 YES다. 백업 중 복사되어 일관성이 없다.
+-- 헤더 SCN 은 BEGIN BACKUP 때 찍힌 값이다. 복사 중의 변경은 헤더에 반영되지 않는다.
 
 SYS@orcl> SET AUTORECOVERY ON
 SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 13:05:00';
-Media recovery complete.
+ORA-00279: change 2425600 generated at 05/12/2025 13:02:12 needed for thread 1
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_1_1200558700.arc
+ORA-00280: change 2425600 for thread 1 is in sequence #1
+
+
+ORA-01547: warning: RECOVER succeeded but OPEN RESETLOGS would get error below
+ORA-01195: online backup of file 1 needs more recovery to be consistent
+ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
+
+
+ORA-01112: media recovery not started
 
 SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
 ALTER DATABASE OPEN RESETLOGS
@@ -187,7 +205,7 @@ ORA-01195: online backup of file 1 needs more recovery to be consistent
 ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
 
 -- << 원인 파악 >>
--- Media recovery complete. 가 나왔는데도 오픈이 거부되었다.
+-- RECOVER 는 "succeeded" 라면서도 ORA-01547 로 미리 경고했고, 오픈은 예고대로 거부되었다.
 -- 지정한 13:05:00은 백업 구간(13:02:12~13:08:44) 안이다.
 -- 그 시점의 데이터파일은 fuzzy 상태이며 일관성이 없다.
 -- 백업 중 갱신된 블록을 정리하려면 END BACKUP 시점까지의 리두를 모두 적용해야 한다.
@@ -205,30 +223,54 @@ SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER B
         11            2425820 YES
         12            2425820 YES
 
--- 여전히 FUZZY가 YES다.
+-- 13:05:00 까지 적용되어 SCN 은 올라갔지만 여전히 FUZZY가 YES다.
 
 -- << 수정 >>
 -- 목표 지점인 13:18:00 까지 이어서 적용한다.
+-- READ ONLY 로 검증할 것이므로 USING BACKUP CONTROLFILE 을 붙인다(10-2).
 
-SYS@orcl> SET AUTORECOVERY ON
-SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 13:18:00';
+SYS@orcl> RECOVER DATABASE UNTIL TIME '2025-05-12 13:18:00' USING BACKUP CONTROLFILE;
+ORA-00279: change 2425820 generated at 05/12/2025 13:05:00 needed for thread 1
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_1_1200558700.arc
+ORA-00280: change 2425820 for thread 1 is in sequence #1
+
+
+ORA-00279: change 2426000 generated at 05/12/2025 13:08:50 needed for thread 1
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_2_1200558700.arc
+ORA-00280: change 2426000 for thread 1 is in sequence #2
+ORA-00278: log file '/home/oracle/arch1/arch_1_1_1200558700.arc' no longer needed for this recovery
+
+
+ORA-00279: change 2426400 generated at 05/12/2025 13:14:18 needed for thread 1
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_3_1200558700.arc
+ORA-00280: change 2426400 for thread 1 is in sequence #3
+ORA-00278: log file '/home/oracle/arch1/arch_1_2_1200558700.arc' no longer needed for this recovery
+
+
+Log applied.
 Media recovery complete.
 
-SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
+-- 복원을 다시 하지 않았다. 첫 시도가 멈춘 2425820 부터 이어서 적용되었다.
 
-     FILE# CHECKPOINT_CHANGE# FUZ
----------- ------------------ ---
-         1            2426740 NO
-         3            2426740 NO
-         4            2426740 NO
-         7            2426740 NO
-        10            2426740 NO
-        11            2426740 NO
-        12            2426740 NO
+SYS@orcl> SELECT file#, checkpoint_change#,
+  2         TO_CHAR(checkpoint_time, 'HH24:MI:SS') AS ckpt_time, fuzzy
+  3  FROM   v$datafile_header ORDER BY file#;
 
--- FUZZY가 NO로 바뀌었다. 일관성이 맞았다.
+     FILE# CHECKPOINT_CHANGE# CKPT_TIME FUZ
+---------- ------------------ --------- ---
+         1            2426739 13:18:00  NO
+         3            2426739 13:18:00  NO
+         4            2426739 13:18:00  NO
+         7            2426739 13:18:00  NO
+        10            2426739 13:18:00  NO
+        11            2426739 13:18:00  NO
+        12            2426739 13:18:00  NO
+
+-- FUZZY가 NO로 바뀌었다. END BACKUP 을 지나면서 일관성이 맞았다.
 
 SYS@orcl> ALTER DATABASE OPEN READ ONLY;
+
+Database altered.
 
 SYS@orcl> SELECT id, memo FROM hr.emp104 ORDER BY id;
 
@@ -261,13 +303,14 @@ SYS@orcl> SELECT COUNT(*) FROM hr.emp104;
 ----------
          5
 
-SYS@orcl> SELECT checkpoint_change# AS recovered_scn,
-  2         TO_CHAR(SCN_TO_TIMESTAMP(checkpoint_change#), 'HH24:MI:SS') AS recovered_time
-  3  FROM   v$database;
+SYS@orcl> SELECT resetlogs_change#, TO_CHAR(resetlogs_time, 'HH24:MI:SS') AS resetlogs_time
+  2  FROM   v$database;
 
-RECOVERED_SCN RECOVERED_TIME
-------------- --------------
-      2426740 13:17:58
+RESETLOGS_CHANGE# RESETLOGS_TIME
+----------------- --------------
+          2426740 13:31:05
+
+-- 새 인카네이션은 멈춘 지점 다음 SCN(2426739 + 1)에서 시작한다.
 
 SYS@orcl> SELECT COUNT(*) FROM v$backup WHERE status = 'ACTIVE';
 
@@ -308,7 +351,8 @@ SYS@orcl> ALTER DATABASE BACKUP CONTROLFILE TO
 --    END BACKUP 시점 이전으로는 복구 지점을 잡을 수 없다.
 --    백업 중 fuzzy 상태로 복사된 블록을 리두로 정리해야 하기 때문이다.
 --
--- 2) Media recovery complete. 가 나와도 오픈이 거부될 수 있다.
+-- 2) RECOVER 가 succeeded 라고 해도 오픈이 거부될 수 있다.
+--    이 경우 RECOVER 는 ORA-01547 경고와 함께 ORA-01195 를 미리 보여 준다.
 --    ORA-01195는 온라인 백업이 아직 일관성에 도달하지 못했다는 뜻이다.
 --    복구가 끝났다는 메시지와 열 수 있다는 것은 다른 문제다.
 --
