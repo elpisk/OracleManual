@@ -17,7 +17,8 @@
 --------------------------------------------------------------------------------
 [2] 사전 조건
 --------------------------------------------------------------------------------
--- ARCHIVELOG 모드이며 Hot Backup과 컨트롤파일 trace 백업이 있다.
+-- ARCHIVELOG 모드이며 Hot Backup과 컨트롤파일 trace 백업(12-6 에서 잘라 둔
+-- cf_ch12_resetlogs.sql)이 있다.
 -- 이 실습은 복구가 실패하는 것을 확인하는 것이 목적이다.
 -- 실습 후 12-8로 이어 Cold Backup으로 복구한다.
 
@@ -74,11 +75,23 @@ SYS@orcl> COMMIT;
 SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
 System altered.
 
-SYS@orcl> SELECT MAX(sequence#) FROM v$archived_log WHERE status = 'A';
+SYS@orcl> SELECT MAX(sequence#) FROM v$archived_log
+  2  WHERE  status = 'A'
+  3  AND    resetlogs_change# = (SELECT resetlogs_change# FROM v$database);
 
 MAX(SEQUENCE#)
 --------------
-            38
+             2
+
+SYS@orcl> SELECT group#, sequence#, archived, status FROM v$log ORDER BY group#;
+
+    GROUP#  SEQUENCE# ARC STATUS
+---------- ---------- --- ----------------
+         1          1 YES INACTIVE
+         3          2 YES INACTIVE
+         4          3 NO  CURRENT
+
+-- 12-6 의 RESETLOGS 뒤라 시퀀스가 1 부터다. Hot Backup 구간은 시퀀스 1 안에 있다.
 
 --------------------------------------------------------------------------------
 [4] 장애 유발 : 스토리지 전체 손상 (아카이브 포함)
@@ -107,6 +120,12 @@ SYS@orcl> !ls /home/oracle/backup/hot12/*.dbf | wc -l
 --------------------------------------------------------------------------------
 SYS@orcl> STARTUP
 ORACLE instance started.
+
+Total System Global Area 2147481656 bytes
+Fixed Size                  8898616 bytes
+Variable Size             956301312 bytes
+Database Buffers         1174405120 bytes
+Redo Buffers                7876608 bytes
 ORA-00205: error in identifying control file, check alert log for more info
 
 SYS@orcl> SELECT status FROM v$instance;
@@ -128,43 +147,55 @@ SYS@orcl> !ls /home/oracle/backup/cold12/*.dbf 2>/dev/null | wc -l
 8
 
 -- 백업 종류를 먼저 확인한다. 이 확인이 결과를 결정한다.
-
-[oracle@oel7v9 ~]$ grep -n 'BEGIN BACKUP' \
->   /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -1
-23150:ALTER DATABASE BEGIN BACKUP
-
--- hot12는 열린 상태에서 받은 백업이다.
+-- alert log 는 BEGIN/END BACKUP 을 기록하지 않는다. 백업 절차서·스크립트 로그로 확인하고,
+-- 파일 자체의 상태는 MOUNT 뒤 v$backup 으로 확정한다([7]).
 
 -- 판정
 --   ① 컨트롤파일 수단 : trace 백업 있음
 --   ② 아카이브 : 없음
---   ③ 백업 종류 : Hot Backup
---   → 백업 구간의 리두가 없어 일관성을 맞출 수 없다. 복구 불가로 예상된다.
+--   ③ 백업 종류 : hot12 는 Hot Backup, cold12 는 Cold Backup
+--   → Hot Backup 은 백업 구간의 리두가 없어 일관성을 맞출 수 없다. 복구 불가로 예상된다.
 --   확인 후 Cold Backup으로 전환한다.
 
 --------------------------------------------------------------------------------
 [7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
 --------------------------------------------------------------------------------
+-- 전체 손실이므로 데이터파일 복원 → 컨트롤파일 재생성 순서다(12-6).
+
+SYS@orcl> !cp -p /home/oracle/backup/hot12/*.dbf /u01/app/oracle/oradata/orcl/
+
 SYS@orcl> @/home/oracle/backup/cf_ch12_resetlogs.sql
 
 Control file created.
-
-SYS@orcl> !cp -p /home/oracle/backup/hot12/*.dbf /u01/app/oracle/oradata/orcl/
 
 SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER BY file#;
 
      FILE# CHECKPOINT_CHANGE# FUZ
 ---------- ------------------ ---
          1            2491200 YES
-         3            2491260 YES
-         4            2491310 YES
-         7            2491220 YES
-        10            2491260 YES
-        11            2491260 YES
-        13            2491260 YES
+         3            2491200 YES
+         4            2491200 YES
+         7            2491200 YES
+        10            2491200 YES
+        11            2491200 YES
+        13            2491200 YES
 
--- SCN이 파일마다 다르고 FUZZY가 모두 YES다.
--- 열린 상태에서 순차적으로 복사했기 때문이다.
+SYS@orcl> SELECT file#, status, change#,
+  2         TO_CHAR(time, 'YYYY-MM-DD HH24:MI:SS') AS begin_time
+  3  FROM   v$backup ORDER BY file#;
+
+     FILE# STATUS     CHANGE# BEGIN_TIME
+---------- ---------- ---------- -------------------
+         1 ACTIVE        2491200 2025-05-13 16:02:11
+         3 ACTIVE        2491200 2025-05-13 16:02:11
+         4 ACTIVE        2491200 2025-05-13 16:02:11
+         7 ACTIVE        2491200 2025-05-13 16:02:11
+        10 ACTIVE        2491200 2025-05-13 16:02:11
+        11 ACTIVE        2491200 2025-05-13 16:02:11
+        13 ACTIVE        2491200 2025-05-13 16:02:11
+
+-- 파일 헤더에 백업 모드 표시(ACTIVE)와 BEGIN BACKUP 시각이 남아 있다.
+-- 열린 상태에서 복사한 Hot Backup 이 확실하다. FUZZY 도 모두 YES 다.
 
 -- 복구 없이 열어 본다.
 
@@ -172,11 +203,11 @@ SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
 ALTER DATABASE OPEN RESETLOGS
 *
 ERROR at line 1:
-ORA-01194: file 1 needs more recovery to be consistent
+ORA-01195: online backup of file 1 needs more recovery to be consistent
 ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
 
 -- << 원인 파악 >>
--- 파일이 일관성 있는 상태가 아니다.
+-- ORA-01195는 온라인 백업이 최소 복구 지점(END BACKUP)에 도달하지 못했다는 뜻이다.
 -- 백업 중 진행된 변경과 fuzzy 블록을 정리할 리두가 적용되지 않았다.
 -- 복구를 먼저 수행해야 한다.
 
@@ -184,24 +215,27 @@ ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
 
 SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE UNTIL CANCEL;
 ORA-00279: change 2491200 generated at 05/13/2025 16:02:11 needed for thread 1
-ORA-00289: suggestion : /home/oracle/arch1/arch_1_37_1200584500.arc
-ORA-00280: change 2491200 for thread 1 is in sequence #37
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_1_1200607800.arc
+ORA-00280: change 2491200 for thread 1 is in sequence #1
+
 
 Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
-/home/oracle/arch1/arch_1_37_1200584500.arc
-ORA-00308: cannot open archived log '/home/oracle/arch1/arch_1_37_1200584500.arc'
+
+ORA-00308: cannot open archived log '/home/oracle/arch1/arch_1_1_1200607800.arc'
 ORA-27037: unable to obtain file status
 Linux-x86_64 Error: 2: No such file or directory
 Additional information: 7
+
+
+ORA-01547: warning: RECOVER succeeded but OPEN RESETLOGS would get error below
+ORA-01195: online backup of file 1 needs more recovery to be consistent
+ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
 
 -- << 원인 파악 >>
 -- 요구하는 아카이브가 존재하지 않는다.
 -- 아카이브가 손상된 스토리지에 함께 있어 사라졌기 때문이다.
 -- 온라인 리두도 없으므로 이 구간을 채울 방법이 없다.
-
-Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
-CANCEL
-Media recovery cancelled.
+-- Oracle 이 미리 경고한다 — 이 상태로 RESETLOGS 를 하면 ORA-01195 가 난다.
 
 SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
 ALTER DATABASE OPEN RESETLOGS
@@ -210,21 +244,29 @@ ERROR at line 1:
 ORA-01195: online backup of file 1 needs more recovery to be consistent
 ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
 
--- << 원인 파악 >>
--- ORA-01195는 온라인 백업이 최소 복구 지점에 도달하지 못했다는 뜻이다.
--- Hot Backup은 백업 구간의 리두를 전부 적용해야 열 수 있다.
--- 그 리두가 없으므로 어떤 방법으로도 열리지 않는다.
-
--- 시점을 앞당겨도 되는지 확인해 본다.
+-- 시점을 앞당겨도 되는지 확인해 본다. 첫 프롬프트에서 바로 CANCEL 한다.
 
 SYS@orcl> RECOVER DATABASE USING BACKUP CONTROLFILE UNTIL CANCEL;
+ORA-00279: change 2491200 generated at 05/13/2025 16:02:11 needed for thread 1
+ORA-00289: suggestion : /home/oracle/arch1/arch_1_1_1200607800.arc
+ORA-00280: change 2491200 for thread 1 is in sequence #1
+
 
 Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
 CANCEL
-Media recovery cancelled.
+ORA-01547: warning: RECOVER succeeded but OPEN RESETLOGS would get error below
+ORA-01195: online backup of file 1 needs more recovery to be consistent
+ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
+
+
+ORA-01112: media recovery not started
 
 SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+ALTER DATABASE OPEN RESETLOGS
+*
+ERROR at line 1:
 ORA-01195: online backup of file 1 needs more recovery to be consistent
+ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
 
 -- 몇 번을 시도해도 같은 결과다.
 -- 최소 복구 지점은 백업 종료 시점이며 그 이전으로는 열 수 없다.
@@ -248,12 +290,12 @@ SYS@orcl> SELECT file#, checkpoint_change#, fuzzy FROM v$datafile_header ORDER B
      FILE# CHECKPOINT_CHANGE# FUZ
 ---------- ------------------ ---
          1            2491200 YES
-         3            2491260 YES
-         4            2491310 YES
-         7            2491220 YES
-        10            2491260 YES
-        11            2491260 YES
-        13            2491260 YES
+         3            2491200 YES
+         4            2491200 YES
+         7            2491200 YES
+        10            2491200 YES
+        11            2491200 YES
+        13            2491200 YES
 
 -- 복구가 전혀 진행되지 않아 SCN이 그대로다.
 
@@ -262,17 +304,16 @@ SYS@orcl> SELECT file#, error, change# FROM v$recover_file ORDER BY file#;
      FILE# ERROR                    CHANGE#
 ---------- -------------------- -----------
          1                          2491200
-         3                          2491260
-         4                          2491310
-         7                          2491220
-        10                          2491260
-        11                          2491260
-        13                          2491260
+         3                          2491200
+         4                          2491200
+         7                          2491200
+        10                          2491200
+        11                          2491200
+        13                          2491200
 
--- 네 파일 모두 복구가 필요한 상태로 남아 있다.
+-- 모든 파일이 복구가 필요한 상태로 남아 있다.
 
-SYS@orcl> !grep -c 'ORA-01195' \
-          /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+SYS@orcl> !grep -c 'ORA-01195' /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
 3
 
 -- 세 번의 오픈 시도가 모두 같은 이유로 실패했다.
@@ -287,22 +328,26 @@ ORACLE instance shut down.
 --    백업 구간의 리두를 적용해야 비로소 쓸 수 있는 상태가 된다.
 --    그 리두는 아카이브로만 남으므로 아카이브가 없으면 백업본은 무용지물이다.
 --
--- 2) ORA-01194와 ORA-01195는 뜻이 다르다.
+-- 2) 백업본이 Hot 인지 Cold 인지는 v$backup 으로 확정한다.
+--    MOUNT 뒤 STATUS 가 ACTIVE 면 백업 모드에서 복사된 파일이고 TIME 이 BEGIN BACKUP 시각이다.
+--    alert log 에는 BEGIN/END BACKUP 이 남지 않는다.
+--
+-- 3) ORA-01194와 ORA-01195는 뜻이 다르다.
 --    ORA-01194는 복구가 더 필요하다는 뜻이고
 --    ORA-01195는 온라인 백업이 최소 복구 지점에 도달하지 못했다는 뜻이다.
 --    후자는 시점을 앞당겨도 해결되지 않는다.
 --
--- 3) 최소 복구 지점은 백업 종료 시점이다.
+-- 4) 최소 복구 지점은 백업 종료 시점이다.
 --    UNTIL 로 그 이전을 지정할 수 없으며 우회 방법도 없다.
---    같은 시도를 반복하는 것은 시간 낭비다.
+--    RECOVER 가 끝날 때 ORA-01547 로 미리 알려 주므로 같은 시도를 반복하지 않는다.
 --
--- 4) 백업본과 아카이브를 같은 스토리지에 두면 이 상황이 만들어진다.
+-- 5) 백업본과 아카이브를 같은 스토리지에 두면 이 상황이 만들어진다.
 --    실무에서 스토리지 손상으로 두 가지를 함께 잃은 사례가 실제로 있다.
 --    복원해도 열리지 않아 한 달 전 Cold Backup으로 되돌려야 했다.
 --
--- 5) 대책은 두 가지다.
+-- 6) 대책은 두 가지다.
 --    백업 직후 ALTER SYSTEM ARCHIVE LOG CURRENT 로 구간 리두를 확보하고
 --    그 아카이브를 백업본과 같은 위치에 복사해 짝으로 보관한다.
 --
--- 6) Cold Backup을 정기 정지 시간에 받아 장기 보관하는 것이 최후의 보루다.
+-- 7) Cold Backup을 정기 정지 시간에 받아 장기 보관하는 것이 최후의 보루다.
 --    이 실습이 그 필요성을 가장 직접적으로 보여 준다.
