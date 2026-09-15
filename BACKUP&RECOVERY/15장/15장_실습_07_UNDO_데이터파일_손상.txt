@@ -21,7 +21,7 @@
 
 [oracle@oel7v9 ~]$ rman target / catalog rcatowner@rcat
 
-RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'BASE_157';
+RMAN> BACKUP DATABASE TAG 'BASE_157' PLUS ARCHIVELOG;
 RMAN> EXIT
 
 --------------------------------------------------------------------------------
@@ -35,10 +35,11 @@ NAME                 TYPE        VALUE
 -------------------- ----------- --------
 undo_tablespace      string      UNDOTBS1
 
+SYS@orcl> COL name FOR a45
 SYS@orcl> SELECT file#, name FROM v$datafile WHERE file# = 4;
 
      FILE# NAME
----------- ------------------------------------------
+---------- ---------------------------------------------
          4 /u03/oradata/ORCL/undotbs01.dbf
 
 SYS@orcl> CREATE TABLE hr.rec157(id NUMBER, memo VARCHAR2(30)) TABLESPACE users;
@@ -58,15 +59,27 @@ Commit complete.
 --------------------------------------------------------------------------------
 -- 버퍼 캐시를 먼저 비운다. 지운 뒤에 비우면 안 된다.
 -- 더티 버퍼가 남은 채 파일이 사라지면 그것을 기록하려던 CKPT 가
--- ORA-63999 를 만나 인스턴스를 종료시킨다. 조회는 해 보지도 못한다.
+-- ORA-63999 를 만나 인스턴스를 종료시킨다.
 SYS@orcl> ALTER SYSTEM FLUSH BUFFER_CACHE;
+
 System altered.
 
 SYS@orcl> !rm -f /u03/oradata/ORCL/undotbs01.dbf
 
 SYS@orcl> INSERT INTO hr.rec157 VALUES (3, 'after failure');
+
+1 row created.
+
+SYS@orcl> ROLLBACK;
+
+-- 이 세션은 UNDO 파일을 이미 열어 두어 DML 도 된다(15-1). 새 세션에서 확인한다.
+
+SYS@orcl> EXIT
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SYS@orcl> INSERT INTO hr.rec157 VALUES (3, 'after failure');
 INSERT INTO hr.rec157 VALUES (3, 'after failure')
-*
+               *
 ERROR at line 1:
 ORA-01116: error in opening database file 4
 ORA-01110: data file 4: '/u03/oradata/ORCL/undotbs01.dbf'
@@ -74,7 +87,7 @@ ORA-27041: unable to open file
 Linux-x86_64 Error: 2: No such file or directory
 Additional information: 3
 
--- UNDO를 쓸 수 없으므로 DML 자체가 진행되지 않는다.
+-- UNDO를 쓸 수 없으므로 새 세션의 DML 은 진행되지 않는다.
 
 --------------------------------------------------------------------------------
 [5] 증상 관찰
@@ -85,13 +98,11 @@ SYS@orcl> SELECT COUNT(*) FROM hr.rec157;
 ----------
          2
 
--- 조회는 아직 동작한다. 버퍼에 있는 블록을 읽는 경우다.
+-- 조회는 동작한다. UNDO 를 읽을 일이 없는 조회라서다.
 
 SYS@orcl> SELECT file#, error FROM v$recover_file;
 
-     FILE# ERROR
----------- --------------------
-         4 FILE NOT FOUND
+no rows selected
 
 SYS@orcl> SELECT tablespace_name, status FROM dba_tablespaces
   2  WHERE  tablespace_name = 'UNDOTBS1';
@@ -103,12 +114,6 @@ UNDOTBS1                       ONLINE
 --------------------------------------------------------------------------------
 [6] 진단
 --------------------------------------------------------------------------------
-SYS@orcl> SELECT file#, tablespace_name FROM dba_data_files WHERE file_id = 4;
-
-     FILE# TABLESPACE_NAME
----------- ------------------------------
-         4 UNDOTBS1
-
 -- 판정
 --   ① 손상 파일 : 4번, UNDO 테이블스페이스
 --   ② UNDO는 OFFLINE 불가 → 전면 중단 확정
@@ -127,10 +132,12 @@ SYS@orcl> EXIT
 
 RMAN> SQL 'ALTER TABLESPACE undotbs1 OFFLINE IMMEDIATE';
 
+sql statement: ALTER TABLESPACE undotbs1 OFFLINE IMMEDIATE
 RMAN-00571: ===========================================================
 RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
 RMAN-00571: ===========================================================
-RMAN-03009: failure of sql command on default channel at 05/16/2025 16:02:41
+RMAN-03009: failure of sql command on default channel at 05/16/2025 16:18:48
+RMAN-11003: failure during parse/execution of SQL statement: ALTER TABLESPACE undotbs1 OFFLINE IMMEDIATE
 ORA-30042: Cannot offline the undo tablespace
 
 -- << 원인 파악 >>
@@ -138,52 +145,109 @@ ORA-30042: Cannot offline the undo tablespace
 -- 활성 트랜잭션의 되돌리기 정보가 들어 있어 데이터베이스가 그것을 놓을 수 없다.
 -- SYSTEM과 함께 무중단 복구가 불가능한 두 대상이다.
 
--- 데이터파일 단위로도 시도해 본다.
+-- 데이터파일 단위로도 시도해 본다. (해서는 안 되는 명령이다. 결과만 확인한다.)
 
 RMAN> SQL 'ALTER DATABASE DATAFILE 4 OFFLINE';
 
 sql statement: ALTER DATABASE DATAFILE 4 OFFLINE
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03009: failure of sql command on default channel at 05/16/2025 16:18:49
+RMAN-11003: failure during parse/execution of SQL statement: ALTER DATABASE DATAFILE 4 OFFLINE
+ORA-00603: ORACLE server session terminated by fatal error
+ORA-00376: file 4 cannot be read at this time
+ORA-01110: data file 4: '/u03/oradata/ORCL/undotbs01.dbf'
+ORA-00376: file 4 cannot be read at this time
+ORA-01110: data file 4: '/u03/oradata/ORCL/undotbs01.dbf'
+Process ID: 15518
+Session ID: 21 Serial number: 17107
 
--- 명령은 통과한다. 하지만 이 상태로는 문제가 남는다.
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+ORA-03114: not connected to ORACLE
 
-RMAN> SQL 'SELECT COUNT(*) FROM v$transaction';
+-- 명령은 적용되었지만(파일 상태 RECOVER) 그 세션 자체가 UNDO 를 읽지 못해 죽었다(ORA-00603).
+-- 이 상태에서는 모든 DML 이 ORA-00376 으로 막히고 v$transaction 조차 조회되지 않는다.
+-- 열어 둔 채로는 정합성을 보장할 수 없으므로 UNDO 는 MOUNT 상태에서 복구하는 것이 원칙이다.
 
--- 활성 트랜잭션이 그 UNDO 세그먼트를 참조하면 되돌릴 수 없다.
--- 데이터베이스를 열어 둔 채로는 정합성을 보장할 수 없으므로
--- UNDO는 MOUNT 상태에서 복구하는 것이 원칙이다.
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SELECT COUNT(*) FROM v$transaction;
+SELECT COUNT(*) FROM v$transaction
+                     *
+ERROR at line 1:
+ORA-00376: file 4 cannot be read at this time
+ORA-01110: data file 4: '/u03/oradata/ORCL/undotbs01.dbf'
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+-- (응답이 없다. 종료 과정이 UNDO 파일에 막혀 진행되지 않는다. 다른 창에서 ABORT 한다.)
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SYS@orcl> SHUTDOWN ABORT
+ORACLE instance shut down.
+
+SYS@orcl> EXIT
 
 -- << 수정 >> 전면 중단 후 MOUNT 상태에서 복구한다.
 
-RMAN> SHUTDOWN IMMEDIATE
-
-database closed
-database dismounted
-Oracle instance shut down
+[oracle@oel7v9 ~]$ rman target / catalog rcatowner@rcat
 
 RMAN> STARTUP MOUNT
 
 Oracle instance started
 database mounted
 
+Total System Global Area    2147481656 bytes
+
+Fixed Size                     8898616 bytes
+Variable Size               1006632960 bytes
+Database Buffers            1124073472 bytes
+Redo Buffers                   7876608 bytes
+
 RMAN> SQL 'ALTER DATABASE DATAFILE 4 ONLINE';
 
 sql statement: ALTER DATABASE DATAFILE 4 ONLINE
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03009: failure of sql command on default channel at 05/16/2025 16:29:32
+RMAN-11003: failure during parse/execution of SQL statement: ALTER DATABASE DATAFILE 4 ONLINE
+ORA-01157: cannot identify/lock data file 4 - see DBWR trace file
+ORA-01110: data file 4: '/u03/oradata/ORCL/undotbs01.dbf'
 
--- MOUNT 상태이므로 ONLINE으로 되돌려도 접근이 일어나지 않는다.
+-- 파일이 없으니 ONLINE 도 안 된다. 복원과 복구를 먼저 한다.
 
 RMAN> RESTORE DATAFILE 4;
 
 Starting restore at 16-MAY-25
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=395 device type=DISK
+allocated channel: ORA_DISK_2
+channel ORA_DISK_2: SID=597 device type=DISK
+
+channel ORA_DISK_1: starting datafile backup set restore
+channel ORA_DISK_1: specifying datafile(s) to restore from backup set
 channel ORA_DISK_1: restoring datafile 00004 to /u03/oradata/ORCL/undotbs01.dbf
-channel ORA_DISK_1: restore complete, elapsed time: 00:00:18
+channel ORA_DISK_1: reading from backup piece /home/oracle/rmanbk/ORCL_20250516_184_1.bkp
+channel ORA_DISK_1: piece handle=/home/oracle/rmanbk/ORCL_20250516_184_1.bkp tag=BASE_157
+channel ORA_DISK_1: restored backup piece 1
+channel ORA_DISK_1: restore complete, elapsed time: 00:00:07
 Finished restore at 16-MAY-25
 
 RMAN> RECOVER DATAFILE 4;
 
 Starting recover at 16-MAY-25
+using channel ORA_DISK_1
+using channel ORA_DISK_2
+
 starting media recovery
-archived log file name=/home/oracle/arch1/arch_1_38_1200607800.arc thread=1 sequence=38
-media recovery complete, elapsed time: 00:00:03
+
+archived log for thread 1 with sequence 31 is already on disk as file /home/oracle/arch1/arch_1_31_1200607800.arc
+archived log file name=/home/oracle/arch1/arch_1_31_1200607800.arc thread=1 sequence=31
+media recovery complete, elapsed time: 00:00:00
 Finished recover at 16-MAY-25
 
 RMAN> ALTER DATABASE OPEN;
@@ -211,14 +275,22 @@ SYS@orcl> SELECT file#, status FROM v$datafile WHERE file# = 4;
 
      FILE# STATUS
 ---------- -------
-         4 ONLINE
+         4 OFFLINE
 
-SYS@orcl> SELECT id, memo FROM hr.rec157 ORDER BY id;
+SYS@orcl> INSERT INTO hr.rec157 VALUES (3, 'after recover');
+INSERT INTO hr.rec157 VALUES (3, 'after recover')
+               *
+ERROR at line 1:
+ORA-01552: cannot use system rollback segment for non-system tablespace 'USERS'
 
-        ID MEMO
----------- ------------------------------
-         1 committed
-         2 in current redo
+-- << 원인 파악 >>
+-- [7] 에서 내린 OFFLINE 표시가 남아 있다. 복원·복구가 끝나도 상태는 저절로 돌아오지 않고,
+-- UNDO 파일이 OFFLINE 인 채로 데이터베이스가 열린다. 그러면 UNDO 세그먼트를 못 써서
+-- 모든 DML 이 ORA-01552 로 막힌다. 파일을 OFFLINE 했다면 반드시 되돌린다.
+
+SYS@orcl> ALTER DATABASE DATAFILE 4 ONLINE;
+
+Database altered.
 
 SYS@orcl> INSERT INTO hr.rec157 VALUES (3, 'after recover');
 SYS@orcl> COMMIT;
@@ -227,23 +299,37 @@ Commit complete.
 
 -- DML이 정상적으로 진행된다. UNDO가 복구되었다.
 
-SYS@orcl> SELECT tablespace_name, status FROM dba_tablespaces
-  2  WHERE  tablespace_name = 'UNDOTBS1';
+SYS@orcl> SELECT id, memo FROM hr.rec157 ORDER BY id;
 
-TABLESPACE_NAME                STATUS
------------------------------- ---------
-UNDOTBS1                       ONLINE
+        ID MEMO
+---------- ------------------------------
+         1 committed
+         2 in current redo
+         3 after recover
 
-SYS@orcl> SELECT segment_name, status FROM dba_rollback_segs
-  2  WHERE  tablespace_name = 'UNDOTBS1' AND ROWNUM <= 3;
+SYS@orcl> SELECT status, COUNT(*) FROM dba_rollback_segs
+  2  WHERE  tablespace_name = 'UNDOTBS1' GROUP BY status;
 
-SEGMENT_NAME                   STATUS
------------------------------- ----------------
-_SYSSMU1_2931906360$           ONLINE
-_SYSSMU2_1152005954$           ONLINE
-_SYSSMU3_1930754532$           ONLINE
+STATUS             COUNT(*)
+---------------- ----------
+NEEDS RECOVERY           10
+ONLINE                    1
 
--- UNDO 세그먼트가 정상 상태다.
+-- OFFLINE 이었던 사이에 세그먼트가 NEEDS RECOVERY 로 남았다. 새 DML 은 ONLINE 세그먼트
+-- 하나로 처리되지만 정상 상태가 아니다. 재기동하면 Undo 초기화가 모두 되돌린다.
+
+SYS@orcl> SHUTDOWN IMMEDIATE
+SYS@orcl> STARTUP
+
+SYS@orcl> SELECT status, COUNT(*) FROM dba_rollback_segs
+  2  WHERE  tablespace_name = 'UNDOTBS1' GROUP BY status;
+
+STATUS             COUNT(*)
+---------------- ----------
+ONLINE                   10
+OFFLINE                   1
+
+-- UNDO 세그먼트가 정상 상태다(OFFLINE 하나는 예비 세그먼트).
 
 SYS@orcl> SELECT COUNT(*) FROM v$transaction;
 
@@ -254,7 +340,7 @@ SYS@orcl> SELECT COUNT(*) FROM v$transaction;
 SYS@orcl> EXIT
 
 [oracle@oel7v9 ~]$ rman target / catalog rcatowner@rcat
-RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'AFTER_UNDO';
+RMAN> BACKUP DATABASE TAG 'AFTER_UNDO' PLUS ARCHIVELOG;
 RMAN> EXIT
 
 -- 실무 포인트
@@ -262,20 +348,22 @@ RMAN> EXIT
 --    ORA-30042가 그 사실을 명시적으로 알려 준다.
 --    SYSTEM과 함께 무중단 복구가 불가능한 두 대상이다.
 --
--- 2) 데이터파일 단위 OFFLINE 명령은 통과하지만 해결책이 아니다.
---    활성 트랜잭션이 그 UNDO 세그먼트를 참조하면 정합성을 보장할 수 없다.
---    MOUNT 상태에서 복구하는 것이 원칙이다.
+-- 2) 데이터파일 단위 OFFLINE 명령은 적용되지만 해결책이 아니다.
+--    그 세션이 ORA-00603 으로 죽고 모든 DML 이 ORA-00376 으로 막히며 정상 종료도 안 된다.
+--    복구 뒤에도 OFFLINE 표시가 남아 ORA-01552 를 만든다. 쓰지 않는다.
 --
--- 3) UNDO 손상은 DML을 즉시 막는다.
---    조회는 버퍼에 있는 블록을 읽는 동안 잠시 동작할 수 있어
---    장애를 늦게 인지하는 경우가 있다.
+-- 3) 올바른 절차는 SHUTDOWN ABORT → STARTUP MOUNT → RESTORE → RECOVER → OPEN 이다.
+--    파일을 OFFLINE 한 적이 있다면 OPEN 뒤 ONLINE 으로 되돌리고 재기동해 세그먼트를 정리한다.
 --
--- 4) 9장의 판단이 그대로 적용된다.
+-- 4) UNDO 손상은 새 세션의 DML을 즉시 막는다.
+--    조회와 이미 파일을 연 세션은 잠시 동작할 수 있어 장애를 늦게 인지하는 경우가 있다.
+--
+-- 5) 9장의 판단이 그대로 적용된다.
 --    도구가 RMAN으로 바뀌어도 UNDO의 성격은 변하지 않는다.
 --    판정 흐름은 같고 명령만 짧아진다.
 --
--- 5) 복구 후 UNDO 세그먼트 상태를 확인한다.
---    dba_rollback_segs 의 STATUS가 ONLINE이어야 정상이다.
+-- 6) 복구 후 UNDO 세그먼트 상태를 확인한다.
+--    dba_rollback_segs 의 STATUS가 ONLINE이어야 정상이다. NEEDS RECOVERY 가 남으면 재기동한다.
 --
--- 6) UNDO 데이터파일도 다중화 대상은 아니지만 백업 주기는 짧게 가져간다.
+-- 7) UNDO 데이터파일도 다중화 대상은 아니지만 백업 주기는 짧게 가져간다.
 --    손상 시 전면 중단이므로 복원 시간이 그대로 중단 시간이 된다.

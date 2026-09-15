@@ -8,8 +8,8 @@
 --------------------------------------------------------------------------------
 [1] 시나리오 개요
 --------------------------------------------------------------------------------
--- 테이블 하나가 잘못된 작업으로 지워졌다.
--- UNDO는 이미 덮여 Flashback을 쓸 수 없다.
+-- 테이블 하나가 잘못된 작업(TRUNCATE)으로 지워졌다.
+-- TRUNCATE 는 UNDO 를 남기지 않아 Flashback 을 쓸 수 없다.
 -- RECOVER TABLE로 그 시점의 테이블만 되살린다.
 -- REMAP TABLE로 다른 이름으로 가져와 확인한 뒤 반영한다.
 -- 복구 유형 : 테이블 단위 복구, 다른 업무에 영향 없음
@@ -65,15 +65,20 @@ SYS@orcl> EXIT
 
 [oracle@oel7v9 ~]$ rman target / catalog rcatowner@rcat
 
-RMAN> BACKUP DATABASE PLUS ARCHIVELOG TAG 'BASE_161';
+RMAN> BACKUP DATABASE TAG 'BASE_161' PLUS ARCHIVELOG;
 
 Starting backup at 18-MAY-25
+...
 Finished backup at 18-MAY-25
+
+Starting Control File and SPFILE Autobackup at 18-MAY-25
+piece handle=/home/oracle/rmanbk/cf_c-1200530011-20250518-00 comment=NONE
+Finished Control File and SPFILE Autobackup at 18-MAY-25
 
 RMAN> EXIT
 
 --------------------------------------------------------------------------------
-[4] 장애 유발 : 테이블 데이터 삭제
+[4] 장애 유발 : 테이블 TRUNCATE
 --------------------------------------------------------------------------------
 [oracle@oel7v9 ~]$ sqlplus / as sysdba
 
@@ -83,23 +88,21 @@ NOW
 -------------------
 2025-05-18 09:14:02
 
-SYS@orcl> DELETE FROM hr.emp160 WHERE department_id <> 50;
+SYS@orcl> TRUNCATE TABLE hr.emp160;
 
-102 rows deleted.
-
-SYS@orcl> COMMIT;
-
-Commit complete.
+Table truncated.
 
 SYS@orcl> SELECT COUNT(*) FROM hr.emp160;
 
   COUNT(*)
 ----------
-         5
+         0
 
 SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
 
 System altered.
+
+-- 다른 테이블을 비우려다 emp160 을 비웠다고 가정한다.
 
 --------------------------------------------------------------------------------
 [5] 증상 관찰
@@ -109,24 +112,21 @@ System altered.
 SYS@orcl> SELECT COUNT(*) FROM hr.emp160
   2  AS OF TIMESTAMP TO_TIMESTAMP('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS');
 SELECT COUNT(*) FROM hr.emp160
-                     *
+                        *
 ERROR at line 1:
-ORA-01555: snapshot too old: rollback segment number 3 with name
-"_SYSSMU3_1930754532$" too small
+ORA-01466: unable to read data - table definition has changed
 
 -- << 원인 파악 >>
--- UNDO가 이미 덮여 그 시점의 이전 이미지를 만들 수 없다.
--- UNDO_RETENTION을 넘겼거나 UNDO 테이블스페이스가 작아 재사용된 것이다.
--- Flashback 계열은 UNDO에 의존하므로 이 상황에서는 쓸 수 없다.
--- 백업과 아카이브를 쓰는 RECOVER TABLE 로 전환한다.
+-- TRUNCATE 는 DDL 이라 행마다 UNDO 를 남기지 않고 세그먼트를 통째로 비운다.
+-- 그 이전 시점의 이미지를 UNDO 로 만들 수 없으니 Flashback Query 가 막힌다.
+-- FLASHBACK TABLE 도 같은 이유로 안 된다(행 이동을 켜도 ORA-01466).
+-- UNDO 에 의존하지 않고 백업과 아카이브를 쓰는 RECOVER TABLE 로 전환한다.
 
-SYS@orcl> SHOW PARAMETER undo_retention
+SYS@orcl> SELECT * FROM v$recover_file;
 
-NAME                 TYPE        VALUE
--------------------- ----------- -----
-undo_retention       integer     900
+no rows selected
 
--- 900초, 즉 15분이다. 그 이전 시점은 보장되지 않는다.
+-- 파일 손상이 아니다. 데이터베이스 전체를 되돌릴 일도 아니다.
 
 --------------------------------------------------------------------------------
 [6] 진단
@@ -136,18 +136,29 @@ SYS@orcl> EXIT
 
 RMAN> LIST BACKUP OF TABLESPACE system SUMMARY;
 
-Key     TY LV S Device Type Completion Time #Pieces Tag
-------- -- -- - ----------- --------------- ------- ---------
-118     B  F  A DISK        18-MAY-25       1       BASE_161
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time #Pieces #Copies Compressed Tag
+------- -- -- - ----------- --------------- ------- ------- ---------- ---
+...
+6296    B  F  A DISK        17-MAY-25       1       1       NO         AFTER_INCARNATION
+6364    B  F  A DISK        18-MAY-25       1       1       NO         BASE_161
 
-RMAN> LIST BACKUP OF TABLESPACE undotbs1 SUMMARY;
 RMAN> LIST BACKUP OF TABLESPACE users SUMMARY;
 
--- 세 테이블스페이스의 백업이 모두 있다.
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time #Pieces #Copies Compressed Tag
+------- -- -- - ----------- --------------- ------- ------- ---------- ---
+...
+6297    B  F  A DISK        17-MAY-25       1       1       NO         AFTER_INCARNATION
+6365    B  F  A DISK        18-MAY-25       1       1       NO         BASE_161
+
+-- SYSTEM·SYSAUX·UNDO·USERS 의 백업이 모두 있다(PLUS ARCHIVELOG 로 받아 아카이브도 있다).
 
 -- 판정
 --   ① 대상 : hr.emp160, USERS 테이블스페이스 (SYS나 SYSTEM 아님)
---   ② 시점 : 09:10 (DELETE 이전)
+--   ② 시점 : 09:10 (TRUNCATE 이전)
 --   ③ 백업 : SYSTEM·SYSAUX·UNDO·USERS 모두 존재
 --   ④ 공간 : /u03 에 16GB 여유, 필요량 약 1.8GB
 --   → RECOVER TABLE 수행 가능
@@ -155,20 +166,85 @@ RMAN> LIST BACKUP OF TABLESPACE users SUMMARY;
 --------------------------------------------------------------------------------
 [7] 복구 절차 : 오류 발생 → 원인 파악 → 수정
 --------------------------------------------------------------------------------
--- AUXILIARY DESTINATION 없이 시도해 본다.
+-- 먼저 REMAP 없이 시도해 본다.
 
 RMAN> RECOVER TABLE hr.emp160
-  2>   UNTIL TIME "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')";
+  2>   UNTIL TIME "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')"
+  3>   AUXILIARY DESTINATION '/u03/aux';
 
+Starting recover at 18-MAY-25
 RMAN-00571: ===========================================================
 RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
 RMAN-00571: ===========================================================
 RMAN-03002: failure of recover command at 05/18/2025 09:22:41
-RMAN-05902: must specify AUXILIARY DESTINATION or set DB_RECOVERY_FILE_DEST
+RMAN-05063: Cannot recover specified tables
+RMAN-05112: table "HR"."EMP160" already exists
 
 -- << 원인 파악 >>
--- 보조 인스턴스가 파일을 만들 위치가 필요하다.
--- FRA가 구성되어 있으면 그것을 쓰지만 이 환경에는 없다.
+-- 같은 이름의 테이블이 있으면 RMAN 은 덮어쓰지 않고 거부한다.
+-- 비워졌어도 테이블 자체는 남아 있기 때문이다.
+-- REMAP TABLE 로 다른 이름으로 가져온다. (원본을 먼저 DROP 하는 방법도 있지만
+--  되돌릴 수 없으므로 REMAP 이 안전하다.)
+
+-- AUXILIARY DESTINATION 도 빼고 시도해 본다.
+
+RMAN> RECOVER TABLE hr.emp160
+  2>   UNTIL TIME "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')"
+  3>   REMAP TABLE hr.emp160:emp160_recovered;
+
+Starting recover at 18-MAY-25
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=24 device type=DISK
+allocated channel: ORA_DISK_2
+channel ORA_DISK_2: SID=406 device type=DISK
+
+Creating automatic instance, with SID='nkyE'
+
+initialization parameters used for automatic instance:
+db_name=ORCL
+db_unique_name=nkyE_pitr_ORCL
+compatible=19.0.0
+db_block_size=8192
+db_files=200
+diagnostic_dest=/u01/app/oracle
+_system_trig_enabled=FALSE
+sga_target=2048M
+processes=200
+db_4k_cache_size=48M
+#No auxiliary destination in use
+#No auxiliary parameter file used
+
+
+starting up automatic instance ORCL
+
+Oracle instance started
+
+Total System Global Area    2147481656 bytes
+
+Fixed Size                     8898616 bytes
+Variable Size                469762048 bytes
+Database Buffers            1660944384 bytes
+Redo Buffers                   7876608 bytes
+Automatic instance created
+
+Removing automatic instance
+shutting down automatic instance
+Oracle instance shut down
+Automatic instance removed
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of recover command at 05/18/2025 09:23:12
+RMAN-05002: aborting Tablespace Point-in-Time Recovery
+RMAN-05517: tempfile /u03/oradata/ORCL/temp01.dbf conflicts with file used by target database
+RMAN-05001: auxiliary file name /u03/oradata/ORCL/sysaux01.dbf conflicts with a file used by the target database
+RMAN-05001: auxiliary file name /u03/oradata/ORCL/undotbs01.dbf conflicts with a file used by the target database
+RMAN-05001: auxiliary file name /u03/oradata/ORCL/system01.dbf conflicts with a file used by the target database
+
+-- << 원인 파악 >>
+-- 보조 인스턴스가 파일을 만들 위치가 없으면(#No auxiliary destination in use)
+-- 원본과 같은 경로에 복원하려 들고, 운영 중인 파일과 겹치므로 시작 전에 중단된다.
+-- FRA(DB_RECOVERY_FILE_DEST)가 있으면 그것을 쓰지만 이 환경에는 없다.
 -- AUXILIARY DESTINATION 으로 경로를 지정해야 한다.
 
 -- << 수정 >>
@@ -179,61 +255,307 @@ RMAN> RECOVER TABLE hr.emp160
   4>   REMAP TABLE hr.emp160:emp160_recovered;
 
 Starting recover at 18-MAY-25
-current log archived
+using channel ORA_DISK_1
+using channel ORA_DISK_2
 
-Creating automatic instance, with SID='qBxA'
+Creating automatic instance, with SID='uopE'
 
 initialization parameters used for automatic instance:
 db_name=ORCL
-db_unique_name=qBxA_pitr_ORCL
+db_unique_name=uopE_pitr_ORCL
 compatible=19.0.0
 db_block_size=8192
 db_files=200
 diagnostic_dest=/u01/app/oracle
-_no_recovery_through_resetlogs=TRUE
+_system_trig_enabled=FALSE
+sga_target=2048M
+processes=200
+db_4k_cache_size=48M
 db_create_file_dest=/u03/aux
-control_files=/u03/aux/ORCL/controlfile/o1_mf_...ctl
+log_archive_dest_1='location=/u03/aux'
+#No auxiliary parameter file used
+
 
 starting up automatic instance ORCL
+
 Oracle instance started
-Total System Global Area     1073741824 bytes
+
+Total System Global Area    2147481656 bytes
+
+Fixed Size                     8898616 bytes
+Variable Size                469762048 bytes
+Database Buffers            1660944384 bytes
+Redo Buffers                   7876608 bytes
 Automatic instance created
 
 contents of Memory Script:
 {
 # set requested point in time
-set until time "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')";
+set until  time "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')";
 # restore the controlfile
 restore clone controlfile;
+
 # mount the controlfile
 sql clone 'alter database mount clone database';
+
+# archive current online log
+sql 'alter system archive log current';
+# resync catalog
+resync catalog;
 }
 executing Memory Script
+
+executing command: SET until clause
+
+Starting restore at 18-MAY-25
+allocated channel: ORA_AUX_DISK_1
+channel ORA_AUX_DISK_1: SID=244 device type=DISK
+allocated channel: ORA_AUX_DISK_2
+channel ORA_AUX_DISK_2: SID=173 device type=DISK
+
+channel ORA_AUX_DISK_1: starting datafile backup set restore
+channel ORA_AUX_DISK_1: restoring control file
+channel ORA_AUX_DISK_1: reading from backup piece /home/oracle/rmanbk/cf_c-1200530011-20250518-00
+channel ORA_AUX_DISK_1: piece handle=/home/oracle/rmanbk/cf_c-1200530011-20250518-00 tag=TAG20250518T090412
+channel ORA_AUX_DISK_1: restored backup piece 1
+channel ORA_AUX_DISK_1: restore complete, elapsed time: 00:00:01
+output file name=/u03/aux/ORCL/controlfile/o1_mf_obk8hxmh_.ctl
+Finished restore at 18-MAY-25
+
+sql statement: alter database mount clone database
+
+sql statement: alter system archive log current
+
+starting full resync of recovery catalog
+full resync complete
 
 contents of Memory Script:
 {
 # set requested point in time
-set until time "TO_DATE('2025-05-18 09:10:00',...)";
+set until  time "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')";
+# set destinations for recovery set and auxiliary set datafiles
+set newname for clone datafile  1 to new;
+set newname for clone datafile  4 to new;
+set newname for clone datafile  3 to new;
+set newname for clone tempfile  1 to new;
+# switch all tempfiles
+switch clone tempfile all;
 # restore the tablespaces in the recovery set and the auxiliary set
-restore clone datafile  1, 3, 4, 7;
+restore clone datafile  1, 4, 3;
+
 switch clone datafile all;
 }
 executing Memory Script
 
+executing command: SET until clause
+executing command: SET NEWNAME
+executing command: SET NEWNAME
+executing command: SET NEWNAME
+executing command: SET NEWNAME
+
+renamed tempfile 1 to /u03/aux/ORCL/datafile/o1_mf_temp_%u_.tmp in control file
+
+Starting restore at 18-MAY-25
+using channel ORA_AUX_DISK_1
+using channel ORA_AUX_DISK_2
+
+channel ORA_AUX_DISK_1: starting datafile backup set restore
+channel ORA_AUX_DISK_1: specifying datafile(s) to restore from backup set
+channel ORA_AUX_DISK_1: restoring datafile 00001 to /u03/aux/ORCL/datafile/o1_mf_system_%u_.dbf
+channel ORA_AUX_DISK_1: restoring datafile 00004 to /u03/aux/ORCL/datafile/o1_mf_undotbs1_%u_.dbf
+channel ORA_AUX_DISK_1: restoring datafile 00003 to /u03/aux/ORCL/datafile/o1_mf_sysaux_%u_.dbf
+channel ORA_AUX_DISK_1: reading from backup piece /home/oracle/rmanbk/ORCL_20250518_223_1.bkp
+channel ORA_AUX_DISK_1: piece handle=/home/oracle/rmanbk/ORCL_20250518_223_1.bkp tag=BASE_161
+channel ORA_AUX_DISK_1: restored backup piece 1
+channel ORA_AUX_DISK_1: restore complete, elapsed time: 00:01:05
+Finished restore at 18-MAY-25
+
+datafile 1 switched to datafile copy
+input datafile copy RECID=26 STAMP=1200955302 file name=/u03/aux/ORCL/datafile/o1_mf_system_obk845jf_.dbf
+datafile 4 switched to datafile copy
+input datafile copy RECID=27 STAMP=1200955302 file name=/u03/aux/ORCL/datafile/o1_mf_undotbs1_obk845ll_.dbf
+datafile 3 switched to datafile copy
+input datafile copy RECID=28 STAMP=1200955302 file name=/u03/aux/ORCL/datafile/o1_mf_sysaux_obk845l8_.dbf
+
 contents of Memory Script:
 {
 # set requested point in time
-recover clone database tablespace  "USERS", "SYSTEM", "UNDOTBS1", "SYSAUX";
+set until  time "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')";
+# online the datafiles restored or switched
+sql clone "alter database datafile  1 online";
+sql clone "alter database datafile  4 online";
+sql clone "alter database datafile  3 online";
+# recover and open database read only
+recover clone database tablespace  "SYSTEM", "UNDOTBS1", "SYSAUX";
+sql clone 'alter database open read only';
+}
+executing Memory Script
+
+executing command: SET until clause
+
+sql statement: alter database datafile  1 online
+
+sql statement: alter database datafile  4 online
+
+sql statement: alter database datafile  3 online
+
+Starting recover at 18-MAY-25
+using channel ORA_AUX_DISK_1
+using channel ORA_AUX_DISK_2
+
+starting media recovery
+
+archived log for thread 1 with sequence 4 is already on disk as file /home/oracle/arch1/arch_1_4_1200936800.arc
+archived log for thread 1 with sequence 5 is already on disk as file /home/oracle/arch1/arch_1_5_1200936800.arc
+archived log file name=/home/oracle/arch1/arch_1_4_1200936800.arc thread=1 sequence=4
+archived log file name=/home/oracle/arch1/arch_1_5_1200936800.arc thread=1 sequence=5
+media recovery complete, elapsed time: 00:00:00
+Finished recover at 18-MAY-25
+
+sql statement: alter database open read only
+
+contents of Memory Script:
+{
+   sql clone "create spfile from memory";
+   shutdown clone immediate;
+   startup clone nomount;
+   sql clone "alter system set  control_files =
+  ''/u03/aux/ORCL/controlfile/o1_mf_obk8hxmh_.ctl'' comment=
+ ''RMAN set'' scope=spfile";
+   shutdown clone immediate;
+   startup clone nomount;
+# mount database
+sql clone 'alter database mount clone database';
+}
+executing Memory Script
+
+sql statement: create spfile from memory
+
+database closed
+database dismounted
+Oracle instance shut down
+
+connected to auxiliary database (not started)
+Oracle instance started
+
+Total System Global Area    2147481656 bytes
+
+Fixed Size                     8898616 bytes
+Variable Size                469762048 bytes
+Database Buffers            1660944384 bytes
+Redo Buffers                   7876608 bytes
+
+sql statement: alter system set  control_files =   ''/u03/aux/ORCL/controlfile/o1_mf_obk8hxmh_.ctl'' comment= ''RMAN set'' scope=spfile
+
+Oracle instance shut down
+
+connected to auxiliary database (not started)
+Oracle instance started
+
+Total System Global Area    2147481656 bytes
+
+Fixed Size                     8898616 bytes
+Variable Size                469762048 bytes
+Database Buffers            1660944384 bytes
+Redo Buffers                   7876608 bytes
+
+sql statement: alter database mount clone database
+
+contents of Memory Script:
+{
+# set requested point in time
+set until  time "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')";
+# set destinations for recovery set and auxiliary set datafiles
+set newname for datafile  7 to new;
+# restore the tablespaces in the recovery set and the auxiliary set
+restore clone datafile  7;
+
+switch clone datafile all;
+}
+executing Memory Script
+
+executing command: SET until clause
+
+executing command: SET NEWNAME
+
+Starting restore at 18-MAY-25
+allocated channel: ORA_AUX_DISK_1
+channel ORA_AUX_DISK_1: SID=91 device type=DISK
+allocated channel: ORA_AUX_DISK_2
+channel ORA_AUX_DISK_2: SID=172 device type=DISK
+
+channel ORA_AUX_DISK_1: starting datafile backup set restore
+channel ORA_AUX_DISK_1: specifying datafile(s) to restore from backup set
+channel ORA_AUX_DISK_1: restoring datafile 00007 to /u03/aux/UOPE_PITR_ORCL/datafile/o1_mf_users_%u_.dbf
+channel ORA_AUX_DISK_1: reading from backup piece /home/oracle/rmanbk/ORCL_20250518_224_1.bkp
+channel ORA_AUX_DISK_1: piece handle=/home/oracle/rmanbk/ORCL_20250518_224_1.bkp tag=BASE_161
+channel ORA_AUX_DISK_1: restored backup piece 1
+channel ORA_AUX_DISK_1: restore complete, elapsed time: 00:00:01
+Finished restore at 18-MAY-25
+
+datafile 7 switched to datafile copy
+input datafile copy RECID=30 STAMP=1200955381 file name=/u03/aux/UOPE_PITR_ORCL/datafile/o1_mf_users_obk88o09_.dbf
+
+contents of Memory Script:
+{
+# set requested point in time
+set until  time "TO_DATE('2025-05-18 09:10:00','YYYY-MM-DD HH24:MI:SS')";
+# online the datafiles restored or switched
+sql clone "alter database datafile  7 online";
+# recover and open resetlogs
+recover clone database tablespace  "USERS", "SYSTEM", "UNDOTBS1", "SYSAUX" delete archivelog;
 alter clone database open resetlogs;
 }
 executing Memory Script
 
+executing command: SET until clause
+
+sql statement: alter database datafile  7 online
+
+Starting recover at 18-MAY-25
+using channel ORA_AUX_DISK_1
+using channel ORA_AUX_DISK_2
+
+starting media recovery
+
+archived log for thread 1 with sequence 4 is already on disk as file /home/oracle/arch1/arch_1_4_1200936800.arc
+archived log for thread 1 with sequence 5 is already on disk as file /home/oracle/arch1/arch_1_5_1200936800.arc
+archived log file name=/home/oracle/arch1/arch_1_4_1200936800.arc thread=1 sequence=4
+archived log file name=/home/oracle/arch1/arch_1_5_1200936800.arc thread=1 sequence=5
+media recovery complete, elapsed time: 00:00:00
+Finished recover at 18-MAY-25
+
+database opened
+
+contents of Memory Script:
+{
+# create directory for datapump import
+sql "create or replace directory TSPITR_DIROBJ_DPDIR as ''
+/u03/aux''";
+# create directory for datapump export
+sql clone "create or replace directory TSPITR_DIROBJ_DPDIR as ''
+/u03/aux''";
+}
+executing Memory Script
+
+sql statement: create or replace directory TSPITR_DIROBJ_DPDIR as ''/u03/aux''
+
+sql statement: create or replace directory TSPITR_DIROBJ_DPDIR as ''/u03/aux''
+
 Performing export of tables...
-   EXPDP> Starting "SYS"."TSPITR_EXP_qBxA_xoDt":
+   EXPDP> Starting "SYS"."TSPITR_EXP_uopE_habh":
    EXPDP> Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
-   EXPDP> . . exported "HR"."EMP160"                   8.789 KB     107 rows
-   EXPDP> Job "SYS"."TSPITR_EXP_qBxA_xoDt" successfully completed
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/TABLE
+   EXPDP> . . exported "HR"."EMP160"                               17.12 KB     107 rows
+   EXPDP> Master table "SYS"."TSPITR_EXP_uopE_habh" successfully loaded/unloaded
+   EXPDP> ******************************************************************************
+   EXPDP> Dump file set for SYS.TSPITR_EXP_uopE_habh is:
+   EXPDP>   /u03/aux/tspitr_uopE_18876.dmp
+   EXPDP> Job "SYS"."TSPITR_EXP_uopE_habh" successfully completed at Sun May 18 09:29:01 2025 elapsed 0 00:00:22
 Export completed
+
 
 contents of Memory Script:
 {
@@ -242,18 +564,42 @@ shutdown clone abort
 }
 executing Memory Script
 
+Oracle instance shut down
+
 Performing import of tables...
-   IMPDP> Master table "SYS"."TSPITR_IMP_qBxA_alkx" successfully loaded/unloaded
-   IMPDP> Starting "SYS"."TSPITR_IMP_qBxA_alkx":
-   IMPDP> . . imported "HR"."EMP160_RECOVERED"         8.789 KB     107 rows
-   IMPDP> Job "SYS"."TSPITR_IMP_qBxA_alkx" successfully completed
+   IMPDP> Master table "SYS"."TSPITR_IMP_uopE_DfAo" successfully loaded/unloaded
+   IMPDP> Starting "SYS"."TSPITR_IMP_uopE_DfAo":
+   IMPDP> Processing object type TABLE_EXPORT/TABLE/TABLE
+   IMPDP> Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+   IMPDP> . . imported "HR"."EMP160_RECOVERED"                     17.12 KB     107 rows
+   IMPDP> Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+   IMPDP> Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+   IMPDP> Job "SYS"."TSPITR_IMP_uopE_DfAo" successfully completed at Sun May 18 09:29:17 2025 elapsed 0 00:00:11
 Import completed
 
+
 Removing automatic instance
-auxiliary instance file /u03/aux/ORCL/datafile/o1_mf_system_... deleted
-auxiliary instance file /u03/aux/ORCL/controlfile/o1_mf_... deleted
-Removing automatic instance complete
+Automatic instance removed
+auxiliary instance file /u03/aux/ORCL/datafile/o1_mf_temp_obk869lv_.tmp deleted
+auxiliary instance file /u03/aux/UOPE_PITR_ORCL/onlinelog/o1_mf_4_obk88qhc_.log deleted
+auxiliary instance file /u03/aux/UOPE_PITR_ORCL/onlinelog/o1_mf_3_obk88qdy_.log deleted
+auxiliary instance file /u03/aux/UOPE_PITR_ORCL/onlinelog/o1_mf_1_obk88qc0_.log deleted
+auxiliary instance file /u03/aux/UOPE_PITR_ORCL/datafile/o1_mf_users_obk88o09_.dbf deleted
+auxiliary instance file /u03/aux/ORCL/datafile/o1_mf_sysaux_obk845l8_.dbf deleted
+auxiliary instance file /u03/aux/ORCL/datafile/o1_mf_undotbs1_obk845ll_.dbf deleted
+auxiliary instance file /u03/aux/ORCL/datafile/o1_mf_system_obk845jf_.dbf deleted
+auxiliary instance file /u03/aux/ORCL/controlfile/o1_mf_obk8hxmh_.ctl deleted
+auxiliary instance file tspitr_uopE_18876.dmp deleted
 Finished recover at 18-MAY-25
+
+-- 로그를 구간별로 읽는다.
+--   ① 보조 인스턴스 생성 : 임의 SID(uopE), sga 2G, 파일 위치는 AUXILIARY DESTINATION
+--   ② 컨트롤파일 복원 → clone MOUNT → 카탈로그 RESYNC
+--   ③ SYSTEM·UNDO·SYSAUX 복원(SET NEWNAME … TO NEW) → 시점까지 복구 → READ ONLY 오픈
+--   ④ spfile 을 만들어 재기동한 뒤 대상 테이블스페이스(USERS, 파일 7) 복원·복구 → RESETLOGS 오픈
+--   ⑤ Data Pump 디렉터리 생성 → clone 에서 EXPDP(107행) → clone 종료 → 원본에 IMPDP
+--   ⑥ 보조 인스턴스와 파일 정리
+-- clone 이 붙은 명령이 보조 인스턴스를 대상으로 한 것이다. 15장에서 배운 절차와 같다.
 
 --------------------------------------------------------------------------------
 [8] 검증 및 실무 포인트
@@ -268,24 +614,21 @@ SYS@orcl> SELECT COUNT(*) FROM hr.emp160_recovered;
 ----------
        107
 
--- 삭제 전 상태로 복구되었다.
+-- TRUNCATE 전 상태로 복구되었다.
 
 SYS@orcl> SELECT COUNT(*) FROM hr.emp160;
 
   COUNT(*)
 ----------
-         5
+         0
 
--- 현재 테이블은 그대로다. REMAP 덕분에 덮어쓰지 않았다.
+-- 현재 테이블은 그대로다. REMAP 덕분에 건드리지 않았다.
 
--- 필요한 행만 반영한다.
+-- 확인이 끝났으니 반영한다.
 
-SYS@orcl> INSERT INTO hr.emp160
-  2  SELECT * FROM hr.emp160_recovered r
-  3  WHERE  NOT EXISTS (SELECT 1 FROM hr.emp160 e
-  4                     WHERE e.employee_id = r.employee_id);
+SYS@orcl> INSERT INTO hr.emp160 SELECT * FROM hr.emp160_recovered;
 
-102 rows created.
+107 rows created.
 
 SYS@orcl> COMMIT;
 
@@ -301,20 +644,27 @@ Table dropped.
 
 -- 보조 인스턴스 파일이 정리되었는지 확인한다.
 
-SYS@orcl> !ls -R /u03/aux 2>/dev/null | head -5
+SYS@orcl> !ls -R /u03/aux | head -6
+/u03/aux:
+ORCL
+UOPE_PITR_ORCL
+
+/u03/aux/ORCL:
+controlfile
 
 SYS@orcl> !du -sh /u03/aux
-4.0K    /u03/aux
+0       /u03/aux
 
--- 비어 있다. 정리가 정상적으로 끝났다.
+-- 빈 디렉터리만 남고 파일은 모두 지워졌다. 정리가 정상적으로 끝났다.
 
-SYS@orcl> SELECT COUNT(*) FROM v$instance;
+SYS@orcl> SELECT directory_name, directory_path FROM dba_directories
+  2  WHERE  directory_name LIKE 'TSPITR%';
 
-  COUNT(*)
-----------
-         1
+DIRECTORY_NAME        DIRECTORY_PATH
+--------------------- ---------------
+TSPITR_DIROBJ_DPDIR   /u03/aux
 
--- 보조 인스턴스가 남아 있지 않다.
+-- Data Pump 용 디렉터리 객체는 원본 DB 에 남는다. 다음 수행 때 재사용된다.
 
 SYS@orcl> EXIT
 
@@ -322,22 +672,24 @@ SYS@orcl> EXIT
 oracle    3021     1  0 08:40 ?        00:00:01 ora_pmon_orcl
 oracle    4188     1  0 08:52 ?        00:00:00 ora_pmon_rcat
 
+-- 보조 인스턴스가 남아 있지 않다.
+
 -- 실무 포인트
 -- 1) Flashback이 안 되는 상황에서 RECOVER TABLE이 답이 된다.
---    ORA-01555는 UNDO가 이미 덮였다는 뜻이며 Flashback 계열을 쓸 수 없다.
+--    TRUNCATE·DROP 뒤 PURGE 처럼 UNDO 가 없는 경우(ORA-01466), UNDO 가 이미 덮인 경우(ORA-01555)다.
 --    RECOVER TABLE은 백업과 아카이브를 쓰므로 UNDO와 무관하다.
 --
--- 2) AUXILIARY DESTINATION 은 필수다.
---    FRA가 구성되어 있으면 생략할 수 있으나 그렇지 않으면 RMAN-05902가 나온다.
+-- 2) 같은 이름의 테이블이 있으면 RMAN-05112 로 거부된다. 덮어쓰지 않는다.
+--    REMAP TABLE 로 다른 이름으로 가져와 확인한 뒤 필요한 행만 반영하는 것이 기본이다.
+--    (원본을 먼저 DROP 하면 REMAP 없이도 되지만 되돌릴 수 없다.)
+--
+-- 3) AUXILIARY DESTINATION 은 FRA 가 없으면 필수다.
+--    없으면 원본 파일 위치로 복원하려다 RMAN-05001/05517 로 중단된다.
 --    SYSTEM·SYSAUX·UNDO와 대상 TS만큼의 공간이 필요하다.
 --
--- 3) REMAP TABLE을 기본으로 쓴다.
---    생략하면 현재 테이블을 덮어쓰며 되돌릴 수 없다.
---    다른 이름으로 가져와 확인한 뒤 필요한 행만 반영하는 편이 안전하다.
---
--- 4) 로그는 다섯 구간으로 읽는다.
---    보조 인스턴스 생성, Memory Script, 복원과 복구, Export/Import, 정리다.
---    clone 이 붙은 명령이 보조 인스턴스를 대상으로 하는 것이다.
+-- 4) 로그는 여섯 구간으로 읽는다.
+--    보조 인스턴스 생성, 컨트롤파일 복원·RESYNC, 보조 세트 복원·복구,
+--    대상 TS 복원·RESETLOGS, Export/Import, 정리다.
 --
 -- 5) Export 단계의 행 수를 확인한다.
 --    기대한 수와 다르면 시점을 잘못 지정한 것이다.
