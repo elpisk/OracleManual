@@ -74,45 +74,45 @@ WHERE mc.claim_id = cd.claim_id AND cd.drug_code = dm.drug_code AND dm.category 
 
 ## 05. Execution Plan — 세 버전 실측 비교
 
-**A. IN 방식** (SQL_ID `cmm0gaqr7whs5`)
+**A. IN 방식** (SQL_ID `7z0a37r0usf76`) — 실습 01 직후라 CLAIM_DETAILS 가 캐시에 없어 Reads 열이 나타난다
+
+```text
+| Id | Operation             | Name               | E-Rows | A-Rows |   A-Time   | Buffers | Reads |
+| 0  | SELECT STATEMENT      |                    |        |      1 |00:00:00.10 |    8659 |  6709 |
+| 1  |  SORT AGGREGATE       |                    |      1 |      1 |00:00:00.10 |    8659 |  6709 |
+| 2  |   HASH JOIN RIGHT SEMI|                    |   296K |  79342 |00:00:00.10 |    8659 |  6709 |
+| 3  |    VIEW                | VW_NSO_1          |   299K |  90430 |00:00:00.02 |    6768 |  6709 |
+| 4  |     HASH JOIN          |                    |   299K |  90430 |00:00:00.02 |    6768 |  6709 |
+| 5  |      TABLE ACCESS FULL | DRUG_MASTER        |   3333 |   1000 |00:00:00.01 |      91 |    89 |
+| 6  |      TABLE ACCESS FULL | CLAIM_DETAILS      |   899K |   899K |00:00:00.01 |    6621 |  6613 |
+| 7  |    INDEX FAST FULL SCAN| PK_MEDICAL_CLAIMS  |   300K |   300K |00:00:00.02 |    1891 |     0 |
+```
+
+**B. EXISTS 방식** (SQL_ID `7jgu8vt9cppsb`) — 구조가 A와 동일, `VIEW` 이름만 `VW_SQ_1`. Reads 열이 없다
 
 ```text
 | Id | Operation             | Name               | E-Rows | A-Rows |   A-Time   | Buffers |
-| 0  | SELECT STATEMENT      |                    |        |      1 |00:00:03.04 |    8604 |
-| 1  |  SORT AGGREGATE       |                    |      1 |      1 |00:00:03.04 |    8604 |
-| 2  |   HASH JOIN RIGHT SEMI|                    |   296K |  79342 |00:00:03.03 |    8604 |
-| 3  |    VIEW                | VW_NSO_1          |   299K |  90430 |00:00:00.03 |    6713 |
+| 0  | SELECT STATEMENT      |                    |        |      1 |00:00:00.05 |    8604 |
+| 1  |  SORT AGGREGATE       |                    |      1 |      1 |00:00:00.05 |    8604 |
+| 2  |   HASH JOIN RIGHT SEMI|                    |   296K |  79342 |00:00:00.06 |    8604 |
+| 3  |    VIEW                | VW_SQ_1           |   299K |  90430 |00:00:00.02 |    6713 |
 | 4  |     HASH JOIN          |                    |   299K |  90430 |00:00:00.02 |    6713 |
 | 5  |      TABLE ACCESS FULL | DRUG_MASTER        |   3333 |   1000 |00:00:00.01 |      91 |
 | 6  |      TABLE ACCESS FULL | CLAIM_DETAILS      |   899K |   899K |00:00:00.01 |    6621 |
-| 7  |    INDEX FAST FULL SCAN| PK_MEDICAL_CLAIMS  |   300K |   300K |00:00:02.88 |    1891 |
+| 7  |    INDEX FAST FULL SCAN| PK_MEDICAL_CLAIMS  |   300K |   300K |00:00:00.01 |    1891 |
 ```
 
-**B. EXISTS 방식** (SQL_ID `b0r8p72bjvc2f`) — 구조가 A와 동일, `VIEW` 이름만 `VW_SQ_1`
-
-```text
-| Id | Operation             | Name               | E-Rows | A-Rows |   A-Time   | Buffers |
-| 0  | SELECT STATEMENT      |                    |        |      1 |00:00:00.13 |    8604 |
-| 1  |  SORT AGGREGATE       |                    |      1 |      1 |00:00:00.13 |    8604 |
-| 2  |   HASH JOIN RIGHT SEMI|                    |   296K |  79342 |00:00:00.12 |    8604 |
-| 3  |    VIEW                | VW_SQ_1           |   299K |  90430 |00:00:00.04 |    6713 |
-| 4  |     HASH JOIN          |                    |   299K |  90430 |00:00:00.03 |    6713 |
-| 5  |      TABLE ACCESS FULL | DRUG_MASTER        |   3333 |   1000 |00:00:00.01 |      91 |
-| 6  |      TABLE ACCESS FULL | CLAIM_DETAILS      |   899K |   899K |00:00:00.02 |    6621 |
-| 7  |    INDEX FAST FULL SCAN| PK_MEDICAL_CLAIMS  |   300K |   300K |00:00:00.02 |    1891 |
-```
-
-**C. JOIN + DISTINCT 방식** (SQL_ID `a3nqx088zkzhq`)
+**C. JOIN + DISTINCT 방식** (SQL_ID `dx438vv8qg166`)
 
 ```text
 | Id | Operation           | Name          | E-Rows | A-Rows |   A-Time   | Buffers |
-| 0  | SELECT STATEMENT    |               |        |      1 |00:00:00.04 |    6713 |
-| 1  |  SORT AGGREGATE     |               |      1 |      1 |00:00:00.04 |    6713 |
-| 2  |   VIEW               | VW_DAG_0     |   296K |  79342 |00:00:00.04 |    6713 |
-| 3  |    HASH GROUP BY     |               |   296K |  79342 |00:00:00.04 |    6713 |
-| 4  |     HASH JOIN        |               |   299K |  90430 |00:00:00.03 |    6713 |
+| 0  | SELECT STATEMENT    |               |        |      1 |00:00:00.05 |    6713 |
+| 1  |  SORT AGGREGATE     |               |      1 |      1 |00:00:00.05 |    6713 |
+| 2  |   VIEW               | VW_DAG_0     |   296K |  79342 |00:00:00.05 |    6713 |
+| 3  |    HASH GROUP BY     |               |   296K |  79342 |00:00:00.05 |    6713 |
+| 4  |     HASH JOIN        |               |   299K |  90430 |00:00:00.04 |    6713 |
 | 5  |      TABLE ACCESS FULL| DRUG_MASTER  |   3333 |   1000 |00:00:00.01 |      91 |
-| 6  |      TABLE ACCESS FULL| CLAIM_DETAILS|   899K |   899K |00:00:00.02 |    6621 |
+| 6  |      TABLE ACCESS FULL| CLAIM_DETAILS|   899K |   899K |00:00:00.03 |    6621 |
 ```
 
 - C 버전 실행계획에는 `MEDICAL_CLAIMS`나 `PK_MEDICAL_CLAIMS`에 대한 접근이 전혀 없음 —
@@ -124,13 +124,14 @@ WHERE mc.claim_id = cd.claim_id AND cd.drug_code = dm.drug_code AND dm.category 
 - A(IN)와 B(EXISTS)의 실행계획은 `VIEW` 이름(`VW_NSO_1` vs `VW_SQ_1`)만 다를 뿐 오퍼레이션
   구성이 완전히 동일함 — Oracle 옵티마이저가 IN 서브쿼리와 EXISTS 서브쿼리를 **같은
   세미조인(HASH JOIN RIGHT SEMI) 형태로 변환**했기 때문
-- 그런데 A-Time은 A가 3.04초, B가 0.13초로 크게 다름. Buffers는 둘 다 8,604로 동일
-  - Buffers(논리적 I/O)가 같은데 시간이 다른 것은 **물리적 I/O(디스크 접근) 여부** 때문일
-    가능성이 큼 — A를 먼저 실행해 디스크에서 블록을 읽어 캐시에 올렸고, B는 그 직후
-    실행되어 이미 캐시에 있는 블록을 그대로 재사용했을 가능성이 높음
-  - 특히 A의 7번 단계(`INDEX FAST FULL SCAN`, `PK_MEDICAL_CLAIMS`)만 유독 2.88초가
-    걸렸고 B의 동일 단계는 0.02초임 — 같은 오퍼레이션인데 시간 차이가 집중된 지점이 정확히
-    "처음 읽는 블록"에 해당하는 부분과 일치함
+- 그런데 A-Time은 A가 0.10초, B가 0.05초로 두 배 다름. Buffers는 둘 다 8,604(A 는 물리 읽기에 따른
+  몇십 블록이 더해져 8,659)로 사실상 동일
+  - Buffers(논리적 I/O)가 같은데 시간이 다른 것은 **물리적 I/O(디스크 접근) 여부** 때문 — A 의 계획에만
+    Reads 열이 있고(6,709), B 에는 열 자체가 없음. A를 먼저 실행해 디스크에서 블록을 읽어 캐시에 올렸고,
+    B는 그 직후 실행되어 이미 캐시에 있는 블록을 그대로 재사용함. V$SQL.DISK_READS 로도 6,714 vs 0
+  - 특히 A의 6번 단계(`TABLE ACCESS FULL`, `CLAIM_DETAILS`)에 Reads 6,613 이 몰려 있음 — 실습 01 이
+    MEDICAL_CLAIMS 만 읽었으므로 CLAIM_DETAILS 는 "처음 읽는 블록"이었음. 이 실습 VM 은 SSD 위라 두 배에
+    그쳤지만 회전 디스크라면 수십 배로 벌어지는 지점
 - 결론: 이번 실측에서 "EXISTS가 IN보다 빠르다"는 차이는 **EXISTS와 IN의 구조적 차이가
   아니라 캐시 상태(먼저 실행됐는지 나중에 실행됐는지)에서 비롯됨**. 실행계획 구조 자체는
   동일했음
@@ -149,9 +150,9 @@ WHERE mc.claim_id = cd.claim_id AND cd.drug_code = dm.drug_code AND dm.category 
 
 | 버전 | Buffers | A-Time | Memory(Used-Mem, 최대) | 비고 |
 |---|---:|---|---|---|
-| A. IN | 8,604 | 3.04초 | 6,694K | EXISTS와 구조 동일, 캐시 미보유 상태에서 측정 |
-| B. EXISTS | 8,604 | 0.13초 | 6,694K | IN과 구조 동일, 캐시 보유 상태에서 측정 |
-| C. JOIN+DISTINCT | 6,713 | 0.04초 | 12M(HASH GROUP BY) | MEDICAL_CLAIMS 접근 자체가 없음 |
+| A. IN | 8,659 | 0.10초 | 6,651K | EXISTS와 구조 동일, 캐시 미보유 상태에서 측정(Reads 6,709) |
+| B. EXISTS | 8,604 | 0.05초 | 6,694K | IN과 구조 동일, 캐시 보유 상태에서 측정 |
+| C. JOIN+DISTINCT | 6,713 | 0.05초 | 12M(HASH GROUP BY) | MEDICAL_CLAIMS 접근 자체가 없음 |
 
 - Buffers만 보면 C가 가장 적고, A·B는 동일함
 - Memory는 C가 `HASH GROUP BY` 때문에 오히려 더 큰 작업 영역(12M)을 씀 — "Buffers가 적은

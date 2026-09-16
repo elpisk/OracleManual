@@ -60,10 +60,10 @@ WHERE c.hosp_id = h.hosp_id AND c.hosp_id <= 5;
 
 ```text
 | Id | Operation                   | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
-| 0  | SELECT STATEMENT            |                |      1 |        |  15029 |00:00:00.09 |    4081 |
+| 0  | SELECT STATEMENT            |                |      1 |        |  15029 |00:00:00.02 |    4081 |
 | 1  |  TABLE ACCESS BY INDEX ROWID| HOSPITALS      |      5 |      1 |      5 |00:00:00.01 |      13 |
 | 2  |   INDEX UNIQUE SCAN         | PK_HOSPITALS   |      5 |      1 |      5 |00:00:00.01 |       8 |
-| 3  |  TABLE ACCESS FULL          | MEDICAL_CLAIMS |      1 |  14397 |  15029 |00:00:00.09 |    4081 |
+| 3  |  TABLE ACCESS FULL          | MEDICAL_CLAIMS |      1 |  15283 |  15029 |00:00:00.02 |    4081 |
 ```
 
 **Q2. JOIN**
@@ -71,10 +71,10 @@ WHERE c.hosp_id = h.hosp_id AND c.hosp_id <= 5;
 ```text
 | Id | Operation                          | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
 | 0  | SELECT STATEMENT                   |                |      1 |        |  15029 |00:00:00.02 |    4083 |
-| 1  |  HASH JOIN                         |                |      1 |     72 |  15029 |00:00:00.02 |    4083 |
+| 1  |  HASH JOIN                         |                |      1 |     76 |  15029 |00:00:00.01 |    4083 |
 | 2  |   TABLE ACCESS BY INDEX ROWID BATCHED| HOSPITALS    |      1 |      5 |      5 |00:00:00.01 |       3 |
 | 3  |    INDEX RANGE SCAN                | PK_HOSPITALS   |      1 |      5 |      5 |00:00:00.01 |       2 |
-| 4  |   TABLE ACCESS FULL                | MEDICAL_CLAIMS |      1 |  14397 |  15029 |00:00:00.02 |    4080 |
+| 4  |   TABLE ACCESS FULL                | MEDICAL_CLAIMS |      1 |  15283 |  15029 |00:00:00.01 |    4080 |
 ```
 
 - 결과 행은 15,029건으로 동일한데, Q1의 스칼라 서브쿼리는 `HOSPITALS`에 대해 `Starts=5`
@@ -95,19 +95,19 @@ AND   c.total_amt > (SELECT AVG(c2.total_amt) FROM medical_claims c2 WHERE c2.ho
 
 ```text
 | Id | Operation           | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
-| 0  | SELECT STATEMENT    |                |      1 |        |   6462 |00:00:00.03 |    6609 |
-| 1  |  HASH JOIN          |                |      1 |   6922 |   6462 |00:00:00.03 |    6609 |
-| 2  |   VIEW               | VW_SQ_1       |      1 |     48 |      5 |00:00:00.01 |    3090 |
-| 3  |    HASH GROUP BY     |                |      1 |     48 |      5 |00:00:00.01 |    3090 |
-| 4  |     TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |  14397 |  15029 |00:00:00.01 |    3090 |
-| 5  |   TABLE ACCESS FULL  | MEDICAL_CLAIMS |      1 |  14397 |  15029 |00:00:00.01 |    3518 |
+| 0  | SELECT STATEMENT    |                |      1 |        |   6462 |00:00:00.03 |    6612 |
+| 1  |  HASH JOIN          |                |      1 |   7951 |   6462 |00:00:00.03 |    6612 |
+| 2  |   VIEW               | VW_SQ_1       |      1 |     50 |      5 |00:00:00.02 |    3090 |
+| 3  |    HASH GROUP BY     |                |      1 |     50 |      5 |00:00:00.02 |    3090 |
+| 4  |     TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |  15283 |  15029 |00:00:00.01 |    3090 |
+| 5  |   TABLE ACCESS FULL  | MEDICAL_CLAIMS |      1 |  15283 |  15029 |00:00:00.01 |    3518 |
 ```
 
 - Oracle은 이 상관 서브쿼리를 "행마다 반복 실행"하지 않고, `HOSP_ID`별 평균을 미리 한
   번에 계산하는 `VIEW VW_SQ_1`(내부적으로 `HASH GROUP BY`)로 변환한 뒤, 원본 데이터와
   다시 조인하는 형태로 처리함
 - 문제는 이 변환이 결과적으로 `MEDICAL_CLAIMS`를 **두 번** 읽게 만든다는 점(Id 4에서
-  한 번, Id 5에서 한 번) — Buffers가 6,609로, Q1·Q2(약 4,080대)보다 오히려 커짐
+  한 번, Id 5에서 한 번) — Buffers가 6,612로, Q1·Q2(약 4,080대)보다 오히려 커짐
 - 상관 서브쿼리가 자동으로 효율적인 형태로 변환되긴 하지만, "원본 테이블을 여러 번
   읽어야 하는 구조"라면 그 변환 자체가 비용을 늘릴 수 있음 — 무조건 저렴하다고 가정하면
   안 됨
@@ -139,7 +139,7 @@ SELECT hosp_id, COUNT(*) cnt FROM medical_claims GROUP BY hosp_id HAVING COUNT(*
 | 비교 | 방식 A | 방식 B | Buffers A | Buffers B | 비고 |
 |---|---|---|---:|---:|---|
 | 값 하나 붙이기 | 스칼라 서브쿼리 | JOIN | 4,081 | 4,083 | distinct 값이 적어 캐싱으로 거의 동일 |
-| 그룹 평균과 비교 | 상관 서브쿼리 | (JOIN 미측정) | 6,609 | - | 테이블 2회 스캔되는 구조라 오히려 비쌈 |
+| 그룹 평균과 비교 | 상관 서브쿼리 | (JOIN 미측정) | 6,612 | - | 테이블 2회 스캔되는 구조라 오히려 비쌈 |
 | 집계 결과 필터링 | 인라인 뷰+WHERE | HAVING | 3,090 | 3,090 | 뷰 병합으로 완전히 동등 |
 
 ## 09. Practice

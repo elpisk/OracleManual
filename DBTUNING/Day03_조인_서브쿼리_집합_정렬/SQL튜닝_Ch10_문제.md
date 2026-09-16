@@ -23,14 +23,14 @@ BY`가 발생했다. `claim_id`가 PK인데도 정렬이 생략되지 않은 이
 경로(`TABLE ACCESS FULL`)와 연결지어 설명하시오.
 
 **5. [상]** 좁은 범위(0.27% 선택도)에서는 `ORDER BY claim_id`가 정렬을 완전히 생략했다
-(Buffers 776, `SORT` 오퍼레이션 없음). 왜 이 범위에서는 정렬이 생략될 수 있었는지, 4번
+(Buffers 791, `SORT` 오퍼레이션 없음). 왜 이 범위에서는 정렬이 생략될 수 있었는지, 4번
 문항과 대조해서 설명하시오.
 
 **6. [최상]** "ORDER BY 대상 컬럼에 인덱스만 있으면 정렬이 생략된다"는 말이 4·5번
 문항의 실측 결과를 종합했을 때 왜 부정확한지, 더 정확한 조건은 무엇인지 서술하시오.
 
-**7. [상]** 좁은 범위에서 `ORDER BY total_amt`(비인덱스 컬럼, Buffers 717)와 `ORDER BY
-claim_id`(인덱스 컬럼, Buffers 776)를 비교하면, 오히려 정렬이 발생한 total_amt 쪽의
+**7. [상]** 좁은 범위에서 `ORDER BY total_amt`(비인덱스 컬럼, Buffers 731)와 `ORDER BY
+claim_id`(인덱스 컬럼, Buffers 791)를 비교하면, 오히려 정렬이 발생한 total_amt 쪽의
 Buffers가 더 작다. 이 결과가 "정렬이 없으면 항상 더 저렴하다"는 단순한 가정에 대해
 무엇을 시사하는지 논하시오. (힌트: `TABLE ACCESS BY INDEX ROWID`와 `... BATCHED`의
 차이, Chapter 3 4번 해설을 참고할 것)

@@ -150,12 +150,12 @@ Q6 전체 실행계획 (문제지 7번 문항 소재):
 
 ```text
 | Id | Operation                          | Name           | Rows  | Bytes | Cost(%CPU)|
-| 0  | SELECT STATEMENT                   |                |     4 |    84 |   860  (1)|
-| 1  |  HASH GROUP BY                     |                |     4 |    84 |   860  (1)|
-| 2  |   HASH JOIN                        |                |   297 |  6237 |   859  (1)|
+| 0  | SELECT STATEMENT                   |                |     4 |    64 |   859  (1)|
+| 1  |  HASH GROUP BY                     |                |     4 |    64 |   859  (1)|
+| 2  |   HASH JOIN                        |                |   292 |  4672 |   858  (1)|
 | 3  |    TABLE ACCESS BY INDEX ROWID BATCHED| HOSPITALS   |    10 |   120 |     3  (0)|
 | 4  |     INDEX RANGE SCAN               | PK_HOSPITALS   |    10 |       |     2  (0)|
-| 5  |    TABLE ACCESS FULL               | MEDICAL_CLAIMS | 29631 |   260K|   855  (1)|
+| 5  |    TABLE ACCESS FULL               | MEDICAL_CLAIMS | 29128 |   113K|   855  (1)|
 
 Predicate Information:
    2 - access("H"."HOSP_ID"="M"."HOSP_ID")

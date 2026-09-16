@@ -54,22 +54,22 @@ SELECT COUNT(*) FROM medical_claims WHERE hosp_id = :b_hosp;
 
 ## 05. Execution Plan — 리터럴 값에 따른 실측 비교
 
-**HOSP_ID=1** (SQL_ID `92p460f4hj858`, 대형병원·쏠림 구간)
+**HOSP_ID=1** (SQL_ID `0fqfut0m2jfxw`, 대형병원·쏠림 구간)
 
 ```text
 | Id | Operation         | Name           | E-Rows | A-Rows |   A-Time   | Buffers |
-| 2  |  TABLE ACCESS FULL | MEDICAL_CLAIMS |   3039 |   3058 |00:00:01.92 |    3090 |
+| 2  |  TABLE ACCESS FULL | MEDICAL_CLAIMS |   2795 |   3058 |00:00:00.01 |    3090 |
 ```
 
-**HOSP_ID=500** (SQL_ID `5awbw1wcprrj2`, 일반 병원)
+**HOSP_ID=500** (SQL_ID `71xyxd4t42wvj`, 일반 병원)
 
 ```text
 | Id | Operation         | Name           | E-Rows | A-Rows |   A-Time   | Buffers |
-| 2  |  TABLE ACCESS FULL | MEDICAL_CLAIMS |    109 |    177 |00:00:00.01 |    3090 |
+| 2  |  TABLE ACCESS FULL | MEDICAL_CLAIMS |    280 |    177 |00:00:00.01 |    3090 |
 ```
 
-- 두 SQL은 리터럴 값만 다를 뿐 문장 구조가 완전히 같은데도 **E-Rows가 3039 vs 109로
-  실제 차이(3058 vs 177)에 가깝게 다르게 나옴**. 왜 이런 정확한 추정이 가능했는지는
+- 두 SQL은 리터럴 값만 다를 뿐 문장 구조가 완전히 같은데도 **E-Rows가 2,795 vs 280으로
+  실제 차이(3,058 vs 177)에 가깝게 다르게 나옴**(히스토그램은 표본이라 수집마다 ±10% 흔들린다). 왜 이런 정확한 추정이 가능했는지는
   06절에서 확인함
 - Buffers는 3,090으로 둘 다 동일 — `HOSP_ID`에 인덱스가 없어 두 조회 모두 테이블
   전체를 Full Scan하기 때문(어떤 값을 찾든 결국 전체를 다 읽어야 함)

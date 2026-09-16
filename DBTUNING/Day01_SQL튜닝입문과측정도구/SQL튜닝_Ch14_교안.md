@@ -54,32 +54,37 @@ WHERE claim_id BETWEEN '20240601-0000000' AND '20240602-0000000';
 **콜드 캐시(버퍼 캐시 비운 직후 첫 실행)**
 
 ```text
-| Id | Operation         | Name           | A-Rows |   A-Time   | Buffers | Reads |
-| 0  | SELECT STATEMENT  |                |    804 |00:00:03.46 |    3144 |  3085 |
-| 1  |  TABLE ACCESS FULL| MEDICAL_CLAIMS |    804 |00:00:03.46 |    3144 |  3085 |
+| Id | Operation                           | Name              | A-Rows |   A-Time   | Buffers | Reads |
+| 0  | SELECT STATEMENT                    |                   |    804 |00:00:00.01 |     787 |   785 |
+| 1  |  TABLE ACCESS BY INDEX ROWID BATCHED| MEDICAL_CLAIMS    |    804 |00:00:00.01 |     787 |   785 |
+| 2  |   INDEX RANGE SCAN                  | PK_MEDICAL_CLAIMS |    804 |00:00:00.01 |      61 |    64 |
 ```
 
 **웜 캐시(동일 쿼리 즉시 재실행)**
 
 ```text
-| Id | Operation         | Name           | A-Rows |   A-Time   | Buffers |
-| 0  | SELECT STATEMENT  |                |    804 |00:00:00.01 |    3144 |
-| 1  |  TABLE ACCESS FULL| MEDICAL_CLAIMS |    804 |00:00:00.01 |    3144 |
+| Id | Operation                           | Name              | A-Rows |   A-Time   | Buffers |
+| 0  | SELECT STATEMENT                    |                   |    804 |00:00:00.01 |     776 |
+| 1  |  TABLE ACCESS BY INDEX ROWID BATCHED| MEDICAL_CLAIMS    |    804 |00:00:00.01 |     776 |
+| 2  |   INDEX RANGE SCAN                  | PK_MEDICAL_CLAIMS |    804 |00:00:00.01 |      61 |
 ```
 
-- **`Buffers`는 3,144로 완전히 동일함** — 논리적으로 "요청한" 블록 수는 캐시 상태와
-  무관하게 같기 때문
-- **`Reads`는 3,085 → (0, 컬럼이 사라짐)** — 콜드 캐시에서는 요청한 블록 대부분을
+- **`Buffers`는 787 → 776으로 사실상 동일함** — 논리적으로 "요청한" 블록 수는 캐시 상태와
+  무관하게 같기 때문(11 차이는 물리 읽기 때 세그먼트 헤더 등을 더 읽은 몫)
+- **`Reads`는 785 → (0, 컬럼이 사라짐)** — 콜드 캐시에서는 요청한 블록 거의 전부를
   디스크에서 읽어와야 했지만, 웜 캐시에서는 전부 메모리에 있어 디스크 접근이 전혀
   없었음
-- **`A-Time`은 3.46초 → 0.01초로 약 346배** — 디스크 I/O가 메모리 접근보다 압도적으로
-  느리다는 것이 시간 차이로 그대로 드러남
+- **`A-Time`은 둘 다 0.01초** — 이 실습 VM 은 SSD·호스트 캐시 위라 785 블록의 물리 읽기가
+  10ms 안에 끝난다. 회전 디스크라면 블록당 수 ms 씩 수 초가 걸리는 자리이며, Chapter 1 의
+  IN vs EXISTS 에서는 같은 원리로 A-Time 이 두 배 났다. 그래서 시간이 아니라 `Reads` 로 판정한다
+- (참고) 이 1일 범위(0.27%)는 PK 인덱스 RANGE SCAN 으로 804건을 찾은 뒤 표에서 TOTAL_AMT 를
+  읽는다 — 804행이 726개 표 블록에 흩어져 있다(Chapter 4 실습 02 의 클러스터링 팩터)
 
 ## 06. Bad SQL — Buffers만 보고 튜닝했다면
 
-- 이 실험에서 `Buffers`는 콜드든 웜이든 3,144로 **완전히 동일**했다. 만약 `Buffers`만
-  보고 "이 쿼리는 항상 똑같은 비용"이라고 판단했다면, 346배에 달하는 실제 체감 속도
-  차이를 완전히 놓쳤을 것이다
+- 이 실험에서 `Buffers`는 콜드든 웜이든 780 안팎으로 **사실상 동일**했다. 만약 `Buffers`만
+  보고 "이 쿼리는 항상 똑같은 비용"이라고 판단했다면, 785 블록의 물리 읽기(느린 저장 장치에서는
+  수 초)를 완전히 놓쳤을 것이다
 - 이는 Chapter 1(IN vs EXISTS 캐시 효과), Chapter 9(SORT UNIQUE), Chapter 11(WINDOW
   SORT PUSHED RANK)에서 반복적으로 확인한 "Buffers만으론 안 보이는 비용"의 **가장
   근본적인 원인**이 바로 이 Logical/Physical I/O 차이였다는 것을 이제 명확히 알 수 있음
@@ -100,9 +105,9 @@ WHERE claim_id BETWEEN '20240601-0000000' AND '20240602-0000000';
 
 | 상태 | Buffers | Reads | A-Time |
 |---|---:|---:|---|
-| 콜드 캐시(첫 실행) | 3,144 | 3,085 | 3.46초 |
-| 웜 캐시(재실행) | 3,144 | 0(표시 안 됨) | 0.01초 |
-| 배율 | 1배(동일) | - | 약 346배 |
+| 콜드 캐시(첫 실행) | 787 | 785 | 0.01초 |
+| 웜 캐시(재실행) | 776 | 0(표시 안 됨) | 0.01초 |
+| 배율 | 1배(동일) | 785 → 0 | SSD 라 차이 없음(회전 디스크면 수백 배) |
 
 ## 09. Practice
 

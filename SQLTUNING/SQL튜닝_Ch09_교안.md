@@ -60,11 +60,11 @@ SELECT COUNT(*) FROM (
 
 ```text
 | Id | Operation           | Name           | A-Rows |   A-Time   | Buffers | OMem  | 1Mem | Used-Mem  |
-| 0  | SELECT STATEMENT    |                |      1 |00:00:00.07 |    3532 |       |      |           |
-| 1  |  SORT AGGREGATE     |                |      1 |00:00:00.07 |    3532 |       |      |           |
-| 2  |   VIEW              |                |  35985 |00:00:00.07 |    3532 |       |      |           |
-| 3  |    SORT UNIQUE      |                |  35985 |00:00:00.06 |    3532 | 1824K | 791K | 1621K (0) |
-| 4  |     UNION-ALL       |                |  64011 |00:00:00.04 |    3532 |       |      |           |
+| 0  | SELECT STATEMENT    |                |      1 |00:00:00.04 |    3532 |       |      |           |
+| 1  |  SORT AGGREGATE     |                |      1 |00:00:00.04 |    3532 |       |      |           |
+| 2  |   VIEW              |                |  35985 |00:00:00.04 |    3532 |       |      |           |
+| 3  |    SORT UNIQUE      |                |  35985 |00:00:00.04 |    3532 | 1824K | 791K | 1621K (0) |
+| 4  |     UNION-ALL       |                |  64011 |00:00:00.03 |    3532 |       |      |           |
 | 5  |      TABLE ACCESS FULL| MEDICAL_CLAIMS|  59511 |00:00:00.02 |    3090 |       |      |           |
 | 6  |      TABLE ACCESS FULL| PATIENTS      |   4500 |00:00:00.01 |     442 |       |      |           |
 ```
@@ -87,7 +87,7 @@ SELECT COUNT(*) FROM (
 
 - `Buffers`는 두 쿼리 모두 **3,532로 완전히 동일**함 — `SORT UNIQUE` 단계가 이미 읽어온
   데이터를 메모리에서 처리하는 작업이라 추가 블록 접근이 없기 때문(03절)
-- 하지만 `A-Time`은 Q1이 0.07초, Q2가 0.03초로 2배 이상 차이 남 — `SORT UNIQUE`의 CPU
+- 하지만 `A-Time`은 Q1이 0.04초, Q2가 0.03초로 차이 남 — `SORT UNIQUE`의 CPU
   비용이 여기에 나타남
 - 만약 Buffers만 보고 판단했다면 "UNION과 UNION ALL은 비용이 같다"고 잘못 결론 내렸을
   것임
@@ -132,7 +132,7 @@ Q3, Q4 공통 실행계획 (Plan hash value 완전히 동일: 1619867082)
 
 | 비교 | Buffers | A-Time | 비고 |
 |---|---:|---|---|
-| UNION (Q1) | 3,532 | 0.07초 | SORT UNIQUE 추가, 결과 35,985건 |
+| UNION (Q1) | 3,532 | 0.04초 | SORT UNIQUE 추가, 결과 35,985건 |
 | UNION ALL (Q2) | 3,532 | 0.03초 | SORT UNIQUE 없음, 결과 64,011건(중복 포함) |
 | DISTINCT, PK 컬럼(Q3) | 9 | 0.01초 | SORT UNIQUE 완전히 생략됨 |
 | DISTINCT 없음, 동일 조회(Q4) | 9 | 0.01초 | Q3과 완전히 동일한 계획 |

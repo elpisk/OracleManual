@@ -60,9 +60,10 @@ GROUP BY c.claim_id;
 
 ```text
 SQL_ID          EXECUTIONS  BUFFER_GETS  AVG_BUFFERS  ELAPSED_TIME(µs)
-cq8zvf7njas01   20          132,468      6,623.4      374,094
+3w1a060hkngfr   20          132,420      6,621        305,359
 
-SQL_TEXT: SELECT COUNT(*) FROM CLAIM_DETAILS WHERE CLAIM_ID = :B1
+SQL_TEXT: SELECT /*+ N1_DETAIL */ COUNT(*) FROM CLAIM_DETAILS WHERE CLAIM_ID = :B1
+(태그를 힌트 형식으로 쓴 이유: PL/SQL 은 일반 주석을 컴파일 때 지우지만 힌트 주석은 SQL 텍스트에 남긴다)
 ```
 
 **조인 1회**
@@ -78,9 +79,9 @@ SQL_TEXT: SELECT COUNT(*) FROM CLAIM_DETAILS WHERE CLAIM_ID = :B1
 | 6  |    TABLE ACCESS FULL| CLAIM_DETAILS  |    899K|00:00:00.03 |    6622 |
 ```
 
-- N+1 패턴: **총 132,468 Buffers** (20번 실행 누적, 1회 평균 6,623)
+- N+1 패턴: **총 132,420 Buffers** (20번 실행 누적, 1회 평균 6,621)
 - 조인 1회: **총 6,645 Buffers**
-- 비율: 132,468 ÷ 6,645 ≈ **19.9배** — 정확히 반복 횟수(20)에 가까운 배수로 커짐. 이는
+- 비율: 132,420 ÷ 6,645 ≈ **19.9배** — 정확히 반복 횟수(20)에 가까운 배수로 커짐. 이는
   `CLAIM_DETAILS` Full Scan 비용(약 6,622)이 그대로 20번 곱해진 결과이기 때문
   (03절 원리 그대로)
 
@@ -98,7 +99,7 @@ SQL_TEXT: SELECT COUNT(*) FROM CLAIM_DETAILS WHERE CLAIM_ID = :B1
 
 - 가장 직접적인 해법: 04절처럼 반복 조회를 조인 1회로 대체
 - 만약 애플리케이션 구조상 조인이 당장 어렵다면, 최소한 반복되는 조회의 `WHERE` 절
-  컬럼(`CLAIM_ID`)에 **인덱스를 추가**하는 것만으로도 개별 조회 1회의 비용을 6,623에서
+  컬럼(`CLAIM_ID`)에 **인덱스를 추가**하는 것만으로도 개별 조회 1회의 비용을 6,621에서
   훨씬 작은 값(인덱스 탐색 수준)으로 낮출 수 있음 — 다만 이는 "완화책"이지 N+1이라는
   반복 호출 구조 자체를 없애는 근본 해법은 아님. 반복 횟수가 계속 늘어나면 인덱스를 타도
   결국 배수로 커지는 것은 마찬가지임(Chapter 4 원칙: 결과가 몇 건이든 Full Scan은
@@ -108,7 +109,7 @@ SQL_TEXT: SELECT COUNT(*) FROM CLAIM_DETAILS WHERE CLAIM_ID = :B1
 
 | 방식 | 실행 횟수 | 총 Buffers | 비고 |
 |---|---:|---:|---|
-| N+1 (개별 반복 조회) | 20 | 132,468 | 매번 CLAIM_DETAILS Full Scan |
+| N+1 (개별 반복 조회) | 20 | 132,420 | 매번 CLAIM_DETAILS Full Scan |
 | 조인 1회 | 1 | 6,645 | CLAIM_DETAILS Full Scan 단 1회 |
 
 ## 09. Practice

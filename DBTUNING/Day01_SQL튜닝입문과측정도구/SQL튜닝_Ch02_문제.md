@@ -11,19 +11,19 @@
 
 ```text
 SQL_ID          EXECUTIONS  PARSE_CALLS  SQL_TEXT
-5awbw1wcprrj2   1           1            ...WHERE hosp_id = 500
-92p460f4hj858   1           1            ...WHERE hosp_id = 1
+71xyxd4t42wvj   1           1            ...WHERE hosp_id = 500
+0fqfut0m2jfxw   2           2            ...WHERE hosp_id = 1
 ```
 
 `WHERE hosp_id = 1`과 `WHERE hosp_id = 500`은 숫자 하나만 다른데도 왜 서로 다른 SQL_ID를
 부여받는지 설명하시오.
 
 **3. [최상]** 바인드 변수 버전은 `:b_hosp`에 1과 500을 순서대로 대입해 두 번 실행했는데도
-SQL_ID가 `3zakhp3a1b0ac` 하나로 유지됐다(EXECUTIONS=2). 하루에 수만 명의 사용자가 각자
+SQL_ID가 `78qznuqcawm4c` 하나로 유지됐다(EXECUTIONS=2). 하루에 수만 명의 사용자가 각자
 다른 병원 ID로 "내 병원 청구 목록 조회" API를 호출하는 상황을 가정하고, 이 API의 SQL을
 리터럴로 짤 때와 바인드 변수로 짤 때 공유 풀에 어떤 차이가 생길지 설명하시오.
 
-**4. [상]** `HOSP_ID=1` 조회는 E-Rows 3,039, `HOSP_ID=500` 조회는 E-Rows 109로 실제
+**4. [상]** `HOSP_ID=1` 조회는 E-Rows 2,795, `HOSP_ID=500` 조회는 E-Rows 280으로 실제
 차이(3,058 vs 177)에 가깝게 나왔다. 두 SQL이 같은 문장 구조인데 왜 예상치가 이렇게 다르게
 나왔는지, `USER_TAB_COL_STATISTICS`에서 확인한 `HOSP_ID` 컬럼의 통계정보(HISTOGRAM=HYBRID,
 NUM_BUCKETS=254)를 근거로 설명하시오.

@@ -94,8 +94,8 @@ Q1, Q2 공통 실행계획 (Plan hash value 완전히 동일: 3971657403)
 
 | 정렬 기준 | Operation | Buffers |
 |---|---|---:|
-| `ORDER BY claim_id`(PK 컬럼) | `INDEX RANGE SCAN`만(정렬 생략됨) | 776 |
-| `ORDER BY total_amt`(비인덱스) | `SORT ORDER BY` + `INDEX RANGE SCAN` | 717 |
+| `ORDER BY claim_id`(PK 컬럼) | `INDEX RANGE SCAN`만(정렬 생략됨) | 791 |
+| `ORDER BY total_amt`(비인덱스) | `SORT ORDER BY` + `INDEX RANGE SCAN` | 731 |
 
 - 이번엔 좁은 선택도 덕분에 `INDEX RANGE SCAN`이 선택됐고, 그 상태에서 `ORDER BY
   claim_id`는 인덱스가 이미 그 순서로 정렬해서 반환하므로 **별도 정렬 단계가 아예
@@ -115,8 +115,8 @@ Q1, Q2 공통 실행계획 (Plan hash value 완전히 동일: 3971657403)
 |---|---:|---|
 | GROUP BY 키에 대한 필터(Q1, Q2 — 위치 무관) | 3,090 | HASH GROUP BY는 필연적으로 발생(정렬과 무관) |
 | 넓은 범위 ORDER BY (선택도 8.5%, 두 컬럼 모두) | 3,090 | SORT ORDER BY 발생 |
-| 좁은 범위 ORDER BY, 인덱스 컬럼(claim_id) | 776 | SORT 생략됨 |
-| 좁은 범위 ORDER BY, 비인덱스 컬럼(total_amt) | 717 | SORT ORDER BY 발생 |
+| 좁은 범위 ORDER BY, 인덱스 컬럼(claim_id) | 791 | SORT 생략됨 |
+| 좁은 범위 ORDER BY, 비인덱스 컬럼(total_amt) | 731 | SORT ORDER BY 발생 |
 
 ## 09. Practice
 
