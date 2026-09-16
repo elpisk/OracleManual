@@ -26,7 +26,7 @@ SYS@CLONE> SELECT dbid, name, open_mode FROM v$database;
 
       DBID NAME      OPEN_MODE
 ---------- --------- --------------------
-1428930055 CLONE     READ WRITE
+1200530011 CLONE     READ WRITE
 
 --------------------------------------------------------------------------------
 [3] 초기 상태 확인
@@ -37,7 +37,7 @@ SYS@CLONE> SELECT dbid, name, resetlogs_change# FROM v$database;
 
       DBID NAME      RESETLOGS_CHANGE#
 ---------- --------- -----------------
-1428930055 CLONE               2782401
+1200530011 CLONE               2761326
 
 SYS@CLONE> EXIT
 
@@ -49,7 +49,9 @@ SYS@CLONE> EXIT
 ---------- --------- -----------------
 1200530011 ORCL                2672396
 
--- DBID가 다르고 인카네이션 기준도 다르다. 별개의 데이터베이스다.
+-- 이름과 인카네이션 기준(RESETLOGS SCN)은 다르지만 DBID 는 같다.
+-- 파일과 인스턴스는 완전히 분리돼 있어도, RMAN 과 카탈로그는 DBID 로 데이터베이스를 구분한다.
+-- 이 상태의 위험을 [5] 에서 본다.
 
 [oracle@oel7v9 ~]$ ps -ef | grep [p]mon
 oracle    3021     1  0 08:40 ?        00:00:01 ora_pmon_orcl
@@ -74,19 +76,21 @@ Table created.
 SYS@CLONE> INSERT INTO hr.clone_only VALUES (1, 'created in clone');
 SYS@CLONE> COMMIT;
 
-SYS@CLONE> DELETE FROM hr.employees WHERE department_id = 50;
+SYS@CLONE> DELETE FROM hr.job_history;
 
-45 rows deleted.
+10 rows deleted.
 
 SYS@CLONE> COMMIT;
 
-SYS@CLONE> SELECT COUNT(*) FROM hr.employees;
+SYS@CLONE> SELECT COUNT(*) FROM hr.job_history;
 
   COUNT(*)
 ----------
-        62
+         0
 
--- 복제본에서 45건을 지웠다.
+-- 복제본에서 10건을 지웠다.
+-- (employees 를 지우려 하면 departments.manager_id 가 참조하는 사원이 있어 ORA-02292 로 막힌다.
+--  자식이 없는 job_history 를 골랐다.)
 
 SYS@CLONE> EXIT
 
@@ -94,20 +98,20 @@ SYS@CLONE> EXIT
 
 [oracle@oel7v9 ~]$ export ORACLE_SID=orcl
 [oracle@oel7v9 ~]$ sqlplus -s / as sysdba <<< \
-> "SELECT COUNT(*) FROM hr.employees;
+> "SELECT COUNT(*) FROM hr.job_history;
    SELECT COUNT(*) FROM hr.clone_only;"
 
   COUNT(*)
 ----------
-       107
+        10
 
 SELECT COUNT(*) FROM hr.clone_only
-                     *
+                        *
 ERROR at line 1:
 ORA-00942: table or view does not exist
 
--- 원본은 107건 그대로이고 복제본에서 만든 테이블도 없다.
--- 두 데이터베이스가 완전히 독립적임이 확인되었다.
+-- 원본은 10건 그대로이고 복제본에서 만든 테이블도 없다.
+-- 두 데이터베이스의 파일이 완전히 독립적임이 확인되었다.
 
 --------------------------------------------------------------------------------
 [5] 진행 로그 : 백업 관리 관점의 검증
@@ -115,15 +119,41 @@ ORA-00942: table or view does not exist
 [oracle@oel7v9 ~]$ export ORACLE_SID=CLONE
 [oracle@oel7v9 ~]$ rman target /
 
-connected to target database: CLONE (DBID=1428930055)
+connected to target database: CLONE (DBID=1200530011)
 
 RMAN> LIST BACKUP SUMMARY;
 
-specification does not match any backup in the repository
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time #Pieces #Copies Compressed Tag
+------- -- -- - ----------- --------------- ------- ------- ---------- ---
+1       B  F  A DISK        19-MAY-25       1       1       NO         TAG20250519T104645
 
--- 복제본에는 백업 기록이 없다.
--- DBID가 다르므로 원본의 백업을 자기 것으로 인식하지 않는다.
--- 이것이 DBID를 바꾸는 이유다.
+-- 새 컨트롤파일이라 원본의 백업 기록은 없다. 그런데 백업이 하나 있다.
+
+RMAN> LIST BACKUP OF CONTROLFILE;
+
+List of Backup Sets
+===================
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ ---------------
+1       Full    13.80M     DISK        00:00:00     19-MAY-25
+        BP Key: 1   Status: AVAILABLE  Compressed: NO  Tag: TAG20250519T104645
+        Piece Name: /u01/app/oracle/product/19.3.0/dbhome_1/dbs/c-1200530011-20250519-00
+  Control File Included: Ckp SCN: 2761540      Ckp time: 19-MAY-25
+
+RMAN> SHOW CONTROLFILE AUTOBACKUP;
+
+RMAN configuration parameters for database with db_unique_name CLONE are:
+CONFIGURE CONTROLFILE AUTOBACKUP ON; # default
+
+-- 19c 는 자동 백업이 기본 ON 이다. 17-4 에서 임시 파일을 추가한 구조 변경 직후
+-- 복제본이 스스로 컨트롤파일 자동 백업을 만들었다.
+-- 이름이 c-1200530011-... 이다. 원본의 DBID 다. 원본이 기본 위치를 쓰고 있었다면
+-- 같은 디렉터리에 같은 이름 규칙으로 쌓여 서로 덮어쓴다.
+-- RMAN 은 이 파일이 원본 것인지 복제본 것인지 이름만으로 구분하지 못한다.
+-- 카탈로그는 DBID 하나에 데이터베이스 하나만 등록하므로 복제본을 따로 등록할 수도 없다.
+-- 이것이 nid 로 DBID 를 바꿔야 하는 이유다(17-8). 복제본을 오래 쓸 계획이면 반드시 바꾼다.
 
 RMAN> REPORT SCHEMA;
 
@@ -138,6 +168,12 @@ File Size(MB) Tablespace           RB segs Datafile Name
 4    320      UNDOTBS1             YES     /u04/clone/CLONE/undotbs01.dbf
 7    10       USERS                NO      /u04/clone/CLONE/users01.dbf
 8    20       TBS13                NO      /u04/clone/CLONE/tbs13_01.dbf
+
+List of Temporary Files
+=======================
+File Size(MB) Tablespace           Maxsize(MB) Tempfile Name
+---- -------- -------------------- ----------- --------------------
+1    100      TEMP                 100         /u04/clone/CLONE/temp01.dbf
 
 RMAN> EXIT
 
@@ -156,9 +192,9 @@ RMAN> EXIT
 - 목적       : 복구 훈련용 환경
 - 요청자     : DBA팀 (교육)
 - 원본       : ORCL (DBID 1200530011)
-- 복제 시점  : 2025-05-19 10:02 (마지막 아카이브 시퀀스 14)
+- 복제 시점  : 2025-05-19 09:18 (마지막 아카이브 시퀀스 14)
 - 사용 백업  : /home/oracle/backup/ch17 (Cold Backup, 2025-05-19 09:12)
-- 복제본     : CLONE (DBID 1428930055), SID=CLONE
+- 복제본     : CLONE, SID=CLONE, DBID 1200530011 (원본과 동일 — nid 미적용)
 - 파일 경로  : /u04/clone/CLONE/
 - 아카이브   : /u04/clone/arch/
 - pfile      : $ORACLE_HOME/dbs/initCLONE.ora
@@ -167,9 +203,10 @@ RMAN> EXIT
 EOS
 
 [oracle@oel7v9 ~]$ ls -l /home/oracle/doc/clone_CLONE_20250519.md
--rw-r--r--. 1 oracle dba 512 May 19 11:02 clone_CLONE_20250519.md
+-rw-r--r--. 1 oracle dba 536 May 19 11:02 clone_CLONE_20250519.md
 
 -- 이 기록이 없으면 나중에 지워도 되는지 판단할 수 없다.
+-- DBID 가 원본과 같다는 사실은 반드시 적어 둔다. 백업 정리 때 사고를 막는 정보다.
 
 --------------------------------------------------------------------------------
 [7] 삭제 절차 : 오류 발생 → 원인 파악 → 수정
@@ -201,6 +238,12 @@ ORACLE instance shut down.
 SYS@CLONE> STARTUP MOUNT EXCLUSIVE RESTRICT;
 
 ORACLE instance started.
+
+Total System Global Area  536868920 bytes
+Fixed Size                  8898616 bytes
+Variable Size             218103808 bytes
+Database Buffers          301989888 bytes
+Redo Buffers                7876608 bytes
 Database mounted.
 
 -- 실행 전 반드시 이름을 확인한다.
@@ -209,9 +252,9 @@ SYS@CLONE> SELECT name, dbid FROM v$database;
 
 NAME            DBID
 --------- ----------
-CLONE     1428930055
+CLONE     1200530011
 
--- CLONE이 맞다. 원본이 아니다.
+-- CLONE이 맞다. 원본이 아니다. DBID 는 같으므로 DBID 로는 구분할 수 없다. 이름과 SID 로 확인한다.
 
 SYS@CLONE> DROP DATABASE;
 
@@ -225,23 +268,27 @@ SYS@CLONE> EXIT
 [oracle@oel7v9 ~]$ ls -l /u04/clone/CLONE/
 total 0
 
--- 데이터파일, 컨트롤파일, 리두가 모두 지워졌다.
+-- 데이터파일, 컨트롤파일, 리두, 임시 파일이 모두 지워졌다.
 
 [oracle@oel7v9 ~]$ ls -l /u04/clone/arch/ | head -3
-total 2097152
--rw-r-----. 1 oracle dba  2148352 May 19 10:41 arch_1_1_1200621700.arc
--rw-r-----. 1 oracle dba 45213696 May 19 09:41 arch_1_1_1200606000.arc
+total 3892
+-rw-r-----. 1 oracle dba  528384 May 19 10:41 arch_1_1_1200621700.arc
+-rw-r-----. 1 oracle dba  563200 May 19 09:18 arch_1_12_1200606000.arc
 
 -- 아카이브는 남아 있다. DROP DATABASE가 지우지 않는다.
 
 [oracle@oel7v9 ~]$ ls $ORACLE_HOME/dbs/initCLONE.ora
 /u01/app/oracle/product/19.3.0/dbhome_1/dbs/initCLONE.ora
 
--- pfile도 남아 있다.
+[oracle@oel7v9 ~]$ ls $ORACLE_HOME/dbs/c-1200530011-*
+/u01/app/oracle/product/19.3.0/dbhome_1/dbs/c-1200530011-20250519-00
+
+-- pfile 도, 복제본이 만든 컨트롤파일 자동 백업도 남아 있다.
+-- 자동 백업은 이름에 원본 DBID 가 박혀 있어 나중에 원본 것으로 오인하기 쉽다. 지금 지운다.
 
 -- 남은 것을 정리한다.
 
-[oracle@oel7v9 ~]$ rm -f $ORACLE_HOME/dbs/initCLONE.ora
+[oracle@oel7v9 ~]$ rm -f $ORACLE_HOME/dbs/initCLONE.ora $ORACLE_HOME/dbs/c-1200530011-20250519-00
 [oracle@oel7v9 ~]$ rm -rf /u01/app/oracle/admin/CLONE
 [oracle@oel7v9 ~]$ rm -rf /u04/clone
 
@@ -253,20 +300,27 @@ oracle    4188     1  0 08:52 ?        00:00:00 ora_pmon_rcat
 
 [oracle@oel7v9 ~]$ export ORACLE_SID=orcl
 [oracle@oel7v9 ~]$ sqlplus -s / as sysdba <<< \
-> "SELECT COUNT(*) FROM hr.employees; SELECT * FROM v\$recover_file;"
+> "SELECT COUNT(*) FROM hr.employees;
+   SELECT COUNT(*) FROM hr.job_history;
+   SELECT * FROM v\$recover_file;"
 
   COUNT(*)
 ----------
        107
+
+  COUNT(*)
+----------
+        10
 
 no rows selected
 
 -- 원본은 아무 영향도 받지 않았다.
 
 -- 실무 포인트
--- 1) 복제본의 DBID가 다르면 백업 기록도 분리된다.
---    복제본에서 RMAN에 접속해도 원본의 백업이 보이지 않는다.
---    이것이 DBID를 바꾸는 가장 실질적인 이유다.
+-- 1) 수동 복제본은 DBID 가 원본과 같다.
+--    SET DATABASE 는 이름만 바꾼다. RMAN·카탈로그·자동 백업 파일명은 DBID 로 데이터베이스를 구분하므로
+--    복제본의 자동 백업이 원본 것과 같은 이름으로 생기고, 카탈로그에 함께 등록할 수 없다.
+--    이것이 nid 로 DBID 를 바꾸는 가장 실질적인 이유다(17-8).
 --
 -- 2) 복제본의 변경은 원본에 전혀 영향을 주지 않는다.
 --    파일 경로가 완전히 분리되어 있기 때문이다.
@@ -278,11 +332,11 @@ no rows selected
 --
 -- 4) 실행 전 반드시 데이터베이스 이름을 확인한다.
 --    v$database 의 name 컬럼을 보고 복제본이 맞는지 확인한 뒤 실행한다.
---    ORACLE_SID만 믿지 않는다.
+--    ORACLE_SID만 믿지 않는다. DBID 는 원본과 같아 근거가 못 된다.
 --
--- 5) DROP DATABASE는 데이터파일·컨트롤파일·리두만 지운다.
---    아카이브와 pfile, adump 디렉터리는 별도로 지워야 한다.
+-- 5) DROP DATABASE는 데이터파일·컨트롤파일·리두·임시 파일만 지운다.
+--    아카이브, pfile, adump 디렉터리, 복제본이 만든 자동 백업은 별도로 지워야 한다.
 --
 -- 6) 복제 작업 기록을 남긴다.
---    목적, 시점, 사용 백업, 식별자, 경로, 삭제 예정일, 담당자가 항목이다.
+--    목적, 시점, 사용 백업, 식별자(DBID 동일 여부 포함), 경로, 삭제 예정일, 담당자가 항목이다.
 --    기록이 없으면 정체를 알 수 없는 인스턴스가 자원을 계속 쓰게 된다.

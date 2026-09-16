@@ -35,6 +35,37 @@ SYS@orcl> !rm -f /home/oracle/backup/ch17/temp01.dbf
 SYS@orcl> STARTUP
 
 -- 복제용 백업을 새로 받았다. Cold Backup이므로 일관성이 있다.
+-- 이 랩은 데이터파일 복사에 4분 30초가 걸렸다(디스크 하나에서 읽고 쓰기 때문).
+
+-- 원본은 백업 뒤에도 계속 운영된다. 변경이 이어지는 상황을 흉내 낸다.
+-- 백업 이후의 아카이브가 생겨야 17-4 에서 복구할 것이 있다.
+
+SYS@orcl> CREATE TABLE hr.ch17_after (id NUMBER, memo VARCHAR2(40)) TABLESPACE users;
+SYS@orcl> INSERT INTO hr.ch17_after VALUES (1, 'after cold backup');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> INSERT INTO hr.ch17_after VALUES (2, 'after switch 1');
+SYS@orcl> COMMIT;
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+SYS@orcl> ALTER SYSTEM SWITCH LOGFILE;
+
+SYS@orcl> SELECT sequence#, status FROM v$log ORDER BY sequence#;
+
+ SEQUENCE# STATUS
+---------- ----------------
+        13 ACTIVE
+        14 ACTIVE
+        15 CURRENT
+
+SYS@orcl> !ls -l /home/oracle/arch1
+
+total 576
+-rw-r-----. 1 oracle dba 563200 May 19 09:18 arch_1_12_1200606000.arc
+-rw-r-----. 1 oracle dba   2048 May 19 09:18 arch_1_13_1200606000.arc
+-rw-r-----. 1 oracle dba  17408 May 19 09:18 arch_1_14_1200606000.arc
+
+-- 백업 시점의 CURRENT 였던 12번부터 14번까지 아카이브 셋이 생겼다.
+-- 지금 CURRENT 인 15번은 아직 아카이브가 아니다. 복제본은 14번까지만 따라갈 수 있다.
 
 --------------------------------------------------------------------------------
 [3] 초기 상태 확인
@@ -56,9 +87,9 @@ SYS@orcl> SELECT COUNT(*) AS log_groups,
 
 LOG_GROUPS    REDO_GB
 ---------- ----------
-         3        .59
+         3        .15
 
--- 필요 공간 : 데이터파일 1.75 + 임시 0.06 + 리두 0.59 = 약 2.4GB
+-- 필요 공간 : 데이터파일 1.75 + 임시 0.06 + 리두 0.15 = 약 2GB
 -- 아카이브까지 고려해 3GB 이상을 확보한다.
 
 SYS@orcl> !df -h /u04 | tail -1
@@ -85,13 +116,14 @@ total 1789432
 
 -- 임시 파일은 복사하지 않았다. 복제본을 연 뒤 새로 만든다.
 -- 온라인 리두도 복사하지 않는다. 재생성 시 만들어진다.
+-- cp -p 로 시각을 유지했다. 백업 시각(09:12)이 그대로 보여 어느 백업본인지 알 수 있다.
 
 [oracle@oel7v9 ~]$ cp -p /home/oracle/arch1/*.arc /u04/clone/arch/
 [oracle@oel7v9 ~]$ ls /u04/clone/arch/*.arc | wc -l
-14
+3
 
 [oracle@oel7v9 ~]$ du -sh /u04/clone
-2.1G    /u04/clone
+1.8G    /u04/clone
 
 --------------------------------------------------------------------------------
 [5] 진행 로그 : pfile 생성
@@ -105,16 +137,24 @@ File created.
 SYS@orcl> !grep -E 'db_name|control_files|audit|log_archive|recovery|sga' \
           /tmp/initclone.ora
 
-*.audit_file_dest='/u01/app/oracle/admin/ORCL/adump'
-*.control_files='/u01/app/oracle/oradata/orcl/control01.ctl',
- '/u01/app/oracle/oradata/orcl/control02.ctl','/u02/oradata/orcl/control03.ctl'
+orcl.__sga_target=2147483648
+*.audit_file_dest='/u01/app/oracle/admin/orcl/adump'
+*.audit_trail='db'
+*.control_files='/u01/app/oracle/oradata/orcl/control01.ctl','/u01/app/oracle/oradata/orcl/control02.ctl','/u02/oradata/orcl/control03.ctl'#Restore Controlfile
 *.db_name='orcl'
 *.db_recovery_file_dest=''
 *.db_recovery_file_dest_size=8589934592
-*.log_archive_dest_1='LOCATION=/home/oracle/arch1'
-*.sga_target=1073741824
+*.log_archive_dest_1='location=/home/oracle/arch1 mandatory'
+*.log_archive_dest_2=''
+*.log_archive_dest_state_1='ENABLE'
+*.log_archive_format='arch_%t_%s_%r.arc'
+*.sga_max_size=2147483648
+*.sga_target=2147483648
 
--- 이 값들이 모두 원본을 가리킨다. 하나씩 바꿔야 한다.
+-- 이 값들이 대부분 원본을 가리킨다. 하나씩 바꿔야 한다.
+-- control_files 줄 끝의 #Restore Controlfile 은 앞 장의 복구 때 붙은 주석이다. 줄째 바뀐다.
+-- db_unique_name 줄은 없다. 지정하지 않으면 db_name 을 따라간다.
+-- sga_max_size 도 함께 잡혔다. sga_target 만 줄이면 이 값이 남아 뒤에서 드러난다.
 
 SYS@orcl> EXIT
 
@@ -130,34 +170,68 @@ SYS@orcl> EXIT
 >   /tmp/initclone.ora
 [oracle@oel7v9 ~]$ sed -i "s|^\*.log_archive_dest_1=.*|*.log_archive_dest_1='LOCATION=/u04/clone/arch'|" \
 >   /tmp/initclone.ora
+[oracle@oel7v9 ~]$ sed -i "s|^\*.db_recovery_file_dest=.*|*.db_recovery_file_dest=''|" \
+>   /tmp/initclone.ora
 [oracle@oel7v9 ~]$ sed -i "s|^\*.sga_target=.*|*.sga_target=536870912|" \
 >   /tmp/initclone.ora
+
+-- db_unique_name 줄이 없으면 그 sed 는 아무것도 안 바꾼다. 있으면 바꾼다. 둘 다 안전하다.
+-- db_recovery_file_dest 는 이 환경에서는 비어 있지만 명시적으로 비운다.
+-- 값이 있는 환경이라면 반드시 바꾼다. 복제본이 원본 FRA 에 파일을 만들어 공간을 잠식한다.
 
 -- 원본을 가리키는 값이 남아 있는지 확인한다.
 
 [oracle@oel7v9 ~]$ grep -n 'ORCL\|orcl\|/u02\|/u03' /tmp/initclone.ora
-7:orcl.__db_cache_size=671088640
-8:orcl.__java_pool_size=16777216
-9:orcl.__large_pool_size=33554432
+1:orcl.__data_transfer_cache_size=0
+2:orcl.__db_cache_size=1157627904
+3:orcl.__inmemory_ext_roarea=0
+4:orcl.__inmemory_ext_rwarea=0
+5:orcl.__java_pool_size=0
+6:orcl.__large_pool_size=33554432
+7:orcl.__oracle_base='/u01/app/oracle'#ORACLE_BASE set from environment
+8:orcl.__pga_aggregate_target=738197504
+9:orcl.__sga_target=2147483648
+10:orcl.__shared_io_pool_size=67108864
+11:orcl.__shared_pool_size=738197504
+12:orcl.__streams_pool_size=33554432
+13:orcl.__unified_pga_pool_size=0
+23:*.db_create_file_dest='/u01/app/oracle/oradata/orcl'
 
 -- orcl.__ 로 시작하는 줄은 인스턴스별 메모리 값이며 지워도 된다.
--- db_recovery_file_dest 는 이 환경에서는 비어 있다(12장 끝에서 비웠다).
--- 값이 있는 환경이라면 반드시 바꾼다. 복제본이 원본 FRA 에 파일을 만들어 공간을 잠식한다.
+-- 23번 줄이 진짜 문제다. 바꿀 목록에 없던 db_create_file_dest 가 원본 디렉터리를 가리킨다.
+-- 이대로 두면 복제본에서 경로 없이 만드는 파일(OMF)이 원본의 디렉터리에 생긴다.
+-- 목록만 믿고 넘어가면 놓친다. grep 이 잡아 준 것이다.
 
 [oracle@oel7v9 ~]$ sed -i "/^orcl\.__/d" /tmp/initclone.ora
+[oracle@oel7v9 ~]$ sed -i "s|^\*.db_create_file_dest=.*|*.db_create_file_dest='/u04/clone/CLONE'|" \
+>   /tmp/initclone.ora
+[oracle@oel7v9 ~]$ grep -n 'ORCL\|orcl\|/u02\|/u03' /tmp/initclone.ora
+[oracle@oel7v9 ~]$ echo $?
+1
+
+-- 아무것도 나오지 않는다. 메모리 값도 하나 더 손본다.
+
+[oracle@oel7v9 ~]$ grep -n 'sga' /tmp/initclone.ora
+33:*.sga_max_size=2147483648
+34:*.sga_target=536870912
+
+[oracle@oel7v9 ~]$ sed -i "s|^\*.sga_max_size=.*|*.sga_max_size=536870912|" /tmp/initclone.ora
+
+-- sga_max_size 가 2G 로 남으면 인스턴스가 2G 짜리로 뜬다(sga_target 은 상한이 아니라 목표값이다).
+-- 원본과 복제본이 한 서버에서 4G 를 나눠 써야 하므로 상한도 같이 내린다.
 
 [oracle@oel7v9 ~]$ cp /tmp/initclone.ora $ORACLE_HOME/dbs/initCLONE.ora
-[oracle@oel7v9 ~]$ cat $ORACLE_HOME/dbs/initCLONE.ora | head -12
+[oracle@oel7v9 ~]$ grep -nE 'db_name|control_files|audit_file|log_archive_dest_1|recovery_file_dest=|sga|create_file' \
+>   $ORACLE_HOME/dbs/initCLONE.ora
 
-*.audit_file_dest='/u01/app/oracle/admin/CLONE/adump'
-*.compatible='19.0.0'
-*.control_files='/u04/clone/CLONE/control01.ctl'
-*.db_block_size=8192
-*.db_name='CLONE'
-*.db_unique_name='CLONE'
-*.db_recovery_file_dest=''
-*.log_archive_dest_1='LOCATION=/u04/clone/arch'
-*.sga_target=536870912
+1:*.audit_file_dest='/u01/app/oracle/admin/CLONE/adump'
+5:*.control_files='/u04/clone/CLONE/control01.ctl'
+10:*.db_create_file_dest='/u04/clone/CLONE'
+13:*.db_name='CLONE'
+14:*.db_recovery_file_dest=''
+19:*.log_archive_dest_1='LOCATION=/u04/clone/arch'
+33:*.sga_max_size=536870912
+34:*.sga_target=536870912
 
 --------------------------------------------------------------------------------
 [7] 오류 발생 → 원인 파악 → 수정
@@ -187,13 +261,14 @@ SYS@CLONE> STARTUP NOMOUNT PFILE='?/dbs/initCLONE.ora';
 
 ORACLE instance started.
 
-Total System Global Area  536870912 bytes
-Fixed Size                  8896512 bytes
-Variable Size             184549376 bytes
-Database Buffers          335544320 bytes
-Redo Buffers                7880704 bytes
+Total System Global Area  536868920 bytes
+Fixed Size                  8898616 bytes
+Variable Size             218103808 bytes
+Database Buffers          301989888 bytes
+Redo Buffers                7876608 bytes
 
--- 인스턴스가 떴다. 다음 실습에서 컨트롤파일을 만든다.
+-- 인스턴스가 떴다. 512MB 로 떴다. sga_max_size 를 안 내렸다면 여기가 2147479656 으로 나온다.
+-- 다음 실습에서 컨트롤파일을 만든다.
 
 --------------------------------------------------------------------------------
 [8] 검증 및 실무 포인트
@@ -204,54 +279,56 @@ INSTANCE_NAME    STATUS
 ---------------- ------------
 CLONE            STARTED
 
-SYS@CLONE> SHOW PARAMETER db_name
+SYS@CLONE> SELECT name, value FROM v$parameter
+  2  WHERE  name IN ('db_name','db_unique_name','control_files','log_archive_dest_1',
+  3                  'db_recovery_file_dest','db_create_file_dest','sga_target');
 
-NAME     TYPE   VALUE
--------- ------ ------
-db_name  string CLONE
+NAME                     VALUE
+------------------------ ----------------------------------------
+sga_target               536870912
+control_files            /u04/clone/CLONE/control01.ctl
+log_archive_dest_1       LOCATION=/u04/clone/arch
+db_create_file_dest      /u04/clone/CLONE
+db_recovery_file_dest
+db_name                  CLONE
+db_unique_name           CLONE
 
-SYS@CLONE> SHOW PARAMETER control_files
-
-NAME           TYPE   VALUE
--------------- ------ ---------------------------------
-control_files  string /u04/clone/CLONE/control01.ctl
-
-SYS@CLONE> SHOW PARAMETER log_archive_dest_1
-
-NAME                 TYPE   VALUE
--------------------- ------ ---------------------------
-log_archive_dest_1   string LOCATION=/u04/clone/arch
-
--- 세 값이 모두 복제본을 가리킨다.
+-- 모든 값이 복제본을 가리킨다. db_unique_name 은 줄이 없어도 db_name 을 따라 CLONE 이 됐다.
 
 SYS@CLONE> SHUTDOWN IMMEDIATE
 
+ORA-01507: database not mounted
 ORACLE instance shut down.
+
+-- NOMOUNT 에서 내리면 ORA-01507 이 한 줄 붙는다. 마운트한 적이 없다는 안내일 뿐 오류가 아니다.
 
 SYS@CLONE> EXIT
 
 [oracle@oel7v9 ~]$ export ORACLE_SID=orcl
 [oracle@oel7v9 ~]$ du -sh /u04/clone
-2.1G    /u04/clone
+1.8G    /u04/clone
 
 -- 실무 포인트
 -- 1) 필요 공간을 미리 계산한다.
 --    데이터파일 + 임시 + 리두 + 아카이브가 대상이며 여유를 두고 확보한다.
 --    작업 도중 공간이 부족하면 처음부터 다시 해야 한다.
+--    같은 디스크 안에서 복사하면 읽기와 쓰기가 겹쳐 느리다. 시간도 계산에 넣는다.
 --
 -- 2) 임시 파일과 온라인 리두는 복사하지 않는다.
 --    임시 파일은 복제본을 연 뒤 새로 만들고
 --    온라인 리두는 컨트롤파일 재생성 시 만들어진다.
 --
--- 3) pfile에서 바꿔야 할 항목이 여섯 가지다.
---    db_name, db_unique_name, control_files, audit_file_dest,
---    log_archive_dest, db_recovery_file_dest 다.
+-- 3) pfile에서 바꿔야 할 항목은 목록으로 외우지 말고 grep 으로 찾는다.
+--    db_name, db_unique_name, control_files, audit_file_dest, log_archive_dest,
+--    db_recovery_file_dest 가 기본이고, 이 랩에서는 db_create_file_dest 와 sga_max_size 가 더 나왔다.
+--    원본 이름과 원본 경로로 grep 해서 아무것도 안 나올 때까지 고친다.
 --
 -- 4) audit_file_dest 디렉터리를 빠뜨리면 ORA-09925로 기동이 실패한다.
 --    복제 절차에서 가장 자주 빠뜨리는 항목이다.
 --
--- 5) db_recovery_file_dest 를 원본 값 그대로 두면 위험하다.
---    복제본이 원본 FRA에 파일을 만들어 원본의 공간을 잠식한다.
+-- 5) db_recovery_file_dest 와 db_create_file_dest 를 원본 값 그대로 두면 위험하다.
+--    복제본이 원본 디렉터리에 파일을 만들어 원본의 공간을 잠식하고 파일이 섞인다.
 --
--- 6) 수정 후 grep 으로 원본 경로가 남아 있는지 확인한다.
+-- 6) 메모리는 상한(sga_max_size)까지 같이 본다.
+--    sga_target 만 줄이면 기동 화면의 Total System Global Area 가 원본 크기로 나온다.
 --    orcl.__ 로 시작하는 인스턴스별 메모리 값은 지워도 무방하다.
