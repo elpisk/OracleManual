@@ -1,7 +1,8 @@
 ================================================================================
- Ch13 실습 03 — 히스토그램 복원(SIZE AUTO)과 통계 이력: 3,285 로 돌아온다, 그리고 되돌리는 두 길
- 목표: METHOD_OPT => 'FOR ALL COLUMNS SIZE AUTO' 로 히스토그램을 복원해 HYBRID 254 와 E-Rows 3,285 를
-       확인한다. "복원했는데 3,470 이 아니다" 는 이상 징후를 표본 통계로 설명하고, 통계 이력
+ Ch13 실습 03 — 히스토그램 복원(SIZE AUTO)과 통계 이력: 2,958 로 돌아온다, 그리고 과정 기준 상태로 되돌리기
+ 목표: METHOD_OPT => 'FOR ALL COLUMNS SIZE AUTO' 로 히스토그램을 복원해 HYBRID 254 와 E-Rows 2,958 을
+       확인한다. "복원했는데 2,795 가 아니다" 는 이상 징후를 표본 통계로 설명하고, AUTO 가 다른 컬럼에 만든
+       히스토그램을 과정 기준 상태로 되돌린다. 통계 이력
        (USER_TAB_STATS_HISTORY)과 RESTORE_TABLE_STATS 로 "수집 전 통계로 되돌리는" 두 번째 길을 익힌다.
  환경: non-CDB=orcl 19.3, 스키마 SQLT. 실습 02 로 HOSP_ID 히스토그램이 없는 상태에서 시작.
  주의: 개인 실습 환경 전용. 이 실습을 마치면 통계가 원상태(HYBRID 254)여야 한다.
@@ -10,85 +11,211 @@
 $ sqlplus sqlt/sqlt@orcl
 
 SQLT@orcl> SET LINESIZE 200
+
+
 SQLT@orcl> SET PAGESIZE 100
+
 
 --------------------------------------------------------------------------------
 -- [1] (조치) AUTO 로 복원 — Oracle 이 스스로 히스토그램 필요 여부를 판단한다
 --------------------------------------------------------------------------------
 SQLT@orcl> BEGIN
   2         DBMS_STATS.GATHER_TABLE_STATS(USER, 'MEDICAL_CLAIMS',
-  3           METHOD_OPT => 'FOR ALL COLUMNS SIZE AUTO');
-  4       END;
-  5       /
+  3           METHOD_OPT => 'FOR ALL COLUMNS SIZE AUTO',
+  4           NO_INVALIDATE => FALSE);
+  5       END;
+  6       /
 
 PL/SQL procedure successfully completed.
 
 SQLT@orcl> COLUMN histogram FORMAT A10
+
+
+SQLT@orcl> COLUMN column_name FORMAT A14
+
+
 SQLT@orcl> SELECT column_name, histogram, num_buckets FROM user_tab_col_statistics
-  2       WHERE  table_name = 'MEDICAL_CLAIMS' AND column_name = 'HOSP_ID';
+  2       WHERE  table_name = 'MEDICAL_CLAIMS' AND histogram <> 'NONE' ORDER BY column_name;
 
 COLUMN_NAME    HISTOGRAM  NUM_BUCKETS
 -------------- ---------- -----------
+CLAIM_ID       HYBRID             254
+CLAIM_TYPE     FREQUENCY            2
+DEPT_CODE      FREQUENCY            9
 HOSP_ID        HYBRID             254
+RECEIPT_DATE   HYBRID             254
+REVIEW_STATUS  FREQUENCY            2
+TOTAL_AMT      HYBRID             254
+VISIT_DATE     HYBRID             254
+
+8 rows selected.
 
 -- 해석: AUTO 는 컬럼 사용 이력(SYS.COL_USAGE$ — WHERE 에 쓰인 적이 있는가)과 데이터 분포를 보고
 --   히스토그램을 만들지 정한다. HOSP_ID 는 WHERE 에 쓰였고 분포가 쏠려 있으므로 다시 만들어졌다.
 
 --------------------------------------------------------------------------------
--- [2] (이상 징후 → 원인 → 재확인) 복원했는데 E-Rows 가 3,470 이 아니라 3,285
+-- [2] (이상 징후 → 원인 → 재확인) 복원했는데 E-Rows 가 2,795 가 아니라 2,958
 --------------------------------------------------------------------------------
 SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE hosp_id = 1;
-(결과 3058)
+
+  COUNT(*)
+----------
+      3058
+
 SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
 
 PLAN_TABLE_OUTPUT
-------------------------------------------------------------------------------------------
-|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |   3285 |   3058 |    3090 |
-------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  0fqfut0m2jfxw, child number 2
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE
+hosp_id = 1
 
-SQLT@orcl> -- 이상 징후: 실습 01 의 베이스라인은 3,470 이었는데 복원 후 3,285 다. "복원이 덜 됐나".
+Plan hash value: 2119550289
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                |      1 |        |      1 |00:00:00.01 |    3090 |
+|   1 |  SORT AGGREGATE    |                |      1 |      1 |      1 |00:00:00.01 |    3090 |
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |   2958 |   3058 |00:00:00.01 |    3090 |
+-----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter("HOSP_ID"=1)
+
+
+20 rows selected.
+
+SQLT@orcl> -- 이상 징후: 실습 01 의 베이스라인은 2,795 였는데 복원 후 2,958 이다. "복원이 덜 됐나".
 SQLT@orcl> -- 원인 파악: 히스토그램은 표본으로 만든다. 수집할 때마다 표본이 달라 버킷 경계·반복 수가
-SQLT@orcl> --   조금씩 다르고, popular value 의 추정치도 그만큼 흔들린다. 3,470 과 3,285 는 둘 다 실제
-SQLT@orcl> --   3,058 에 대해 1.07~1.13배 — 같은 자릿수의 정확한 추정이다. 실습 02 의 300 과 비교하면
+SQLT@orcl> --   조금씩 다르고, popular value 의 추정치도 그만큼 흔들린다. 2,795 와 2,958 은 둘 다 실제
+SQLT@orcl> --   3,058 에 대해 0.91~0.97배 — 같은 자릿수의 정확한 추정이다. 실습 02 의 300 과 비교하면
 SQLT@orcl> --   무엇이 "복원" 인지 분명하다.
 SQLT@orcl> -- 재확인: 500번 병원도 다시 1번과 다른 값을 받는지 본다(균등 가정 탈출 확인).
 SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE hosp_id = 500;
-(결과 177)
+
+  COUNT(*)
+----------
+       177
+
 SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
 
 PLAN_TABLE_OUTPUT
-------------------------------------------------------------------------------------------
-|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |  <환경값> |    177 |    3090 |
-------------------------------------------------------------------------------------------
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  71xyxd4t42wvj, child number 2
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE
+hosp_id = 500
 
--- 재확인: <환경값>은 300 이 아니라 100~200 대다. 두 값이 다시 구분된다.
+Plan hash value: 2119550289
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                |      1 |        |      1 |00:00:00.01 |    3090 |
+|   1 |  SORT AGGREGATE    |                |      1 |      1 |      1 |00:00:00.01 |    3090 |
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |    158 |    177 |00:00:00.01 |    3090 |
+-----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter("HOSP_ID"=500)
+
+
+20 rows selected.
+
+-- 재확인: 158 — 300 이 아니라 100~200 대다. 두 값이 다시 구분된다.
 
 --   ┌────────────────────────┬──────────────────┬────────────────────┬──────────────┐
 --   │ 상태                   │ hosp_id=1 E-Rows │ hosp_id=500 E-Rows │ 두 값이 다른가│
 --   ├────────────────────────┼──────────────────┼────────────────────┼──────────────┤
---   │ 원본(실습 01)          │      3,470       │       159          │ 다름         │
+--   │ 원본(실습 01)          │      2,795       │       280          │ 다름         │
 --   │ 제거 SIZE 1(실습 02)   │        300       │       300          │ 같음(균등)   │
---   │ 복원 SIZE AUTO(실습 03)│      3,285       │     <환경값>       │ 다시 다름    │
+--   │ 복원 SIZE AUTO(실습 03)│      2,958       │       158          │ 다시 다름    │
+--   │ 기준 명령 재수집([3])  │      3,112       │        —           │ 다시 다름    │
 --   └────────────────────────┴──────────────────┴────────────────────┴──────────────┘
 
 --------------------------------------------------------------------------------
--- [3] (조치 후 관점) 되돌리는 두 번째 길 — 통계 이력 복원
+-- [3] (이상 징후 → 원인 → 조치) AUTO 가 다른 컬럼에도 히스토그램을 만들었다 — 과정 기준 상태로 되돌리기
 --------------------------------------------------------------------------------
-SQLT@orcl> -- 다시 모으는 대신 "수집 전 통계" 로 되돌릴 수도 있다. Oracle 은 통계를 바꿀 때마다 이전 값을
-SQLT@orcl> --   보관한다(기본 31일).
+SQLT@orcl> -- 이상 징후: [1] 의 목록에 HOSP_ID 말고도 히스토그램이 생긴 컬럼이 있다.
+SQLT@orcl> -- 원인 파악: AUTO 는 "WHERE 에 쓰인 적이 있는 컬럼" 전부를 후보로 본다. Day 1~2 실습에서 CLAIM_ID·
+SQLT@orcl> --   CLAIM_TYPE·TOTAL_AMT·RECEIPT_DATE 를 조건에 썼으니 그 이력이 남아 있고, AUTO 는 그 컬럼들에도
+SQLT@orcl> --   히스토그램을 만든다. 그러면 이후 실습의 E-Rows(예: CLAIM_ID 범위 추정)가 교안과 달라진다.
+SQLT@orcl> --   운영에서도 같은 일이 생긴다 — "통계만 다시 모았는데 계획이 바뀌었다" 의 흔한 원인이다.
+SQLT@orcl> -- 조치: 이 과정의 기준 상태(Ch01 실습 01 — 히스토그램은 HOSP_ID 하나)로 되돌린다. Day 0 준비 명령과 같다.
+SQLT@orcl> BEGIN
+  2         DBMS_STATS.GATHER_TABLE_STATS(USER, 'MEDICAL_CLAIMS',
+  3           METHOD_OPT => 'FOR ALL COLUMNS SIZE 1 FOR COLUMNS SIZE 254 HOSP_ID',
+  4           NO_INVALIDATE => FALSE);
+  5       END;
+  6       /
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> SELECT column_name, histogram, num_buckets FROM user_tab_col_statistics
+  2       WHERE  table_name = 'MEDICAL_CLAIMS' AND histogram <> 'NONE' ORDER BY column_name;
+
+COLUMN_NAME    HISTOGRAM  NUM_BUCKETS
+-------------- ---------- -----------
+HOSP_ID        HYBRID             254
+
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE hosp_id = 1;
+
+  COUNT(*)
+----------
+      3058
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  0fqfut0m2jfxw, child number 3
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS */ COUNT(*) FROM medical_claims WHERE
+hosp_id = 1
+
+Plan hash value: 2119550289
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                |      1 |        |      1 |00:00:00.01 |    3090 |
+|   1 |  SORT AGGREGATE    |                |      1 |      1 |      1 |00:00:00.01 |    3090 |
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |   3112 |   3058 |00:00:00.01 |    3090 |
+-----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter("HOSP_ID"=1)
+
+
+20 rows selected.
+
+-- 재확인: HOSP_ID 만 남았고 E-Rows 는 실습 01 의 베이스라인과 같은 자릿수다. Day 3 부터는 이 상태를 전제한다.
+
+SQLT@orcl> -- 되돌리는 세 번째 길 — 통계 이력 복원. 다시 모으는 대신 "수집 전 통계" 로 되돌릴 수도 있다.
+SQLT@orcl> --   Oracle 은 통계를 바꿀 때마다 이전 값을 보관한다(기본 31일).
 SQLT@orcl> SELECT table_name, TO_CHAR(stats_update_time, 'YYYY-MM-DD HH24:MI:SS') updated
   2       FROM   user_tab_stats_history
-  3       WHERE  table_name = 'MEDICAL_CLAIMS' ORDER BY stats_update_time DESC;
+  3       WHERE  table_name = 'MEDICAL_CLAIMS' ORDER BY stats_update_time DESC FETCH FIRST 5 ROWS ONLY;
 
-TABLE_NAME       UPDATED
----------------- -------------------
-MEDICAL_CLAIMS   <환경값>                       -- 실습 03 (AUTO) 직전 상태
-MEDICAL_CLAIMS   <환경값>                       -- 실습 02 (SIZE 1) 직전 상태 = 원본
-MEDICAL_CLAIMS   <환경값>
+TABLE_NAME                                                                                                                       UPDATED
+-------------------------------------------------------------------------------------------------------------------------------- -------------------
+MEDICAL_CLAIMS                                                                                                                   2026-09-16 19:52:43
+MEDICAL_CLAIMS                                                                                                                   2026-09-16 19:52:41
+MEDICAL_CLAIMS                                                                                                                   2026-09-16 19:52:36
+MEDICAL_CLAIMS                                                                                                                   2026-09-16 19:34:34
+MEDICAL_CLAIMS                                                                                                                   2026-09-16 19:34:32
 
 SQLT@orcl> -- 실습 02 직전(원본) 시각으로 되돌리려면:
 SQLT@orcl> --   EXEC DBMS_STATS.RESTORE_TABLE_STATS(USER, 'MEDICAL_CLAIMS', TO_TIMESTAMP('<실습 02 직전 시각>', 'YYYY-MM-DD HH24:MI:SS'))
-SQLT@orcl> --   이렇게 하면 표본을 새로 뽑지 않으므로 E-Rows 가 정확히 3,470 으로 돌아온다.
+SQLT@orcl> --   이렇게 하면 표본을 새로 뽑지 않으므로 E-Rows 가 정확히 실습 01 의 값으로 돌아온다.
 SQLT@orcl> --   운영에서 "통계 수집 뒤 계획이 나빠졌다" 면 재수집보다 이 복원이 먼저다 — 빠르고 결정적이다.
 SQLT@orcl> --   보관 기간 확인:
 SQLT@orcl> SELECT DBMS_STATS.GET_STATS_HISTORY_RETENTION retention_days FROM dual;
@@ -97,7 +224,7 @@ RETENTION_DAYS
 --------------
             31
 
--- 이 실습에서는 AUTO 복원으로 충분하므로 RESTORE 는 실행하지 않는다(실행해도 무방하다).
+-- 이 실습에서는 기준 명령으로 되돌렸으므로 RESTORE 는 실행하지 않는다(실행해도 무방하다).
 
 --------------------------------------------------------------------------------
 -- [4] (조치 후 관점) 바인드 변수와 히스토그램 — Ch02 실습 02 의 뒷이야기
@@ -111,11 +238,13 @@ RETENTION_DAYS
 --------------------------------------------------------------------------------
 -- [정리]
 --------------------------------------------------------------------------------
--- 1) FOR ALL COLUMNS SIZE AUTO 가 표준. 사용 이력과 분포를 보고 필요한 컬럼에만 히스토그램을 만든다.
--- 2) 복원 후 3,285 ≠ 3,470 은 표본 오차. 300(균등) 과 비교하면 복원이 맞다.
+-- 1) FOR ALL COLUMNS SIZE AUTO 가 운영의 표준. 사용 이력과 분포를 보고 필요한 컬럼에 히스토그램을 만든다 —
+--    그래서 이 과정에서는 기준 상태(HOSP_ID 만)로 되돌려 이후 실습의 E-Rows 를 고정한다.
+-- 2) 복원 후 2,958 ≠ 2,795 는 표본 오차(수집할 때마다 ±10% 흔들린다). 300(균등) 과 비교하면 복원이 맞다.
 -- 3) 통계 이력(31일)과 RESTORE_TABLE_STATS 로 "수집 전" 으로 결정적으로 되돌릴 수 있다.
 -- 4) 히스토그램 컬럼 + 바인드 변수 = peeking 문제. 리터럴이 옳은 경우도 있다.
 -- 5) 이 실습을 마친 뒤 HOSP_ID 는 HYBRID 254 여야 한다. 아니면 Day 6 TUN 7장 실측이 어긋난다.
 
 SQLT@orcl> EXIT
+
 ================================================================================

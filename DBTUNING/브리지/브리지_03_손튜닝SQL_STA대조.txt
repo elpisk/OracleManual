@@ -1,0 +1,608 @@
+================================================================================
+ 브리지 03 — 손으로 튜닝한 SQL 을 SQL Tuning Advisor 권고와 대조한다 (Day 9, TUN 15장 실습 04 대체)
+ 목표: Day 4 평가에서 손으로 튜닝한 SQL 두 개를 튜닝 전 원문 그대로 어드바이저에 넣어, 권고가 내 조치와
+       같은지·더 나은지·엉뚱한지를 실측으로 판정한다. A(인덱스 설계)는 권고가 내 인덱스에 컬럼을 더 얹은
+       커버링 인덱스라 "권고가 더 낫다", B(SARGable 재작성)는 권고가 함수 기반 인덱스라 "권고 맹신 경계" 다.
+       마지막에 태스크·인덱스를 모두 지워 PK 만 있는 상태로 되돌린다.
+ 환경: non-CDB=orcl 19.3, SYS AS SYSDBA(어드바이저) + SQLT(실측, 별도 터미널). 🔒 SQL Tuning Advisor 는
+       Tuning Pack. 미보유 환경은 절차서 7 단계(브리지_03_*.md)의 대안을 따른다.
+ 전제: PK 인덱스만 있는 상태(Day 4 평가 03 의 마지막 과제가 원복 증명이다).
+   A. 평가 03 과제 9 — "병원 7 의 2024-06-15 접수 청구" : 손 튜닝 = 인덱스 (HOSP_ID, RECEIPT_DATE)
+   B. 평가 03 과제 7 — "2024년 6월 청구 건수"           : 손 튜닝 = TO_CHAR 제거, 범위 조건 (Ch06 실습 02)
+ 주의: 개인 실습 환경 전용. 어드바이저 태스크는 SYS 소유로 만들고 끝에 지운다.
+================================================================================
+
+$ sqlplus / as sysdba
+
+SYS@orcl> SET LINESIZE 200
+
+
+SYS@orcl> SET PAGESIZE 100
+
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 튜닝 전 상태 확인 — 인덱스는 이미 없어야 한다
+--------------------------------------------------------------------------------
+SYS@orcl> COLUMN table_name FORMAT A16
+
+
+SYS@orcl> COLUMN index_name FORMAT A20
+
+
+SYS@orcl> SELECT table_name, index_name, uniqueness, visibility
+  2         FROM dba_indexes
+  3        WHERE owner = 'SQLT' AND table_name = 'MEDICAL_CLAIMS';
+
+TABLE_NAME       INDEX_NAME           UNIQUENES VISIBILIT
+---------------- -------------------- --------- ---------
+MEDICAL_CLAIMS   PK_MEDICAL_CLAIMS    UNIQUE    VISIBLE
+
+-- 해석: PK_MEDICAL_CLAIMS 한 줄이면 준비된 것이다. PK 외 인덱스가 있으면 Day 4 원복이 빠진 것 — 지우지 말고
+--   ALTER INDEX sqlt.<이름> INVISIBLE 로 숨긴 뒤 진행하고, 누구 것인지 확인해 답안의 원복 증명과 대조한다.
+
+SYS@orcl> -- 정말 튜닝 전 계획인지 SQLT 세션에서 Day 1 Ch14 방식으로 확인한다(별도 터미널).
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET LINESIZE 200
+
+
+SQLT@orcl> SET PAGESIZE 100
+
+
+SQLT@orcl> -- A. 튜닝 전 원문 (힌트 태그만 붙임)
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS BR03_A_BEFORE */ claim_id, total_amt
+  2         FROM medical_claims
+  3        WHERE hosp_id = 7 AND receipt_date = DATE '2024-06-15';
+
+CLAIM_ID              TOTAL_AMT
+-------------------- ----------
+20240615-0028757         210251
+20240615-0071592         205708
+20240615-0086031         110018
+20240615-0104840         425913
+20240615-0104848         130861
+20240615-0118290          64669
+20240615-0183441          38852
+20240615-0230511         171570
+20240615-0270321          47131
+20240615-0294987         490111
+20240615-0299093         105456
+
+11 rows selected.
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  5dgzpcjnpgdpg, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS BR03_A_BEFORE */ claim_id, total_amt
+      FROM medical_claims       WHERE hosp_id = 7 AND receipt_date =
+DATE '2024-06-15'
+
+Plan hash value: 3132986698
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |     11 |00:00:00.01 |    3091 |
+|*  1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |      9 |     11 |00:00:00.01 |    3091 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(("RECEIPT_DATE"=TO_DATE(' 2024-06-15 00:00:00', 'syyyy-mm-dd
+              hh24:mi:ss') AND "HOSP_ID"=7))
+
+
+21 rows selected.
+
+SQLT@orcl> -- B. 튜닝 전 원문
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS BR03_B_BEFORE */ COUNT(*)
+  2         FROM medical_claims
+  3        WHERE TO_CHAR(receipt_date, 'YYYYMM') = '202406';
+
+  COUNT(*)
+----------
+     24655
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  2g3mryfwdmz5u, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS BR03_B_BEFORE */ COUNT(*)        FROM
+medical_claims       WHERE TO_CHAR(receipt_date, 'YYYYMM') = '202406'
+
+Plan hash value: 2119550289
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                |      1 |        |      1 |00:00:00.03 |    3090 |
+|   1 |  SORT AGGREGATE    |                |      1 |      1 |      1 |00:00:00.03 |    3090 |
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |      1 |   3000 |  24655 |00:00:00.03 |    3090 |
+-----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(TO_CHAR(INTERNAL_FUNCTION("RECEIPT_DATE"),'YYYYMM')='202406')
+
+
+20 rows selected.
+
+-- 해석: 둘 다 TABLE ACCESS FULL, Buffers 3,090 안팎 — Day 4 에 캡처한 튜닝 전 값과 같다. 준비됐다.
+--   A 는 11건을 찾는 데 3,090, B 는 24,655건을 세는 데 3,090. 손 튜닝 결과는 Ch05 실습 01(3)과
+--   Ch06 실습 02(68)에서 이미 실측했다.
+
+--------------------------------------------------------------------------------
+-- [2] (조치) A — 튜닝 태스크 생성·실행 (SYS)
+--------------------------------------------------------------------------------
+SYS@orcl> -- SQL 원문을 텍스트로 넘긴다. sql_id 로 넘기는 방법(15장 실습 04)도 있지만, 어드바이저가 "튜닝 전 SQL"
+SYS@orcl> --   을 보게 해야 하므로 원문(힌트·주석 제거)을 준다. user_name 이 없으면 SYS 스키마에서 파싱해 실패한다.
+SYS@orcl> VARIABLE task_a VARCHAR2(64)
+
+
+SYS@orcl> BEGIN
+  2      :task_a := DBMS_SQLTUNE.CREATE_TUNING_TASK(
+  3                   sql_text    => q'[SELECT claim_id, total_amt FROM medical_claims WHERE hosp_id = 7 AND receipt_date = DATE '2024-06-15']',
+  4                   user_name   => 'SQLT',
+  5                   scope       => DBMS_SQLTUNE.SCOPE_COMPREHENSIVE,
+  6                   time_limit  => 60,
+  7                   task_name   => 'BR03_A',
+  8                   description => 'Bridge 03 - Day4 hand-tuned SQL A vs STA');
+  9    END;
+ 10    /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> PRINT task_a
+
+TASK_A
+--------------------------------------------------------------------------------------------------------------------------------
+BR03_A
+
+SYS@orcl> EXEC DBMS_SQLTUNE.EXECUTE_TUNING_TASK(:task_a)
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COLUMN task_name FORMAT A12
+
+
+SYS@orcl> SELECT task_name, status, TO_CHAR(execution_end, 'HH24:MI:SS') done
+  2         FROM dba_advisor_log WHERE task_name = :task_a;
+
+TASK_NAME    STATUS      DONE
+------------ ----------- --------
+BR03_A       COMPLETED   19:59:44
+
+-- 해석: COMPLETED 가 아니면 time_limit 안에 못 끝난 것이다. 단일 SQL 은 몇 초면 끝난다.
+
+--------------------------------------------------------------------------------
+-- [3] (재확인) A — 보고서 읽기
+--------------------------------------------------------------------------------
+SYS@orcl> SET LONG 1000000 LONGCHUNKSIZE 1000000 PAGESIZE 0
+
+
+SYS@orcl> SELECT DBMS_SQLTUNE.REPORT_TUNING_TASK(:task_a) FROM dual;
+
+GENERAL INFORMATION SECTION
+-------------------------------------------------------------------------------
+Tuning Task Name   : BR03_A
+Tuning Task Owner  : SYS
+Workload Type      : Single SQL Statement
+Scope              : COMPREHENSIVE
+Time Limit(seconds): 60
+Completion Status  : COMPLETED
+Started at         : 09/16/2026 19:59:44
+Completed at       : 09/16/2026 19:59:44
+
+-------------------------------------------------------------------------------
+Schema Name: SQLT
+SQL ID     : b7k7qav2q97au
+SQL Text   : SELECT claim_id, total_amt FROM medical_claims WHERE hosp_id = 7
+             AND receipt_date = DATE '2024-06-15'
+
+-------------------------------------------------------------------------------
+FINDINGS SECTION (1 finding)
+-------------------------------------------------------------------------------
+
+1- Index Finding (see explain plans section below)
+--------------------------------------------------
+  The execution plan of this statement can be improved by creating one or more
+  indices.
+
+  Recommendation (estimated benefit: 99.64%)
+  ------------------------------------------
+  - Consider running the Access Advisor to improve the physical schema design
+    or creating the recommended index.
+    create index SQLT.IDX$$_03750001 on SQLT.MEDICAL_CLAIMS("HOSP_ID","RECEIPT_
+    DATE","CLAIM_ID","TOTAL_AMT");
+
+  Rationale
+  ---------
+    Creating the recommended indices significantly improves the execution plan
+    of this statement. However, it might be preferable to run "Access Advisor"
+    using a representative SQL workload as opposed to a single statement. This
+    will allow to get comprehensive index recommendations which takes into
+    account index maintenance overhead and additional space consumption.
+
+-------------------------------------------------------------------------------
+EXPLAIN PLANS SECTION
+-------------------------------------------------------------------------------
+
+1- Original
+-----------
+Plan hash value: 3132986698
+
+------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |     9 |   306 |   856   (1)| 00:00:01 |
+|*  1 |  TABLE ACCESS FULL| MEDICAL_CLAIMS |     9 |   306 |   856   (1)| 00:00:01 |
+------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter("RECEIPT_DATE"=TO_DATE(' 2024-06-15 00:00:00', 'syyyy-mm-dd
+              hh24:mi:ss') AND "HOSP_ID"=7)
+
+2- Using New Indices
+--------------------
+Plan hash value: 2269129916
+
+-----------------------------------------------------------------------------------
+| Id  | Operation        | Name           | Rows  | Bytes | Cost (%CPU)| Time     |
+-----------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |                |     9 |   306 |     3   (0)| 00:00:01 |
+|*  1 |  INDEX RANGE SCAN| IDX$$_03750001 |     9 |   306 |     3   (0)| 00:00:01 |
+-----------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("HOSP_ID"=7 AND "RECEIPT_DATE"=TO_DATE(' 2024-06-15
+              00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+
+-------------------------------------------------------------------------------
+
+SYS@orcl> SET PAGESIZE 100
+
+
+SYS@orcl> -- 뷰로 직접 뽑을 때
+SYS@orcl> COLUMN type FORMAT A10
+
+
+SYS@orcl> COLUMN message FORMAT A80
+
+
+SYS@orcl> SELECT f.type, f.impact_type, ROUND(f.impact) impact, f.message
+  2         FROM dba_advisor_findings f
+  3        WHERE f.task_name = :task_a ORDER BY f.impact DESC NULLS LAST;
+
+TYPE
+----------
+IMPACT_TYPE
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+    IMPACT MESSAGE
+---------- --------------------------------------------------------------------------------
+PROBLEM
+
+         0 The execution plan of this statement can be improved by creating one or more ind
+           ices.
+
+SYS@orcl> SELECT r.rec_id, r.type, r.rank, r.benefit
+  2         FROM dba_advisor_recommendations r
+  3        WHERE r.task_name = :task_a ORDER BY r.rank;
+
+    REC_ID TYPE             RANK    BENEFIT
+---------- ---------- ---------- ----------
+         1 INDEX               0       9964
+
+SYS@orcl> -- 해석: Index Finding 하나. 권고 인덱스는 (HOSP_ID, RECEIPT_DATE, CLAIM_ID, TOTAL_AMT) — 내가 만든
+SYS@orcl> --   (HOSP_ID, RECEIPT_DATE) 에 SELECT 목록의 두 컬럼을 더 얹은 커버링 인덱스다(Ch04 실습 03).
+SYS@orcl> --   예상 개선율 99.64%, 권고 적용 계획은 INDEX RANGE SCAN 만으로 표 접근이 없다(Cost 856 → 3).
+SYS@orcl> --   "Access Advisor 를 돌려 보라" 는 문구가 붙는다 — STA 는 이 SQL 하나만 봤다는 뜻이다.
+SYS@orcl> --   Statistics Finding·Restructure SQL Finding 은 없다 — 통계는 최신이고 SQL 구조는 문제없다.
+
+--------------------------------------------------------------------------------
+-- [4] (조치 → 재확인) B — 재작성으로 튜닝한 SQL 도 넣어 본다
+--------------------------------------------------------------------------------
+SYS@orcl> VARIABLE task_b VARCHAR2(64)
+
+
+SYS@orcl> BEGIN
+  2      :task_b := DBMS_SQLTUNE.CREATE_TUNING_TASK(
+  3                   sql_text    => q'[SELECT COUNT(*) FROM medical_claims WHERE TO_CHAR(receipt_date, 'YYYYMM') = '202406']',
+  4                   user_name   => 'SQLT',
+  5                   scope       => DBMS_SQLTUNE.SCOPE_COMPREHENSIVE,
+  6                   time_limit  => 60,
+  7                   task_name   => 'BR03_B',
+  8                   description => 'Bridge 03 - Day4 hand-tuned SQL B vs STA');
+  9    END;
+ 10    /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC DBMS_SQLTUNE.EXECUTE_TUNING_TASK(:task_b)
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SET LONG 1000000 LONGCHUNKSIZE 1000000 PAGESIZE 0
+
+
+SYS@orcl> SELECT DBMS_SQLTUNE.REPORT_TUNING_TASK(:task_b) FROM dual;
+
+GENERAL INFORMATION SECTION
+-------------------------------------------------------------------------------
+Tuning Task Name   : BR03_B
+Tuning Task Owner  : SYS
+Workload Type      : Single SQL Statement
+Scope              : COMPREHENSIVE
+Time Limit(seconds): 60
+Completion Status  : COMPLETED
+Started at         : 09/16/2026 19:59:48
+Completed at       : 09/16/2026 19:59:48
+
+-------------------------------------------------------------------------------
+Schema Name: SQLT
+SQL ID     : 6abufqwz571qu
+SQL Text   : SELECT COUNT(*) FROM medical_claims WHERE TO_CHAR(receipt_date,
+             'YYYYMM') = '202406'
+
+-------------------------------------------------------------------------------
+FINDINGS SECTION (1 finding)
+-------------------------------------------------------------------------------
+
+1- Index Finding (see explain plans section below)
+--------------------------------------------------
+  The execution plan of this statement can be improved by creating one or more
+  indices.
+
+  Recommendation (estimated benefit: 92.77%)
+  ------------------------------------------
+  - Consider running the Access Advisor to improve the physical schema design
+    or creating the recommended index.
+    create index SQLT.IDX$$_03760001 on SQLT.MEDICAL_CLAIMS(TO_CHAR("RECEIPT_DA
+    TE",'YYYYMM'));
+
+  Rationale
+  ---------
+    Creating the recommended indices significantly improves the execution plan
+    of this statement. However, it might be preferable to run "Access Advisor"
+    using a representative SQL workload as opposed to a single statement. This
+    will allow to get comprehensive index recommendations which takes into
+    account index maintenance overhead and additional space consumption.
+
+-------------------------------------------------------------------------------
+EXPLAIN PLANS SECTION
+-------------------------------------------------------------------------------
+
+1- Original
+-----------
+Plan hash value: 2119550289
+
+-------------------------------------------------------------------------------------
+| Id  | Operation          | Name           | Rows  | Bytes | Cost (%CPU)| Time     |
+-------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                |     1 |     8 |   860   (1)| 00:00:01 |
+|   1 |  SORT AGGREGATE    |                |     1 |     8 |            |          |
+|*  2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |  3000 | 24000 |   860   (1)| 00:00:01 |
+-------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(TO_CHAR(INTERNAL_FUNCTION("RECEIPT_DATE"),'YYYYMM')='202406')
+
+2- Using New Indices
+--------------------
+Plan hash value: 1655869001
+
+------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |     1 |     8 |    62   (0)| 00:00:01 |
+|   1 |  SORT AGGREGATE   |                |     1 |     8 |            |          |
+|*  2 |   INDEX RANGE SCAN| IDX$$_03760001 |  3000 | 24000 |    62   (0)| 00:00:01 |
+------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("MEDICAL_CLAIMS"."SYS_QSMMIX_VCOL_5001"='202406')
+
+-------------------------------------------------------------------------------
+
+SYS@orcl> SET PAGESIZE 100
+
+
+SYS@orcl> -- 이상 징후: 권고가 "TO_CHAR("RECEIPT_DATE",'YYYYMM') 위에 함수 기반 인덱스를 만들라" 다. Ch06 실습 02 에서
+SYS@orcl> --   배운 처방(컬럼을 가공하지 말고 범위 조건으로)과 다르다. Restructure SQL Finding 도 없다.
+SYS@orcl> -- 원인 파악: STA 는 "이 SQL 텍스트를 그대로 둔 채" 빠르게 만드는 길을 찾는다. 가공된 컬럼 조건에는
+SYS@orcl> --   함수 기반 인덱스가 그 길이다. 그 인덱스는 이 표현식을 쓰는 SQL 에만 쓸모가 있고, 같은 컬럼을
+SYS@orcl> --   범위로 조회하는 다른 SQL(Ch11 의 Keyset, 기간 조회)에는 도움이 안 된다. 손 튜닝(범위 조건 + 일반
+SYS@orcl> --   인덱스 IX_RECEIPT)은 한 인덱스로 둘 다를 해결한다 — 권고가 "엉뚱한" 쪽이다.
+SYS@orcl> --   이것이 9장 ADDM 과 같은 교훈이다: 어드바이저는 자기가 본 범위 안에서만 옳다.
+
+--------------------------------------------------------------------------------
+-- [5] (대조표) 이 절차의 산출물
+--------------------------------------------------------------------------------
+--   ┌───────────────────┬────────────────────────────────┬──────────────────────────────────────────┬────────────────────┐
+--   │ 항목              │ 내 조치 (Day 4)                │ STA 권고                                 │ 판정               │
+--   ├───────────────────┼────────────────────────────────┼──────────────────────────────────────────┼────────────────────┤
+--   │ A 인덱스 컬럼·순서│ (HOSP_ID, RECEIPT_DATE)        │ (HOSP_ID, RECEIPT_DATE, CLAIM_ID,        │ 권고가 더 좋음     │
+--   │                   │                                │  TOTAL_AMT) — 커버링, 99.64%             │ (표 접근 제거)     │
+--   │ B 재작성 지점     │ TO_CHAR 제거 → receipt_date    │ 재작성 권고 없음, 함수 기반 인덱스        │ 내 것이 더 좋음    │
+--   │                   │ >= DATE / < DATE + IX_RECEIPT  │ TO_CHAR(receipt_date,'YYYYMM')           │ (범용 인덱스)      │
+--   │ 통계              │ 재수집 안 함                   │ Statistics Finding 없음                  │ 같음               │
+--   │ 프로파일 제안     │ —                              │ 없음                                     │ —                  │
+--   │ Original = [1]    │ 3,090 Full Scan                │ Original 계획 Full Scan, Cost 856        │ 예                 │
+--   └───────────────────┴────────────────────────────────┴──────────────────────────────────────────┴────────────────────┘
+-- 판정 기준(절차서 5 단계): 권고 인덱스에 컬럼이 더 있으면 SELECT 목록에 있는지 본다 — A 는 있다(커버링).
+--   B 의 권고 인덱스는 이 SQL 하나만 보고 만든 것이라 과잉 인덱스다(Ch05 "인덱스가 늘 때의 비용").
+
+--------------------------------------------------------------------------------
+-- [6] (재확인) A — 권고 인덱스와 내 인덱스를 실측으로 견준다 (SQLT, 둘을 동시에 두지 않는다)
+--------------------------------------------------------------------------------
+SQLT@orcl> CREATE INDEX ix_br03_mine ON medical_claims(hosp_id, receipt_date);
+
+Index created.
+
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS BR03_A_MINE */ claim_id, total_amt
+  2         FROM medical_claims
+  3        WHERE hosp_id = 7 AND receipt_date = DATE '2024-06-15';
+
+CLAIM_ID              TOTAL_AMT
+-------------------- ----------
+20240615-0071592         205708
+20240615-0086031         110018
+20240615-0118290          64669
+20240615-0270321          47131
+20240615-0294987         490111
+20240615-0028757         210251
+20240615-0104840         425913
+20240615-0104848         130861
+20240615-0183441          38852
+20240615-0230511         171570
+20240615-0299093         105456
+
+11 rows selected.
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  fuastd84aug6k, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS BR03_A_MINE */ claim_id, total_amt
+    FROM medical_claims       WHERE hosp_id = 7 AND receipt_date = DATE
+'2024-06-15'
+
+Plan hash value: 746890551
+
+-------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                           | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+-------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                    |                |      1 |        |     11 |00:00:00.01 |      14 |      2 |
+|   1 |  TABLE ACCESS BY INDEX ROWID BATCHED| MEDICAL_CLAIMS |      1 |      9 |     11 |00:00:00.01 |      14 |      2 |
+|*  2 |   INDEX RANGE SCAN                  | IX_BR03_MINE   |      1 |      9 |     11 |00:00:00.01 |       4 |      2 |
+-------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("HOSP_ID"=7 AND "RECEIPT_DATE"=TO_DATE(' 2024-06-15 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+
+
+21 rows selected.
+
+SQLT@orcl> DROP INDEX ix_br03_mine;
+
+Index dropped.
+
+SQLT@orcl> CREATE INDEX ix_br03_sta ON medical_claims(hosp_id, receipt_date, claim_id, total_amt);
+
+Index created.
+
+SQLT@orcl> SELECT /*+ GATHER_PLAN_STATISTICS BR03_A_STA */ claim_id, total_amt
+  2         FROM medical_claims
+  3        WHERE hosp_id = 7 AND receipt_date = DATE '2024-06-15';
+
+CLAIM_ID              TOTAL_AMT
+-------------------- ----------
+20240615-0028757         210251
+20240615-0071592         205708
+20240615-0086031         110018
+20240615-0104840         425913
+20240615-0104848         130861
+20240615-0118290          64669
+20240615-0183441          38852
+20240615-0230511         171570
+20240615-0270321          47131
+20240615-0294987         490111
+20240615-0299093         105456
+
+11 rows selected.
+
+SQLT@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_CURSOR(NULL, NULL, 'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  czfsvtwptrspa, child number 0
+-------------------------------------
+SELECT /*+ GATHER_PLAN_STATISTICS BR03_A_STA */ claim_id, total_amt
+   FROM medical_claims       WHERE hosp_id = 7 AND receipt_date = DATE
+'2024-06-15'
+
+Plan hash value: 3257023240
+
+---------------------------------------------------------------------------------------------------
+| Id  | Operation        | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |             |      1 |        |     11 |00:00:00.01 |       4 |      2 |
+|*  1 |  INDEX RANGE SCAN| IX_BR03_STA |      1 |      9 |     11 |00:00:00.01 |       4 |      2 |
+---------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("HOSP_ID"=7 AND "RECEIPT_DATE"=TO_DATE(' 2024-06-15 00:00:00', 'syyyy-mm-dd
+              hh24:mi:ss'))
+
+
+21 rows selected.
+
+SQLT@orcl> DROP INDEX ix_br03_sta;
+
+Index dropped.
+
+-- 재확인: 내 인덱스는 INDEX RANGE SCAN(4) → TABLE ACCESS BY INDEX ROWID(11행이 10개 표 블록에 흩어져 +10)
+--   = 14, 권고 인덱스는 INDEX RANGE SCAN 만으로 4. 커버링이 3.5배 싸다 — 그러나 3,090 → 14 와 14 → 4 는
+--   자릿수가 다른 이득이다. 권고의 99.64% 는 Full Scan(3,090) 대비이지 내 인덱스 대비가 아니다. 이 SQL 이
+--   초당 수백 번 도는 화면이면 커버링을, 그렇지 않으면 인덱스 크기(엔트리가 두 배 길어진다)와 다른 조회
+--   패턴을 감안해 (HOSP_ID, RECEIPT_DATE)를 남긴다.
+
+--------------------------------------------------------------------------------
+-- [7] (원복) 태스크 삭제와 PK 만 남았는지 확인 — Day 10 종합 평가의 전제
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_SQLTUNE.DROP_TUNING_TASK(:task_a)
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC DBMS_SQLTUNE.DROP_TUNING_TASK(:task_b)
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT task_name FROM dba_advisor_tasks WHERE task_name LIKE 'BR03%';
+
+no rows selected
+
+SYS@orcl> SELECT owner, table_name, index_name, visibility
+  2         FROM dba_indexes
+  3        WHERE owner = 'SQLT' AND index_name NOT LIKE 'PK%';
+
+no rows selected
+
+-- 재확인: 0 행이어야 한다. PK 외 인덱스를 남긴 채 Day 10 으로 넘어가면 18·19장 부하 실습과 종합 평가의
+--   실행계획이 전부 달라진다. 종합 평가 문제지는 "PK 인덱스만 존재" 를 전제하고 인덱스 생성을 0점 사유로 둔다.
+
+--------------------------------------------------------------------------------
+-- [정리]
+--------------------------------------------------------------------------------
+-- 1) STA 에는 튜닝 전 원문을 sql_text 로, user_name 과 함께 넘긴다. 단일 SQL 은 몇 초면 COMPLETED.
+-- 2) A: 권고 = 내 인덱스 + SELECT 컬럼(커버링). 컬럼이 더 있으면 SELECT 목록에 있는지로 커버링 여부를 판정한다.
+-- 3) B: 권고 = 함수 기반 인덱스. 어드바이저는 SQL 을 고쳐 주지 않는다 — 가공 컬럼은 재작성이 먼저다.
+-- 4) 권고의 개선율은 Original(Full Scan) 대비다. 내 조치 대비는 실측(DISPLAY_CURSOR)으로 따로 잰다.
+-- 5) 태스크와 인덱스를 지우고 PK 만 남겼다. 최종 판정과 근거 한 문장을 절차서 8 단계 양식으로 제출한다.
+
+SQLT@orcl> EXIT
+
+SYS@orcl> EXIT
+
+================================================================================

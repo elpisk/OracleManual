@@ -110,11 +110,10 @@ TUN 본문은 7단 구조다: Learning Objective / Concept / Diagnosis / Example
 | 파일 | 쓰는 시점 | 목적 |
 |---|---|---|
 | `브리지_01_SQL한문장에서시스템으로.pptx` + `.md`(강의 노트) | Day 5 09:00, TUN 1장 도입 전 | SQL 부문에서 배운 측정(Buffers/A-Rows)이 인스턴스 부문의 DB Time 과 어떻게 이어지는지, "내 SQL 이 아니라 시스템이 문제" 인지 어떻게 아는지 |
-| `브리지_02_AWR상위SQL_실행계획판독_절차.md` | Day 7, TUN 8장 실습 04 직후 | AWR SQL 섹션의 SQL_ID → `DBMS_XPLAN.DISPLAY_AWR` / `DISPLAY_CURSOR` → Day 1~4 기법으로 판독 |
-| `브리지_03_손튜닝SQL_STA대조_절차.md` | Day 9, TUN 15장 실습 04 대체 | Day 4 평가에서 손으로 튜닝한 SQL(원문·내 인덱스 DDL·전후 Buffers 를 보관해 둔 것)을 SQL Tuning Advisor 에 넣고 권고와 대조, 채택 여부 판단 |
+| `브리지_02_AWR상위SQL_실행계획판독_절차.md` + `.txt`(실측) | Day 7, TUN 8장 실습 04 직후 | AWR SQL 섹션의 SQL_ID → `DBMS_XPLAN.DISPLAY_AWR` / `DISPLAY_CURSOR` → Day 1~4 기법으로 판독 |
+| `브리지_03_손튜닝SQL_STA대조_절차.md` + `.txt`(실측) | Day 9, TUN 15장 실습 04 대체 | Day 4 평가에서 손으로 튜닝한 SQL(원문·내 인덱스 DDL·전후 Buffers 를 보관해 둔 것)을 SQL Tuning Advisor 에 넣고 권고와 대조, 채택 여부 판단 |
 
-브리지 02·03 은 **절차서**다. SQL 과 판독 기준은 확정돼 있지만 실행 출력은 실습 환경에서 캡처해야
-하므로, 원 과정 트랜스크립트처럼 실측 출력이 실린 `.txt` 로 바꾸려면 랩에서 한 번 돌려 붙인다.
+브리지 02·03 의 `.md` 는 절차서, `.txt` 는 그 절차를 랩에서 돌린 실측 트랜스크립트(2026-09-16)다. 수업에서는 `.txt` 를 연다.
 
 ---
 
