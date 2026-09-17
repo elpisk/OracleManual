@@ -8,9 +8,43 @@
  주의: 개인 실습 환경 전용. 읽기 전용 조회. V$ 조회는 라이선스 불필요.
 ================================================================================
 
+-- [0] (부하 준비) SQLT 세션에서 '무거운 전체 스캔 1개'와 '리터럴만 다른 다발'을 함께 만든다.
+--     절대값 순위표 오판(무거운 것만 보고 리터럴 다발을 놓침)을 재현하기 위한 소재다.
+--     ★개인 실습 환경 전용★ 순위를 깨끗하게 보려고 먼저 공유 풀을 비운다(운영 DB 금지).
+$ sqlplus / as sysdba
+
+SYS@orcl> ALTER SYSTEM FLUSH SHARED_POOL;
+
+System altered.
+
+SYS@orcl> EXIT
+
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> DECLARE
+  2         n NUMBER; s NUMBER;
+  3       BEGIN
+  4         -- (a) 무거운 전체 스캔 집계: buffer_gets 절대 상위가 된다
+  5         FOR k IN 1..3 LOOP
+  6           SELECT /*+ full(d) */ COUNT(*), SUM(d.amt) INTO n, s FROM claim_details d;
+  7         END LOOP;
+  8         -- (b) 병원 ID 리터럴만 다른 집계: 값마다 커서가 갈라진다(커서 다발)
+  9         FOR i IN 1..30 LOOP
+ 10           EXECUTE IMMEDIATE 'select count(*) from medical_claims where hosp_id = ' || (90000 + i) INTO n;
+ 11           EXECUTE IMMEDIATE 'select count(*) from medical_claims where hosp_id = ' || (90000 + i) INTO n;
+ 12         END LOOP;
+ 13       END;
+ 14       /
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> EXIT
+
+-- [진단] SYS 로 절대값 순위표부터 본다.
 $ sqlplus / as sysdba
 
 SYS@orcl> SET LINESIZE 200
+
 SYS@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
@@ -23,33 +57,50 @@ SYS@orcl> SELECT sql_id, executions execs, buffer_gets,
   5             ORDER BY buffer_gets DESC)
   6       WHERE ROWNUM<=2;
 
-SQL_ID        EXECS BUFFER_GETS TXT
-------------- ----- ----------- ----------------------------------------
-9vmszgd1ft9x0  1290     8494906 select /*+ full(d) */ count(*), sum(d.am
-ddukvcz4gwcad   631     1946786 select hosp_id, count(*), avg(total_amt)
+SQL_ID             EXECS BUFFER_GETS TXT
+------------- ---------- ----------- ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+d0zz984q88frv          1      206034 DECLARE        n NUMBER; s NUMBER;
+55tp57d566c4q          3       20400 SELECT /*+ full(d) */ COUNT(*), SUM(D.AM
 
--- 오판: "상위 2개(9vmsz, dduk)만 튜닝하면 끝"이라고 결론짓는다.
---   → 이 결론은 그럴듯하지만 불완전하다. 아래에서 교정한다.
+-- 오판: "buffer_gets 상위 1~2개(무거운 전체 스캔)만 튜닝하면 끝"이라고 결론짓는다.
+--   → 이 결론은 그럴듯하지만 불완전하다. 리터럴 다발은 개별로 작아 여기 안 보인다. 아래에서 교정한다.
 
 --------------------------------------------------------------------------------
 -- [2] (조회 → 이상 징후) 순위표 아래쪽을 마저 본다.
 --------------------------------------------------------------------------------
+SYS@orcl> -- 주의: WHERE ROWNUM BETWEEN 3 AND 8 은 항상 0건이다(ROWNUM 은 1부터 매겨지며 1<3 이라
+SYS@orcl> --   버려져 2·3…에 도달하지 못한다). 순번을 먼저 매긴 뒤 그 순번으로 걸러야 한다.
 SYS@orcl> SELECT sql_id, executions execs, buffer_gets,
   2         ROUND(buffer_gets/GREATEST(executions,1)) per_exec,
   3         SUBSTR(sql_text,1,40) txt
-  4       FROM (SELECT sql_id, executions, buffer_gets, sql_text
-  5             FROM   v$sql WHERE parsing_schema_name='SQLT'
-  6             ORDER BY buffer_gets DESC)
-  7       WHERE ROWNUM BETWEEN 3 AND 8;
+  4       FROM (SELECT sql_id, executions, buffer_gets, sql_text,
+  5                   ROW_NUMBER() OVER (ORDER BY buffer_gets DESC) rn
+  6             FROM   v$sql WHERE parsing_schema_name='SQLT')
+  7       WHERE rn BETWEEN 3 AND 8;
 
-SQL_ID        EXECS BUFFER_GETS PER_EXEC TXT
-------------- ----- ----------- -------- ----------------------------------------
-2hwjffuh4cs8t     2        6188     3094 select count(*) from medical_claims wher
-6jwvu6btpjhnu     2        6188     3094 select count(*) from medical_claims wher
-b85cymcwbd1qj     2        6188     3094 select count(*) from medical_claims wher
-13ywm87qcw0by     2        6180     3090 select count(*) from medical_claims wher
-fq4sycqx841ht     2        6180     3090 select count(*) from medical_claims wher
-fxj7b9gx2w1ay     2        6180     3090 select count(*) from medical_claims wher
+SQL_ID             EXECS BUFFER_GETS   PER_EXEC
+------------- ---------- ----------- ----------
+TXT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+87ca0c15ddpst          2        6380       3190
+select count(*) from medical_claims wher
+
+fff9xma3f411a          2        6180       3090
+select count(*) from medical_claims wher
+
+5xvyaps5j4nw3          2        6180       3090
+select count(*) from medical_claims wher
+
+fsa9ssc4qwfp0          2        6180       3090
+select count(*) from medical_claims wher
+
+cz7r4pd3rwczs          2        6180       3090
+select count(*) from medical_claims wher
+
+81h1rn6pbwcj0          2        6180       3090
+select count(*) from medical_claims wher
+
+6 rows selected.
 
 -- 이상 징후: sql_text가 모두 'select count(*) from medical_claims where ...'로
 --   사실상 같은데 SQL_ID가 여섯 개로 갈라졌다. 각각은 작아 보여(6,188) 절대값
@@ -66,30 +117,33 @@ SYS@orcl> SELECT force_matching_signature sig, COUNT(*) child_cnt,
   6       GROUP BY force_matching_signature
   7       ORDER BY tot_gets DESC;
 
-SIG                   CHILD_CNT  TOT_EXECS   TOT_GETS
---------------------- --------- ---------- ----------
- 14738201956... <환경값>      6         12      37112
+       SIG  CHILD_CNT  TOT_EXECS   TOT_GETS
+---------- ---------- ---------- ----------
+4.3388E+17         30         60     185600
 
--- 원인 확정: FORCE_MATCHING_SIGNATURE로 묶으면 리터럴만 다른 여섯 문장이
---   하나의 시그니처로 합쳐진다. 개별로는 6,188씩이라 작아 보였지만, 이들은
---   '같은 문장'이며 매번 하드 파싱을 일으킨 주범이다. 절대값 순위표는 이
+-- 원인 확정: FORCE_MATCHING_SIGNATURE 로 묶으면 리터럴만 다른 30여 문장이
+--   하나의 시그니처로 합쳐진다. 개별로는 수천 gets 씩이라 작아 보였지만, 이들은
+--   '같은 문장'이며 값마다 커서가 갈라져 매번 하드 파싱을 일으킨 주범이다. 절대값 순위표는 이
 --   '공유되지 못하는 다발'을 보여 주지 못한다.
 
 --------------------------------------------------------------------------------
 -- [4] (해석) 하드 파싱 비율로 시스템 전역 영향을 확인한다.
 --------------------------------------------------------------------------------
+SYS@orcl> COLUMN name FORMAT A20
+
 SYS@orcl> SELECT name, value FROM v$sysstat
   2       WHERE name IN ('parse count (hard)','parse count (total)');
 
-NAME                             VALUE
------------------------------- ---------
-parse count (hard)                112198
-parse count (total)               185227
+NAME                      VALUE
+-------------------- ----------
+parse count (total)    16188321
+parse count (hard)      1977839
 
--- 하드 파싱 비율 = 112,198 / 185,227 ≈ 0.606 → 60.6% (비정상적으로 높음)
--- 해석: [2]~[3]의 리터럴 SQL 다발이 이 60.6%를 만든다. buffer_gets 절대값
---   1·2위를 튜닝해도 이 하드 파싱이 만든 공유 풀·라이브러리 캐시 래치 경합은
---   그대로 남아, 피크 성능은 크게 나아지지 않는다.
+-- 하드 파싱 비율 = (hard / total). 기동 이후 누적이라 절대값·비율 모두 환경마다 다르다
+--   (이 랩은 앞 실습들의 리터럴 부하가 쌓여 높다).
+-- 해석: [2]~[3]의 리터럴 SQL 다발이 하드 파싱을 끌어올린다. buffer_gets 절대값
+--   1·2위(무거운 전체 스캔)를 튜닝해도 이 하드 파싱이 만든 공유 풀·라이브러리 캐시 래치 부하는
+--   그대로 남아, 피크 성능은 크게 나아지지 않는다. → 리터럴 다발을 바인드로 바꾸는 것도 함께 필요하다.
 
 --------------------------------------------------------------------------------
 -- [5] (조치 → 재확인) 교정된 결론.
@@ -112,4 +166,5 @@ parse count (total)               185227
 -- ※ 시그니처 값 등은 환경·시점에 따라 다른 <환경값>이다. 판정 절차가 핵심이다.
 
 SYS@orcl> EXIT
+
 ================================================================================

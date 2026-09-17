@@ -11,24 +11,34 @@
 $ sqlplus sqlt/sqlt@orcl
 
 SQLT@orcl> SET LINESIZE 200
+
 SQLT@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
 -- [1] (조치 전 상태 · 이상/오류 → 원인 → 조치 → 재확인)
 --     조치 전: SQLT로 V$SQL을 조회하자 권한 오류가 난다.
 --------------------------------------------------------------------------------
+SQLT@orcl> -- 이 과정의 SQLT 는 Day 1 에서 SELECT_CATALOG_ROLE 을 이미 받았다. 순수 업무 계정이
+SQLT@orcl> --   V$ 뷰에 부딪히는 벽을 보려고 세션의 롤을 잠시 끈다.
+SQLT@orcl> SET ROLE NONE;
+
+Role set.
+
 SQLT@orcl> SELECT sql_id, buffer_gets FROM v$sql WHERE ROWNUM<=1;
+
 SELECT sql_id, buffer_gets FROM v$sql WHERE ROWNUM<=1
                                 *
 ERROR at line 1:
 ORA-00942: table or view does not exist
 
--- 원인 파악: SQLT 계정에 V$SQL(V_$SQL) 조회 권한이 없다. V$ 뷰 조회에는
+-- 원인 파악: 롤이 없는 업무 계정에는 V$SQL(V_$SQL) 조회 권한이 없다. V$ 뷰 조회에는
 --   SELECT_CATALOG_ROLE(또는 개별 SELECT 권한)이 필요하다.
--- 조치: SYS에서 1회 권한을 부여한다.
+-- 조치: SYS 에서 1회 부여한다(이 랩은 이미 부여돼 있으므로 롤을 되살리면 된다).
 --     SYS@orcl> GRANT SELECT_CATALOG_ROLE TO SQLT;
--- 재확인: 재접속 후 다시 조회하면 정상 동작한다(아래 [2]부터 진행).
-SQLT@orcl> -- (SYS가 권한 부여 후) 재접속하여 진행한다.
+-- 재확인: 롤을 되살리면(SET ROLE ALL, 새 접속도 같다) 정상 동작한다(아래 [2]부터).
+SQLT@orcl> SET ROLE ALL;
+
+Role set.
 
 --------------------------------------------------------------------------------
 -- [2] (조회 A) 논리읽기(buffer_gets) 기준 상위. 실행당도 함께 본다.
@@ -41,13 +51,13 @@ SQLT@orcl> SELECT sql_id, executions execs, buffer_gets,
   6             ORDER BY buffer_gets DESC)
   7       WHERE ROWNUM<=5;
 
-SQL_ID        EXECS BUFFER_GETS PER_EXEC TXT
-------------- ----- ----------- -------- --------------------------------------
-9vmszgd1ft9x0  1290     8494906     6585 select /*+ full(d) */ count(*), sum(d.
-ddukvcz4gwcad   631     1946786     3085 select hosp_id, count(*), avg(total_am
-2hwjffuh4cs8t     2        6188     3094 select count(*) from medical_claims wh
-6jwvu6btpjhnu     2        6188     3094 select count(*) from medical_claims wh
-b85cymcwbd1qj     2        6188     3094 select count(*) from medical_claims wh
+SQL_ID             EXECS BUFFER_GETS   PER_EXEC TXT
+------------- ---------- ----------- ---------- --------------------------------------------------------------------------------------------------------------------------------------------------------
+6xu0wc1rhww34          1     8766061    8766061 DECLARE     TYPE t_map IS TABLE OF NUM
+858mpgdtr5ssf     619578     2189946          4 UPDATE /* WL06_UPD */ REVIEW_LOG_MIX_W
+gz97yq3a3n02v        308     2052519       6664 SELECT /*+ FULL(d) NO_PARALLEL(d) */ S
+3gy9h99h9d54n     308685     1234712          4 SELECT /*+ INDEX(d PK_CLAIM_DETAILS) *
+8yy5q06wvrpga        151      999771       6621 SELECT /*+ LEADING(c d) USE_HASH(d) FU
 
 -- 해석: 1위 9vmsz…는 총량(849만)도, 실행당(6,585)도 커서 두 축 모두 나쁜
 --   진짜 상위 부하다(강제 풀 스캔). 3~5위는 sql_text가 사실상 같은데
@@ -64,11 +74,13 @@ SQLT@orcl> SELECT sql_id, executions execs,
   6             ORDER BY elapsed_time DESC)
   7       WHERE ROWNUM<=5;
 
-SQL_ID        EXECS  ELAPSED_S  MS_PER_EXEC
-------------- ----- ---------- ------------
-9vmszgd1ft9x0  1290    <환경값>      <환경값>
-ddukvcz4gwcad   631    <환경값>      <환경값>
-...
+SQL_ID             EXECS  ELAPSED_S MS_PER_EXEC
+------------- ---------- ---------- -----------
+6xu0wc1rhww34          1     179.49   179491.62
+8yy5q06wvrpga        156      17.24       110.5
+0dhsm13grpw10        156      16.86      108.06
+gz97yq3a3n02v        318      12.51       39.34
+858mpgdtr5ssf     639572      10.91         .02
 
 -- 해석: elapsed_time은 마이크로초 누적이다. 실행당 ms로 나눠 문장 효율을 본다.
 --   buffer_gets 상위와 elapsed_time 상위가 대개 비슷하지만, 어긋나는 문장이
@@ -86,11 +98,11 @@ SQLT@orcl> SELECT sql_id, executions execs,
   6             ORDER BY executions DESC)
   7       WHERE ROWNUM<=3;
 
-SQL_ID        EXECS PER_EXEC TXT
-------------- ----- -------- --------------------------------------
-9vmszgd1ft9x0  1290     6585 select /*+ full(d) */ count(*), sum(d.
-ddukvcz4gwcad   631     3085 select hosp_id, count(*), avg(total_am
-...
+SQL_ID             EXECS   PER_EXEC TXT
+------------- ---------- ---------- --------------------------------------------------------------------------------------------------------------------------------------------------------
+858mpgdtr5ssf     647041          4 UPDATE /* WL06_UPD */ REVIEW_LOG_MIX_W
+3gy9h99h9d54n     328621          4 SELECT /*+ INDEX(d PK_CLAIM_DETAILS) *
+7tqyv4v46gfv8     109769          4 SELECT /*+ INDEX(l PK_REVIEW_LOG) */ L
 
 -- 해석: 실행횟수 상위는 '자주 불리는 문장'을 잡는다. 실행당이 작으면 총 부하는
 --   낮을 수 있으니, 실행당(per_exec)을 함께 봐야 실체가 보인다.
@@ -116,4 +128,5 @@ ddukvcz4gwcad   631     3085 select hosp_id, count(*), avg(total_am
 -- ※ 실행시간 등 일부 값은 환경·시점에 따라 다른 <환경값>이다.
 
 SQLT@orcl> EXIT
+
 ================================================================================
