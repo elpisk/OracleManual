@@ -124,12 +124,31 @@ SET FEEDBACK ON
 --   wl_run_hash  : 1이면 구획 2(해시 조인) 실행
 --   wl_run_group : 1이면 구획 3(그룹핑) 실행
 -- ----------------------------------------------------------------------------
-DEFINE wl_sort_area = 1048576
-DEFINE wl_hash_area = 2097152
-DEFINE wl_div       = 1
-DEFINE wl_run_sort  = 1
-DEFINE wl_run_hash  = 1
-DEFINE wl_run_group = 1
+-- 기본값 처리: 실행 전에 DEFINE 해 둔 값이 있으면 그 값을 쓰고, 없으면 아래 기본값을 쓴다.
+--   (SQL*Plus 에는 '미정의면 정의' 문법이 없어 NEW_VALUE 관용구를 쓴다. 값을 바꾸려면
+--    스크립트를 고치지 말고 실행 전에 DEFINE 하라. 예: DEFINE wl_sort_area = 1048576)
+SET TERMOUT OFF
+COLUMN wl_sort_area NEW_VALUE wl_sort_area NOPRINT
+COLUMN wl_hash_area NEW_VALUE wl_hash_area NOPRINT
+COLUMN wl_div       NEW_VALUE wl_div NOPRINT
+COLUMN wl_run_sort  NEW_VALUE wl_run_sort NOPRINT
+COLUMN wl_run_hash  NEW_VALUE wl_run_hash NOPRINT
+COLUMN wl_run_group NEW_VALUE wl_run_group NOPRINT
+SELECT NULL wl_sort_area, NULL wl_hash_area, NULL wl_div, NULL wl_run_sort, NULL wl_run_hash, NULL wl_run_group FROM dual WHERE 1 = 2;
+COLUMN wl_sort_area_d NEW_VALUE wl_sort_area NOPRINT
+COLUMN wl_hash_area_d NEW_VALUE wl_hash_area NOPRINT
+COLUMN wl_div_d       NEW_VALUE wl_div NOPRINT
+COLUMN wl_run_sort_d  NEW_VALUE wl_run_sort NOPRINT
+COLUMN wl_run_hash_d  NEW_VALUE wl_run_hash NOPRINT
+COLUMN wl_run_group_d NEW_VALUE wl_run_group NOPRINT
+SELECT NVL(TRIM('&wl_sort_area'), '1048576') wl_sort_area_d,
+       NVL(TRIM('&wl_hash_area'), '2097152') wl_hash_area_d,
+       NVL(TRIM('&wl_div'), '1') wl_div_d,
+       NVL(TRIM('&wl_run_sort'), '1') wl_run_sort_d,
+       NVL(TRIM('&wl_run_hash'), '1') wl_run_hash_d,
+       NVL(TRIM('&wl_run_group'), '1') wl_run_group_d
+  FROM dual;
+SET TERMOUT ON
 
 PROMPT
 PROMPT ============================================================

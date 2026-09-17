@@ -93,9 +93,22 @@ SET FEEDBACK ON
 --   wl_cs    : 세션 CURSOR_SHARING. EXACT 여야 리터럴이 하드 파싱된다.
 --              18장에서 FORCE 로 바꿔 재실행하면 하드 파싱이 사라지는 것을 볼 수 있다.
 -- ----------------------------------------------------------------------------
-DEFINE wl_loops = 5000
-DEFINE wl_mode  = BOTH
-DEFINE wl_cs    = EXACT
+-- 기본값 처리: 실행 전에 DEFINE 해 둔 값이 있으면 그 값을 쓰고, 없으면 아래 기본값을 쓴다.
+--   (SQL*Plus 에는 '미정의면 정의' 문법이 없어 NEW_VALUE 관용구를 쓴다. 값을 바꾸려면
+--    스크립트를 고치지 말고 실행 전에 DEFINE 하라. 예: DEFINE wl_loops = 5000)
+SET TERMOUT OFF
+COLUMN wl_loops NEW_VALUE wl_loops NOPRINT
+COLUMN wl_mode  NEW_VALUE wl_mode NOPRINT
+COLUMN wl_cs    NEW_VALUE wl_cs NOPRINT
+SELECT NULL wl_loops, NULL wl_mode, NULL wl_cs FROM dual WHERE 1 = 2;
+COLUMN wl_loops_d NEW_VALUE wl_loops NOPRINT
+COLUMN wl_mode_d  NEW_VALUE wl_mode NOPRINT
+COLUMN wl_cs_d    NEW_VALUE wl_cs NOPRINT
+SELECT NVL(TRIM('&wl_loops'), '5000') wl_loops_d,
+       NVL(TRIM('&wl_mode'), 'BOTH') wl_mode_d,
+       NVL(TRIM('&wl_cs'), 'EXACT') wl_cs_d
+  FROM dual;
+SET TERMOUT ON
 
 PROMPT
 PROMPT ============================================================

@@ -111,10 +111,25 @@ SET FEEDBACK ON
 --                  0으로 두고 실행해 direct path read 로 나타나는 것을 대조하면
 --                  20장 "다중 블록 읽기" 실습 소재가 된다.
 -- ----------------------------------------------------------------------------
-DEFINE wl_rand     = 5000
-DEFINE wl_scan     = 5
-DEFINE wl_flush    = 0
-DEFINE wl_nodirect = 1
+-- 기본값 처리: 실행 전에 DEFINE 해 둔 값이 있으면 그 값을 쓰고, 없으면 아래 기본값을 쓴다.
+--   (SQL*Plus 에는 '미정의면 정의' 문법이 없어 NEW_VALUE 관용구를 쓴다. 값을 바꾸려면
+--    스크립트를 고치지 말고 실행 전에 DEFINE 하라. 예: DEFINE wl_rand = 5000)
+SET TERMOUT OFF
+COLUMN wl_rand     NEW_VALUE wl_rand NOPRINT
+COLUMN wl_scan     NEW_VALUE wl_scan NOPRINT
+COLUMN wl_flush    NEW_VALUE wl_flush NOPRINT
+COLUMN wl_nodirect NEW_VALUE wl_nodirect NOPRINT
+SELECT NULL wl_rand, NULL wl_scan, NULL wl_flush, NULL wl_nodirect FROM dual WHERE 1 = 2;
+COLUMN wl_rand_d     NEW_VALUE wl_rand NOPRINT
+COLUMN wl_scan_d     NEW_VALUE wl_scan NOPRINT
+COLUMN wl_flush_d    NEW_VALUE wl_flush NOPRINT
+COLUMN wl_nodirect_d NEW_VALUE wl_nodirect NOPRINT
+SELECT NVL(TRIM('&wl_rand'), '5000') wl_rand_d,
+       NVL(TRIM('&wl_scan'), '5') wl_scan_d,
+       NVL(TRIM('&wl_flush'), '0') wl_flush_d,
+       NVL(TRIM('&wl_nodirect'), '1') wl_nodirect_d
+  FROM dual;
+SET TERMOUT ON
 
 PROMPT
 PROMPT ============================================================

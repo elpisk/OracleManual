@@ -101,7 +101,7 @@
 --           SQL> DEFINE wl_role = C
 --           SQL> @WL_04_lock.sql
 --           -> 블로커/대기자, V$LOCK, 대기 이벤트를 조회해 화면에 출력한다.
---              여러 번 반복 실행해도 된다.
+--              여러 번 반복 실행해도 된다. (관찰 절의 화면 출력은 역할 C 일 때만 한다)
 --
 --   [4단계] 정리
 --           SQL> DEFINE wl_role = CLEANUP
@@ -131,9 +131,22 @@ SET FEEDBACK ON
 --                 행은 잠기지 않는다"를 보이려고 여유 있게 1000행을 둔다.
 --   wl_hold_sec : 세션 A가 커밋하지 않고 잠금을 유지할 시간(초). 기본 60.
 -- ----------------------------------------------------------------------------
-DEFINE wl_role     = SETUP
-DEFINE wl_rows     = 1000
-DEFINE wl_hold_sec = 60
+-- 기본값 처리: 실행 전에 DEFINE 해 둔 값이 있으면 그 값을 쓰고, 없으면 아래 기본값을 쓴다.
+--   (SQL*Plus 에는 '미정의면 정의' 문법이 없어 NEW_VALUE 관용구를 쓴다. 값을 바꾸려면
+--    스크립트를 고치지 말고 실행 전에 DEFINE 하라. 예: DEFINE wl_role = SETUP)
+SET TERMOUT OFF
+COLUMN wl_role     NEW_VALUE wl_role NOPRINT
+COLUMN wl_rows     NEW_VALUE wl_rows NOPRINT
+COLUMN wl_hold_sec NEW_VALUE wl_hold_sec NOPRINT
+SELECT NULL wl_role, NULL wl_rows, NULL wl_hold_sec FROM dual WHERE 1 = 2;
+COLUMN wl_role_d     NEW_VALUE wl_role NOPRINT
+COLUMN wl_rows_d     NEW_VALUE wl_rows NOPRINT
+COLUMN wl_hold_sec_d NEW_VALUE wl_hold_sec NOPRINT
+SELECT NVL(TRIM('&wl_role'), 'SETUP') wl_role_d,
+       NVL(TRIM('&wl_rows'), '1000') wl_rows_d,
+       NVL(TRIM('&wl_hold_sec'), '60') wl_hold_sec_d
+  FROM dual;
+SET TERMOUT ON
 
 PROMPT
 PROMPT ============================================================
@@ -241,7 +254,17 @@ BEGIN
     DBMS_OUTPUT.PUT_LINE('      @WL_04_lock.sql');
     DBMS_OUTPUT.PUT_LINE(' ');
     DBMS_OUTPUT.PUT_LINE('[세션 A] ' || &wl_hold_sec || ' 초 동안 잠금을 유지한다...');
-
+END;
+/
+-- 대기는 별도 블록으로 뗀다: DBMS_OUTPUT 은 블록이 끝나야 화면에 나오므로, 같은 블록에서
+-- 잠들면 위의 SID 안내가 wl_hold_sec 초 뒤에야(세션이 KILL 되면 영영) 보이지 않는다.
+-- 트랜잭션은 블록 경계와 무관하게 이어지므로 잠금은 그대로 유지된다.
+DECLARE
+    v_role VARCHAR2(20) := UPPER('&wl_role');
+BEGIN
+    IF v_role <> 'A' THEN
+        RETURN;
+    END IF;
     -- 19c 에서 사용 가능. DBMS_LOCK.SLEEP 은 별도 EXECUTE 권한이 필요해 쓰지 않는다.
     DBMS_SESSION.SLEEP(&wl_hold_sec);
 
@@ -257,6 +280,23 @@ END;
 --     - 블로킹 전후로 자기 대기 통계를 스냅샷해 델타를 출력한다.
 --     - A가 롤백하면 자동으로 풀린다. 화면이 멈춰 보이는 것이 정상이다.
 -- ============================================================================
+-- 안내는 별도 블록에서 먼저 찍는다(아래 본 블록은 UPDATE 에서 멈추므로 DBMS_OUTPUT 이 늦게 나온다).
+DECLARE
+    v_role   VARCHAR2(20) := UPPER('&wl_role');
+    v_target NUMBER;
+BEGIN
+    IF v_role <> 'B' THEN
+        RETURN;
+    END IF;
+    EXECUTE IMMEDIATE 'SELECT MIN(LOG_ID) FROM REVIEW_LOG_WL' INTO v_target;
+    DBMS_OUTPUT.PUT_LINE(RPAD('=',80,'='));
+    DBMS_OUTPUT.PUT_LINE('[세션 B] 나의 SID = ' || SYS_CONTEXT('USERENV','SID'));
+    DBMS_OUTPUT.PUT_LINE('[세션 B] 갱신 시도 대상 : REVIEW_LOG_WL.LOG_ID = ' || v_target);
+    DBMS_OUTPUT.PUT_LINE('[세션 B] 세션 A가 같은 행을 잡고 있으면 여기서 멈춘다.');
+    DBMS_OUTPUT.PUT_LINE('         (화면이 멈춘 것처럼 보이는 것이 정상이다)');
+    DBMS_OUTPUT.PUT_LINE(RPAD('=',80,'='));
+END;
+/
 DECLARE
     TYPE t_map IS TABLE OF NUMBER INDEX BY VARCHAR2(120);
 
@@ -340,13 +380,6 @@ BEGIN
     v_sid := SYS_CONTEXT('USERENV','SID');
     EXECUTE IMMEDIATE 'SELECT MIN(LOG_ID) FROM REVIEW_LOG_WL' INTO v_target;
 
-    DBMS_OUTPUT.PUT_LINE(RPAD('=',80,'='));
-    DBMS_OUTPUT.PUT_LINE('[세션 B] 나의 SID = ' || v_sid);
-    DBMS_OUTPUT.PUT_LINE('[세션 B] 갱신 시도 대상 : REVIEW_LOG_WL.LOG_ID = ' || v_target);
-    DBMS_OUTPUT.PUT_LINE('[세션 B] 세션 A가 같은 행을 잡고 있으면 여기서 멈춘다.');
-    DBMS_OUTPUT.PUT_LINE('         (화면이 멈춘 것처럼 보이는 것이 정상이다)');
-    DBMS_OUTPUT.PUT_LINE(RPAD('=',80,'='));
-
     p_snap(v_b);
     v_t := DBMS_UTILITY.GET_TIME;
 
@@ -381,9 +414,14 @@ END;
 
 -- ============================================================================
 -- [5] [세션 C]  관찰 - 블로커/대기자 추적
---     아래 조회는 어느 역할로 실행하든 그대로 수행된다.
+--     아래 조회는 어느 역할로 실행하든 수행되지만, 화면 출력은 역할이 C 일 때만 한다
+--     (다른 역할의 화면이 빈 결과 8개로 어지러워지지 않도록 SET TERMOUT 으로 숨긴다).
 --     세션 C에서는 이 부분만 반복 실행하면 된다(스크립트를 다시 @ 해도 된다).
 -- ============================================================================
+SET TERMOUT OFF
+COLUMN wl_obs_d NEW_VALUE wl_obs NOPRINT
+SELECT CASE WHEN UPPER('&wl_role') = 'C' THEN 'ON' ELSE 'OFF' END wl_obs_d FROM dual;
+SET TERMOUT &wl_obs
 PROMPT
 PROMPT ============================================================
 PROMPT  [세션 C] 관찰 : 블로커와 대기자
@@ -431,7 +469,7 @@ SELECT s.SID, o.OWNER, o.OBJECT_NAME, o.OBJECT_TYPE,
 PROMPT
 PROMPT >>> (4) V$SESSION_BLOCKERS - 19c 의 블로킹 관계 뷰
 SELECT SID, SESS_SERIAL#, BLOCKER_SID, BLOCKER_SESS_SERIAL#,
-       WAIT_EVENT_TEXT, IN_WAIT_SECS
+       WAIT_EVENT_TEXT
   FROM V$SESSION_BLOCKERS
  ORDER BY SID;
 
@@ -476,6 +514,7 @@ SELECT t.XIDUSN, t.XIDSLOT, t.XIDSQN, s.SID, s.USERNAME,
 --     역할에 관계없이 이 세션의 미완료 트랜잭션을 롤백한다.
 --     세션 A는 여기서 잠금을 놓고, 그 순간 세션 B의 블로킹이 풀린다.
 -- ============================================================================
+SET TERMOUT ON
 PROMPT
 PROMPT >>> [마무리] ROLLBACK - 이 세션의 미커밋 트랜잭션을 되돌린다
 ROLLBACK;

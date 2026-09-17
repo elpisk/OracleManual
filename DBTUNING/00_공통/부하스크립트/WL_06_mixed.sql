@@ -140,15 +140,40 @@ SET FEEDBACK ON
 --                    스파이크를 구분하는 10장 실습에 쓰인다.
 --   wl_cleanup     : 1이면 끝에서 복제 테이블 삭제
 -- ----------------------------------------------------------------------------
-DEFINE wl_cycles      = 3
-DEFINE wl_parse_loops = 2000
-DEFINE wl_rand        = 2000
-DEFINE wl_scan        = 2
-DEFINE wl_sort_div    = 4
-DEFINE wl_commit_rows = 2000
-DEFINE wl_batch       = 200
-DEFINE wl_gap_sec     = 5
-DEFINE wl_cleanup     = 1
+-- 기본값 처리: 실행 전에 DEFINE 해 둔 값이 있으면 그 값을 쓰고, 없으면 아래 기본값을 쓴다.
+--   (SQL*Plus 에는 '미정의면 정의' 문법이 없어 NEW_VALUE 관용구를 쓴다. 값을 바꾸려면
+--    스크립트를 고치지 말고 실행 전에 DEFINE 하라. 예: DEFINE wl_cycles = 3)
+SET TERMOUT OFF
+COLUMN wl_cycles      NEW_VALUE wl_cycles NOPRINT
+COLUMN wl_parse_loops NEW_VALUE wl_parse_loops NOPRINT
+COLUMN wl_rand        NEW_VALUE wl_rand NOPRINT
+COLUMN wl_scan        NEW_VALUE wl_scan NOPRINT
+COLUMN wl_sort_div    NEW_VALUE wl_sort_div NOPRINT
+COLUMN wl_commit_rows NEW_VALUE wl_commit_rows NOPRINT
+COLUMN wl_batch       NEW_VALUE wl_batch NOPRINT
+COLUMN wl_gap_sec     NEW_VALUE wl_gap_sec NOPRINT
+COLUMN wl_cleanup     NEW_VALUE wl_cleanup NOPRINT
+SELECT NULL wl_cycles, NULL wl_parse_loops, NULL wl_rand, NULL wl_scan, NULL wl_sort_div, NULL wl_commit_rows, NULL wl_batch, NULL wl_gap_sec, NULL wl_cleanup FROM dual WHERE 1 = 2;
+COLUMN wl_cycles_d      NEW_VALUE wl_cycles NOPRINT
+COLUMN wl_parse_loops_d NEW_VALUE wl_parse_loops NOPRINT
+COLUMN wl_rand_d        NEW_VALUE wl_rand NOPRINT
+COLUMN wl_scan_d        NEW_VALUE wl_scan NOPRINT
+COLUMN wl_sort_div_d    NEW_VALUE wl_sort_div NOPRINT
+COLUMN wl_commit_rows_d NEW_VALUE wl_commit_rows NOPRINT
+COLUMN wl_batch_d       NEW_VALUE wl_batch NOPRINT
+COLUMN wl_gap_sec_d     NEW_VALUE wl_gap_sec NOPRINT
+COLUMN wl_cleanup_d     NEW_VALUE wl_cleanup NOPRINT
+SELECT NVL(TRIM('&wl_cycles'), '3') wl_cycles_d,
+       NVL(TRIM('&wl_parse_loops'), '2000') wl_parse_loops_d,
+       NVL(TRIM('&wl_rand'), '2000') wl_rand_d,
+       NVL(TRIM('&wl_scan'), '2') wl_scan_d,
+       NVL(TRIM('&wl_sort_div'), '4') wl_sort_div_d,
+       NVL(TRIM('&wl_commit_rows'), '2000') wl_commit_rows_d,
+       NVL(TRIM('&wl_batch'), '200') wl_batch_d,
+       NVL(TRIM('&wl_gap_sec'), '5') wl_gap_sec_d,
+       NVL(TRIM('&wl_cleanup'), '1') wl_cleanup_d
+  FROM dual;
+SET TERMOUT ON
 
 PROMPT
 PROMPT ============================================================

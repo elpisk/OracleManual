@@ -3,11 +3,20 @@
  목표: 공유 풀·라이브러리 캐시 관련 대기(Concurrency)가 상위일 때,
        원인이 되는 SQL 을 V$SQL·V$SQLSTATS 로 지목하는 절차를 익힌다.
        리터럴 SQL 이 자식 커서를 양산해 경합을 키우는 이상 징후를 다룬다.
- 환경: non-CDB=orcl 19.3. 진단은 SYS@orcl>. (부하 예시로 WL_01_parse.sql 참조)
+ 환경: non-CDB=orcl 19.3. 진단은 SYS@orcl>. 부하는 WL_01_parse.sql 리터럴 모드를
+       SQLT 세션 6개에서 동시에 돌린다(다른 터미널, 아래 [0]).
  라이선스: ASH(V$ACTIVE_SESSION_HISTORY)는 Diagnostics Pack(🔒) 필요.
            대안 경로(V$SESSION 폴링·V$SQL 직접 조회)를 함께 싣는다.
- 주의: 개인 실습 환경 전용. 조회 위주다.
+ 주의: 개인 실습 환경 전용. 공유 풀에 리터럴 커서 수십만 개를 만든다.
 ================================================================================
+
+--------------------------------------------------------------------------------
+-- [0] (부하) 다른 터미널 6개에서 리터럴 하드 파싱 부하를 동시에 띄운다(약 40~60초).
+--     각 터미널: sqlplus sqlt/sqlt@orcl → DEFINE wl_mode = LITERAL → DEFINE wl_loops = 100000
+--                → @WL_01_parse.sql
+--------------------------------------------------------------------------------
+-- ▶ 부하 시작: WL_01_parse.sql × 6 DEFINE wl_mode=LITERAL DEFINE wl_loops=100000
+-- ▶ 잠시 대기: 8초
 
 $ sqlplus / as sysdba
 
@@ -16,61 +25,105 @@ SYS@orcl> SET LINESIZE 200
 --------------------------------------------------------------------------------
 -- [1] (증상) 활성 대기가 Concurrency 클래스에 몰려 있는지 확인.
 --------------------------------------------------------------------------------
+SYS@orcl> COLUMN event FORMAT A34
+
+SYS@orcl> COLUMN wait_class FORMAT A12
+
 SYS@orcl> SELECT event, wait_class, COUNT(*) sessions
   2       FROM  v$session
   3       WHERE type='USER' AND status='ACTIVE' AND wait_class <> 'Idle'
   4       GROUP BY event, wait_class ORDER BY sessions DESC;
 
-EVENT                            WAIT_CLASS    SESSIONS
--------------------------------- ------------ ---------
-library cache: mutex X           Concurrency   <환경값>
-cursor: pin S wait on X          Concurrency   <환경값>
+EVENT                              WAIT_CLASS     SESSIONS
+---------------------------------- ------------ ----------
+kksfbc child completion            Other                 3
+library cache: mutex X             Concurrency           1
+latch: shared pool                 Concurrency           1
+cursor: pin S wait on X            Concurrency           1
+PGA memory operation               Other                 1
 
--- 해석: Idle 을 제외한 상위 대기가 Concurrency(라이브러리 캐시 mutex/커서 핀)다.
+-- 해석: Idle 을 제외한 상위 대기가 Concurrency(라이브러리 캐시 mutex/커서 핀/공유 풀 래치)다.
 --   이는 잠금 경합(Application)이 아니라 공유 풀/커서 공유 문제 신호다.
+--   'cursor: pin S wait on X' 는 같은 SQL 을 여러 세션이 동시에 하드 파싱할 때 한 세션이
+--   커서를 만드는 동안 나머지가 기다리는 대기다(6개 세션이 같은 리터럴 순서로 돌기 때문).
+--   Other 클래스의 'kksfbc child completion' 도 자식 커서 생성 완료를 기다리는 같은 계열이다.
 
 --------------------------------------------------------------------------------
 -- [2] (조치 전 상태) 라이브러리 캐시 재파싱 지표를 본다.
 --------------------------------------------------------------------------------
+SYS@orcl> COLUMN namespace FORMAT A16
+
 SYS@orcl> SELECT namespace, gets, pins, reloads, invalidations
   2       FROM  v$librarycache
   3       WHERE namespace IN ('SQL AREA','TABLE/PROCEDURE');
 
-NAMESPACE          GETS    PINS RELOADS INVALIDATIONS
---------------- ------- ------- ------- -------------
-SQL AREA        <환경값> <환경값> <환경값>      <환경값>
-TABLE/PROCEDURE <환경값> <환경값> <환경값>      <환경값>
+NAMESPACE              GETS       PINS    RELOADS INVALIDATIONS
+---------------- ---------- ---------- ---------- -------------
+SQL AREA            1240308    6451157       3673         16422
+TABLE/PROCEDURE      332248    2150640       3062             0
 
 -- 판정 기준: reloads/pins 비율이 높으면 커서가 자꾸 밀려났다 다시 로드된 것.
 --   공유 풀 부족 또는 커서 미공유(리터럴)를 의심한다.
 
 --------------------------------------------------------------------------------
--- [3] (원인 SQL 지목) 자식 커서가 많은 SQL — 커서 미공유 후보.
+-- [3] (원인 SQL 지목) 커서 미공유 후보 — 두 각도로 본다.
+--     (a) 자식 커서가 많은 SQL(VERSION_COUNT): 같은 텍스트인데 공유가 안 되는 경우.
+--     (b) 텍스트만 다르고 구조가 같은 SQL 무리(FORCE_MATCHING_SIGNATURE): 리터럴 SQL.
 --------------------------------------------------------------------------------
+SYS@orcl> COLUMN sql_text FORMAT A34
+
 SYS@orcl> SELECT sql_id, version_count, executions execs, parse_calls,
   2         SUBSTR(sql_text,1,34) sql_text
   3       FROM  v$sqlarea
   4       WHERE parsing_schema_name='SQLT'
   5       ORDER BY version_count DESC FETCH FIRST 5 ROWS ONLY;
 
-SQL_ID        VERSION_COUNT  EXECS PARSE_CALLS SQL_TEXT
-------------- ------------- ------ ----------- ----------------------------------
-<환경값>          <환경값>   ...       ...     select ... where hosp_id = ...
+SQL_ID        VERSION_COUNT      EXECS PARSE_CALLS SQL_TEXT
+------------- ------------- ---------- ----------- ----------------------------------
+72y71h3j6n003             1          6           6 SELECT /* WL01_LIT */ COUNT(*) FRO
+dvhk5nzvkh007             1          6           6 SELECT /* WL01_LIT */ COUNT(*) FRO
+5kf80skd5c007             1          6           6 SELECT /* WL01_LIT */ COUNT(*) FRO
+9quh9jk0h8009             1          6           6 SELECT /* WL01_LIT */ COUNT(*) FRO
+6rwaufwph800x             1          6           6 SELECT /* WL01_LIT */ COUNT(*) FRO
 
--- 해석: VERSION_COUNT(자식 커서 수)가 큰 SQL 이 원인 후보다. 텍스트만 다르고
---   구조가 같은 리터럴 SQL 이 다수면 각기 다른 커서로 잡혀 경합을 키운다.
+-- 해석(a): VERSION_COUNT(자식 커서 수)가 큰 SQL 이 있으면 그 SQL 이 원인 후보다.
+--   리터럴 SQL 은 텍스트가 전부 달라 각각 '부모' 커서가 되므로 이 각도에는 안 잡힌다.
+
+SYS@orcl> COLUMN fms FORMAT A22 NEW_VALUE fms
+
+SYS@orcl> SET VERIFY OFF
+
+SYS@orcl> SELECT TO_CHAR(force_matching_signature) fms, COUNT(*) cursors,
+  2              SUM(executions) execs, SUM(parse_calls) parse_calls
+  3       FROM  v$sqlarea
+  4       WHERE parsing_schema_name='SQLT' AND force_matching_signature <> 0
+  5       GROUP BY force_matching_signature
+  6       ORDER BY cursors DESC FETCH FIRST 3 ROWS ONLY;
+
+FMS                       CURSORS      EXECS PARSE_CALLS
+---------------------- ---------- ---------- -----------
+11693694142070710956         7874      46933       46920
+
+-- 해석(b): FORCE_MATCHING_SIGNATURE 는 리터럴을 바인드로 바꿨을 때 같아지는 SQL 끼리
+--   같은 값을 갖는다. 한 서명에 커서가 수천 개 = '구조는 하나인데 값마다 커서'인
+--   리터럴 SQL 무리다. 실행 1회에 파싱 1회(execs ≈ parse_calls) — 전부 하드 파싱이다.
 
 --------------------------------------------------------------------------------
 -- [4] (이상 징후 → 원인 → 조치 → 재확인) 리터럴 SQL 이 원인일 때.
---     이상 징후: 같은 형태의 SQL 이 hosp_id 값만 바뀌며 수백 개 커서로 존재.
+--     이상 징후: 같은 형태의 SQL 이 pat_id 값만 바뀌며 수천 개 커서로 존재.
 --------------------------------------------------------------------------------
-SYS@orcl> SELECT sql_text FROM v$sql
-  2       WHERE sql_id='<환경값>' AND ROWNUM<=1;   -- 대표 텍스트 확인
-SQL_TEXT
-----------------------------------------------------------------
-select count(*) from medical_claims where hosp_id = 37
+SYS@orcl> COLUMN sql_text FORMAT A70
 
--- 원인: 바인드 변수 대신 리터럴(37, 38, ...)을 써서 매번 하드 파싱 →
+SYS@orcl> SELECT sql_text FROM v$sqlarea
+  2       WHERE force_matching_signature = &fms AND ROWNUM <= 3;   -- 대표 텍스트 확인
+
+SQL_TEXT
+----------------------------------------------------------------------
+SELECT /* WL01_LIT */ COUNT(*) FROM PATIENTS WHERE PAT_ID = 24690
+SELECT /* WL01_LIT */ COUNT(*) FROM PATIENTS WHERE PAT_ID = 20270
+SELECT /* WL01_LIT */ COUNT(*) FROM PATIENTS WHERE PAT_ID = 16985
+
+-- 원인: 바인드 변수 대신 리터럴(PAT_ID = 1, 2, 3, ...)을 써서 매번 하드 파싱 →
 --   라이브러리 캐시 경합. (열 가지 실수 2번: 커서·공유 풀 오용)
 -- 조치(개발/설정): 애플리케이션에 바인드 변수 적용. 즉시 완화가 필요하면
 --   세션/시스템에서 CURSOR_SHARING=FORCE 검토(부작용 유의, 18장에서 상술).
@@ -88,21 +141,40 @@ SYS@orcl> --    AND event LIKE 'library cache%' GROUP BY sql_id;
 SYS@orcl> -- Diagnostics Pack 無(대안): 사건 도중 V$SESSION 을 짧은 주기로 폴링해
 SYS@orcl> --   EVENT LIKE 'library cache%' 인 세션의 SQL_ID 를 반복 수집한다.
 SYS@orcl> SELECT sid, sql_id, event FROM v$session
-  2       WHERE event LIKE 'library cache%' OR event LIKE 'cursor:%';
+  2       WHERE event LIKE 'library cache%' OR event LIKE 'cursor:%' OR event LIKE 'latch: shared%';
+
        SID SQL_ID        EVENT
----------- ------------- --------------------------------
-   <환경값> <환경값>      library cache: mutex X
+---------- ------------- ----------------------------------
+       218 cu3d8rn4zs5y9 latch: shared pool
+       602 cu3d8rn4zs5y9 cursor: pin S wait on X
 
 -- 해석: 원천은 언제나 V$ 에 있다. 라이선스는 '얼마나 편하게 자동으로 보느냐'의
 --   차이일 뿐, V$SESSION 폴링으로 같은 원인 SQL 을 지목할 수 있다.
+--   (부하가 끝나면 이 조회는 빈 결과가 된다 — 폴링은 '사건 도중'에만 의미가 있다.)
+
+-- ▶ 부하 대기
+SYS@orcl> -- 부하가 끝난 뒤 인스턴스 누적 Concurrency 대기를 본다(사건의 총량).
+SYS@orcl> SELECT event, total_waits, ROUND(time_waited_micro/1e6,1) secs
+  2       FROM  v$system_event WHERE wait_class = 'Concurrency'
+  3       ORDER BY time_waited_micro DESC FETCH FIRST 5 ROWS ONLY;
+
+EVENT                              TOTAL_WAITS       SECS
+---------------------------------- ----------- ----------
+row cache lock                          378973        160
+buffer busy waits                       117588      133.4
+cursor: pin S wait on X                  85538      123.8
+latch: shared pool                       15059       34.3
+enq: TX - index contention               11909       25.9
 
 --------------------------------------------------------------------------------
 -- [정리]
 --------------------------------------------------------------------------------
 -- 1) Concurrency 대기 상위 → 잠금이 아니라 공유 풀/커서 공유 문제 신호.
 -- 2) V$LIBRARYCACHE 의 reloads/invalidations 로 재파싱 압박을 확인.
--- 3) 원인 SQL 은 VERSION_COUNT(자식 커서 수)가 큰 것부터 의심.
+-- 3) 원인 SQL 은 VERSION_COUNT(자식 커서 수)가 큰 것, 그리고 FORCE_MATCHING_SIGNATURE 당
+--    커서 수가 많은 무리(리터럴 SQL)부터 의심.
 -- 4) 리터럴 SQL → 바인드 변수(또는 CURSOR_SHARING) → 전후 델타로 재확인.
 -- 5) 라이선스 없으면 ASH 대신 V$SESSION 폴링으로 원인 SQL 지목.
 SYS@orcl> EXIT
+
 ================================================================================

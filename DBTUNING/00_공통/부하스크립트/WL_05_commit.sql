@@ -101,10 +101,25 @@ SET FEEDBACK ON
 --                   ★ 데이터 유실 위험이 있는 설정이므로 원리 확인용으로만 켤 것 ★
 --   wl_cleanup    : 1이면 스크립트 끝에서 복제 테이블을 삭제. 기본 1.
 -- ----------------------------------------------------------------------------
-DEFINE wl_rows       = 5000
-DEFINE wl_batch      = 500
-DEFINE wl_run_nowait = 0
-DEFINE wl_cleanup    = 1
+-- 기본값 처리: 실행 전에 DEFINE 해 둔 값이 있으면 그 값을 쓰고, 없으면 아래 기본값을 쓴다.
+--   (SQL*Plus 에는 '미정의면 정의' 문법이 없어 NEW_VALUE 관용구를 쓴다. 값을 바꾸려면
+--    스크립트를 고치지 말고 실행 전에 DEFINE 하라. 예: DEFINE wl_rows = 5000)
+SET TERMOUT OFF
+COLUMN wl_rows       NEW_VALUE wl_rows NOPRINT
+COLUMN wl_batch      NEW_VALUE wl_batch NOPRINT
+COLUMN wl_run_nowait NEW_VALUE wl_run_nowait NOPRINT
+COLUMN wl_cleanup    NEW_VALUE wl_cleanup NOPRINT
+SELECT NULL wl_rows, NULL wl_batch, NULL wl_run_nowait, NULL wl_cleanup FROM dual WHERE 1 = 2;
+COLUMN wl_rows_d       NEW_VALUE wl_rows NOPRINT
+COLUMN wl_batch_d      NEW_VALUE wl_batch NOPRINT
+COLUMN wl_run_nowait_d NEW_VALUE wl_run_nowait NOPRINT
+COLUMN wl_cleanup_d    NEW_VALUE wl_cleanup NOPRINT
+SELECT NVL(TRIM('&wl_rows'), '5000') wl_rows_d,
+       NVL(TRIM('&wl_batch'), '500') wl_batch_d,
+       NVL(TRIM('&wl_run_nowait'), '0') wl_run_nowait_d,
+       NVL(TRIM('&wl_cleanup'), '1') wl_cleanup_d
+  FROM dual;
+SET TERMOUT ON
 
 PROMPT
 PROMPT ============================================================
