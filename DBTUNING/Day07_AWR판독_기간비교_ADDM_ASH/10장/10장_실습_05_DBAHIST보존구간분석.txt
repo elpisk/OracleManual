@@ -11,57 +11,65 @@
 $ sqlplus / as sysdba
 
 SYS@orcl> SET LINESIZE 200
+
 SYS@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
 -- [1] (조치 전 상태) 메모리 ASH가 지금 몇 분 치를 담고 있는지 본다.
 --------------------------------------------------------------------------------
-SYS@orcl> SELECT MIN(sample_time) AS oldest, MAX(sample_time) AS newest
-  2       FROM  v$active_session_history;
+SYS@orcl> COLUMN oldest FORMAT A26
 
-OLDEST                    NEWEST
-------------------------- -------------------------
-25-AUG-26 11.42.10.***    25-AUG-26 12.17.30.***
+SYS@orcl> COLUMN newest FORMAT A26
 
--- 해석: oldest~newest 간격이 메모리 ASH로 되짚을 수 있는 최대 구간이다. 부하가
---   높을수록 버퍼가 빨리 회전해 이 간격이 좁아진다(ASH Buffer Size 16.0M).
+SYS@orcl> SELECT MIN(sample_time) AS oldest, MAX(sample_time) AS newest,
+  2         ROUND((CAST(MAX(sample_time) AS DATE) - CAST(MIN(sample_time) AS DATE)) * 1440) AS minutes
+  3       FROM  v$active_session_history;
+
+OLDEST                     NEWEST                        MINUTES
+-------------------------- -------------------------- ----------
+17-SEP-26 01.50.36.937 PM  17-SEP-26 10.23.45.481 PM         513
+
+-- 해석: oldest~newest 간격(MINUTES)이 메모리 ASH로 되짚을 수 있는 최대 구간이다. 부하가
+--   높을수록 버퍼가 빨리 회전해 이 간격이 좁아진다. 이 구간보다 과거는 메모리에 없다([4]).
 
 --------------------------------------------------------------------------------
 -- [2] (조회) 같은 부하 구간을 메모리 ASH로 집계한다(기준값).
 --------------------------------------------------------------------------------
+SYS@orcl> COLUMN event FORMAT A34
+
 SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS samples
   2       FROM  v$active_session_history
-  3       WHERE sample_time BETWEEN TIMESTAMP '2026-08-25 12:15:00'
-  4                             AND TIMESTAMP '2026-08-25 12:17:30'
-  5       GROUP BY NVL(event,'ON CPU') ORDER BY samples DESC;
+  3       WHERE sample_time > SYSTIMESTAMP - INTERVAL '60' MINUTE
+  4       GROUP BY NVL(event,'ON CPU') ORDER BY samples DESC FETCH FIRST 4 ROWS ONLY;
 
-EVENT                              SAMPLES
---------------------------------- --------
-ON CPU                                 529
-log file sync                           17
-log file parallel write                 14
-db file sequential read                 10
+EVENT                                 SAMPLES
+---------------------------------- ----------
+ON CPU                                   4353
+kksfbc child completion                  1173
+cursor: pin S wait on X                   857
+buffer busy waits                         265
 
--- 해석: 1초 간격이라 ON CPU가 529 샘플. 이 값을 디스크 ASH와 비교할 기준으로 둔다.
+-- 해석: 1초 간격이라 최근 60분에 ON CPU 샘플이 수천 개다. 이 값을 디스크 ASH와 비교할 기준으로 둔다.
 
 --------------------------------------------------------------------------------
 -- [3] (조회) 같은 구간을 디스크 ASH(DBA_HIST_)로 집계한다.
 --------------------------------------------------------------------------------
 SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS samples
   2       FROM  dba_hist_active_sess_history
-  3       WHERE sample_time BETWEEN TIMESTAMP '2026-08-25 12:15:00'
-  4                             AND TIMESTAMP '2026-08-25 12:17:30'
-  5       GROUP BY NVL(event,'ON CPU') ORDER BY samples DESC;
+  3       WHERE sample_time > SYSTIMESTAMP - INTERVAL '60' MINUTE
+  4       GROUP BY NVL(event,'ON CPU') ORDER BY samples DESC FETCH FIRST 4 ROWS ONLY;
 
-EVENT                              SAMPLES
---------------------------------- --------
-ON CPU                                  53
-log file sync                            2
-db file sequential read                  1
+EVENT                                 SAMPLES
+---------------------------------- ----------
+ON CPU                                    358
+kksfbc child completion                   134
+cursor: pin S wait on X                    89
+buffer busy waits                          35
 
--- 해석: 같은 구간인데 샘플이 메모리(529)의 약 1/10(53)이다. MMON이 메모리
---   샘플의 약 10분의 1만 SYSAUX에 저장하기(10초 간격) 때문이다. 비율(ON CPU
---   압도적)은 같지만 세밀함이 줄었다.
+-- 해석: 같은 60분 구간인데 디스크 ASH 샘플이 메모리의 약 1/10 이다. MMON 이 메모리
+--   샘플의 약 10분의 1만 SYSAUX 에 저장하기(10초 간격) 때문이다. 비율(ON CPU
+--   압도적)은 같지만 세밀함이 줄었다. (막 끝난 부하는 다음 스냅샷 때 디스크로 내려가므로,
+--   아주 최근 몇 분은 디스크 ASH 에 아직 없을 수 있다.)
 
 --------------------------------------------------------------------------------
 -- [4] (이상 징후 → 원인 → 조치 → 재확인)
@@ -70,24 +78,24 @@ db file sequential read                  1
 --------------------------------------------------------------------------------
 SYS@orcl> SELECT COUNT(*) AS cnt
   2       FROM  v$active_session_history
-  3       WHERE sample_time BETWEEN TIMESTAMP '2026-08-24 14:00:00'
-  4                             AND TIMESTAMP '2026-08-24 14:10:00';
+  3       WHERE sample_time BETWEEN TIMESTAMP '2026-09-15 09:00:00'
+  4                             AND TIMESTAMP '2026-09-15 18:00:00';
 
        CNT
 ----------
          0
 
-SYS@orcl> -- 원인 파악: 메모리 ASH의 oldest([1])보다 과거다. 순환 버퍼가 이미
-SYS@orcl> --   덮어써서 어제 데이터는 메모리에 없다. 고장이 아니라 정상 회전이다.
+SYS@orcl> -- 원인 파악: 메모리 ASH의 oldest([1])보다 과거다(이틀 전). 순환 버퍼가 이미
+SYS@orcl> --   덮어써서 그 데이터는 메모리에 없다. 고장이 아니라 정상 회전이다.
 SYS@orcl> -- 조치: 디스크 ASH(DBA_HIST_)로 같은 구간을 조회한다(보존 8일 이내면 남음).
 SYS@orcl> SELECT COUNT(*) AS cnt
   2       FROM  dba_hist_active_sess_history
-  3       WHERE sample_time BETWEEN TIMESTAMP '2026-08-24 14:00:00'
-  4                             AND TIMESTAMP '2026-08-24 14:10:00';
+  3       WHERE sample_time BETWEEN TIMESTAMP '2026-09-15 09:00:00'
+  4                             AND TIMESTAMP '2026-09-15 18:00:00';
 
        CNT
 ----------
-       <환경값>
+      2164
 
 -- 원인 확정 + 재확인: 메모리엔 없지만 디스크 ASH에는 어제 구간이 남아 있다
 --   (AWR 보존기간 기본 8일 이내). 해상도(10초)는 낮지만 큰 그림은 복원된다.
@@ -116,4 +124,5 @@ SYS@orcl> --   → 이 INSERT를 1초마다 반복(스케줄러/외부 스크립
 -- 4) 라이선스가 없으면 V$SESSION 폴링을 직접 이력 테이블에 적재해 대체한다.
 
 SYS@orcl> EXIT
+
 ================================================================================

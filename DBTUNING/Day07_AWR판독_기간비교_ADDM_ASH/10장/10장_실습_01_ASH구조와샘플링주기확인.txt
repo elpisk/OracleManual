@@ -11,6 +11,7 @@
 $ sqlplus / as sysdba
 
 SYS@orcl> SET LINESIZE 200
+
 SYS@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
@@ -36,15 +37,32 @@ SYS@orcl> SELECT column_name, data_type
   5              'SESSION_STATE','EVENT','SQL_ID','BLOCKING_SESSION')
   6       ORDER BY column_name;
 
-COLUMN_NAME              DATA_TYPE
------------------------- ------------------------------
-BLOCKING_SESSION         NUMBER
-EVENT                    VARCHAR2
-SAMPLE_TIME              TIMESTAMP(3)
-SESSION_ID               NUMBER
-SESSION_SERIAL#          NUMBER
-SESSION_STATE            VARCHAR2
-SQL_ID                   VARCHAR2
+COLUMN_NAME
+--------------------------------------------------------------------------------------------------------------------------------
+DATA_TYPE
+--------------------------------------------------------------------------------------------------------------------------------
+BLOCKING_SESSION
+NUMBER
+
+EVENT
+VARCHAR2
+
+SAMPLE_TIME
+TIMESTAMP(3)
+
+SESSION_ID
+NUMBER
+
+SESSION_SERIAL#
+NUMBER
+
+SESSION_STATE
+VARCHAR2
+
+SQL_ID
+VARCHAR2
+
+7 rows selected.
 
 -- 해석: SESSION_STATE(ON CPU/WAITING)가 진단의 첫 갈림길이다. ON CPU면 EVENT가
 --   NULL, WAITING이면 EVENT에 무엇을 기다렸는지가 담긴다.
@@ -59,12 +77,15 @@ SYS@orcl> SELECT DISTINCT sample_time
   4       ORDER BY sample_time;
 
 SAMPLE_TIME
----------------------------------
-25-AUG-26 12.16.55.121
-25-AUG-26 12.16.56.123
-25-AUG-26 12.16.57.121
-25-AUG-26 12.16.58.123
-25-AUG-26 12.16.59.121
+---------------------------------------------------------------------------
+17-SEP-26 10.21.53.868 PM
+17-SEP-26 10.21.54.888 PM
+17-SEP-26 10.21.55.913 PM
+17-SEP-26 10.21.56.937 PM
+17-SEP-26 10.21.57.960 PM
+17-SEP-26 10.21.58.985 PM
+
+6 rows selected.
 
 -- 해석: 서로 다른 샘플 시각이 약 1초 간격으로 찍힌다. ASH의 기본 샘플링 주기가
 --   1초임을 눈으로 확인한 것이다.
@@ -74,24 +95,30 @@ SAMPLE_TIME
 --     이상 징후: 어떤 SQL_ID의 samples가 186으로 크게 나오자, 옆자리 동료가
 --       "이 SQL이 186번 실행됐다"고 단정한다. 정말 그런지 검증한다.
 --------------------------------------------------------------------------------
-SYS@orcl> SELECT sql_id, COUNT(*) AS samples
+SYS@orcl> COLUMN top_sql NEW_VALUE top_sql
+
+SYS@orcl> SELECT sql_id top_sql, COUNT(*) AS samples
   2       FROM  v$active_session_history
   3       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
   4         AND sql_id IS NOT NULL
   5       GROUP BY sql_id ORDER BY samples DESC FETCH FIRST 1 ROWS ONLY;
 
-SQL_ID          SAMPLES
+TOP_SQL          SAMPLES
 ------------- ----------
-9vmszgd1ft9x0        186
+858mpgdtr5ssf         49
 
 SYS@orcl> -- 원인 파악: samples는 '실행 횟수'가 아니라 '1초 샘플에 수행 중으로
 SYS@orcl> --   포착된 수'다. 실제 실행 횟수는 V$SQL.EXECUTIONS로 확인해야 한다.
-SYS@orcl> SELECT executions FROM v$sql WHERE sql_id='9vmszgd1ft9x0'
+SYS@orcl> --   (위에서 잡은 상위 SQL_ID 를 치환 변수 &top_sql 로 이어서 쓴다.)
+SYS@orcl> SELECT executions FROM v$sql WHERE sql_id='&top_sql'
   2         AND rownum=1;
+
+old   1: SELECT executions FROM v$sql WHERE sql_id='&top_sql'
+new   1: SELECT executions FROM v$sql WHERE sql_id='858mpgdtr5ssf'
 
 EXECUTIONS
 ----------
-   <환경값>
+    875020
 
 -- 원인 확정: samples(186)와 executions(<환경값>)는 서로 다른 값이다. 만약
 --   이 SQL이 1회 실행에 오래 걸렸다면 executions가 작아도 samples는 클 수 있다.
@@ -102,11 +129,14 @@ EXECUTIONS
 SYS@orcl> -- 재확인: 같은 SQL의 1회당 논리 읽기를 V$SQL로 본다(횟수·비용 분리).
 SYS@orcl> SELECT executions, buffer_gets,
   2         ROUND(buffer_gets/NULLIF(executions,0)) AS gets_per_exec
-  3       FROM  v$sql WHERE sql_id='9vmszgd1ft9x0' AND rownum=1;
+  3       FROM  v$sql WHERE sql_id='&top_sql' AND rownum=1;
 
-EXECUTIONS  BUFFER_GETS  GETS_PER_EXEC
------------ ------------ --------------
-   <환경값>      <환경값>          <환경값>
+old   3:      FROM  v$sql WHERE sql_id='&top_sql' AND rownum=1
+new   3:      FROM  v$sql WHERE sql_id='858mpgdtr5ssf' AND rownum=1
+
+EXECUTIONS BUFFER_GETS GETS_PER_EXEC
+---------- ----------- -------------
+    878498     3298724             4
 
 -- 재확인 완료: ASH는 시간을, V$SQL은 횟수를 센다. 두 값을 겹쳐 읽어야 한다.
 
@@ -118,10 +148,10 @@ SYS@orcl> SELECT session_state, COUNT(*) AS samples
   3       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
   4       GROUP BY session_state ORDER BY samples DESC;
 
-SESSION_STATE   SAMPLES
---------------- ----------
-ON CPU               529
-WAITING               54
+SESSION    SAMPLES
+------- ----------
+ON CPU         227
+WAITING        178
 
 -- 해석: 담긴 것은 모두 활성 세션이다. Idle(SQL*Net message from client 등)
 --   세션은 아예 샘플에 없다. 그래서 ASH 크기는 작업량에 비례한다.
@@ -143,14 +173,17 @@ SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS active_now
   3       WHERE status='ACTIVE' AND wait_class <> 'Idle'
   4       GROUP BY NVL(event,'ON CPU') ORDER BY active_now DESC;
 
-EVENT                             ACTIVE_NOW
---------------------------------- ----------
-ON CPU                                     5
-log file sync                              1
+EVENT                                                            ACTIVE_NOW
+---------------------------------------------------------------- ----------
+cursor: pin S wait on X                                                   5
+library cache: mutex X                                                    4
+latch: shared pool                                                        1
+SQL*Net message to client                                                 1
 
 -- 대안 해석: 이 조회를 1초마다 반복해 테이블에 적재하면 '수제 ASH'가 된다.
 --   wait_class<>'Idle' 조건이 ASH의 '활성 세션만' 규칙을 재현한다. 다만
 --   V$SESSION은 현재 순간만 보여줘 폴링을 멈추면 과거는 사라진다는 한계가 있다.
 
 SYS@orcl> EXIT
+
 ================================================================================

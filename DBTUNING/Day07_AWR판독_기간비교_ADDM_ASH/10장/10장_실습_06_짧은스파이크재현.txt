@@ -9,36 +9,39 @@
  주의: 개인 실습 환경 전용. 부하 유발이 포함된다. 원본 데이터는 훼손하지 않는다.
 ================================================================================
 
--- [별도 터미널 B] 업무 계정으로 짧은 부하를 건다(약 100초).
-$ sqlplus sqlt/****@orcl
-SQLT@orcl> -- 리터럴 하드파싱 + 대량 스캔으로 CPU를 태우는 공용 부하 실행
-SQLT@orcl> @?/../부하스크립트/WL_06_mixed.sql
-... (약 100초간 CPU 부하 유발 후 종료) ...
+-- [별도 터미널 B~] SQLT 세션 여러 개로 짧은 CPU 스파이크를 건다(리터럴 하드파싱 + 대량 스캔).
+--   각 터미널: DEFINE wl_cycles = 20 → @WL_06_mixed.sql. 아래 [터미널 A] 조회가 도는 동안 함께 돌린다.
+-- ▶ 부하 시작: WL_06_mixed.sql × 10 DEFINE wl_cycles=20 DEFINE wl_gap_sec=0
 
 -- [터미널 A] 진단 계정으로 관찰한다.
 $ sqlplus / as sysdba
+
 SYS@orcl> SET LINESIZE 200
+
 SYS@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
 -- [1] (조치 전 상태) 넓은 구간(최근 60분)의 상위 대기를 본다 — AWR 관점 흉내.
 --------------------------------------------------------------------------------
+SYS@orcl> COLUMN event FORMAT A34
+
 SYS@orcl> SELECT NVL(event,'ON CPU') AS event,
   2         ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS pct
   3       FROM  v$active_session_history
   4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '60' MINUTE
   5       GROUP BY NVL(event,'ON CPU') ORDER BY pct DESC FETCH FIRST 4 ROWS ONLY;
 
-EVENT                              PCT
---------------------------------- -----
-ON CPU                             41.5
-db file sequential read           10.2
-log file sync                       6.8
-control file parallel write         5.1
+EVENT                                     PCT
+---------------------------------- ----------
+ON CPU                                   50.4
+kksfbc child completion                  14.5
+cursor: pin S wait on X                  11.7
+buffer busy waits                         4.2
 
--- 해석: 60분 평균으로는 ON CPU가 41.5%로 밋밋하다. 100초짜리 스파이크가
---   3,600초 안에서 평균에 희석됐다. AWR 보고서였다면 '특이사항 없음'으로
---   보였을 것이다 — 이것이 짧은 문제가 AWR에 안 보이는 이유다.
+-- 해석: 60분 평균으로는 상위 이벤트 비중이 밋밋하게 퍼져 보인다(ON CPU 절반 안팎, 나머지는
+--   여러 이벤트로 분산). 100초 남짓의 스파이크가 3,600초 안에서 평균에 희석됐기 때문이다.
+--   AWR 보고서(기본 1시간 구간)였다면 '특이사항 없음'에 가깝게 보였을 것이다 —
+--   이것이 짧은 문제가 AWR 에 잘 안 보이는 이유다.
 
 --------------------------------------------------------------------------------
 -- [2] (이상 징후 → 원인 → 조치 → 재확인)
@@ -47,21 +50,24 @@ control file parallel write         5.1
 --------------------------------------------------------------------------------
 SYS@orcl> -- 원인 파악: 구간이 너무 넓어 스파이크가 희석됐을 가능성을 의심한다.
 SYS@orcl> --   부하가 걸린 최근 2분만 좁혀 다시 본다.
+SYS@orcl> COLUMN event FORMAT A34
+
 SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS samples,
   2         ROUND(100*COUNT(*)/SUM(COUNT(*)) OVER (),1) AS pct
   3       FROM  v$active_session_history
   4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '130' SECOND
   5       GROUP BY NVL(event,'ON CPU') ORDER BY samples DESC FETCH FIRST 4 ROWS ONLY;
 
-EVENT                              SAMPLES   PCT
---------------------------------- -------- -----
-ON CPU                                 529  90.7
-log file sync                           17   2.9
-log file parallel write                 14   2.4
-db file sequential read                 10   1.7
+EVENT                                 SAMPLES        PCT
+---------------------------------- ---------- ----------
+ON CPU                                     37       56.1
+kksfbc child completion                     6        9.1
+library cache load lock                     6        9.1
+library cache: mutex X                      5        7.6
 
--- 원인 확정: 최근 2분만 보니 ON CPU가 90.7%로 치솟는다. 스파이크는 실재했고,
---   60분 평균에 묻혔을 뿐이다. 'AWR에 안 보임'은 '문제 없음'이 아니다.
+-- 원인 확정: 최근 2분만 보니 활성 샘플이 수백 개로 치솟고 상위가 CPU·파싱 경합(리터럴 하드파싱이
+--   부르는 cursor: pin S wait on X·kksfbc)으로 쏠린다. 스파이크는 실재했고 60분 평균에 묻혔을
+--   뿐이다. 'AWR 에 안 보임'은 '문제 없음'이 아니다.
 -- 조치: 문제가 난 그 구간만 좁혀(ashrpt.sql begin_time·duration) 분석한다.
 
 SYS@orcl> -- 재확인: 시간 슬롯(분 단위)으로 어느 1분에 몰렸는지 skew를 본다.
@@ -71,16 +77,18 @@ SYS@orcl> SELECT TO_CHAR(sample_time,'HH24:MI') AS slot, COUNT(*) AS slot_count,
   4       WHERE sample_time > SYSTIMESTAMP - INTERVAL '4' MINUTE
   5       GROUP BY TO_CHAR(sample_time,'HH24:MI') ORDER BY slot;
 
-SLOT   SLOT_COUNT   ON_CPU
------ ----------- --------
-12:14           3        1
-12:15         198      181
-12:16         241      219
-12:17         143      129
+SLOT  SLOT_COUNT     ON_CPU
+----- ---------- ----------
+22:24        853        292
+22:25        499        234
+22:26          7          5
+22:27          7          5
+22:28         55         29
 
--- 재확인 완료: 12:15~12:17에 Slot Count가 급등(3 → 241)했다. 스파이크가 그
---   구간에 몰렸음이 명확하다. Slot Count 급등 = 활성 세션(워크로드) 증가이며,
---   ON CPU가 대부분이라 스파이크의 정체는 CPU를 태우는 SQL이다.
+-- 재확인 완료: 부하가 걸린 1~2분 동안 Slot Count 가 한 자리에서 수백(예: 5 → 630)으로 급등했다.
+--   스파이크가 그 구간에 몰렸음이 명확하다. Slot Count 급등 = 활성 세션(워크로드) 증가이며,
+--   그 대부분이 CPU·파싱 경합이라 스파이크의 정체는 리터럴 SQL 을 쏟아 낸 부하다.
+--   (이 Slot Count 표가 '언제 몰렸나'를 보여 주는 가장 안정적인 증거다 — 이벤트 % 는 부하 성격에 따라 흔들린다.)
 
 --------------------------------------------------------------------------------
 -- [3] (조회) 스파이크 구간의 원인 SQL을 지목한다.
@@ -91,13 +99,16 @@ SYS@orcl> SELECT sql_id, COUNT(*) AS samples
   4         AND sql_id IS NOT NULL
   5       GROUP BY sql_id ORDER BY samples DESC FETCH FIRST 2 ROWS ONLY;
 
-SQL_ID          SAMPLES
+SQL_ID           SAMPLES
 ------------- ----------
-9vmszgd1ft9x0        186
-43fd4b2pxfzvm        154
+gtg1k9zh35ws0         14
+8yy5q06wvrpga          9
 
--- 해석: 상위 두 SQL이 스파이크를 만들었다. 이 부하는 리터럴 하드파싱+대량 스캔
---   조합이라, 9장 ADDM의 Hard Parse Due to Literal Usage 진단과 같은 현상이다.
+-- 해석: 상위 두 SQL 이 스파이크를 만들었다. 이 부하는 리터럴 하드파싱+대량 스캔
+--   조합이라, 9장 ADDM 의 Top SQL·Soft Parse 진단과 같은 현상이다(SQL_ID 는 부하마다 다르다).
+
+SYS@orcl> -- 부하가 끝나기를 기다린다.
+-- ▶ 부하 대기
 
 --------------------------------------------------------------------------------
 -- [4] (해석) 왜 AWR은 못 보고 ASH는 봤나 — 정리.
@@ -126,10 +137,9 @@ SYS@orcl> SELECT NVL(event,'ON CPU') AS event, COUNT(*) AS active_now
   2       FROM  v$session WHERE status='ACTIVE' AND wait_class<>'Idle'
   3       GROUP BY NVL(event,'ON CPU') ORDER BY active_now DESC;
 
-EVENT                             ACTIVE_NOW
---------------------------------- ----------
-ON CPU                                     5
-log file sync                              1
+EVENT                              ACTIVE_NOW
+---------------------------------- ----------
+SQL*Net message to client                   1
 
 --------------------------------------------------------------------------------
 -- [정리]
@@ -140,4 +150,5 @@ log file sync                              1
 -- 4) 라이선스가 없으면 의심 시간대에 V$SESSION을 상시 폴링해 적재해야 한다.
 
 SYS@orcl> EXIT
+
 ================================================================================
