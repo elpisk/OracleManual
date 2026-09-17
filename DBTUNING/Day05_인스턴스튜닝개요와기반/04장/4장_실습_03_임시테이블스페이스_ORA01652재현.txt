@@ -1,116 +1,219 @@
 ================================================================================
  4장 실습 03 — 임시 테이블스페이스 사용량 추적과 ORA-01652 재현
- 목표: 작은 TEMP(20MB)에서 대량 정렬을 유발해 ORA-01652 unable to extend temp
-       segment를 재현한다. V$TEMPSEG_USAGE로 어느 세션의 어떤 SQL이 TEMP을
-       삼켰는지 지목하고, 임시 파일 추가로 TEMP을 확장해 완주를 확인한다.
-       오류 메시지의 테이블스페이스 이름이 진단의 절반임을 익힌다.
- 환경: non-CDB=orcl 19.3 (부하 세션은 SQLT, 진단은 SYS AS SYSDBA)
+ 목표: 작은 TEMP(60MB, 자동 확장 없음)에서 대량 정렬을 유발해 ORA-01652 unable to
+       extend temp segment 를 재현한다. V$SORT_SEGMENT·V$SQL 로 사후에, V$TEMPSEG_USAGE 로
+       진행 중에 어느 세션의 어떤 SQL 이 TEMP 을 삼켰는지 지목하고, 임시 파일 추가로
+       TEMP 을 확장해 완주를 확인한다. 오류 메시지의 테이블스페이스 이름이 진단의 절반임을 익힌다.
+ 환경: non-CDB=orcl 19.3 (부하 세션은 SQLT 터미널 B, 진단은 SYS 터미널 A)
  주의: 개인 실습 환경 전용. 임시 파일 추가·PGA 조정이 포함된다. 마지막에
        추가한 임시 파일을 제거해 원복한다. 공용 DB에서 수행하지 않는다.
 ================================================================================
 
+-- (터미널 A) 진단
 $ sqlplus / as sysdba
 
 --------------------------------------------------------------------------------
 -- [1] (조치 전 상태) 임시 테이블스페이스 크기와 현재 사용량을 캡처한다.
 --------------------------------------------------------------------------------
-SYS@orcl> SELECT tablespace_name, ROUND(SUM(bytes)/1024/1024) mb
-  2       FROM  dba_temp_files GROUP BY tablespace_name;
-TABLESPACE_NAME          MB
------------------ ----------
-TEMP                      20
+SYS@orcl> COLUMN tablespace_name FORMAT A16
+
+SYS@orcl> COLUMN file_name FORMAT A32
+
+SYS@orcl> SELECT tablespace_name, file_name, ROUND(bytes/1024/1024) mb, autoextensible
+  2       FROM  dba_temp_files;
+
+TABLESPACE_NAME  FILE_NAME                                MB AUT
+---------------- -------------------------------- ---------- ---
+TEMP             /u03/oradata/ORCL/temp01.dbf             60 NO
 
 SYS@orcl> SELECT tablespace_name,
   2         ROUND(used_blocks*8192/1024/1024) used_mb,
-  3         ROUND(total_blocks*8192/1024/1024) total_mb
-  4       FROM  v$sort_segment;
-TABLESPACE_NAME      USED_MB   TOTAL_MB
------------------ ---------- ----------
-TEMP                       0          0
+  3         ROUND(total_blocks*8192/1024/1024) total_mb,
+  4         ROUND(max_used_blocks*8192/1024/1024) max_used_mb
+  5       FROM  v$sort_segment;
 
--- 조치 전 요약: TEMP은 20MB뿐. 평소엔 사용량 0이지만, 대량 정렬 한 번이면
---   금세 20MB를 넘어선다. 재현에 좋은 조건이다.
+TABLESPACE_NAME     USED_MB   TOTAL_MB MAX_USED_MB
+---------------- ---------- ---------- -----------
+TEMP                      3         59         136
+
+-- 조치 전 요약: TEMP 은 60MB 뿐이고 자동 확장이 꺼져 있다. 평소 사용량은 몇 MB 지만,
+--   대량 정렬 한 번이면 금세 60MB 를 넘어선다. 재현에 좋은 조건이다.
 
 --------------------------------------------------------------------------------
 -- [2] (재현 준비) 정렬이 메모리에서 안 끝나고 디스크로 흘러넘치게 만든다.
 --     PGA 작업 영역을 강제로 작게 잡아 스필을 유도한다(세션 한정).
 --------------------------------------------------------------------------------
--- ==== 세션 B (부하: SQLT) ====
-SQLT@orcl> ALTER SESSION SET workarea_size_policy=MANUAL;
+-- (터미널 B) 부하: SQLT
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> ALTER SESSION SET workarea_size_policy = MANUAL;
+
 Session altered.
-SQLT@orcl> ALTER SESSION SET sort_area_size=65536;   -- 64KB로 극단화 → 디스크 정렬
+
+SQLT@orcl> ALTER SESSION SET sort_area_size = 65536;   -- 64KB 로 극단화 → 디스크 정렬
+
 Session altered.
 
 --------------------------------------------------------------------------------
--- [3] (이상 징후 발생) CLAIM_DETAILS(약 90만 건)를 통째로 정렬한다.
---     20MB TEMP으로는 감당이 안 된다.
+-- [3] (이상 징후 발생) 청구(30만)×상세(90만) 조인 결과를 병원·접수일·금액으로 정렬한다.
+--     60MB TEMP 으로는 감당이 안 된다. (결과 90만 행을 화면에 쏟지 않으려고 정렬된
+--     집합의 행 수만 세는 형태로 감쌌다 — 정렬 자체는 그대로 수행된다.)
 --------------------------------------------------------------------------------
-SQLT@orcl> SELECT claim_id, detail_seq, amount
-  2       FROM  sqlt.claim_details
-  3       ORDER BY amount, claim_id, detail_seq;   -- 대량 디스크 정렬
+SQLT@orcl> SET TIMING ON
 
-ERROR at line 1:
+SQLT@orcl> SELECT MAX(rn) rows_sorted FROM (
+  2         SELECT ROWNUM rn FROM (
+  3           SELECT m.hosp_id, m.receipt_date, m.claim_id, m.total_amt, d.drug_code, d.qty, d.amt
+  4           FROM   medical_claims m JOIN claim_details d ON d.claim_id = m.claim_id
+  5           ORDER BY m.hosp_id, m.receipt_date, d.amt DESC));
+
+         FROM   medical_claims m JOIN claim_details d ON d.claim_id = m.claim_id
+                *
+ERROR at line 4:
 ORA-01652: unable to extend temp segment by 128 in tablespace TEMP
 
--- 이상 징후: ORA-01652. 메시지 끝의 테이블스페이스가 'TEMP'임을 먼저 확인한다.
+Elapsed: 00:00:02.10
+
+-- 이상 징후: ORA-01652. 메시지 끝의 테이블스페이스가 'TEMP' 임을 먼저 확인한다.
 --   => 데이터 테이블스페이스 부족이 아니라 임시 공간 부족이다(오인① 회피).
+--   사건은 2~3초 만에 끝난다 — 이런 짧은 사건은 '진행 중 관찰'이 아니라 사후 흔적으로 잡는다.
 
 --------------------------------------------------------------------------------
--- [4] (원인 파악) 누가 TEMP을 삼켰는가 — V$TEMPSEG_USAGE로 세션·SQL 지목.
---     (오류 직전~직후 다른 세션이 큰 정렬을 도는 동안 관찰한다)
+-- [4] (원인 파악) 누가 TEMP 을 삼켰는가 — 사후 흔적: V$SORT_SEGMENT(최대 사용량)와 V$SQL.
 --------------------------------------------------------------------------------
--- ==== 세션 A (진단: SYS) ====
-SYS@orcl> SELECT u.session_addr, s.sid, s.username,
-  2         u.tablespace, u.blocks*8192/1024/1024 mb, u.sql_id
-  3       FROM  v$tempseg_usage u JOIN v$session s
-  4              ON u.session_addr = s.saddr
-  5       ORDER BY u.blocks DESC;
-   SID USERNAME  TABLESPACE   MB        SQL_ID
------- --------- ---------- ------ -------------
-   145 SQLT      TEMP           20  7ab9c3ktx0m2p   <- TEMP을 꽉 채운 세션/SQL
+-- (터미널 A) 진단: SYS
+SYS@orcl> SELECT tablespace_name,
+  2         ROUND(max_used_blocks*8192/1024/1024) max_used_mb,
+  3         ROUND(total_blocks*8192/1024/1024) total_mb
+  4       FROM  v$sort_segment;
 
--- 원인 확정: SID 145(SQLT)의 SQL_ID 7ab9c3ktx0m2p가 TEMP 20MB 전부를 점유했다.
---   이 정렬은 amount 전체 정렬로, 업무상 정당한 대량 정렬이다(불필요한 정렬 아님).
---   => 판정: SQL로 회피할 성격이 아니라 구성(TEMP 확장)이 정답이다.
+TABLESPACE_NAME  MAX_USED_MB   TOTAL_MB
+---------------- ----------- ----------
+TEMP                     136         59
+
+-- 해석: 확보된 정렬 익스텐트 총량(TOTAL)이 물리 크기(60MB)에 닿았다 = 누군가 TEMP 을 끝까지 채웠다.
+--   (MAX_USED 는 기동 이후 최대치라 앞선 실습에서 더 큰 값이 남아 있을 수 있다 — 이번 사건의
+--    상한은 TOTAL 이 말해 준다.)
+
+SYS@orcl> COLUMN sql_text FORMAT A60
+
+SYS@orcl> SELECT sql_id, executions, ROUND(elapsed_time/1e6,1) elapsed_sec,
+  2              SUBSTR(sql_text, 1, 60) sql_text
+  3       FROM   v$sql
+  4       WHERE  parsing_schema_name = 'SQLT' AND sql_text LIKE '%ORDER BY m.hosp_id, m.receipt_date, d.amt DESC%'
+  5       AND    sql_text NOT LIKE '%v$sql%';
+
+SQL_ID        EXECUTIONS ELAPSED_SEC SQL_TEXT
+------------- ---------- ----------- ------------------------------------------------------------
+2bhr8y000kw8z          1         2.1 SELECT MAX(rn) rows_sorted FROM (        SELECT ROWNUM rn FR
+
+-- 원인 확정: SQLT 의 위 SQL 이 TEMP 60MB 전부를 점유하다 실패했다(EXECUTIONS 1, 실패해도 커서는 남는다).
+--   이 정렬은 병원별 접수 순 상세 리포트라는 업무상 정당한 대량 정렬이다(불필요한 정렬 아님).
+--   => 판정: SQL 로 회피할 성격이 아니라 구성(TEMP 확장)이 정답이다.
 
 --------------------------------------------------------------------------------
--- [5] (조치) 임시 파일을 추가해 TEMP을 넉넉히 확장하고 자동 확장을 켠다.
+-- [5] (조치) 임시 파일을 추가해 TEMP 을 넉넉히 확장하고 자동 확장을 켠다.
 --------------------------------------------------------------------------------
 SYS@orcl> ALTER TABLESPACE temp ADD TEMPFILE
-  2       '/u01/app/oracle/oradata/orcl/temp02.dbf'
+  2       '/u03/oradata/ORCL/temp02.dbf'
   3       SIZE 512M AUTOEXTEND ON NEXT 64M MAXSIZE 2G;
+
 Tablespace altered.
 
 --------------------------------------------------------------------------------
 -- [6] (조치 후 상태 + 재확인) TEMP 총량 확인 후 같은 정렬을 다시 돌린다.
+--     이번에는 정렬이 끝난 뒤 결과를 천천히 읽게 해(커서 루프 + 잠깐씩 대기) 정렬 세그먼트가
+--     살아 있는 동안 V$TEMPSEG_USAGE 로 '진행 중' 관찰도 해 본다.
 --------------------------------------------------------------------------------
 SYS@orcl> SELECT tablespace_name, ROUND(SUM(bytes)/1024/1024) mb
   2       FROM  dba_temp_files GROUP BY tablespace_name;
+
 TABLESPACE_NAME          MB
------------------ ----------
-TEMP                     532
+---------------- ----------
+TEMP                    572
 
--- ==== 세션 B ====
-SQLT@orcl> SELECT claim_id, detail_seq, amount
-  2       FROM  sqlt.claim_details
-  3       ORDER BY amount, claim_id, detail_seq;
-   ... (정상 종료 — 900,000행 반환) ...
+-- (터미널 B) 같은 정렬을 커서로 열어 10만 행마다 1초씩 쉬며 읽는다(약 10초).
+SQLT@orcl> SET SERVEROUTPUT ON
 
--- 재확인: TEMP 532MB로 확장되자 같은 SQL이 ORA-01652 없이 완주했다.
---   V$SORT_SEGMENT로 최대 사용량을 보면 물리 크기 안에 들어온다.
-SYS@orcl> SELECT tablespace_name, ROUND(max_used_blocks*8192/1024/1024) max_mb
-  2       FROM  v$sort_segment;
-TABLESPACE_NAME       MAX_MB
------------------ ----------
-TEMP                     <환경값>   -- 20MB보다 크고 532MB보다 작으면 여유 있음
+SQLT@orcl> DECLARE
+  2         n NUMBER := 0;
+  3       BEGIN
+  4         FOR r IN (SELECT m.hosp_id, m.receipt_date, m.claim_id, m.total_amt, d.drug_code, d.qty, d.amt
+  5                   FROM   medical_claims m JOIN claim_details d ON d.claim_id = m.claim_id
+  6                   ORDER BY m.hosp_id, m.receipt_date, d.amt DESC) LOOP
+  7           n := n + 1;
+  8           IF MOD(n, 100000) = 0 THEN DBMS_SESSION.SLEEP(1); END IF;
+  9         END LOOP;
+ 10         DBMS_OUTPUT.PUT_LINE('완주: ' || n || ' 행');
+ 11       END;
+ 12       /
+
+완주: 899894 행
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:14.91
+
+-- (터미널 A) B 가 읽는 동안 — 어느 세션의 어떤 SQL 이 TEMP 을 얼마나 쓰는지.
+-- ▶ 잠시 대기: 5초
+SYS@orcl> COLUMN username FORMAT A8
+
+SYS@orcl> COLUMN tablespace FORMAT A10
+
+SYS@orcl> COLUMN segtype FORMAT A8
+
+SYS@orcl> SELECT s.sid, s.username, u.tablespace, u.segtype,
+  2              ROUND(u.blocks*8192/1024/1024) mb, u.sql_id
+  3       FROM   v$tempseg_usage u JOIN v$session s ON u.session_addr = s.saddr
+  4       WHERE  s.username = 'SQLT'
+  5       ORDER  BY u.blocks DESC;
+
+       SID USERNAME TABLESPACE SEGTYPE          MB SQL_ID
+---------- -------- ---------- -------- ---------- -------------
+       217 SQLT     TEMP       SORT             90 8nwsztmf3wt4w
+       217 SQLT     TEMP       SORT             43 8nwsztmf3wt4w
+
+-- 해석: 한 세션이 정렬 세그먼트 두 개(약 90MB + 43MB)를 쥐고 있다 — 커서가 결과를 읽는 동안
+--   정렬 결과와 조인 중간 결과가 함께 살아 있다. 60MB TEMP 으로는 애초에 담을 수 없던 크기다.
+--   V$TEMPSEG_USAGE 는 '지금' 쓰는 세션·SQL·크기를 보여 주므로 진행 중 사건에 쓴다.
+
+-- (터미널 B) 완주 확인
+-- ▶ 대기: 터미널 B
+
+SYS@orcl> SELECT tablespace_name,
+  2         ROUND(max_used_blocks*8192/1024/1024) max_used_mb,
+  3         ROUND(total_blocks*8192/1024/1024) total_mb
+  4       FROM  v$sort_segment;
+
+TABLESPACE_NAME                MAX_USED_MB   TOTAL_MB
+------------------------------ ----------- ----------
+TEMP                                   136        136
+
+-- 재확인: TEMP 572MB 로 확장되자 같은 정렬이 ORA-01652 없이 완주했다.
+--   최대 사용량 136MB 가 물리 크기(572MB) 안에 여유 있게 들어온다.
 
 --------------------------------------------------------------------------------
 -- [7] (원복) 추가한 임시 파일을 제거해 실습 전 상태로 되돌린다.
 --------------------------------------------------------------------------------
-SYS@orcl> ALTER TABLESPACE temp DROP TEMPFILE
-  2       '/u01/app/oracle/oradata/orcl/temp02.dbf';
+-- (터미널 B) 세션 정책 원복(접속을 끊어도 된다)
+SQLT@orcl> ALTER SESSION SET workarea_size_policy = AUTO;
+
+Session altered.
+
+Elapsed: 00:00:00.00
+
+SQLT@orcl> EXIT
+
+-- (터미널 A)
+SYS@orcl> ALTER TABLESPACE temp DROP TEMPFILE '/u03/oradata/ORCL/temp02.dbf';
+
 Tablespace altered.
-SQLT@orcl> ALTER SESSION SET workarea_size_policy=AUTO;   -- 세션 정책 원복
+
+SYS@orcl> SELECT file_name, ROUND(bytes/1024/1024) mb FROM dba_temp_files;
+
+FILE_NAME                                MB
+-------------------------------- ----------
+/u03/oradata/ORCL/temp01.dbf             60
 
 --------------------------------------------------------------------------------
 -- [정리]
@@ -126,4 +229,5 @@ SQLT@orcl> ALTER SESSION SET workarea_size_policy=AUTO;   -- 세션 정책 원�
 -- ※ V$TEMPSEG_USAGE·V$SORT_SEGMENT 조회는 관리 팩 라이선스가 필요 없다.
 
 SYS@orcl> EXIT
+
 ================================================================================
