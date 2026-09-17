@@ -9,79 +9,415 @@
        공유 DB에서 실행하면 다른 업무 응답시간이 눈에 띄게 나빠진다.
 ================================================================================
 
+-- (터미널 A) 부하·측정 세션(WL_06 도 이 세션에서 돌린다)
 $ sqlplus sqlt/sqlt@orcl
 
 SQLT@orcl> SET LINESIZE 200
+
 SQLT@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
 -- [1] (조치 전 상태) 부하 직전(T0) 시간 모델·주요 통계 누적값을 캡처한다.
+--     값은 치환 변수에 담아 두고, 나중에 T1 - T0 를 SQL 로 뺀다.
 --------------------------------------------------------------------------------
-SQLT@orcl> COLUMN stat_name FORMAT A26
-SQLT@orcl> SELECT stat_name, value FROM v$sess_time_model
-  2       WHERE sid = sys_context('USERENV','SID')
-  3         AND stat_name IN ('DB time','DB CPU');       -- (T0 시간모델)
+SQLT@orcl> SET VERIFY OFF
 
-STAT_NAME                   VALUE
--------------------------- ----------
-DB time                    <환경값>
-DB CPU                     <환경값>
+SQLT@orcl> COLUMN t0_time NEW_VALUE t0_time
 
-SQLT@orcl> SELECT name, value FROM v$mystat s JOIN v$statname n USING (statistic#)
-  2       WHERE n.name IN ('session logical reads','physical reads',
-  3              'user commits','parse count (hard)');    -- (T0 통계)
+SQLT@orcl> COLUMN t0_cpu  NEW_VALUE t0_cpu
 
-NAME                             VALUE
------------------------------- ----------
-session logical reads          <환경값>
-physical reads                 <환경값>
-user commits                   <환경값>
-parse count (hard)             <환경값>
+SQLT@orcl> SELECT MAX(DECODE(stat_name, 'DB time', value)) t0_time,
+  2              MAX(DECODE(stat_name, 'DB CPU',  value)) t0_cpu
+  3       FROM   v$sess_time_model WHERE sid = sys_context('USERENV','SID');   -- (T0 시간모델)
+
+   T0_TIME     T0_CPU
+---------- ----------
+    187343      52214
+
+SQLT@orcl> COLUMN t0_lio    NEW_VALUE t0_lio
+
+SQLT@orcl> COLUMN t0_pio    NEW_VALUE t0_pio
+
+SQLT@orcl> COLUMN t0_commit NEW_VALUE t0_commit
+
+SQLT@orcl> COLUMN t0_hp     NEW_VALUE t0_hp
+
+SQLT@orcl> SELECT MAX(DECODE(n.name, 'session logical reads', s.value)) t0_lio,
+  2              MAX(DECODE(n.name, 'physical reads',        s.value)) t0_pio,
+  3              MAX(DECODE(n.name, 'user commits',          s.value)) t0_commit,
+  4              MAX(DECODE(n.name, 'parse count (hard)',    s.value)) t0_hp
+  5       FROM   v$mystat s JOIN v$statname n USING (statistic#);                -- (T0 통계)
+
+    T0_LIO     T0_PIO  T0_COMMIT      T0_HP
+---------- ---------- ---------- ----------
+       676         45          0         37
 
 --------------------------------------------------------------------------------
 -- [2] (조치) 종합 부하를 실행한다. 첫 시도는 기본값(wl_cycles=3, 약 3~5분)이
---     아니라 아주 짧게(예: wl_cycles=1 미만 축약) 돌려 본다 — 이상 징후 재현용.
+--     아니라 아주 짧게 돌려 본다 — 이상 징후 재현용.
 --------------------------------------------------------------------------------
-SQLT@orcl> -- (짧은 부하: 약 0.3초 구간)  실습 02와 같은 축약 스캔 1회
+SQLT@orcl> -- (짧은 부하: 0.1초 안팎)  실습 02와 같은 축약 스캔 1회
 SQLT@orcl> SELECT /*+ FULL(d) NO_PARALLEL(d) */ SUM(d.amt)
   2       FROM claim_details d WHERE d.qty >= 0;
 
-  SUM(AMT)
+SUM(D.AMT)
 ----------
-<환경값>
+4.5396E+10
 
 --------------------------------------------------------------------------------
 -- [3] (결과) 부하 후(T1) 캡처 → 델타 = T1 - T0.
 --------------------------------------------------------------------------------
--- 이번 짧은 구간의 시간 모델 델타(실측):
---   DB time 델타 : 275,636 us  (약 0.28초)
---   DB CPU  델타 : 297,047 us  (약 0.30초)
---   → DB time 대비 CPU 107.8% ,  대기 -7.8%   (음수?!)
+SQLT@orcl> SELECT MAX(DECODE(stat_name, 'DB time', value)) - &t0_time dbtime_delta_us,
+  2              MAX(DECODE(stat_name, 'DB CPU',  value)) - &t0_cpu  dbcpu_delta_us,
+  3              ROUND(100 * (MAX(DECODE(stat_name, 'DB CPU', value)) - &t0_cpu)
+  4                        / (MAX(DECODE(stat_name, 'DB time', value)) - &t0_time), 1) cpu_pct
+  5       FROM   v$sess_time_model WHERE sid = sys_context('USERENV','SID');
+
+DBTIME_DELTA_US DBCPU_DELTA_US    CPU_PCT
+--------------- -------------- ----------
+          86004          66038       76.8
+
+SQLT@orcl> SELECT n.name, s.value - DECODE(n.name, 'session logical reads', &t0_lio, 'physical reads', &t0_pio,
+  2                                          'user commits', &t0_commit, 'parse count (hard)', &t0_hp) delta
+  3       FROM   v$mystat s JOIN v$statname n USING (statistic#)
+  4       WHERE  n.name IN ('session logical reads','physical reads','user commits','parse count (hard)')
+  5       ORDER  BY n.name;
+
+NAME                                                                  DELTA
+---------------------------------------------------------------- ----------
+parse count (hard)                                                        3
+physical reads                                                            1
+session logical reads                                                  6751
+user commits                                                              0
+
+-- 이번 짧은 구간의 시간 모델 델타(실측): DB time 86,004us(0.09초) / DB CPU 66,038us → CPU 76.8%.
+--   같은 0.1초짜리 구간이 실습 02 에서는 CPU 100.6%(대기 -0.6%)로 나왔다 — 짧은 구간은 이렇게
+--   실행마다 흔들린다. 통계 델타는 논리 읽기 6,751블록, 물리 읽기 1(캐시에 있던 표), 커밋 0,
+--   하드 파싱 3.
 
 --------------------------------------------------------------------------------
 -- [4] (이상 징후 → 원인 → 조치 → 재확인)
---     이상 징후: DB CPU 델타가 DB time 델타보다 커서 대기가 -7.8%로 나온다.
+--     이상 징후: 0.1초 구간의 CPU/대기 비율이 실행마다 크게 다르고(76.8% ↔ 100.6%),
+--       DB CPU 델타가 DB time 델타보다 커서 대기가 0 이하로 나오기도 한다.
 --------------------------------------------------------------------------------
-SQLT@orcl> -- 원인: 구간이 0.3초로 너무 짧아 카운터 갱신 시점 어긋남 + 반올림으로
+SQLT@orcl> -- 원인: 구간이 0.1초 안팎으로 너무 짧아 카운터 갱신 시점 어긋남 + 반올림으로
 SQLT@orcl> --   시간 모델의 CPU/대기 분해가 불안정해진 것. 버그가 아니다.
-SQLT@orcl> -- 조치: 구간을 충분히(수 분) 넓혀 다시 잰다. WL_06의 wl_cycles를 올린다.
-SQLT@orcl> --   10분 구간을 원하면 wl_cycles=8 정도. (부하스크립트\WL_06_mixed.sql)
-SQLT@orcl> -- 예)  DEFINE wl_cycles = 8
-SQLT@orcl> --      @WL_06_mixed.sql
-SQLT@orcl> -- WL_06은 전후 델타와 초당·트랜잭션당 요약(Load Profile 형식)을 스스로 출력한다:
-SQLT@orcl> --
-SQLT@orcl> --   [Load Profile]  구간 <환경값> 초 / 트랜잭션 <환경값> 건
-SQLT@orcl> --   항목                구간 합계        초당       트랜잭션당
-SQLT@orcl> --   -----------------------------------------------------------
-SQLT@orcl> --   DB Time (ms)        <환경값>       <환경값>     <환경값>
-SQLT@orcl> --   DB CPU  (ms)        <환경값>       <환경값>     <환경값>
-SQLT@orcl> --   Logical reads       <환경값>       <환경값>     <환경값>
-SQLT@orcl> --   Physical reads      <환경값>       <환경값>     <환경값>
-SQLT@orcl> --   Hard parses         <환경값>       <환경값>     <환경값>
+SQLT@orcl> -- 조치: 구간을 충분히 넓혀 다시 잰다 — 종합 부하 WL_06 을 2주기 돌린다(이 VM 은 빨라 약 10초;
+SQLT@orcl> --   수 분 구간을 원하면 wl_cycles 를 20 이상으로 준다).
+SQLT@orcl> --   WL_06 은 전후 델타와 초당·트랜잭션당 요약(Load Profile 형식)을 스스로 출력한다.
+SQLT@orcl> COLUMN t0_time NEW_VALUE t0_time
 
-SQLT@orcl> -- 재확인: 구간을 넓히면 'DB time 델타 - DB CPU 델타 ≈ 대기'가 양수로,
-SQLT@orcl> --   대기 클래스 델타의 합과 앞뒤가 맞게 안정된다. 넓은 구간에서 대기가
-SQLT@orcl> --   음수로 나오지 않는지 확인한다. (정확한 구간 관리는 6장 AWR로 이어진다.)
+SQLT@orcl> COLUMN t0_cpu  NEW_VALUE t0_cpu
+
+SQLT@orcl> SELECT MAX(DECODE(stat_name, 'DB time', value)) t0_time,
+  2              MAX(DECODE(stat_name, 'DB CPU',  value)) t0_cpu
+  3       FROM   v$sess_time_model WHERE sid = sys_context('USERENV','SID');   -- (넓은 구간의 T0)
+
+   T0_TIME     T0_CPU
+---------- ----------
+    284857     129795
+
+SQLT@orcl> SELECT MAX(DECODE(n.name, 'session logical reads', s.value)) t0_lio,
+  2              MAX(DECODE(n.name, 'physical reads',        s.value)) t0_pio,
+  3              MAX(DECODE(n.name, 'user commits',          s.value)) t0_commit,
+  4              MAX(DECODE(n.name, 'parse count (hard)',    s.value)) t0_hp
+  5       FROM   v$mystat s JOIN v$statname n USING (statistic#);
+
+    T0_LIO     T0_PIO  T0_COMMIT      T0_HP
+---------- ---------- ---------- ----------
+      7427         46          0         40
+
+SQLT@orcl> DEFINE wl_cycles = 2
+
+SQLT@orcl> @WL_06_mixed.sql
+
+============================================================
+WL_06_mixed.sql  -  AWR 구간용 종합 부하
+주기 수(wl_cycles)      : 2
+주기당 파싱             : 2000
+주기당 랜덤읽기/스캔    : 2000 / 2
+정렬 축소 계수          : 4
+주기당 DML 행수/배치    : 2000 / 200
+주기 간 휴지(초)        : 5
+----------------------------------------------------------- PROMPT  시작 전에 SYSDBA 세션에서 AWR 스냅샷을 하나 떠 두었는가?
+EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;   (Diagnostics Pack)
+============================================================
+
+[준비] REVIEW_LOG_MIX_WL 생성 완료. 행수 = 2000
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:00.53
+
+Session altered.
+
+Elapsed: 00:00:00.00
+
+Session altered.
+
+Elapsed: 00:00:00.00
+
+Session altered.
+
+Elapsed: 00:00:00.00
+
+Session altered.
+
+Elapsed: 00:00:00.00
+
+Session altered.
+
+Elapsed: 00:00:00.00
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:00.01
+[WL_06] 종합 부하 시작 : 2026-09-17 19:49:59
+주기 2회, DML 대상 2000 행
+>>> 주기 1 / 2  (19:49:59)
+- 파싱 구획 완료
+- I/O 구획 완료
+- 정렬/해시 구획 완료
+- DML/커밋 구획 완료
+>>> 주기 2 / 2  (19:50:06)
+- 파싱 구획 완료
+- I/O 구획 완료
+- 정렬/해시 구획 완료
+- DML/커밋 구획 완료
+==========================================================================================================================
+[WL_06] 종합 부하 전후 델타  (총 경과 7.35 초)
+==========================================================================================================================
+지표                                                                    전(前)              후(後)                델타
+--------------------------------------------------------------------------------------------------------------------------
+[TIME] DB CPU                                                          580,408             581,679              +1,271
+[TIME] DB time                                                       1,820,157           1,821,603              +1,446
+[TIME] PL/SQL execution elapsed time                                    43,009              43,082                 +73
+[TIME] background cpu time                                           1,132,460           1,132,526                 +66
+[TIME] background elapsed time                                       2,060,218           2,060,458                +240
+[TIME] hard parse elapsed time                                         135,456             136,636              +1,180
+[TIME] parse time elapsed                                              624,326             625,830              +1,504
+[TIME] sql execute elapsed time                                      1,679,581           1,680,836              +1,255
+[INST] CPU used by this session                                        116,033             116,259                +226
+[INST] db block changes                                             18,369,274          18,393,377             +24,103
+[INST] execute count                                                 7,093,244           7,111,050             +17,806
+[INST] parse count (hard)                                              340,644             344,769              +4,125
+[INST] parse count (total)                                           1,971,940           1,976,194              +4,254
+[INST] physical reads                                                  864,725             864,773                 +48
+[INST] physical writes                                                 768,428             768,453                 +25
+[INST] redo size                                                 4,499,056,812       4,502,424,916          +3,368,104
+[INST] session logical reads                                        47,980,873          48,104,937            +124,064
+[INST] sorts (disk)                                                         18                  18                  +0
+[INST] sorts (memory)                                                  441,924             442,090                +166
+[INST] table scans (long tables)                                            17                  17                  +0
+[INST] user calls                                                      270,389             270,389                  +0
+[INST] user commits                                                     12,978              16,998              +4,020
+[INST] user rollbacks                                                       51                  51                  +0
+[CLAS] Other  (대기ms)                                                 344,160             344,290                +130
+[CLAS] System I/O  (대기ms)                                            695,190             695,380                +190
+[CLAS] User I/O  (대기ms)                                              202,940             202,990                 +50
+[EVNT] db file sequential read  (대기ms)                                82,917              82,964                 +47
+[EVNT] log file parallel write  (대기ms)                                53,041              53,227                +186
+--------------------------------------------------------------------------------------------------------------------------
+====================================================================================================
+[Load Profile]  구간 7.35 초 / 트랜잭션 4020 건
+====================================================================================================
+항목                                               구간 합계                초당          트랜잭션당
+----------------------------------------------------------------------------------------------------
+DB Time (ms)                                           1,446              196.73                0.36
+DB CPU (ms)                                            1,271              172.93                0.32
+Redo size (bytes)                                  3,368,104          458,245.44              837.84
+Logical reads                                        124,064           16,879.46               30.86
+Physical reads                                            48                6.53                0.01
+Physical writes                                           25                3.40                0.01
+Block changes                                         24,103            3,279.32                6.00
+User calls                                                 0                0.00                0.00
+Parses (total)                                         4,254              578.78                1.06
+Hard parses                                            4,125              561.22                1.03
+Executes                                              17,806            2,422.59                4.43
+Sorts (memory)                                           166               22.59                0.04
+Sorts (disk)                                               0                0.00                0.00
+Transactions                                           4,020              546.94                1.00
+----------------------------------------------------------------------------------------------------
+구획별 경과(초) : 파싱 1.57 / I/O .22 / 정렬 .33 / DML .17
+====================================================================================================
+### 판정 포인트 ###
+1) 위 Load Profile 값을 AWR 보고서의 Load Profile 과 대조한다.
+AWR 구간이 이 부하 구간보다 넓으면 초당 값이 낮게 나온다.
+"구간을 어떻게 잡았는가"가 수치를 좌우한다는 것이 8장 요지다.
+2) [TIME] DB time 델타에서 DB CPU 를 뺀 값이 대략 대기 시간이다.
+[CLAS] 대기 클래스 델타 합과 비슷해야 앞뒤가 맞는다.
+3) enq: TX - row lock contention 이 0 이면 정상이다.
+이 스크립트는 단일 세션이라 잠금 경합을 만들지 않는다.
+필요하면 WL_04_lock.sql 을 별도 터미널에서 함께 돌린다.
+4) 총 경과 시간이 목표(3~5분)와 다르면 wl_cycles 를 조정한다.
+이번 실행 : 7.35 초 (주기 2회)
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:07.56
+
+>>> [실행 후] DB Time 구성 (V$SYS_TIME_MODEL)
+
+STAT_NAME                                       SEC
+---------------------------------------- ----------
+background elapsed time                     2060.46
+DB time                                     1822.68
+sql execute elapsed time                    1681.91
+background cpu time                         1132.53
+parse time elapsed                           625.83
+DB CPU                                       582.75
+RMAN cpu time (backup/restore)               349.07
+sequence load elapsed time                   188.98
+hard parse elapsed time                      136.64
+PL/SQL execution elapsed time                 43.08
+connection management call elapsed time       34.49
+PL/SQL compilation elapsed time                4.99
+
+12 rows selected.
+
+Elapsed: 00:00:00.01
+
+>>> [실행 후] 대기 클래스별 집계 (Idle 제외)
+
+WAIT_CLASS             TOTAL_WAITS        SEC
+---------------------- ----------- ----------
+System I/O                  462720     695.38
+Concurrency                 648927     525.13
+Other                       226348     344.29
+Application                    647     218.16
+User I/O                    622127     202.99
+Configuration                 1953     134.85
+Commit                        1378       5.23
+Administrative                 501         .2
+Network                     271997        .17
+
+9 rows selected.
+
+Elapsed: 00:00:00.00
+
+>>> [실행 후] 상위 대기 이벤트 10 (Idle 제외)
+
+EVENT                              WAIT_CLASS             TOTAL_WAITS        SEC     AVG_MS
+---------------------------------- ---------------------- ----------- ---------- ----------
+RMAN backup & recovery I/O         System I/O                   44272     523.83     11.832
+kksfbc child completion            Other                         6044     289.78     47.945
+enq: TX - row lock contention      Application                     10      215.7  21569.818
+row cache lock                     Concurrency                 378975     160.04       .422
+cursor: pin S wait on X            Concurrency                  95450     139.75      1.464
+buffer busy waits                  Concurrency                 117589     133.36      1.134
+log file switch (checkpoint incomp Configuration                  125     125.45   1003.622
+lete)
+
+control file parallel write        System I/O                   46277      96.39      2.083
+db file sequential read            User I/O                     77481      82.96      1.071
+Disk file operations I/O           User I/O                     19993      64.35      3.219
+
+10 rows selected.
+
+Elapsed: 00:00:00.00
+
+>>> [실행 후] 이번 부하가 만든 상위 SQL (경과시간 기준)
+
+SQL_ID               SEC EXECUTIONS BUFFER_GETS DISK_READS SQL_TEXT
+------------- ---------- ---------- ----------- ---------- ----------------------------------------------
+8ucauynusghmq       2.52          1      124553         59 DECLARE     TYPE t_map IS TABLE OF NUMBER INDE
+858mpgdtr5ssf        .06       8000       32275          1 UPDATE /* WL06_UPD */ REVIEW_LOG_MIX_WL    SET
+2a8kkupnkp7nw          0          1           2          0 SELECT /* WL06_LIT */ COUNT(*) FROM PATIENTS W
+8wn82mx7mq21m          0          1           2          0 SELECT /* WL06_LIT */ COUNT(*) FROM PATIENTS W
+0ks9rgpwzav5t          0          1           2          0 SELECT /* WL06_LIT */ COUNT(*) FROM PATIENTS W
+fhd8x2b4s096y          0          1           2          0 SELECT /* WL06_LIT */ COUNT(*) FROM PATIENTS W
+3t9a4cs999uwz          0          1           2          0 SELECT /* WL06_LIT */ COUNT(*) FROM PATIENTS W
+7xa12udvhmtgp          0          1           2          0 SELECT /* WL06_LIT */ COUNT(*) FROM PATIENTS W
+44rjc4ht3mhg8          0          1           2          0 SELECT /* WL06_LIT */ COUNT(*) FROM PATIENTS W
+cg3a5p23gcrs0          0          1           2          0 SELECT /* WL06_LIT */ COUNT(*) FROM PATIENTS W
+
+10 rows selected.
+
+Elapsed: 00:00:00.06
+
+>>> [실행 후] 리터럴 SQL 이 만든 커서 수 (WL_01 과 같은 현상)
+
+LITERAL_CURSORS SHARED_POOL_MB
+--------------- --------------
+           2335         42.679
+
+1 row selected.
+
+Elapsed: 00:00:00.06
+
+----------------------------------------------------------- PROMPT  [라이선스 안내]
+AWR / ADDM / ASH / DBA_HIST_* / V$ACTIVE_SESSION_HISTORY 는
+Diagnostics Pack 라이선스가 필요하다.
+라이선스가 없다면 :
+- 위 [4]절이 출력한 V$ 기반 델타 요약을 그대로 쓴다
+- Statspack 을 설치해 스냅샷/보고서를 쓴다
+@?/rdbms/admin/spcreate.sql   (설치, PERFSTAT 계정)
+EXEC STATSPACK.SNAP;          (스냅샷)
+@?/rdbms/admin/spreport.sql   (보고서)
+현재 설정 확인 : SHOW PARAMETER control_management_pack_access
+-----------------------------------------------------------
+
+>>> [되돌리기] 세션 파라미터 원복
+
+Session altered.
+
+Elapsed: 00:00:00.00
+
+Session altered.
+
+Elapsed: 00:00:00.00
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:00.00
+>>> [되돌리기] 복제 테이블 정리
+[정리] REVIEW_LOG_MIX_WL 삭제 완료.
+[정리] 원본 7개 테이블은 읽기만 했다. 변경 없음.
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:00.15
+
+============================================================
+WL_06 완료.
+지금 SYSDBA 세션에서 종료 스냅샷을 뜨고 보고서를 만든다.
+EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT
+@?/rdbms/admin/awrrpt.sql
+(라이선스가 없으면 Statspack 또는 위 [4]절 델타 요약을 사용)
+============================================================
+
+SQLT@orcl> -- 재확인: 넓은 구간에서는 'DB time 델타 - DB CPU 델타 ≈ 대기'가 양수로 안정된다.
+SQLT@orcl> SELECT MAX(DECODE(stat_name, 'DB time', value)) - &t0_time dbtime_delta_us,
+  2              MAX(DECODE(stat_name, 'DB CPU',  value)) - &t0_cpu  dbcpu_delta_us,
+  3              ROUND(100 * (MAX(DECODE(stat_name, 'DB CPU', value)) - &t0_cpu)
+  4                        / (MAX(DECODE(stat_name, 'DB time', value)) - &t0_time), 1) cpu_pct
+  5       FROM   v$sess_time_model WHERE sid = sys_context('USERENV','SID');
+
+DBTIME_DELTA_US DBCPU_DELTA_US    CPU_PCT
+--------------- -------------- ----------
+        3344545        2760833       82.5
+
+1 row selected.
+
+SQLT@orcl> SELECT n.name, s.value - DECODE(n.name, 'session logical reads', &t0_lio, 'physical reads', &t0_pio,
+  2                                          'user commits', &t0_commit, 'parse count (hard)', &t0_hp) delta
+  3       FROM   v$mystat s JOIN v$statname n USING (statistic#)
+  4       WHERE  n.name IN ('session logical reads','physical reads','user commits','parse count (hard)')
+  5       ORDER  BY n.name;
+
+NAME                                                                  DELTA
+---------------------------------------------------------------- ----------
+parse count (hard)                                                     4609
+physical reads                                                          475
+session logical reads                                                140882
+user commits                                                           4023
+
+4 rows selected.
+
+-- 재확인: 구간이 넓어지자(WL_06 2주기, DB time 3.34초) CPU 82.5% / 대기 17.5% 로 앞뒤가 맞는다.
+--   통계 델타도 논리 읽기 140,882·물리 읽기 475·커밋 4,023·하드 파싱 4,609 으로 모두 잡힌다.
+--   WL_06 자체의 Load Profile(구간 7.35초, 트랜잭션 4,020건, 초당 DB Time 196ms·하드 파싱 561회)과
+--   이 세션 델타가 같은 그림을 그린다. (정확한 구간 관리는 6장 AWR 로 이어진다.)
 
 --------------------------------------------------------------------------------
 -- [5] (조치 후 관점) 왜 초당·트랜잭션당으로 환산하나
@@ -95,10 +431,11 @@ SQLT@orcl> --   음수로 나오지 않는지 확인한다. (정확한 구간 �
 -- [정리]
 --------------------------------------------------------------------------------
 -- 1) 부하 전후 캡처 → 델타 = T1 - T0. 이것이 이 구간의 실제 부하다.
--- 2) 짧은 구간(0.3초)은 CPU/대기 분해가 불안정(실측 CPU 107.8%, 대기 -7.8%).
--- 3) 조치: wl_cycles를 올려 구간을 수 분으로 넓히면 델타가 안정된다.
+-- 2) 짧은 구간(0.1초 안팎)은 CPU/대기 분해가 불안정(실행마다 76.8% ↔ 100.6%).
+-- 3) 조치: WL_06 을 돌려 구간을 넓히면 델타가 안정된다(실측 CPU 82.5%·대기 17.5%, wl_cycles 로 길이 조절).
 -- 4) 델타는 초당·트랜잭션당으로 환산해 비교한다(Load Profile 형식).
 -- ※ 이 실습의 V$ 조회는 라이선스가 필요 없다. AWR 스냅샷부터 🔒 Diagnostics Pack.
 
 SQLT@orcl> EXIT
+
 ================================================================================

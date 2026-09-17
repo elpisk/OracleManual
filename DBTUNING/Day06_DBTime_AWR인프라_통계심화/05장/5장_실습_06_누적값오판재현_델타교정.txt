@@ -10,6 +10,7 @@
 $ sqlplus / as sysdba
 
 SYS@orcl> SET LINESIZE 200
+
 SYS@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
@@ -17,6 +18,7 @@ SYS@orcl> SET PAGESIZE 100
 --     상황: 아침에 출근한 DBA가 대기 클래스 누적 집계를 보고 보고서를 쓴다.
 --------------------------------------------------------------------------------
 SYS@orcl> COLUMN wait_class FORMAT A22
+
 SYS@orcl> SELECT wait_class, total_waits, ROUND(time_waited/100) sec
   2       FROM  v$system_wait_class
   3       WHERE wait_class <> 'Idle'
@@ -24,16 +26,19 @@ SYS@orcl> SELECT wait_class, total_waits, ROUND(time_waited/100) sec
 
 WAIT_CLASS             TOTAL_WAITS        SEC
 ---------------------- ----------- ----------
-Network                       8583        358
-System I/O                   81525         77
-User I/O                     13860         52
-Other                        19811         27
-Application                    128          7
-Commit                         109          5
-Concurrency                     75          2
-Administrative                 109          1
+System I/O                  465800        696
+Concurrency                 651487        527
+Other                       230275        347
+Application                    680        218
+User I/O                    622355        203
+Configuration                 1954        135
+Commit                        1393          5
+Administrative                 517          0
+Network                     272403          0
 
-SYS@orcl> -- (오판) "User I/O 52초, System I/O 77초로 크다. 밤사이 I/O 병목이 있었다.
+9 rows selected.
+
+SYS@orcl> -- (오판) "System I/O 695초, User I/O 177초로 크다. 밤사이 I/O 병목이 있었다.
 SYS@orcl> --        스토리지를 증설해야 한다."  ← 이 결론이 왜 틀렸는지 아래에서 본다.
 
 --------------------------------------------------------------------------------
@@ -45,68 +50,133 @@ SYS@orcl> SELECT TO_CHAR(startup_time,'YYYY-MM-DD HH24:MI') startup,
 
 STARTUP            UP_HOURS
 ---------------- ----------
-<환경값>          <환경값>
+2026-09-16 15:14       28.6
 
 -- 원인 확정: V$SYSTEM_WAIT_CLASS의 sec는 인스턴스 기동 이후 '누적'이다.
---   가동 시간이 길면 정상 운영으로도 User I/O 52초, System I/O 77초는 충분히 쌓인다.
+--   가동 시간(28시간)이 길면 정상 운영으로도 System I/O 695초, User I/O 177초는 충분히 쌓인다.
 --   '밤 2~3시 구간'의 값이 아니라 '기동 이후 전체'의 합계다. 절대값으로 판정 불가.
 --   → 특정 구간의 병목은 그 구간의 '델타'로만 지목할 수 있다.
 
 --------------------------------------------------------------------------------
 -- [3] (조치) 델타 방식으로 교정한다 — 관심 구간의 시작·끝을 빼서 본다.
 --------------------------------------------------------------------------------
-SYS@orcl> -- 관심 구간(T0~T1)을 감싸 두 번 집계한다. (AWR이 있으면 그 구간 스냅샷,
-SYS@orcl> --  없으면 아래처럼 V$를 두 번 조회하거나 Statspack 스냅샷 쌍을 쓴다.)
-SYS@orcl> -- T0: 구간 시작 집계
-SYS@orcl> SELECT wait_class, ROUND(time_waited/100) sec_t0
-  2       FROM v$system_wait_class WHERE wait_class <> 'Idle'
-  3       ORDER BY time_waited DESC FETCH FIRST 4 ROWS ONLY;
+SYS@orcl> -- 관심 구간(T0~T1)을 감싸 두 번 집계한다. (AWR 이 있으면 그 구간 스냅샷,
+SYS@orcl> --  없으면 아래처럼 V$ 를 두 번 조회하거나 Statspack 스냅샷 쌍을 쓴다.)
+SYS@orcl> -- T0: 구간 시작 집계를 실습용 표 세 개에 떠 둔다(대기 클래스 / 대기 이벤트 / 시스템 통계).
+SYS@orcl> CREATE TABLE sqlt.wc_t0 AS SELECT wait_class, time_waited FROM v$system_wait_class;
 
-WAIT_CLASS             SEC_T0
----------------------- ----------
-Network                <환경값>
-System I/O             <환경값>
-User I/O               <환경값>
-Other                  <환경값>
+Table created.
 
-SYS@orcl> -- (관심 구간의 부하가 흐른다 — 예: WL_06_mixed.sql)
-SYS@orcl> -- T1: 구간 끝 집계
-SYS@orcl> SELECT wait_class, ROUND(time_waited/100) sec_t1
-  2       FROM v$system_wait_class WHERE wait_class <> 'Idle'
-  3       ORDER BY time_waited DESC FETCH FIRST 4 ROWS ONLY;
+SYS@orcl> CREATE TABLE sqlt.ev_t0 AS SELECT event, total_waits, time_waited_micro FROM v$system_event;
 
-WAIT_CLASS             SEC_T1
----------------------- ----------
-Network                <환경값>
-System I/O             <환경값>
-User I/O               <환경값>
-Other                  <환경값>
+Table created.
+
+SYS@orcl> CREATE TABLE sqlt.st_t0 AS SELECT name, value FROM v$sysstat
+  2       WHERE name IN ('physical reads','session logical reads','user commits','parse count (hard)');
+
+Table created.
+
+SYS@orcl> CREATE TABLE sqlt.tm_t0 AS SELECT stat_name, value FROM v$sys_time_model
+  2       WHERE stat_name IN ('DB time','DB CPU');
+
+Table created.
+
+SYS@orcl> -- (관심 구간의 부하가 흐른다 — 다른 터미널에서 종합 부하 WL_06_mixed.sql 2세션, wl_cycles=3)
+-- ▶ 부하: WL_06_mixed.sql × 2 DEFINE wl_cycles=3
+
+SYS@orcl> -- T1: 구간 끝 집계와 조인해 델타를 본다.
+SYS@orcl> SELECT n.wait_class, ROUND((n.time_waited - t.time_waited) / 100, 1) delta_sec,
+  2              ROUND(n.time_waited / 100) cum_sec
+  3       FROM   v$system_wait_class n JOIN sqlt.wc_t0 t ON t.wait_class = n.wait_class
+  4       WHERE  n.wait_class <> 'Idle'
+  5       ORDER  BY delta_sec DESC FETCH FIRST 5 ROWS ONLY;
+
+WAIT_CLASS              DELTA_SEC    CUM_SEC
+---------------------- ---------- ----------
+System I/O                     .8        697
+Other                          .4        347
+Concurrency                    .1        527
+User I/O                       .1        203
+Application                     0        218
+
+SYS@orcl> -- 같은 구간의 DB Time 델타 — 클래스 델타의 '비중'을 재는 분모.
+SYS@orcl> COLUMN stat_name FORMAT A12
+
+SYS@orcl> SELECT n.stat_name, ROUND((n.value - t.value) / 1e6, 2) delta_sec
+  2       FROM   v$sys_time_model n JOIN sqlt.tm_t0 t ON t.stat_name = n.stat_name
+  3       ORDER  BY n.stat_name;
+
+STAT_NAME     DELTA_SEC
+------------ ----------
+DB CPU             2.91
+DB time            3.12
 
 -- 델타(= T1 - T0)와 같은 구간 DB Time 델타를 함께 본다:
 --   그 구간 DB Time 델타 대비 각 클래스 델타의 '비중'이 병목 판정의 기준이다.
---   누적으로 1위였던 Network가 구간 델타에서는 상위가 아닐 수 있다.
+--   누적으로 695초였던 System I/O 가 이 구간 델타에서는 1초 미만이다 — 이 구간(WL_06, 약 10초)의
+--   대기는 커밋이 부른 log file parallel write(System I/O)·LGWR 작업자(Other)·파싱 경합(Concurrency)
+--   정도이고, 합쳐도 DB Time 델타(3.1초) 대비 몇 십 % 수준이다. 나머지는 CPU 다(SSD VM 의 특성).
+--   (부하 스크립트의 SQL 이 공유 풀에 이미 있으면 파싱 대기가, 처음이면 파싱 대기가 더 크게
+--    나온다 — 같은 부하도 상태에 따라 델타 순위가 바뀐다.)
 
 --------------------------------------------------------------------------------
--- [4] (재확인) 대기의 실체는 세션 이벤트로, 원시 카운트로 교차 검증한다.
+-- [4] (재확인) 대기의 실체는 이벤트로, 원시 카운트로 교차 검증한다.
 --------------------------------------------------------------------------------
-SYS@orcl> -- 구간에 물리 I/O가 정말 병목이었다면 db file scattered read 같은 이벤트와
-SYS@orcl> -- physical reads 통계가 함께 커야 앞뒤가 맞는다(교차 검증).
+SYS@orcl> -- 구간에 물리 I/O 가 정말 병목이었다면 db file scattered read 같은 이벤트와
+SYS@orcl> -- physical reads 통계가 함께 커야 앞뒤가 맞는다(교차 검증). 부하 세션은 이미 끝났으므로
+SYS@orcl> -- V$SESSION_EVENT 대신 인스턴스 이벤트(V$SYSTEM_EVENT)의 구간 델타를 본다.
 SYS@orcl> COLUMN event FORMAT A30
-SYS@orcl> SELECT event, total_waits, ROUND(time_waited_micro/1000) ms
-  2       FROM  v$session_event
-  3       WHERE sid = <내SID> AND wait_class <> 'Idle'
-  4       ORDER BY time_waited_micro DESC;
 
-EVENT                          TOTAL_WAITS         MS
------------------------------- ----------- ----------
-db file scattered read                 120         65
-db file sequential read                 12         17
-log file sync                            1          0
-SQL*Net message to client               12          0
+SYS@orcl> SELECT n.event, n.total_waits - t.total_waits delta_waits,
+  2              ROUND((n.time_waited_micro - t.time_waited_micro) / 1000) delta_ms, n.wait_class
+  3       FROM   v$system_event n JOIN sqlt.ev_t0 t ON t.event = n.event
+  4       WHERE  n.wait_class <> 'Idle'
+  5       ORDER  BY delta_ms DESC FETCH FIRST 6 ROWS ONLY;
 
--- 재확인: 이 세션 구간에서는 db file scattered read 120회·65ms가 실체다. 이처럼
---   델타 + 이벤트 + 원시 카운트를 함께 봐야 '진짜 그 구간의 병목'을 지목할 수 있다.
---   누적 절대값 하나로 내린 [1]의 '밤사이 I/O 병목'은 근거 없는 조치였다.
+EVENT                          DELTA_WAITS   DELTA_MS WAIT_CLASS
+------------------------------ ----------- ---------- ----------------------
+log file parallel write               1929        717 System I/O
+LGWR any worker group                 1603        335 Other
+buffer busy waits                      441         63 Concurrency
+LGWR worker group ordering             357         40 Other
+LGWR all worker groups                 113         28 Other
+Disk file operations I/O                39         27 User I/O
+
+6 rows selected.
+
+SYS@orcl> COLUMN name FORMAT A30
+
+SYS@orcl> SELECT n.name, n.value - t.value delta
+  2       FROM   v$sysstat n JOIN sqlt.st_t0 t ON t.name = n.name
+  3       ORDER  BY n.name;
+
+NAME                                DELTA
+------------------------------ ----------
+parse count (hard)                     26
+physical reads                         59
+session logical reads              367516
+user commits                        12068
+
+-- 재확인: 이 구간의 이벤트 델타 상위(log file parallel write·LGWR 작업자 = 커밋의 흔적)와 원시
+--   카운트 델타(커밋 12,068·물리 읽기 59·하드 파싱 26)가 같은 방향을 가리킨다 — 커밋의 구간이지
+--   물리 읽기의 구간이 아니다. 이처럼 델타 + 이벤트 + 원시 카운트를 함께 봐야 '진짜 그 구간의
+--   병목'을 지목할 수 있다. 누적 절대값 하나로 내린 [1]의 '밤사이 I/O 병목'은 근거 없는 조치였다.
+
+SYS@orcl> DROP TABLE sqlt.wc_t0 PURGE;
+
+Table dropped.
+
+SYS@orcl> DROP TABLE sqlt.ev_t0 PURGE;
+
+Table dropped.
+
+SYS@orcl> DROP TABLE sqlt.st_t0 PURGE;
+
+Table dropped.
+
+SYS@orcl> DROP TABLE sqlt.tm_t0 PURGE;
+
+Table dropped.
 
 --------------------------------------------------------------------------------
 -- [정리]
@@ -118,4 +188,5 @@ SQL*Net message to client               12          0
 -- ※ 이 실습의 V$ 조회는 라이선스가 필요 없다. AWR로 구간을 뜨려면 🔒 Diagnostics Pack(6장).
 
 SYS@orcl> EXIT
+
 ================================================================================

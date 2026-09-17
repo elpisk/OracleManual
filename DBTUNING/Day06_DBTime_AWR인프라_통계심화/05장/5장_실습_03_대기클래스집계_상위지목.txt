@@ -10,6 +10,7 @@
 $ sqlplus / as sysdba
 
 SYS@orcl> SET LINESIZE 200
+
 SYS@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
@@ -17,6 +18,7 @@ SYS@orcl> SET PAGESIZE 100
 --     이상 징후: 상위가 Idle 대기로 채워져 엉뚱한 결론에 이른다.
 --------------------------------------------------------------------------------
 SYS@orcl> COLUMN wait_class FORMAT A22
+
 SYS@orcl> SELECT wait_class, total_waits, ROUND(time_waited/100) sec
   2       FROM  v$system_wait_class
   3       ORDER BY time_waited DESC
@@ -24,9 +26,9 @@ SYS@orcl> SELECT wait_class, total_waits, ROUND(time_waited/100) sec
 
 WAIT_CLASS             TOTAL_WAITS        SEC
 ---------------------- ----------- ----------
-Idle                       <환경값>   <환경값>
-Network                       8583        358
-System I/O                   81525         77
+Idle                       2101649    6992023
+System I/O                  461114        695
+Concurrency                 636514        511
 
 -- 원인 파악: 최상위 Idle은 세션이 할 일 없이 쉰 시간이다(SQL*Net message from
 --   client 등). 이를 병목으로 오해하면 네트워크 증설 같은 근거 없는 조치로 이어진다.
@@ -42,65 +44,92 @@ SYS@orcl> SELECT wait_class, total_waits, ROUND(time_waited/100) sec
 
 WAIT_CLASS             TOTAL_WAITS        SEC
 ---------------------- ----------- ----------
-Network                       8583        358
-System I/O                   81525         77
-User I/O                     13860         52
-Other                        19811         27
-Application                    128          7
-Commit                         109          5
-Concurrency                     75          2
-Administrative                 109          1
+System I/O                  461114        695
+Concurrency                 636514        511
+Other                       223420        316
+Application                    644        218
+User I/O                    619579        198
+Configuration                 1953        135
+Commit                        1373          5
+Administrative                 497          0
+Network                     271691          0
+
+9 rows selected.
 
 -- 해석(주의): 이 값들은 인스턴스 기동 이후 '누적'이라 학습자 환경과 반드시 다르다.
---   누적 상위는 Network → System I/O → User I/O 순이지만, 이것을 그대로
---   '이 시스템의 병목은 네트워크다'라고 읽으면 안 된다(다음 [3] 참조).
+--   이 랩의 누적 상위는 System I/O → Concurrency → Other 순이지만(앞 실습들의 리터럴
+--   파싱·시퀀스 경합이 쌓인 결과), 이것을 그대로 '이 시스템의 병목은 System I/O 다'라고
+--   읽으면 안 된다(다음 [3] 참조).
 
 --------------------------------------------------------------------------------
 -- [3] (재확인) 누적 순위와 '구간 델타' 순위는 다를 수 있다.
 --------------------------------------------------------------------------------
 SYS@orcl> -- 특정 부하 구간의 병목을 지목하려면 클래스별로도 델타를 봐야 한다.
-SYS@orcl> -- 부하 직전(T0)과 직후(T1)에 같은 집계를 떠서 그 차이를 본다.
-SYS@orcl> -- (개념 예시. WL_06_mixed.sql이 대기 클래스 델타를 스스로 출력한다.)
-SYS@orcl> SELECT wait_class, ROUND(time_waited/100) sec_now
-  2       FROM v$system_wait_class WHERE wait_class <> 'Idle'
-  3       ORDER BY time_waited DESC FETCH FIRST 3 ROWS ONLY;   -- (T1 예)
+SYS@orcl> -- 부하 직전(T0)에 집계를 실습용 표에 떠 두고, 부하 직후(T1)에 같은 집계와 조인해 차이를 본다.
+SYS@orcl> CREATE TABLE sqlt.wc_t0 AS
+  2       SELECT wait_class, time_waited FROM v$system_wait_class;   -- (T0)
 
-WAIT_CLASS             SEC_NOW
----------------------- ----------
-Network                <환경값>
-System I/O             <환경값>
-User I/O               <환경값>
+Table created.
+
+SYS@orcl> -- 관심 구간: 다른 터미널 4개에서 리터럴 파싱 부하(WL_01_parse.sql, LITERAL 4만 회)를
+SYS@orcl> --   동시에 돌리고 끝날 때까지 기다린다(약 15초). (이 SSD VM 은 I/O 부하로는 대기가
+SYS@orcl> --   거의 안 생기므로, 대기가 분명히 생기는 파싱 경합 부하를 골랐다.)
+-- ▶ 부하: WL_01_parse.sql × 4 DEFINE wl_mode=LITERAL DEFINE wl_loops=40000
+
+SYS@orcl> SELECT n.wait_class, ROUND((n.time_waited - t.time_waited) / 100, 1) delta_sec,
+  2              ROUND(n.time_waited / 100) cum_sec
+  3       FROM   v$system_wait_class n JOIN sqlt.wc_t0 t ON t.wait_class = n.wait_class
+  4       WHERE  n.wait_class <> 'Idle'
+  5       ORDER  BY delta_sec DESC FETCH FIRST 4 ROWS ONLY;                -- (T1 - T0)
+
+WAIT_CLASS              DELTA_SEC    CUM_SEC
+---------------------- ---------- ----------
+Other                        28.3        344
+Concurrency                  14.4        525
+User I/O                       .8        198
+Application                     0        218
 
 -- 재확인 포인트: 구간 델타(= T1 - T0)에서 DB Time 대비 비중이 큰 클래스가
---   그 구간의 병목이다. 누적 1위(Network)가 구간 델타에서는 상위가 아닐 수 있다.
+--   그 구간의 병목이다. 누적 1위(System I/O)가 구간 델타에서는 상위가 아니다 — 이 구간의
+--   병목은 델타 1·2위인 Other(kksfbc child completion = 자식 커서 생성 대기)와 Concurrency
+--   (파싱 경합) 즉 둘 다 '파싱'이고, System I/O 델타는 0 이다.
+SYS@orcl> DROP TABLE sqlt.wc_t0 PURGE;
+
+Table dropped.
 
 --------------------------------------------------------------------------------
 -- [4] (조회) 특정 세션이 기다린 이벤트로 대기의 실체를 확인한다.
 --------------------------------------------------------------------------------
+SYS@orcl> -- 부하 세션은 이미 끝나 V$SESSION_EVENT 에서 사라졌으므로, 인스턴스 누적(V$SYSTEM_EVENT)에서
+SYS@orcl> -- Concurrency 클래스의 이벤트를 본다. 살아 있는 세션이면 V$SESSION_EVENT ... WHERE sid = <SID> 로 본다.
 SYS@orcl> COLUMN event FORMAT A30
+
 SYS@orcl> SELECT event, total_waits, ROUND(time_waited_micro/1000) ms
-  2       FROM  v$session_event
-  3       WHERE sid = <내SID> AND wait_class <> 'Idle'
-  4       ORDER BY time_waited_micro DESC;
+  2       FROM  v$system_event
+  3       WHERE wait_class = 'Concurrency'
+  4       ORDER BY time_waited_micro DESC FETCH FIRST 4 ROWS ONLY;
 
 EVENT                          TOTAL_WAITS         MS
 ------------------------------ ----------- ----------
-db file scattered read                 120         65
-db file sequential read                 12         17
-log file sync                            1          0
-SQL*Net message to client               12          0
+row cache lock                      378975     160043
+cursor: pin S wait on X              95449     139747
+buffer busy waits                   117589     133363
+latch: shared pool                   17634      34527
 
--- 해석: 클래스(User I/O) 아래의 실제 이벤트는 db file scattered read다. 클래스로
---   방향을 좁히고, 이벤트로 실체를 확인한 뒤, 세그먼트·SQL로 원인을 추적한다(13·14장).
+-- 해석: 클래스(Concurrency) 아래의 실제 이벤트는 cursor: pin S wait on X(같은 SQL 을 여러 세션이
+--   동시에 하드 파싱)·latch: shared pool 등이다(row cache lock·buffer busy waits 는 2장 시퀀스
+--   실습의 잔재). 클래스로 방향을 좁히고, 이벤트로 실체를 확인한 뒤, SQL(3장 실습 03 의
+--   리터럴 무리)로 원인을 추적한다.
 
 --------------------------------------------------------------------------------
 -- [정리]
 --------------------------------------------------------------------------------
 -- 1) 대기 클래스 집계는 항상 Idle을 제외한다(SQL*Net message from client는 유휴).
--- 2) 실측 상위(누적): Network 358초 / System I/O 77초 / User I/O 52초 — 누적이라 참고만.
+-- 2) 실측 상위(누적): System I/O / Concurrency / Other — 누적이라 참고만. 구간 델타에서는 Other·Concurrency(파싱)가 상위.
 -- 3) 구간 병목은 누적이 아니라 델타로, DB Time 비중과 함께 지목한다.
 -- 4) 대기는 증상이다. 클래스 → 이벤트 → 세그먼트·SQL로 좁혀 원인을 찾는다.
 -- ※ V$SYSTEM_WAIT_CLASS·V$SESSION_EVENT 조회는 라이선스가 필요 없다.
 
 SYS@orcl> EXIT
+
 ================================================================================

@@ -10,6 +10,7 @@
 $ sqlplus / as sysdba
 
 SYS@orcl> SET LINESIZE 200
+
 SYS@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
@@ -17,29 +18,42 @@ SYS@orcl> SET PAGESIZE 100
 --     DB time = DB CPU + 대기. 하위 항목은 상위의 부분집합이다.
 --------------------------------------------------------------------------------
 SYS@orcl> COLUMN stat_name FORMAT A32
+
 SYS@orcl> SELECT stat_name, value
   2       FROM  v$sys_time_model
   3       WHERE stat_name IN ('DB time','DB CPU','sql execute elapsed time',
   4              'parse time elapsed','hard parse elapsed time')
   5       ORDER BY value DESC;
 
-STAT_NAME                          VALUE
------------------------------- ----------
-DB time                          67698738
-sql execute elapsed time         29344735
-DB CPU                           17487220
-parse time elapsed                3907411
-hard parse elapsed time           3674923
+STAT_NAME                             VALUE
+-------------------------------- ----------
+DB time                          1722662986
+sql execute elapsed time         1585266563
+parse time elapsed                561233636
+DB CPU                            547332467
+hard parse elapsed time           119566573
+
+SYS@orcl> -- 비율은 손으로 나누지 말고 SQL 로 뽑는다.
+SYS@orcl> SELECT ROUND(100 * cpu / dbtime, 1) cpu_pct, ROUND(100 * (dbtime - cpu) / dbtime, 1) wait_pct,
+  2              ROUND(100 * hp / parse, 1) hard_parse_pct, ROUND(dbtime / 1e6) dbtime_sec
+  3       FROM  (SELECT MAX(DECODE(stat_name, 'DB time', value)) dbtime,
+  4                     MAX(DECODE(stat_name, 'DB CPU', value)) cpu,
+  5                     MAX(DECODE(stat_name, 'parse time elapsed', value)) parse,
+  6                     MAX(DECODE(stat_name, 'hard parse elapsed time', value)) hp
+  7              FROM   v$sys_time_model);
+
+   CPU_PCT   WAIT_PCT HARD_PARSE_PCT DBTIME_SEC
+---------- ---------- -------------- ----------
+      31.8       68.2           21.3       1723
 
 -- 해석: 값의 단위는 마이크로초이며, 인스턴스 기동 이후의 누적값이다.
---   DB CPU / DB time = 17,487,220 / 67,698,738 ≈ 0.258 → 누적 기준 약 25.8%가 CPU,
---   나머지 약 74.2%가 대기 및 기타다. 'DB Time = DB CPU + 대기'가 확인된다.
---   hard parse(3,674,923)가 parse time(3,907,411)의 대부분(약 94%)을 차지한다
---   → 이 인스턴스의 파싱 시간은 거의 하드 파싱에서 왔다(2·18장 소재).
+--   DB CPU / DB time 이 CPU_PCT — 이 랩은 누적 기준 약 1/3 이 CPU, 2/3 가 대기·기타다.
+--   'DB Time = DB CPU + 대기'가 확인된다. hard parse 가 parse time 의 일부(HARD_PARSE_PCT)를
+--   차지한다 — 앞 실습들의 리터럴 부하가 남긴 흔적이다(2·18장 소재).
 
 --------------------------------------------------------------------------------
 -- [2] (이상 징후 → 원인 → 조치 → 재확인)
---     이상 징후: DB time이 약 67.7초로 크게 나온다. 신입 DBA가 이 절대값만 보고
+--     이상 징후: DB time 이 1,700초 남짓(DBTIME_SEC)으로 크게 나온다. 신입 DBA가 이 절대값만 보고
 --       "지금 DB가 심각하게 느리다"고 오판할 수 있다.
 --------------------------------------------------------------------------------
 SYS@orcl> -- 원인 파악: 이 값은 기동 이후 누적이다. 기동한 지 오래됐으면 당연히 크다.
@@ -50,32 +64,44 @@ SYS@orcl> SELECT TO_CHAR(startup_time,'YYYY-MM-DD HH24:MI') startup, status
 
 STARTUP          STATUS
 ---------------- ------------
-<환경값>         OPEN
+2026-09-16 15:14 OPEN
 
--- 원인 확정: DB time 67.7초는 기동 이후 누적이라 큰 것이 정상이다.
+-- 원인 확정: DB time 1,700여 초는 하루 넘게 기동된 인스턴스의 누적이라 큰 것이 정상이다.
 --   이 값 하나로는 '지금 느리다/괜찮다'를 말할 수 없다.
 
 SYS@orcl> -- 조치: 절대값이 아니라 '관심 구간의 델타'로 봐야 한다.
 SYS@orcl> -- 짧은 간격(예: 몇 초)을 두고 두 번 조회해 그 사이의 DB time 증가분을 잰다.
 SYS@orcl> COLUMN stat_name FORMAT A20
-SYS@orcl> SELECT stat_name, value FROM v$sys_time_model
-  2       WHERE stat_name IN ('DB time','DB CPU');    -- (T0: 시작값 기록)
 
-STAT_NAME             VALUE
--------------------- ----------
-DB time              67698738
-DB CPU               17487220
+SYS@orcl> COLUMN t0_time NEW_VALUE t0_time
 
-SYS@orcl> -- (이 사이에 관심 작업/부하가 흐른다. 무부하면 델타는 0에 가깝다.)
-SYS@orcl> SELECT stat_name, value FROM v$sys_time_model
-  2       WHERE stat_name IN ('DB time','DB CPU');    -- (T1: 끝값)
+SYS@orcl> COLUMN t0_cpu  NEW_VALUE t0_cpu
 
-STAT_NAME             VALUE
--------------------- ----------
-DB time              <환경값>
-DB CPU               <환경값>
+SYS@orcl> SELECT MAX(DECODE(stat_name, 'DB time', value)) t0_time,
+  2              MAX(DECODE(stat_name, 'DB CPU',  value)) t0_cpu
+  3       FROM   v$sys_time_model;                      -- (T0: 시작값을 치환 변수에 기록)
 
--- 재확인: DB time 델타 = (T1 DB time) - (T0 DB time) = <환경값> 마이크로초.
+   T0_TIME     T0_CPU
+---------- ----------
+1722670058  547340035
+
+SYS@orcl> -- (이 사이에 관심 작업/부하가 흐른다. 여기서는 10초 동안 아무 부하도 주지 않는다.)
+-- ▶ 잠시 대기: 10초
+SYS@orcl> SELECT MAX(DECODE(stat_name, 'DB time', value)) - &t0_time dbtime_delta_us,
+  2              MAX(DECODE(stat_name, 'DB CPU',  value)) - &t0_cpu  dbcpu_delta_us
+  3       FROM   v$sys_time_model;                      -- (T1: 끝값 - 시작값 = 델타)
+
+old   1: SELECT MAX(DECODE(stat_name, 'DB time', value)) - &t0_time dbtime_delta_us,
+new   1: SELECT MAX(DECODE(stat_name, 'DB time', value)) - 1722670058 dbtime_delta_us,
+old   2:             MAX(DECODE(stat_name, 'DB CPU',  value)) - &t0_cpu  dbcpu_delta_us
+new   2:             MAX(DECODE(stat_name, 'DB CPU',  value)) -  547340035  dbcpu_delta_us
+
+DBTIME_DELTA_US DBCPU_DELTA_US
+--------------- --------------
+           4293           4668
+
+-- 재확인: DB time 델타 = (T1 DB time) - (T0 DB time). 무부하 10초 구간이라 델타는
+--   수천 마이크로초(0.00x초)에 그친다 — 누적 1,700여 초와는 비교도 안 된다.
 --   이 델타가 '이 구간에 DB가 쓴 시간'이다. 누적값이 아니라 이 델타로 판단한다.
 --   (정확한 CPU/대기 분해는 짧은 구간에서 불안정하다 → 실습 02·05에서 확인)
 
@@ -90,11 +116,12 @@ DB CPU               <환경값>
 --------------------------------------------------------------------------------
 -- [정리]
 --------------------------------------------------------------------------------
--- 1) DB Time = DB CPU + 대기. 실측 누적에서 CPU 약 25.8% / 대기·기타 약 74.2%.
+-- 1) DB Time = DB CPU + 대기. 실측 누적에서 CPU 약 1/3 / 대기·기타 약 2/3.
 -- 2) 시간 모델 값은 기동 이후 누적(마이크로초)이라 0이 아니고, 절대값으로 판정 불가.
 -- 3) 판단은 반드시 '관심 구간의 델타'로 한다(두 번 조회 후 빼기).
--- 4) 파싱 시간의 대부분이 하드 파싱이었다 — 시간 모델 계층으로 행방을 좁힌다.
+-- 4) 파싱 시간 중 하드 파싱 몫을 시간 모델 계층으로 좁혀 읽는다.
 -- ※ 참고: 시간 모델 조회는 관리 팩 라이선스가 필요 없다(6장 AWR부터 🔒 Diagnostics Pack).
 
 SYS@orcl> EXIT
+
 ================================================================================
