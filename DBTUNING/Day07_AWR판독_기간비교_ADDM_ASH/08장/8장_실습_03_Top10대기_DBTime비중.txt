@@ -4,88 +4,105 @@
        'DB CPU가 1위'의 의미를 이해하고, log file sync를 주범으로 오판하는
        상황을 재현·교정한다. 작은 Concurrency 대기들을 하드파싱 경합으로 묶는다.
  환경: non-CDB=orcl 19.3 (SYS AS SYSDBA)
- 부하: WL_06_mixed.sql (7세션). 보고서 awrrpt_1_295_296.txt 사용.
+ 부하: WL_06_mixed.sql (7세션). 보고서 awrrpt_1_479_480.txt 사용.
  라이선스: 🔒 Diagnostics Pack. 미보유 시 V$SYSTEM_EVENT/V$SYSTEM_WAIT_CLASS 델타(하단).
 ================================================================================
 
 $ sqlplus / as sysdba
 
 SYS@orcl> SET LINESIZE 200
+
 SYS@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
--- [1] (조치 전 상태) 보고서의 Top 10 Foreground Events를 발췌한다.
+-- [1] (조치 전 상태) 보고서의 Top 10 Foreground Events 를 발췌한다.
 --------------------------------------------------------------------------------
-SYS@orcl> HOST sed -n '95,108p' awrrpt_1_295_296.txt
+SYS@orcl> HOST awk '/^Top 10 Foreground Events/,/^Wait Classes by Total Wait Time/' awrrpt_1_479_480.txt
 
 Top 10 Foreground Events by Total Wait Time
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
                                            Total Wait       Avg   % DB Wait
 Event                                Waits Time (sec)      Wait   time Class
 ------------------------------ ----------- ---------- --------- ------ --------
-DB CPU                                            549             95.7
-log file sync                       21,405       21.1     .99ms    3.7 Commit
-kksfbc child completion                130        6.4   49.58ms    1.1 Other
-db file sequential read              1,681        3.2    1.93ms     .6 User I/O
-cursor: pin S wait on X                609         .9    1.40ms     .1 Concurre
-library cache: mutex X                 180         .4    2.33ms     .1 Concurre
-latch: shared pool                   3,506         .3   91.94us     .1 Concurre
-SQL*Net message to client          125,937         .3    2.26us     .0 Network
+DB CPU                                           30.4             62.2
+kksfbc child completion                231       11.2   48.62ms   23.0 Other
+cursor: pin S wait on X              3,378        4.9    1.45ms   10.0 Concurre
+library cache: mutex X                 212         .8    3.80ms    1.6 Concurre
+library cache lock                     272         .3    1.17ms     .6 Concurre
+db file sequential read                 66         .2    2.73ms     .4 User I/O
+buffer busy waits                    2,105         .1   68.86us     .3 Concurre
+latch: shared pool                   1,707         .1   82.84us     .3 Concurre
+cursor: pin S                           59         .1    1.38ms     .2 Concurre
+library cache load lock                414         .1  191.55us     .2 Concurre
+
+Wait Classes by Total Wait Time
 
 --------------------------------------------------------------------------------
--- [2] (해석 1) 맨 윗줄부터 읽는다 — DB CPU 95.7%.
+-- [2] (해석 1) 맨 윗줄부터 읽는다 — DB CPU 62.2%.
 --------------------------------------------------------------------------------
--- DB CPU는 대기가 아니라 '실제로 쓴 CPU 시간'이다. % DB time 95.7%는 전체
---   DB Time의 대부분이 CPU라는 뜻 → 이 구간의 병목은 어떤 대기도 아닌 CPU다.
--- 실습 02의 Load Profile(DB CPU≈DB Time)이 여기서 확증된다.
+-- DB CPU 는 대기가 아니라 '실제로 쓴 CPU 시간'이다. % DB time 62.2% 는 전체
+--   DB Time 의 6할이 CPU 라는 뜻이고, 나머지 4할 가까이가 대기다.
+-- 실습 02 의 Load Profile(DB CPU 0.4/s vs DB Time 0.7/s)이 여기서 확증된다.
 
 --------------------------------------------------------------------------------
 -- [3] (해석 2) 작은 대기들을 '방향'으로 묶는다.
 --------------------------------------------------------------------------------
--- kksfbc child completion(1.1%) + cursor: pin S wait on X(.1%)
---   + library cache: mutex X(.1%) + latch: shared pool(.1%)
---   → 모두 공유 풀/라이브러리 캐시 커서 경합이다. 각각은 작지만 한 방향을
---     가리킨다: 초당 319번의 하드 파싱(실습 02)이 만든 경합이다.
--- Avg Wait도 본다: kksfbc는 49.58ms(드물지만 길다), log file sync는 0.99ms
---   (짧지만 21,405회로 잦다). 총시간=횟수×평균 → 처방이 다르다.
+-- kksfbc child completion(23.0%) + cursor: pin S wait on X(10.0%) + library cache: mutex X(1.6%)
+--   + library cache lock(.6%) + latch: shared pool(.3%) + cursor: pin S(.2%) + library cache load lock(.2%)
+--   → 클래스는 Other 와 Concurrency 로 갈리지만 전부 '커서를 만들고 잡는' 공유 풀/라이브러리 캐시
+--     경합이다. 합치면 약 36% — 초당 355번의 하드 파싱(실습 02)이 만든 경합이 한 방향을 가리킨다.
+--     (kksfbc child completion = 다른 세션이 같은 SQL 의 자식 커서를 다 만들 때까지 기다리는 대기.)
+-- Avg Wait 도 본다: kksfbc 는 48.62ms(드물지만 길다 — 231회), cursor: pin S wait on X 는 1.45ms
+--   (짧지만 3,378회로 잦다). 총시간 = 횟수 × 평균 → 처방이 다르다.
 
 --------------------------------------------------------------------------------
 -- [4] (조회) 대기 클래스별 집계로 '경합(Concurrency)'의 크기를 확인한다.
 --------------------------------------------------------------------------------
-SYS@orcl> SELECT wait_class, ROUND(SUM(time_waited_micro)/1e6,1) sec
-  2       FROM  v$system_event e JOIN v$event_name n USING (event)
-  3       WHERE wait_class IN ('Concurrency','Commit','User I/O')
-  4       GROUP BY wait_class ORDER BY sec DESC;
+SYS@orcl> HOST awk '/^Wait Classes by Total Wait Time/,/^Host CPU/' awrrpt_1_479_480.txt
 
-WAIT_CLASS               SEC
--------------------- --------
-Commit               <환경값>
-Concurrency          <환경값>
-User I/O             <환경값>
+Wait Classes by Total Wait Time
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                                                          Avg             Avg
+                                        Total Wait       Wait   % DB   Active
+Wait Class                  Waits       Time (sec)       Time   time Sessions
+---------------- ---------------- ---------------- ---------- ------ --------
+DB CPU                                          30              62.2      0.4
+Other                       3,336               13     3.77ms   25.8      0.2
+Concurrency                 8,178                7   803.07us   13.4      0.1
+System I/O                  2,845                2   642.31us    3.7      0.0
+User I/O                      227                0     1.32ms     .6      0.0
+Application                    96                0   675.04us     .1      0.0
+Configuration                   6                0     1.98ms     .0      0.0
+Commit                         11                0   569.91us     .0      0.0
+Network                       463                0   524.84ns     .0      0.0
+Administrative                 24                0     2.92us     .0      0.0
 
--- 해석: V$SYSTEM_EVENT는 누적값이라 절대값은 <환경값>이다. 중요한 것은
---   보고서의 % DB time 구조다 — Concurrency 대기들의 합조차 log file sync보다
---   작지만, 그 원인(하드파싱)은 DB CPU를 끌어올린 리터럴 SQL과 같은 뿌리다.
+Host CPU
+
+-- 해석: 클래스로 묶으면 Other 25.8% + Concurrency 13.4% ≈ 39% 가 대기의 거의 전부다.
+--   User I/O 는 .6% — 디스크는 이 구간의 문제가 아니다(실습 02 의 물리 읽기 2.6/s 와 일치).
+--   V$SYSTEM_EVENT 로 같은 것을 보려면 누적값이라 구간 델타를 떠야 한다(5장 실습 06).
 
 --------------------------------------------------------------------------------
 -- [5] (이상 징후 → 원인 → 조치 → 재확인)
---     이상 징후: 동료가 "log file sync가 21.1초로 두 번째이니 커밋/리두를
---       먼저 튜닝하자"고 주장한다.
+--     이상 징후: 동료가 "kksfbc child completion 의 평균 대기 48ms 가 제일 기니까
+--       이 이벤트 자체를 튜닝하자(숨은 파라미터 검색)"고 주장한다.
 --------------------------------------------------------------------------------
--- 원인 파악: Total Wait Time(sec)의 절대값에 현혹된 오판이다. 판정은
---   % DB time으로 해야 한다.
-SYS@orcl> SELECT 3.7 AS lfs_pct_dbtime, 95.7 AS dbcpu_pct_dbtime,
-  2         ROUND(95.7/3.7,1) AS ratio FROM dual;
+-- 원인 파악: 이벤트 이름을 '증상'이 아니라 '원인'으로 착각한 오판이다. 판정은
+--   % DB time 과 원인의 뿌리로 해야 한다.
+SYS@orcl> SELECT 23.0 + 10.0 + 1.6 + .6 + .3 + .2 + .2 AS parse_waits_pct, 62.2 AS dbcpu_pct FROM dual;
 
-LFS_PCT_DBTIME DBCPU_PCT_DBTIME  RATIO
--------------- ---------------- ------
-           3.7             95.7   25.9
+PARSE_WAITS_PCT  DBCPU_PCT
+--------------- ----------
+           35.9       62.2
 
--- 원인 확정: log file sync는 % DB time 3.7%뿐이고 DB CPU는 95.7%로 약 26배다.
---   log file sync를 완전히 없애도 전체 DB Time의 3.7%만 줄어 응답시간은 거의
---   그대로다. 커밋/리두 튜닝은 이 구간의 주범이 아니다.
--- 조치: 우선순위를 CPU로 되돌린다 → 실습 04에서 CPU를 쓰는 상위 SQL을 찾는다.
---   log file sync는 필요하면 커밋 빈도 조정으로 부차적으로 다룬다(14장).
--- 재확인: DB CPU 95.7% >> log file sync 3.7% → 병목은 CPU. 판정 교정 완료.
+-- 원인 확정: 파싱 계열 대기 35.9% 는 이벤트 하나가 아니라 '초당 355번 하드 파싱'이라는
+--   한 원인의 여러 얼굴이다. 그 하드 파싱은 DB CPU 62.2% 의 상당 부분도 태운다
+--   (Instance Efficiency 의 % Non-Parse CPU 67.5% = CPU 의 1/3 이 파싱).
+-- 조치: 이벤트를 쫓지 말고 원인을 없앤다 → 실습 04에서 리터럴로 파싱을 부르는 상위
+--   SQL 을 찾아 바인드 변수화(또는 CURSOR_SHARING)로 하드 파싱을 줄인다.
+-- 재확인: 조치 후 같은 부하로 보고서를 다시 떠 kksfbc·cursor: pin S wait on X 와
+--   Hard parses (SQL)/s 가 함께 줄어야 한다. 둘 중 하나만 줄면 원인이 틀린 것이다.
 
 --------------------------------------------------------------------------------
 -- [대안 경로] 🔒 미보유 — V$로 Top Events를 델타로 만든다.
@@ -94,17 +111,18 @@ LFS_PCT_DBTIME DBCPU_PCT_DBTIME  RATIO
 --   SELECT event, total_waits, time_waited_micro, wait_class
 --     FROM v$system_event ORDER BY time_waited_micro DESC;
 -- DB CPU 상당량은 V$SYS_TIME_MODEL의 'DB CPU' 델타로 확인한다. 이렇게
--- 만든 목록을 보고서 Top Events와 동일하게 % 기준으로 판독한다.
+-- 만든 목록을 보고서 Top Events와 동일하게 % 기준으로 판독한다(5장 실습 06 의 표 세 개).
 
 --------------------------------------------------------------------------------
 -- [정리]
 --------------------------------------------------------------------------------
--- 1) Top Events는 % DB time으로 읽는다. 절대 Total 시간이 아니다.
--- 2) DB CPU 95.7% = 병목은 대기가 아니라 CPU.
--- 3) 작은 Concurrency 대기(kksfbc/cursor pin S/mutex/latch)는 하드파싱 경합으로
+-- 1) Top Events 는 % DB time 으로 읽는다. 절대 Total 시간이나 평균 대기가 아니다.
+-- 2) DB CPU 62.2% + 파싱 계열 대기 36% = 이 구간은 'CPU + 공유 풀 경합' 구간.
+-- 3) 작은 대기(kksfbc/cursor pin S/mutex/latch/library cache)는 하드 파싱 경합으로
 --    묶어 하나의 원인으로 수렴시킨다.
--- 4) log file sync 3.7%를 주범으로 지목하면 오판 → CPU 우선.
--- 5) 라이선스 없으면 V$SYSTEM_EVENT 델타 + V$SYS_TIME_MODEL로 동일 판독.
+-- 4) 이벤트 이름을 원인으로 착각해 이벤트 자체를 튜닝하려 하면 오판 → 원인(하드 파싱) 우선.
+-- 5) 라이선스 없으면 V$SYSTEM_EVENT 델타 + V$SYS_TIME_MODEL 로 동일 판독.
 
 SYS@orcl> EXIT
+
 ================================================================================

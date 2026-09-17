@@ -4,103 +4,112 @@
        Stats의 원시 통계로 확증/반증한다. 눈에 띄는 통계 하나로 근거 없는 새
        가설을 세우는 오판을 재현·교정한다.
  환경: non-CDB=orcl 19.3 (SYS AS SYSDBA)
- 부하: WL_06_mixed.sql (7세션). 보고서 awrrpt_1_295_296.txt 사용.
+ 부하: WL_06_mixed.sql (7세션). 보고서 awrrpt_1_479_480.txt 사용.
  라이선스: 🔒 Diagnostics Pack. 미보유 시 V$SYSSTAT 델타로 대체(하단).
 ================================================================================
 
 $ sqlplus / as sysdba
 
 SYS@orcl> SET LINESIZE 200
+
 SYS@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
 -- [1] (조치 전 상태) 확증할 가설을 먼저 적어둔다.
 --------------------------------------------------------------------------------
--- 가설(실습 02~04): ① 리터럴 하드파싱(319/s) ② 대량 논리읽기(118만/s)
---   ③ 인덱스 못 타는 대량 스캔 가능성 ④ 커서 재사용 실패(Library Hit 59%).
--- Instance Activity Stats에서 이 네 가지를 뒷받침하는 통계만 골라 본다.
+-- 가설(실습 02~04): ① 리터럴 하드파싱(355/s) ② 논리읽기 4만/s 는 '전체 스캔 + 대량 반복 단건 조회'
+--   ③ 디스크는 한가하다(물리 읽기 2.6/s) ④ 커서 재사용 실패(Library Hit 87%, Soft Parse 74%).
+-- Instance Activity Stats 에서 이 네 가지를 뒷받침하는 통계만 골라 본다.
 
 --------------------------------------------------------------------------------
--- [2] (조회) 보고서의 Instance Activity Stats에서 관련 통계만 발췌.
+-- [2] (조회) 보고서의 Instance Activity Stats 에서 관련 통계만 발췌.
+--     (같은 통계가 요약 절과 상세 절에 두 번 나오므로 sort -u 로 한 번씩만 본다)
 --------------------------------------------------------------------------------
-SYS@orcl> HOST grep -E "parse count \(hard\)|parse count \(total\)|session logical reads|table scans \(long tables\)|table scan blocks gotten|session cursor cache hits" awrrpt_1_295_296.txt
+SYS@orcl> HOST grep -E "^(parse count \(hard\)|parse count \(total\)|session logical reads|table scans \(long tables\)|table scans \(short tables\)|table scan blocks gotten|index fetch by key|table fetch by rowid|execute count|session cursor cache hits) " awrrpt_1_479_480.txt | sort -u
 
-Statistic                                     Total     per Second   per Trans
------------------------------------- -------------- -------------- -----------
-parse count (hard)                           31,900         319.0        1.5
-parse count (total)                          43,370         433.7        2.1
-session logical reads                   118,510,700   1,185,107.0    5,735.2
-table scans (long tables)                     11,824         118.2        0.6
-table scan blocks gotten                109,830,441   1,098,304.4    5,314.0
-session cursor cache hits                     28,140         281.4        1.4
+execute count                               432,029        5,903.6           4.5
+index fetch by key                          424,856        5,805.6           4.4
+parse count (hard)                           26,013          355.5           0.3
+parse count (total)                         101,069        1,381.1           1.1
+session cursor cache hits                   429,550        5,869.7           4.5
+session logical reads                     2,994,890       40,924.4          31.0
+table fetch by rowid                        144,330        1,972.2           1.5
+table scan blocks gotten                  1,253,915       17,134.4          13.0
+table scans (long tables)                         0            0.0           0.0
+table scans (short tables)                    1,097           15.0           0.0
 
 --------------------------------------------------------------------------------
 -- [3] (해석) 각 통계가 어느 가설을 확증하는가?
 --------------------------------------------------------------------------------
--- parse count (hard) 31,900 = 319/s×100초 → 가설 ① 하드파싱 확증.
--- session logical reads 1억1,851만 → SQL Gets 섹션 Total 1억2,283만과 자릿수
---   일치 → 가설 ② 논리읽기 확증.
--- table scan blocks gotten 1억983만 → 논리읽기 총량의 대부분이 '대량 스캔'에서
---   나왔다 → 가설 ③ 인덱스 못 타는 스캔 확증.
-SYS@orcl> SELECT ROUND(109830441/118510700*100,1) AS scan_share_pct FROM dual;
+-- parse count (hard) 26,013 = 355/s × 73초 → 가설 ① 하드파싱 확증(전체 파싱 101,069 의 25.7%).
+-- session logical reads 2,994,890 → SQL Gets 섹션 Total 2,994,890 과 정확히 같다 → 가설 ② 논리읽기 확증.
+-- table scan blocks gotten 1,253,915 → 논리읽기의 42% 가 '테이블 스캔'에서 나왔고,
+--   index fetch by key 424,856 + table fetch by rowid 144,330 → 나머지는 인덱스 단건 조회다.
+SYS@orcl> SELECT ROUND(1253915/2994890*100,1) AS scan_share_pct, ROUND(424856/432029*100,1) AS keyfetch_per_exec_pct FROM dual;
 
-SCAN_SHARE_PCT
---------------
-          92.7
+SCAN_SHARE_PCT KEYFETCH_PER_EXEC_PCT
+-------------- ---------------------
+          41.9                  98.3
 
--- 해석: 논리읽기의 92.7%가 테이블 스캔에서 발생 → 대량 스캔이 논리읽기 주범.
--- session cursor cache hits 281/s는 파싱 대비 낮은 편 → 가설 ④(커서 재사용
---   실패)와 방향이 맞는다(Library Hit 59%, 실습 06/Instance Efficiency와 교차).
+-- 해석: 논리읽기의 41.9% 가 테이블 스캔(long 0·short 1,097 — 이 표들은 '작은 표' 분류)에서,
+--   나머지는 실행 43만 회 중 98% 가 인덱스 키 조회인 단건 SQL 에서 나왔다 → 가설 ②의 두 얼굴 확증.
+-- session cursor cache hits 5,870/s 는 실행 5,904/s 와 거의 같다 → 바인드 SQL 은 세션 커서 캐시로
+--   잘 재사용되고 있고, 하드 파싱 355/s 는 전부 리터럴 SQL 몫이다 → 가설 ④의 실체는
+--   '리터럴'이지 커서 캐시 부족이 아니다(Library Hit 87% 도 리터럴 때문).
 
 --------------------------------------------------------------------------------
--- [4] (조회) 반증 통계도 찾아본다 — CPU 바운드 가설이 틀리지 않았나?
+-- [4] (조회) 반증 통계도 찾아본다 — 디스크가 한가하다는 가설 ③이 틀리지 않았나?
 --------------------------------------------------------------------------------
-SYS@orcl> HOST grep -E "physical reads direct|sorts \(disk\)|sorts \(memory\)" awrrpt_1_295_296.txt
+SYS@orcl> HOST grep -E "^(physical reads |physical reads direct |sorts \(disk\)|sorts \(memory\)) " awrrpt_1_479_480.txt | sort -u
 
-physical reads direct                            120           1.2        0.0
-sorts (disk)                                       0           0.0        0.0
-sorts (memory)                                12,540         125.4        0.6
+physical reads                                  190            2.6           0.0
+physical reads direct                            12            0.2           0.0
+sorts (disk)                                      0            0.0           0.0
+sorts (memory)                                4,222           57.7           0.0
 
--- 해석: physical reads direct 1.2/s, sorts(disk) 0 → 디스크 직접 읽기·디스크
---   정렬이 사실상 없다. CPU 바운드 가설을 반증할 통계가 없다 → 가설 유지.
---   (sorts는 전부 메모리에서 처리됨 = In-memory Sort 100%와 일치)
+-- 해석: physical reads 190블록(2.6/s), direct 12, sorts(disk) 0 → 디스크 읽기·디스크 정렬이
+--   사실상 없다. 가설 ③을 반증할 통계가 없다 → 가설 유지.
+--   (정렬은 전부 메모리에서 처리됨 = Instance Efficiency 의 In-memory Sort 100% 와 일치)
 
 --------------------------------------------------------------------------------
 -- [5] (이상 징후 → 원인 → 조치 → 재확인)
---     이상 징후: 동료가 Instance Activity에서 'redo size'가 크다며 "리두가
+--     이상 징후: 동료가 Instance Activity 에서 'redo size' 가 7,700만 바이트라며 "리두가
 --       진짜 병목"이라는 새 가설을 세웠다.
 --------------------------------------------------------------------------------
 -- 원인 파악: 이 섹션은 수백 개 통계라 뭐든 커 보인다. 절대값이 아니라 앞
 --   가설·DB Time 비중과 연결해서 봐야 한다.
-SYS@orcl> HOST grep -E "^redo size " awrrpt_1_295_296.txt
+SYS@orcl> HOST grep -E "^(redo size |user commits ) " awrrpt_1_479_480.txt | sort -u
 
-redo size                                14,001,700       140,017.0      677.6
+redo size                                77,738,456    1,062,276.5         805.5
+user commits                                 96,510        1,318.8           1.0
 
--- 원인 확정: redo size 140,017/s는 존재하지만, 이것이 만든 대기(log file sync)는
---   실습 03에서 % DB time 3.7%로 확인됐다. DB CPU 95.7% 앞에서 리두는 주범이
---   아니다. Instance Activity의 큰 절대값만으로 새 가설을 세운 것이 오판이다.
+-- 원인 확정: redo size 1MB/s 는 초당 1,319건 커밋(트랜잭션당 805바이트)의 자연스러운 결과다.
+--   이것이 만든 대기(log file sync·Commit 클래스)는 실습 03 의 Top 10 에 들지도 못했고
+--   Wait Classes 에서 Commit 은 .0% 다. DB CPU 62% 와 파싱 경합 36% 앞에서 리두는 주범이
+--   아니다. Instance Activity 의 큰 절대값만으로 새 가설을 세운 것이 오판이다.
 -- 조치: 이 섹션에서는 새 이론을 세우지 않는다. 앞 섹션의 가설을 확증/반증하는
 --   용도로만 쓴다. 리두는 부차적 관찰로 남긴다.
--- 재확인: redo가 만든 대기(log file sync)의 % DB time=3.7% → 병목 아님 확인.
+-- 재확인: 리두가 만든 대기(Commit 클래스)의 % DB time = .0% → 병목 아님 확인.
 
 --------------------------------------------------------------------------------
 -- [대안 경로] 🔒 미보유 — V$SYSSTAT 델타로 같은 통계를 만든다.
 --------------------------------------------------------------------------------
--- 부하 전/후로 두 번 찍어 (후-전)을 계산한다.
+-- 부하 전/후로 두 번 찍어 (후-전)을 계산한다(5장 실습 06 의 st_t0 표 방식).
 --   SELECT name, value FROM v$sysstat
 --    WHERE name IN ('parse count (hard)','session logical reads',
 --                   'table scan blocks gotten','sorts (disk)','redo size');
--- AWR Instance Activity Stats와 동일한 원시 통계를 얻어 확증/반증에 쓴다.
+-- AWR Instance Activity Stats 와 동일한 원시 통계를 얻어 확증/반증에 쓴다.
 
 --------------------------------------------------------------------------------
 -- [정리]
 --------------------------------------------------------------------------------
--- 1) Instance Activity Stats는 앞 가설의 확증/반증용. 새 이론을 함부로 세우지 않음.
--- 2) parse count(hard) 31,900 / logical reads 1.18억 → 하드파싱·논리읽기 확증.
--- 3) table scan blocks gotten이 논리읽기의 92.7% → 대량 스캔이 주범.
--- 4) 확증만이 아니라 반증(sorts disk 0, physical direct 미미)도 확인 → 확증편향 경계.
--- 5) redo size 큰 값만 보고 '리두 병목'이라 하면 오판 → % DB time으로 검증.
+-- 1) Instance Activity Stats 는 앞 가설의 확증/반증용. 새 이론을 함부로 세우지 않음.
+-- 2) parse count(hard) 26,013 / logical reads 299만 → 하드파싱·논리읽기 확증.
+-- 3) table scan blocks gotten 이 논리읽기의 42%, 나머지는 실행 43만 회의 인덱스 단건 조회.
+-- 4) 확증만이 아니라 반증(sorts disk 0, physical reads 190)도 확인 → 확증편향 경계.
+-- 5) redo size 큰 값만 보고 '리두 병목'이라 하면 오판 → % DB time 으로 검증.
 -- 6) 라이선스 없으면 V$SYSSTAT 델타로 동일 통계 확보.
 
 SYS@orcl> EXIT
+
 ================================================================================
