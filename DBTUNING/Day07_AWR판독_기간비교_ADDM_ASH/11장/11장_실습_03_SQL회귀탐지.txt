@@ -4,92 +4,176 @@
        으로 두 구간의 실행당 지표와 plan_hash_value 를 비교해, 실행 횟수는 비슷한데
        실행당 시간이 급증하고 계획이 바뀐 SQL 을 회귀로 확정한다.
  환경: non-CDB=orcl 19.3 (SQLT 업무 계정으로 조회, SELECT_CATALOG_ROLE 보유)
- 부하: WL_06_mixed.sql 로 구간A(303→304)/구간B(305→306) 생성. 구간B 직전 대상
+ 부하: WL_06_mixed.sql 로 구간A(497→498)/구간B(499→500) 생성. 구간B 직전 대상
        테이블 통계가 갱신되며 특정 조회 SQL 의 계획이 인덱스→전체 스캔으로 바뀌었다.
  주의: 개인 실습 환경 전용. 🔒 DBA_HIST_SQLSTAT 은 Diagnostics Pack 필요.
 ================================================================================
 
-$ sqlplus sqlt/<환경값>@orcl
+-- (터미널 A) 진단
+$ sqlplus / as sysdba
 
-SQLT@orcl> SET LINESIZE 200
-SQLT@orcl> SET PAGESIZE 100
+SYS@orcl> SET LINESIZE 200
+
+SYS@orcl> SET PAGESIZE 100
 
 --------------------------------------------------------------------------------
--- [1] (조치 전 상태) 보고서 SQL Statistics(실행시간 기준)에서 후보를 좁힌다.
---     "한 구간에서만 DB Time 을 크게 쓴 SQL" 이 회귀 후보다.
+-- [1] (조치 전 상태) DBA_HIST_SQLSTAT(구간별 SQL 통계)에서 후보를 좁힌다.
+--     "한 구간에서만 실행당 시간이 크게 는 SQL" 이 회귀 후보다. 보고서의 SQL Statistics
+--     절도 같은 뷰에서 나오지만, 정렬 기준을 마음대로 두려면 뷰를 직접 읽는 편이 낫다.
 --------------------------------------------------------------------------------
-SQLT@orcl> SELECT sql_id,
-  2         SUM(CASE WHEN snap_id=304 THEN elapsed_time_delta ELSE 0 END) a_ela,
-  3         SUM(CASE WHEN snap_id=306 THEN elapsed_time_delta ELSE 0 END) b_ela
-  4       FROM  dba_hist_sqlstat
-  5       WHERE snap_id IN (304,306)
-  6         AND parsing_schema_name='SQLT'
-  7       GROUP BY sql_id
-  8       ORDER BY b_ela - a_ela DESC FETCH FIRST 5 ROWS ONLY;
+SYS@orcl> SELECT sql_id,
+  2         SUM(CASE WHEN snap_id=498 THEN executions_delta   ELSE 0 END) a_execs,
+  3         SUM(CASE WHEN snap_id=500 THEN executions_delta   ELSE 0 END) b_execs,
+  4         ROUND(SUM(CASE WHEN snap_id=498 THEN elapsed_time_delta ELSE 0 END)
+  5               / NULLIF(SUM(CASE WHEN snap_id=498 THEN executions_delta ELSE 0 END),0) / 1000, 2) a_ms_exec,
+  6         ROUND(SUM(CASE WHEN snap_id=500 THEN elapsed_time_delta ELSE 0 END)
+  7               / NULLIF(SUM(CASE WHEN snap_id=500 THEN executions_delta ELSE 0 END),0) / 1000, 2) b_ms_exec
+  8       FROM  dba_hist_sqlstat
+  9       WHERE snap_id IN (498,500) AND parsing_schema_name='SQLT'
+ 10       GROUP BY sql_id
+ 11       HAVING SUM(CASE WHEN snap_id=498 THEN executions_delta ELSE 0 END) >= 100
+ 12          AND SUM(CASE WHEN snap_id=500 THEN executions_delta ELSE 0 END) >= 100
+ 13       ORDER BY b_ms_exec / NULLIF(a_ms_exec, 0) DESC NULLS LAST FETCH FIRST 5 ROWS ONLY;
 
-SQL_ID              A_ELA        B_ELA
-------------- ----------- ------------
-9xk2p1m4qz7ab   3,100,000   58,400,000   <= 후보 : 구간B에서 급증
-3j9gw8s0v82pc  12,000,000   14,600,000
-...
+SQL_ID           A_EXECS    B_EXECS  A_MS_EXEC  B_MS_EXEC
+------------- ---------- ---------- ---------- ----------
+0w1g9nknbnvs3        300        300        .09       8.61
+7tqyv4v46gfv8       7992      55883        .01        .01
+3gy9h99h9d54n      23988     167454          0        .01
 
--- 해석: 9xk2p1m4qz7ab 가 구간B에서 경과시간이 폭증했다. 회귀 후보로 지목한다.
+-- 해석: 두 구간 모두 300회씩 실행된 SQL 하나가 실행당 0.09ms → 8.6ms 로 폭증했다.
+--   (다른 SQL 들은 실행 횟수가 몇 배 늘었을 뿐 실행당 시간은 비슷하다 = 부하 증가.)
+--   회귀 후보로 지목한다.
 
 --------------------------------------------------------------------------------
 -- [2] (조회) 후보 SQL 을 DBA_HIST_SQLSTAT 으로 두 구간 상세 비교한다.
 --     실행 횟수 · 실행당 경과시간 · 실행당 버퍼읽기 · plan_hash_value.
 --------------------------------------------------------------------------------
-SQLT@orcl> SELECT snap_id, plan_hash_value,
+SYS@orcl> COLUMN sql_id NEW_VALUE biz_id
+
+SYS@orcl> SELECT sql_id FROM dba_hist_sqltext WHERE sql_text LIKE 'SELECT /*+ BIZ_HOSP%';
+
+SQL_ID
+-------------
+0w1g9nknbnvs3
+
+SYS@orcl> SET VERIFY OFF
+
+SYS@orcl> SELECT snap_id, plan_hash_value,
   2         executions_delta execs,
   3         ROUND(elapsed_time_delta/NULLIF(executions_delta,0)/1000,2) ms_exec,
   4         ROUND(buffer_gets_delta/NULLIF(executions_delta,0))          gets_exec
   5       FROM  dba_hist_sqlstat
-  6       WHERE sql_id='9xk2p1m4qz7ab'
-  7         AND snap_id IN (304,306)
+  6       WHERE sql_id='&biz_id'
+  7         AND snap_id IN (498,500)
   8       ORDER BY snap_id;
 
-   SNAP_ID PLAN_HASH_VALUE      EXECS    MS_EXEC   GETS_EXEC
----------- --------------- ---------- ---------- -----------
-       304      1388734953        500      12.40        1850
-       306       983734112        520     112.31       42800
+   SNAP_ID PLAN_HASH_VALUE      EXECS    MS_EXEC  GETS_EXEC
+---------- --------------- ---------- ---------- ----------
+       498      2441390803        300        .09        158
+       500      2119550289        300       8.61       3091
+
+SYS@orcl> -- 두 계획의 실체를 AWR 계획 이력에서 본다.
+SYS@orcl> SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY_AWR('&biz_id', NULL, NULL, 'BASIC'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID 0w1g9nknbnvs3
+--------------------
+SELECT /*+ BIZ_HOSP */ COUNT(*), SUM(TOTAL_AMT) FROM MEDICAL_CLAIMS
+WHERE HOSP_ID = 100 + MOD(:B1 , 300)
+
+Plan hash value: 2119550289
+
+---------------------------------------------
+| Id  | Operation          | Name           |
+---------------------------------------------
+|   0 | SELECT STATEMENT   |                |
+|   1 |  SORT AGGREGATE    |                |
+|   2 |   TABLE ACCESS FULL| MEDICAL_CLAIMS |
+---------------------------------------------
+
+SQL_ID 0w1g9nknbnvs3
+--------------------
+SELECT /*+ BIZ_HOSP */ COUNT(*), SUM(TOTAL_AMT) FROM MEDICAL_CLAIMS
+WHERE HOSP_ID = 100 + MOD(:B1 , 300)
+
+Plan hash value: 2441390803
+
+---------------------------------------------------------------
+| Id  | Operation                            | Name           |
+---------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                |
+|   1 |  SORT AGGREGATE                      |                |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| MEDICAL_CLAIMS |
+|   3 |    INDEX RANGE SCAN                  | IX_MC_HOSP     |
+---------------------------------------------------------------
+
+31 rows selected.
 
 --------------------------------------------------------------------------------
 -- [3] (해석) 회귀 확정 — 최소 조건 세 가지가 모두 성립하는가.
 --------------------------------------------------------------------------------
--- (a) 같은 SQL_ID : 9xk2p1m4qz7ab  → 같은 문장, 비교 성립.
--- (b) 실행 횟수 유사 : 500 → 520  → '더 자주 불린 것'이 아니다.
--- (c) 실행당 악화 + 계획 변경 : 12.40ms → 112.31ms(약 9배),
---       버퍼읽기 1,850 → 42,800, plan_hash_value 1388734953 → 983734112.
+-- (a) 같은 SQL_ID  → 같은 문장, 비교 성립.
+-- (b) 실행 횟수 동일 : 300 → 300  → '더 자주 불린 것'이 아니다.
+-- (c) 실행당 악화 + 계획 변경 : 0.09ms → 8.61ms(약 95배),
+--       버퍼읽기 158 → 3,091(약 20배), plan_hash_value 2441390803(인덱스) → 2119550289(전체 스캔).
 -- 판정: 인덱스 계획이 전체 스캔 계획으로 바뀌며 느려진 '전형적 회귀'다.
---   집계(실습 05: DB time 81.8초→302.0초는 부하 증가로 판정)여도 이 SQL 은
+--   집계(실습 05: DB time 이 몇 배가 됐어도 트랜잭션당은 그대로 → 부하 증가)여도 이 SQL 은
 --   명백한 성능 저하다 — 집계 판정과 SQL 단위 판정은 층위가 다르다.
 
 --------------------------------------------------------------------------------
 -- [4] (이상 징후 → 원인 → 조치 → 재확인)
 --     이상 징후: "왜 계획이 바뀌었나?" 를 확인하지 않고 힌트부터 박으려 한다.
 --------------------------------------------------------------------------------
-SQLT@orcl> -- 원인 파악: 구간B 직전 대상 테이블의 통계가 갱신되며 카디널리티
-SQLT@orcl> --   추정이 달라져 옵티마이저가 전체 스캔을 골랐다(통계 변화형 회귀).
-SQLT@orcl> SELECT table_name, TO_CHAR(last_analyzed,'MM-DD HH24:MI') la, num_rows
-  2       FROM  user_tables WHERE table_name IN ('MEDICAL_CLAIMS','CLAIM_DETAILS');
-TABLE_NAME       LA            NUM_ROWS
----------------- ------------- ----------
-CLAIM_DETAILS    08-25 13:18   <환경값>     -- 구간B 직전에 재분석됨
+SYS@orcl> -- 원인 파악: 좋았던 계획이 쓰던 인덱스(IX_MC_HOSP)가 지금 어떤 상태인가부터 본다.
+SYS@orcl> COLUMN index_name FORMAT A14
 
--- 조치: 급한 불은 좋았던 계획(1388734953)을 SQL Plan Management 로 고정한다.
---   (근본 조치는 대표 통계 재수집·고정. 계획 고정은 임시 조치임을 기록한다.)
-SQLT@orcl> -- (SYS 권한 필요) 예: 좋은 계획을 AWR 에서 로드해 SQL Plan Baseline 생성
-SYS@orcl> DECLARE n PLS_INTEGER;
-  2       BEGIN
-  3         n := DBMS_SPM.LOAD_PLANS_FROM_AWR(
-  4                begin_snap=>303, end_snap=>304, sql_id=>'9xk2p1m4qz7ab');
-  5         DBMS_OUTPUT.PUT_LINE('loaded='||n);
-  6       END;
-  7     /
-loaded=1
+SYS@orcl> SELECT index_name, visibility, status, TO_CHAR(last_analyzed, 'MM-DD HH24:MI') la
+  2       FROM   dba_indexes WHERE owner = 'SQLT' AND table_name = 'MEDICAL_CLAIMS';
 
--- 재확인: 다음 실행 구간에서 같은 SQL 의 plan_hash_value 가 1388734953 로
---   돌아오고 ms_exec 가 이전 수준(약 12ms)으로 회복되는지 DBA_HIST_SQLSTAT 로 확인.
+INDEX_NAME     VISIBILIT STATUS   LA
+-------------- --------- -------- -----------
+PK_MEDICAL_CLA VISIBLE   VALID    09-17 20:23
+IMS
+
+IX_MC_HOSP     INVISIBLE VALID    09-17 21:49
+
+-- 원인 확정: 인덱스가 INVISIBLE 이다 — 옵티마이저에게는 없는 인덱스라 전체 스캔밖에 없었다.
+--   (구간 사이에 누군가 바꿨다. 통계 변경·인덱스 삭제·파라미터 변경도 같은 유형의 원인이다.)
+-- 조치: 원인을 되돌린다 — 인덱스를 VISIBLE 로. (힌트나 SQL Plan Baseline 으로 계획을 고정하는 것은
+--   원인을 모를 때의 임시 조치이지, 원인이 이렇게 분명할 때의 답이 아니다.)
+SYS@orcl> ALTER INDEX sqlt.ix_mc_hosp VISIBLE;
+
+Index altered.
+
+-- 재확인: 같은 SQL 을 다시 실행해 실행당 버퍼읽기가 158 수준으로 돌아오는지 본다.
+-- (터미널 B)
+$ sqlplus sqlt/sqlt@orcl
+
+SQLT@orcl> SET SERVEROUTPUT ON
+
+SQLT@orcl> DECLARE
+  2         n NUMBER; s NUMBER;
+  3       BEGIN
+  4         FOR i IN 1..300 LOOP
+  5           SELECT /*+ BIZ_HOSP */ COUNT(*), SUM(total_amt) INTO n, s
+  6           FROM   medical_claims WHERE hosp_id = 100 + MOD(i, 300);
+  7         END LOOP;
+  8       END;
+  9       /
+
+PL/SQL procedure successfully completed.
+
+SQLT@orcl> SELECT child_number, plan_hash_value, executions, ROUND(buffer_gets/executions) gets_exec
+  2       FROM   v$sql WHERE sql_text LIKE 'SELECT /*+ BIZ_HOSP%' ORDER BY child_number;
+
+CHILD_NUMBER PLAN_HASH_VALUE EXECUTIONS  GETS_EXEC
+------------ --------------- ---------- ----------
+           0      2441390803        300        159
+
+-- 재확인 완료: 새 커서가 인덱스 계획(2441390803)으로 돌고 실행당 158블록으로 돌아왔다.
+--   (계획 이력은 AWR 에 남아, 다음 스냅샷의 DBA_HIST_SQLSTAT 에서도 확인할 수 있다.)
 
 --------------------------------------------------------------------------------
 -- [5] (라이선스 대안)
@@ -99,13 +183,28 @@ loaded=1
 --   보이므로, '의심되는 즉시' 저장하는 것이 핵심이다(DBA_HIST 가 자동으로 하던 일).
 
 --------------------------------------------------------------------------------
+-- [6] (원복) 실습용 인덱스와 색칠(colored SQL)을 거둔다.
+--------------------------------------------------------------------------------
+SQLT@orcl> DROP INDEX ix_mc_hosp;
+
+Index dropped.
+
+SQLT@orcl> EXIT
+
+-- (터미널 A)
+SYS@orcl> EXEC DBMS_WORKLOAD_REPOSITORY.REMOVE_COLORED_SQL('&biz_id');
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
 -- [정리]
 --------------------------------------------------------------------------------
 -- 1) 회귀 = 같은 SQL_ID + 실행 횟수 유사 + 실행당 악화 + plan_hash_value 변경.
--- 2) 실측: 실행 500→520, 12.40ms→112.31ms, 계획 1388734953→983734112.
+-- 2) 실측: 실행 300→300, 0.09ms→8.61ms, 158→3,091블록, 계획 2441390803(인덱스)→2119550289(전체 스캔).
 -- 3) 집계가 부하 증가여도 개별 SQL 은 회귀할 수 있다(층위가 다름).
--- 4) 조치: 좋은 계획 고정(임시) + 통계 재수집(근본), 이후 실행당 회복을 재확인.
--- ※ 🔒 DBA_HIST_SQLSTAT 은 Diagnostics Pack 필요. 없으면 V$SQL·V$SQL_PLAN 캡처.
+-- 4) 조치: 원인(인덱스 INVISIBLE)을 되돌린다. 계획 고정(힌트·SPM)은 원인을 모를 때의 임시 조치.
+-- ※ 🔒 DBA_HIST_SQLSTAT·DISPLAY_AWR 은 Diagnostics Pack 필요. 없으면 V$SQL·V$SQL_PLAN 캡처.
 
-SQLT@orcl> EXIT
+SYS@orcl> EXIT
+
 ================================================================================

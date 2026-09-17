@@ -67,7 +67,8 @@
 --                  FROM V$SQL WHERE PARSING_SCHEMA_NAME='SQLT'
 --                 ORDER BY ELAPSED_TIME DESC FETCH FIRST 10 ROWS ONLY;
 --
--- 되돌리기   : 1) 복제 테이블은 wl_cleanup=1(기본값)이면 스크립트 끝에서 자동 삭제.
+-- 되돌리기   : 1) 복제 테이블은 wl_cleanup=1(기본값)이면 마지막 세션이 끝날 때 자동 삭제.
+--                 (여러 세션이 동시에 돌 때는 다른 세션이 남아 있는 동안 남긴다)
 --                 남겼다면 :  DROP TABLE REVIEW_LOG_MIX_WL PURGE;
 --              2) 세션 파라미터(WORKAREA_SIZE_POLICY, _serial_direct_read,
 --                 CURSOR_SHARING)는 [7]절에서 자동 원복한다. 접속을 끊어도
@@ -193,26 +194,57 @@ PROMPT
 
 -- ============================================================================
 -- [2] 복제 테이블 생성 (DML 전용). 원본은 읽기만 한다.
+--     여러 세션이 동시에 이 스크립트를 돌릴 수 있으므로(AWR 구간용 7세션 등):
+--       - 세션을 MODULE='WL_06' 으로 등록해 서로를 알아본다(V$SESSION).
+--       - 다른 WL_06 세션이 이미 있으면 복제 테이블을 지우지 않고 같이 쓴다.
+--       - 동시에 만들다 난 ORA-00955 는 '다른 세션이 먼저 만들었다'로 보고 넘어간다.
 -- ============================================================================
+EXEC DBMS_APPLICATION_INFO.SET_MODULE('WL_06', 'running');
+
 DECLARE
-    v_cnt NUMBER;
+    v_cnt    NUMBER;
+    v_others NUMBER;
 BEGIN
+    SELECT COUNT(*) INTO v_others FROM V$SESSION
+     WHERE MODULE = 'WL_06' AND SID <> SYS_CONTEXT('USERENV','SID');
+
     SELECT COUNT(*) INTO v_cnt FROM USER_TABLES WHERE TABLE_NAME = 'REVIEW_LOG_MIX_WL';
-    IF v_cnt > 0 THEN
+    IF v_cnt > 0 AND v_others = 0 THEN
         EXECUTE IMMEDIATE 'DROP TABLE REVIEW_LOG_MIX_WL PURGE';
+        v_cnt := 0;
     END IF;
 
-    EXECUTE IMMEDIATE
-        'CREATE TABLE REVIEW_LOG_MIX_WL AS ' ||
-        'SELECT LOG_ID, CLAIM_ID, REVIEWER_ID, PROCESS_DATE, ACTION_MSG, ERROR_CODE ' ||
-        '  FROM REVIEW_LOG WHERE ROWNUM <= ' || &wl_commit_rows;
-    EXECUTE IMMEDIATE
-        'ALTER TABLE REVIEW_LOG_MIX_WL ' ||
-        'ADD CONSTRAINT PK_REVIEW_LOG_MIX_WL PRIMARY KEY (LOG_ID)';
+    IF v_cnt = 0 THEN
+        BEGIN
+            EXECUTE IMMEDIATE
+                'CREATE TABLE REVIEW_LOG_MIX_WL AS ' ||
+                'SELECT LOG_ID, CLAIM_ID, REVIEWER_ID, PROCESS_DATE, ACTION_MSG, ERROR_CODE ' ||
+                '  FROM REVIEW_LOG WHERE ROWNUM <= ' || &wl_commit_rows;
+            EXECUTE IMMEDIATE
+                'ALTER TABLE REVIEW_LOG_MIX_WL ' ||
+                'ADD CONSTRAINT PK_REVIEW_LOG_MIX_WL PRIMARY KEY (LOG_ID)';
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF SQLCODE <> -955 THEN RAISE; END IF;   -- 다른 세션이 먼저 만들었다
+                DBMS_OUTPUT.PUT_LINE('[준비] 다른 WL_06 세션이 복제 테이블을 만들고 있다. 같이 쓴다.');
+        END;
+    ELSE
+        DBMS_OUTPUT.PUT_LINE('[준비] 다른 WL_06 세션 ' || v_others || '개가 사용 중인 복제 테이블을 같이 쓴다.');
+    END IF;
 
     -- 실행 시점에야 존재하는 테이블이므로 이후 참조는 전부 동적 SQL로 한다.
-    EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM REVIEW_LOG_MIX_WL' INTO v_cnt;
-    DBMS_OUTPUT.PUT_LINE('[준비] REVIEW_LOG_MIX_WL 생성 완료. 행수 = ' || v_cnt);
+    -- (다른 세션이 아직 만드는 중이면 최대 30초 기다린다)
+    FOR i IN 1 .. 30 LOOP
+        BEGIN
+            EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM REVIEW_LOG_MIX_WL' INTO v_cnt;
+            EXIT;
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF SQLCODE <> -942 OR i = 30 THEN RAISE; END IF;
+                DBMS_SESSION.SLEEP(1);
+        END;
+    END LOOP;
+    DBMS_OUTPUT.PUT_LINE('[준비] REVIEW_LOG_MIX_WL 준비 완료. 행수 = ' || v_cnt);
 END;
 /
 
@@ -618,10 +650,24 @@ BEGIN
         RETURN;
     END IF;
 
+    -- 다른 WL_06 세션이 아직 돌고 있으면 복제 테이블을 남긴다(마지막 세션이 지운다).
+    DBMS_APPLICATION_INFO.SET_MODULE(NULL, NULL);
+    SELECT COUNT(*) INTO v_cnt FROM V$SESSION
+     WHERE MODULE = 'WL_06' AND SID <> SYS_CONTEXT('USERENV','SID');
+    IF v_cnt > 0 THEN
+        DBMS_OUTPUT.PUT_LINE('[정리] 다른 WL_06 세션 ' || v_cnt || '개가 아직 사용 중 → 복제 테이블을 남긴다.');
+        RETURN;
+    END IF;
+
     SELECT COUNT(*) INTO v_cnt FROM USER_TABLES WHERE TABLE_NAME = 'REVIEW_LOG_MIX_WL';
     IF v_cnt > 0 THEN
-        EXECUTE IMMEDIATE 'DROP TABLE REVIEW_LOG_MIX_WL PURGE';
-        DBMS_OUTPUT.PUT_LINE('[정리] REVIEW_LOG_MIX_WL 삭제 완료.');
+        BEGIN
+            EXECUTE IMMEDIATE 'DROP TABLE REVIEW_LOG_MIX_WL PURGE';
+            DBMS_OUTPUT.PUT_LINE('[정리] REVIEW_LOG_MIX_WL 삭제 완료.');
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF SQLCODE <> -942 THEN RAISE; END IF;   -- 다른 세션이 방금 지웠다
+        END;
     END IF;
     DBMS_OUTPUT.PUT_LINE('[정리] 원본 7개 테이블은 읽기만 했다. 변경 없음.');
 END;
