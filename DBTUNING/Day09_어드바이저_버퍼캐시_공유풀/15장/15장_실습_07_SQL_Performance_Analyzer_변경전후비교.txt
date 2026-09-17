@@ -13,15 +13,47 @@ $ sqlplus / as sysdba
 SYS@orcl> SET LONG 200000 LINESIZE 140 PAGESIZE 0
 
 --------------------------------------------------------------------------------
+-- [0] (준비) 분석 대상 STS(CLAIMS_STS)를 만들고 대표 SQL을 담는다.
+--     SPA는 'SQL 집합(STS)'을 대상으로 before/after를 잰다. 먼저 SQLT 계정으로 대표
+--     질의 몇 개를 실행해 커서 캐시에 올린 뒤(그래야 parsing_schema_name=SQLT로 잡힌다),
+--     SYS에서 커서 캐시로부터 STS로 적재한다.
+$ sqlplus sqlt/sqlt@orcl
+SQLT@orcl> SELECT claim_id, total_amt FROM medical_claims
+  2         WHERE hosp_id=777 AND receipt_date=DATE '2024-06-15';
+SQLT@orcl> SELECT hosp_id, COUNT(*) FROM medical_claims GROUP BY hosp_id;
+SQLT@orcl> SELECT claim_type, COUNT(*) FROM medical_claims GROUP BY claim_type;
+SQLT@orcl> EXIT
+
+$ sqlplus / as sysdba
+SYS@orcl> SET LONG 200000 LINESIZE 140 PAGESIZE 0
+SYS@orcl> EXEC DBMS_SQLTUNE.CREATE_SQLSET('CLAIMS_STS');
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> DECLARE
+  2    cur DBMS_SQLTUNE.SQLSET_CURSOR;
+  3  BEGIN
+  4    OPEN cur FOR
+  5      SELECT VALUE(p) FROM TABLE(DBMS_SQLTUNE.SELECT_CURSOR_CACHE(
+  6        'parsing_schema_name=''SQLT'' AND sql_text LIKE ''SELECT%medical_claims%''')) p;
+  7    DBMS_SQLTUNE.LOAD_SQLSET('CLAIMS_STS', cur);
+  8  END;
+  9  /
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
 -- [1] (조치 전) 분석에 쓸 STS가 있는지 확인한다.
 --------------------------------------------------------------------------------
-SYS@orcl> SELECT name, statement_count FROM dba_sqlset WHERE owner='SYS';
+SYS@orcl> SELECT name, statement_count FROM dba_sqlset WHERE owner='SYS'
+  2       AND name='CLAIMS_STS';
 
 NAME         STATEMENT_COUNT
 ------------ ---------------
 CLAIMS_STS              <환경값>
 
--- 해석: SPA는 'SQL 집합(STS)'을 대상으로 before/after를 잰다. 건수는 환경 의존.
+-- 해석: SPA는 이 STS를 대상으로 before/after를 잰다. 담긴 건수는 커서 캐시 상태에
+--   따라 다르므로 <환경값>(위 준비 기준 3건 안팎).
 
 --------------------------------------------------------------------------------
 -- [2] (이상 징후 → 원인 → 조치) 존재하지 않는 STS 이름으로 태스크를 만들어 본다.
@@ -36,11 +68,16 @@ SYS@orcl> DECLARE t VARCHAR2(64);
 DECLARE t VARCHAR2(64);
 *
 ERROR at line 1:
-ORA-13757: "SQL Tuning Set" "CLAIMS_STSS" owned by user "SYS" does not exist.
-ORA-06512: at "SYS.DBMS_SQLPA", line 1024
+ORA-13754: "SQL Tuning Set" "CLAIMS_STSS" does not exist for user "SYS".
+ORA-06512: at "SYS.DBMS_SQLTUNE_INTERNAL", line 9405
+ORA-06512: at "SYS.DBMS_SQLTUNE_INTERNAL", line 17061
+ORA-06512: at "SYS.DBMS_SYS_ERROR", line 95
+ORA-06512: at "SYS.DBMS_SQLTUNE_UTIL1", line 491
+ORA-06512: at "SYS.PRVT_SQLADV_INFRA", line 621
+ORA-06512: at "SYS.DBMS_SQLPA", line 355
 ORA-06512: at line 3
 
-SYS@orcl> -- 원인 파악: STS 이름 오타. DBA_SQLSET에서 실제 이름을 확인한다.
+SYS@orcl> -- 원인 파악: STS 이름 오타(ORA-13754). DBA_SQLSET에서 실제 이름을 확인한다.
 SYS@orcl> SELECT name FROM dba_sqlset WHERE owner='SYS' AND name LIKE 'CLAIMS%';
 
 NAME
@@ -142,12 +179,17 @@ SYS@orcl> EXEC DBMS_SQLPA.DROP_ANALYSIS_TASK('SPA_PARAM');
 
 PL/SQL procedure successfully completed.
 
+SYS@orcl> -- 준비에서 만든 STS도 삭제해 환경을 원복한다.
+SYS@orcl> EXEC DBMS_SQLTUNE.DROP_SQLSET('CLAIMS_STS');
+
+PL/SQL procedure successfully completed.
+
 --------------------------------------------------------------------------------
 -- [정리]
 --------------------------------------------------------------------------------
 -- 1) SPA는 DBMS_SQLPA로 STS 기반 before/after를 측정·비교한다(프로덕션 무영향, 🔒).
 -- 2) 실행 유형: EXPLAIN PLAN(계획만) / TEST EXECUTE(실제 실행 통계).
--- 3) 존재하지 않는 STS 참조는 ORA-13757. DBA_SQLSET에서 실제 이름을 확인한다.
+-- 3) 존재하지 않는 STS 참조는 ORA-13754. DBA_SQLSET에서 실제 이름을 확인한다.
 -- 4) 보고서는 개선/회귀/불변을 집계 → 회귀 SQL만 SQL Plan Baseline으로 부분 대응한다.
 
 SYS@orcl> EXIT
