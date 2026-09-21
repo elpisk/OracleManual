@@ -96,10 +96,11 @@ echo
 # 백업 수행 (이중 모드 + KEEP + 복원 지점)
 # ---------------------------------------------------------------------------
 log "=== secure export start : $DBNAME / $LABEL ==="
+# SET ENCRYPTION ... IDENTIFIED BY 는 RUN 블록 안에 둘 수 없다 (RMAN-03032)
 rman target / catalog $CATALOG >> "$LOG" 2>&1 << EOF
+SET ENCRYPTION ON IDENTIFIED BY "$PW";
 RUN {
   ALLOCATE CHANNEL c1 DEVICE TYPE DISK FORMAT '$OUTDIR/%d_${LABEL}_%U';
-  SET ENCRYPTION ON IDENTIFIED BY "$PW";
   BACKUP AS COMPRESSED BACKUPSET DATABASE
     TAG 'EXPORT_${LABEL}'
     KEEP UNTIL TIME 'SYSDATE+${KEEPDAYS}'
@@ -192,9 +193,9 @@ cat > "$OUTDIR/README_${LABEL}.txt" << TXT
     RMAN> RESTORE CONTROLFILE FROM '<컨트롤파일이 담긴 조각 경로>';
     RMAN> ALTER DATABASE MOUNT;
 
- 3) 데이터베이스 복원
+ 3) 데이터베이스 복원 (SET DECRYPTION 은 RUN 블록 밖에서)
+    RMAN> SET DECRYPTION IDENTIFIED BY '<별도 통보>';
     RMAN> RUN {
-            SET DECRYPTION IDENTIFIED BY '<별도 통보>';
             SET NEWNAME FOR DATABASE TO '<데이터경로>/%b';
             RESTORE DATABASE;
             SWITCH DATAFILE ALL;

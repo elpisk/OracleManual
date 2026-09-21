@@ -23,6 +23,7 @@ Recovery Catalog 고급 과정(고급 실습 01~10)에서 만든 산출물을 �
 | `rc_perf_analysis.sql` | 실습 08 | 백업 성능 분석 | 주간 |
 | `rc_bct_check.sh` | 실습 08 | 변경 추적(BCT) 파일 점검 | 매일 백업 전 |
 | `rc_secure_export.sh` | 실습 09 | 외부 반출용 암호화 백업 | 요청 시 |
+| `rc_wallet_check.sh` | 실습 09 | TDE 지갑 상태 점검과 지갑 백업 | 매일 백업 전 |
 | `rc_restore_validate.sh` | 실습 10 | 복구 가능성 검증 L1~L3 | 매일(L2)·주간(L3) |
 | `dr_drill_runbook.md` | 실습 10 | 장애 대응·훈련 런북 | 상시 참조 |
 
