@@ -78,7 +78,7 @@ elif [ "$USEPCT" -ge 80 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 사전 점검 4 : 카탈로그 접속. 실패 시 폴백 (RMAN-06171 대비)
+# 사전 점검 4 : 카탈로그 접속. 실패 시 폴백 (RMAN-06002 대비)
 # ---------------------------------------------------------------------------
 if ! echo "exit" | rman target / catalog $CATALOG > /tmp/cat_$$.log 2>&1; then
   log "[WARN] recovery catalog unreachable - entering fallback mode"
