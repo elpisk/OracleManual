@@ -71,7 +71,7 @@
 --   등급  | 범위                        | 소요    | 주기   | 서비스 영향
 --   ------|-----------------------------|---------|--------|------------
 --   드릴A | 테이블 하나 복원            | 30분    | 월간   | 없음
---   드릴B | 다른 서버에 DUPLICATE       | 2시간   | 분기   | 없음
+--   드릴B | 다른 서버에 DUPLICATE       | 1시간   | 분기   | 없음 (메모리·공간 확보 필요)
 --   드릴C | 운영 DB 실제 복구           | 3시간   | 연간   | 계획 정지
 --
 --   이 실습에서는 드릴 A 와 B 를 수행한다.
@@ -85,50 +85,63 @@
 --   RTO = 감지 + 판단 + 복구 + 검증 + 서비스 전환
 --       = 각 단계를 실측해 합산한다
 --
---   고급 실습 07에서 실측한 값이 있다.
---     복구(오픈까지)  : 67분
---     정상화 포함     : 95분
---   여기에 감지·판단·서비스 전환 시간을 더해야 한다.
+--   고급 실습 07에서 실측한 값이 있다 (sales 1.8GB).
+--     복구(오픈까지)  : 10분
+--     정상화 포함     : 15분
+--   여기에 감지·판단·서비스 전환 시간을 더해야 하고, 크기가 다른 DB 는 다시 재야 한다.
 
 --------------------------------------------------------------------------------
 [3] 환경 준비
 --------------------------------------------------------------------------------
 -- 3-1. 현재 백업 체계 요약
+--
+-- rc_backup_set 에는 db_name 이 없다(고급 실습 07). 요약은 rc_backup_set_details 로 한다.
+-- 열 이름은 backup_type('D' 전체, 'I' 증분, 'L' 아카이브) 과 incremental_level 이다.
 
 [oracle@oel7v9r2 ~]$ sqlplus -s rc_report/oracle_4U@rcat
 
 RC_REPORT@rcat> SET LINESIZE 170 PAGESIZE 60
 
-RC_REPORT@rcat> SELECT d.name,
-  2    TO_CHAR(MAX(CASE WHEN s.incr_level = 0 THEN s.completion_time END),
+RC_REPORT@rcat> SELECT s.db_name,
+  2    TO_CHAR(MAX(CASE WHEN s.incremental_level = 0 THEN s.completion_time END),
   3            'MM-DD HH24:MI') AS last_l0,
-  4    TO_CHAR(MAX(CASE WHEN s.incr_level = 1 THEN s.completion_time END),
+  4    TO_CHAR(MAX(CASE WHEN s.incremental_level = 1 THEN s.completion_time END),
   5            'MM-DD HH24:MI') AS last_l1,
-  6    TO_CHAR(MAX(CASE WHEN s.bck_type = 'L' THEN s.completion_time END),
+  6    TO_CHAR(MAX(CASE WHEN s.backup_type = 'L' THEN s.completion_time END),
   7            'MM-DD HH24:MI') AS last_arch
-  8  FROM  rc_database d JOIN rc_backup_set s ON d.db_key = s.db_key
-  9  GROUP BY d.name ORDER BY d.name;
+  8  FROM  rc_backup_set_details s GROUP BY s.db_name ORDER BY s.db_name;
 
-NAME     LAST_L0       LAST_L1       LAST_ARCH
--------- ------------- ------------- -------------
-HRDB     09-01 01:12   09-08 02:12   09-08 02:16
-ORCL     09-01 01:04   09-08 02:01   09-08 02:05
-SALES    09-01 01:20   09-08 02:04   09-08 02:08
+DB_NAME  LAST_L0     LAST_L1     LAST_ARCH
+-------- ----------- ----------- -----------
+HRDB     09-08 00:18             09-08 00:49
+ORCL     09-08 13:21 09-08 13:24 09-08 14:29
+SALES    09-07 17:30 09-07 15:23 09-07 17:30
+
+-- orcl 은 이 실습 환경에서 별도의 일일 작업(태그 FULL_DAILY, 압축 전체 백업, 보존 7일)이
+-- 17:55 에 돈다. 증분 체계는 고급 실습 03의 것이다. 두 체계가 공존하는 상태다.
 
 -- 3-2. 훈련용 자원 확인
 
 [oracle@oel7v9r2 ~]$ df -h /u02 /backup
 
 Filesystem            Size  Used Avail Use% Mounted on
-/dev/mapper/ol-u02    300G   48G  252G  16% /u02
-/dev/mapper/ol-bk     200G  118G   82G  60% /backup
+/dev/mapper/ol-root    34G   27G  7.4G  78% /
 
 [oracle@oel7v9r2 ~]$ free -g | head -2
 
               total        used        free      shared  buff/cache   available
-Mem:             16           7           1       4          8           6
+Mem:              7           2           0          3           4           1
 
--- 드릴 B 를 위해 6GB 정도의 여유가 필요하다. 가능하다.
+[grid@oel7v9r2 ~]$ asmcmd lsdg
+
+State    Type    Rebal  Sector  Logical_Sector  Block       AU  Total_MB  Free_MB  ...  Name
+MOUNTED  EXTERN  N         512             512   4096  4194304     20464     8744  ...  DATA/
+MOUNTED  EXTERN  N         512             512   4096  4194304     40928    39272  ...  FRA/
+
+-- 드릴 B 는 orcl(8.7GB)의 복제본을 만든다. 로컬 디스크 7.4GB 로는 모자라고
+-- ASM +FRA 에 39GB 가 남아 있다. 복제본은 +FRA 에 만든다.
+-- 메모리 1GB 로는 복제 인스턴스(SGA 1GB)를 올릴 수 없다. 훈련 중 hrdb 를 잠시 내린다.
+-- 이 판단 자체가 훈련의 일부다. 자원이 없는 서버에서는 훈련이 안 된다.
 
 -- 3-3. 검증 로그 경로
 
@@ -143,62 +156,86 @@ Mem:             16           7           1       4          8           6
 -- 4-1. L1 메타 검증
 -- ────────────────────────────────────────────────
 
+[oracle@oel7v9 ~]$ date
+
+Mon Sep  8 09:03:51 KST 2025
+
 [oracle@oel7v9 ~]$ export ORACLE_SID=orcl
 [oracle@oel7v9 ~]$ rman target / catalog rcatowner@rcat
 
 RMAN> REPORT NEED BACKUP;
 
 RMAN retention policy will be applied to the command
-RMAN retention policy is set to recovery window of 21 days
-Report of files that must be backed up to satisfy 21 days recovery window
+RMAN retention policy is set to recovery window of 7 days
+Report of files that must be backed up to satisfy 7 days recovery window
 File Days  Name
 ---- ----- -----------------------------------------------------
-(none)
 
 RMAN> REPORT UNRECOVERABLE;
 
 Report of files that need backup due to unrecoverable operations
 File Type of Backup Required Name
 ---- ----------------------- -----------------------------------
-(none)
 
--- NOLOGGING 작업으로 복구 불가능해진 파일이 있는지 본다.
--- 이 항목이 나오면 즉시 해당 파일을 백업해야 한다.
+-- 둘 다 빈 목록이다. "(none)" 같은 말은 찍히지 않는다. 제목 줄만 있으면 없는 것이다.
+-- NOLOGGING 작업으로 복구 불가능해진 파일이 있으면 두 번째 목록에 나온다.
+-- 그 항목이 나오면 즉시 해당 파일을 백업해야 한다.
 
 RMAN> RESTORE DATABASE PREVIEW SUMMARY;
+
+Starting restore at 2025-09-08 09:04:07
+
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---
+15163   B  F  A DISK        2025-09-07 17:57:04 1       1       YES        FULL_DAILY
+15162   B  F  A DISK        2025-09-07 17:56:53 1       1       YES        FULL_DAILY
+using channel ORA_DISK_1
+using channel ORA_DISK_2
+
+List of Backups
+===============
+Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---
+15165   B  A  A DISK        2025-09-07 17:57:19 1       1       NO         TAG20250907T175719
+
+recovery will be done up to SCN 38652616
+Media recovery start SCN is 38652616
+Recovery must be done beyond SCN 38652618 to clear datafile fuzziness
+Finished restore at 2025-09-08 09:04:09
+
+-- 데이터파일 백업 두 세트와 아카이브 백업 한 세트로 SCN 38652616 까지 간다.
+-- "Recovery must be done beyond SCN" 줄이 중요하다.
+-- 이 SCN 을 넘겨야 파일 불일치가 해소된다는 뜻이다.
+-- 그 지점까지의 아카이브가 없으면 복구가 완성되지 않는다.
+
+RMAN> RESTORE ARCHIVELOG FROM SCN 38652616 PREVIEW SUMMARY;
 
 Starting restore at 2025-09-08 09:04:11
 
 List of Backups
 ===============
 Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
-------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
-2101    B  0  A DISK        2025-09-01 01:04:22       5       1  NO         ORCL_FULL
-2288    B  1  A DISK        2025-09-08 02:01:48       4       1  NO         ORCL_INCR
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---
+15165   B  A  A DISK        2025-09-07 17:57:19 1       1       NO         TAG20250907T175719
+Finished restore at 2025-09-08 09:04:12
 
-List of Archived Logs
-=====================
-Thrd Seq     Low SCN    Next SCN   Name
----- ------- ---------- ---------- --------------------------------------------
-1    602     4102881    4104220    /home/oracle/arch1/arch_1_602_1200712900.arc
+RMAN> RESTORE SPFILE PREVIEW;
 
-Media recovery start SCN is 4103100
-Recovery must be done beyond SCN 4104102 to clear datafile fuzziness
-Finished restore at 2025-09-08 09:04:22
+Starting restore at 2025-09-08 09:04:16
+List of Backup Sets
+===================
+BS Key  Type LV Size       Device Type Elapsed Time Completion Time
+------- ---- -- ---------- ----------- ------------ -------------------
+15166   Full    18.95M     DISK        00:00:01     2025-09-07 17:57:25
+        BP Key: 15171   Status: AVAILABLE  Compressed: NO  Tag: TAG20250907T175724
+        Piece Name: /backup/ORCL/cf_c-1547823901-20250907-05
+  SPFILE Included: Modification time: 2025-09-03 23:50:24
+  SPFILE db_unique_name: ORCL
+Finished restore at 2025-09-08 09:04:17
 
--- "Recovery must be done beyond SCN" 줄이 중요하다.
--- 이 SCN 을 넘겨야 파일 불일치가 해소된다는 뜻이다.
--- 그 지점까지의 아카이브가 없으면 복구가 완성되지 않는다.
-
-RMAN> RESTORE ARCHIVELOG FROM SCN 4103100 PREVIEW SUMMARY;
-
-List of Backups
-===============
-Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
-------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
-2291    B  A  A DISK        2025-09-08 02:05:12       1       1  NO         ORCL_ARCH
-
-Finished restore at 2025-09-08 09:05:44
+-- L1 은 20초 안에 끝난다. 파일을 읽지 않고 카탈로그만 본다.
 
 -- ────────────────────────────────────────────────
 -- 4-2. L2 읽기 검증
@@ -206,37 +243,68 @@ Finished restore at 2025-09-08 09:05:44
 
 RMAN> RESTORE DATABASE VALIDATE;
 
-Starting restore at 2025-09-08 09:08:11
-allocated channel: ORA_DISK_1
-allocated channel: ORA_DISK_2
-allocated channel: ORA_DISK_3
-allocated channel: ORA_DISK_4
-
+Starting restore at 2025-09-08 09:04:19
 channel ORA_DISK_1: starting validation of datafile backup set
-channel ORA_DISK_1: reading from backup piece /backup/ORCL/5ba8d1e1_92_1_1
-channel ORA_DISK_1: piece handle=/backup/ORCL/5ba8d1e1_92_1_1 tag=ORCL_FULL
-channel ORA_DISK_1: validation complete, elapsed time: 00:01:22
-channel ORA_DISK_2: validation complete, elapsed time: 00:01:41
-channel ORA_DISK_3: validation complete, elapsed time: 00:01:18
-channel ORA_DISK_4: validation complete, elapsed time: 00:00:44
-Finished restore at 2025-09-08 09:10:02
+channel ORA_DISK_2: starting validation of datafile backup set
+channel ORA_DISK_1: reading from backup piece /backup/ORCL/full_ORCL_20250907_dk52t8gp_1_1
+channel ORA_DISK_2: reading from backup piece /backup/ORCL/full_ORCL_20250907_dl52t8gp_1_1
+channel ORA_DISK_1: piece handle=/backup/ORCL/full_ORCL_20250907_dk52t8gp_1_1 tag=FULL_DAILY
+channel ORA_DISK_1: restored backup piece 1
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:35
+channel ORA_DISK_2: piece handle=/backup/ORCL/full_ORCL_20250907_dl52t8gp_1_1 tag=FULL_DAILY
+channel ORA_DISK_2: restored backup piece 1
+channel ORA_DISK_2: validation complete, elapsed time: 00:00:55
+Finished restore at 2025-09-08 09:05:15
 
-RMAN> RESTORE ARCHIVELOG ALL VALIDATE;
+RMAN> RESTORE ARCHIVELOG FROM TIME 'SYSDATE-1' VALIDATE;
 
-Starting restore at 2025-09-08 09:10:11
+Starting restore at 2025-09-08 09:27:29
+channel ORA_DISK_1: scanning archived log /home/oracle/arch1/arch_1_431_1244128516.arc
+channel ORA_DISK_2: scanning archived log /home/oracle/arch1/arch_1_432_1244128516.arc
+channel ORA_DISK_1: scanning archived log /home/oracle/arch1/arch_1_433_1244128516.arc
+channel ORA_DISK_2: starting validation of archived log backup set
 channel ORA_DISK_1: starting validation of archived log backup set
-channel ORA_DISK_1: validation complete, elapsed time: 00:00:38
-Finished restore at 2025-09-08 09:10:52
+channel ORA_DISK_1: reading from backup piece /backup/ORCL/cg52soai_1_1
+...
+channel ORA_DISK_1: reading from backup piece /backup/ORCL/ORCL_20250907_438_1.bkp
+channel ORA_DISK_1: piece handle=/backup/ORCL/ORCL_20250907_438_1.bkp tag=TAG20250907T175719
+channel ORA_DISK_1: restored backup piece 1
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:01
+Finished restore at 2025-09-08 09:27:56
 
-RMAN> RESTORE SPFILE VALIDATE FROM AUTOBACKUP;
+-- 디스크에 있는 아카이브는 "scanning" 으로 훑고, 백업된 것은 조각을 읽는다.
 
-Starting restore at 2025-09-08 09:11:04
-channel ORA_DISK_1: AUTOBACKUP found: /backup/ORCL/c-1547823901-20250908-00
-channel ORA_DISK_1: validation complete
-Finished restore at 2025-09-08 09:11:14
+RMAN> RESTORE SPFILE FROM AUTOBACKUP VALIDATE;
 
+Starting restore at 2025-09-08 09:28:09
+recovery area destination: /fra
+database name (or database unique name) used for search: ORCL
+channel ORA_DISK_1: no AUTOBACKUPS found in the recovery area
+channel ORA_DISK_1: looking for AUTOBACKUP on day: 20250908
+channel ORA_DISK_2: looking for AUTOBACKUP on day: 20250907
+channel ORA_DISK_2: AUTOBACKUP found: /backup/ORCL/cf_c-1547823901-20250907-00
+channel ORA_DISK_1: AUTOBACKUP found: /backup/ORCL/cf_c-1547823901-20250907-05
+channel ORA_DISK_2: skipped, AUTOBACKUP already found
+channel ORA_DISK_1: starting validation of datafile backup set
+channel ORA_DISK_1: SPFILE restore from AUTOBACKUP complete
+Finished restore at 2025-09-08 09:28:26
+
+RMAN> RESTORE CONTROLFILE FROM AUTOBACKUP VALIDATE;
+
+Starting restore at 2025-09-08 09:28:37
+...
+channel ORA_DISK_1: AUTOBACKUP found: /backup/ORCL/cf_c-1547823901-20250907-05
+channel ORA_DISK_1: starting validation of datafile backup set
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:08
+Finished restore at 2025-09-08 09:28:46
+
+-- 어순에 주의한다. RESTORE SPFILE VALIDATE FROM AUTOBACKUP 은 구문 오류다.
+--   RMAN-01009: syntax error: found "autobackup": expecting one of: "backupset, copy, ..."
+-- FROM AUTOBACKUP 이 앞이고 VALIDATE 가 뒤다. [7-1]의 스크립트가 처음에 이 순서로
+-- 되어 있었고, 구문 오류가 나도 "통과" 로 판정하는 결함까지 함께 있었다. [7-1] 에서 고친다.
+--
 -- 실제로 파일을 만들지 않고 읽기만 한다.
--- 운영 중에 안전하게 수행할 수 있다.
+-- 운영 중에 안전하게 수행할 수 있다. 8.7GB 압축 백업 두 조각에 1분.
 
 -- ────────────────────────────────────────────────
 -- 4-3. L3 논리 검증
@@ -244,26 +312,62 @@ Finished restore at 2025-09-08 09:11:14
 
 RMAN> BACKUP VALIDATE CHECK LOGICAL DATABASE ARCHIVELOG ALL;
 
-Starting backup at 2025-09-08 09:14:11
+Starting backup at 2025-09-08 09:05:21
+specification does not match any archived log in the repository
 channel ORA_DISK_1: starting full datafile backup set
 channel ORA_DISK_1: specifying datafile(s) in backup set
+input datafile file number=00004 name=/u01/app/oracle/oradata/orcl/undotbs01.dbf
+input datafile file number=00003 name=/u01/app/oracle/oradata/orcl/sysaux01.dbf
+input datafile file number=00009 name=/u01/app/oracle/oradata/orcl/exam_tbs01.dbf
+input datafile file number=00011 name=/u01/app/oracle/oradata/orcl/tbs_new01.dbf
+input datafile file number=00010 name=/u01/app/oracle/oradata/orcl/tbs13_01.dbf
+channel ORA_DISK_2: starting full datafile backup set
+channel ORA_DISK_2: specifying datafile(s) in backup set
+input datafile file number=00007 name=/u01/app/oracle/oradata/orcl/users01.dbf
 input datafile file number=00001 name=/u01/app/oracle/oradata/orcl/system01.dbf
-channel ORA_DISK_1: backup set complete, elapsed time: 00:03:22
-
+input datafile file number=00002 name=/u01/app/oracle/oradata/orcl/ts_stg01.dbf
+input datafile file number=00008 name=/u01/app/oracle/oradata/orcl/users02.dbf
+input datafile file number=00005 name=/u01/app/oracle/oradata/orcl/rtbs01.dbf
+channel ORA_DISK_2: backup set complete, elapsed time: 00:02:38
 List of Datafiles
 =================
 File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
 ---- ------ -------------- ------------ --------------- ----------
-1    OK     0              14208        115200          4104288
-2    OK     0              12044         99840          4104288
-3    OK     0              22016         53760          4104288
-4    OK     0              38400        131072          4104288
-5    OK     0              10240         43520          4104288
-6    OK     0               2048          6400          4104288
+1    OK     0              16292        168978          38653697
+  File Name: /u01/app/oracle/oradata/orcl/system01.dbf
+  Block Type Blocks Failing Blocks Processed
+  ---------- -------------- ----------------
+  Data       0              84953
+  Index      0              14362
+  Other      0              53353
+File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
+---- ------ -------------- ------------ --------------- ----------
+2    OK     0              494          54049           4092506
+  File Name: /u01/app/oracle/oradata/orcl/ts_stg01.dbf
+...
+File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
+---- ------ -------------- ------------ --------------- ----------
+7    OK     0              56500        290410          38641559
+  File Name: /u01/app/oracle/oradata/orcl/users01.dbf
+  Block Type Blocks Failing Blocks Processed
+  ---------- -------------- ----------------
+  Data       0              225968
+  Index      0              4190
+  Other      0              3742
+...
+channel ORA_DISK_1: backup set complete, elapsed time: 00:02:45
+...
+List of Control File and SPFILE
+===============================
+File Type    Status Blocks Failing Blocks Examined
+------------ ------ -------------- ---------------
+Control File OK     0              1206
+SPFILE       OK     0              2
+Finished backup at 2025-09-08 09:08:07
 
-Finished backup at 2025-09-08 09:22:41
-
--- Marked Corrupt 가 모두 0 이다.
+-- 파일 10개, 컨트롤파일, SPFILE 모두 Marked Corrupt 0. 2분 45초.
+-- "specification does not match any archived log" 는 이 DB 의 아카이브가 삭제 정책
+-- (BACKED UP 1 TIMES)에 따라 백업 뒤 지워져 디스크에 검사할 것이 없다는 뜻이다.
 --
 -- 이 명령은 실제 백업을 만들지 않고 검사만 한다.
 -- 그러나 데이터파일 전체를 읽으므로 부하가 있다.
@@ -280,136 +384,244 @@ no rows selected
 -- 4-4. L4 드릴 A — 테이블 하나 복원
 -- ────────────────────────────────────────────────
 -- 월간 훈련. 가장 가볍고 서비스 영향이 없다.
+-- 운영 DB 에 테이블을 만들지 않도록 NOTABLEIMPORT 로 덤프까지만 만든다.
+-- 임포트 여부는 훈련 뒤 필요할 때 결정한다.
 
 [oracle@oel7v9 ~]$ date
 
-Mon Sep  8 09:30:11 KST 2025
+Mon Sep  8 09:08:12 KST 2025
 
-SYS@orcl> SELECT COUNT(*) FROM itwill.emp;
+SYS@orcl> SELECT COUNT(*) FROM hr.employees;
 
   COUNT(*)
 ----------
        107
 
+SYS@orcl> ALTER SYSTEM ARCHIVE LOG CURRENT;
 SYS@orcl> SELECT current_scn FROM v$database;
 
 CURRENT_SCN
 -----------
-    4104502
+   38653936
 
-[oracle@oel7v9 ~]$ mkdir -p /u02/aux_drill
+-- 복구 시점(SCN)은 아카이브된 범위 안이어야 한다. 현재 로그를 먼저 아카이브한다.
+
+[oracle@oel7v9 ~]$ mkdir -p /arch/aux_drill
 
 [oracle@oel7v9 ~]$ rman target / catalog rcatowner@rcat
 
-RMAN> RECOVER TABLE itwill.emp
-2>   UNTIL SCN 4104502
-3>   AUXILIARY DESTINATION '/u02/aux_drill'
-4>   REMAP TABLE itwill.emp:emp_drill_0908;
+RMAN> RECOVER TABLE hr.employees
+2>   UNTIL SCN 38653936
+3>   AUXILIARY DESTINATION '/arch/aux_drill'
+4>   DATAPUMP DESTINATION '/arch/aux_drill'
+5>   DUMP FILE 'employees_drill.dmp'
+6>   NOTABLEIMPORT;
 
-Creating automatic instance, with SID='wBcd'
+Starting recover at 2025-09-08 09:08:23
+current log archived
+
+Creating automatic instance, with SID='eFax'
+
 initialization parameters used for automatic instance:
 db_name=ORCL
-db_unique_name=wBcd_pitr_ORCL
+db_unique_name=eFax_pitr_ORCL
 compatible=19.0.0
 db_block_size=8192
 db_files=200
 diagnostic_dest=/u01/app/oracle
 _system_trig_enabled=FALSE
-sga_target=1G
+sga_target=2048M
 processes=200
-db_create_file_dest=/u02/aux_drill
-log_archive_dest_1='location=/u02/aux_drill'
+db_4k_cache_size=48M
+db_create_file_dest=/arch/aux_drill
+log_archive_dest_1='location=/arch/aux_drill'
+#No auxiliary parameter file used
 
 starting up automatic instance ORCL
 Oracle instance started
+Total System Global Area    2147481656 bytes
+...
+Automatic instance created
 
 contents of Memory Script:
 {
 # set requested point in time
-set until  scn 4104502;
+set until  scn 38653936;
 # restore the controlfile
 restore clone controlfile;
 # mount the controlfile
 sql clone 'alter database mount clone database';
 # archive current online log
 sql 'alter system archive log current';
+# resync catalog
+resync catalog;
 }
 executing Memory Script
 ...
+contents of Memory Script:
+{
+# set requested point in time
+set until  scn 38653936;
+# set destinations for recovery set and auxiliary set datafiles
+set newname for clone datafile  1 to new;
+set newname for clone datafile  4 to new;
+set newname for clone datafile  3 to new;
+set newname for clone tempfile  2 to new;
+# switch all tempfiles
+switch clone tempfile all;
+# restore the tablespaces in the recovery set and the auxiliary set
+restore clone datafile  1, 4, 3;
+switch clone datafile all;
+}
+executing Memory Script
+...
+channel ORA_AUX_DISK_1: restoring datafile 00004 to /arch/aux_drill/ORCL/datafile/o1_mf_undotbs1_%u_.dbf
+channel ORA_AUX_DISK_1: restoring datafile 00003 to /arch/aux_drill/ORCL/datafile/o1_mf_sysaux_%u_.dbf
+channel ORA_AUX_DISK_1: reading from backup piece /backup/ORCL/full_ORCL_20250907_dk52t8gp_1_1
+channel ORA_AUX_DISK_2: restoring datafile 00001 to /arch/aux_drill/ORCL/datafile/o1_mf_system_%u_.dbf
+channel ORA_AUX_DISK_2: reading from backup piece /backup/ORCL/full_ORCL_20250907_dl52t8gp_1_1
+channel ORA_AUX_DISK_1: restore complete, elapsed time: 00:01:56
+channel ORA_AUX_DISK_2: restore complete, elapsed time: 00:01:56
+Finished restore at 2025-09-08 09:11:14
+...
+Starting recover at 2025-09-08 09:11:14
+archived log for thread 1 with sequence 431 is already on disk as file /home/oracle/arch1/arch_1_431_1244128516.arc
+archived log for thread 1 with sequence 432 is already on disk as file /home/oracle/arch1/arch_1_432_1244128516.arc
+channel ORA_AUX_DISK_1: restoring archived log
+archived log thread=1 sequence=430
+channel ORA_AUX_DISK_1: reading from backup piece /backup/ORCL/ORCL_20250907_438_1.bkp
+...
+media recovery complete, elapsed time: 00:00:02
+Finished recover at 2025-09-08 09:11:19
+sql statement: alter database open read only
+...
+contents of Memory Script:
+{
+# set requested point in time
+set until  scn 38653936;
+# set destinations for recovery set and auxiliary set datafiles
+set newname for datafile  7 to new;
+set newname for datafile  8 to new;
+# restore the tablespaces in the recovery set and the auxiliary set
+restore clone datafile  7, 8;
+switch clone datafile all;
+}
+executing Memory Script
+...
+channel ORA_AUX_DISK_1: restoring datafile 00007 to /arch/aux_drill/EFAX_PITR_ORCL/datafile/o1_mf_users_%u_.dbf
+channel ORA_AUX_DISK_1: restoring datafile 00008 to /arch/aux_drill/EFAX_PITR_ORCL/datafile/o1_mf_users_%u_.dbf
+channel ORA_AUX_DISK_1: restore complete, elapsed time: 00:01:18
+Finished restore at 2025-09-08 09:13:51
+...
+recover clone database tablespace  "USERS", "SYSTEM", "UNDOTBS1", "SYSAUX" delete archivelog;
+alter clone database open resetlogs;
+...
+database opened
+
 Performing export of tables...
-   EXPDP> Starting "SYS"."TSPITR_EXP_wBcd_kAxq":
+   EXPDP> Starting "SYS"."TSPITR_EXP_eFax_zwCt":
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/INDEX/STATISTICS/INDEX_STATISTICS
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
    EXPDP> Processing object type TABLE_EXPORT/TABLE/TABLE
-   EXPDP> . . exported "ITWILL"."EMP"    17.05 KB     107 rows
-   EXPDP> Job "SYS"."TSPITR_EXP_wBcd_kAxq" successfully completed
-Performing import of tables...
-   IMPDP> . . imported "ITWILL"."EMP_DRILL_0908"   17.05 KB   107 rows
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/COMMENT
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/INDEX/INDEX
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/CONSTRAINT/CONSTRAINT
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/CONSTRAINT/REF_CONSTRAINT
+   EXPDP> Processing object type TABLE_EXPORT/TABLE/TRIGGER
+   EXPDP> . . exported "HR"."EMPLOYEES"                            17.08 KB     107 rows
+   EXPDP> Master table "SYS"."TSPITR_EXP_eFax_zwCt" successfully loaded/unloaded
+   EXPDP> ******************************************************************************
+   EXPDP> Dump file set for SYS.TSPITR_EXP_eFax_zwCt is:
+   EXPDP>   /arch/aux_drill/employees_drill.dmp
+   EXPDP> Job "SYS"."TSPITR_EXP_eFax_zwCt" successfully completed at Mon Sep 8 09:18:18 2025 elapsed 0 00:03:20
+Export completed
+
+Not performing table import after point-in-time recovery
+
 Removing automatic instance
-Finished recover at 2025-09-08 09:48:22
+shutting down automatic instance
+Oracle instance shut down
+Automatic instance removed
+auxiliary instance file /arch/aux_drill/ORCL/datafile/o1_mf_temp_oc1x5sfc_.tmp deleted
+auxiliary instance file /arch/aux_drill/EFAX_PITR_ORCL/onlinelog/o1_mf_4_oc1xbl46_.log deleted
+...
+auxiliary instance file /arch/aux_drill/ORCL/controlfile/o1_mf_oc1x1cpq_.ctl deleted
+Finished recover at 2025-09-08 09:18:22
 
 [oracle@oel7v9 ~]$ date
 
-Mon Sep  8 09:48:31 KST 2025
+Mon Sep  8 09:18:26 KST 2025
 
--- 18분 소요.
+-- 10분 소요. 보조 인스턴스는 SGA 2GB 로 자동 생성되고(지정할 수 없다) SYSTEM, UNDO,
+-- SYSAUX 를 먼저 복원해 읽기 전용으로 연 뒤 대상 테이블스페이스(USERS)를 복원한다.
+-- 복원·복구·export 를 마치면 스스로 정리한다. 원본 DB 에는 아무것도 생기지 않았다.
+-- 아카이브 431, 432 는 디스크에 있어 백업에서 꺼내지 않았다. 430 만 백업에서 꺼냈다.
 
-SYS@orcl> SELECT COUNT(*) FROM itwill.emp_drill_0908;
+[oracle@oel7v9 ~]$ ls -l /arch/aux_drill/
+
+-rw-r-----. 1 oracle dba 274432 Sep  8 09:18 employees_drill.dmp
+
+[oracle@oel7v9 ~]$ strings /arch/aux_drill/employees_drill.dmp | grep -m1 -o '<OWNER_NAME>HR</OWNER_NAME><NAME>EMPLOYEES</NAME>'
+
+<OWNER_NAME>HR</OWNER_NAME><NAME>EMPLOYEES</NAME>
+
+SYS@orcl> SELECT COUNT(*) FROM dba_tables WHERE owner = 'HR' AND table_name LIKE 'EMPLOYEES%';
 
   COUNT(*)
 ----------
-       107
+         1
 
-SYS@orcl> SELECT COUNT(*) FROM (
-  2    SELECT employee_id, last_name, salary FROM itwill.emp
-  3    MINUS
-  4    SELECT employee_id, last_name, salary FROM itwill.emp_drill_0908);
+-- 덤프에 HR.EMPLOYEES 107건이 들었고 운영 DB 의 테이블은 하나 그대로다. 드릴 A 성공.
+-- 실제 복구가 필요할 때는 REMAP TABLE hr.employees:employees_rec 로 바로 임포트하거나
+-- 이 덤프를 impdp 로 들여온다.
 
-  COUNT(*)
-----------
-         0
-
--- 원본과 완전히 일치한다. 드릴 A 성공.
-
-SYS@orcl> DROP TABLE itwill.emp_drill_0908 PURGE;
-[oracle@oel7v9 ~]$ rm -rf /u02/aux_drill/*
+[oracle@oel7v9 ~]$ rm -rf /arch/aux_drill
 
 -- ────────────────────────────────────────────────
 -- 4-5. L4 드릴 B — 다른 서버에 DUPLICATE
 -- ────────────────────────────────────────────────
 -- 분기 훈련. 백업만으로 실제 데이터베이스가 열리는지 확인한다.
+-- 이 실습 환경의 orcl 백업은 oel7v9 로컬(/backup/ORCL)에 있다. oel7v9r2 에서 같은 경로로
+-- 보이도록 복사해 둔다(운영에서는 NFS 나 공유 스토리지가 이 역할을 한다).
 
-[oracle@oel7v9r2 ~]$ date
+[oracle@oel7v9 ~]$ cd /backup/ORCL
+[oracle@oel7v9 ORCL]$ scp full_ORCL_20250907_dk52t8gp_1_1 full_ORCL_20250907_dl52t8gp_1_1 \
+>   ORCL_20250907_438_1.bkp ORCL_20250907_439_1.bkp cf_c-1547823901-20250907-05 \
+>   oracle@oel7v9r2:/backup/ORCL/
 
-Mon Sep  8 10:02:11 KST 2025
+[oracle@oel7v9r2 ~]$ ls -l /backup/ORCL/
 
-[oracle@oel7v9r2 ~]$ mkdir -p /u02/oradata/orclDR /u02/admin/orcldr/adump
+-rw-r-----. 1 oracle oinstall  15528960 Sep  8 09:19 ORCL_20250907_438_1.bkp
+-rw-r-----. 1 oracle oinstall   5174272 Sep  8 09:19 ORCL_20250907_439_1.bkp
+-rw-r-----. 1 oracle oinstall  19890176 Sep  8 09:19 cf_c-1547823901-20250907-05
+-rw-r-----. 1 oracle oinstall 161447936 Sep  8 09:19 full_ORCL_20250907_dk52t8gp_1_1
+-rw-r-----. 1 oracle oinstall 405143552 Sep  8 09:19 full_ORCL_20250907_dl52t8gp_1_1
+
+-- 4-1 의 PREVIEW 가 알려 준 조각들이다. 580MB.
+
+SYS@hrdb> SHUTDOWN IMMEDIATE
+
+-- 메모리를 비운다([3-2]).
+
+[oracle@oel7v9r2 ~]$ mkdir -p /u01/app/oracle/admin/orcldr/adump
 [oracle@oel7v9r2 ~]$ orapwd file=$ORACLE_HOME/dbs/orapworcldr \
->   password=oracle_4U entries=5
+>   password=oracle_4U entries=5 format=12
 
 [oracle@oel7v9r2 ~]$ cat > $ORACLE_HOME/dbs/initorcldr.ora << 'EOF'
 db_name=orcldr
-sga_target=2G
+sga_target=1G
+pga_aggregate_target=200M
 db_block_size=8192
 compatible=19.0.0
-audit_file_dest=/u02/admin/orcldr/adump
-db_create_file_dest=/u02/oradata/orclDR
+db_create_file_dest='+FRA'
+audit_file_dest='/u01/app/oracle/admin/orcldr/adump'
+diagnostic_dest='/u01/app/oracle'
 EOF
 
--- 리스너 정적 등록 (17장의 조건)
-
-[oracle@oel7v9r2 ~]$ grep -A6 'SID_LIST_LISTENER' \
->   $ORACLE_HOME/network/admin/listener.ora
-
-SID_LIST_LISTENER =
-  (SID_LIST =
-    (SID_DESC =
-      (GLOBAL_DBNAME = orcldr)
-      (ORACLE_HOME = /u01/app/oracle/product/19.3.0/dbhome_1)
-      (SID_NAME = orcldr)))
-
-[oracle@oel7v9r2 ~]$ lsnrctl reload
-[oracle@oel7v9r2 ~]$ tnsping ORCLDR | tail -2
-
-OK (0 msec)
+-- db_create_file_dest 하나로 데이터파일·리두·컨트롤파일·임시파일이 모두 +FRA 에
+-- OMF 이름으로 만들어진다. control_files 는 적지 않는다. DUPLICATE 가 정한다.
 
 [oracle@oel7v9r2 ~]$ export ORACLE_SID=orcldr
 [oracle@oel7v9r2 ~]$ sqlplus -s / as sysdba << 'EOF'
@@ -418,10 +630,14 @@ EOF
 
 ORACLE instance started.
 
--- 백업 기반 복제 (원본 서버에 접속하지 않는다)
+-- 백업 기반 복제 (원본 서버에 접속하지 않는다). 보조 인스턴스는 같은 서버이므로
+-- 리스너 없이 OS 인증(auxiliary /)으로 붙는다.
 
-[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat \
->   auxiliary sys/oracle_4U@ORCLDR
+[oracle@oel7v9r2 ~]$ date
+
+Mon Sep  8 09:22:40 KST 2025
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat auxiliary /
 
 connected to recovery catalog database
 connected to auxiliary database: ORCLDR (not mounted)
@@ -436,51 +652,211 @@ RMAN> RUN {
 -- 카탈로그에 접속했으므로 백업 위치는 카탈로그가 안다. BACKUP LOCATION 은
 -- 카탈로그도 원본도 없을 때 쓰는 절이다(17-8). 어느 DB 인지는 이름과 DBID 로 알려 준다.
 
-Starting Duplicate Db at 2025-09-08 10:12:04
+allocated channel: a1
+allocated channel: a2
+
+Starting Duplicate Db at 2025-09-08 09:23:02
+contents of Memory Script:
+{
+   sql clone "create spfile from memory";
+}
+executing Memory Script
+sql statement: create spfile from memory
 
 contents of Memory Script:
 {
-   sql clone "alter system set  db_name = ''ORCL'' comment= ''Modified by RMAN
-duplicate'' scope=spfile";
-   sql clone "alter system set  db_unique_name = ''ORCLDR'' comment= ''Modified
-by RMAN duplicate'' scope=spfile";
+   shutdown clone immediate;
+   startup clone nomount;
+}
+executing Memory Script
+...
+duplicating Online logs to Oracle Managed File (OMF) location
+duplicating Datafiles to Oracle Managed File (OMF) location
+
+contents of Memory Script:
+{
+   sql clone "alter system set  control_files =
+  ''+FRA/ORCLDR/CONTROLFILE/current.273.1244525027'' comment=
+ ''Set by RMAN'' scope=spfile";
+   sql clone "alter system set  db_name =
+ ''ORCL'' comment=
+ ''Modified by RMAN duplicate'' scope=spfile";
+   sql clone "alter system set  db_unique_name =
+ ''orcldr'' comment=
+ ''Modified by RMAN duplicate'' scope=spfile";
    shutdown clone immediate;
    startup clone force nomount
-   restore clone primary controlfile from  '/backup/ORCL/c-1547823901-20250908-00';
+   restore clone primary controlfile;
    alter clone database mount;
 }
 executing Memory Script
 ...
-contents of Memory Script:
-{
-   set until scn  4104288;
-   set newname for clone datafile  1 to new;
-   set newname for clone datafile  2 to new;
-   ...
-   restore clone database;
-}
-executing Memory Script
+channel a1: restoring control file
+channel a1: reading from backup piece /backup/ORCL/cf_c-1547823901-20250907-05
+channel a1: restore complete, elapsed time: 00:00:03
+output file name=+FRA/ORCLDR/CONTROLFILE/current.273.1244525027
+Finished restore at 2025-09-08 09:24:33
+database mounted
 
-channel a1: restoring datafile 00001 to /u02/oradata/orclDR/ORCLDR/datafile/...
-channel a1: restore complete, elapsed time: 00:12:41
-channel a2: restore complete, elapsed time: 00:14:02
+contents of Memory Script:
+{
+   set until scn  38654022;
+   set newname for clone datafile  1 to new;
+   ...
+   restore
+   clone database
+   ;
+}
+executing Memory Script
+...
+channel a1: restoring datafile 00003 to +FRA
+channel a1: restoring datafile 00004 to +FRA
+...
+channel a1: reading from backup piece /backup/ORCL/full_ORCL_20250907_dk52t8gp_1_1
+channel a2: restoring datafile 00001 to +FRA
+...
+channel a2: reading from backup piece /backup/ORCL/full_ORCL_20250907_dl52t8gp_1_1
+channel a1: restore complete, elapsed time: 00:02:45
+channel a2: restore complete, elapsed time: 00:03:35
+Finished restore at 2025-09-08 09:28:13
+...
+datafile 1 switched to datafile copy
+input datafile copy RECID=34 STAMP=1244525293 file name=+FRA/ORCLDR/DATAFILE/system.279.1244525079
 ...
 contents of Memory Script:
 {
-   recover clone database delete archivelog;
+   set until scn  38654022;
+   recover
+   clone database
+    delete archivelog
+   ;
 }
 executing Memory Script
-media recovery complete, elapsed time: 00:04:11
-...
-   Alter clone database open resetlogs;
-database opened
-Finished Duplicate Db at 2025-09-08 10:44:33
+Starting recover at 2025-09-08 09:28:14
+starting media recovery
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of Duplicate Db command at 09/08/2025 09:28:16
+RMAN-05501: aborting duplication of target database
+RMAN-03015: error occurred in stored script Memory Script
+RMAN-06053: unable to perform media recovery because of missing log
+RMAN-06025: no backup of archived log for thread 1 with sequence 433 and starting SCN of 38653966 found to restore
+RMAN-06025: no backup of archived log for thread 1 with sequence 432 and starting SCN of 38653932 found to restore
+RMAN-06025: no backup of archived log for thread 1 with sequence 431 and starting SCN of 38652691 found to restore
+
+-- 복원은 됐는데 복구에서 멈췄다. 5분 걸린 복원이 헛일이 되었다.
+--
+-- << 원인 파악 >>
+-- 원본에 접속하지 않은 DUPLICATE 는 "어디까지 복구할지"를 카탈로그가 아는 가장 최근
+-- 아카이브(SCN 38654022, 시퀀스 433)로 정한다("set until scn"). 그런데 431~433 은
+-- 오늘 드릴 A 가 만든 아카이브라 아직 백업되지 않았고 원본 서버 디스크에만 있다.
+-- 이 서버에는 그 파일이 없으니 RMAN-06025 다.
+--
+-- 4-1 의 PREVIEW 가 "recovery will be done up to SCN 38652616" 이라고 했던 것과
+-- DUPLICATE 가 고른 38654022 가 다른 이유가 이것이다. PREVIEW 는 백업만 세고,
+-- DUPLICATE 는 디스크의 아카이브까지 센다.
+--
+-- UNTIL SCN 38652616 으로 끝을 앞당기면 될 것 같지만 그것도 안 된다.
+--   RMAN-06024: no backup or copy of the control file found to restore
+-- 컨트롤파일 자동백업이 그 SCN 뒤(17:57:24)에 만들어졌기 때문에, 그 SCN 이전의
+-- 컨트롤파일 백업을 찾다가 오늘 것 말고는 이 서버에 없어 실패한다.
+--
+-- << 수정 >> 카탈로그가 아는 아카이브도 같은 경로로 가져다 놓는다.
+-- (운영에서는 훈련 직전 원본에서 BACKUP ARCHIVELOG ALL 을 돌리는 편이 깔끔하다.
+--  그러면 백업만으로 끝까지 간다.)
+
+SYS@orcldr> SHUTDOWN ABORT
+[grid@oel7v9r2 ~]$ asmcmd rm -rf +FRA/ORCLDR
+[oracle@oel7v9r2 ~]$ rm -f $ORACLE_HOME/dbs/spfileorcldr.ora
+
+-- 실패한 복제본은 이렇게 지운다. DROP DATABASE 는 쓰지 않는다. [5] 오류 ③ 참조.
+
+[oracle@oel7v9 ~]$ scp /home/oracle/arch1/arch_1_43*_1244128516.arc \
+>   oracle@oel7v9r2:/home/oracle/arch1/
+
+[oracle@oel7v9r2 ~]$ sqlplus -s / as sysdba << 'EOF'
+STARTUP NOMOUNT PFILE='?/dbs/initorcldr.ora';
+EOF
 
 [oracle@oel7v9r2 ~]$ date
 
-Mon Sep  8 10:44:41 KST 2025
+Mon Sep  8 10:09:43 KST 2025
 
--- 42분 소요.
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat auxiliary /
+
+RMAN> RUN {
+2>   ALLOCATE AUXILIARY CHANNEL a1 DEVICE TYPE DISK;
+3>   ALLOCATE AUXILIARY CHANNEL a2 DEVICE TYPE DISK;
+4>   DUPLICATE DATABASE 'ORCL' DBID 1547823901 TO orcldr
+5>     NOFILENAMECHECK;
+6> }
+
+Starting Duplicate Db at 2025-09-08 10:09:45
+...
+Finished restore at 2025-09-08 10:15:01
+...
+Starting recover at 2025-09-08 10:15:02
+starting media recovery
+archived log for thread 1 with sequence 431 is already on disk as file /home/oracle/arch1/arch_1_431_1244128516.arc
+archived log for thread 1 with sequence 432 is already on disk as file /home/oracle/arch1/arch_1_432_1244128516.arc
+archived log for thread 1 with sequence 433 is already on disk as file /home/oracle/arch1/arch_1_433_1244128516.arc
+channel a1: starting archived log restore to default destination
+channel a1: restoring archived log
+archived log thread=1 sequence=430
+channel a1: reading from backup piece /backup/ORCL/ORCL_20250907_438_1.bkp
+channel a1: piece handle=/backup/ORCL/ORCL_20250907_438_1.bkp tag=TAG20250907T175719
+channel a1: restored backup piece 1
+channel a1: restore complete, elapsed time: 00:00:01
+archived log file name=/u01/app/oracle/product/19.3.0/dbhome_1/dbs/arch1_430_1244128516.dbf thread=1 sequence=430
+channel clone_default: deleting archived log(s)
+archived log file name=/home/oracle/arch1/arch_1_431_1244128516.arc thread=1 sequence=431
+archived log file name=/home/oracle/arch1/arch_1_432_1244128516.arc thread=1 sequence=432
+archived log file name=/home/oracle/arch1/arch_1_433_1244128516.arc thread=1 sequence=433
+media recovery complete, elapsed time: 00:00:03
+Finished recover at 2025-09-08 10:15:08
+...
+contents of Memory Script:
+{
+   sql clone "alter system set  db_name =
+ ''ORCLDR'' comment=
+ ''Reset to original value by RMAN'' scope=spfile";
+   sql clone "alter system reset  db_unique_name scope=spfile";
+}
+executing Memory Script
+...
+sql statement: CREATE CONTROLFILE REUSE SET DATABASE "ORCLDR" RESETLOGS ARCHIVELOG
+  MAXLOGFILES     16
+  MAXLOGMEMBERS      3
+  MAXDATAFILES      100
+  MAXINSTANCES     8
+  MAXLOGHISTORY     2920
+ LOGFILE
+  GROUP     1  SIZE 50 M ,
+  GROUP     3  SIZE 50 M ,
+  GROUP     4  SIZE 50 M
+ DATAFILE
+  '+FRA/ORCLDR/DATAFILE/system.279.1244527877'
+ CHARACTER SET AL32UTF8
+...
+Reenabling controlfile options for auxiliary database
+Executing: alter database enable block change tracking
+contents of Memory Script:
+{
+   Alter clone database open resetlogs;
+}
+executing Memory Script
+database opened
+Cannot remove created server parameter file
+Finished Duplicate Db at 2025-09-08 10:16:29
+
+[oracle@oel7v9r2 ~]$ date
+
+Mon Sep  8 10:16:33 KST 2025
+
+-- 6분 44초 소요. 복원 5분, 복구 6초, 컨트롤파일 재생성과 오픈 1분.
+-- 새 컨트롤파일을 만들면서(CREATE CONTROLFILE ... SET DATABASE "ORCLDR" RESETLOGS)
+-- 원본의 백업 기록은 사라진다. 변경 추적(08)까지 복제본에 다시 켜 준다.
 
 -- 검증
 
@@ -489,14 +865,15 @@ Mon Sep  8 10:44:41 KST 2025
 
 SYS@orcldr> SELECT name, dbid, open_mode FROM v$database;
 
-NAME       DBID       OPEN_MODE
----------- ---------- ----------
-ORCL       2884012773 READ WRITE
+NAME            DBID OPEN_MODE
+--------- ---------- --------------------
+ORCLDR    3300488065 READ WRITE
 
 -- DBID 가 다르다. DUPLICATE 는 새 DBID 를 만든다.
--- 재해 복구(고급 실습 07)와의 결정적 차이다.
+-- 재해 복구(고급 실습 07)와의 결정적 차이다. 그래서 카탈로그에 그대로 등록해도
+-- 원본과 섞이지 않는다.
 
-SYS@orcldr> SELECT COUNT(*) FROM itwill.emp;
+SYS@orcldr> SELECT COUNT(*) FROM hr.employees;
 
   COUNT(*)
 ----------
@@ -506,21 +883,52 @@ SYS@orcldr> SELECT COUNT(*) FROM dba_objects WHERE status = 'INVALID';
 
   COUNT(*)
 ----------
-         0
+        10
+
+SYS@orcl> SELECT COUNT(*) FROM dba_objects WHERE status = 'INVALID';
+
+  COUNT(*)
+----------
+        10
+
+-- 무효 객체 10개는 원본과 같은 수다. 복제로 생긴 것이 아니다.
 
 SYS@orcldr> SELECT tablespace_name, status FROM dba_tablespaces ORDER BY 1;
 
 TABLESPACE_NAME  STATUS
 ---------------- ---------
-EXAMPLE          ONLINE
-SAMPLE           ONLINE
+EXAM_TBS         ONLINE
+RTBS             ONLINE
 SYSAUX           ONLINE
 SYSTEM           ONLINE
+TBS13            ONLINE
+TBS_NEW          ONLINE
 TEMP             ONLINE
+TS_STG           ONLINE
 UNDOTBS1         ONLINE
 USERS            ONLINE
 
--- 백업만으로 실제 데이터베이스가 열렸다. 드릴 B 성공.
+10 rows selected.
+
+SYS@orcldr> SELECT name FROM v$tempfile;
+
+NAME
+------------------------------------------------------------
++FRA/ORCLDR/TEMPFILE/temp.288.1244528145
+
+SYS@orcldr> SELECT status, filename FROM v$block_change_tracking;
+
+STATUS     FILENAME
+---------- ----------------------------------------
+ENABLED    +FRA/ORCLDR/CHANGETRACKING/ctf.284.1244528133
+
+[grid@oel7v9r2 ~]$ asmcmd du +FRA/ORCLDR
+
+Used_MB      Mirror_used_MB
+   9272                9272
+
+-- 백업만으로 실제 데이터베이스가 열렸다. 임시 파일과 변경 추적 파일도 새 위치에 있다.
+-- 드릴 B 성공.
 
 --------------------------------------------------------------------------------
 [5] 오류 주입과 대응
@@ -539,31 +947,34 @@ SYS@sales> SELECT DISTINCT
   3    DBMS_ROWID.rowid_block_number(rowid) AS blk
   4  FROM  itwill.customer WHERE ROWNUM <= 1;
 
-  FNO   BLK
------ -----
-    4  2288
+       FNO        BLK
+---------- ----------
+         7        347
 
 SYS@sales> ALTER SYSTEM CHECKPOINT;
 SYS@sales> EXIT
 
 [oracle@oel7v9 ~]$ dd of=/u01/app/oracle/oradata/SALES/users01.dbf \
->   bs=8192 seek=2288 conv=notrunc count=1 if=/dev/urandom
+>   bs=8192 seek=347 conv=notrunc count=1 if=/dev/urandom
 
 1+0 records in
 1+0 records out
+8192 bytes (8.2 kB) copied, 0.000123322 s, 66.4 MB/s
 
 [oracle@oel7v9 ~]$ rman target / catalog rcatowner@rcat
 
 RMAN> BACKUP TABLESPACE users TAG 'CORRUPT_TEST';
 
-Starting backup at 2025-09-08 11:04:11
-
+Starting backup at 2025-09-08 10:28:58
+channel ORA_DISK_1: starting full datafile backup set
+channel ORA_DISK_1: specifying datafile(s) in backup set
+input datafile file number=00007 name=/u01/app/oracle/oradata/SALES/users01.dbf
+channel ORA_DISK_1: starting piece 1 at 2025-09-08 10:28:59
 RMAN-00571: ===========================================================
 RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
 RMAN-00571: ===========================================================
-RMAN-03009: failure of backup command on ORA_DISK_1 channel at 09/08/2025 11:04:22
-ORA-19566: exceeded limit of 0 corrupt blocks for file
-  /u01/app/oracle/oradata/SALES/users01.dbf
+RMAN-03009: failure of backup command on ORA_DISK_1 channel at 09/08/2025 10:29:02
+ORA-19566: exceeded limit of 0 corrupt blocks for file /u01/app/oracle/oradata/SALES/users01.dbf
 
 -- 기본 설정에서는 손상 블록을 만나면 백업이 중단된다.
 -- 이 동작이 첫 번째 방어선이다.
@@ -571,28 +982,35 @@ ORA-19566: exceeded limit of 0 corrupt blocks for file
 -- 문제는 MAXCORRUPT 를 설정한 경우다.
 
 RMAN> RUN {
-2>   SET MAXCORRUPT FOR DATAFILE 4 TO 10;
+2>   SET MAXCORRUPT FOR DATAFILE 7 TO 10;
 3>   BACKUP TABLESPACE users TAG 'CORRUPT_TEST';
 4> }
 
-executing command: SET MAXCORRUPT
+executing command: SET MAX CORRUPT
 
-Starting backup at 2025-09-08 11:06:11
+Starting backup at 2025-09-08 10:29:06
 channel ORA_DISK_1: starting full datafile backup set
-piece handle=/backup/SALES/5fa8e1g1_74_1_1 tag=CORRUPT_TEST
-Finished backup at 2025-09-08 11:07:02
+channel ORA_DISK_1: specifying datafile(s) in backup set
+input datafile file number=00007 name=/u01/app/oracle/oradata/SALES/users01.dbf
+channel ORA_DISK_1: starting piece 1 at 2025-09-08 10:29:07
+channel ORA_DISK_1: finished piece 1 at 2025-09-08 10:29:08
+piece handle=/backup/SALES/9952te03_1_1 tag=CORRUPT_TEST comment=NONE
+channel ORA_DISK_1: backup set complete, elapsed time: 00:00:01
+Finished backup at 2025-09-08 10:29:08
 
--- 백업이 성공했다. 손상 블록이 그대로 담겼다.
+-- 백업이 성공했다. 손상 블록이 그대로 담겼다. 경고 한 줄 없다.
 
 -- L2 검증을 해 본다.
 
 RMAN> RESTORE TABLESPACE users VALIDATE FROM TAG 'CORRUPT_TEST';
 
-Starting restore at 2025-09-08 11:08:11
+Starting restore at 2025-09-08 10:29:30
 channel ORA_DISK_1: starting validation of datafile backup set
-channel ORA_DISK_1: reading from backup piece /backup/SALES/5fa8e1g1_74_1_1
-channel ORA_DISK_1: validation complete, elapsed time: 00:00:32
-Finished restore at 2025-09-08 11:08:44
+channel ORA_DISK_1: reading from backup piece /backup/SALES/9952te03_1_1
+channel ORA_DISK_1: piece handle=/backup/SALES/9952te03_1_1 tag=CORRUPT_TEST
+channel ORA_DISK_1: restored backup piece 1
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:01
+Finished restore at 2025-09-08 10:29:31
 
 -- 통과한다. 백업 파일 자체는 읽히기 때문이다.
 
@@ -607,319 +1025,471 @@ Finished restore at 2025-09-08 11:08:44
 
 -- << 수정 >> L3 검증을 함께 수행한다.
 
--- 백업 세트 키를 LIST 로 찾아 직접 지정한다.
+-- 백업 세트 키를 LIST 로 찾아 직접 지정한다. TAG 는 SUMMARY 뒤에 쓴다.
 
-RMAN> LIST BACKUP TAG 'CORRUPT_TEST' SUMMARY;
+RMAN> LIST BACKUP SUMMARY TAG 'CORRUPT_TEST';
 
+List of Backups
+===============
 Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
-------- -- -- - ----------- ------------------- ------- ------- ---------- -------------
-88      B  F  A DISK        2025-09-08 11:07:02       1       1  NO         CORRUPT_TEST
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---
+15264   B  F  A DISK        2025-09-08 10:29:07 1       1       NO         CORRUPT_TEST
 
-RMAN> VALIDATE CHECK LOGICAL BACKUPSET 88;
+RMAN> VALIDATE CHECK LOGICAL BACKUPSET 15264;
 
-Starting validate at 2025-09-08 11:11:04
+Starting validate at 2025-09-08 10:29:38
 channel ORA_DISK_1: starting validation of datafile backup set
-channel ORA_DISK_1: reading from backup piece /backup/SALES/5fa8e1g1_74_1_1
-channel ORA_DISK_1: piece handle=/backup/SALES/5fa8e1g1_74_1_1
-channel ORA_DISK_1: validation complete, elapsed time: 00:00:41
+channel ORA_DISK_1: reading from backup piece /backup/SALES/9952te03_1_1
+channel ORA_DISK_1: piece handle=/backup/SALES/9952te03_1_1 tag=CORRUPT_TEST
+channel ORA_DISK_1: restored backup piece 1
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:01
+Finished validate at 2025-09-08 10:29:40
 
-List of Datafiles
-=================
-File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
----- ------ -------------- ------------ --------------- ----------
-4    FAILED 1              38400        131072          4104880
+-- 화면에는 손상 표가 나오지 않는다. 결과는 뷰에 남는다.
 
-Finished validate at 2025-09-08 11:11:48
+SYS@sales> SELECT * FROM v$database_block_corruption;
 
--- Marked Corrupt 가 1 이다. L3 이 잡아냈다.
+     FILE#     BLOCK#     BLOCKS CORRUPTION_CHANGE# CORRUPTIO     CON_ID
+---------- ---------- ---------- ------------------ --------- ----------
+         7        347          1                  0 CORRUPT            0
 
--- 원본을 복구한다.
+-- L3 이 잡아냈다. 파일 7 블록 347, CORRUPTION_TYPE = CORRUPT.
+
+-- 원본을 복구한다. 손상이 담긴 백업은 지운다.
 
 RMAN> DELETE NOPROMPT BACKUP TAG 'CORRUPT_TEST';
 
-RMAN> RECOVER DATAFILE 4 BLOCK 2288;
+deleted backup piece
+backup piece handle=/backup/SALES/9952te03_1_1 RECID=299 STAMP=1244575747
+Deleted 1 objects
 
-Starting recover at 2025-09-08 11:14:02
+RMAN> RECOVER DATAFILE 7 BLOCK 347;
+
+Starting recover at 2025-09-08 10:29:46
+channel ORA_DISK_1: restoring block(s)
+channel ORA_DISK_1: specifying block(s) to restore from backup set
+restoring blocks of datafile 00007
+channel ORA_DISK_1: reading from backup piece /backup/SALES/9352t719_1_1
+channel ORA_DISK_1: piece handle=/backup/SALES/9352t719_1_1 tag=SALES_FULL
+channel ORA_DISK_1: restored block(s) from backup piece 1
+channel ORA_DISK_1: block restore complete, elapsed time: 00:00:01
 starting media recovery
-media recovery complete, elapsed time: 00:00:06
-Finished recover at 2025-09-08 11:14:11
+media recovery complete, elapsed time: 00:00:07
+Finished recover at 2025-09-08 10:29:54
+
+-- 블록 하나를 어제 전체 백업(SALES_FULL)에서 꺼내 리두를 적용했다. 8초.
 
 SYS@sales> SELECT * FROM v$database_block_corruption;
 
 no rows selected
 
+SYS@sales> ALTER SYSTEM FLUSH BUFFER_CACHE;
+SYS@sales> SELECT COUNT(*) FROM itwill.customer;
+
+  COUNT(*)
+----------
+     50800
+
 RMAN> BACKUP TABLESPACE users TAG 'SALES_CLEAN';
 
-Finished backup at 2025-09-08 11:16:33
+Finished backup at 2025-09-08 10:30:03
 
 -- 교훈
 --   MAXCORRUPT 를 설정하면 손상을 감춘 백업이 만들어진다.
 --   설정했다면 L3 검증이 필수다.
---   그리고 검증 결과를 실제로 읽는 절차가 있어야 한다.
+--   그리고 검증 결과를 실제로 읽는 절차가 있어야 한다. VALIDATE 는 화면에 표를 찍지
+--   않고 v$database_block_corruption 에만 남긴다.
 
 -- ────────────────────────────────────────────────
 -- 오류 ② PREVIEW 에서 아카이브 갭 발견
 -- ────────────────────────────────────────────────
+-- hrdb 에서 재현한다. 야간에 아카이브 대상이 찼다며 당직자가 RMAN 으로 아카이브 두 개를
+-- 지운 상황이다(삭제 정책이 NONE 이라 막히지 않는다). 그 뒤 정기 아카이브 백업이 돌았다.
 
 [oracle@oel7v9r2 ~]$ export ORACLE_SID=hrdb
 [oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
 
-RMAN> RESTORE DATABASE UNTIL TIME "SYSDATE-4" PREVIEW SUMMARY;
+RMAN> SHOW ARCHIVELOG DELETION POLICY;
 
-Starting restore at 2025-09-08 11:22:04
+RMAN configuration parameters for database with db_unique_name HRDB are:
+CONFIGURE ARCHIVELOG DELETION POLICY TO NONE; # default
+
+RMAN> DELETE NOPROMPT ARCHIVELOG FROM SEQUENCE 22 UNTIL SEQUENCE 23;
+
+deleted archived log
+archived log file name=+FRA/HRDB/ARCHIVELOG/2025_09_08/thread_1_seq_22.277.1244530057 RECID=19 STAMP=1244530057
+Deleted 1 objects
+deleted archived log
+archived log file name=+FRA/HRDB/ARCHIVELOG/2025_09_08/thread_1_seq_23.278.1244530057 RECID=18 STAMP=1244530057
+Deleted 1 objects
+
+[oracle@oel7v9r2 ~]$ /home/oracle/rcadm/rc_backup_framework.sh hrdb gs_archive_only HRDB
+
+2025-09-08 10:47:58 === hrdb / gs_archive_only / prefix=HRDB ===
+2025-09-08 10:48:12 [OK] hrdb / gs_archive_only completed
+
+-- 백업은 정상으로 끝났다. 이제 검증한다.
+
+RMAN> RESTORE DATABASE PREVIEW SUMMARY;
+
+Starting restore at 2025-09-08 10:48:15
 
 List of Backups
 ===============
 Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
-------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
-1988    B  0  A DISK        2025-09-01 01:12:41       4       1  NO         HRDB_FULL
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---
+6534    B  0  A DISK        2025-09-08 00:18:37 1       1       NO         HRDB_INCR
+6533    B  0  A DISK        2025-09-08 00:18:28 1       1       NO         HRDB_INCR
+6542    B  F  A DISK        2025-09-08 01:00:59 1       1       NO         OLDCAT_01
 
-RMAN-00571: ===========================================================
-RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
-RMAN-00571: ===========================================================
-RMAN-03002: failure of restore command at 09/08/2025 11:22:08
-RMAN-06025: no backup of archived log for thread 1 with sequence 1204
-  and starting SCN of 8811024 found to restore
-RMAN-06025: no backup of archived log for thread 1 with sequence 1203
-  and starting SCN of 8809880 found to restore
+List of Archived Log Copies for database with db_unique_name HRDB
+=====================================================================
+Key     Thrd Seq     S Low Time
+------- ---- ------- - -------------------
+6524    1    12      A 2025-09-08 00:17:53
+        Name: +FRA/HRDB/ARCHIVELOG/2025_09_08/thread_1_seq_12.271.1244506741
+...
+15388   1    21      A 2025-09-08 10:47:20
+        Name: +FRA/HRDB/ARCHIVELOG/2025_09_08/thread_1_seq_21.285.1244530045
+15440   1    24      A 2025-09-08 10:47:37
+        Name: +FRA/HRDB/ARCHIVELOG/2025_09_08/thread_1_seq_24.278.1244530073
+...
+recovery will be done up to SCN 2046252
+Media recovery start SCN is 2046252
+Recovery must be done beyond SCN 2049197 to clear datafile fuzziness
+Finished restore at 2025-09-08 10:48:18
+
+-- 오류가 없다. 그런데 "recovery will be done up to SCN 2046252" 는 Level 0 직후의
+-- SCN 이다. 시퀀스 21 다음에 24 가 온다. 22, 23 이 없어 그 앞에서 멈춘다는 뜻인데
+-- PREVIEW 는 그것을 오류로 말하지 않는다. 숫자를 읽어야 안다.
+-- 끝 시점을 지정하면 비로소 오류가 된다.
+
+RMAN> RESTORE DATABASE UNTIL SEQUENCE 25 PREVIEW SUMMARY;
+
+Starting restore at 2025-09-08 10:48:22
+...
+15440   1    24      A 2025-09-08 10:47:37
+        Name: +FRA/HRDB/ARCHIVELOG/2025_09_08/thread_1_seq_24.278.1244530073
+RMAN-05117: archive logs missing from SCN 2070637 to SCN 2070645
+RMAN-05117: archive logs missing from SCN 2071235 to SCN 2071319
+recovery will be done up to SCN 2071752
+Media recovery start SCN is 2046252
+Recovery must be done beyond SCN 2049197 to clear datafile fuzziness
+Finished restore at 2025-09-08 10:48:24
 
 -- << 원인 파악 >>
--- 9월 1일 전체 백업은 있으나 9월 4일까지 복구할 아카이브가 없다.
--- 시퀀스 1203, 1204 가 백업되지 않았다.
+-- 빠진 구간이 두 곳이다. 카탈로그로 어느 시퀀스인지 확인한다.
 
-RC_REPORT@rcat> SELECT sequence#,
-  2    TO_CHAR(first_time,'MM-DD HH24:MI') AS created,
+RC_REPORT@rcat> SELECT a.sequence#,
+  2    TO_CHAR(a.first_time,'MM-DD HH24:MI') AS created,
   3    CASE WHEN EXISTS (SELECT 1 FROM rc_backup_redolog b
   4                      WHERE b.dbinc_key = a.dbinc_key
   5                      AND   b.sequence# = a.sequence#)
   6         THEN 'Y' ELSE '*** N ***' END AS backed_up
   7  FROM  rc_archived_log a
-  8  WHERE a.db_name = 'HRDB' AND a.sequence# BETWEEN 1198 AND 1210
+  8  WHERE a.db_name = 'HRDB' AND a.sequence# BETWEEN 18 AND 25
   9  ORDER BY a.sequence#;
 
-SEQUENCE# CREATED       BACKED_UP
---------- ------------- ----------
-     1198 09-03 22:04   Y
-     1199 09-03 23:12   Y
-     1200 09-04 00:41   Y
-     1201 09-04 01:22   Y
-     1202 09-04 01:58   Y
-     1203 09-04 02:14   *** N ***
-     1204 09-04 03:02   *** N ***
-     1205 09-04 04:11   Y
-     1206 09-04 05:02   Y
+ SEQUENCE# CREATED     BACKED_UP
+---------- ----------- ---------
+        18 09-08 10:34 Y
+        19 09-08 10:34 Y
+        20 09-08 10:34 Y
+        21 09-08 10:47 Y
+        24 09-08 10:47 Y
+        25 09-08 10:47 Y
 
--- 9월 4일 02:14 와 03:02 의 두 건만 빠졌다.
--- 그날 야간 백업이 02:12 에 끝났고 다음 아카이브 백업은 다음 날이었다.
--- 그 사이 생성된 아카이브가 백업되기 전에 지워졌다.
+6 rows selected.
 
+-- 22, 23 은 행 자체가 없다. rc_archived_log 는 지워진 아카이브를 보여 주지 않는다.
+-- "백업 안 됨(N)" 으로 나오지 않고 "없음" 으로 나온다는 점이 함정이다.
+-- (앞서 같은 방식으로 지워진 16, 17 도 같다. RMAN-05117 이 둘인 이유다.)
+
+RC_REPORT@rcat> COLUMN operation FORMAT A20
 RC_REPORT@rcat> SELECT operation, status,
   2    TO_CHAR(start_time,'MM-DD HH24:MI') AS started
   3  FROM  rc_rman_status
-  4  WHERE db_name = 'HRDB' AND start_time BETWEEN
-  5        TO_DATE('2025-09-04','YYYY-MM-DD') AND TO_DATE('2025-09-05','YYYY-MM-DD')
+  4  WHERE db_name = 'HRDB' AND start_time > SYSDATE - 1/24
+  5  AND   operation IN ('BACKUP','DELETE')
   6  ORDER BY start_time;
 
-OPERATION            STATUS      STARTED
--------------------- ----------- -------------
-BACKUP               COMPLETED   09-04 02:00
-DELETE               COMPLETED   09-04 05:40
+OPERATION            STATUS       STARTED
+-------------------- ------------ -----------
+DELETE               COMPLETED    09-08 10:34
+BACKUP               COMPLETED    09-08 10:47
+DELETE               COMPLETED    09-08 10:47
+BACKUP               COMPLETED    09-08 10:48
 
--- 05:40 의 DELETE 가 그것이다. 당직 기록을 보니 그날 새벽 아카이브 대상이 차서
--- 당직자가 오래된 아카이브부터 OS 에서 지우고 CROSSCHECK 와 DELETE EXPIRED 로
--- 기록을 정리했다. 아직 백업되지 않은 두 건이 그 안에 들어갔다.
+-- 10:47 의 DELETE 가 그것이다. 백업(10:48)보다 먼저 지웠다.
 --
 -- 정기 정리(DELETE OBSOLETE)는 보존 기간 안의 아카이브를 지우지 않는다.
 -- 사람이 지우면 정책은 소용없고, 백업되기 전에 지워진 구간으로는 복구할 수 없다.
---
--- 근본 원인은 아카이브 백업 주기가 하루 한 번이라 백업되지 않은 구간이 길다는 점이다.
+-- 근본 원인은 삭제 정책이 NONE 이라 RMAN 조차 막지 않았다는 점이다.
 
 -- << 수정 >> 두 가지를 함께 적용한다.
 
--- ① 아카이브 백업 주기를 4시간으로 줄인다
+-- ① 백업되지 않은 아카이브는 지우지 못하게 한다
+
+RMAN> CONFIGURE ARCHIVELOG DELETION POLICY TO BACKED UP 1 TIMES TO DISK;
+
+old RMAN configuration parameters:
+CONFIGURE ARCHIVELOG DELETION POLICY TO NONE;
+new RMAN configuration parameters:
+CONFIGURE ARCHIVELOG DELETION POLICY TO BACKED UP 1 TIMES TO DISK;
+new RMAN configuration parameters are successfully stored
+starting full resync of recovery catalog
+full resync complete
+
+RMAN> DELETE NOPROMPT ARCHIVELOG FROM SEQUENCE 24 UNTIL SEQUENCE 25;
+
+deleted archived log
+archived log file name=+FRA/HRDB/ARCHIVELOG/2025_09_08/thread_1_seq_25.277.1244530073 RECID=21 STAMP=1244530072
+Deleted 1 objects
+deleted archived log
+archived log file name=+FRA/HRDB/ARCHIVELOG/2025_09_08/thread_1_seq_24.278.1244530073 RECID=20 STAMP=1244530072
+Deleted 1 objects
+
+-- 24, 25 는 이미 백업되었으므로 정책이 지우게 둔다. 백업되지 않은 것이면 이 정책이
+-- 삭제를 거부한다. OS 삭제까지 막지는 못하므로 "아카이브는 RMAN 으로만 지운다" 를
+-- 운영 절차에 명시한다.
+
+-- ② 아카이브 백업 주기를 4시간으로 줄여 백업되지 않은 구간을 짧게 한다
 
 [oracle@oel7v9r2 ~]$ crontab -l | grep archive_only
 
 0 */4 * * * /home/oracle/rcadm/rc_backup_framework.sh hrdb gs_archive_only HRDB
 
--- ② 백업되지 않은 아카이브는 지우지 않도록 한다
+-- 세 DB 모두 확인한다. orcl 은 이미 설정되어 있고 sales 는 이번에 맞췄다.
 
-[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+RMAN> SHOW ARCHIVELOG DELETION POLICY;          -- sales
 
-RMAN> CONFIGURE ARCHIVELOG DELETION POLICY TO BACKED UP 1 TIMES TO DISK;
-
-new RMAN configuration parameters:
+RMAN configuration parameters for database with db_unique_name SALES are:
 CONFIGURE ARCHIVELOG DELETION POLICY TO BACKED UP 1 TIMES TO DISK;
-new RMAN configuration parameters are successfully stored
 
--- 이 설정이 있으면 RMAN 의 DELETE ARCHIVELOG 가 백업되지 않은 아카이브를 지우지 못한다.
--- OS 삭제까지 막지는 못하므로 "아카이브는 RMAN 으로만 지운다" 를 운영 절차에 명시한다.
+RMAN> SHOW ARCHIVELOG DELETION POLICY;          -- orcl
 
-RMAN> DELETE NOPROMPT OBSOLETE;
-
-RMAN retention policy is set to recovery window of 21 days
-no obsolete backups found
-
--- 세 DB 모두에 적용한다.
-
-[oracle@oel7v9 ~]$ for S in orcl sales; do
->   export ORACLE_SID=$S
->   echo "CONFIGURE ARCHIVELOG DELETION POLICY TO BACKED UP 1 TIMES TO DISK;" \
->     | rman target / catalog rcatowner@rcat | tail -3
-> done
-
-new RMAN configuration parameters are successfully stored
-new RMAN configuration parameters are successfully stored
+RMAN configuration parameters for database with db_unique_name ORCL are:
+CONFIGURE ARCHIVELOG DELETION POLICY TO BACKED UP 1 TIMES TO DISK;
 
 -- ────────────────────────────────────────────────
 -- 오류 ③ 훈련 중 공간 부족
 -- ────────────────────────────────────────────────
--- 드릴 B 를 다시 수행하려는데 이전 복제본이 남아 있다.
-
-[oracle@oel7v9r2 ~]$ df -h /u02
-
-Filesystem            Size  Used Avail Use% Mounted on
-/dev/mapper/ol-u02    300G  289G   11G  97% /u02
+-- 드릴 B 를 한 번 더 수행하되 이번에는 +DATA(여유 8.7GB) 에 만든다.
+-- orcl 은 8.9GB 다. 이전 복제본(orcldr, +FRA 9.3GB)이 아직 남아 있는 상태다.
 
 [oracle@oel7v9r2 ~]$ export ORACLE_SID=orcldr2
-[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat \
->   auxiliary sys/oracle_4U@ORCLDR2
+[oracle@oel7v9r2 ~]$ sed -e 's/orcldr/orcldr2/g' -e 's/+FRA/+DATA/' -e 's/sga_target=1G/sga_target=450M/' \
+>   $ORACLE_HOME/dbs/initorcldr.ora > $ORACLE_HOME/dbs/initorcldr2.ora
+[oracle@oel7v9r2 ~]$ orapwd file=$ORACLE_HOME/dbs/orapworcldr2 password=oracle_4U entries=5 format=12
+[oracle@oel7v9r2 ~]$ mkdir -p /u01/app/oracle/admin/orcldr2/adump
+[oracle@oel7v9r2 ~]$ sqlplus -s / as sysdba << 'EOF'
+STARTUP NOMOUNT PFILE='?/dbs/initorcldr2.ora';
+EOF
+
+[oracle@oel7v9r2 ~]$ rman catalog rcatowner@rcat auxiliary /
 
 RMAN> RUN {
 2>   ALLOCATE AUXILIARY CHANNEL a1 DEVICE TYPE DISK;
 3>   DUPLICATE DATABASE 'ORCL' DBID 1547823901 TO orcldr2 NOFILENAMECHECK;
 4> }
 
-Starting Duplicate Db at 2025-09-08 11:44:02
+Starting Duplicate Db at 2025-09-08 09:28:45
 ...
-channel a1: restoring datafile 00004
-
+channel a1: restoring datafile 00003 to +DATA
+channel a1: restoring datafile 00004 to +DATA
+...
+channel a1: reading from backup piece /backup/ORCL/full_ORCL_20250907_dk52t8gp_1_1
+channel a1: restore complete, elapsed time: 00:02:05
+channel a1: starting datafile backup set restore
+channel a1: restoring datafile 00001 to +DATA
+channel a1: restoring datafile 00002 to +DATA
+...
+channel a1: reading from backup piece /backup/ORCL/full_ORCL_20250907_dl52t8gp_1_1
+released channel: a1
 RMAN-00571: ===========================================================
 RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
 RMAN-00571: ===========================================================
-RMAN-03002: failure of Duplicate Db command at 09/08/2025 11:52:11
+RMAN-03002: failure of Duplicate Db command at 09/08/2025 09:32:22
 RMAN-05501: aborting duplication of target database
 RMAN-03015: error occurred in stored script Memory Script
-ORA-19870: error while restoring backup piece /backup/ORCL/5ba8d1e3_94_1_1
-ORA-19504: failed to create file "/u02/oradata/orclDR2/..."
-ORA-27044: unable to write the header block of file
-Linux-x86_64 Error: 28: No space left on device
+ORA-19870: error while restoring backup piece /backup/ORCL/full_ORCL_20250907_dl52t8gp_1_1
+ORA-19504: failed to create file "+DATA"
+ORA-17502: ksfdcre:4 Failed to create file +DATA
+ORA-15041: diskgroup "DATA" space exhausted
+
+[grid@oel7v9r2 ~]$ asmcmd du +DATA/ORCLDR2
+
+Used_MB      Mirror_used_MB
+   4548                4548
+
+[grid@oel7v9r2 ~]$ asmcmd ls +DATA/
+
+ASM/
+CRM/
+HRDB/
+ORCLDR2/
+RCAT/
+orapwasm
 
 -- << 원인 파악 >>
--- 이전 훈련의 복제본(orcldr)이 정리되지 않고 남아 있다.
--- 훈련은 자원을 소모하며 정리하지 않으면 다음 훈련을 막는다.
+-- +DATA 는 hrdb·rcat·crm 의 데이터파일이 있는 디스크그룹이다. 복제하다 만 파일 4.5GB 가
+-- 남아 있고 여유는 0 에 가깝다. 이 상태로 두면 운영 DB 의 자동 확장이 실패한다.
+-- 훈련은 자원을 소모하며 정리하지 않으면 다음 훈련을 막고 운영까지 위협한다.
 --
--- 더 큰 문제는 이 상황이 운영에도 영향을 준다는 점이다.
--- /u02 는 hrdb 의 데이터파일이 있는 파일 시스템이다.
--- 97% 상태에서 hrdb 의 자동 확장이 실패할 수 있다.
+-- 실패한 복제본을 지우려다 더 큰 사고가 날 뻔했다. 아래를 읽는다.
+
+-- << 잘못된 수정 >> DROP DATABASE INCLUDING BACKUPS
+
+[oracle@oel7v9r2 ~]$ rman target /
+
+RMAN> STARTUP FORCE MOUNT;
+RMAN> SQL 'ALTER SYSTEM ENABLE RESTRICTED SESSION';
+RMAN> DROP DATABASE INCLUDING BACKUPS NOPROMPT;
+
+database name is "ORCL" and DBID is 1547823901
+deleted backup piece
+backup piece handle=/backup/ORCL/ORCL_20250901_300_1.bkp RECID=286 STAMP=1244031329
+deleted backup piece
+backup piece handle=/backup/ORCL/ORCL_20250901_301_1.bkp RECID=287 STAMP=1244031329
+...
+deleted backup piece
+backup piece handle=/archive_keep/ORCL/ORCL_Q2_2025_db52ssal_1_1 RECID=396 STAMP=1244557653
+...
+deleted backup piece
+backup piece handle=/backup/ORCL/full_ORCL_20250907_dl52t8gp_1_1 RECID=405 STAMP=1244570138
+deleted backup piece
+backup piece handle=/backup/ORCL/full_ORCL_20250907_dk52t8gp_1_1 RECID=404 STAMP=1244570138
+Deleted 55 objects
+deleted archived log
+archived log file name=/home/oracle/arch1/arch_1_151_1244051103.arc RECID=322 STAMP=1244119682
+...
+Deleted 9 objects
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of drop db & bck command at 09/08/2025 09:32:57
+ORA-19855: cannot use clone mounted control file to drop database
+
+-- "database name is ORCL and DBID is 1547823901" — 복제하다 만 orcldr2 의 컨트롤파일은
+-- 원본 orcl 컨트롤파일의 복원본이다. 원본의 백업 55개와 아카이브 9개, 장기 보관
+-- KEEP 백업까지 전부 삭제 대상으로 잡았다. DROP 자체는 마지막에 ORA-19855 로 거부되지만
+-- INCLUDING BACKUPS 의 삭제는 그 전에 실행된다.
 --
--- 훈련 절차에 정리 단계가 반드시 포함되어야 한다.
+-- 이 서버에는 /backup/ORCL 에 옮겨 둔 조각 5개뿐이라 그것만 지워졌다. 원본 서버의 백업은
+-- 무사했다(CROSSCHECK 로 확인). /backup 이 NFS 로 공유된 구성이었다면 운영 백업 전체가
+-- 사라졌다. 운영 절차에서 가장 위험한 명령이 무엇인지 이 실습이 보여 준다.
 
-[oracle@oel7v9r2 ~]$ du -sh /u02/oradata/*
+-- << 올바른 수정 >> 실패한 복제본은 인스턴스를 내리고 파일을 직접 지운다.
 
-8.4G    /u02/oradata/orcl
-8.4G    /u02/oradata/orclDR
-2.1G    /u02/oradata/orclDR2
-9.2G    /u02/oradata/SALESV
+SYS@orcldr2> SHUTDOWN ABORT
 
--- 고급 실습 07의 ORCL, 09의 SALESV 도 남아 있다.
+[grid@oel7v9r2 ~]$ asmcmd rm -rf +DATA/ORCLDR2
+[oracle@oel7v9r2 ~]$ rm -f $ORACLE_HOME/dbs/*orcldr2*
+[oracle@oel7v9r2 ~]$ rm -rf /u01/app/oracle/admin/orcldr2
 
--- << 수정 >> 훈련 산출물을 정리한다.
+-- 완성된 복제본(RESETLOGS 로 열려 자기 DBID 를 가진 것)은 DROP DATABASE 로 지운다.
+-- 그때도 INCLUDING BACKUPS 는 붙이지 않는다. 복제본이 자기 백업을 만들지 않았으면
+-- 붙일 이유가 없고, 붙이면 어떤 기록을 따라 지울지 확신할 수 없다.
 
 [oracle@oel7v9r2 ~]$ export ORACLE_SID=orcldr
 [oracle@oel7v9r2 ~]$ rman target /
 
 RMAN> STARTUP FORCE MOUNT;
 RMAN> SQL 'ALTER SYSTEM ENABLE RESTRICTED SESSION';
-RMAN> DROP DATABASE INCLUDING BACKUPS NOPROMPT;
+RMAN> DROP DATABASE NOPROMPT;
 
-database name is "ORCL" and DBID is 2884012773
+database name is "ORCLDR" and DBID is 3300488065
 database dropped
 
-[oracle@oel7v9r2 ~]$ export ORACLE_SID=salesv
-[oracle@oel7v9r2 ~]$ rman target /
-RMAN> STARTUP FORCE MOUNT;
-RMAN> SQL 'ALTER SYSTEM ENABLE RESTRICTED SESSION';
-RMAN> DROP DATABASE INCLUDING BACKUPS NOPROMPT;
+-- 이번에는 이름이 ORCLDR, DBID 가 복제본 것이다. 이 두 줄을 읽고 나서 엔터를 친다.
 
-database dropped
+[grid@oel7v9r2 ~]$ asmcmd ls +FRA/
 
-[oracle@oel7v9r2 ~]$ rm -f $ORACLE_HOME/dbs/*orcldr* $ORACLE_HOME/dbs/*salesv*
-[oracle@oel7v9r2 ~]$ rm -rf /u02/oradata/orclDR2
+CRM/
+HRDB/
 
-[oracle@oel7v9r2 ~]$ df -h /u02
+[oracle@oel7v9r2 ~]$ rm -f $ORACLE_HOME/dbs/*orcldr*
+[oracle@oel7v9r2 ~]$ rm -rf /u01/app/oracle/admin/orcldr /backup/ORCL /home/oracle/arch1
 
-Filesystem            Size  Used Avail Use% Mounted on
-/dev/mapper/ol-u02    300G   57G  243G  19% /u02
+SYS@hrdb> STARTUP
 
--- DROP DATABASE 는 복제본에만 사용한다.
--- 운영 DB 에는 절대 실행하지 않는다.
--- SID 를 반드시 확인하고 실행한다.
+-- 옮겨 온 조각과 아카이브, 복제본 pfile 까지 지우고 hrdb 를 다시 올린다.
+-- 훈련은 정리까지가 한 작업이다.
 
 --------------------------------------------------------------------------------
 [6] 검증
 --------------------------------------------------------------------------------
 -- 6-1. 4단계 검증 결과 (요구 사항 ①②)
 
--- 단계 | 대상  | 결과   | 소요    | 발견 사항
--- -----|-------|--------|---------|---------------------------
--- L1   | ORCL  | PASS   |  1분    |
--- L1   | SALES | PASS   |  1분    |
--- L1   | HRDB  | FAIL   |  1분    | 아카이브 갭 (오류 ②)
--- L2   | ORCL  | PASS   |  3분    |
--- L2   | SALES | PASS   |  3분    |
--- L2   | HRDB  | PASS   |  2분    |
--- L3   | ORCL  | PASS   |  9분    |
--- L3   | SALES | FAIL   |  7분    | 블록 손상 1건 (오류 ①)
--- L3   | HRDB  | PASS   |  6분    |
--- L4-A | ORCL  | PASS   | 18분    |
--- L4-B | ORCL  | PASS   | 42분    |
+-- 단계 | 대상  | 결과   | 소요     | 발견 사항
+-- -----|-------|--------|----------|---------------------------
+-- L1   | ORCL  | PASS   |  20초    |
+-- L1   | SALES | PASS   |   3초    | ([7-1] 스크립트)
+-- L1   | HRDB  | FAIL   |   3초    | 아카이브 갭 22~23 (오류 ②). UNTIL 을 줘야 보인다
+-- L2   | ORCL  | PASS   |   7분    | 전체 백업 1분, 아카이브 백업 전량 검증이 6분
+-- L2   | SALES | PASS   |  49초    |
+-- L3   | ORCL  | PASS   | 2분 45초 | 8.7GB, Marked Corrupt 0
+-- L3   | SALES | FAIL   |   2초    | 블록 손상 1건 (오류 ①). L2 는 통과
+-- L3   | SALES | PASS   |  51초    | 복구 후 재검증
+-- L4-A | ORCL  | PASS   |  10분    | 보조 인스턴스 SGA 2GB 자동
+-- L4-B | ORCL  | FAIL→PASS | 5분+7분 | 첫 시도 RMAN-06025(아카이브 미백업), 재시도 성공
 --
--- L1 과 L3 에서 각각 하나씩 실제 문제를 발견했다.
--- 두 문제 모두 일일 리포트(고급 실습 02)에서는 잡히지 않았다.
+-- L1 과 L3 에서 각각 하나씩 실제 문제를 발견했고, L4-B 는 첫 시도에 실패했다.
+-- 셋 다 일일 리포트(고급 실습 02)에서는 잡히지 않는다.
 -- "백업이 있는가"와 "복구되는가"가 다른 질문임이 확인되었다.
 
 -- 6-2. 조치 후 재검증
+--
+-- 갭 구간의 아카이브는 되살릴 수 없다. 이미 지워진 것은 복구할 수 없다.
+-- 앞으로 발생하지 않도록 설정을 바꾼 것이 조치이고, 갭 이후에 새 Level 0 을 받아
+-- 그 시점부터 복구 경로를 다시 만드는 것이 나머지 조치다.
 
-[oracle@oel7v9r2 ~]$ export ORACLE_SID=hrdb
-[oracle@oel7v9r2 ~]$ rman target / catalog rcatowner@rcat
+[oracle@oel7v9r2 ~]$ /home/oracle/rcadm/rc_backup_framework.sh hrdb gs_weekly_full HRDB
 
-RMAN> RUN { EXECUTE GLOBAL SCRIPT gs_archive_only USING 'HRDB'; }
+2025-09-08 10:48:59 === hrdb / gs_weekly_full / prefix=HRDB ===
+2025-09-08 10:50:56 [OK] hrdb / gs_weekly_full completed
 
-executing global script: gs_archive_only
-Finished backup at 2025-09-08 12:04:22
+RMAN> RESTORE DATABASE PREVIEW SUMMARY;
 
-RMAN> RESTORE DATABASE UNTIL TIME "SYSDATE-1" PREVIEW SUMMARY;
-
-Starting restore at 2025-09-08 12:05:11
+Starting restore at 2025-09-08 10:51:00
 
 List of Backups
 ===============
 Key     TY LV S Device Type Completion Time     #Pieces #Copies Compressed Tag
-------- -- -- - ----------- ------------------- ------- ------- ---------- ---------
-1988    B  0  A DISK        2025-09-01 01:12:41       4       1  NO         HRDB_FULL
-2401    B  1  A DISK        2025-09-08 02:12:44       2       1  NO         HRDB_INCR
+------- -- -- - ----------- ------------------- ------- ------- ---------- ---
+15515   B  0  A DISK        2025-09-08 10:50:24 1       1       NO         HRDB_FULL
+15514   B  0  A DISK        2025-09-08 10:50:03 1       1       NO         HRDB_FULL
 
-Finished restore at 2025-09-08 12:05:22
+List of Archived Log Copies for database with db_unique_name HRDB
+=====================================================================
+Key     Thrd Seq     S Low Time
+------- ---- ------- - -------------------
+15513   1    29      A 2025-09-08 10:49:01
+        Name: +FRA/HRDB/ARCHIVELOG/2025_09_08/thread_1_seq_29.277.1244530235
 
--- 어제 시점 복구는 가능하다.
--- 9월 4일 구간은 여전히 불가능하다. 이미 지워진 아카이브는 되살릴 수 없다.
--- 앞으로는 발생하지 않도록 설정을 바꾼 것이 조치다.
+recovery will be done up to SCN 2072142
+Media recovery start SCN is 2072142
+Recovery must be done beyond SCN 2072143 to clear datafile fuzziness
+Finished restore at 2025-09-08 10:51:03
+
+-- 복구 경로가 새 Level 0 하나와 아카이브 하나로 단순해졌다.
+-- 갭 이전 시점(10:34~10:48)으로의 복구는 여전히 불가능하다. 그것은 기록으로 남긴다.
 
 [oracle@oel7v9 ~]$ export ORACLE_SID=sales
 [oracle@oel7v9 ~]$ rman target / catalog rcatowner@rcat
 
 RMAN> VALIDATE CHECK LOGICAL DATABASE;
 
+Starting validate at 2025-09-08 10:30:15
+...
 List of Datafiles
 =================
 File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
 ---- ------ -------------- ------------ --------------- ----------
-1    OK     0              12288        115200          4105022
-3    OK     0              10240         99840          4105022
-4    OK     0              36352        131072          4105022
-
-Finished validate at 2025-09-08 12:12:41
+7    OK     0              190          961             2178899
+  File Name: /u01/app/oracle/oradata/SALES/users01.dbf
+...
+Finished validate at 2025-09-08 10:33:51
 
 -- 6-3. RTO / RPO 산정 (요구 사항 ④)
 
@@ -930,36 +1500,37 @@ Finished validate at 2025-09-08 12:12:41
 --   → RPO 선언 : 4시간
 --
 --   이전(하루 1회)에는 최악 24시간이었다.
---   고급 실습 07의 실제 재해에서 1시간 15분을 잃었고
---   그것은 운이 좋았던 경우다.
+--   고급 실습 07의 재해에서 14초를 잃은 것은 백업 직후였기 때문이고, 운이었다.
 
 -- RTO 산정 (고급 실습 07 실측 + 이번 훈련)
 --   단계              | 실측    | 근거
 --   ------------------|---------|---------------------------
 --   장애 감지         |  10분   | 모니터링 알림 주기
 --   판단·의사결정     |  15분   | 런북 판정 절차
---   복구 정보 수집    |  14분   | 실습 07 실측
---   복원·복구         |  34분   | 실습 07 실측 (⑦+⑧)
---   오픈·검증         |  19분   | 실습 07 실측 (⑨+⑩)
+--   복구 정보 수집    |   1분   | 실습 07 실측 (dr_collect_info.sql)
+--   복원·복구         |   4분   | 실습 07 실측 (sales 1.8GB). orcl 8.7GB 는 드릴 B 기준 12분
+--   오픈·검증         |   5분   | 실습 07 실측
 --   서비스 전환       |  20분   | 접속 변경·커넥션 풀 재시작
 --   ------------------|---------|
---   합계              | 112분   |
---   여유 계수 1.5배   | 168분   | 최악 조건 가정
---   → RTO 선언 : 3시간
+--   합계 (sales)      |  55분   |
+--   합계 (orcl)       |  63분   | 복원·복구 12분 대입
+--   여유 계수 2배     | 126분   | 최악 조건 가정
+--   → RTO 선언 : 2시간 30분
 --
 --   여유 계수를 두는 이유
---     백업이 원격에 있을 수 있다
+--     백업이 원격에 있을 수 있다 (이번 드릴 B 는 백업을 옮기는 데 1분이 더 들었다)
 --     담당자가 즉시 대응하지 못할 수 있다
 --     동시에 여러 DB 가 영향받을 수 있다
+--     드릴 B 첫 시도처럼 한 번 실패하고 다시 할 수 있다 (+5분)
 
 -- 6-4. 임원 질문에 대한 답
 --
 --   질문 : "지금 장애가 나면 몇 시간 만에 복구됩니까?"
---   답   : "RTO 3시간, RPO 4시간입니다."
+--   답   : "RTO 2시간 30분, RPO 4시간입니다."
 --
 --   질문 : "그 답을 어떻게 확신합니까?"
 --   답   : "네 단계 검증을 매일·주간·분기로 수행하며
---           최근 실측치는 복구 112분입니다.
+--           최근 실측치는 sales 55분, orcl 63분입니다.
 --           분기 훈련에서 백업만으로 데이터베이스가 열리는 것을
 --           2025-09-08 에 확인했습니다."
 --
@@ -974,32 +1545,36 @@ Finished validate at 2025-09-08 12:12:41
 
 DR 훈련 기록
 ============
-일시      : 2025-09-08 09:30 ~ 11:52
+일시      : 2025-09-08 09:03 ~ 10:51
 수행자    : DBA팀
-대상      : ORCL
+대상      : ORCL (드릴 A·B), SALES·HRDB (L1~L3)
 
 드릴 A (테이블 복원)
-  방식    : RECOVER TABLE + 보조 인스턴스
-  대상    : itwill.emp (107건)
-  소요    : 18분
-  결과    : 성공. 원본과 MINUS 비교 0건
-  비고    : 보조 인스턴스 자동 생성·제거 정상
+  방식    : RECOVER TABLE + 보조 인스턴스, NOTABLEIMPORT
+  대상    : hr.employees (107건)
+  소요    : 10분
+  결과    : 성공. 덤프 employees_drill.dmp 생성, 운영 DB 변경 없음
+  비고    : 보조 인스턴스 SGA 2GB 자동 생성·제거 정상
 
 드릴 B (타 서버 복제)
-  방식    : DUPLICATE (카탈로그 접속, 원본 서버 미접속)
-  대상    : /backup/ORCL 의 백업만 사용
-  소요    : 42분
-  결과    : 성공. 무효 객체 0, 데이터 일치
-  비고    : 새 DBID 2884012773 생성 확인
+  방식    : DUPLICATE (카탈로그 접속, 원본 서버 미접속, 백업 조각 복사)
+  대상    : /backup/ORCL 의 당일 전체 백업 + 아카이브 백업
+  소요    : 12분 (첫 시도 5분 실패 + 재시도 7분)
+  결과    : 성공. 무효 객체 10 (원본과 동일), hr.employees 107건
+  비고    : 새 DBID 3300488065 생성 확인. hrdb 를 내리고 수행(메모리)
 
 발견 문제
-  1) HRDB 아카이브 갭 (9/4 sequence 1203~1204)
-     → 아카이브 백업 주기 4시간으로 변경
-     → ARCHIVELOG DELETION POLICY 설정
-  2) SALES 블록 손상 (file 4 block 2288)
+  1) 드릴 B 첫 시도 실패 — 백업되지 않은 아카이브(431~433)를 복구 종점으로 잡음
+     → 훈련 전 원본에서 아카이브 백업, 또는 아카이브 경로 공유
+  2) HRDB 아카이브 갭 (sequence 16~17, 22~23) — 삭제 정책 NONE
+     → ARCHIVELOG DELETION POLICY BACKED UP 1 TIMES 설정, 새 Level 0
+  3) SALES 블록 손상 (file 7 block 347) — L2 통과, L3 적발
      → RECOVER BLOCK 으로 복구, 재백업
-  3) 훈련 산출물 미정리로 /u02 97% 도달
-     → 훈련 절차에 정리 단계 추가
+  4) 오류 ③ 정리 중 DROP DATABASE INCLUDING BACKUPS 가 원본 백업을 삭제 대상으로 잡음
+     → 런북에서 INCLUDING BACKUPS 제거, 실패 복제본은 ABORT + 파일 삭제로 정리
+  5) rc_restore_validate.sh 의 L2 구문 오류(RESTORE SPFILE VALIDATE FROM AUTOBACKUP)와
+     구문 오류를 통과로 판정하던 결함
+     → 어순 수정, RMAN-00558/01009 를 실패로 판정
 
 다음 훈련 : 2025-12-08 (분기)
 
@@ -1007,6 +1582,8 @@ DR 훈련 기록
 [7] 운영 산출물과 확장 과제
 --------------------------------------------------------------------------------
 -- 7-1. rc_restore_validate.sh — L1~L3 자동 검증
+--
+-- 전문은 운영스크립트/rc_restore_validate.sh. 골격은 다음과 같다.
 
 [oracle@oel7v9 ~]$ cat /home/oracle/rcadm/rc_restore_validate.sh
 
@@ -1020,14 +1597,16 @@ export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1
 export ORACLE_SID=$SID
 export PATH=$ORACLE_HOME/bin:$PATH
 CATALOG="rcatowner/oracle_4U@rcat"
-D=$(date +%Y%m%d)
-LOG=/home/oracle/rcadm/verify/verify_${SID}_L${LEVEL}_${D}.log
 MAILTO="dba-team@example.com"
-mkdir -p /home/oracle/rcadm/verify
+VDIR=/home/oracle/rcadm/verify
+LOG=$VDIR/verify_${SID}_L${LEVEL}_$(date +%Y%m%d_%H%M).log
+mkdir -p $VDIR
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
 
-echo "=== $(date) $SID L$LEVEL 검증 시작 ===" > $LOG
+log "=== $SID L$LEVEL 복구 가능성 검증 시작 ==="
 
 # --- L1 : 메타 검증
+log "--- L1 : metadata ---"
 rman target / catalog $CATALOG >> $LOG 2>&1 << 'EOF'
 REPORT NEED BACKUP;
 REPORT UNRECOVERABLE;
@@ -1036,56 +1615,80 @@ RESTORE ARCHIVELOG ALL PREVIEW SUMMARY;
 RESTORE SPFILE PREVIEW;
 EXIT
 EOF
-
-if grep -qE 'RMAN-060(23|25|26)' $LOG; then
-  echo "[CRIT] L1 실패 : 복원 경로 결손" >> $LOG
-  grep -E 'RMAN-060(23|25|26)' $LOG >> $LOG
+# 구문 오류(RMAN-00558/01009)도 실패로 본다. 검증이 실행조차 안 된 것을 통과로 판정하면 안 된다.
+if grep -qE 'RMAN-060(23|25|26)|RMAN-00558|RMAN-01009' $LOG; then
+  log "[CRIT] L1 실패 : 복원 경로 결손 (또는 구문 오류)"
   mailx -s "[CRIT] L1 restore path broken ($SID)" $MAILTO < $LOG
   exit 1
 fi
-echo "[OK] L1 통과" >> $LOG
+log "[OK] L1 통과"
 [ "$LEVEL" = "1" ] && exit 0
 
 # --- L2 : 읽기 검증
+log "--- L2 : readability ---"
 rman target / catalog $CATALOG >> $LOG 2>&1 << 'EOF'
 RESTORE DATABASE VALIDATE;
 RESTORE ARCHIVELOG ALL VALIDATE;
-RESTORE SPFILE VALIDATE FROM AUTOBACKUP;
+RESTORE SPFILE FROM AUTOBACKUP VALIDATE;
+RESTORE CONTROLFILE FROM AUTOBACKUP VALIDATE;
 EXIT
 EOF
-
-if grep -qE 'ORA-19870|ORA-19501|RMAN-06172' $LOG; then
-  echo "[CRIT] L2 실패 : 백업 조각 읽기 불가" >> $LOG
+if grep -qE 'ORA-19870|ORA-19501|ORA-19505|RMAN-06172|RMAN-00558|RMAN-01009' $LOG; then
+  log "[CRIT] L2 실패 : 백업 조각을 읽을 수 없다"
   mailx -s "[CRIT] L2 backup unreadable ($SID)" $MAILTO < $LOG
   exit 1
 fi
-echo "[OK] L2 통과" >> $LOG
+log "[OK] L2 통과"
 [ "$LEVEL" = "2" ] && exit 0
 
 # --- L3 : 논리 검증 (부하가 있으므로 주간 수행)
+log "--- L3 : logical (block) ---"
 rman target / catalog $CATALOG >> $LOG 2>&1 << 'EOF'
 BACKUP VALIDATE CHECK LOGICAL DATABASE ARCHIVELOG ALL;
 EXIT
 EOF
-
 CORRUPT=$(sqlplus -s / as sysdba << 'EOF'
 SET PAGESIZE 0 FEEDBACK OFF HEADING OFF
 SELECT COUNT(*) FROM v$database_block_corruption;
 EXIT
 EOF
 )
-if [ "$CORRUPT" -gt 0 ]; then
-  echo "[CRIT] L3 실패 : 손상 블록 ${CORRUPT}건" >> $LOG
-  sqlplus -s / as sysdba >> $LOG << 'EOF'
-SELECT file#, block#, blocks, corruption_type FROM v$database_block_corruption;
-EOF
+if [ "${CORRUPT:-0}" -gt 0 ]; then
+  log "[CRIT] L3 실패 : 손상 블록 ${CORRUPT}건"
   mailx -s "[CRIT] L3 block corruption ($SID)" $MAILTO < $LOG
   exit 1
 fi
-
-echo "[OK] L3 통과 - 손상 블록 없음" >> $LOG
-find /home/oracle/rcadm/verify -name "verify_*.log" -mtime +90 -delete
+log "[OK] L3 통과 - 손상 블록 없음"
+find $VDIR -name "verify_*.log" -mtime +90 -delete
 exit 0
+
+-- 첫 버전은 L2 의 SPFILE 검증이 VALIDATE FROM AUTOBACKUP 어순이라 RMAN-01009 로 실행조차
+-- 되지 않았고, 그 오류를 잡는 패턴이 없어 "[OK] L2 통과" 를 찍었다.
+-- 검증 스크립트가 통과를 남발하면 없느니만 못하다. 만든 날 로그를 끝까지 읽는다.
+
+[oracle@oel7v9 ~]$ /home/oracle/rcadm/rc_restore_validate.sh orcl 2; echo EXIT=$?
+
+2025-09-08 10:50:54 === orcl L2 복구 가능성 검증 시작 ===
+2025-09-08 10:50:54 --- L1 : metadata ---
+2025-09-08 10:51:01 [OK] L1 통과
+2025-09-08 10:51:01 --- L2 : readability ---
+2025-09-08 10:58:25 [OK] L2 통과
+EXIT=0
+
+[oracle@oel7v9 ~]$ /home/oracle/rcadm/rc_restore_validate.sh sales 3; echo EXIT=$?
+
+2025-09-08 10:35:04 === sales L3 복구 가능성 검증 시작 ===
+2025-09-08 10:35:04 --- L1 : metadata ---
+2025-09-08 10:35:07 [OK] L1 통과
+2025-09-08 10:35:07 --- L2 : readability ---
+2025-09-08 10:35:56 [OK] L2 통과
+2025-09-08 10:35:56 --- L3 : logical (block) ---
+2025-09-08 10:36:47 [OK] L3 통과 - 손상 블록 없음
+EXIT=0
+
+-- orcl L2 가 7분 반이다. RESTORE ARCHIVELOG ALL VALIDATE 가 보존 기간 안의 아카이브
+-- 백업을 전부 읽기 때문이다. 매일 06시에 돌리기에는 길다. 아카이브는 FROM TIME 'SYSDATE-2'
+-- 로 줄이는 것을 검토한다([7-4] 과제 B).
 
 [oracle@oel7v9 ~]$ crontab -l | grep restore_validate
 
@@ -1097,186 +1700,74 @@ exit 0
 0 23 * * 6 /home/oracle/rcadm/rc_restore_validate.sh sales 3
 
 -- 7-2. dr_drill_runbook.md — DR 훈련·대응 런북
-
-[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/dr_drill_runbook.md
-
-# DR 대응·훈련 런북
-
-## 선언 값
-| 항목 | 값 | 근거 |
-|---|---|---|
-| RTO | 3시간 | 실측 112분 × 여유 1.5 |
-| RPO | 4시간 | 아카이브 백업 주기 |
-| 최종 갱신 | 2025-09-08 | 분기 훈련 후 |
-
-## 장애 대응 흐름
-
-### 1단계 — 감지와 판정 (목표 10분)
-1. 알림 확인. 어느 DB, 어떤 증상인지 기록
-2. `SELECT status FROM v$instance;` 로 상태 확인
-3. 판정표에서 유형 선택
-
-| 상태 | 증상 | 유형 | 절차 |
-|---|---|---|---|
-| OPEN | 특정 조회만 오류 | 블록 손상 | A |
-| MOUNTED | ORA-01157 | 데이터파일 유실 | B |
-| STARTED | ORA-00205 | 컨트롤파일 유실 | C |
-| 접속 불가 | 서버 무응답 | 서버 소실 | D |
-| OPEN | 잘못된 DML/DDL | 논리 오류 | E |
-
-### 2단계 — 손실 범위 산정 (목표 5분, 절차 D 필수)
-```
-sqlplus -s rc_report/<pw>@rcat @dr_collect_info.sql <DB_NAME>
-```
-`=== 8. 복구 가능 종점` 항목을 업무 담당자에게 즉시 통보한다.
-
-### 3단계 — 복구 수행
-
-**절차 A — 블록 손상**
-```
-RMAN> VALIDATE DATAFILE <n>;
-RMAN> RECOVER CORRUPTION LIST;
-SYS> SELECT * FROM v$database_block_corruption;   -- 비어야 한다
-```
-
-**절차 B — 데이터파일 유실**
-```
-SYS> SELECT file#, error FROM v$recover_file;     -- 범위 특정
--- SYSTEM/UNDO 아니면 오프라인 후 먼저 OPEN
-SYS> ALTER DATABASE DATAFILE <n> OFFLINE;
-SYS> ALTER DATABASE OPEN;
-RMAN> RESTORE DATAFILE <n>; RECOVER DATAFILE <n>;
-RMAN> SQL 'ALTER DATABASE DATAFILE <n> ONLINE';
-```
-
-**절차 C — 컨트롤파일 유실**
-```
-RMAN> STARTUP NOMOUNT;
-RMAN> SET DBID <DBID_LIST.txt 참조>;
-RMAN> RESTORE CONTROLFILE FROM AUTOBACKUP;
-RMAN> ALTER DATABASE MOUNT; RECOVER DATABASE;
--- RMAN-06054 시 온라인 리두 직접 지정
-SYS> RECOVER DATABASE USING BACKUP CONTROLFILE UNTIL CANCEL;
-SYS> ALTER DATABASE OPEN RESETLOGS;
-RMAN> RESYNC CATALOG; BACKUP DATABASE PLUS ARCHIVELOG;
-```
-
-**절차 D — 서버 소실 (고급 실습 07 전체 절차)**
-```
-sh /home/oracle/rcadm/dr_rebuild.sh <DB_NAME> <데이터경로> <아카이브경로>
-```
-출력된 안내를 순서대로 수행한다. 실측 67분.
-
-**절차 E — 논리 오류**
-| 상황 | 방법 |
-|---|---|
-| DELETE 후 UNDO 보존 내 | Flashback Query |
-| TRUNCATE | RECOVER TABLE |
-| DROP (PURGE 아님) | FLASHBACK TABLE TO BEFORE DROP |
-| 테이블스페이스 전체 | TSPITR |
-
-### 4단계 — 정상화 (모든 절차 공통)
-- [ ] `SELECT * FROM v$recover_file;` 결과 없음
-- [ ] 무효 객체 0 (`utlrp.sql` 필요 시 실행)
-- [ ] `RESYNC CATALOG` (세 DB 모두)
-- [ ] RESETLOGS 했다면 전체 백업
-- [ ] 일일 리포트 정상 출력 확인
-- [ ] 애플리케이션 접속 전환·커넥션 풀 재시작
-
-## 훈련 절차
-
-### 드릴 A (월간, 30분)
-```
-RMAN> RECOVER TABLE <스키마>.<테이블> UNTIL SCN <scn>
-      AUXILIARY DESTINATION '/u02/aux_drill'
-      REMAP TABLE <스키마>.<테이블>:<테이블>_drill_<MMDD>;
--- 원본과 MINUS 비교 → 0건 확인 → DROP ... PURGE → 보조 경로 정리
-```
-
-### 드릴 B (분기, 2시간)
-```
-1) 대상 서버에 경로·비밀번호 파일·최소 pfile 준비
-2) 리스너 정적 등록, tnsping 확인
-3) STARTUP NOMOUNT
-4) rman catalog <cat> auxiliary sys/<pw>@<TNS>
-   RUN { ALLOCATE AUXILIARY CHANNEL a1 DEVICE TYPE DISK;
-         DUPLICATE DATABASE '<원본명>' DBID <dbid> TO <복제명>
-         NOFILENAMECHECK; }
-   (카탈로그 없이 백업 파일만으로 할 때는 BACKUP LOCATION '<백업경로>' 를 쓴다)
-5) 검증 : 행 수, 무효 객체, 테이블스페이스 상태
-6) **정리** : STARTUP FORCE MOUNT → ENABLE RESTRICTED SESSION →
-              DROP DATABASE INCLUDING BACKUPS NOPROMPT
-              pfile·비밀번호 파일·디렉터리 제거, df 확인
-```
-
-### 드릴 C (연간, 3시간, 계획 정지 필요)
-운영 DB 를 실제로 정지하고 백업에서 복구한다.
-사전 승인, 서비스 공지, 롤백 계획(스냅숏)이 필수다.
-
-## 훈련 후 필수 작업
-1. 소요 시간을 단계별로 기록한다
-2. 발견 문제를 조치 항목으로 등록한다
-3. RTO/RPO 선언 값을 재검토한다
-4. 이 런북을 갱신한다
+--
+-- 전문은 운영스크립트/dr_drill_runbook.md. 이번 훈련으로 바뀐 곳은 다음이다.
+--   절차 D   : 실측 10분(오픈)·15분(정상화, sales 1.8GB). RESTORE·SWITCH·RECOVER 는 한 RUN.
+--              리두·임시·변경추적 파일 정리, local_listener 확인 항목 추가 (실습 07)
+--   드릴 A   : NOTABLEIMPORT 로 덤프까지만. 보조 인스턴스 SGA 2GB 자동
+--   드릴 B   : 같은 서버 보조 인스턴스는 auxiliary / 로. 훈련 전 아카이브 백업.
+--              첫 시도 실패 시 정리는 ABORT + 파일 삭제
+--   정리     : DROP DATABASE 에 INCLUDING BACKUPS 를 쓰지 않는다 (오류 ③)
+--   선언 값  : RTO 2시간 30분, RPO 4시간
 
 -- 7-3. 통합 대시보드
+--
+-- 전문은 운영스크립트/rc_dashboard.sql. rc_rman_configuration 은 NAME/VALUE 두 열이라
+-- 'CONTROLFILE AUTOBACKUP ON' 같은 문자열을 VALUE 에서 찾으면 안 된다.
 
-[oracle@oel7v9r2 ~]$ cat /home/oracle/rcadm/rc_dashboard.sql
+[oracle@oel7v9r2 ~]$ sqlplus -s rc_report/oracle_4U@rcat @/home/oracle/rcadm/rc_dashboard.sql
 
--- 백업·복구 체계 종합 현황
-SET LINESIZE 190 PAGESIZE 200 FEEDBACK OFF VERIFY OFF
-PROMPT ================================================================
-PROMPT  백업·복구 체계 종합 현황
-PROMPT ================================================================
+================================================================
+ 백업·복구 체계 종합 현황
+================================================================
 
-PROMPT === 1. DB별 요약 ===
-SELECT d.name AS db_name,
-  TO_CHAR(MAX(s.completion_time),'MM-DD HH24:MI') AS last_backup,
-  ROUND((SYSDATE - MAX(s.completion_time))*24,1) AS hours_ago,
-  (SELECT COUNT(*) FROM rc_backup_set k
-   WHERE k.db_key = d.db_key AND k.keep_options IS NOT NULL) AS keep_sets,
-  (SELECT COUNT(*) FROM rc_unusable_backupfile_details u
-   WHERE u.db_name = d.name) AS unusable,
-  (SELECT MAX(c.value) FROM rc_rman_configuration c
-   WHERE c.db_key = d.db_key AND c.value LIKE 'RETENTION%') AS retention
-FROM rc_database d LEFT JOIN rc_backup_set s ON d.db_key = s.db_key
-GROUP BY d.name, d.db_key ORDER BY d.name;
+=== 1. DB별 요약 ===
 
-PROMPT === 2. 설정 표준 준수 ===
-SELECT d.name AS db_name,
-  MAX(CASE WHEN c.value LIKE '%CONTROLFILE AUTOBACKUP ON%' THEN 'Y' END) AS cf_auto,
-  MAX(CASE WHEN c.value LIKE '%ARCHIVELOG DELETION POLICY%' THEN 'Y' END) AS arch_pol,
-  MAX(CASE WHEN c.value LIKE '%ENCRYPTION FOR DATABASE ON%' THEN 'Y' END) AS enc,
-  MAX(CASE WHEN c.value LIKE '%RETENTION%21 DAYS%' THEN 'Y' END) AS ret21
-FROM rc_database d LEFT JOIN rc_rman_configuration c ON d.db_key = c.db_key
-GROUP BY d.name ORDER BY d.name;
+DB_NAME  LAST_BACKUP  HOURS_AGO  KEEP_SETS   UNUSABLE RETENTION
+-------- ----------- ---------- ---------- ---------- --------------------------------
+HRDB     09-08 10:50         .4          0          0 TO RECOVERY WINDOW OF 21 DAYS
+ORCL     09-07 17:57      -10.7          4          0 TO RECOVERY WINDOW OF 7 DAYS
+SALES    09-08 10:30      -12.2         12          0 TO RECOVERY WINDOW OF 21 DAYS
 
-PROMPT === 3. 최근 30일 작업 성공률 ===
-SELECT db_name, COUNT(*) AS jobs,
-  SUM(CASE WHEN status='COMPLETED' THEN 1 ELSE 0 END) AS ok,
-  ROUND(SUM(CASE WHEN status='COMPLETED' THEN 1 ELSE 0 END)/COUNT(*)*100,1) AS pct
-FROM rc_rman_backup_job_details
-WHERE start_time > SYSDATE - 30 GROUP BY db_name ORDER BY db_name;
+=== 2. 설정 표준 준수 (Y = 명시 설정됨, 빈칸 = 기본값 또는 미설정) ===
 
-PROMPT === 4. 복구 가능 범위 ===
-SELECT d.name AS db_name,
-  TO_CHAR(MIN(s.completion_time),'MM-DD') AS oldest_backup,
-  ROUND(SYSDATE - MIN(s.completion_time)) AS days_back
-FROM rc_database d JOIN rc_backup_set s ON d.db_key = s.db_key
-WHERE s.keep_options IS NULL
-GROUP BY d.name ORDER BY d.name;
+DB_NAME  CF_AUTO ARCH_POL ENC RET21 BK_OPT
+-------- ------- -------- --- ----- ------
+HRDB     Y       Y            Y     Y
+ORCL     Y       Y
+SALES    Y       Y        Y   Y     Y
 
--- 실행 결과
+=== 3. 최근 30일 작업 성공률 ===
 
-=== 2. 설정 표준 준수 ===
-DB_NAME  CF_AUTO ARCH_POL ENC RET21
--------- ------- -------- --- -----
-HRDB     Y       Y            Y
-ORCL     Y       Y            Y
-SALES    Y       Y        Y   Y
+DB_NAME        JOBS         OK        PCT
+-------- ---------- ---------- ----------
+HRDB              8          7       87.5
+ORCL             21         19       90.5
+SALES           132        127       96.2
 
--- ORCL 과 HRDB 의 암호화가 아직 적용되지 않았다.
--- 고급 실습 09의 확장 과제 A 로 남아 있는 항목이다.
+=== 4. 복구 가능 범위 (KEEP 제외, 가장 오래된 백업) ===
+
+DB_NAME  OLDEST_BACKUP  DAYS_BACK
+-------- ------------- ----------
+HRDB     09-07                  0
+ORCL     09-03                  5
+SALES    09-08                  0
+
+=== 5. 아카이브 백업 공백 (백업되지 않은 아카이브가 있는 DB) ===
+
+DB_NAME  NOT_BACKED_UP  FIRST_SEQ   LAST_SEQ
+-------- ------------- ---------- ----------
+ORCL                 3        431        433
+SALES                3         19         21
+
+-- HOURS_AGO 가 음수인 것은 카탈로그 서버(oel7v9r2)의 시간대가 운영계와 달라서다.
+-- 시간 비교는 대상 DB 쪽에서 하거나 두 서버의 시간대를 맞춘다(고급 실습 06).
+-- ORCL 은 암호화·21일 보존·백업 최적화가 표준과 다르다. 별도 일일 작업(7일 보존)을
+-- 쓰기 때문이며 통합 여부는 [7-4] 과제 E 로 남긴다. HRDB 의 암호화는 09 확장 과제 A 다.
+-- 5절이 이 실습에서 새로 넣은 절이다. 오류 ② 를 매일 아침 잡아 주는 조회다.
+-- ORCL 431~433 은 드릴 A 가 만든 아카이브로 다음 야간 백업에서 해소된다. HRDB 는 새 Level 0
+-- 뒤라 공백이 없다. 지워진 아카이브(16~17, 22~23)는 rc_archived_log 에 없으므로 이 절에도
+-- 안 나온다. 그것은 [7-1]의 L1(UNTIL 을 준 PREVIEW)이 잡는다.
 
 -- 7-4. 확장 과제
 --
@@ -1284,17 +1775,16 @@ SALES    Y       Y        Y   Y
 --   드릴 B 를 완전 자동화할 수 있는지 검토하시오.
 --   자동화했을 때의 이점과 위험을 정리하고
 --   자동화하지 않는 편이 나은 이유가 있다면 서술한다.
---   힌트 : 정리 단계 실패 시 운영 파일 시스템에 미치는 영향.
+--   힌트 : 오류 ③ 의 정리 단계. 자동화된 정리가 잘못된 대상을 지우면 어떻게 되는가.
 --
--- 과제 B. 검증 결과의 이력화
+-- 과제 B. 검증 비용 줄이기
+--   orcl 의 L2 가 7분 반 걸렸다. 어느 명령이 시간을 쓰는지 로그로 확인하고
+--   RESTORE ARCHIVELOG 의 범위를 FROM TIME 으로 제한했을 때 무엇을 놓치는지 논하시오.
+--
+-- 과제 C. 검증 결과의 이력화
 --   현재 검증 결과는 로그 파일로만 남는다.
 --   결과를 테이블에 적재해 추세를 보는 구조를 설계하시오.
 --   "지난 90일간 L2 실패 횟수" 같은 질문에 답할 수 있어야 한다.
---
--- 과제 C. RTO 재산정
---   [6-3]의 여유 계수 1.5 는 임의로 정한 값이다.
---   각 단계의 변동 폭을 근거로 더 타당한 값을 도출하시오.
---   여러 DB 가 동시에 영향받는 경우도 반영한다.
 --
 -- 과제 D. 드릴 C 계획서
 --   연간 훈련(운영 DB 실제 복구) 계획서를 작성하시오.
@@ -1304,49 +1794,58 @@ SALES    Y       Y        Y   Y
 -- 과제 E. 전체 체계 점검
 --   고급 실습 01~10에서 만든 산출물을 모두 나열하고
 --   각각이 어떤 위험을 줄이는지 대응표를 작성하시오.
---   빠진 위험이 있다면 추가 대책을 제안한다.
+--   orcl 의 별도 일일 작업(FULL_DAILY, 7일)을 표준 프레임워크로 통합할지도 판단한다.
 
 -- 7-5. 정리 — 이 과정 전체에서 남는 것
 --
 --   실습 01  rc_vpc_setup.sql / rc_vpc_audit.sql
---   실습 02  rc_daily_report.sql / rc_daily_report.sh / rc_monthly_audit.sql
---   실습 03  글로벌 스크립트 5종 / rc_backup_framework.sh / rc_export_scripts.sh
+--   실습 02  rc_daily_report.sql
+--   실습 03  글로벌 스크립트 5종 / rc_backup_framework.sh / rc_global_scripts.rman
 --   실습 04  rc_maint_crosscheck.sh / rc_find_orphan.sh
---   실습 05  rc_catalog_backup.sh / RUNBOOK_catalog_recovery.md
---   실습 06  rc_keep_audit.sql / rc_quarterly_keep.sh / rc_keep_verify.sh
+--   실습 05  rc_catalog_backup.sh
+--   실습 06  rc_keep_audit.sql
 --   실습 07  dr_collect_info.sql / dr_rebuild.sh
---   실습 08  rc_perf_analysis.sql / bench_backup.sh / rc_nightly.sh
+--   실습 08  rc_perf_analysis.sql / bench_backup.sh / rc_nightly.sh / rc_bct_check.sh
 --   실습 09  rc_secure_export.sh / rc_wallet_check.sh
 --   실습 10  rc_restore_validate.sh / dr_drill_runbook.md / rc_dashboard.sql
 --
 --   이 스크립트들은 그대로 현업에 반입할 수 있다.
 --   다만 비밀번호 처리, 메일 주소, 경로는 각 조직에 맞게 고쳐야 한다.
+--   그리고 반입한 날 한 번 돌려 로그를 끝까지 읽는다. 이 과정에서 그렇게 잡은 결함이
+--   rc_secure_export.sh(09), rc_restore_validate.sh(10) 에 하나씩 있었다.
 
 -- 실무 포인트
 -- 1) "백업이 있는가"와 "복구되는가"는 다른 질문이다.
 --    일일 리포트는 전자를, 이 검증 체계는 후자를 본다.
---    이번 검증에서 두 가지 문제를 새로 발견했고
---    둘 다 일일 리포트에서는 정상으로 보였다.
+--    이번 검증에서 세 가지 문제를 새로 발견했고
+--    셋 다 일일 리포트에서는 정상으로 보였다.
 --
 -- 2) 검증 단계마다 잡아내는 것이 다르다.
 --    L2 가 통과해도 블록 손상은 남아 있을 수 있다.
 --    MAXCORRUPT 를 설정했다면 L3 검증이 필수다.
+--    PREVIEW 는 UNTIL 을 줘야 갭을 오류로 말한다. 없으면 "up to SCN" 숫자로만 말한다.
 --
 -- 3) 아카이브 삭제 정책을 반드시 설정한다.
 --    CONFIGURE ARCHIVELOG DELETION POLICY TO BACKED UP 1 TIMES 가
 --    백업되지 않은 아카이브의 삭제를 구조적으로 막는다.
 --    보존 정책만으로는 이 사고를 막을 수 없다.
 --
--- 4) 훈련은 정리까지가 한 작업이다.
---    복제본을 남겨 두면 다음 훈련을 막고 운영 파일 시스템까지 압박한다.
---    DROP DATABASE 는 SID 를 반드시 확인하고 실행한다.
+-- 4) 원본 없이 하는 DUPLICATE 는 카탈로그가 아는 마지막 아카이브까지 가려 한다.
+--    그 아카이브가 백업되지 않았으면 복원까지 다 하고 복구에서 실패한다.
+--    훈련 전에 아카이브를 백업한다. 그것이 5분을 아낀다.
 --
--- 5) RTO 와 RPO 는 선언이 아니라 실측이다.
+-- 5) DROP DATABASE INCLUDING BACKUPS 를 복제본에 쓰지 않는다.
+--    복제하다 만 인스턴스의 컨트롤파일은 원본 것이다. 원본의 백업을 지우려 든다.
+--    실패한 복제본은 ABORT 하고 파일을 지운다. 완성된 복제본은 DROP DATABASE 만 쓴다.
+--    어느 쪽이든 "database name is ... DBID is ..." 줄을 읽고 나서 진행한다.
+--
+-- 6) RTO 와 RPO 는 선언이 아니라 실측이다.
 --    "3시간"이라고 적어 두는 것과
---    "실측 112분에 여유 1.5배"라고 말하는 것은 다르다.
+--    "실측 63분에 여유 2배"라고 말하는 것은 다르다.
 --    후자만이 임원 질문에 답이 된다.
 --
--- 6) 런북은 훈련 후에 갱신한다.
+-- 7) 런북은 훈련 후에 갱신한다.
+--    이번 훈련에서 런북의 드릴 B 정리 절차 자체가 위험한 것으로 드러났다.
 --    훈련에서 발견한 것이 반영되지 않은 런북은
 --    실제 장애에서 그 문제를 다시 만나게 한다.
 --    문서로만 있는 절차는 동작하지 않는다.

@@ -56,9 +56,9 @@ RESTORE SPFILE PREVIEW;
 EXIT
 EOF
 
-if grep -qE 'RMAN-060(23|25|26)' "$LOG"; then
-  log "[CRIT] L1 실패 : 복원 경로 결손"
-  grep -E 'RMAN-060(23|25|26)' "$LOG" | head -10 | tee -a "$LOG"
+if grep -qE 'RMAN-060(23|25|26)|RMAN-00558|RMAN-01009' "$LOG"; then
+  log "[CRIT] L1 실패 : 복원 경로 결손 (또는 구문 오류)"
+  grep -E 'RMAN-060(23|25|26)|RMAN-00558|RMAN-01009' "$LOG" | head -10 | tee -a "$LOG"
   log "       원인 후보 : 아카이브 미백업 상태에서 삭제 / 백업 세대 부족"
   log "       조치      : CONFIGURE ARCHIVELOG DELETION POLICY TO BACKED UP 1 TIMES"
   mailx -s "[CRIT] L1 restore path broken ($SID)" "$MAILTO" < "$LOG"
@@ -82,11 +82,13 @@ log "--- L2 : readability ---"
 rman target / catalog $CATALOG >> "$LOG" 2>&1 << 'EOF'
 RESTORE DATABASE VALIDATE;
 RESTORE ARCHIVELOG ALL VALIDATE;
-RESTORE SPFILE VALIDATE FROM AUTOBACKUP;
+RESTORE SPFILE FROM AUTOBACKUP VALIDATE;
+RESTORE CONTROLFILE FROM AUTOBACKUP VALIDATE;
 EXIT
 EOF
 
-if grep -qE 'ORA-19870|ORA-19501|ORA-19505|RMAN-06172' "$LOG"; then
+# 구문 오류(RMAN-00558/01009)도 실패로 본다. 검증이 실행조차 안 된 것을 통과로 판정하면 안 된다.
+if grep -qE 'ORA-19870|ORA-19501|ORA-19505|RMAN-06172|RMAN-00558|RMAN-01009' "$LOG"; then
   log "[CRIT] L2 실패 : 백업 조각을 읽을 수 없다"
   grep -E 'ORA-19870|ORA-19501|ORA-19505|RMAN-06172' "$LOG" | head -10
   log "       조치 : CROSSCHECK 후 EXPIRED 확인. 매체 접근 상태 점검"

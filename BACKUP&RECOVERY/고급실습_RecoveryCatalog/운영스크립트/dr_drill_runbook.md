@@ -2,7 +2,7 @@
 
 출처: 고급 실습 10
 대상: orcl, sales, hrdb (Recovery Catalog `rcatowner@rcat`)
-최종 갱신: 분기 훈련 직후 반드시 갱신할 것
+최종 갱신: 2025-09-08 분기 훈련 (분기 훈련 직후 반드시 갱신할 것)
 
 ---
 
@@ -10,11 +10,11 @@
 
 | 항목 | 값 | 근거 |
 |---|---|---|
-| RTO | 3시간 | 실측 112분 × 여유 계수 1.5 |
+| RTO | 2시간 30분 | 실측 55분(sales)·63분(orcl) × 여유 계수 2 |
 | RPO | 4시간 | 아카이브 백업 주기 |
 | 최종 검증 | 분기 훈련일 | 드릴 B 성공 |
 
-여유 계수를 두는 이유 — 백업이 원격에 있을 수 있고, 담당자가 즉시 대응하지 못할 수 있으며, 여러 DB가 동시에 영향받을 수 있다.
+여유 계수를 두는 이유 — 백업이 원격에 있을 수 있고, 담당자가 즉시 대응하지 못할 수 있으며, 여러 DB가 동시에 영향받을 수 있고, 드릴 B 첫 시도처럼 한 번 실패하고 다시 할 수 있다.
 
 ---
 
@@ -124,12 +124,14 @@ SQL>  ALTER DATABASE OPEN RESETLOGS;
 sh /home/oracle/rcadm/dr_rebuild.sh <DB_NAME> <데이터경로> <아카이브경로>
 ```
 
-출력된 8단계 안내를 순서대로 수행한다. 실측 67분(오픈까지), 95분(백업 정상화까지).
+출력된 8단계 안내를 순서대로 수행한다. 실측 10분(오픈까지), 15분(백업 정상화까지) — sales 1.8GB 기준. orcl(8.7GB)은 복원·복구가 12분(드릴 B 실측).
 
 순서를 **바꿀 수 없는** 지점:
-1. spfile → 2. 컨트롤파일 → 3. MOUNT → 4. SET NEWNAME + RESTORE → 5. SWITCH → 6. RECOVER → 7. OPEN RESETLOGS
+1. spfile → 2. 컨트롤파일 → 3. MOUNT → 4. SET NEWNAME + RESTORE + SWITCH + RECOVER (한 RUN 블록) → 5. 리두 RENAME · 임시파일 DROP · BCT DISABLE → 6. OPEN RESETLOGS → 7. 임시파일 ADD · local_listener 확인
 
-`SET NEWNAME` · `RESTORE` · `SWITCH` · `RECOVER` 는 한 묶음이다. 하나라도 빠지면 `ORA-19504` 또는 `RMAN-06571` 로 막힌다.
+`SET NEWNAME` · `RESTORE` · `SWITCH` · `RECOVER` 는 **한 RUN 블록**에 넣는다. 백업 컨트롤파일로 마운트한 상태에서는 카탈로그가 SWITCH 결과를 모르므로(`ORA-00236`) 세션을 나누면 `RMAN-06094` 로 막힌다. 이미 나뉘었다면 `rman target /`(nocatalog)로 RECOVER 한다.
+
+spfile 을 고칠 때 경로(control_files, 아카이브, 감사)뿐 아니라 `local_listener` 별칭과 지갑 파라미터(`wallet_root`)도 본다. 리두 RENAME 전에 `SET LINESIZE 200` — 80 이면 SPOOL 된 경로에 개행이 들어가 `ORA-00344` 가 난다.
 
 ### 절차 E — 논리 오류
 
@@ -167,47 +169,57 @@ sh /home/oracle/rcadm/dr_rebuild.sh <DB_NAME> <데이터경로> <아카이브경
 ### 드릴 A — 테이블 복원 (월간, 30분, 서비스 영향 없음)
 
 ```
+SQL>  ALTER SYSTEM ARCHIVE LOG CURRENT;             -- 복구 시점이 아카이브 안에 있도록
 SQL>  SELECT current_scn FROM v$database;          -- 기록
 RMAN> RECOVER TABLE <스키마>.<테이블>
         UNTIL SCN <scn>
-        AUXILIARY DESTINATION '/u02/aux_drill'
-        REMAP TABLE <스키마>.<테이블>:<테이블>_drill_<MMDD>;
-SQL>  SELECT COUNT(*) FROM (
-        SELECT * FROM <원본> MINUS SELECT * FROM <복원본>);   -- 0 이어야 한다
-SQL>  DROP TABLE <복원본> PURGE;
-$     rm -rf /u02/aux_drill/*
+        AUXILIARY DESTINATION '/arch/aux_drill'
+        DATAPUMP DESTINATION '/arch/aux_drill'
+        DUMP FILE '<테이블>_drill.dmp'
+        NOTABLEIMPORT;                               -- 훈련은 덤프까지만. 운영 DB 무변경
+$     ls -l /arch/aux_drill/*.dmp                    -- 덤프 확인
+$     rm -rf /arch/aux_drill
 ```
 
-REMAP 을 쓰는 이유 — 원래 이름으로 받으면 현재 테이블과 충돌한다.
+실측 10분(orcl, USERS 2.7GB). 보조 인스턴스는 SGA 2GB 로 자동 생성되므로 메모리를 먼저 본다.
+실제 복구에서는 `NOTABLEIMPORT` 대신 `REMAP TABLE <스키마>.<테이블>:<테이블>_rec` 로 바로 들여온다. 원래 이름으로 받으면 현재 테이블과 충돌한다.
 
 ### 드릴 B — 타 서버 복제 (분기, 2시간, 서비스 영향 없음)
 
-1. 대상 서버에 경로·비밀번호 파일·최소 pfile 준비
-2. 리스너 **정적 등록** 후 `lsnrctl reload`, `tnsping` 확인
-   NOMOUNT 인스턴스는 동적 등록을 하지 못한다. 없으면 `ORA-12514`.
-3. `STARTUP NOMOUNT`
-4. 복제 수행
+0. **훈련 전 원본에서 아카이브를 백업한다** (`gs_archive_only`). 원본 없이 하는 DUPLICATE 는 카탈로그가 아는 마지막 아카이브까지 가려 하므로, 백업되지 않은 아카이브가 있으면 복원을 다 하고 복구에서 `RMAN-06025` 로 실패한다.
+1. 대상 서버에 공간·메모리 확인(복제 인스턴스 SGA 만큼 비운다), 경로·비밀번호 파일·최소 pfile 준비. ASM 이면 `db_create_file_dest='+DG'` 하나면 된다.
+2. 백업 조각이 원본과 **같은 경로**로 보이게 한다(NFS, 공유 스토리지, 없으면 복사). 카탈로그 접속 복제는 카탈로그가 아는 경로를 그대로 쓴다.
+3. `STARTUP NOMOUNT PFILE=...`
+4. 복제 수행 — 같은 서버의 보조 인스턴스는 리스너 없이 `auxiliary /` 로 붙는다
    ```
-   $ rman catalog rcatowner@rcat auxiliary sys/<pw>@<TNS>
-   RMAN> SET DBID <dbid>;
+   $ rman catalog rcatowner@rcat auxiliary /
    RMAN> RUN {
            ALLOCATE AUXILIARY CHANNEL a1 DEVICE TYPE DISK;
            ALLOCATE AUXILIARY CHANNEL a2 DEVICE TYPE DISK;
-           DUPLICATE DATABASE TO <복제명>
-             BACKUP LOCATION '<백업경로>' NOFILENAMECHECK;
+           DUPLICATE DATABASE '<원본명>' DBID <dbid> TO <복제명> NOFILENAMECHECK;
          }
    ```
-   원본 서버에 접속하지 않는다. **백업만으로 열리는지**를 보는 것이 목적이다.
-5. 검증 — 행 수, 무효 객체 0, 테이블스페이스 상태, **DBID 가 원본과 다른지**
-6. **정리 (생략 금지)**
-   ```
-   RMAN> STARTUP FORCE MOUNT;
-   RMAN> DROP DATABASE INCLUDING BACKUPS NOPROMPT;
-   $     rm -f $ORACLE_HOME/dbs/*<복제명>*
-   $     df -h   # 공간 회수 확인
-   ```
-   > `DROP DATABASE` 는 복제본에만 쓴다. **SID 를 반드시 확인**하고 실행한다.
-   > 정리하지 않으면 다음 훈련을 막고 운영 파일 시스템까지 압박한다.
+   원본 서버에 접속하지 않는다. **백업만으로 열리는지**를 보는 것이 목적이다. 카탈로그도 없으면 `BACKUP LOCATION '<경로>'` 를 쓴다.
+   원격 서버의 보조 인스턴스에 붙을 때만 리스너 **정적 등록**이 필요하다(NOMOUNT 는 동적 등록을 못 한다, `ORA-12514`).
+5. 검증 — 행 수, 무효 객체 수(원본과 같은지), 테이블스페이스 상태, **DBID 가 원본과 다른지**
+6. **정리 (생략 금지)** — 두 경우를 구분한다
+   - 복제가 **실패한** 인스턴스(컨트롤파일이 원본 것의 복원본):
+     ```
+     SQL>  SHUTDOWN ABORT
+     $     asmcmd rm -rf +DG/<복제명>    # 또는 rm -rf <경로>
+     $     rm -f $ORACLE_HOME/dbs/*<복제명>*
+     ```
+   - 복제가 **완성된** 인스턴스(RESETLOGS 로 열려 자기 DBID 를 가진 것):
+     ```
+     RMAN> STARTUP FORCE MOUNT;
+     RMAN> SQL 'ALTER SYSTEM ENABLE RESTRICTED SESSION';
+     RMAN> DROP DATABASE NOPROMPT;      -- "database name is <복제명> and DBID is <새 DBID>" 를 읽고 진행
+     $     rm -f $ORACLE_HOME/dbs/*<복제명>*
+     $     df -h / asmcmd lsdg           # 공간 회수 확인
+     ```
+   > **`DROP DATABASE INCLUDING BACKUPS` 는 쓰지 않는다.** 복제하다 만 인스턴스에서 실행하면 원본 컨트롤파일 기록을 따라 **원본의 백업과 아카이브를 지우려 든다**(2025-09-08 훈련에서 실제로 55개를 삭제 대상으로 잡았다. 백업 경로가 공유되어 있었다면 운영 백업이 사라졌다).
+   > `DROP DATABASE` 는 복제본에만 쓴다. **SID 와 "database name is ..." 줄을 반드시 확인**하고 실행한다.
+   > 정리하지 않으면 다음 훈련을 막고 운영 파일 시스템·디스크그룹까지 압박한다(`ORA-15041`).
 
 ### 드릴 C — 운영 DB 실제 복구 (연간, 3시간, 계획 정지 필요)
 
@@ -259,6 +271,7 @@ DR 훈련 기록
 | `dr_collect_info.sql` | 재해 시 카탈로그에서 복구 정보 수집 |
 | `dr_rebuild.sh` | 타 서버 재구축 준비·구문 생성 |
 | `rc_restore_validate.sh` | L1~L3 상시 검증 |
+| `rc_dashboard.sql` | 백업·복구 체계 종합 현황 (아카이브 공백 포함) |
 | `rc_daily_report.sql` | 일일 백업 점검 |
 | `rc_catalog_backup.sh` | 카탈로그 3중 보호 |
 | `DBID_LIST.txt` | 컨트롤파일 유실 시 필수. **운영 서버 밖에도 보관** |
