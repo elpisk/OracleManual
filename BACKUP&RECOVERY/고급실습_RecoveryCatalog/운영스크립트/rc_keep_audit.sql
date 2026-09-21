@@ -3,6 +3,8 @@
 --  출처   : 고급 실습 06
 --  실행   : sqlplus -s rc_report/<pw>@rcat @rc_keep_audit.sql
 --  용도   : 분기 감사 제출, 보관 누락 점검, 만료 예정 확인
+--  주의   : rc_backup_set 에는 db_name·tag 열이 없다. DB 이름은 rc_database, 태그는 rc_backup_piece 에서 가져온다.
+--           keep_until 은 대상 DB 의 시각이다. 카탈로그 서버와 시간대가 다르면 SYSDATE 비교가 어긋난다.
 --
 --  KEEP 백업의 성질
 --    - 보존 정책의 대상에서 제외된다 (DELETE OBSOLETE 로 지워지지 않는다)
@@ -28,7 +30,7 @@ PROMPT =========================================================================
 
 PROMPT
 PROMPT === 1. 보관 중인 백업 세트 ===
-SELECT d.name AS db_name, s.tag,
+SELECT d.name AS db_name, p.tag,
        TO_CHAR(s.completion_time,'YYYY-MM-DD')            AS taken,
        CASE WHEN s.keep_until IS NULL THEN 'FOREVER'
             ELSE TO_CHAR(s.keep_until,'YYYY-MM-DD') END   AS keep_until,
@@ -39,28 +41,29 @@ SELECT d.name AS db_name, s.tag,
 FROM   rc_backup_set s JOIN rc_backup_piece p ON s.bs_key = p.bs_key
        JOIN rc_database d ON d.db_key = s.db_key
 WHERE  s.keep_options IS NOT NULL
-GROUP  BY d.name, s.tag, s.completion_time, s.keep_until, s.keep_options
+GROUP  BY d.name, p.tag, s.completion_time, s.keep_until, s.keep_options
 ORDER  BY d.name, s.completion_time;
 
 PROMPT
 PROMPT === 2. 만료 예정 (&expire_warn_days 일 내) ===
-SELECT d.name AS db_name, s.tag,
+SELECT DISTINCT d.name AS db_name, p.tag,
        TO_CHAR(s.keep_until,'YYYY-MM-DD')   AS expires,
        ROUND(s.keep_until - SYSDATE)        AS days_left
-FROM   rc_backup_set s JOIN rc_database d ON d.db_key = s.db_key
+FROM   rc_backup_set s JOIN rc_backup_piece p ON p.bs_key = s.bs_key
+       JOIN rc_database d ON d.db_key = s.db_key
 WHERE  s.keep_until IS NOT NULL
 AND    s.keep_until BETWEEN SYSDATE AND SYSDATE + &expire_warn_days
-ORDER  BY s.keep_until;
+ORDER  BY 3;
 
 PROMPT
 PROMPT === 3. 조각 상태 (파일이 실제로 있는가) ===
 PROMPT     status A=AVAILABLE  X=EXPIRED(파일 없음)  U=UNAVAILABLE
-SELECT d.name AS db_name, s.tag, p.status, COUNT(*) AS pieces,
+SELECT d.name AS db_name, p.tag, p.status, COUNT(*) AS pieces,
        ROUND(SUM(p.bytes)/1024/1024) AS mb
 FROM   rc_backup_set s JOIN rc_backup_piece p ON s.bs_key = p.bs_key
        JOIN rc_database d ON d.db_key = s.db_key
 WHERE  s.keep_options IS NOT NULL
-GROUP  BY d.name, s.tag, p.status
+GROUP  BY d.name, p.tag, p.status
 ORDER  BY d.name, p.status;
 
 PROMPT
@@ -105,9 +108,10 @@ GROUP  BY d.name ORDER BY d.name;
 
 PROMPT
 PROMPT === 7. 복원 지점 (KEEP 백업과 짝을 이루어야 의미가 있다) ===
-SELECT db_name, name AS restore_point, scn,
-       TO_CHAR(time,'YYYY-MM-DD HH24:MI') AS created
-FROM   rc_restore_point ORDER BY db_name, scn;
+SELECT d.name AS db_name, r.name AS restore_point, r.scn,
+       TO_CHAR(r.restore_point_time,'YYYY-MM-DD HH24:MI') AS created
+FROM   rc_restore_point r JOIN rc_database d ON d.dbinc_key = r.dbinc_key
+ORDER  BY d.name, r.scn;
 
 PROMPT
 PROMPT ================================================================================
