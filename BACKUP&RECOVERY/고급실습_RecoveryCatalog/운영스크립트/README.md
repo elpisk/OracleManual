@@ -9,6 +9,8 @@ Recovery Catalog 고급 과정(고급 실습 01~10)에서 만든 산출물을 �
 
 | 파일 | 출처 | 용도 | 실행 주기 |
 |---|---|---|---|
+| `rc_vpc_setup.sql` | 실습 01 | VPC 담당자 계정 생성 | 담당자 추가 시 |
+| `rc_vpc_audit.sql` | 실습 01 | VPC 권한 현황 점검 | 분기 |
 | `rc_daily_report.sql` | 실습 02 | 일일 백업 점검 리포트 | 매일 08시 |
 | `rc_backup_framework.sh` | 실습 03 | 글로벌 스크립트 기반 백업 실행기 | 매일/주간 |
 | `rc_global_scripts.rman` | 실습 03 | 표준 글로벌 스토어드 스크립트 정의 | 최초 1회·변경 시 |
@@ -57,6 +59,7 @@ Recovery Catalog 고급 과정(고급 실습 01~10)에서 만든 산출물을 �
 새 환경에 적용할 때는 아래 순서를 따른다. 뒤 항목이 앞 항목을 전제로 한다.
 
 1. **카탈로그 구성** — 계정, `CREATE CATALOG`, 대상 DB `REGISTER`
+   - 권한을 나눌 계획이면 `dbmsrmanvpc.sql -vpd` 와 `UPGRADE CATALOG` 로 VPD 모델을 먼저 켠다 (`rc_vpc_setup.sql`)
 2. **읽기 전용 리포팅 계정** — `rc_report` 생성과 `RC_*` 뷰 SELECT 권한
    - 리포트를 VPC 계정으로 돌리면 **조용히 일부만 점검**하고 정상으로 보고한다
 3. **표준 CONFIGURE 적용** — `rc_global_scripts.rman` 하단 참조
