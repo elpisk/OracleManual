@@ -12,6 +12,9 @@
 #  절대 원칙
 #    rcat 의 백업은 nocatalog 로 받는다.
 #    자기 자신을 저장소로 쓰면 그것이 사라졌을 때 복구할 수 없다.
+#
+#  VPD 모델 카탈로그(고급 실습 01)의 Data Pump 는 EXEMPT ACCESS POLICY 를 가진 계정으로 받는다.
+#    SYSTEM 으로 받으면 ORA-39181 과 함께 표마다 0 rows 인 빈 덤프가 만들어진다.
 # =============================================================================
 set -u
 
@@ -23,6 +26,8 @@ export NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS'
 # ---- 환경에 맞게 수정할 값 ----
 CATOWNER=rcatowner
 SYSPW=oracle_4U
+DPUSER=rc_dpadm                        # DATAPUMP_EXP/IMP_FULL_DATABASE + EXEMPT ACCESS POLICY
+DPPW=oracle_4U
 DUMPDIR_OBJ=dp_rcat                    # 디렉터리 객체 이름
 DUMPDIR=/u03/dpdump_rcat               # 그 실제 경로
 SCRIPTS="gs_daily_incr gs_weekly_full gs_archive_only gs_maint_obsolete gs_validate_full"
@@ -33,7 +38,7 @@ MAILTO="dba-team@example.com"
 # --------------------------------
 
 D=$(date +%Y%m%d)
-LOG=/home/oracle/rcadm/log/rcat_protect_$D.log
+LOG=/home/oracle/rcadm/log/rcat_protect_${D}_$(date +%H%M).log   # 실행마다 새 로그 (누적하면 옛 오류가 판정에 섞인다)
 mkdir -p "$(dirname "$LOG")" "$FALLBACK" "$DUMPDIR"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
@@ -70,9 +75,9 @@ EOF
 #   덤프 도중 백업 작업이 돌면 테이블별 시점이 어긋난다.
 # ---------------------------------------------------------------------------
 log "--- 2차 : 스키마 Data Pump ---"
-expdp system/$SYSPW directory=$DUMPDIR_OBJ \
+expdp $DPUSER/$DPPW directory=$DUMPDIR_OBJ \
   dumpfile=${CATOWNER}_${D}.dmp logfile=${CATOWNER}_${D}.log \
-  schemas=$CATOWNER flashback_time=systimestamp >> "$LOG" 2>&1
+  schemas=$CATOWNER flashback_time=systimestamp reuse_dumpfiles=y >> "$LOG" 2>&1
 
 # ---------------------------------------------------------------------------
 # 3차 : 글로벌 스크립트 추출과 배포
@@ -115,9 +120,10 @@ cat /home/oracle/rcadm/DBID_LIST.txt >> "$LOG"
 # ---------------------------------------------------------------------------
 # 판정
 # ---------------------------------------------------------------------------
-if grep -qE 'ORA-[0-9]{5}|RMAN-[0-9]{5}' "$LOG"; then
+#   RMAN-07553 같은 warning: 줄은 실패가 아니다 (RECOVERY WINDOW > CONTROL_FILE_RECORD_KEEP_TIME 경고)
+if grep -E 'ORA-[0-9]{5}|RMAN-[0-9]{5}' "$LOG" | grep -qv 'warning:'; then
   log "[FAIL] errors detected"
-  grep -E 'ORA-[0-9]{5}|RMAN-[0-9]{5}' "$LOG" | head -20
+  grep -E 'ORA-[0-9]{5}|RMAN-[0-9]{5}' "$LOG" | grep -v 'warning:' | head -20
   mailx -s "[FAIL] catalog protection $D" "$MAILTO" < "$LOG"
   exit 1
 fi
@@ -136,7 +142,7 @@ exit 0
 #  고급 실습 05의 RUNBOOK_catalog_recovery.md 를 볼 것
 #
 #  스키마만 유실 (권장 경로, 약 11분)
-#    impdp system/<pw> directory=dp_rcat \
+#    impdp rc_dpadm/<pw> directory=dp_rcat \
 #      dumpfile=rcatowner_<최신날짜>.dmp schemas=rcatowner
 #    @?/rdbms/admin/utlrp.sql
 #    → 각 대상 DB에서 RESYNC CATALOG
