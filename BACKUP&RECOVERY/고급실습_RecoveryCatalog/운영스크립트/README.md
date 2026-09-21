@@ -15,6 +15,7 @@ Recovery Catalog 고급 과정(고급 실습 01~10)에서 만든 산출물을 �
 | `rc_backup_framework.sh` | 실습 03 | 글로벌 스크립트 기반 백업 실행기 | 매일/주간 |
 | `rc_global_scripts.rman` | 실습 03 | 표준 글로벌 스토어드 스크립트 정의 | 최초 1회·변경 시 |
 | `rc_maint_crosscheck.sh` | 실습 04 | 정합성 점검과 공간 회수 | 매일 05시 |
+| `rc_find_orphan.sh` | 실습 04 | 카탈로그에 없는 백업 파일 탐지 | 주 1회 |
 | `rc_catalog_backup.sh` | 실습 05 | 카탈로그 3중 보호 | 매일 03:30 |
 | `rc_keep_audit.sql` | 실습 06 | 장기 보관 백업 감사 | 분기 |
 | `dr_collect_info.sql` | 실습 07 | 재해 시 복구 정보 수집 | 재해 시 · 주 1회 평시 |

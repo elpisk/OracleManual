@@ -39,8 +39,11 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG"; }
 # 안전장치 1 : 마운트와 쓰기 가능 여부
 #   RMAN 은 "접근 불가"와 "파일 없음"을 구분하지 못한다.
 # ---------------------------------------------------------------------------
-if ! mountpoint -q "$BKROOT"; then
-  log "[ABORT] $BKROOT is not a mountpoint - skipping crosscheck"
+#   mountpoint 는 BKROOT 가 심볼릭 링크이거나 마운트 안의 하위 디렉터리면 실패한다.
+#   대신 "BKROOT 가 루트 파일시스템 위에 있으면 마운트가 빠진 것" 으로 판정한다.
+MNT=$(df -P "$BKROOT" 2>/dev/null | awk 'NR==2{print $6}')
+if [ -z "$MNT" ] || [ "$MNT" = "/" ]; then
+  log "[ABORT] $BKROOT is not on a mounted backup filesystem (mount=${MNT:-none}) - skipping crosscheck"
   mailx -s "[ABORT] maint skipped - not mounted ($SID)" "$MAILTO" < "$LOG"
   exit 2
 fi
