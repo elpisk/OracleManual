@@ -23,6 +23,8 @@ COLUMN week    FORMAT A9
 COLUMN judge   FORMAT A12
 COLUMN db1     FORMAT A10
 COLUMN db2     FORMAT A10
+COLUMN status  FORMAT A10
+COLUMN time_taken_display FORMAT A10 HEADING 'TAKEN'
 
 PROMPT ================================================================================
 PROMPT  백업 성능 분석 리포트
@@ -124,7 +126,7 @@ PROMPT   읽는 양이 DB 크기에 근접   → Block Change Tracking (새 Leve
 PROMPT   특정 파일이 병목            → SECTION SIZE
 PROMPT   채널이 파일 수보다 적다     → PARALLELISM 증가
 PROMPT   작업이 겹친다               → 스케줄 순차화
-PROMPT   저장 공간이 문제            → 압축 (단, 시간은 늘어난다)
+PROMPT   저장 공간이 문제            → 압축 (시간 비용은 CPU 여유에 달렸다. 측정으로 확인)
 PROMPT
 PROMPT  주의 : 백업을 빠르게 하는 선택이 복구를 느리게 할 수 있다.
 PROMPT         차등은 백업이 짧고 복구가 길다. 누적은 그 반대다.
