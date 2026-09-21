@@ -22,6 +22,7 @@ COLUMN name       FORMAT A55
 COLUMN directory  FORMAT A60
 COLUMN value      FORMAT A62
 COLUMN stmt       FORMAT A90
+COLUMN handle     FORMAT A60
 
 PROMPT ================================================================================
 PROMPT  재해 복구 정보 수집 : &dbname
@@ -31,11 +32,9 @@ PROMPT
 PROMPT === 1. DBID 와 인카네이션  (가장 먼저 확보할 것) ===
 PROMPT     DBID 없이는 자동 백업을 찾지 못한다
 SELECT dbid, name, dbinc_key,
-       TO_CHAR(reset_time,'YYYY-MM-DD HH24:MI:SS') AS reset_time,
-       CASE WHEN dbinc_key = (SELECT MAX(dbinc_key) FROM rc_database
-                              WHERE name = UPPER('&dbname'))
-            THEN '<-- CURRENT' END AS cur
-FROM   rc_database WHERE name = UPPER('&dbname') ORDER BY dbinc_key;
+       TO_CHAR(resetlogs_time,'YYYY-MM-DD HH24:MI:SS') AS reset_time,
+       CASE WHEN current_incarnation = 'YES' THEN '<-- CURRENT' END AS cur
+FROM   rc_database_incarnation WHERE name = UPPER('&dbname') ORDER BY dbinc_key;
 
 PROMPT
 PROMPT === 2. 데이터파일 구성 ===
@@ -57,11 +56,11 @@ ORDER  BY file#;
 
 PROMPT
 PROMPT === 4. 리두 로그 구성  (RESETLOGS 후 이 구성으로 생성된다) ===
-SELECT group#, thread#, ROUND(bytes/1024/1024) AS mb, members
+SELECT group#, thread#, ROUND(bytes/1024/1024) AS mb, COUNT(*) AS members
 FROM   rc_redo_log
 WHERE  dbinc_key = (SELECT MAX(dbinc_key) FROM rc_database
                     WHERE name = UPPER('&dbname'))
-ORDER  BY group#;
+GROUP  BY group#, thread#, bytes ORDER BY group#;
 
 PROMPT
 PROMPT === 5. 임시 테이블스페이스 ===
@@ -73,12 +72,15 @@ ORDER  BY file#;
 
 PROMPT
 PROMPT === 6. 최근 7일 백업  (복원 대상 판단) ===
-SELECT bs_key, bck_type, incr_level,
-       TO_CHAR(completion_time,'MM-DD HH24:MI') AS done,
-       ROUND(bytes/1024/1024) AS mb
-FROM   rc_backup_set
-WHERE  db_name = UPPER('&dbname') AND completion_time > SYSDATE - 7
-ORDER  BY completion_time;
+PROMPT     (컨트롤파일·SPFILE 만 담은 세트는 제외)
+SELECT s.bs_key, s.backup_type, s.incremental_level,
+       TO_CHAR(s.completion_time,'MM-DD HH24:MI') AS done,
+       ROUND(s.output_bytes/1024/1024) AS mb
+FROM   rc_backup_set_details s
+WHERE  s.db_name = UPPER('&dbname') AND s.completion_time > SYSDATE - 7
+AND    (s.backup_type = 'L' OR EXISTS (SELECT 1 FROM rc_backup_datafile d
+                                       WHERE d.bs_key = s.bs_key AND d.file# > 0))
+ORDER  BY s.completion_time;
 
 PROMPT
 PROMPT === 7. 백업 조각 위치  (매체 준비) ===
@@ -86,7 +88,8 @@ SELECT SUBSTR(handle, 1, INSTR(handle,'/',-1)) AS directory,
        COUNT(*) AS pieces,
        ROUND(SUM(bytes)/1024/1024/1024,2) AS gb
 FROM   rc_backup_piece
-WHERE  db_name = UPPER('&dbname') AND status = 'A'
+WHERE  db_key = (SELECT db_key FROM rc_database WHERE name = UPPER('&dbname'))
+AND    status = 'A'
 GROUP  BY SUBSTR(handle, 1, INSTR(handle,'/',-1))
 ORDER  BY 1;
 
@@ -105,19 +108,22 @@ PROMPT     ↑ 이 시각 이후의 변경은 온라인 리두가 남아 있지 
 PROMPT
 
 PROMPT === 9. CONFIGURE 설정  (대상 서버에서 재현) ===
-SELECT value FROM rc_rman_configuration
+COLUMN conf_name FORMAT A40
+SELECT name AS conf_name, value FROM rc_rman_configuration
 WHERE  db_key = (SELECT MAX(db_key) FROM rc_database
                  WHERE name = UPPER('&dbname'))
 ORDER  BY conf#;
 
 PROMPT
 PROMPT === 10. 장기 보관 백업  (정기 백업이 없을 때의 대안) ===
-SELECT tag, TO_CHAR(completion_time,'YYYY-MM-DD') AS taken,
-       CASE WHEN keep_until IS NULL THEN 'FOREVER'
-            ELSE TO_CHAR(keep_until,'YYYY-MM-DD') END AS keep_until
-FROM   rc_backup_set
-WHERE  db_name = UPPER('&dbname') AND keep_options IS NOT NULL
-ORDER  BY completion_time DESC;
+COLUMN tag FORMAT A24
+SELECT p.tag, TO_CHAR(s.completion_time,'YYYY-MM-DD') AS taken,
+       CASE WHEN s.keep_until IS NULL THEN 'FOREVER'
+            ELSE TO_CHAR(s.keep_until,'YYYY-MM-DD') END AS keep_until, p.handle
+FROM   rc_backup_set_details s
+       JOIN rc_backup_piece p ON p.bs_key = s.bs_key AND p.piece# = 1
+WHERE  s.db_name = UPPER('&dbname') AND s.keep_options IS NOT NULL
+ORDER  BY s.completion_time DESC;
 
 PROMPT
 PROMPT ================================================================================

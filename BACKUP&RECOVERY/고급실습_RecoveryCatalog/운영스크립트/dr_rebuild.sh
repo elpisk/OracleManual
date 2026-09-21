@@ -2,8 +2,8 @@
 # =============================================================================
 #  dr_rebuild.sh  —  타 서버 재구축 보조 (카탈로그 기반 재해 복구)
 #  출처   : 고급 실습 07
-#  사용법 : dr_rebuild.sh <DB_NAME> <신규데이터경로> <신규아카이브경로>
-#  예     : dr_rebuild.sh ORCL /u02/oradata/ORCL /u02/arch_orcl
+#  사용법 : dr_rebuild.sh <DB_NAME> <신규데이터경로> <신규아카이브경로> [SGA]
+#  예     : dr_rebuild.sh ORCL /u02/oradata/ORCL /u02/arch_orcl 2G
 #
 #  이 스크립트는 정보 수집·구문 생성·최소 pfile 작성까지만 한다.
 #  실제 RESTORE / RECOVER 는 사람이 내용을 확인한 뒤 실행한다.
@@ -35,7 +35,7 @@ export NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS'
 RCUSER="rc_report/oracle_4U@rcat"
 RCADMIN="rcatowner@rcat"
 ADUMP=/u02/admin/$SID/adump
-SGA=2G
+SGA=${4:-2G}
 # --------------------------------
 
 WORK=/tmp/dr_$DBNAME
@@ -56,9 +56,9 @@ echo "### 1. DBID 와 데이터베이스 정보"
 sqlplus -s $RCUSER << EOF | tee "$WORK/dbinfo.txt"
 SET PAGESIZE 0 FEEDBACK OFF LINESIZE 200 HEADING OFF
 SELECT 'DBID=' || dbid || ' DBINC_KEY=' || dbinc_key ||
-       ' RESET=' || TO_CHAR(reset_time,'YYYY-MM-DD HH24:MI:SS')
-FROM   rc_database WHERE name = '$DBNAME'
-AND    dbinc_key = (SELECT MAX(dbinc_key) FROM rc_database WHERE name='$DBNAME');
+       ' RESET=' || TO_CHAR(resetlogs_time,'YYYY-MM-DD HH24:MI:SS')
+FROM   rc_database_incarnation
+WHERE  name = '$DBNAME' AND current_incarnation = 'YES';
 EXIT
 EOF
 
@@ -85,10 +85,10 @@ echo
 echo "### 3. 리두 로그 구성 (RESETLOGS 후 이 구성으로 생성된다)"
 sqlplus -s $RCUSER << EOF
 SET PAGESIZE 50 LINESIZE 120 FEEDBACK OFF
-SELECT group#, thread#, ROUND(bytes/1024/1024) AS mb, members
+SELECT group#, thread#, ROUND(bytes/1024/1024) AS mb, COUNT(*) AS members
 FROM   rc_redo_log
 WHERE  dbinc_key = (SELECT MAX(dbinc_key) FROM rc_database WHERE name='$DBNAME')
-ORDER  BY group#;
+GROUP  BY group#, thread#, bytes ORDER BY group#;
 EXIT
 EOF
 
@@ -112,7 +112,8 @@ sqlplus -s $RCUSER << EOF
 SET PAGESIZE 50 LINESIZE 160 FEEDBACK OFF
 COLUMN directory FORMAT A60
 SELECT SUBSTR(handle, 1, INSTR(handle,'/',-1)) AS directory, COUNT(*) AS pieces
-FROM   rc_backup_piece WHERE db_name = '$DBNAME' AND status = 'A'
+FROM   rc_backup_piece
+WHERE  db_key = (SELECT db_key FROM rc_database WHERE name = '$DBNAME') AND status = 'A'
 GROUP  BY SUBSTR(handle, 1, INSTR(handle,'/',-1));
 EXIT
 EOF
