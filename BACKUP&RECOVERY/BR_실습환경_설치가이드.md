@@ -203,7 +203,7 @@ SID_DESC 를 추가하는 절차가 교안에 있으므로 oel7v9 에는 orcl �
 lsnrctl start
 ```
 
-`tnsnames.ora` 는 dbca 가 orcl 항목을 만든다. 고급 실습용 항목은 8-5 에서 넣는다.
+`tnsnames.ora` 는 dbca 가 orcl 항목을 만든다. 고급 실습용 항목은 8-6 에서 넣는다.
 
 ---
 
