@@ -1,46 +1,50 @@
 ================================================================================
- 16장 실습 02 — AMM 구성과 MEMORY_TARGET 조정 후 재기동 확인
+ 16장 실습 02 — AMM 구성과 MEMORY_TARGET 조정 후 재기동 확인 (실측)
  목표: ASMM인 인스턴스를 자동 메모리 관리(AMM)로 전환하는 절차를 익힌다.
-       ① MEMORY_MAX_TARGET(정적, 상한)을 잡고 ② 재기동 후 MEMORY_TARGET(동적)을 설정한다.
-       전환 과정에서 흔한 오류(ORA-00838)를 재현하고 원인·조치를 확인한다.
- 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA로 수행)
- ⚠ 주의: 파라미터 변경·재기동(SHUTDOWN/STARTUP)을 5회 포함한다. 반드시 '다른 세션이
-        하나도 없는' 격리된 개인 실습 DB에서만 수행한다 — SHUTDOWN IMMEDIATE 는 접속 중인
-        모든 세션(다른 사용자·RMAN 포함)을 강제 종료한다.
- ⚠ 수치: ORA-00838 이 알려 주는 '최소치'와 각 뷰 값은 그 인스턴스의 SGA+PGA 크기에 따라
-        달라지는 <환경값>이다. 아래는 절차와 오류 흐름을 보이기 위한 것이며, 실제 최소치는
-        각자 환경에서 STARTUP 이 돌려 주는 값을 따른다.
+       전환 실패(파라미터 충돌)를 재현하고, 그 상태에서 '재기동으로 못 살리는' 함정과
+       올바른 복구(백업 pfile)를 실측으로 확인한 뒤, 정상값으로 AMM 전환·원복한다.
+ 환경: non-CDB=orcl 19.3 (SYS AS SYSDBA). 이 랩은 sga_max_size=2G 가 명시돼 있다.
+ ⚠ 주의: SHUTDOWN/STARTUP 을 여러 번 포함한다. 반드시 '다른 세션이 없는' 격리된 개인
+        실습 DB에서만 수행한다. SHUTDOWN IMMEDIATE 는 접속 중인 모든 세션(다른 사용자·RMAN
+        포함)을 강제 종료한다.
+ ⚠ 필수: 시작 전 [1]에서 현재 파라미터를 pfile 로 백업한다. 전환 실패 시 이 백업이
+        유일한 복구 수단이다(아래 [3]에서 STARTUP NOMOUNT 로는 못 살리는 것을 확인한다).
 ================================================================================
 
 $ sqlplus / as sysdba
 
-SYS@orcl> SET LINESIZE 200
-
 --------------------------------------------------------------------------------
--- [1] (조치 전 상태) 현재는 ASMM이다. 전환 전 값을 기록해 둔다(원복 대비).
+-- [1] (조치 전 상태 + 백업) 현재 값을 기록하고, pfile 로 반드시 백업한다.
 --------------------------------------------------------------------------------
 SYS@orcl> SELECT name, display_value FROM v$parameter
   2       WHERE name IN ('memory_target','memory_max_target',
-  3         'sga_target','sga_max_size','pga_aggregate_target');
+  3         'sga_target','sga_max_size','pga_aggregate_target')
+  4       ORDER BY name;
 
 NAME                   DISPLAY_VALUE
 ---------------------- --------------
 memory_max_target      0
 memory_target          0
-sga_target             1504M
-sga_max_size           2G
 pga_aggregate_target   700M
+sga_max_size           2G
+sga_target             1504M
 
--- 조치 전: MEMORY_TARGET=0 → ASMM. SGA(1504M)+PGA(700M) ≈ 2204M가 대략의 총 수요다.
+-- 조치 전: MEMORY_TARGET=0 → ASMM. SGA(1504M)+PGA(700M) ≈ 2204M 가 대략의 총 수요다.
+--   ★ 이 랩은 SGA_MAX_SIZE=2G 가 명시돼 있다 — 이 값이 아래 [3] 오류의 핵심이 된다.
+
+SYS@orcl> -- (필수) 현재 spfile 을 pfile 로 백업한다. 전환 실패 시 복구의 유일한 근거다.
+SYS@orcl> CREATE PFILE='/home/oracle/wl/pf_16_02_bak.ora' FROM SPFILE;
+
+File created.
 
 --------------------------------------------------------------------------------
--- [2] (조치 → 이상/오류 재현) MEMORY_TARGET을 너무 작게 주면 어떻게 되는지 먼저 본다.
+-- [2] (조치 → 오류 재현) MEMORY_TARGET 을 SGA_MAX_SIZE 보다 작게 주고 재기동한다.
 --------------------------------------------------------------------------------
--- MEMORY_MAX_TARGET(정적)을 먼저 잡는다. 정적이라 재기동해야 반영된다.
-SYS@orcl> ALTER SYSTEM SET memory_max_target=2400M SCOPE=SPFILE;
+SYS@orcl> -- MEMORY_MAX_TARGET(정적, 상한)을 먼저 잡는다.
+SYS@orcl> ALTER SYSTEM SET memory_max_target=2800M SCOPE=SPFILE;
 System altered.
 
--- (오류 재현) MEMORY_TARGET을 SGA+PGA 합보다 작게 주려 시도한다.
+SYS@orcl> -- (오류 유발) MEMORY_TARGET 을 SGA_MAX_SIZE(2G)보다 작은 800M 로 준다.
 SYS@orcl> ALTER SYSTEM SET memory_target=800M SCOPE=SPFILE;
 System altered.
 
@@ -50,79 +54,155 @@ Database dismounted.
 ORACLE instance shut down.
 
 SYS@orcl> STARTUP
-ORA-00838: Specified value of MEMORY_TARGET is too small, needs to be at
-least <환경값>M
+ORA-00844: Parameter not taking MEMORY_TARGET into account
+ORA-00851: SGA_MAX_SIZE 2147483648 cannot be set to more than MEMORY_TARGET
+838860800.
+ORA-01078: failure in processing system parameters
 
--- * 이상/오류: 인스턴스가 기동하지 못하고 ORA-00838로 멈춘다.
--- * 원인: MEMORY_TARGET은 SGA와 PGA가 나눠 쓸 총 메모리다. 800M는 기존 SGA 최소치와
---     PGA 수요를 담기에 턱없이 작아, 오라클이 필요한 최소치(<환경값>M, SGA+PGA 수요에서
---     계산)를 알려 주며 거부한다. '자동'이라도 총량이 부족하면 기동 자체가 안 된다 —
---     상한·목표를 잘못 주면 자동이 오히려 인스턴스를 못 띄운다.
+-- * 이상/오류: 인스턴스가 기동하지 못하고 멈춘다. 전사(轉寫) 통념의 ORA-00838 이 아니라
+--   ORA-00844/ORA-00851 이다 — 이 랩은 SGA_MAX_SIZE 가 2G 로 명시돼 있어, MEMORY_TARGET(800M)
+--   이 그보다 작으면 'SGA_MAX_SIZE 를 MEMORY_TARGET 보다 크게 둘 수 없다'며 먼저 거부한다.
+--   (SGA_MAX_SIZE 를 명시하지 않은 환경이라면 대신 ORA-00838: needs to be at least … 가 난다.)
 
 --------------------------------------------------------------------------------
--- [3] (조치 → 재확인) 오라클이 알려 준 최소치 이상으로 올바르게 설정한다.
+-- [3] (함정 확인) '재기동으로 살린다'가 안 통한다 — NOMOUNT 도 같은 오류다.
 --------------------------------------------------------------------------------
--- 기동 실패 상태에서는 SPFILE 값을 고쳐야 한다. NOMOUNT로 접근해 값을 정정한다.
 SYS@orcl> STARTUP NOMOUNT
+ORA-00844: Parameter not taking MEMORY_TARGET into account
+ORA-00851: SGA_MAX_SIZE 2147483648 cannot be set to more than MEMORY_TARGET
+838860800.
+ORA-01078: failure in processing system parameters
+
+-- * 함정: NOMOUNT 도 실패한다. 메모리 파라미터는 인스턴스가 SGA 를 잡는 '기동 최초 단계'에서
+--   검증되므로, spfile 에 잘못된 값이 있으면 NOMOUNT 조차 못 간다. 즉 'STARTUP NOMOUNT 로
+--   접근해 ALTER SYSTEM 으로 고친다'는 흔한 절차가 이 경우엔 통하지 않는다.
+
+--------------------------------------------------------------------------------
+-- [4] (복구) 백업 pfile 로 spfile 을 다시 만들어 살린다.
+--     인스턴스가 내려간(idle) 상태라 CREATE SPFILE 이 가능하다([6]의 ORA-32002 대비).
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE SPFILE FROM PFILE='/home/oracle/wl/pf_16_02_bak.ora';
+
+File created.
+
+SYS@orcl> STARTUP
 ORACLE instance started.
 
-SYS@orcl> -- 오라클이 알려 준 최소치(<환경값>M) 이상, 그리고 MEMORY_MAX_TARGET 이하로 준다.
-SYS@orcl> -- (최소치가 MEMORY_MAX_TARGET(2400M)보다 크면, MEMORY_MAX_TARGET 부터 그 이상으로
-SYS@orcl> --  올려 두어야 한다. 여기서는 상한까지 채워 2400M 로 맞춘다.)
-SYS@orcl> ALTER SYSTEM SET memory_target=2400M SCOPE=SPFILE;
+Total System Global Area 2147481656 bytes
+Fixed Size                  8898616 bytes
+Variable Size            1375731712 bytes
+Database Buffers          754974720 bytes
+Redo Buffers                7876608 bytes
+Database mounted.
+Database opened.
+
+SYS@orcl> SHOW PARAMETER memory_target
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+memory_target                        big integer 0
+
+-- * 복구: 백업 pfile(MEMORY_TARGET=0 등 ASMM 값)로 spfile 을 재생성하고 기동하니 정상으로
+--   돌아왔다. 잘못된 memory 파라미터의 유일한 확실한 복구는 '백업 pfile 로 spfile 재생성'이다.
+
+--------------------------------------------------------------------------------
+-- [5] (조치 → 재확인) 이번엔 올바른 값으로 AMM 로 전환한다.
+--     MEMORY_TARGET 을 SGA_MAX_SIZE(2G) 이상이자 최소 수요 이상으로 준다.
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET memory_max_target=2800M SCOPE=SPFILE;
+System altered.
+SYS@orcl> ALTER SYSTEM SET memory_target=2800M SCOPE=SPFILE;   -- 2800M > SGA_MAX_SIZE 2G
 System altered.
 
 SYS@orcl> SHUTDOWN IMMEDIATE
-ORA-01507: database not mounted
+Database closed.
+Database dismounted.
 ORACLE instance shut down.
 
 SYS@orcl> STARTUP
 ORACLE instance started.
-Database mounted.
+...
 Database opened.
 
--- * 재확인: MEMORY_TARGET을 오라클이 요구한 최소치 이상이자 MEMORY_MAX_TARGET 이하로
---     주니 정상 기동했다. ORA-00838 오류 흐름이 해소되었다.
---     (주의: 최소치가 상한보다 크면 이 STARTUP 도 다시 ORA-00838 이 난다 — 그때는
---      MEMORY_MAX_TARGET 을 최소치 이상으로 먼저 올린다.)
+SYS@orcl> SHOW PARAMETER memory_target
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+memory_target                        big integer 2800M
 
---------------------------------------------------------------------------------
--- [4] (해석) AMM으로 전환됐는지 확인한다.
---------------------------------------------------------------------------------
-SYS@orcl> SELECT name, display_value FROM v$parameter
-  2       WHERE name IN ('memory_target','memory_max_target','sga_target');
+-- * 재확인: MEMORY_TARGET=2800M(>0) → 판별 규칙 ①에 의해 이제 AMM 이다. 2800M 은 SGA_MAX_SIZE
+--   (2G)보다 크고 SGA+PGA 최소 수요(≈2204M)보다도 커서 ORA-00851/ORA-00838 없이 기동했다.
 
-NAME                   DISPLAY_VALUE
----------------------- --------------
-memory_max_target      2400M
-memory_target          2400M
-sga_target             <환경값>     -- AMM에서는 SGA 하한으로만 작동(자동 조정)
-
--- memory_target>0 → 판별 규칙 ①에 의해 이제 AMM이다.
--- AMM에서는 SGA와 PGA 사이 경계까지 오라클이 조정한다. 통합 구성은 아래로 본다.
-SYS@orcl> SELECT component, ROUND(current_size/1024/1024,1) cur_mb
+SYS@orcl> -- AMM 에서는 SGA 와 PGA 를 하나의 통합 구성으로 조정한다. 그 흔적을 본다.
+SYS@orcl> COLUMN component FORMAT A26
+SYS@orcl> SELECT component, ROUND(current_size/1024/1024) cur_mb
   2       FROM v$memory_dynamic_components
   3       WHERE current_size>0 ORDER BY current_size DESC;
--- (SGA Target·PGA Target 등 SGA+PGA 통합 구성 요소가 함께 나타난다 — <환경값>)
+
+COMPONENT                  CUR_MB
+-------------------------- ------
+SGA Target                   1504
+PGA Target                   1296
+shared pool                <환경값>
+DEFAULT buffer cache       <환경값>
+Shared IO Pool             <환경값>
+KEEP buffer cache          <환경값>
+DEFAULT 4K buffer cache    <환경값>
+large pool                 <환경값>
+streams pool               <환경값>
+
+-- 해석: ASMM(실습 01)과 달리 'SGA Target'·'PGA Target' 이 함께 나타난다 — 이것이 AMM 의 표시다.
+--   SGA Target 1504 + PGA Target 1296 = 2800 = MEMORY_TARGET. 즉 오라클이 총 2800M 를 SGA 와
+--   PGA 로 나눠 잡았다(SGA 는 sga_target 1504M 하한을 지켜 배정). 하위 풀 크기는 자동조정이라 <환경값>.
 
 --------------------------------------------------------------------------------
--- [5] (원복) 실습 후 원래 ASMM 구성으로 되돌린다(개인 환경 위생).
+-- [6] (원복) 다시 ASMM 으로 되돌린다 — 실행 중 CREATE SPFILE 은 거부됨에 유의.
 --------------------------------------------------------------------------------
-SYS@orcl> ALTER SYSTEM SET memory_target=0 SCOPE=SPFILE;
-SYS@orcl> ALTER SYSTEM SET memory_max_target=0 SCOPE=SPFILE;
-SYS@orcl> ALTER SYSTEM SET sga_target=1504M SCOPE=SPFILE;
-SYS@orcl> ALTER SYSTEM SET pga_aggregate_target=700M SCOPE=SPFILE;
--- 재기동하면 다시 ASMM(실습 01 상태)로 복원된다.
+SYS@orcl> -- (함정) 인스턴스가 떠 있는 채로 백업 pfile 로 spfile 을 만들려 하면 거부된다.
+SYS@orcl> CREATE SPFILE FROM PFILE='/home/oracle/wl/pf_16_02_bak.ora';
+CREATE SPFILE FROM PFILE='/home/oracle/wl/pf_16_02_bak.ora'
+*
+ERROR at line 1:
+ORA-32002: cannot create SPFILE already being used by the instance
+
+SYS@orcl> -- 조치: 먼저 SHUTDOWN 으로 내린 뒤(그러면 spfile 을 안 쓰는 상태) 재생성한다.
+SYS@orcl> SHUTDOWN IMMEDIATE
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@orcl> CREATE SPFILE FROM PFILE='/home/oracle/wl/pf_16_02_bak.ora';
+
+File created.
+
+SYS@orcl> STARTUP
+ORACLE instance started.
+...
+Database opened.
+
+SYS@orcl> SHOW PARAMETER memory_target
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+memory_max_target                    big integer 0
+memory_target                        big integer 0
+
+SYS@orcl> SHOW PARAMETER sga_target
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- --------
+sga_target                           big integer 1504M
+
+-- * 재확인: MEMORY_TARGET=0·MEMORY_MAX_TARGET=0·SGA_TARGET=1504M → 다시 ASMM(실습 01 상태)로
+--   복원됐다. 실습 환경을 원복했다.
 
 --------------------------------------------------------------------------------
 -- [정리]
 --------------------------------------------------------------------------------
--- 1) AMM 전환 순서: MEMORY_MAX_TARGET(정적) 설정 → 재기동 → MEMORY_TARGET(동적) 설정.
--- 2) MEMORY_TARGET이 SGA+PGA 최소 수요보다 작으면 ORA-00838로 기동 실패한다.
---    오라클이 알려 준 최소치 이상으로 주어야 한다.
--- 3) 재기동·파라미터 변경은 개인 환경 전용. 실습 후 반드시 원복한다.
--- 4) memory_target>0이면 AMM, =0이면 ASMM — 값 하나가 방식을 바꾼다.
--- ※ 절대값은 환경 의존 <환경값>. 핵심은 전환 절차와 오류 흐름의 이해다.
+-- 1) AMM 전환: MEMORY_MAX_TARGET(정적) → 재기동 → MEMORY_TARGET(동적) 설정. 판별은 MEMORY_TARGET>0.
+-- 2) MEMORY_TARGET 이 SGA_MAX_SIZE 보다 작으면 ORA-00844/ORA-00851 로 기동 실패(SGA_MAX_SIZE 미명시
+--    환경이면 ORA-00838). 그래서 MEMORY_TARGET 은 SGA_MAX_SIZE 이상이자 SGA+PGA 수요 이상으로 준다.
+-- 3) ★ 잘못된 memory 파라미터는 STARTUP NOMOUNT 로도 못 살린다(파라미터가 기동 최초 단계에서 검증됨).
+--    유일한 복구는 '백업 pfile 로 spfile 재생성 → STARTUP'. 그래서 시작 전 pfile 백업이 필수다.
+-- 4) 인스턴스가 떠 있으면 CREATE SPFILE 은 ORA-32002 — 반드시 SHUTDOWN 후 재생성한다.
+-- 5) 재기동·파라미터 변경은 개인 격리 환경 전용. 실습 후 반드시 원복한다.
+-- ※ 절대값은 환경 의존 <환경값>. 핵심은 전환 절차·오류 흐름·pfile 복구의 이해다.
 
 SYS@orcl> EXIT
 ================================================================================
