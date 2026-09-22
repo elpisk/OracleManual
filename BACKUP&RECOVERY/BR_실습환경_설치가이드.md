@@ -41,6 +41,7 @@ VMware Workstation 기준. 두 서버 모두 같은 규격으로 만들면 07·1
 | `/u01` | 60 GB | ORACLE_HOME, `oradata/orcl` 데이터파일, FRA(2장) | ○ | ○ |
 | `/u02` | 30 GB | 컨트롤파일 3번·리두 b 멤버(2장), 새 위치 복구(8·9·15장), 로컬 rcat(13장) | ○ | **60 GB** (07 의 DR 복구 대상 `/u02/oradata/sales`) |
 | `/u03` | 30 GB | Data Pump(`/u03/dpdump`, 19장), 보조 인스턴스(`/u03/aux`, 16장), 2번 아카이브 대상(`/u03/arch2`, 9장) | ○ | — |
+| `/u04` | 30 GB | 복제 DB (`/u04/clone`, `/u04/newdb`, `/u04/target`, 17장) | ○ | — |
 | `/fra` | 30 GB | 9·13·18장이 FRA 로 쓰는 위치 | ○ | — |
 | `/archive_keep` | 30 GB | KEEP 장기 보관 (고급 06) | ○ | — |
 | `/export` | 20 GB | 암호화 반출 (고급 09) | ○ | — |
@@ -104,12 +105,15 @@ sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config && setenforce 0
 
 ```bash
 mkdir -p /u01/app/oracle/product/19.3.0/dbhome_1 /u01/app/oraInventory
-mkdir -p /u01/app/oracle/oradata /u02/oradata /u03/dpdump /u03/arch2 /u03/aux /fra
-chown -R oracle:oinstall /u01 /u02 /u03 /fra
-chmod -R 775 /u01 /u02 /u03 /fra
+mkdir -p /u01/app/oracle/oradata /u02/oradata /u03/dpdump /u03/arch2 /u03/aux /u04 /fra
+chown -R oracle:oinstall /u01 /u02 /u03 /u04 /fra
+chmod -R 775 /u01 /u02 /u03 /u04 /fra
+echo 'oracle ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/oracle   # 2장 실습 6 이 sudo mount -t tmpfs 를 쓴다
 ```
 
 `/u01/app/oracle/oradata` 는 **oracle 소유**여야 한다. root 소유면 dbca 가 `DBT-06006 Unable to create directory` 로 멈춘다.
+교안 화면의 `ls -l` 은 `oracle dba` 로 보인다(실측 랩은 oracle 의 주 그룹이 dba). preinstall 로 만든 계정은
+`oracle oinstall` 로 보이지만 실습에는 영향이 없다. 맞추고 싶으면 `usermod -g dba oracle`.
 
 ### 2-5. oracle 사용자 환경
 
@@ -394,7 +398,6 @@ SYS@orcl> SELECT COUNT(*) FROM hr.employees;            -- 107
 
 | 이 가이드 | 교안의 다른 표기 | 어디에 |
 |---|---|---|
-| `/u01/app/oracle/oradata/orcl/` | `/u03/oradata/ORCL/` | 15~19장 트랜스크립트 (실측 랩의 표기). 파일 이름은 같으므로 디렉터리만 바꿔 읽는다 |
 | FRA `/u01/app/oracle/fast_recovery_area` (2장) | `/fra/ORCL/...` (9·13장), `/u03/fra` (18장) | FRA 를 어디에 두든 실습은 같다. `/fra` 마운트를 만들어 두었으므로 18장 Flashback Database 는 `/fra` 를 써도 된다 |
 | 호스트 `oel7v9` | `oel7v9r1` | 종합실습과제, 고급실습 과정안내 |
 | `/u02/oradata/RCAT` (13장 로컬 카탈로그) | `/u01/app/oracle/oradata/rcat` | 고급 05 (관리계 rcat 의 경로) |
@@ -607,7 +610,6 @@ sqlplus -s rcatowner/oracle_4U@rcat <<< "SELECT name, dbid FROM rc_database ORDE
 |---|---|---|
 | dbca `DBT-06006 Unable to create directory` | `-datafileDestination` 디렉터리가 root 소유 | `chown oracle:oinstall` (2-4) |
 | dbca 뒤 데이터파일이 `oradata/ORCL/` | dbca 는 DB 이름을 대문자로 붙인다 | 4-2 의 RENAME 절차 (orcl 만. sales·rcat·hrdb 는 대문자 그대로) |
-| 교안 15~19장의 `/u03/oradata/ORCL/` | 실측 랩 표기 | `/u01/app/oracle/oradata/orcl/` 로 바꿔 읽는다 (7절 대조표) |
 | 17장 DUPLICATE, 고급 07·10 에서 `ORA-12514` | NOMOUNT 인스턴스는 동적 등록이 안 된다 | listener.ora 의 SID_LIST 정적 등록 (3-2) |
 | `CREATE CATALOG` 가 `ORA-04031` | rcat SGA 부족 | `-totalMemory 1024` 이상으로 다시 만든다 |
 | 고급 03 에서 `ORA-19504` | `/backup/<DB이름>` 디렉터리가 없다 | 8-2 의 `mkdir -p /backup/{ORCL,SALES,HRDB,RCAT}` |

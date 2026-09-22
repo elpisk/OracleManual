@@ -220,7 +220,7 @@ chmod 755 /u03 /u04
 ls -ld /arch /fra          # 이미 마련되어 있어야 한다
 ```
 
-이 아래의 하위 디렉터리(`/u03/arch2`, `/u03/oradata/ORCL`, `/u04/clone/arch` 등)는
+이 아래의 하위 디렉터리(`/u03/arch2`, `/u03/dpdump`, `/u04/clone/arch` 등)는
 각 실습이 oracle 계정으로 직접 만든다.
 
 ### 리스너
