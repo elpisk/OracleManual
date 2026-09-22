@@ -1,0 +1,318 @@
+================================================================================
+ ■ RMAN·Flashback·Data Pump 복구 실기평가 — 운영 가이드
+   감독관 진행 순서 · 응시자 개인 PC 작업 · 채점과 정리
+================================================================================
+
+--------------------------------------------------------------------------------
+ 0. 전제
+--------------------------------------------------------------------------------
+ 응시자는 각자 자기 PC 의 VM 에서 자기 ORCL 을 깨고 복구한다.
+ 공용 데이터베이스 하나를 여럿이 쓰는 방식이 아니다. 장애를 실제로 일으키므로
+ 공용 환경에서는 성립하지 않는다.
+
+ 감독관은 준비물 배포와 시간 관리, 채점을 맡는다.
+ 응시자 PC 에 원격 접속할 필요는 없다. 제출물은 텍스트 파일로 받는다.
+
+ 배포 대상 6개 스크립트 (같은 디렉터리에 있어야 한다. 나머지가 exam_env.sh 를 읽는다)
+   exam_env.sh     공통 (경로를 v$ 뷰에서 읽는다. 직접 실행하지 않는다)
+   exam_prep.sh    준비 (기준선 · RMAN 설정 · Level 0 · 논리백업 · 확인용 테이블 · 감독자 복원점)
+   exam_reset.sh   복원 (감독자 복원점으로 되돌리기)
+   exam_break1.sh  시나리오 1 장애 유발   인자 1|2|3
+   exam_break2.sh  시나리오 2 장애 유발   인자 1|2|3
+   exam_break3.sh  시나리오 3 장애 유발   인자 1|2|3
+
+ 스크립트는 경로를 고정하지 않는다. 데이터파일·컨트롤파일·리두·아카이브 위치를
+ 실행 시점의 v$datafile / v$controlfile / v$logfile / v$archive_dest 에서 읽으므로
+ 교안 기준 배치가 아닌 VM 에서도 동작한다. 문제지의 경로 표기만 다를 뿐이다.
+ 이 가이드는 SID sales, 백업 위치 /arch/exam, 새 위치 /u02/oradata/exam_new 인
+ 별도 랩에서 세 시나리오 전부를 실행해 검증했다.
+
+ 바꿀 수 있는 값 (환경변수로 준다. 보통은 건드리지 않는다)
+   EXAM_SID      대상 SID                       기본 orcl
+   EXAM_BASE     백업 보관 상위 디렉터리        기본 /home/oracle/backup
+   EXAM_DIR      스크립트·기준선 디렉터리       기본 /home/oracle/exam
+   EXAM_NEWLOC   과제 1-3 의 새 데이터파일 위치  기본 /u02/oradata/orcl
+   EXAM_DP_CONN  Data Pump 접속 문자열           기본 system/oracle_4U
+   예 : $ EXAM_DP_CONN=system/oracle /home/oracle/exam/exam_prep.sh
+
+================================================================================
+ 1. 감독관 — 시험 전날
+================================================================================
+ 1-1. 응시자 VM 이 아래 조건을 만족하는지 확인한다.
+
+      [oracle@oel7v9 ~]$ sqlplus / as sysdba
+      SYS@orcl> SELECT name, log_mode, open_mode FROM v$database;
+      SYS@orcl> SELECT file#, name FROM v$datafile ORDER BY file#;
+      SYS@orcl> SELECT dest_id, destination, status FROM v$archive_dest WHERE dest_id = 1;
+      SYS@orcl> SHOW PARAMETER undo_retention
+      SYS@orcl> SELECT username FROM dba_users WHERE username IN ('HR','SYSTEM');
+      [oracle@oel7v9 ~]$ rman target /
+      RMAN> SHOW ALL;
+      RMAN> LIST BACKUP SUMMARY;
+      [oracle@oel7v9 ~]$ sqlplus system/oracle_4U          ← Data Pump 접속 확인 (비번이 다르면 EXAM_DP_CONN)
+
+      확인 항목
+        · ORCL / READ WRITE / ARCHIVELOG, 아카이브 대상 1번이 디렉터리이고 VALID
+        · hr 계정이 존재한다 (USERS·exam_tbs 쿼터는 스크립트가 준다)
+        · system 계정 비밀번호를 안다 (expdp/impdp 에 쓴다)
+        · undo_retention 이 900 이상이다 (과제 3-2 Flashback 은 UNDO 가 살아 있어야 한다)
+        · RMAN ENCRYPTION FOR DATABASE 가 OFF 다 (ON 이면 과제 2-1 의 spfile 복원 때
+          임시 인스턴스가 지갑을 열지 못한다 — WALLET_ROOT 가 spfile 에 있기 때문)
+        · 13~19장 실습이 남긴 exam_* 객체·EXAM_DP 디렉터리·exam_stg 계정이 없다
+          (있으면 exam_prep.sh 가 지운다. 지워도 되는 것인지 미리 확인한다)
+        · LIST BACKUP SUMMARY 에 실습 백업이 많이 남아 있으면 정리한다 (아래 1-2)
+
+ 1-2. RMAN 리포지터리를 정리한다. 실습이 남긴 EXPIRED 항목이 있으면 과제 1-1 의 CROSSCHECK 가
+      여러 개를 보고해 판정이 흐려진다. exam_prep.sh 도 CROSSCHECK + DELETE EXPIRED 를 하지만
+      전날 한 번 눈으로 보는 것이 낫다.
+
+      RMAN> CROSSCHECK BACKUP;  DELETE EXPIRED BACKUP;
+      RMAN> CROSSCHECK ARCHIVELOG ALL;  DELETE EXPIRED ARCHIVELOG ALL;
+      RMAN> DELETE OBSOLETE;                                  ← 실습 백업을 정리해도 된다면
+
+ 1-3. 디스크 여유를 본다. Level 0(데이터파일 총량의 약 70%) + Level 1 + Cold 복원점 + 백업 사본 —
+      데이터파일 총량의 약 세 배가 필요하다. 교안 기준 랩(약 2GB)에서 약 6GB 다.
+      과제 1-3 의 새 위치(/u02/oradata/orcl)에 데이터파일 하나(20MB)를 둘 공간도 본다.
+
+      $ df -h /home/oracle /u01 /u02
+
+ 1-4. 스크립트 6개를 각 응시자 VM 의 /home/oracle/exam/ 에 배포한다.
+      (다른 실기평가의 스크립트가 같은 이름으로 남아 있다면 먼저 치운다)
+
+      $ mkdir -p /home/oracle/exam
+      $ cp exam_*.sh /home/oracle/exam/
+      $ chmod +x /home/oracle/exam/*.sh
+      $ chown -R oracle:dba /home/oracle/exam
+
+ 1-5. VM 스냅숏을 하나 떠 둔다. 응시자가 복구에 실패하고 exam_reset.sh 로도
+      돌아오지 못하는 경우의 마지막 보루다. 정지 상태에서 뜬다.
+
+ 1-6. 문제지를 인쇄하거나 파일로 준비한다. 모범답안은 배포하지 않는다.
+
+================================================================================
+ 2. 감독관 — 시험 당일, 각 시나리오 시작 전
+================================================================================
+ 2-1. 응시자에게 준비 스크립트를 실행시킨다. 이것은 시험 시간에 포함하지 않는다.
+      Level 0 백업과 Cold 복사가 있어 데이터파일 2GB 기준 3~5분 걸린다.
+
+      $ /home/oracle/exam/exam_prep.sh
+
+      정상 종료 시 마지막에 이렇게 나온다.
+        준비 완료.
+          백업·덤프      : /home/oracle/backup/exam_rman   (DBID ... — 응시자에게 알려 주지 않는다)
+          감독자 복원점  : /home/oracle/backup/_proctor_rman   (되돌리려면 exam_reset.sh)
+          기준선         : /home/oracle/exam/baseline.txt
+          평가 전 RMAN 설정 : /home/oracle/exam/rman_config_before.rman
+
+      "중단:" 으로 끝나면 데이터베이스가 READ WRITE 가 아니거나 NOARCHIVELOG 다.
+      expdp 줄에 ORA-/UDE- 가 보이면 system 비밀번호가 다른 것이다. EXAM_DP_CONN 을 주고 재실행한다.
+      이 스크립트는 반복 실행해도 안전하다 (이전 평가의 객체와 백업을 스스로 지우고 다시 만든다).
+
+ 2-2. 기준선을 응시자가 직접 읽게 한다. 이후 모든 판정의 출발점이다.
+
+      $ cat /home/oracle/exam/baseline.txt
+
+      기준선에는 DBID 가 들어 있다. 시나리오 2 는 "DBID 를 어디서 찾았는가" 를 묻는 것이지
+      값을 숨기려는 것이 아니므로 그대로 둔다. 다만 응시자가 baseline.txt 를 열어 보지 않고
+      자동백업 파일명에서 읽어 내면 그것도 정답이다.
+      특히 아래 값을 각자 종이에 적게 한다.
+        · DBID, RESETLOGS_CHANGE#
+        · LIST BACKUP SUMMARY 의 Key 와 Tag (EXAM_L0, EXAM_ARC)
+        · SHOW ALL 의 자동백업 FORMAT 과 채널 FORMAT (시나리오 2 에서 다시 입력해야 한다)
+
+ 2-3. 시간을 알린다. 시나리오당 60분이며 첫 장애 유발 시각부터 센다.
+      장애 스크립트가 새 Level 0 를 받는 시간(2-3 의 앞부분)은 시험 시간에서 뺀다.
+
+ 2-4. 금지 사항을 고지한다.
+      · /home/oracle/backup/_proctor_rman 은 손대지 않는다  (건드리면 자동 불합격)
+      · 지시하지 않은 시나리오의 장애 스크립트를 미리 돌리지 않는다
+      · 파일을 cp 로 복원하지 않는다 (이 평가는 RMAN 복구다)
+      · 모범답안·인터넷 검색 허용 여부는 감독관이 정해 사전 고지한다
+
+================================================================================
+ 3. 응시자 — 개인 PC 에서 하는 일
+================================================================================
+ 3-0. 시작 전 준비
+
+      · SSH 또는 콘솔로 자기 VM 에 접속한다.
+      · 창을 세 개 연다. SQL*Plus, RMAN, 셸(alert log 감시·impdp 용)이다.
+
+        [창 A]  $ sqlplus / as sysdba
+        [창 B]  $ rman target /
+        [창 C]  $ tail -f /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log
+
+      · 출력을 파일로 남긴다. 답안 제출물이 된다.
+        SYS@orcl> SPOOL /home/oracle/answer_s1.txt
+        RMAN>     SPOOL LOG TO /home/oracle/answer_s1_rman.txt
+        (시나리오가 끝나면 SPOOL OFF / SPOOL LOG OFF)
+
+      · 화면 폭과 날짜 형식을 맞춘다. RMAN 의 시각 표기와 UNTIL TIME 입력에 필요하다.
+        SYS@orcl> SET LINESIZE 200 PAGESIZE 100
+        SYS@orcl> COL name FOR a50
+        SYS@orcl> ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS';
+        $ export NLS_DATE_FORMAT='YYYY-MM-DD HH24:MI:SS'      ← rman 을 띄우기 전에
+
+ 3-0b. 케이스는 하나씩 주입한다
+
+      한 시나리오에 과제가 3개 있지만 한꺼번에 깨지지 않는다.
+      장애 스크립트는 인자로 케이스를 지정한다.
+
+        $ /home/oracle/exam/exam_break1.sh 1     ← 1-1 만 깨진다
+          (진단 → 복구 → 검증 → 답안 작성)
+        $ /home/oracle/exam/exam_break1.sh 2     ← 1-2 만 깨진다
+          ...
+
+      ★ 앞 케이스를 복구해야 다음 케이스를 주입할 수 있다.
+        각 스크립트는 시작할 때 hr.exam_log 에 표식 행을 넣으므로
+        데이터베이스가 READ WRITE 여야 한다.
+        복구가 끝나지 않은 상태에서 실행하면 "중단" 메시지를 내고 아무것도 건드리지 않은 채
+        종료한다. 그때는 복구를 이어서 하거나 감독관에게 알린다.
+
+      ★ 앞 케이스가 RESETLOGS 로 끝났다면 (2-2 뒤의 2-3), 다음 장애 스크립트는 먼저 새 Level 0
+        백업을 받는다. 화면에 "새 Level 0 백업을 받는다" 가 표시된다.
+        그때부터 LIST BACKUP 의 최신 EXAM_L0 가 복구에 쓰인다.
+
+ 3-1. 각 과제의 진행 순서 — 네 걸음을 반드시 지킨다
+
+      ① 장애를 일으킨다
+         $ /home/oracle/exam/exam_break1.sh 1
+         화면에 나온 오류를 그대로 답안에 붙여 넣는다.
+
+      ② 판정한다  ← 여기서 점수가 갈린다
+         명령을 치기 전에 조회부터 한다. LIST / REPORT / CROSSCHECK / v$ 뷰로
+         무엇이 손상되었고, 리포지터리가 무엇을 알고, 어느 백업이 쓰일지 확인한다.
+         각 조회의 결과를 답안에 남기고 "그래서 어느 경로를 택했다" 를 한 줄 적는다.
+
+      ③ 되돌릴 수 없는 명령 전에 기록한다
+         RESETLOGS 앞 : LIST INCARNATION 과 hr.exam_log 의 현재 행을 남긴다
+         FLASHBACK TABLE 앞 : AS OF TIMESTAMP 로 되돌아갈 시점의 값을 먼저 확인한다
+         impdp REPLACE 앞 : 지금 테이블의 행 수를 남긴다
+         이 기록이 없으면 감점한다.
+
+      ④ 복구하고 검증한다
+         복구 명령만 적고 끝내지 않는다. 무엇으로 복구를 확인했는지 적는다.
+         hr.exam_log 의 행 수와 내용(step, reg_time), 대상 테이블의 행 수,
+         v$database 의 open_mode 와 resetlogs_change# 를 함께 남긴다.
+
+ 3-2. 막혔을 때
+
+      · 오류가 나는 것은 감점 사유가 아니다. 오류와 그때의 판단을 적으면 된다.
+      · RMAN 이 "RMAN-06172: no AUTOBACKUP found" 로 끝나면 DBID 나 자동백업 FORMAT 을
+        알려 주지 않은 것이다 (모범답안 2-1.4).
+      · SET NEWNAME / SET UNTIL 은 RUN { } 안에서만 유효하다.
+      · Flashback Query 가 ORA-01555 로 실패하면 UNDO 가 이미 덮인 것이다. 감독관에게 알린다.
+      · 30분이 지나도 진전이 없으면 감독관에게 알린다. 감독관이
+        exam_reset.sh 로 되돌려 주고, 그 시나리오는 부분 점수로 처리한다.
+
+ 3-3. 시나리오가 끝나면
+
+      SYS@orcl> SPOOL OFF
+      RMAN>     SPOOL LOG OFF
+      제출 파일 : /home/oracle/answer_s1.txt, answer_s1_rman.txt (시나리오별로)
+
+      감독관이 지시할 때까지 다음 시나리오의 장애 스크립트를 실행하지 않는다.
+
+================================================================================
+ 4. 감독관 — 시나리오 사이
+================================================================================
+ 4-1. 응시자 답안 파일을 수거한다.
+
+ 4-1b. 한 케이스에서 응시자가 복구에 실패했을 때
+
+      그 케이스만 포기시키고 다음 케이스로 넘긴다. 시나리오 전체를 버리지 않는다.
+
+        ① 응시자에게 그때까지의 판정·시도 기록을 답안에 남기게 한다
+        ② 감독관이 되돌린다
+           $ /home/oracle/exam/exam_reset.sh
+        ③ 다음 케이스의 장애 스크립트를 실행하게 한다
+
+      되돌리면 hr.exam_log 가 BASE·SAFE 두 행으로 초기화된다.
+
+ 4-2. 다음 시나리오를 위해 랩을 되돌린다. 응시자가 복구에 성공했든 실패했든
+      항상 실행한다. 앞 시나리오의 잔재(새 위치의 데이터파일, 새 인카네이션, 응시자가 받은
+      백업, 되돌린 테이블)가 다음 판정을 오염시키기 때문이다.
+
+      $ /home/oracle/exam/exam_reset.sh
+
+      약 1~2분 걸린다. 마지막에 "복원 완료. 다음 시나리오를 시작할 수 있다." 가 나와야 한다.
+      되돌리는 것 : 데이터파일·TEMP·컨트롤파일·리두·spfile·패스워드 파일, 아카이브 디렉터리,
+      백업 디렉터리(응시자가 만든 조각 삭제·지워진 조각 복원·덤프), 새 위치의 데이터파일.
+      복원된 컨트롤파일은 복원점 시점의 RMAN 리포지터리를 가지고 있으므로 LIST BACKUP 이
+      준비 직후 상태로 돌아온다.
+
+ 4-3. 되돌아온 상태를 확인한다. 스크립트 끝의 "=== 확인 ===" 출력으로 본다.
+      · ORCL / READ WRITE / ARCHIVELOG / RESETLOGS_CHANGE# 가 기준선과 같다
+      · 데이터파일 수가 기준선과 같다 (exam_tbs 포함), TEMP 1개
+      · hr.exam_log 2행 (BASE, SAFE), hr.exam_orders 2000행, hr.exam_items 5000행
+      · LIST BACKUP SUMMARY 에 EXAM_L0 · EXAM_ARC · 자동백업만 있다
+
+ 4-4. exam_reset.sh 로도 살아나지 않으면 1-5 의 VM 스냅숏으로 되돌린 뒤
+      exam_prep.sh 부터 다시 시작한다.
+
+================================================================================
+ 5. 감독관 — 시험 후
+================================================================================
+ 5-1. 채점은 모범답안의 【판정】【수행】【검증】 세 축으로 한다.
+      명령이 맞았는지보다 판정을 했는지를 먼저 본다.
+
+ 5-2. 특히 아래 네 가지를 본다.
+      ① 리포지터리와 디스크를 대조했는가 (LIST 만 보고 믿지 않았는가)
+      ② 파일을 통째로 되돌리지 않아도 되는 상황에서 통째로 되돌리지 않았는가
+         (3-1 에서 RESTORE DATAFILE 로 간 답안, 3-2 에서 시점 복구로 간 답안은 크게 감점)
+      ③ 잃은 것을 업무 언어로 보고할 수 있는가
+      ④ RESETLOGS 뒤에 "즉시 Level 0" 을 적었는가
+
+ 5-3. 정리
+      $ /home/oracle/exam/exam_reset.sh
+      $ rman target / @/home/oracle/exam/rman_config_before.rman     ← 평가 전 RMAN 설정으로
+      $ rman target /
+      RMAN> DELETE NOPROMPT BACKUP TAG 'EXAM_L0';
+      RMAN> DELETE NOPROMPT BACKUP TAG 'EXAM_L1';
+      RMAN> DELETE NOPROMPT BACKUP TAG 'EXAM_ARC';
+      RMAN> CROSSCHECK BACKUP;  DELETE NOPROMPT EXPIRED BACKUP;    ← 자동백업 조각까지 정리
+      $ rm -rf /home/oracle/backup/exam_rman /home/oracle/backup/_proctor_rman
+      $ rm -f /u02/oradata/orcl/exam_tbs01.dbf
+
+      SYS@orcl> DROP TABLESPACE exam_tbs INCLUDING CONTENTS AND DATAFILES;
+      SYS@orcl> DROP TABLE hr.exam_log PURGE;
+      SYS@orcl> DROP TABLE hr.exam_orders PURGE;
+      SYS@orcl> DROP DIRECTORY exam_dp;
+      SYS@orcl> PURGE DBA_RECYCLEBIN;
+
+================================================================================
+ 6. 시간 배분 (시나리오당 60분)
+================================================================================
+  0~5분    문제 읽기, 기준선·SHOW ALL·LIST BACKUP SUMMARY 확인
+  5~15분   장애 유발과 증상 관찰, 오류 기록
+  15~25분  판정 (조회 중심). 여기서 서두르면 뒤가 전부 틀어진다
+  25~45분  복구 수행 (RESTORE DATABASE 는 1~2분. 그동안 판정 기록을 정리한다)
+  45~55분  검증과 손실 산정
+  55~60분  SPOOL OFF, 제출
+
+  과제가 여러 개인 시나리오는 배점 비율로 시간을 나눈다.
+  예: 시나리오 3 은 3-1(30점) 18분, 3-2(35점) 21분, 3-3(35점) 21분.
+  시나리오 3-2 는 UNDO 보존 시간(900초) 안에 Flashback 을 끝내야 하므로 3-2 만은
+  장애 유발 직후 15분 안에 3-2.5 까지 마치도록 안내한다.
+
+================================================================================
+ 7. 자주 나오는 상황과 감독관 대응
+================================================================================
+ 상황                                   대응
+ ------------------------------------   --------------------------------------
+ exam_prep.sh 의 expdp 줄에 ORA-01017   system 비밀번호가 다르다.
+                                        EXAM_DP_CONN=system/<비번> 으로 재실행
+ exam_prep.sh 가 "중단:" 으로 끝남       DB 를 READ WRITE / ARCHIVELOG 로 맞춘 뒤 재실행
+ RMAN-06172 no AUTOBACKUP found          DBID 미지정 또는 자동백업 FORMAT 미지정.
+                                        SET DBID / SET CONTROLFILE AUTOBACKUP FORMAT 안내
+ ORA-01589 (OPEN 시)                    백업 컨트롤파일을 썼다. OPEN RESETLOGS 안내
+ ORA-08189 (FLASHBACK TABLE)            정상이다 (3-2.5). ENABLE ROW MOVEMENT 안내
+ ORA-01466 (TRUNCATE 뒤 Flashback)       정상이다 (3-3.2). 논리백업으로 가라고 안내
+ ORA-01555 (Flashback Query)            UNDO 가 덮였다. exam_reset.sh 뒤 3-2 를 다시 주입
+ 3-1 에서 COUNT(*) 가 멀쩡함             정상이다. 인덱스만 읽은 것. SUM(price) 로 보라고 안내
+ 장애 스크립트가 "새 Level 0" 을 받음     정상이다 (2-3). 앞 과제가 RESETLOGS 로 끝났기 때문.
+                                        그 시간은 시험 시간에서 뺀다
+ 응시자가 _proctor_rman 을 건드림        자동 불합격 처리. 그 VM 은 스냅숏으로 복원
+ 응시자가 cp 로 파일을 복원함            자동 불합격. 이 평가는 RMAN 복구다
+ 시간 내 복구 실패                       exam_reset.sh 로 되돌리고 부분 점수 처리.
+                                        판정과 시도 기록에 점수를 준다
+================================================================================

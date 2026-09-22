@@ -1,0 +1,977 @@
+================================================================================
+ ■ ARCHIVELOG 복구 실기평가 — 3종 모범답안
+ 과정      : Oracle Database 19c Backup & Recovery (8~12장 범위, 사용자 관리 복구)
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / ARCHIVELOG
+================================================================================
+
+이 문서는 문제지의 과제 1-1 부터 3-3 까지에 대응하는 모범답안이다.
+각 과제를 【판정】 무엇을 보고 경로를 정했는가 · 【수행】 실제로 실행한 명령 ·
+【검증】 복구가 끝났음을 무엇으로 확인했는가 세 축으로 나눈다.
+
+채점은 명령의 정확성보다 판정 근거의 유무를 먼저 본다.
+
+[검증됨] 표시가 붙은 출력은 이 문서를 만들 때 별도 랩(SID sales, 데이터파일 5개,
+리두 3그룹×1멤버, 2026-09-22)에서 장애 스크립트와 아래 명령을 그대로 실행해 얻은 값이다.
+경로와 SID 만 문제지의 표기(orcl, /u01/app/oracle/oradata/orcl, /home/oracle/arch1)로
+옮겼고 SCN·시퀀스·시각·오류 번호·행 수는 실측값 그대로다.
+파일 번호(USERS = 7 등)와 그룹 번호는 환경마다 다르다. 값 자체가 아니라
+두 값의 대소 관계와 "무엇을 조회했는가" 를 본다.
+
+================================================================================
+ 이 평가를 관통하는 판정 틀
+================================================================================
+데이터파일 계열 (시나리오 1)
+  ① 무엇이 손상되었는가        v$recover_file  (OPEN 이면 OFFLINE 한 뒤에 보인다)
+  ② 백업본에 그 파일이 있는가   ls, manifest.txt
+  ③ 필요한 리두가 이어지는가    change# 이후의 시퀀스가 v$archived_log / v$log 에 빠짐없이 있는가
+  ④ 백업이 없다면              creation_change# 이후의 리두만 있으면 CREATE DATAFILE
+
+불완전 복구 (시나리오 2) — 세 가지를 반드시 적는다
+  ① 왜 완전 복구가 안 되는가   ② 어디까지 되돌리는가(CANCEL/TIME 과 그 근거)   ③ 대가와 후속 조치
+
+리두·컨트롤파일 계열 (시나리오 3) — 세 질문이 결과를 가른다
+  ① 손상된 그룹이 CURRENT 인가, 아카이브는 되었는가
+  ② 종료가 정상이었는가 비정상이었는가
+  ③ 컨트롤파일이 현재 것인가 백업본인가 (백업본이면 RESETLOGS)
+
+================================================================================
+ 시나리오 1  데이터파일 계열 장애
+================================================================================
+
+--------------------------------------------------------------------------------
+ 과제 1-1. 운영 중 USERS 데이터파일 유실 — 무중단 복구  [25점]
+--------------------------------------------------------------------------------
+【판정】
+
+1-1.2 증상  [검증됨]
+
+  SYS@orcl> SELECT COUNT(*) FROM hr.exam_log;
+  select count(*) from hr.exam_log
+                          *
+  ERROR at line 1:
+  ORA-01116: error in opening database file 7
+  ORA-01110: data file 7: '/u01/app/oracle/oradata/orcl/users01.dbf'
+  ORA-27041: unable to open file
+  Linux-x86_64 Error: 2: No such file or directory
+  Additional information: 3
+
+  ▸ 데이터베이스는 OPEN 을 유지한다. 파일 7 을 건드리는 조회만 실패하고
+    다른 테이블스페이스 조회(예: SELECT COUNT(*) FROM dba_objects)는 성공한다.
+    SGA 와 컨트롤파일은 멀쩡하고 그 파일 하나만 열리지 않기 때문이다.
+  ▸ 채점 포인트 : ORA-01116 / ORA-01110 / ORA-27041 세 개를 모두 적었는가, "OPEN 유지" 를 확인했는가.
+
+1-1.3 v$recover_file 과 OFFLINE  [검증됨]
+
+  SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+  no rows selected
+
+  ▸ 컨트롤파일은 아직 파일 7 이 정상이라고 알고 있다. 파일이 필요해지는 순간에야 오류가 난다.
+    OFFLINE 하면 컨트롤파일이 그 파일의 상태를 다시 보고 행이 생긴다.
+
+  SYS@orcl> ALTER DATABASE DATAFILE 7 OFFLINE;
+  Database altered.
+
+  SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+
+       FILE# ERROR                   CHANGE#
+  ---------- -------------------- ----------
+           7 FILE NOT FOUND                0
+
+  ▸ NOARCHIVELOG 에서는 같은 명령이 ORA-01145 로 막혔다(NOARCHIVELOG 평가 과제 1-1).
+    ARCHIVELOG 에서는 오프라인으로 둔 사이의 변경을 나중에 아카이브로 따라잡을 수 있으므로
+    허용된다. 그래서 서비스를 내리지 않고 그 파일만 떼어 낼 수 있다.
+  ▸ 파일이 아예 없으므로 change# 는 0 이다. 복원한 뒤 다시 조회하면 백업 시점 SCN 이 나온다.
+
+1-1.4 리두가 이어지는가  [검증됨]
+
+  -- 백업본을 복원한 뒤 다시 보면 복구 시작 SCN 이 나온다 (1-1.5 의 순서와 겹친다)
+  SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+           7                          2294966
+
+  SYS@orcl> SELECT sequence#, first_change#, next_change# FROM v$log WHERE status = 'CURRENT';
+   SEQUENCE# FIRST_CHANGE# NEXT_CHANGE#
+  ---------- ------------- ------------
+          27       2296901   1.8447E+19
+
+  SYS@orcl> SELECT sequence#, name FROM v$archived_log
+    2       WHERE dest_id = 1 AND next_change# > 2294966 ORDER BY 1;
+          23 /home/oracle/arch1/arch_1_23_1244546460.arc
+          24 /home/oracle/arch1/arch_1_24_1244546460.arc
+          25 ...  26 ...
+
+  ▸ 복구 시작 SCN 2294966 은 시퀀스 23 에 속한다. 23 부터 현재(27)까지 아카이브가 빠짐없이
+    있고, 27 은 온라인 리두다. 완전 복구가 성립한다.
+  ▸ 채점 포인트 : "아카이브가 있다" 를 파일 목록(ls)이 아니라 v$archived_log 의 SCN 범위로
+    확인했는가. backup_info.txt 의 seq_begin 과 대조해도 좋다.
+
+【수행】
+
+1-1.5 그 파일만 복원 + RECOVER (OPEN 상태 유지)  [검증됨]
+
+  SYS@orcl> !ls /home/oracle/backup/exam_arch/
+  arch  backup_info.txt  control_exam.bkp  manifest.txt  sysaux01.dbf  system01.dbf  undotbs01.dbf  users01.dbf ...
+
+  SYS@orcl> !cp -p /home/oracle/backup/exam_arch/users01.dbf /u01/app/oracle/oradata/orcl/users01.dbf
+
+  SYS@orcl> SET AUTORECOVERY ON
+  SYS@orcl> RECOVER DATAFILE 7;
+  ORA-00279: change 2294966 generated at 09/22/2026 15:16:57 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_23_1244546460.arc
+  ORA-00280: change 2294966 for thread 1 is in sequence #23
+  ORA-00279: change 2295460 generated at 09/22/2026 15:24:09 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_24_1244546460.arc
+  ORA-00280: change 2295460 for thread 1 is in sequence #24
+  Log applied.
+  Media recovery complete.
+
+  ▸ 화면에는 아카이브 23·24 만 나오지만 alert log 에는 그 뒤 온라인 리두(25~27)를
+    직접 읽은 기록이 있다. 완전 복구에서는 온라인 리두를 자동으로 적용한다.
+      Recovery of Online Redo Log: Thread 1 Group 2 Seq 26 Reading mem 0
+      Recovery of Online Redo Log: Thread 1 Group 3 Seq 27 Reading mem 0
+      Media Recovery Complete (orcl)
+  ▸ 컨트롤파일을 되돌리지 않는 이유 : 지금 컨트롤파일이 최신 구조와 SCN 을 알고 있다.
+    백업본으로 바꾸면 RESETLOGS 가 강제된다.
+    리두 로그를 되돌리지 않는 이유 : 25~27 의 변경이 바로 복구 재료다. 덮으면 손실이 된다.
+  ▸ 채점 포인트 : SHUTDOWN 없이 끝냈는가. 내렸다면 "무중단" 요구를 어긴 것이므로 감점.
+
+【검증】
+
+1-1.6 ONLINE 과 손실 없음  [검증됨]
+
+  SYS@orcl> ALTER DATABASE DATAFILE 7 ONLINE;
+  Database altered.
+
+  SYS@orcl> SELECT file#, status FROM v$datafile WHERE file# = 7;
+           7 ONLINE
+
+  SYS@orcl> SELECT COUNT(*), MAX(step) KEEP (DENSE_RANK LAST ORDER BY scn) last_step FROM hr.exam_log;
+    COUNT(*) LAST_STEP
+  ---------- ----------
+           5 S1-1b
+
+  ▸ 장애 직전에 넣은 S1-1b (스위치 뒤, 현재 리두에만 있던 행)까지 살아 있다. 손실 0.
+  ▸ 서비스가 내려가지 않은 근거 : v$instance.startup_time 이 바뀌지 않았다,
+    alert log 에 "Shutting down" 이 없다, 다른 세션의 조회가 계속 성공했다 — 이 중 하나.
+
+--------------------------------------------------------------------------------
+ 과제 1-2. 백업 없는 테이블스페이스의 데이터파일 유실  [30점]
+--------------------------------------------------------------------------------
+【판정】
+
+1-2.2 증상과 백업 부재  [검증됨]
+
+  SYS@orcl> SELECT COUNT(*) FROM hr.exam_nobk_t;
+  ORA-01116: error in opening database file 8
+  ORA-01110: data file 8: '/u01/app/oracle/oradata/orcl/exam_nobk01.dbf'
+  ORA-27041: unable to open file
+
+  SYS@orcl> !ls /home/oracle/backup/exam_arch/ | grep nobk
+  (없음)
+  SYS@orcl> !cat /home/oracle/backup/exam_arch/manifest.txt
+  (exam_nobk 없음 — 백업 시점에 존재하지 않던 파일이다)
+
+1-2.3 만들어진 시점과 그 이후의 리두  [검증됨]
+
+  SYS@orcl> SELECT file#, creation_change#, creation_time FROM v$datafile WHERE file# = 8;
+       FILE# CREATION_CHANGE# CREATION_TIME
+  ---------- ---------------- -------------------
+           8          2296956 2026-09-22 15:35:09
+
+  SYS@orcl> SELECT sequence#, first_change#, name FROM v$archived_log
+    2       WHERE dest_id = 1 AND next_change# >= 2296956 ORDER BY 1;
+          27       2296901 /home/oracle/arch1/arch_1_27_1244546460.arc
+          28       2298049 /home/oracle/arch1/arch_1_28_1244546460.arc
+
+  ▸ 파일이 생긴 SCN 2296956 은 시퀀스 27 안에 있고, 27·28 아카이브와 현재 온라인 리두가
+    모두 있다. 파일 생성부터 지금까지의 모든 변경이 리두에 남아 있으므로,
+    빈 파일을 만들고 그 리두를 다시 적용하면 내용을 전부 되살릴 수 있다.
+  ▸ 조건인 이유 : CREATE DATAFILE 은 "생성 당시의 빈 파일" 을 만든다. 그 뒤의 내용은
+    전적으로 리두에서 온다. 생성 시점 이후의 아카이브가 하나라도 없으면 그 파일은
+    복구할 수 없고 OFFLINE DROP 으로 버려야 한다.
+
+1-2.4 OFFLINE 없이 CREATE DATAFILE  [검증됨]
+
+  SYS@orcl> ALTER DATABASE CREATE DATAFILE '/u01/app/oracle/oradata/orcl/exam_nobk01.dbf'
+    2         AS '/u01/app/oracle/oradata/orcl/exam_nobk01.dbf';
+  ORA-01182: cannot create database file 8 - file is in use or recovery
+  ORA-01110: data file 8: '/u01/app/oracle/oradata/orcl/exam_nobk01.dbf'
+
+  ▸ ONLINE 인 파일은 다시 만들 수 없다. 먼저 OFFLINE 해서 데이터베이스가 그 파일을
+    "쓰지 않는 파일" 로 보게 해야 한다.
+
+【수행】
+
+1-2.5 OFFLINE → CREATE DATAFILE → RECOVER → ONLINE  [검증됨]
+
+  SYS@orcl> ALTER DATABASE DATAFILE 8 OFFLINE;
+  Database altered.
+
+  SYS@orcl> ALTER DATABASE CREATE DATAFILE '/u01/app/oracle/oradata/orcl/exam_nobk01.dbf'
+    2         AS '/u01/app/oracle/oradata/orcl/exam_nobk01.dbf';
+  Database altered.
+
+  SYS@orcl> !ls -l /u01/app/oracle/oradata/orcl/exam_nobk01.dbf
+  -rw-r-----. 1 oracle dba 10493952 ... exam_nobk01.dbf          ← 10M 빈 파일이 생겼다
+
+  SYS@orcl> SET AUTORECOVERY ON
+  SYS@orcl> RECOVER DATAFILE 8;
+  Media recovery complete.
+
+  SYS@orcl> ALTER DATABASE DATAFILE 8 ONLINE;
+  Database altered.
+
+  ▸ 데이터는 아카이브 27·28 과 온라인 리두에서 채워진다. 이 랩에서는 27 이후가 모두
+    온라인 리두에 남아 있어 화면에 ORA-00279 없이 바로 "Media recovery complete" 가 나왔다.
+    alert log 에 "Recovery of Online Redo Log: ... Seq 27 / 28 / 29" 가 남는다.
+  ▸ 파일이 있는 상태에서 다시 만들어야 한다면 AS '...' 뒤에 REUSE 가 필요하다(ORA-27038).
+    이 과제는 파일이 지워졌으므로 REUSE 가 필요 없다.
+
+【검증】
+
+1-2.6 손실 없음  [검증됨]
+
+  SYS@orcl> SELECT COUNT(*) FROM hr.exam_nobk_t;
+         400
+  SYS@orcl> SELECT COUNT(*), MAX(step) KEEP (DENSE_RANK LAST ORDER BY scn) FROM hr.exam_log;
+           6 S1-2
+
+  ▸ 생성 직후 300행 + 스위치 뒤 100행 = 400. 백업이 없었는데도 손실 0.
+  ▸ 생성 시점의 아카이브(27)가 없었다면 : CREATE DATAFILE 뒤 RECOVER 가 ORA-00308 로 멈추고
+    빈 파일만 남는다. 그 파일은 OFFLINE DROP + DROP TABLESPACE 로 버리는 수밖에 없다.
+    → "테이블스페이스를 만들면 곧바로 백업한다" 는 운영 규칙의 근거다.
+
+--------------------------------------------------------------------------------
+ 과제 1-3. 정상 종료 후 모든 데이터파일 유실 + 아카이브 한 개 결손  [45점]
+--------------------------------------------------------------------------------
+【판정】
+
+1-3.2 기동 단계  [검증됨]
+
+  SYS@orcl> STARTUP
+  ORACLE instance started.
+  ...
+  Database mounted.
+  ORA-01157: cannot identify/lock data file 1 - see DBWR trace file
+  ORA-01110: data file 1: '/u01/app/oracle/oradata/orcl/system01.dbf'
+
+  ▸ MOUNT 까지 된다(컨트롤파일은 있다). OPEN 에서 파일 1 부터 못 찾는다.
+    ORA-01157 은 첫 파일만 보여 준다. 전체 범위는 v$recover_file 로 본다.
+
+1-3.3 손상 범위와 백업 대조  [검증됨]
+
+  SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+       FILE# ERROR                   CHANGE#
+  ---------- -------------------- ----------
+           1 FILE NOT FOUND                0
+           3 FILE NOT FOUND                0
+           4 FILE NOT FOUND                0
+           5 FILE NOT FOUND                0
+           7 FILE NOT FOUND                0
+  (5 rows — 환경에 따라 파일 수가 다르다)
+
+  SYS@orcl> !cat /home/oracle/backup/exam_arch/manifest.txt
+  1|/u01/app/oracle/oradata/orcl/system01.dbf
+  3|/u01/app/oracle/oradata/orcl/sysaux01.dbf
+  ...
+  ▸ v$recover_file 의 파일 번호가 manifest.txt 에 모두 있다 → 전부 복원 가능.
+
+1-3.4 사라진 아카이브 찾기  [검증됨]
+
+  SYS@orcl> SELECT sequence#, name FROM v$archived_log WHERE dest_id = 1 AND sequence# >= 23 ORDER BY 1;
+          23 /home/oracle/arch1/arch_1_23_1244546460.arc
+          ...
+          28 /home/oracle/arch1/arch_1_28_1244546460.arc
+          29 /home/oracle/arch1/arch_1_29_1244546460.arc
+  SYS@orcl> !ls /home/oracle/arch1/
+  ... arch_1_27_1244546460.arc  arch_1_28_1244546460.arc          ← 29 가 없다
+
+  ▸ 컨트롤파일(v$archived_log)은 29 를 아는데 디렉터리에는 없다. 사라진 것은 시퀀스 29.
+
+1-3.5 온라인 리두에 남아 있는가  [검증됨]
+
+  SYS@orcl> SELECT group#, sequence#, status, first_change# FROM v$log ORDER BY 1;
+      GROUP#  SEQUENCE# STATUS           FIRST_CHANGE#
+  ---------- ---------- ---------------- -------------
+           1         28 INACTIVE               2298049
+           2         29 INACTIVE               2298054
+           3         30 CURRENT                2298151
+
+  ▸ 시퀀스 29 는 그룹 2 에 아직 남아 있다. 아카이브는 온라인 리두의 사본이므로
+    원본이 남아 있으면 대체할 수 있다 → 완전 복구 가능.
+  ▸ 남아 있지 않았다면(스위치가 더 돌아 그룹 2 가 덮였다면) 29 앞까지만 적용하는
+    불완전 복구(UNTIL CANCEL + RESETLOGS)가 되고 29 이후의 업무를 잃는다.
+
+【수행】
+
+1-3.6 전체 복원 + RECOVER DATABASE  [검증됨]
+
+  SYS@orcl> !mkdir -p /home/oracle/before_13 ; cp -p /u01/app/oracle/oradata/orcl/*.ctl /home/oracle/before_13/
+
+  -- manifest.txt 의 경로대로 전부 복원한다
+  $ while IFS='|' read n path; do cp -p /home/oracle/backup/exam_arch/$(basename $path) $path; done \
+      < /home/oracle/backup/exam_arch/manifest.txt
+
+  SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+           1                          2294966
+           3                          2294966
+           ...                                     ← 복원 뒤에는 백업 시점 SCN 이 보인다
+
+  SYS@orcl> RECOVER DATABASE
+  ORA-00279: change 2294966 generated at 09/22/2026 15:16:57 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_23_1244546460.arc
+  ORA-00280: change 2294966 for thread 1 is in sequence #23
+  Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+  AUTO
+  ORA-00279: ... sequence #24
+  ORA-00279: ... sequence #25
+  ORA-00279: ... sequence #26
+  ORA-00279: change 2296901 generated at 09/22/2026 15:34:41 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_27_1244546460.arc
+  ORA-00280: change 2296901 for thread 1 is in sequence #27
+  Log applied.
+  Media recovery complete.
+
+  ▸ 아카이브 29 를 묻지 않았다. 27 까지 아카이브를 적용한 뒤 28·29·30 은 온라인 리두에서
+    직접 읽었다. alert log 가 그 증거다.
+      Media Recovery Log /home/oracle/arch1/arch_1_27_1244546460.arc
+      Recovery of Online Redo Log: Thread 1 Group 1 Seq 28 Reading mem 0
+      Recovery of Online Redo Log: Thread 1 Group 2 Seq 29 Reading mem 0
+      Recovery of Online Redo Log: Thread 1 Group 3 Seq 30 Reading mem 0
+      Media Recovery Complete (orcl)
+  ▸ 이 랩에서는 29 의 아카이브가 없어도 프롬프트가 나오지 않았다. 필요한 시퀀스가 온라인
+    리두 그룹에 남아 있으면 Oracle 이 아카이브보다 온라인 리두를 먼저 읽는다
+    (같은 랩에서 "첫 번째로 필요한 시퀀스의 아카이브만 없는" 경우도 같았다).
+    교안 9-6 처럼 ORA-00308 로 멈추는 환경이라면 프롬프트에 그 시퀀스를 담은 온라인 리두
+    멤버 경로(/u01/app/oracle/oradata/orcl/redo02.log)를 직접 입력한다. 어느 쪽이든
+    "온라인 리두가 아카이브를 대체했다" 를 alert log 로 증명하면 만점이다.
+
+【검증】
+
+1-3.7 OPEN 과 손실 없음  [검증됨]
+
+  SYS@orcl> ALTER DATABASE OPEN;
+  Database altered.
+  SYS@orcl> SELECT step, memo, TO_CHAR(reg_time,'HH24:MI:SS') t FROM hr.exam_log ORDER BY scn;
+  ...
+  S1-3a    아카이브 되기 전 입력                     15:35:49
+  S1-3b    아카이브 뒤 입력 (현재 리두에만 있다)     15:35:53      ← 마지막 행까지 있다
+
+  ▸ RESETLOGS 불필요 : 현재 컨트롤파일로 현재 리두의 끝까지 적용한 완전 복구다.
+    RECOVER 뒤 그냥 OPEN 이 된 것이 그 증거다.
+
+1-3.8 운이 좋았던 조건과 운영 규칙
+
+  ▸ 조건 : 시퀀스 29 를 담은 그룹이 아직 덮이지 않았다. 스위치가 두 번만 더 돌았어도
+    29 는 아카이브에도 온라인 리두에도 없어 그 앞에서 CANCEL 해야 했다 (과제 2-1 이 그 경우다).
+  ▸ 규칙 : 아카이브는 백업(또는 다중화)되기 전에 지우지 않는다 — 13장 이후라면
+    RMAN 의 ARCHIVELOG DELETION POLICY TO BACKED UP 1 TIMES, 사용자 관리라면
+    LOG_ARCHIVE_DEST_2 로 이중화한 뒤 백업이 끝난 것만 지우는 절차.
+
+================================================================================
+ 시나리오 2  불완전 복구
+================================================================================
+
+--------------------------------------------------------------------------------
+ 과제 2-1. 아카이브 결손 + 리두 소진 — Cancel 기반  [30점]
+--------------------------------------------------------------------------------
+【판정】
+
+2-1.2 완전 복구 시도  [검증됨]
+
+  SYS@orcl> ALTER DATABASE DATAFILE 7 OFFLINE;
+  SYS@orcl> !cp -p /home/oracle/backup/exam_arch/users01.dbf /u01/app/oracle/oradata/orcl/users01.dbf
+  SYS@orcl> SET AUTORECOVERY ON
+  SYS@orcl> RECOVER DATAFILE 7;
+  ORA-00279: ... sequence #23
+  ORA-00279: ... sequence #24
+  ORA-00279: ... sequence #25
+  ORA-00279: change 2296737 generated at 09/22/2026 15:41:25 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_26_1244546460.arc
+  ORA-00280: change 2296737 for thread 1 is in sequence #26
+  ORA-00308: cannot open archived log '/home/oracle/arch1/arch_1_26_1244546460.arc'
+  ORA-27037: unable to obtain file status
+  Linux-x86_64 Error: 2: No such file or directory
+
+  ▸ 시퀀스 26 에서 멈춘다. 23~25 는 이미 적용되었다(파일 7 의 SCN 은 앞으로 갔다).
+
+2-1.3 아카이브에도 온라인 리두에도 없다  [검증됨]
+
+  SYS@orcl> SELECT sequence#, name, deleted FROM v$archived_log WHERE dest_id = 1 AND sequence# >= 23 ORDER BY 1;
+          26 /home/oracle/arch1/arch_1_26_1244546460.arc NO     ← 컨트롤파일은 있다고 안다
+  SYS@orcl> !ls /home/oracle/arch1/ | grep _26_
+  (없음)
+  SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY 1;
+           1         28 INACTIVE
+           2         29 CURRENT
+           3         27 INACTIVE                                ← 26 은 이미 덮였다
+
+  ▸ 과제 1-3 과 다른 점이 이것이다. 26 이 온라인 리두에서도 사라졌다. 완전 복구는 불가능하다.
+
+2-1.4 불완전 복구 결정
+
+  ▸ 한 파일만 되돌리면 안 되는 이유 : 불완전 복구는 데이터베이스 전체를 26 직전 시점으로
+    되돌리는 것이다. 파일 7 만 옛 시점이고 나머지가 현재 시점이면 SCN 이 어긋나
+    RESETLOGS 로 열 수 없다(ORA-01152 계열). 모든 데이터파일을 같은 백업에서 복원한다.
+  ▸ OFFLINE 해 둔 파일 7 : MOUNT 에서 ONLINE 으로 되돌린 뒤 RECOVER 한다. OFFLINE 인 채로
+    두면 RECOVER DATABASE 가 그 파일을 건너뛰고, RESETLOGS 뒤에 옛 인카네이션의 파일이 된다(2-1.7).
+
+【수행】
+
+2-1.5 전체 복원 → UNTIL CANCEL → RESETLOGS  [검증됨]
+
+  SYS@orcl> !mkdir -p /home/oracle/before_21 ; cp -p /u01/app/oracle/oradata/orcl/*.ctl /u01/app/oracle/oradata/orcl/*.log /home/oracle/before_21/
+  SYS@orcl> SHUTDOWN IMMEDIATE
+  SYS@orcl> STARTUP MOUNT
+  $ while IFS='|' read n path; do cp -p /home/oracle/backup/exam_arch/$(basename $path) $path; done \
+      < /home/oracle/backup/exam_arch/manifest.txt
+  SYS@orcl> ALTER DATABASE DATAFILE 7 ONLINE;                ← 잊기 쉽다
+  SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+           1                          2294966
+           ...                                                (전부 백업 시점 SCN)
+
+  SYS@orcl> RECOVER DATABASE UNTIL CANCEL
+  ORA-00279: ... sequence #23
+  Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+  AUTO
+  ORA-00279: ... sequence #24
+  ORA-00279: ... sequence #25
+  ORA-00279: change 2296737 generated at 09/22/2026 15:41:25 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_26_1244546460.arc
+  ORA-00280: change 2296737 for thread 1 is in sequence #26
+  ORA-00308: cannot open archived log '/home/oracle/arch1/arch_1_26_1244546460.arc'
+
+  -- AUTO 는 없는 파일에서 세션을 끝낸다. 다시 실행하면 26 부터 묻는다. 거기서 CANCEL.
+  SYS@orcl> RECOVER DATABASE UNTIL CANCEL
+  ORA-00279: change 2296737 ... sequence #26
+  Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+  CANCEL
+  Media recovery cancelled.
+
+  SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+  Database altered.
+
+  ▸ CANCEL 시점의 근거 : 26 은 어디에도 없으므로 25 까지가 적용 가능한 마지막이다.
+
+【검증】
+
+2-1.6 손실 보고와 인카네이션  [검증됨]
+
+  SYS@orcl> SELECT step, memo, TO_CHAR(reg_time,'HH24:MI:SS') t, scn FROM hr.exam_log ORDER BY scn;
+  BASE     hot backup 직전                              15:16:53    2294959
+  SAFE     감독자 복원점 직전                           15:24:33    2295838
+  S2-1a    결손 이전 입력 (지킬 수 있다)                15:41:24    2296730
+  (S2-1b, S2-1c 없음)
+
+  ▸ 손실 보고 : 15:41:25(시퀀스 26 시작) 이후 장애 시각까지 입력된 업무 전부 —
+    표식으로는 S2-1b(결손 구간), S2-1c(결손 뒤) 두 건. 그 이전(S2-1a 15:41:24)까지는 보존.
+
+  SYS@orcl> SELECT incarnation#, resetlogs_change#, resetlogs_time, status FROM v$database_incarnation ORDER BY 1;
+             2           1920977 2026-09-21 11:21:00 PARENT
+             3           2296738 2026-09-22 15:42:53 CURRENT
+  SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY 1;
+           1          1 CURRENT
+           2          0 UNUSED
+           3          0 UNUSED
+
+  ▸ 즉시 할 일 : 전체 백업. 시퀀스가 1 부터 다시 시작하고 %r 이 바뀌어, 이전 백업과
+    이전 아카이브로는 이 시점 이후를 복구할 수 없다.
+    (다음 장애 스크립트가 이 원칙대로 새 Hot Backup 을 받는다)
+
+2-1.7 파일 7 을 OFFLINE 인 채로 열었다면  [검증됨 — 실제로 겪은 화면]
+
+  SYS@orcl> SELECT ... FROM hr.exam_log;
+  ORA-00376: file 7 cannot be read at this time
+  ORA-01110: data file 7: '/u01/app/oracle/oradata/orcl/users01.dbf'
+  SYS@orcl> ALTER DATABASE DATAFILE 7 ONLINE;
+  ORA-01190: control file or data file 7 is from before the last RESETLOGS
+  SYS@orcl> SET AUTORECOVERY ON
+  SYS@orcl> RECOVER DATAFILE 7;
+  ORA-00279: ... sequence #23 / #24 / #25
+  Log applied.
+  Media recovery complete.
+  SYS@orcl> ALTER DATABASE DATAFILE 7 ONLINE;
+  Database altered.
+
+  ▸ 19c 는 RESETLOGS 를 지난 뒤에도 옛 인카네이션의 아카이브(23~25)로 그 파일을
+    RESETLOGS 지점까지 따라잡게 해 준다. 그래서 수습이 된다. 다만 처음부터 ONLINE 하고
+    RECOVER DATABASE 에 포함시키는 것이 정답이다.
+
+--------------------------------------------------------------------------------
+ 과제 2-2. 사용자 실수 — Time 기반  [30점]
+--------------------------------------------------------------------------------
+【판정】
+
+2-2.2 왜 백업에서 되돌리는가
+
+  ▸ 파일은 전부 멀쩡하지만 "데이터베이스의 내용" 이 잘못된 시점으로 가 버렸다.
+    실수 이전 시점의 내용을 가진 것은 백업 + 그 뒤의 리두뿐이다.
+  ▸ PURGE 로 지운 테이블은 휴지통에 없다. Flashback Drop 은 쓸 수 없다.
+    (18장의 Flashback Database 도 이 평가 범위 밖이고 준비되어 있지 않다)
+
+2-2.3 되돌릴 시각  [검증됨]
+
+  $ cat /home/oracle/exam/incident.txt
+  incident_time=2026-09-22 15:44:09
+  → UNTIL TIME '2026-09-22 15:44:08' (신고 시각 1초 앞)
+
+  ▸ UNTIL TIME 은 그 시각 "이전" 까지의 변경을 적용한다. 같은 초 안에 DROP 이 있으면
+    적용될 수 있으므로 1초 앞으로 잡는다. 너무 앞으로 잡으면 정상 업무까지 버린다.
+  ▸ 예측 : hr.exam_log 를 미리 보면
+      S2-2a  15:44:05  실수 이전 → 남는다
+      S2-2b  15:44:14  실수 이후 → 사라진다
+      S2-2c  15:44:16  아카이브 뒤 → 사라진다
+
+【수행】
+
+2-2.4 전체 복원 → UNTIL TIME → RESETLOGS  [검증됨]
+
+  SYS@orcl> SHUTDOWN IMMEDIATE
+  SYS@orcl> STARTUP MOUNT
+  $ while IFS='|' read n path; do cp -p /home/oracle/backup/exam_arch/$(basename $path) $path; done \
+      < /home/oracle/backup/exam_arch/manifest.txt
+  SYS@orcl> SET AUTORECOVERY ON
+  SYS@orcl> RECOVER DATABASE UNTIL TIME '2026-09-22 15:44:08';
+  Media recovery complete.
+  SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+  Database altered.
+
+  ▸ 이 랩에서는 앞 과제의 RESETLOGS 뒤에 장애 스크립트가 새 Hot Backup 을 받았고,
+    그 뒤의 리두가 전부 온라인 리두에 있어 ORA-00279 없이 바로 끝났다.
+    아카이브가 필요하면 시퀀스별 ORA-00279 가 나오고 AUTO 로 적용된다.
+  ▸ USING BACKUP CONTROLFILE 을 붙이지 않는 이유 : 컨트롤파일은 현재 것이다.
+    현재 컨트롤파일은 리두의 끝을 알고 있으므로 "어디까지" 만 지정하면 된다.
+    그래도 RESETLOGS 가 필요한 것은 리두의 끝까지 가지 않고 중간에 멈췄기 때문이다.
+
+【검증】
+
+2-2.5 검증과 손실 보고  [검증됨]
+
+  SYS@orcl> SELECT COUNT(*) FROM hr.exam_orders;
+        2000
+  SYS@orcl> SELECT step, memo, TO_CHAR(reg_time,'HH24:MI:SS') t FROM hr.exam_log ORDER BY scn;
+  ...
+  S2-1a    결손 이전 입력 (지킬 수 있다)                15:41:24
+  S2-2a    실수 이전 입력 (지켜야 한다)                 15:44:05          ← 여기까지
+  SYS@orcl> SELECT incarnation#, resetlogs_change#, resetlogs_time, status FROM v$database_incarnation ORDER BY 1;
+             3           2296738 2026-09-22 15:42:53 PARENT
+             4           2297672 2026-09-22 15:45:09 CURRENT
+
+  ▸ 손실 보고 : 15:44:08 이후 장애 신고 시각까지의 정상 업무(S2-2b 15:44:14, S2-2c 15:44:16)를
+    잃었다. hr.exam_orders 2000행은 되찾았다. 예측과 일치.
+
+2-2.6 손실을 줄일 수 있었던 방법
+
+  ▸ Flashback Drop(휴지통) — PURGE 만 아니었으면 되돌릴 수 있었다.
+    Flashback Database / 복원점 — 데이터베이스 전체를 되돌리되 백업 복원 없이 빠르게.
+    RMAN RECOVER TABLE (16장) — 보조 인스턴스로 그 테이블만 되살리고 나머지는 그대로.
+    Data Pump 논리백업 (19장) — 테이블만 import 하고 실수 이후의 정상 업무는 보존.
+
+--------------------------------------------------------------------------------
+ 과제 2-3. 전체 손실 — Hot Backup 만 남음  [40점]
+--------------------------------------------------------------------------------
+【판정】
+
+2-3.2 기동 단계  [검증됨]
+
+  SYS@orcl> STARTUP
+  ORACLE instance started.
+  ...
+  ORA-00205: error in identifying control file, check alert log for more info
+
+  ▸ NOMOUNT 에서 멈춘다. 컨트롤파일이 없으니 MOUNT 가 안 되고, v$recover_file 은
+    컨트롤파일의 정보이므로 조회 자체가 불가능하다(ORA-01507).
+
+2-3.3 백업 조사와 "어디까지"  [검증됨]
+
+  $ ls /home/oracle/backup/exam_arch /home/oracle/backup/exam_arch/arch
+  ... control_exam.bkp  manifest.txt  backup_info.txt  system01.dbf ...
+  arch: arch_1_1_1244648709.arc
+  $ cat /home/oracle/backup/exam_arch/backup_info.txt
+  backup_time=2026-09-22 15:46:13
+  resetlogs_change=2297672
+  seq_begin=1
+  seq_end=1
+
+  ▸ 백업 구간의 아카이브(시퀀스 1)가 arch/ 에 있다. 아카이브 디렉터리는 비었으므로
+    되살릴 수 있는 것은 "시퀀스 1 의 끝(= END BACKUP 직후의 ARCHIVE LOG CURRENT)" 까지다.
+    그 뒤의 업무는 전부 잃는다.
+
+【수행】
+
+2-3.4 컨트롤파일·데이터파일 복원과 MOUNT  [검증됨]
+
+  SYS@orcl> SHOW PARAMETER control_files
+  control_files   string   /u01/app/oracle/oradata/orcl/control01.ctl, /u01/app/oracle/oradata/orcl/control02.ctl, /u02/oradata/orcl/control03.ctl
+  ▸ NOMOUNT 에서도 spfile 의 파라미터는 읽힌다. 이 목록의 모든 위치에 복사한다.
+
+  $ cp -p /home/oracle/backup/exam_arch/control_exam.bkp /u01/app/oracle/oradata/orcl/control01.ctl
+  $ cp -p /home/oracle/backup/exam_arch/control_exam.bkp /u01/app/oracle/oradata/orcl/control02.ctl
+  $ cp -p /home/oracle/backup/exam_arch/control_exam.bkp /u02/oradata/orcl/control03.ctl
+  $ while IFS='|' read n path; do cp -p /home/oracle/backup/exam_arch/$(basename $path) $path; done \
+      < /home/oracle/backup/exam_arch/manifest.txt
+
+  SYS@orcl> ALTER DATABASE MOUNT;
+  Database altered.
+  SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+           1                          2298417
+           ...                                        (전부 같은 SCN — 같은 백업)
+  SYS@orcl> SELECT group#, sequence#, status FROM v$log ORDER BY 1;
+           1          1 ACTIVE
+           2          2 CURRENT                       ← 백업 시점의 컨트롤파일이 아는 값이다
+           3          0 UNUSED
+
+2-3.5 UNTIL CANCEL USING BACKUP CONTROLFILE  [검증됨]
+
+  SYS@orcl> RECOVER DATABASE UNTIL CANCEL USING BACKUP CONTROLFILE
+  ORA-00279: change 2298417 generated at 09/22/2026 15:45:26 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_1_1244648709.arc
+  ORA-00280: change 2298417 for thread 1 is in sequence #1
+  Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+  /home/oracle/backup/exam_arch/arch/arch_1_1_1244648709.arc         ← 제안 경로는 없다. 사본 경로를 입력
+  ORA-00279: change 2298452 generated at 09/22/2026 15:46:08 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_2_1244648709.arc
+  ORA-00280: change 2298452 for thread 1 is in sequence #2
+  ORA-00278: log file '/home/oracle/backup/exam_arch/arch/arch_1_1_1244648709.arc' no longer needed for this recovery
+  Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+  CANCEL
+  Media recovery cancelled.
+
+  ▸ 입력 순서 : arch/ 의 사본을 시퀀스 순서대로 하나씩 → 더 없으면 CANCEL.
+    (arch/ 의 파일을 아카이브 디렉터리에 복사해 두고 AUTO 를 써도 같다)
+  ▸ 하나도 적용하지 않고 CANCEL 하면 :
+      ORA-01547: warning: RECOVER succeeded but OPEN RESETLOGS would get error below
+      ORA-01195: online backup of file 1 needs more recovery to be consistent
+    Hot Backup 은 BEGIN~END BACKUP 사이에 복사한 "일관되지 않은" 파일이다. 그 구간의
+    리두(시퀀스 1)를 적용해야 비로소 열 수 있는 상태가 된다. 그래서 백업 구간의 아카이브는
+    백업의 일부이고, 스크립트가 arch/ 에 함께 보관한 것이다.
+
+2-3.6 RESETLOGS 와 리두·TEMP  [검증됨]
+
+  SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+  Database altered.
+
+  ▸ 리두 로그 파일이 없는데 열리는 이유 : RESETLOGS 는 컨트롤파일이 아는 경로에 온라인
+    리두를 새로 만든다. (그래서 리두는 백업하지 않는다)
+  ▸ TEMP : 컨트롤파일 백업이 TEMP 파일 항목을 알고 있고, OPEN 때 파일이 없으면 다시 만든다.
+      alert log : Re-creating tempfile /u01/app/oracle/oradata/orcl/temp01.dbf
+    SELECT file#, name FROM v$tempfile 로 확인한다.
+
+【검증】
+
+2-3.7 손실 보고  [검증됨]
+
+  SYS@orcl> SELECT step, memo, TO_CHAR(reg_time,'HH24:MI:SS') t FROM hr.exam_log ORDER BY scn;
+  ...
+  S2-2a    실수 이전 입력 (지켜야 한다)                 15:44:05        ← 백업(15:46:13) 이전 행까지
+  (S2-3a 15:46:15, S2-3b 15:46:17 없음)
+  SYS@orcl> SELECT incarnation#, resetlogs_change#, resetlogs_time, status FROM v$database_incarnation ORDER BY 1;
+             4           2297672 2026-09-22 15:45:09 PARENT
+             5           2298453 2026-09-22 15:46:52 CURRENT
+
+  ▸ 손실 보고 : 백업 종료(15:46:13) 이후 장애까지의 업무 전부 — S2-3a, S2-3b.
+  ▸ 이유 : 아카이브 디렉터리가 데이터파일과 같은 디스크에 있었다. 백업 이후의 리두가
+    아카이브로만 존재했고 그것이 함께 사라졌다.
+  ▸ 막으려면 : 아카이브를 다른 디스크(LOG_ARCHIVE_DEST_2)나 다른 서버에 이중화하고,
+    백업 구간뿐 아니라 이후의 아카이브도 주기적으로 백업 위치로 옮긴다.
+
+================================================================================
+ 시나리오 3  리두·컨트롤파일 복합 장애
+================================================================================
+
+--------------------------------------------------------------------------------
+ 과제 3-1. 정상 종료 뒤 CURRENT 리두 그룹 전손  [30점]
+--------------------------------------------------------------------------------
+【판정】
+
+3-1.2 기동 단계  [검증됨]
+
+  SYS@orcl> STARTUP
+  ORACLE instance started.
+  ...
+  Database mounted.
+  ORA-03113: end-of-file on communication channel
+  Process ID: 4453
+  Session ID: 134 Serial number: 49864
+
+  $ grep -B3 'terminating the instance' /u01/app/oracle/diag/rdbms/orcl/orcl/trace/alert_orcl.log | tail -4
+  ORA-00313: open failed for members of log group 1 of thread 1
+  ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/orcl/redo01.log'
+  USER (ospid: ...): terminating the instance due to ORA error
+
+  ▸ MOUNT 는 되고 OPEN 에서 인스턴스가 죽는다. 클라이언트에는 ORA-03113 만 보이고
+    ORA-00313/00312 는 alert log 에 있다. 그룹 1 이다. STARTUP MOUNT 로 다시 올려 진행한다.
+
+3-1.3 CURRENT 인가, 정상 종료였는가  [검증됨]
+
+  SYS@orcl> STARTUP MOUNT
+  SYS@orcl> SELECT group#, sequence#, status, archived, first_change# FROM v$log ORDER BY 1;
+      GROUP#  SEQUENCE# STATUS           ARC FIRST_CHANGE#
+  ---------- ---------- ---------------- --- -------------
+           1         28 CURRENT          NO        2299776
+           2         26 INACTIVE         YES       2298002
+           3         27 INACTIVE         YES       2298353
+  SYS@orcl> !ls -l /u01/app/oracle/oradata/orcl/redo*.log
+  (redo01.log 없음)
+
+  $ grep -n 'Shutting down instance (immediate)\|Instance shutdown complete' alert_orcl.log | tail -2
+
+  ▸ ① 그룹 1 이 CURRENT 이고 ARCHIVED = NO. 시퀀스 28 은 아카이브가 없다.
+    ② alert log 의 "Shutting down instance (immediate)" — 정상 종료. 체크포인트가 끝나
+       데이터파일이 일관되므로 크래시 복구에 리두가 필요 없다.
+
+3-1.4 CLEAR LOGFILE 시도  [검증됨]
+
+  SYS@orcl> ALTER DATABASE CLEAR LOGFILE GROUP 1;
+  ORA-00350: log 1 of instance orcl (thread 1) needs to be archived
+  ORA-00312: online log 1 thread 1: '/u01/app/oracle/oradata/orcl/redo01.log'
+
+  ▸ 아카이브되지 않은 그룹은 일반 CLEAR 로 지울 수 없다. "그 리두를 아카이브 없이
+    버려도 되는가" 를 명시적으로 인정하라는 뜻이다.
+
+【수행】
+
+3-1.5 CLEAR UNARCHIVED → OPEN  [검증됨]
+
+  SYS@orcl> !mkdir -p /home/oracle/before_31 ; cp -p /u01/app/oracle/oradata/orcl/*.ctl /home/oracle/before_31/
+  SYS@orcl> ALTER DATABASE CLEAR UNARCHIVED LOGFILE GROUP 1;
+  Database altered.
+  SYS@orcl> SELECT group#, sequence#, status, archived FROM v$log ORDER BY 1;
+           1          0 UNUSED           YES
+           2         29 CURRENT          NO
+           3         27 INACTIVE         YES
+  SYS@orcl> ALTER DATABASE OPEN;
+  Database altered.
+
+  ▸ 손실이 없는 이유 : 정상 종료 때 시퀀스 28 의 내용은 이미 데이터파일에 다 써졌다.
+    리두는 "아직 데이터파일에 없는 변경" 을 되살리는 재료인데 그런 변경이 없다.
+  ▸ RESETLOGS 불필요 : 컨트롤파일이 현재 것이고 불완전 복구를 하지 않았다.
+    (비정상 종료였다면 ORA-01624 로 CLEAR 가 막히고 불완전 복구 + RESETLOGS 가 된다 — 11-2)
+
+【검증】
+
+3-1.6 손실 없음과 즉시 백업  [검증됨]
+
+  SYS@orcl> SELECT step, memo, TO_CHAR(reg_time,'HH24:MI:SS') t FROM hr.exam_log ORDER BY scn;
+  ...
+  S3-1a    아카이브 되기 전 입력                        15:52:41
+  S3-1b    아카이브 뒤 입력 (CURRENT 리두에만 있다)     15:52:43      ← 있다. 손실 0
+
+  ▸ 그런데도 즉시 전체 백업을 받아야 하는 이유 : 시퀀스 28 은 아카이브가 영원히 없다
+    (v$log 에서 27 다음이 29 다). 이전 Hot Backup 으로 복구하려면 28 을 지나야 하는데
+    지날 수 없으므로 이전 백업은 이 시점 이후에 쓸모가 없다. 실제로 과제 3-2 의 장애
+    스크립트가 이 이유로 새 Hot Backup 을 먼저 받는다. (검증 랩에서 새 백업 없이 3-2 를
+    진행했더니 ORA-01152: file 1 was not restored from a sufficiently old backup 으로 열 수 없었다)
+
+--------------------------------------------------------------------------------
+ 과제 3-2. 정상 종료 뒤 컨트롤파일 전손 — 백업 뒤에 구조가 바뀜  [35점]
+--------------------------------------------------------------------------------
+【판정】
+
+3-2.2 기동 단계  [검증됨]
+
+  SYS@orcl> STARTUP
+  ORACLE instance started.
+  ORA-00205: error in identifying control file, check alert log for more info
+
+3-2.3 백업 시점과 지금 구조의 차이  [검증됨]
+
+  $ cat /home/oracle/backup/exam_arch/backup_info.txt
+  backup_time=2026-09-22 16:11:37   seq_begin=30  seq_end=30
+  $ cat /home/oracle/backup/exam_arch/manifest.txt
+  1|.../system01.dbf  3|.../sysaux01.dbf  4|.../undotbs01.dbf  5|...  7|.../users01.dbf     ← exam_new 없음
+
+  $ cp -p /home/oracle/backup/exam_arch/control_exam.bkp /u01/app/oracle/oradata/orcl/control01.ctl
+  $ cp -p ... control02.ctl ;  cp -p ... /u02/oradata/orcl/control03.ctl
+  SYS@orcl> ALTER DATABASE MOUNT;
+  SYS@orcl> SELECT file#, name, status FROM v$datafile ORDER BY 1;
+           1 /u01/app/oracle/oradata/orcl/system01.dbf   SYSTEM
+           3 ... sysaux01.dbf   4 ... undotbs01.dbf   5 ...   7 ... users01.dbf        (5 rows)
+  SYS@orcl> !ls -l /u01/app/oracle/oradata/orcl/*.dbf
+  ... exam_new01.dbf  sales_arch01.dbf  sysaux01.dbf  system01.dbf  temp01.dbf  undotbs01.dbf  users01.dbf
+
+  ▸ 디스크에는 exam_new01.dbf 가 있는데 복원한 컨트롤파일은 모른다. 백업 뒤에 만들어진
+    테이블스페이스다. 이 파일을 되살리는 정보는 CREATE TABLESPACE 가 기록된 리두(시퀀스 31)에 있다.
+  ▸ v$log 도 백업 시점 값이다 (1: 28 INACTIVE, 2: 31 CURRENT, 3: 30 ACTIVE) — 실제 멤버가 무슨
+    시퀀스를 담고 있는지는 이 값으로 알 수 없다(3-2.6).
+
+3-2.4 복구가 멈추는 곳  [검증됨]
+
+  SYS@orcl> RECOVER DATABASE UNTIL CANCEL USING BACKUP CONTROLFILE
+  ORA-00279: change 2303321 generated at 09/22/2026 16:11:30 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_31_1244546460.arc
+  ORA-00280: change 2303321 for thread 1 is in sequence #31
+  Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+  AUTO
+  ORA-00283: recovery session canceled due to errors
+  ORA-01244: unnamed datafile(s) added to control file by media recovery
+  ORA-01110: data file 2: '/u01/app/oracle/oradata/orcl/exam_new01.dbf'
+  ORA-01112: media recovery not started
+
+  SYS@orcl> SELECT file#, name, status FROM v$datafile ORDER BY 1;
+           2 /u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00002   RECOVER
+
+  ▸ 리두 31 의 CREATE TABLESPACE 를 적용하면서 컨트롤파일에 파일 2 를 추가했지만 이름을
+    모르므로 $ORACLE_HOME/dbs/UNNAMED00002 로 등록하고 멈춘다.
+
+3-2.5 RENAME FILE 인가 CREATE DATAFILE 인가  [검증됨]
+
+  SYS@orcl> ALTER DATABASE RENAME FILE '/u01/app/oracle/product/19.3.0/dbhome_1/dbs/UNNAMED00002'
+    2         TO '/u01/app/oracle/oradata/orcl/exam_new01.dbf';
+  Database altered.
+
+  ▸ 실제 파일이 디스크에 그대로 있으므로 RENAME FILE 로 연결만 한다.
+    파일이 없었다면 CREATE DATAFILE '...UNNAMED00002' AS '<경로>' 로 빈 파일을 만들고
+    생성 이후의 리두로 채운다(1-2 와 같다). 있는 파일에 CREATE DATAFILE 을 하면 내용을 버린다.
+
+【수행】
+
+3-2.6 아카이브 → 온라인 리두 → RESETLOGS  [검증됨]
+
+  SYS@orcl> RECOVER DATABASE UNTIL CANCEL USING BACKUP CONTROLFILE
+  ORA-00279: change 2303342 ... sequence #31
+  Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+  AUTO
+  ORA-00279: change 2304425 generated at 09/22/2026 16:11:42 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_32_1244546460.arc
+  ORA-00280: change 2304425 for thread 1 is in sequence #32
+  ORA-00308: cannot open archived log '/home/oracle/arch1/arch_1_32_1244546460.arc'
+  ORA-01547: warning: RECOVER succeeded but OPEN RESETLOGS would get error below
+  ORA-01152: file 1 was not restored from a sufficiently old backup
+
+  ▸ 32 는 CURRENT 였던 그룹에만 있다(아카이브 안 됨). 여기서 CANCEL 하면 ORA-01152 —
+    정상 종료 때 데이터파일은 32 의 끝까지 써졌으므로 32 를 적용해야 일관된다.
+  ▸ 어느 멤버인가 : 복원한 컨트롤파일의 v$log 는 믿을 수 없다. 멤버를 하나씩 넣어 본다.
+    틀린 멤버를 넣으면
+      ORA-00310: archived log contains sequence 30; sequence 32 required
+      ORA-00334: archived log: '/u01/app/oracle/oradata/orcl/redo03.log'
+    로 그 멤버가 담은 시퀀스를 알려 주므로 두 번째 시도 안에 맞는다.
+
+  SYS@orcl> RECOVER DATABASE UNTIL CANCEL USING BACKUP CONTROLFILE
+  ORA-00279: change 2304425 ... sequence #32
+  Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+  /u01/app/oracle/oradata/orcl/redo01.log
+  Log applied.
+  Media recovery complete.
+
+  SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+  Database altered.
+
+  ▸ 백업 컨트롤파일로는 리두의 끝을 모르므로 CURRENT 로그를 적용한 순간 "complete" 가 되고,
+    그래도 RESETLOGS 로만 열 수 있다.
+
+【검증】
+
+3-2.7 손실 없음  [검증됨]
+
+  SYS@orcl> SELECT COUNT(*) FROM hr.exam_new_t;
+         500
+  SYS@orcl> SELECT step, memo, TO_CHAR(reg_time,'HH24:MI:SS') t FROM hr.exam_log ORDER BY scn;
+  ...
+  S3-2a    exam_new 생성과 500행 입력 뒤                16:11:41
+  S3-2b    아카이브 뒤 입력 (CURRENT 리두에만 있다)     16:11:43      ← 있다
+  SYS@orcl> SELECT incarnation#, resetlogs_change#, status FROM v$database_incarnation ORDER BY 1;
+             3           2304741 CURRENT
+
+  ▸ 현재 컨트롤파일이 아니었는데도 손실이 없는 이유 : 데이터파일과 온라인 리두가 전부
+    살아 있었다. 컨트롤파일은 "목차" 일 뿐이고 내용은 리두로 끝까지 재구성할 수 있었다.
+    RESETLOGS 는 목차를 새로 쓴 대가이지 데이터 손실이 아니다. 단, 그 뒤 즉시 전체 백업.
+
+--------------------------------------------------------------------------------
+ 과제 3-3. 비정상 종료 + 데이터파일·컨트롤파일·리두 전손, 아카이브 보유  [35점]
+--------------------------------------------------------------------------------
+【판정】
+
+3-3.2 기동 단계  [검증됨]
+  ORA-00205: error in identifying control file, check alert log for more info
+
+3-3.3 어디까지 되살릴 수 있는가  [검증됨]
+
+  $ cat /home/oracle/backup/exam_arch/backup_info.txt
+  backup_time=2026-09-22 16:13:09   resetlogs_change=2304741   seq_begin=1  seq_end=1
+  $ ls /home/oracle/arch1/ | tail -3
+  arch_1_1_1244650351.arc  arch_1_2_1244650351.arc   (+ 옛 인카네이션 파일들)
+
+  ▸ 새 인카네이션(%r 1244650351)의 아카이브는 1, 2 까지다. 3 은 CURRENT 였고 리두가
+    사라졌으므로 되살릴 수 있는 것은 시퀀스 2 의 끝까지다.
+  ▸ 복원한 컨트롤파일의 v$log (1: 1 ACTIVE, 2: 2 CURRENT, 3: 0 UNUSED) 는 백업 시점 값이다.
+    "현재 3 이 CURRENT 였다" 는 사실은 아카이브 디렉터리(마지막이 2)에서 읽는다.
+
+【수행】
+
+3-3.4 복원 → UNTIL CANCEL USING BACKUP CONTROLFILE  [검증됨]
+
+  $ cp -p /home/oracle/backup/exam_arch/control_exam.bkp <control_files 의 각 위치>
+  $ while IFS='|' read n path; do cp -p /home/oracle/backup/exam_arch/$(basename $path) $path; done \
+      < /home/oracle/backup/exam_arch/manifest.txt
+  SYS@orcl> ALTER DATABASE MOUNT;
+  SYS@orcl> SELECT file#, error, change# FROM v$recover_file;
+           1 ... 2305493   (6 rows, 전부 같은 SCN)
+
+  SYS@orcl> RECOVER DATABASE UNTIL CANCEL USING BACKUP CONTROLFILE
+  ORA-00279: change 2305493 generated at 09/22/2026 16:12:47 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_1_1244650351.arc
+  ORA-00280: change 2305493 for thread 1 is in sequence #1
+  Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+  AUTO
+  ORA-00279: change 2305518 ... sequence #2
+  ORA-00278: log file '/home/oracle/arch1/arch_1_1_1244650351.arc' no longer needed for this recovery
+  ORA-00279: change 2305535 generated at 09/22/2026 16:13:12 needed for thread 1
+  ORA-00289: suggestion : /home/oracle/arch1/arch_1_3_1244650351.arc
+  ORA-00280: change 2305535 for thread 1 is in sequence #3
+  ORA-00308: cannot open archived log '/home/oracle/arch1/arch_1_3_1244650351.arc'
+
+  SYS@orcl> RECOVER DATABASE UNTIL CANCEL USING BACKUP CONTROLFILE
+  ORA-00279: change 2305535 ... sequence #3
+  Specify log: {<RET>=suggested | filename | AUTO | CANCEL}
+  CANCEL
+  Media recovery cancelled.
+  SYS@orcl> ALTER DATABASE OPEN RESETLOGS;
+  Database altered.
+
+  ▸ 3 이 없는 이유 : 아카이브되기 전에(CURRENT) 리두 파일이 사라졌다. 이번에는 온라인
+    리두도 없으므로 3-2 처럼 멤버를 넣어 줄 수도 없다. 그래서 CANCEL.
+
+【검증】
+
+3-3.5 손실 보고  [검증됨]
+
+  SYS@orcl> SELECT step, memo, TO_CHAR(reg_time,'HH24:MI:SS') t FROM hr.exam_log ORDER BY scn;
+  ...
+  S3-2b    아카이브 뒤 입력 (CURRENT 리두에만 있다)     16:11:43
+  S3-3a    아카이브 되기 전 입력                        16:13:11        ← 여기까지
+  (S3-3b 16:13:13 없음)
+  SYS@orcl> SELECT incarnation#, resetlogs_change#, resetlogs_time, status FROM v$database_incarnation ORDER BY 1;
+             3           2304741 2026-09-22 16:12:31 PARENT
+             4           2305536 2026-09-22 16:13:45 CURRENT
+
+  ▸ 손실 보고 : 16:13:12(시퀀스 3 시작) 이후 장애까지의 업무 — S3-3b. 사라진 것은
+    정확히 "CURRENT 리두 그룹(시퀀스 3)에만 있던 변경" 이다.
+  ▸ Re-creating tempfile 이 alert log 에 남는다(2-3 과 같다).
+
+3-3.6 세 과제의 차이
+
+  과제  ① 손상 그룹 / 아카이브     ② 종료      ③ 컨트롤파일   결과
+  3-1   CURRENT 전손 / 안 됨       정상        현재          CLEAR UNARCHIVED, 손실 0, RESETLOGS 불필요
+  3-2   손상 없음 (온라인 리두 있음) 정상       백업본        아카이브 + 온라인 리두 끝까지, 손실 0, RESETLOGS
+  3-3   전 그룹 전손 / 마지막만 안 됨 비정상     백업본        아카이브 끝까지, CURRENT 내용 손실, RESETLOGS
+
+3-3.7 막을 수 있었던 조치
+
+  ▸ 리두 멤버를 다른 디스크에 다중화(b 멤버) — 한 디스크가 사라져도 CURRENT 리두가 남아
+    3-2 처럼 손실 없이 끝난다. 교안 기준 배치가 /u02 에 b 멤버를 두는 이유다.
+    (또는 컨트롤파일·리두를 데이터파일과 다른 디스크에 두는 배치)
+
+================================================================================
+ 채점 요약
+================================================================================
+ 과제   배점  반드시 있어야 하는 것
+ 1-1    25   OFFLINE 가능 이유(ARCHIVELOG), 리두 연속성 조회, 무중단, 손실 0 증명
+ 1-2    30   creation_change# 와 그 이후 리두 확인, ORA-01182, CREATE DATAFILE 순서, 400행
+ 1-3    45   사라진 시퀀스 특정, v$log 로 온라인 리두 확인, alert log 의 Online Redo 인용, 손실 0
+ 2-1    30   ORA-00308 인용, 아카이브·온라인 리두 둘 다 없음 증명, 전체 복원 이유, 손실 보고
+ 2-2    30   PURGE 이유, UNTIL TIME 값 근거, 예측과 대조, 손실 보고
+ 2-3    40   NOMOUNT 이유, arch/ 사본 인식, 입력 순서, ORA-01195 설명, 손실 보고
+ 3-1    30   ORA-03113 → alert log, CURRENT/ARCHIVED, ORA-00350, 손실 0 이유, 즉시 백업 이유
+ 3-2    35   백업 시점 구조 대조, ORA-01244/UNNAMED, RENAME 근거, 멤버 선택(ORA-00310), 손실 0
+ 3-3    35   되살릴 수 있는 범위(시퀀스), CANCEL 근거, 손실 보고(CURRENT 내용), 세 과제 비교표
+================================================================================
