@@ -682,3 +682,5 @@ PROMPT     @?/rdbms/admin/awrrpt.sql
 PROMPT   (라이선스가 없으면 Statspack 또는 위 [4]절 델타 요약을 사용)
 PROMPT ============================================================
 SET TIMING OFF
+PROMPT  (부하 세션은 여기서 종료한다 — 스냅샷·보고서는 SYSDBA 세션에서)
+EXIT
