@@ -26,40 +26,40 @@ DBTUNING/
 ├── DB튜닝_전체자료_번호목록.md        ch01~34 전체 자료 색인
 ├── DB튜닝_교안_통합.pptx              교안 PPT 34개를 진행 순서로 묶은 통합본
 ├── 00_공통/                          진료비 스키마 스크립트·ERD, 부하스크립트 WL_01~06
-├── ch01_Day1_SQL튜닝이란/            SQLT Ch01
-├── ch02_Day1_SQL실행원리/            SQLT Ch02
-├── ch03_Day1_실행계획기초/           SQLT Ch03
-├── ch04_Day1_SQL성능측정/            SQLT Ch14
-├── ch05_Day2_FullScan_vs_IndexScan/  SQLT Ch04
-├── ch06_Day2_인덱스설계/             SQLT Ch05
-├── ch07_Day2_SARGable_SQL/           SQLT Ch06
-├── ch08_Day2_Optimizer와통계/        SQLT Ch13
-├── ch09_Day3_JOIN실행원리/           SQLT Ch07
-├── ch10_Day3_Subquery_EXISTS_IN/     SQLT Ch08
-├── ch11_Day3_UNION_UNIONALL_DISTINCT/ SQLT Ch09
-├── ch12_Day3_SORT_GROUPBY_집계/      SQLT Ch10
-├── ch13_Day4_페이징SQL튜닝/          SQLT Ch11
-├── ch14_Day4_실무SQL문제/            SQLT Ch12
-├── ch15_Day5_성능튜닝개요/           TUN 01장
-├── ch16_Day5_성능설계와개발/         TUN 02장
-├── ch17_Day5_성능개선방법론과긴급대응/ TUN 03장
-├── ch18_Day5_성능을위한DB구성/       TUN 04장
-├── ch19_Day6_성능측정기준_DBTime/    TUN 05장
-├── ch20_Day6_통계수집_AWR인프라/     TUN 06장
-├── ch21_Day6_통계수집_히스토그램확장시스템/ TUN 07장
-├── ch22_Day7_AWR보고서읽기/          TUN 08장
-├── ch23_Day7_기간비교_ComparePeriods/ TUN 11장
-├── ch24_Day7_ADDM자동진단/           TUN 09장
-├── ch25_Day7_ASH샘플링추적/          TUN 10장
-├── ch26_Day8_V뷰인스턴스튜닝1_절차와통계/ TUN 13장
-├── ch27_Day8_V뷰인스턴스튜닝2_대기이벤트/ TUN 14장
-├── ch28_Day8_경고메트릭_상시모니터링/ TUN 12장
-├── ch29_Day8_메모리할당구조/         TUN 16장
-├── ch30_Day9_Advisor프레임워크_자동튜닝/ TUN 15장
-├── ch31_Day9_SGA튜닝1_버퍼캐시_리두버퍼/ TUN 17장
-├── ch32_Day9_SGA튜닝2_공유풀_라지풀/ TUN 18장
-├── ch33_Day10_결과캐시_PGA튜닝/      TUN 19장
-├── ch34_Day10_IO구성_OS자원관리/     TUN 20장
+├── ch01_SQL튜닝이란/                    SQLT Ch01
+├── ch02_SQL실행원리/                    SQLT Ch02
+├── ch03_실행계획기초/                   SQLT Ch03
+├── ch04_SQL성능측정/                    SQLT Ch14
+├── ch05_FullScan_vs_IndexScan/          SQLT Ch04
+├── ch06_인덱스설계/                     SQLT Ch05
+├── ch07_SARGable_SQL/                   SQLT Ch06
+├── ch08_Optimizer와통계/                SQLT Ch13
+├── ch09_JOIN실행원리/                   SQLT Ch07
+├── ch10_Subquery_EXISTS_IN/             SQLT Ch08
+├── ch11_UNION_UNIONALL_DISTINCT/        SQLT Ch09
+├── ch12_SORT_GROUPBY_집계/              SQLT Ch10
+├── ch13_페이징SQL튜닝/                  SQLT Ch11
+├── ch14_실무SQL문제/                    SQLT Ch12
+├── ch15_성능튜닝개요/                   TUN 01장
+├── ch16_성능설계와개발/                 TUN 02장
+├── ch17_성능개선방법론과긴급대응/       TUN 03장
+├── ch18_성능을위한DB구성/               TUN 04장
+├── ch19_성능측정기준_DBTime/            TUN 05장
+├── ch20_통계수집_AWR인프라/             TUN 06장
+├── ch21_통계수집_히스토그램확장시스템/  TUN 07장
+├── ch22_AWR보고서읽기/                  TUN 08장
+├── ch23_기간비교_ComparePeriods/        TUN 11장
+├── ch24_ADDM자동진단/                   TUN 09장
+├── ch25_ASH샘플링추적/                  TUN 10장
+├── ch26_V뷰인스턴스튜닝1_절차와통계/    TUN 13장
+├── ch27_V뷰인스턴스튜닝2_대기이벤트/    TUN 14장
+├── ch28_경고메트릭_상시모니터링/        TUN 12장
+├── ch29_메모리할당구조/                 TUN 16장
+├── ch30_Advisor프레임워크_자동튜닝/     TUN 15장
+├── ch31_SGA튜닝1_버퍼캐시_리두버퍼/     TUN 17장
+├── ch32_SGA튜닝2_공유풀_라지풀/         TUN 18장
+├── ch33_결과캐시_PGA튜닝/               TUN 19장
+├── ch34_IO구성_OS자원관리/              TUN 20장
 ├── SQL튜닝_심화실습_30제_문제.md · _해설.md   SQL 부문 평가(심화 30제)
 ├── SQL튜닝_최종테스트_문제.md · _해설.md       SQL 부문 평가(최종테스트)
 ├── 평가_SQL부문/                     SQL 부문 평가 문제지·모범답안
