@@ -97,6 +97,7 @@ backupdba, dgdba, kmdba, racdba)를 만든다.
 ```bash
 yum install -y oracle-database-preinstall-19c unzip bc nfs-utils
 passwd oracle                              # 비밀번호 oracle (교안은 su - oracle 로만 쓴다)
+usermod -g dba oracle                      # 주 그룹을 dba 로 (교안 화면의 ls -l 이 oracle dba 다)
 systemctl disable --now firewalld          # 또는 1521/2049(NFS) 개방
 sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config && setenforce 0
 ```
@@ -106,14 +107,16 @@ sed -i 's/^SELINUX=.*/SELINUX=permissive/' /etc/selinux/config && setenforce 0
 ```bash
 mkdir -p /u01/app/oracle/product/19.3.0/dbhome_1 /u01/app/oraInventory
 mkdir -p /u01/app/oracle/oradata /u02/oradata /u03/dpdump /u03/arch2 /u03/aux /u04 /fra
-chown -R oracle:oinstall /u01 /u02 /u03 /u04 /fra
+chown -R oracle:oinstall /u01                      # ORACLE_BASE·ORACLE_HOME 은 oinstall
+chown -R oracle:dba /u01/app/oracle/oradata /u02 /u03 /u04 /fra   # 데이터·백업 경로는 oracle 주 그룹
 chmod -R 775 /u01 /u02 /u03 /u04 /fra
 echo 'oracle ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/oracle   # 2장 실습 6 이 sudo mount -t tmpfs 를 쓴다
 ```
 
 `/u01/app/oracle/oradata` 는 **oracle 소유**여야 한다. root 소유면 dbca 가 `DBT-06006 Unable to create directory` 로 멈춘다.
-교안 화면의 `ls -l` 은 `oracle dba` 로 보인다(실측 랩은 oracle 의 주 그룹이 dba). preinstall 로 만든 계정은
-`oracle oinstall` 로 보이지만 실습에는 영향이 없다. 맞추고 싶으면 `usermod -g dba oracle`.
+**데이터베이스가 만드는 파일의 그룹은 oracle 의 주 그룹이 된다.** 교안 화면의 `ls -l` 은 `oracle dba` 이므로
+2-3 에서 주 그룹을 dba 로 바꿨다. 바꾸지 않으면 `oracle oinstall` 로 보이며 실습 동작에는 영향이 없다.
+`ORACLE_HOME` 과 인벤토리만은 `oracle:oinstall` 로 둔다(설치 요건).
 
 ### 2-5. oracle 사용자 환경
 
@@ -422,7 +425,8 @@ oel7v9r2 (관리계)  : rcat (카탈로그 전용) + hrdb + /backup NFS 원본 +
 
 ```bash
 mkdir -p /u02/oradata /u02/admin /u02/arch_sales /exports/backup
-chown -R oracle:oinstall /u02 /exports
+chown -R oracle:dba /u02 /exports
+chmod 775 /exports/backup
 ```
 
 > 고급 07·10 의 트랜스크립트에는 oel7v9r2 에 ASM(`+FRA`, `asm_pmon_+ASM`)이 보인다. 실측 서버가
@@ -435,27 +439,44 @@ chown -R oracle:oinstall /u02 /exports
 두 서버에서 같은 경로로 보여야 한다.
 
 ```bash
-# oel7v9r2 (root)
+# oel7v9r2 (root) — 원본 디렉터리를 만들고 소유권을 oracle 로 준다
+mkdir -p /exports/backup
+chown oracle:dba /exports/backup
+chmod 775 /exports/backup
 echo '/exports/backup oel7v9(rw,sync,no_root_squash)' >> /etc/exports
 systemctl enable --now nfs-server && exportfs -ra
 mkdir -p /backup && mount --bind /exports/backup /backup
 echo '/exports/backup /backup none bind 0 0' >> /etc/fstab
-mkdir -p /backup/HRDB /backup/RCAT && chown -R oracle:oinstall /exports/backup
+su - oracle -c 'mkdir -p /backup/HRDB /backup/RCAT'      # oracle 로 만들면 소유자도 oracle 이 된다
 
-# oel7v9 (root)
+# oel7v9 (root) — 마운트 지점만 만들고, 하위 디렉터리는 oracle 로 만든다
 mkdir -p /backup
 echo 'oel7v9r2:/exports/backup /backup nfs defaults,_netdev 0 0' >> /etc/fstab
 mount /backup
 su - oracle -c 'mkdir -p /backup/ORCL /backup/SALES'
 ```
 
-두 서버의 oracle uid/gid 가 같아야 한다 (`id oracle` 로 확인. preinstall 은 보통 54321/54321 을 준다).
+확인 (양쪽에서 같은 소유자·권한으로 보여야 한다) :
+
+```bash
+ls -ld /backup /backup/ORCL /backup/SALES        # drwxrwxr-x. oracle dba
+su - oracle -c 'touch /backup/ORCL/.w && rm /backup/ORCL/.w && echo WRITE-OK'
+```
+
+- **`no_root_squash` 는 root 에게만 해당한다.** RMAN 은 oracle 로 쓰므로 그 옵션이 있어도
+  원본 디렉터리가 root 소유면 백업이 `ORA-19504: failed to create file` / `ORA-27040: file create error` 로 실패한다.
+  원본(`/exports/backup`)과 DB별 하위 디렉터리의 소유자가 oracle 이어야 한다.
+- **NFS 는 이름이 아니라 uid/gid 숫자로 판단한다.** 두 서버의 `id oracle` 이 같아야 한다.
+  다르면 클라이언트에서 파일이 남의 것으로 보여 같은 오류가 난다. 다를 때는 한쪽을 맞춘다
+  (`usermod -u <uid> oracle; groupmod -g <gid> dba` 뒤 기존 파일 `chown -R oracle:dba`).
+- 소유권은 **NFS 서버(oel7v9r2)의 것이 그대로 보인다.** 클라이언트에서 `chown` 해도 서버 쪽이 바뀐다.
 
 ### 8-3. oel7v9 의 나머지 디렉터리와 계정
 
 ```bash
 # root
-mkdir -p /archive_keep /export /backup_wallet && chown oracle:oinstall /archive_keep /export /backup_wallet
+mkdir -p /archive_keep /export /backup_wallet && chown oracle:dba /archive_keep /export /backup_wallet
+chmod 750 /archive_keep && chmod 755 /export /backup_wallet
 # oracle
 mkdir -p /home/oracle/rcadm/{log,scripts,fallback,verify,bench} /home/oracle/arch_sales /u03/dpdump_rcat
 ssh-keygen -t rsa -N '' -f ~/.ssh/id_rsa && ssh-copy-id oracle@oel7v9r2      # 07 의 파일 전송, 09 의 반출
@@ -608,7 +629,8 @@ sqlplus -s rcatowner/oracle_4U@rcat <<< "SELECT name, dbid FROM rc_database ORDE
 
 | 증상 | 원인 | 조치 |
 |---|---|---|
-| dbca `DBT-06006 Unable to create directory` | `-datafileDestination` 디렉터리가 root 소유 | `chown oracle:oinstall` (2-4) |
+| dbca `DBT-06006 Unable to create directory` | `-datafileDestination` 디렉터리가 root 소유 | `chown oracle:dba` (2-4) |
+| 백업이 `ORA-19504` / `ORA-27040` | 백업 디렉터리가 oracle 소유가 아니다. NFS 면 두 서버의 oracle uid/gid 불일치 | 8-2 의 확인 명령으로 소유자와 쓰기 가능 여부를 본다 |
 | dbca 뒤 데이터파일이 `oradata/ORCL/` | dbca 는 DB 이름을 대문자로 붙인다 | 4-2 의 RENAME 절차 (orcl 만. sales·rcat·hrdb 는 대문자 그대로) |
 | 17장 DUPLICATE, 고급 07·10 에서 `ORA-12514` | NOMOUNT 인스턴스는 동적 등록이 안 된다 | listener.ora 의 SID_LIST 정적 등록 (3-2) |
 | `CREATE CATALOG` 가 `ORA-04031` | rcat SGA 부족 | `-totalMemory 1024` 이상으로 다시 만든다 |
