@@ -45,7 +45,7 @@ VMware Workstation 기준. 두 서버 모두 같은 규격으로 만들면 07·1
 | `/fra` | 30 GB | 9·13·18장이 FRA 로 쓰는 위치 | ○ | — |
 | `/archive_keep` | 30 GB | KEEP 장기 보관 (고급 06) | ○ | — |
 | `/export` | 20 GB | 암호화 반출 (고급 09) | ○ | — |
-| `/backup` | 100 GB | RMAN 백업 (고급 03~10). **oel7v9r2 가 원본, oel7v9 는 NFS 마운트** | (NFS) | ○ (export) |
+| `/backup` | 200 GB | RMAN 백업 (고급 03~10). **oel7v9r2 가 원본, oel7v9 는 NFS 마운트** | (NFS) | ○ (export) |
 
 기본 과정만 할 것이면 `/archive_keep` `/export` `/backup` 은 만들지 않아도 된다.
 디스크를 나누기 어려우면 `/` 를 200 GB 로 잡고 디렉터리로 만들어도 실습은 된다(다중화의 의미만 잃는다).
