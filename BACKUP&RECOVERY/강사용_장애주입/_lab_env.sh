@@ -7,8 +7,8 @@ export ORAENV_ASK=NO
 export DBF=${DBF:-/u01/app/oracle/oradata/orcl}
 # Fast Recovery Area(아카이브·오토백업·백업셋)
 export FRA=${FRA:-/u01/app/oracle/fast_recovery_area/ORCL}
-# 업무 스키마(검증 대상)
-export BIZ_USER=${BIZ_USER:-SQLT}
+# 업무 스키마(검증 대상) — HR 샘플 스키마 사용(대표 표 EMPLOYEES.SALARY)
+export BIZ_USER=${BIZ_USER:-HR}
 # 실습 시작 전 반드시 복원 가능한 스냅숏을 떠 둔다.
 export SNAP_TAKEN=${SNAP_TAKEN:-NO}
 

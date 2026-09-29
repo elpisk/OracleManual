@@ -8,26 +8,33 @@
 # ============================================================================
 set -u; cd "$(dirname "$0")"; . ./_lab_env.sh; guard
 
-# 0) 대상 표/인덱스와 물리 위치 파악(표는 업무 스키마의 대형 표)
+# 0) 대상 표/인덱스의 '실제 데이터 블록' 위치 파악(dba_extents 기준 → 작은 표에서도 확실)
 read TBL_FILE TBL_REL <<<"$(sq "
-select f.file#||' '||1000
-  from dba_segments s join dba_data_files f on s.tablespace_name=f.tablespace_name
- where s.owner='$BIZ_USER' and s.segment_type='TABLE' and rownum=1;")"
+select e.file_id||' '||(e.block_id+2)
+  from dba_extents e
+ where e.owner='$BIZ_USER' and e.segment_type='TABLE' and e.blocks>=4
+ order by e.blocks desc fetch first 1 rows only;")"
 read IDX_FILE IDX_REL <<<"$(sq "
-select f.file#||' '||3000
-  from dba_segments s join dba_data_files f on s.tablespace_name=f.tablespace_name
- where s.owner='$BIZ_USER' and s.segment_type='INDEX' and rownum=1;")"
+select e.file_id||' '||(e.block_id+2)
+  from dba_extents e
+ where e.owner='$BIZ_USER' and e.segment_type='INDEX' and e.blocks>=2
+ order by e.blocks desc fetch first 1 rows only;")"
 TBL_DBF=$(sq "select name from v\$datafile where file#=$TBL_FILE;")
 IDX_DBF=$(sq "select name from v\$datafile where file#=$IDX_FILE;")
 
-echo "[주입] 표 파일#$TBL_FILE  인덱스 파일#$IDX_FILE"
+if [ -z "$TBL_REL" ] || [ -z "$TBL_DBF" ]; then echo "!! $BIZ_USER 표 세그먼트를 못 찾음. BIZ_USER 확인."; exit 1; fi
+echo "[주입] 표 파일#$TBL_FILE 블록$TBL_REL~  인덱스 파일#$IDX_FILE 블록$IDX_REL  (실 세그먼트 블록)"
 
 # 1) 데이터 블록 다수 오손(연속 3블록) — dd 로 8K 블록을 0으로
 for off in 0 1 2; do
   dd if=/dev/zero of="$TBL_DBF" bs=8192 seek=$((TBL_REL+off)) count=1 conv=notrunc 2>/dev/null
 done
 # 2) 인덱스 블록 1개 오손(전략 분기 유도: 인덱스는 REBUILD 가 정답)
-dd if=/dev/zero of="$IDX_DBF" bs=8192 seek=$IDX_REL count=1 conv=notrunc 2>/dev/null
+if [ -n "$IDX_REL" ] && [ -n "$IDX_DBF" ]; then
+  dd if=/dev/zero of="$IDX_DBF" bs=8192 seek=$IDX_REL count=1 conv=notrunc 2>/dev/null
+else
+  echo "[주의] $BIZ_USER 인덱스 세그먼트가 작아 건너뜀 — 표 블록만 손상(전략 분기 유지하려면 큰 인덱스 필요)."
+fi
 
 # 3) 캐시에 안 남도록 flush (재조회 시 물리 읽기→오류 표면화)
 sq "alter system flush buffer_cache;"

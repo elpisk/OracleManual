@@ -14,9 +14,12 @@
 set -u; cd "$(dirname "$0")"; . ./_lab_env.sh; guard
 
 # 1) 미반영 트랜잭션(불완전복구로만 일부 손실될 데이터)
-sq "create table ${BIZ_USER}.dr_marker(id number, ts timestamp) tablespace users;
-    begin for i in 1..200 loop insert into ${BIZ_USER}.dr_marker values(i,systimestamp); end loop; commit; end;
-    alter system switch logfile;"
+sq "alter user ${BIZ_USER} quota unlimited on users;
+    begin execute immediate 'drop table ${BIZ_USER}.dr_marker purge'; exception when others then null; end;
+    create table ${BIZ_USER}.dr_marker(id number, ts timestamp) tablespace users;
+begin for i in 1..200 loop insert into ${BIZ_USER}.dr_marker values(i,systimestamp); end loop; commit; end;
+/
+alter system switch logfile;"
 
 # 2) CURRENT 리두 그룹 전 멤버 삭제
 CUR=$(sq "select group# from v\$log where status='CURRENT';")

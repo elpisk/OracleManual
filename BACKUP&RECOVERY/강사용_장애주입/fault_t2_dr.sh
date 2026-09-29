@@ -13,9 +13,22 @@
 set -u; cd "$(dirname "$0")"; . ./_lab_env.sh; guard
 BACKUP2=${BACKUP2:-/backup2}; mkdir -p "$BACKUP2"
 
-# 1) 한 TS 국소 오염 + 목표 SCN 보관(TSPITR 대상: 예 USERS)
-TSPITR_SCN=$(sq "select current_scn from v\$database;")
-sq "update ${BIZ_USER}.dr_marker set id=id*-1 where rownum<=50; commit;" 2>/dev/null
+# 1) USERS 에 마커 준비(없으면 생성·시드) → 정상 시점 SCN 확보 → 그 뒤 국소 오염
+sq "alter user ${BIZ_USER} quota unlimited on users;
+begin execute immediate 'create table ${BIZ_USER}.dr_marker(id number, ts timestamp) tablespace users';
+exception when others then null; end;
+/
+merge into ${BIZ_USER}.dr_marker t using (select level id from dual connect by level<=200) s
+  on (t.id=s.id) when not matched then insert(id,ts) values(s.id,systimestamp);
+commit;"
+sq "alter system checkpoint; alter system switch logfile; alter system archive log current;"
+# 정상 상태 L0 백업(주어질 백업이 깨끗한 마커를 포함하도록) → 그 직후를 TSPITR 목표로
+rman target / <<'RMAN'
+backup database plus archivelog;
+RMAN
+TSPITR_SCN=$(sq "select current_scn from v\$database;")   # USERS 오염 직전(정상) 시점
+sq "update ${BIZ_USER}.dr_marker set id=id*-1 where id<=50; commit;
+    alter system switch logfile; alter system archive log current;"
 echo "[주입·비공개] TSPITR 목표 SCN ≈ $TSPITR_SCN  (USERS 오염 직전, 학생 비공개)"
 
 # 2) 최신 백업 일부를 두 번째 위치로 분산(양쪽 CATALOG 유도)
