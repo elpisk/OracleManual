@@ -1,0 +1,522 @@
+================================================================================
+ LOB 실습 00 : 실습 환경 구성
+ 과정      : Oracle Database 19c LOB 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 + AL16UTF16 / 8K 블록
+ 계정      : SYS (구성) + loblab (검증)
+ 소요 시간 : 약 25분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 실습 01~08 을 시작하기 전에 필요한 것을 한 번에 만든다.
+-- 이 실습을 건너뛰면 뒤의 모든 실습이 ORA-00942 · ORA-22285 로 막힌다.
+--
+-- 만들 것
+--   ① 테이블스페이스 두 개   lobtbs(ASSM) · lobmssm(MSSM)
+--      -> MSSM 이 왜 필요한가 : 실습 06 이 MSSM 에서 SecureFile 이 거부되는 것을
+--         (ORA-43853) 재현한다. ASSM 하나만 있으면 그 실습을 할 수 없다
+--   ② 계정 loblab            시스템 권한 + v$ 뷰 조회 권한
+--   ③ 디렉터리 객체 lob_dir  /home/oracle/lobfiles
+--   ④ 실습용 OS 파일 세 개   manual.txt · photo.bin · big.dat
+--      -> 실습 03·04 가 이 파일들의 **정확한 크기**를 전제로 한다
+--
+-- 마지막에 loblab 으로 직접 접속해 네 가지를 검증한다.
+--   LOB 컬럼 생성 / 임시 LOB / v$ 뷰 조회 / BFILE 로 디렉터리 읽기
+-- 작업 유형 : 환경 구성
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · SYS 로 접속할 수 있다 (테이블스페이스·계정·디렉터리 객체를 만든다)
+-- · 데이터파일을 둘 경로에 250MB 이상 여유가 있다 (lobtbs 200M + lobmssm 20M)
+-- · 서버에 oracle 사용자로 파일을 만들 수 있다 (디렉터리 객체는 서버의 경로다)
+-- · 문자집합이 AL32UTF8 이어야 실습 03 의 문자/바이트 수가 문서와 일치한다
+--   (한글이 3바이트인 것을 전제로 5,154문자 = 7,566바이트를 쓴다)
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT banner_full FROM v$version;
+
+BANNER_FULL
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+
+SYS@orcl> COL parameter FORMAT a24
+SYS@orcl> COL value FORMAT a12
+SYS@orcl> SELECT parameter, value FROM nls_database_parameters
+  2  WHERE  parameter IN ('NLS_CHARACTERSET','NLS_NCHAR_CHARACTERSET');
+
+PARAMETER                VALUE
+------------------------ ------------
+NLS_NCHAR_CHARACTERSET   AL16UTF16
+NLS_CHARACTERSET         AL32UTF8
+
+SYS@orcl> SHOW PARAMETER db_block_size
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+db_block_size                        integer     8192
+SYS@orcl> SHOW PARAMETER db_securefile
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+db_securefile                        string      PREFERRED
+SYS@orcl> SHOW PARAMETER deferred_segment_creation
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+deferred_segment_creation            boolean     TRUE
+SYS@orcl> COL name FORMAT a46
+SYS@orcl> SELECT name, bytes/1024/1024 AS mb FROM v$datafile ORDER BY file#;
+
+NAME                                                   MB
+---------------------------------------------- ----------
+/u03/oradata/ORCL/system01.dbf                       1320
+/u03/oradata/ORCL/ts_stg01.dbf                     422.25
+/u03/oradata/ORCL/sysaux01.dbf                       1430
+/u03/oradata/ORCL/undotbs01.dbf                      3155
+/u03/oradata/ORCL/rtbs01.dbf                           50
+/u03/oradata/ORCL/users01.dbf                     2268.75
+/u03/oradata/ORCL/users02.dbf                         400
+/u03/oradata/ORCL/exam_tbs01.dbf                       20
+/u03/oradata/ORCL/tbs13_01.dbf                         20
+/u01/app/oracle/oradata/orcl/tbs_new01.dbf             10
+
+10 rows selected.
+
+-- 확인할 네 가지
+--   NLS_CHARACTERSET       AL32UTF8   -> 한글 1자가 3바이트다
+--   NLS_NCHAR_CHARACTERSET AL16UTF16  -> NCLOB 은 1자가 2바이트다
+--   db_block_size          8192       -> 인라인 저장 경계 3,968바이트의 근거다
+--   db_securefile          PREFERRED  -> 19c 기본값. 그냥 만들면 SecureFile 이 된다
+--   deferred_segment_creation TRUE    -> 행을 넣을 때까지 세그먼트를 만들지 않는다
+--
+-- v$datafile 로 기존 데이터파일이 어느 디렉터리에 있는지 본다.
+-- 새 데이터파일도 같은 곳에 두면 된다. OMF(db_create_file_dest) 를 쓴다면
+-- DATAFILE 절을 생략하고 SIZE 만 줘도 된다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 테이블스페이스 두 개
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLESPACE lobtbs DATAFILE '/u01/app/oracle/oradata/orcl/lobtbs01.dbf'
+  2    SIZE 200M AUTOEXTEND ON NEXT 50M MAXSIZE 1G
+  3    EXTENT MANAGEMENT LOCAL AUTOALLOCATE SEGMENT SPACE MANAGEMENT AUTO;
+
+Tablespace created.
+
+SYS@orcl> CREATE TABLESPACE lobmssm DATAFILE '/u01/app/oracle/oradata/orcl/lobmssm01.dbf'
+  2    SIZE 20M
+  3    EXTENT MANAGEMENT LOCAL UNIFORM SIZE 64K SEGMENT SPACE MANAGEMENT MANUAL;
+
+Tablespace created.
+
+SYS@orcl> COL tablespace_name FORMAT a12
+SYS@orcl> SELECT tablespace_name, block_size, initial_extent, extent_management,
+  2         allocation_type, segment_space_management
+  3  FROM   dba_tablespaces WHERE tablespace_name LIKE 'LOB%' ORDER BY tablespace_name;
+
+TABLESPACE_N BLOCK_SIZE INITIAL_EXTENT EXTENT_MAN ALLOCATIO SEGMEN
+------------ ---------- -------------- ---------- --------- ------
+LOBMSSM            8192          65536 LOCAL      UNIFORM   MANUAL
+LOBTBS             8192          65536 LOCAL      SYSTEM    AUTO
+
+SYS@orcl> COL file_name FORMAT a44
+SYS@orcl> SELECT tablespace_name, file_name, bytes/1024/1024 AS mb, autoextensible,
+  2         maxbytes/1024/1024 AS maxmb
+  3  FROM   dba_data_files WHERE tablespace_name LIKE 'LOB%' ORDER BY tablespace_name;
+
+TABLESPACE_N FILE_NAME                                            MB AUT      MAXMB
+------------ -------------------------------------------- ---------- --- ----------
+LOBMSSM      /u01/app/oracle/oradata/orcl/lobmssm01.dbf                     20 NO           0
+LOBTBS       /u01/app/oracle/oradata/orcl/lobtbs01.dbf                     200 YES       1024
+
+-- 두 테이블스페이스의 차이가 실습 06 의 핵심이다.
+--
+--   항목                     | LOBTBS              | LOBMSSM
+--   -------------------------|---------------------|------------------
+--   extent_management        | LOCAL               | LOCAL
+--   allocation_type          | SYSTEM(AUTOALLOCATE)| UNIFORM
+--   segment_space_management | AUTO (ASMM)         | MANUAL (MSSM)
+--   initial_extent           | 65536               | 65536
+--
+-- SecureFile LOB 은 ASSM 테이블스페이스에서만 만들 수 있다.
+-- MSSM 에서 SECUREFILE 을 지정하면 ORA-43853 이다 (실습 06 에서 재현한다).
+-- 그래서 두 개를 미리 만들어 둔다.
+--
+-- lobtbs 를 200M 로 잡은 이유 : 실습 06·07 이 200건 x 100KB(약 20MB) 를
+-- 여섯 가지 구성으로 적재한다. AUTOEXTEND 를 켜 두었으므로 부족하면 늘어난다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 계정과 권한
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE USER loblab IDENTIFIED BY oracle_4U DEFAULT TABLESPACE lobtbs
+  2    QUOTA UNLIMITED ON lobtbs QUOTA UNLIMITED ON lobmssm QUOTA UNLIMITED ON users;
+
+User created.
+
+SYS@orcl> GRANT CREATE SESSION, CREATE TABLE, CREATE PROCEDURE, CREATE SEQUENCE, CREATE VIEW TO loblab;
+
+Grant succeeded.
+
+SYS@orcl> GRANT SELECT ON v$temporary_lobs TO loblab;
+GRANT SELECT ON v$temporary_lobs TO loblab
+                *
+ERROR at line 1:
+ORA-02030: can only select from fixed tables/views
+
+
+SYS@orcl> GRANT SELECT ON v_$temporary_lobs TO loblab;
+
+Grant succeeded.
+
+SYS@orcl> GRANT SELECT ON v_$tempseg_usage TO loblab;
+GRANT SELECT ON v_$tempseg_usage TO loblab
+                *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+
+SYS@orcl> GRANT SELECT ON v_$sort_usage     TO loblab;
+
+Grant succeeded.
+
+SYS@orcl> GRANT SELECT ON v_$session        TO loblab;
+
+Grant succeeded.
+
+SYS@orcl> GRANT SELECT ON v_$mystat         TO loblab;
+
+Grant succeeded.
+
+SYS@orcl> GRANT SELECT ON v_$statname       TO loblab;
+
+Grant succeeded.
+
+SYS@orcl> COL grantee FORMAT a10
+SYS@orcl> COL privilege FORMAT a20
+SYS@orcl> COL table_name FORMAT a20
+SYS@orcl> SELECT privilege FROM dba_sys_privs WHERE grantee='LOBLAB' ORDER BY privilege;
+
+PRIVILEGE
+--------------------
+CREATE PROCEDURE
+CREATE SEQUENCE
+CREATE SESSION
+CREATE TABLE
+CREATE VIEW
+
+SYS@orcl> SELECT table_name, privilege FROM dba_tab_privs WHERE grantee='LOBLAB' ORDER BY table_name;
+
+TABLE_NAME           PRIVILEGE
+-------------------- --------------------
+V_$MYSTAT            SELECT
+V_$SESSION           SELECT
+V_$SORT_USAGE        SELECT
+V_$STATNAME          SELECT
+V_$TEMPORARY_LOBS    SELECT
+
+SYS@orcl> COL username FORMAT a10
+SYS@orcl> COL default_tablespace FORMAT a12
+SYS@orcl> COL temporary_tablespace FORMAT a12
+SYS@orcl> COL account_status FORMAT a10
+SYS@orcl> SELECT username, default_tablespace, temporary_tablespace, account_status
+  2  FROM   dba_users WHERE username='LOBLAB';
+
+USERNAME   DEFAULT_TABL TEMPORARY_TA ACCOUNT_ST
+---------- ------------ ------------ ----------
+LOBLAB     LOBTBS       TEMP         OPEN
+
+SYS@orcl> COL tablespace_name FORMAT a12
+SYS@orcl> SELECT tablespace_name, max_bytes FROM dba_ts_quotas WHERE username='LOBLAB'
+  2  ORDER  BY tablespace_name;
+
+TABLESPACE_N  MAX_BYTES
+------------ ----------
+LOBMSSM              -1
+LOBTBS               -1
+USERS                -1
+
+-- 여기서 두 가지 오류를 일부러 만나 본다. 둘 다 v$ 뷰 권한과 관련된 것이다.
+--
+--   ORA-02030: can only select from fixed tables/views
+--     GRANT SELECT ON v$temporary_lobs 는 안 된다.
+--     v$ 는 뷰가 아니라 **공용 동의어**다. 권한은 기반 뷰 v_$temporary_lobs 에 준다.
+--     조회는 v$ 이름으로 하면 된다 ([7] 에서 확인한다).
+--
+--   ORA-00942: table or view does not exist
+--     v_$tempseg_usage 라는 이름은 없다. v$tempseg_usage 의 기반 뷰는
+--     **v_$sort_usage** 다. 이름이 바뀐 뷰라 짝이 다르다.
+--     실습 05 가 임시 세그먼트를 확인할 때 이 뷰를 쓴다.
+--
+-- 권한 결과
+--   시스템 권한 5개 : CREATE SESSION · TABLE · PROCEDURE · SEQUENCE · VIEW
+--                     (LOB 을 쓰기 위한 별도 권한은 없다. 평범한 테이블 권한으로 충분하다)
+--   객체 권한 5개   : V_$MYSTAT · V_$SESSION · V_$SORT_USAGE · V_$STATNAME
+--                     · V_$TEMPORARY_LOBS
+--   기본 테이블스페이스 LOBTBS, 임시 TEMP
+--   쿼터 max_bytes = -1 은 UNLIMITED 를 뜻한다 (세 테이블스페이스 모두)
+
+--------------------------------------------------------------------------------
+[6] 검증 준비 — 디렉터리 객체와 실습 파일
+--------------------------------------------------------------------------------
+-- 디렉터리 객체는 **서버의 경로**를 가리킨다. 클라이언트 PC 의 경로가 아니다.
+-- 그리고 OS 디렉터리가 실제로 있어야 하고 oracle 사용자가 읽고 쓸 수 있어야 한다.
+-- 객체를 만들 때 Oracle 이 경로 존재를 검사하지 않으므로 여기서 먼저 만든다.
+
+[oracle@oel7v9 ~]$ mkdir -p /home/oracle/lobfiles && ls -ld /home/oracle/lobfiles
+drwxr-xr-x. 2 oracle dba 6 Sep 29 14:59 /home/oracle/lobfiles
+
+SYS@orcl> CREATE OR REPLACE DIRECTORY lob_dir AS '/home/oracle/lobfiles';
+
+Directory created.
+
+SYS@orcl> GRANT READ, WRITE ON DIRECTORY lob_dir TO loblab;
+
+Grant succeeded.
+
+SYS@orcl> COL directory_name FORMAT a12
+SYS@orcl> COL directory_path FORMAT a30
+SYS@orcl> SELECT directory_name, directory_path FROM dba_directories
+  2  WHERE  directory_name = 'LOB_DIR';
+
+DIRECTORY_NA DIRECTORY_PATH
+------------ ------------------------------
+LOB_DIR      /home/oracle/lobfiles
+
+SYS@orcl> COL grantee FORMAT a10
+SYS@orcl> COL privilege FORMAT a10
+SYS@orcl> SELECT grantee, privilege FROM dba_tab_privs
+  2  WHERE  table_name = 'LOB_DIR' ORDER BY privilege;
+
+GRANTEE    PRIVILEGE
+---------- ----------
+LOBLAB     READ
+LOBLAB     WRITE
+
+-- READ 와 WRITE 를 모두 준다.
+--   READ  : BFILE 조회 · LOADBLOBFROMFILE · LOADCLOBFROMFILE (실습 03·04)
+--   WRITE : Data Pump 덤프 파일 생성 (실습 08)
+--
+-- 이제 실습용 파일 세 개를 만든다. 크기가 정확해야 한다.
+-- 실습 03·04 가 아래 숫자를 그대로 전제로 설명하기 때문이다.
+
+[oracle@oel7v9 ~]$ cd /home/oracle/lobfiles  (아래 세 파일을 만든다)
+total 2068
+-rw-r--r--. 1 oracle dba 2097152 Sep 29 14:59 big.dat
+-rw-r--r--. 1 oracle dba    7566 Sep 29 14:59 manual.txt
+-rw-r--r--. 1 oracle dba   12288 Sep 29 14:59 photo.bin
+--- manual.txt ---
+102 manual.txt
+5154 7566 manual.txt
+manual.txt: UTF-8 Unicode text
+LOB 실습 안내 문서
+========================================
+001 행: 한글과 ASCII 가 섞인 본문입니다. abcdefghij 0123456789
+
+-- 파일 세 개와 그 의미
+--
+--   파일        | 크기            | 쓰이는 곳          | 이유
+--   ------------|-----------------|--------------------|---------------------------
+--   manual.txt  | 7,566 바이트    | 실습 03 CLOB 적재  | 문자 수와 바이트 수가 다르다
+--               | 5,154 문자      | 실습 04 BFILE      | (한글 UTF-8 3바이트)
+--   photo.bin   | 12,288 바이트   | 실습 03 BLOB 적재  | 난수 이진 데이터
+--   big.dat     | 2,097,152 바이트| 실습 03 대용량 적재| 2MB 적재 시간 측정
+--
+-- manual.txt 의 구성 : 안내 1줄 + 구분선 1줄 + 본문 100줄 = 102줄.
+--   본문 한 줄에 한글 12자와 ASCII 38자(줄바꿈 포함) 가 섞여 있다. 한 줄 50문자 / 74바이트.
+--   -> 5,154문자 / 7,566바이트. 차이 2,412바이트가 한글 1,206자 x 2 다.
+--
+-- wc 를 두 번 쓴 이유
+--   wc -m (문자 수) 은 **로케일에 의존한다.** LANG 이 C 이면 바이트 수를 돌려준다.
+--   그래서 LC_ALL=en_US.UTF-8 을 붙여야 5,154 가 나온다.
+--   실습 03 에서 CLOB 문자 수 5,154 와 비교할 값이므로 이 차이를 알고 있어야 한다.
+
+--------------------------------------------------------------------------------
+[7] 검증 — loblab 으로 접속해 네 가지를 확인한다
+--------------------------------------------------------------------------------
+[oracle@oel7v9 ~]$ sqlplus loblab/oracle_4U
+LOBLAB@orcl> SHOW USER
+USER is "LOBLAB"
+LOBLAB@orcl> COL table_name FORMAT a14
+LOBLAB@orcl> COL column_name FORMAT a6
+LOBLAB@orcl> COL segment_name FORMAT a26
+LOBLAB@orcl> COL tablespace_name FORMAT a10
+LOBLAB@orcl> CREATE TABLE env_check (
+  2    id      NUMBER PRIMARY KEY,
+  3    b       BLOB,
+  4    c       CLOB,
+  5    n       NCLOB,
+  6    f       BFILE
+  7  ) TABLESPACE lobtbs;
+
+Table created.
+
+LOBLAB@orcl> SELECT table_name, column_name, segment_name, tablespace_name, securefile, in_row
+  2  FROM   user_lobs ORDER BY column_name;
+
+TABLE_NAME     COLUMN SEGMENT_NAME               TABLESPACE SEC IN_
+-------------- ------ -------------------------- ---------- --- ---
+ENV_CHECK      B      SYS_LOB0000076520C00002$$  LOBTBS     YES YES
+ENV_CHECK      C      SYS_LOB0000076520C00003$$  LOBTBS     YES YES
+ENV_CHECK      N      SYS_LOB0000076520C00004$$  LOBTBS     YES YES
+
+LOBLAB@orcl> SELECT segment_name, segment_type, bytes/1024 AS kb FROM user_segments
+  2  ORDER  BY segment_type, segment_name;
+
+no rows selected
+
+LOBLAB@orcl> SET SERVEROUTPUT ON
+LOBLAB@orcl> DECLARE v_c CLOB;
+  2  BEGIN
+  3    DBMS_LOB.CREATETEMPORARY(v_c, TRUE);
+  4    DBMS_LOB.WRITEAPPEND(v_c, 5, 'HELLO');
+  5    DBMS_OUTPUT.PUT_LINE('임시 CLOB 길이=' || DBMS_LOB.GETLENGTH(v_c) ||
+  6                         '  ISTEMPORARY=' || DBMS_LOB.ISTEMPORARY(v_c));
+  7    DBMS_LOB.FREETEMPORARY(v_c);
+  8  END;
+  9  /
+임시 CLOB 길이=5  ISTEMPORARY=1
+
+PL/SQL procedure successfully completed.
+
+LOBLAB@orcl> SET SERVEROUTPUT OFF
+LOBLAB@orcl> SELECT cache_lobs, nocache_lobs, abstract_lobs FROM v$temporary_lobs;
+
+CACHE_LOBS NOCACHE_LOBS ABSTRACT_LOBS
+---------- ------------ -------------
+         0            0             1
+         0            0             0
+
+LOBLAB@orcl> SELECT DBMS_LOB.FILEEXISTS(BFILENAME('LOB_DIR','manual.txt')) AS manual_exists,
+  2         DBMS_LOB.FILEEXISTS(BFILENAME('LOB_DIR','photo.bin'))  AS photo_exists,
+  3         DBMS_LOB.FILEEXISTS(BFILENAME('LOB_DIR','big.dat'))    AS big_exists,
+  4         DBMS_LOB.FILEEXISTS(BFILENAME('LOB_DIR','nofile.txt')) AS nofile
+  5  FROM   dual;
+
+MANUAL_EXISTS PHOTO_EXISTS BIG_EXISTS     NOFILE
+------------- ------------ ---------- ----------
+            1            1          1          0
+
+LOBLAB@orcl> SET SERVEROUTPUT ON
+LOBLAB@orcl> DECLARE
+  2    v_f BFILE := BFILENAME('LOB_DIR','manual.txt');
+  3  BEGIN
+  4    DBMS_LOB.FILEOPEN(v_f, DBMS_LOB.FILE_READONLY);
+  5    DBMS_OUTPUT.PUT_LINE('manual.txt 바이트=' || DBMS_LOB.GETLENGTH(v_f));
+  6    DBMS_LOB.FILECLOSE(v_f);
+  7  END;
+  8  /
+manual.txt 바이트=7566
+
+PL/SQL procedure successfully completed.
+
+LOBLAB@orcl> SET SERVEROUTPUT OFF
+LOBLAB@orcl> CREATE TABLE env_check_mssm (id NUMBER PRIMARY KEY, c CLOB)
+  2  TABLESPACE lobmssm LOB (c) STORE AS BASICFILE (TABLESPACE lobmssm);
+
+Table created.
+
+LOBLAB@orcl> SELECT table_name, column_name, tablespace_name, securefile FROM user_lobs
+  2  WHERE  table_name = 'ENV_CHECK_MSSM';
+
+TABLE_NAME     COLUMN TABLESPACE SEC
+-------------- ------ ---------- ---
+ENV_CHECK_MSSM C      LOBMSSM    NO
+
+LOBLAB@orcl> DROP TABLE env_check PURGE;
+
+Table dropped.
+
+LOBLAB@orcl> DROP TABLE env_check_mssm PURGE;
+
+Table dropped.
+
+LOBLAB@orcl> SELECT COUNT(*) AS my_tables FROM user_tables;
+
+ MY_TABLES
+----------
+         0
+
+-- 검증 결과를 읽는 법
+--
+-- ① LOB 컬럼 생성
+--    BLOB · CLOB · NCLOB 세 개가 user_lobs 에 나왔다. securefile YES, in_row YES.
+--    **BFILE 컬럼(f) 은 user_lobs 에 없다.** BFILE 은 DB 안에 저장하지 않으므로
+--    LOB 세그먼트가 없다. 실습 04 에서 다시 확인한다.
+--    user_segments 가 비어 있는 것은 deferred_segment_creation 때문이다.
+--    행을 한 건도 넣지 않았으므로 세그먼트가 아직 없다.
+--
+-- ② 임시 LOB
+--    CREATETEMPORARY 로 만들고 WRITEAPPEND 로 5문자를 넣었다. ISTEMPORARY=1.
+--    FREETEMPORARY 로 해제했으므로 v$temporary_lobs 의 내 세션 행은 0 이다.
+--    (여러 행이 보이는 것은 세션마다 한 행씩 나오기 때문이다)
+--    v$ 이름으로 조회된다 — 권한은 v_$ 에 줬지만 조회는 v$ 로 한다.
+--
+-- ③ BFILE 로 디렉터리 읽기
+--    세 파일 모두 FILEEXISTS 가 1, 없는 파일은 0 이다.
+--    FILEOPEN 으로 열어 GETLENGTH 가 7,566 을 돌려줬다.
+--    -> READ 권한과 OS 파일 권한이 모두 정상이라는 뜻이다.
+--    여기서 ORA-22285(디렉터리 객체 없음) 나 ORA-22288(파일 없음) 이 나면
+--    [6] 을 다시 확인한다.
+--
+-- ④ MSSM 테이블스페이스
+--    BASICFILE 로 지정하면 MSSM 에서도 만들어진다. securefile 이 NO 다.
+--    SECUREFILE 로 바꿔 보는 것이 실습 06 의 첫 단계다 (ORA-43853).
+--
+-- 검증용 테이블을 지웠으므로 loblab 스키마는 다시 비어 있다. 실습 01 을 시작할 수 있다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. LOB 을 쓰기 위한 별도 권한은 없다.
+--    CREATE TABLE 권한만 있으면 BLOB·CLOB 컬럼을 만들 수 있다.
+--    필요한 것은 테이블스페이스 쿼터와, BFILE 을 쓸 때의 디렉터리 객체 권한이다.
+--
+-- 2. v$ 뷰 권한은 v_$ 에 준다.
+--    GRANT SELECT ON v$xxx 는 ORA-02030 이다. v$ 는 공용 동의어이고
+--    실제 뷰는 v_$xxx 다. 조회는 v$ 이름으로 한다.
+--    이름이 다른 짝도 있다 : v$tempseg_usage -> v_$sort_usage
+--
+-- 3. 디렉터리 객체는 서버 경로다.
+--    Oracle 이 경로 존재를 검사하지 않으므로 객체는 만들어지고 사용할 때 실패한다.
+--    만든 직후 BFILENAME + FILEEXISTS 로 검증하는 습관을 들인다.
+--    운영에서는 경로를 /home/oracle 밖(전용 파일시스템) 에 두고 권한을 좁힌다.
+--
+-- 4. ASSM 과 MSSM 을 구분해 둔다.
+--    SecureFile 은 ASSM 전용이다. 예전에 만든 MSSM 테이블스페이스가 남아 있으면
+--    그 위에서는 SecureFile LOB 을 만들 수 없다 (ORA-43853).
+--    신규 테이블스페이스는 항상 ASSM 으로 만든다.
+--
+-- 5. 문자 수와 바이트 수를 구분하는 습관을 여기서부터 들인다.
+--    OS 의 wc -m 도 로케일에 따라 달라진다. DB 의 GETLENGTH(CLOB) 은 문자 수,
+--    GETLENGTH(BLOB) 과 GETLENGTH(BFILE) 은 바이트 수다.
+--    LOB 과정에서 숫자가 안 맞을 때는 거의 항상 이 구분 때문이다.
+--
+-- 6. 전 과정을 마친 뒤 철거
+--      SYS@orcl> DROP USER loblab CASCADE;
+--      SYS@orcl> DROP DIRECTORY lob_dir;
+--      SYS@orcl> DROP TABLESPACE lobtbs  INCLUDING CONTENTS AND DATAFILES;
+--      SYS@orcl> DROP TABLESPACE lobmssm INCLUDING CONTENTS AND DATAFILES;
+--      [oracle@oel7v9 ~]$ rm -rf /home/oracle/lobfiles
+--
+-- 7. 이 실습에서 본 오류
+--    ORA-02030  GRANT SELECT ON v$xxx        -> v_$xxx 에 권한을 준다
+--    ORA-00942  v_$tempseg_usage 가 없다      -> v_$sort_usage 가 기반 뷰다
+================================================================================
+ 실습 00 끝
+================================================================================

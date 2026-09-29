@@ -485,6 +485,7 @@ ALTER TABLE s_plain MOVE LOB (c) STORE AS (TABLESPACE users);   -- LOB 세그먼
 
 | # | 파일 | 주제 | 핵심 실측 |
 |---|---|---|---|
+| 00 | `LOB_실습_00_환경설정.txt` | 테이블스페이스(ASSM/MSSM)·계정·디렉터리 객체·실습 파일 3종 생성과 검증 | `ORA-02030`, `ORA-00942`, manual.txt 5154문자/7566바이트 |
 | 01 | `LOB_실습_01_타입과_저장구조.txt` | 네 타입 생성, 딕셔너리, 세그먼트 3종, 인라인 경계 | 3968 바이트 / 1984 문자 |
 | 02 | `LOB_실습_02_CLOB_조작과_SQL한계.txt` | `EMPTY_CLOB`+`RETURNING`, 읽기·쓰기 API, SQL 제약 | `ORA-01704`, `ORA-00932`, `ORA-02327` |
 | 03 | `LOB_실습_03_BLOB_파일적재와_변환.txt` | 디렉터리 객체, `LOADBLOBFROMFILE`/`LOADCLOBFROMFILE`, `CONVERTTOBLOB` | 7566 바이트 → 5154 문자 |
@@ -494,7 +495,9 @@ ALTER TABLE s_plain MOVE LOB (c) STORE AS (TABLESPACE users);   -- LOB 세그먼
 | 07 | `LOB_실습_07_공간관리와_성능.txt` | `SPACE_USAGE`, `SHRINK` 제약, `MOVE`, 리두·캐시 | 24.1 → 3.1 MB, 리두 6.45 vs 3.06 MB |
 | 08 | `LOB_실습_08_LONG전환과_DataPump.txt` | `LONG`→`CLOB`, Data Pump, BFILE·암호화 주의 | `ORA-00997`, `ORA-39173` |
 
-실습은 순서대로 진행한다. 01 이 만든 계정·테이블스페이스를 이후 실습이 쓴다.
+실습은 순서대로 진행한다. **00 을 먼저 실행해야 한다.** 00 이 만든 테이블스페이스·계정·디렉터리 객체·실습 파일을
+01~08 이 모두 쓴다. 아래 "실습 환경 준비" SQL 이 곧 00 의 내용이며, 트랜스크립트에는 실행 결과와
+검증 절차까지 들어 있다.
 
 강의용 슬라이드는 `LOB_대용량객체_실습과정.pptx` (48장) 이다. 1부 LOB 이란 · 2부 타입 · 3부 저장 구조 · 4부 다루는 방법 · 5부 공간과 성능 · 6부 전환과 이관 순서이며, 이 문서의 1~6절과 같은 구성이다. 모든 슬라이드에 발표자 노트가 들어 있다.
 
