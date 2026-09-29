@@ -1,0 +1,303 @@
+================================================================================
+ LOB 실습 05 : 임시 LOB 과 로케이터의 규칙
+ 과정      : Oracle Database 19c LOB 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 계정      : loblab
+ 소요 시간 : 약 80분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 보고서 본문을 여러 조각에서 조립하는 프로그램을 가정한다.
+-- 테이블에 넣기 전 가공에 쓰는 것이 임시 LOB 이고, 그것을 다루는 손잡이가 로케이터다.
+--   ① 임시 LOB 만들기·해제, 임시 테이블스페이스 사용량
+--   ② 해제한 로케이터를 다시 쓰면 무엇이 나는가
+--   ③ 테이블 LOB 에 쓰기 위한 두 가지 전제 : 행 잠금, 같은 트랜잭션
+--   ④ 읽기 로케이터의 읽기 일관성
+-- 작업 유형 : 프로그래밍 규칙 확인 (장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 02 완료 (article 테이블, id=3 의 body 길이 100)
+-- · loblab 에 아래 뷰 조회 권한이 있어야 한다 (과정안내의 환경 준비에 포함)
+--     v_$temporary_lobs, v_$sort_usage(=v$tempseg_usage 의 기반), v_$session
+
+[oracle@oel7v9 ~]$ sqlplus loblab/oracle_4U
+
+LOBLAB@orcl> SET SERVEROUTPUT ON SIZE UNLIMITED
+LOBLAB@orcl> SET LINESIZE 140
+LOBLAB@orcl> WHENEVER SQLERROR CONTINUE
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+LOBLAB@orcl> SELECT id, DBMS_LOB.GETLENGTH(body) AS len FROM article ORDER BY id;
+
+        ID        LEN
+---------- ----------
+         1       5000
+         2          5
+         3        100
+
+--------------------------------------------------------------------------------
+[4] 작업 수행
+--------------------------------------------------------------------------------
+-- ────────────────────────────────────────────────
+-- 4-1. 임시 LOB — 만들고, 세어 보고, 해제한다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE v_t CLOB;
+  2  BEGIN
+  3    DBMS_LOB.CREATETEMPORARY(v_t, TRUE);        -- TRUE = 캐시 사용
+  4    DBMS_LOB.WRITEAPPEND(v_t, 10, '0123456789');
+  5    DBMS_OUTPUT.PUT_LINE('ISTEMPORARY=' || DBMS_LOB.ISTEMPORARY(v_t) || '  길이=' || DBMS_LOB.GETLENGTH(v_t));
+  6    FOR r IN (SELECT cache_lobs, nocache_lobs, abstract_lobs FROM v$temporary_lobs
+  7               WHERE sid = SYS_CONTEXT('USERENV','SID')) LOOP
+  8      DBMS_OUTPUT.PUT_LINE('v$temporary_lobs : cache=' || r.cache_lobs
+  9        || '  nocache=' || r.nocache_lobs || '  abstract=' || r.abstract_lobs);
+ 10    END LOOP;
+ 11    DBMS_LOB.FREETEMPORARY(v_t);
+ 12    DBMS_OUTPUT.PUT_LINE('해제 후 ISTEMPORARY=' || DBMS_LOB.ISTEMPORARY(v_t));
+ 13    DBMS_OUTPUT.PUT_LINE('해제 후 길이=' || DBMS_LOB.GETLENGTH(v_t));
+ 14  END;
+ 15  /
+ISTEMPORARY=1  길이=10
+v$temporary_lobs : cache=1  nocache=0  abstract=0
+해제 후 ISTEMPORARY=0
+DECLARE v_t CLOB;
+*
+ERROR at line 1:
+ORA-22275: invalid LOB locator specified
+ORA-06512: at "SYS.DBMS_LOB", line 860
+ORA-06512: at line 13
+
+-- << 원인 파악 >>
+-- FREETEMPORARY 는 LOB 을 없애고 로케이터를 무효로 만든다.
+-- ISTEMPORARY 는 0 을 돌려주지만(오류 없음), GETLENGTH 는 ORA-22275 다.
+-- 즉 "해제 뒤에는 같은 변수를 다시 쓸 수 없다".
+--
+-- << 수정 >> 해제 뒤 다시 쓰려면 CREATETEMPORARY 로 새로 만든다.
+--            프로시저 사이로 로케이터를 넘길 때는 "해제 책임" 을 한 곳에만 둔다.
+
+-- v$temporary_lobs 의 세 열
+--   cache_lobs    : CREATETEMPORARY(..., TRUE)  로 만든 것 (버퍼 캐시 사용)
+--   nocache_lobs  : CREATETEMPORARY(..., FALSE) 로 만든 것
+--   abstract_lobs : JSON·XMLType 등 내부 표현용
+
+-- ────────────────────────────────────────────────
+-- 4-2. 큰 임시 LOB 은 임시 테이블스페이스를 쓴다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE
+  2    v_t CLOB; v_chunk VARCHAR2(400) := RPAD('T',200,'T');
+  3    v_blocks NUMBER; v_segtype VARCHAR2(20);
+  4  BEGIN
+  5    DBMS_LOB.CREATETEMPORARY(v_t, TRUE);
+  6    FOR i IN 1..40000 LOOP DBMS_LOB.WRITEAPPEND(v_t, 200, v_chunk); END LOOP;
+  7    DBMS_OUTPUT.PUT_LINE('임시 LOB 길이=' || DBMS_LOB.GETLENGTH(v_t) || ' 문자');
+  8    SELECT MAX(segtype), SUM(blocks) INTO v_segtype, v_blocks FROM v$tempseg_usage
+  9     WHERE session_addr = (SELECT saddr FROM v$session WHERE sid = SYS_CONTEXT('USERENV','SID'));
+ 10    DBMS_OUTPUT.PUT_LINE('임시 세그먼트 : ' || NVL(v_segtype,'(없음)') || '  '
+ 11      || NVL(v_blocks,0) || ' 블록 = ' || NVL(v_blocks,0)*8/1024 || ' MB');
+ 12    DBMS_LOB.FREETEMPORARY(v_t);
+ 13    SELECT SUM(blocks) INTO v_blocks FROM v$tempseg_usage
+ 14     WHERE session_addr = (SELECT saddr FROM v$session WHERE sid = SYS_CONTEXT('USERENV','SID'));
+ 15    DBMS_OUTPUT.PUT_LINE('해제 후 임시 블록=' || NVL(v_blocks,0));
+ 16  END;
+ 17  /
+임시 LOB 길이=8000000 문자
+임시 세그먼트 : LOB_INDEX  2176 블록 = 17 MB
+해제 후 임시 블록=0
+
+PL/SQL procedure successfully completed.
+
+-- 읽는 법
+--   · 800만 문자 = 16MB(문자당 2바이트) 인데 임시 세그먼트는 17MB 다. LOB 인덱스 몫이 더해졌다.
+--   · 임시 LOB 은 TEMP 테이블스페이스를 쓴다. 정렬·해시 조인과 같은 공간을 나눠 쓴다는 뜻이다.
+--     큰 임시 LOB 을 동시 세션이 여럿 만들면 ORA-01652(임시 공간 부족)로 정렬 작업까지 실패한다.
+--   · FREETEMPORARY 로 즉시 반납된다(0 블록). 이것이 해제를 강조하는 이유다.
+--     해제하지 않으면 세션이 끝날 때까지 TEMP 를 물고 있다.
+
+-- ────────────────────────────────────────────────
+-- 4-3. 테이블 LOB 에 쓰려면 행을 잠가야 한다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE v_c CLOB;
+  2  BEGIN
+  3    SELECT body INTO v_c FROM article WHERE id=3;     -- 잠금 없이 로케이터만 받았다
+  4    DBMS_LOB.WRITEAPPEND(v_c, 5, 'XXXXX');
+  5  END;
+  6  /
+DECLARE v_c CLOB;
+*
+ERROR at line 1:
+ORA-22920: row containing the LOB value is not locked
+ORA-06512: at "SYS.DBMS_LOB", line 1163
+ORA-06512: at line 4
+
+-- << 원인 파악 >>
+-- LOB 쓰기는 그 행에 대한 갱신이다. 일반 UPDATE 와 마찬가지로 행 잠금이 필요하다.
+-- SELECT 만 한 로케이터는 '읽기용' 이다.
+--
+-- << 수정 >> FOR UPDATE 로 잠근 뒤 쓴다.
+
+LOBLAB@orcl> DECLARE v_c CLOB;
+  2  BEGIN
+  3    SELECT body INTO v_c FROM article WHERE id=3 FOR UPDATE;
+  4    DBMS_LOB.WRITEAPPEND(v_c, 5, 'XXXXX');
+  5    DBMS_OUTPUT.PUT_LINE('FOR UPDATE 뒤 길이=' || DBMS_LOB.GETLENGTH(v_c));
+  6    COMMIT;
+  7  END;
+  8  /
+FOR UPDATE 뒤 길이=105
+
+PL/SQL procedure successfully completed.
+
+-- 100 → 105. 쓰기가 반영되었다.
+-- 참고 : INSERT ... RETURNING(실습 02) 으로 받은 로케이터는 이미 그 행을 잠근 상태다.
+--        그래서 별도의 FOR UPDATE 가 필요 없다.
+
+-- ────────────────────────────────────────────────
+-- 4-4. 로케이터는 트랜잭션을 넘지 못한다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE v_c CLOB;
+  2  BEGIN
+  3    SELECT body INTO v_c FROM article WHERE id=3 FOR UPDATE;
+  4    COMMIT;                                   -- 여기서 트랜잭션이 끝난다
+  5    DBMS_LOB.WRITEAPPEND(v_c, 5, 'YYYYY');
+  6  END;
+  7  /
+DECLARE v_c CLOB;
+*
+ERROR at line 1:
+ORA-22990: LOB locators cannot span transactions
+ORA-06512: at "SYS.DBMS_LOB", line 1163
+ORA-06512: at line 5
+
+-- << 원인 파악 >>
+-- COMMIT 이 행 잠금을 풀었다. 쓰기용 로케이터는 그 트랜잭션 안에서만 유효하다.
+-- 긴 작업을 여러 번 커밋하며 진행하는 배치에서 흔히 만나는 오류다.
+--
+-- << 수정 >> 커밋 이후에는 로케이터를 다시 얻는다.
+--   LOOP
+--     SELECT body INTO v_c FROM article WHERE id=3 FOR UPDATE;
+--     ... 한 덩어리 쓰기 ...
+--     COMMIT;      -- 커밋 후 루프 처음으로 돌아가 다시 SELECT FOR UPDATE
+--   END LOOP;
+
+-- ────────────────────────────────────────────────
+-- 4-5. 읽기 로케이터는 커밋 뒤에도 읽힌다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE v_c CLOB; v_len1 INTEGER; v_len2 INTEGER;
+  2  BEGIN
+  3    SELECT body INTO v_c FROM article WHERE id=3;
+  4    v_len1 := DBMS_LOB.GETLENGTH(v_c);
+  5    COMMIT;
+  6    v_len2 := DBMS_LOB.GETLENGTH(v_c);
+  7    DBMS_OUTPUT.PUT_LINE('커밋 전 길이=' || v_len1 || '  커밋 후 같은 로케이터 길이=' || v_len2);
+  8  END;
+  9  /
+커밋 전 길이=105  커밋 후 같은 로케이터 길이=105
+
+PL/SQL procedure successfully completed.
+
+-- 읽기는 막히지 않는다. 쓰기에만 트랜잭션 제약이 걸린다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 읽기 일관성과 NULL LOB
+--------------------------------------------------------------------------------
+-- 5-1. 값이 바뀐 뒤 예전 로케이터로 읽으면 '예전 값' 이 보인다
+
+LOBLAB@orcl> DECLARE v_old CLOB; v_len_old INTEGER; v_len_new INTEGER;
+  2  BEGIN
+  3    SELECT body INTO v_old FROM article WHERE id=3;        -- 이 시점의 스냅숏
+  4    UPDATE article SET body = TO_CLOB(RPAD('Z',200,'Z')) WHERE id=3;
+  5    COMMIT;
+  6    v_len_old := DBMS_LOB.GETLENGTH(v_old);                -- 예전 로케이터
+  7    SELECT DBMS_LOB.GETLENGTH(body) INTO v_len_new FROM article WHERE id=3;
+  8    DBMS_OUTPUT.PUT_LINE('예전 로케이터 길이=' || v_len_old || '  현재 값 길이=' || v_len_new);
+  9  END;
+ 10  /
+예전 로케이터 길이=105  현재 값 길이=200
+
+PL/SQL procedure successfully completed.
+
+-- 같은 행인데 105 와 200 이 동시에 보인다.
+-- 로케이터는 '그 시점의 LOB' 을 가리킨다(읽기 일관성). 변수를 오래 들고 있으면
+-- 화면에 옛 값이 보이는 원인이 된다. 긴 화면 세션에서는 다시 조회한다.
+-- 시간이 더 지나 UNDO 가 덮이면 ORA-01555 로 실패한다(SecureFile 은 RETENTION 설정에 달렸다).
+
+-- 5-2. NULL LOB 과 EMPTY_CLOB() 은 다르다
+
+LOBLAB@orcl> DECLARE v_c CLOB;
+  2  BEGIN
+  3    SELECT body_n INTO v_c FROM article WHERE id=1;   -- body_n 은 NULL 이다
+  4    DBMS_OUTPUT.PUT_LINE('NULL LOB 길이=' || NVL(TO_CHAR(DBMS_LOB.GETLENGTH(v_c)),'(NULL)'));
+  5    DBMS_LOB.WRITEAPPEND(v_c, 3, 'ABC');
+  6  END;
+  7  /
+NULL LOB 길이=(NULL)
+DECLARE v_c CLOB;
+*
+ERROR at line 1:
+ORA-06502: PL/SQL: numeric or value error: invalid LOB locator specified: ORA-22275
+ORA-06512: at "SYS.DBMS_LOB", line 1163
+ORA-06512: at line 5
+
+-- << 원인 파악 >>
+-- NULL 인 LOB 컬럼에는 로케이터가 없다. GETLENGTH 는 NULL 을 돌려주지만(조회는 통과)
+-- 쓰기는 ORA-22275 로 막힌다. "빈 문서" 를 표현하려면 EMPTY_CLOB() 을 넣어야 한다.
+--
+-- << 수정 >> 쓰기 전에 로케이터를 만들어 준다.
+--   UPDATE article SET body_n = EMPTY_CLOB() WHERE id=1 AND body_n IS NULL;
+--   그 뒤 SELECT ... FOR UPDATE 로 로케이터를 받아 쓴다.
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+LOBLAB@orcl> SELECT id, DBMS_LOB.GETLENGTH(body) AS len FROM article ORDER BY id;
+
+        ID        LEN
+---------- ----------
+         1       5000
+         2          5
+         3        200
+
+-- 4-3 의 WRITEAPPEND(105)와 5-1 의 UPDATE(200)가 차례로 반영되었다.
+
+-- 임시 LOB 이 남아 있지 않은지 확인한다 (세션 종료 전 점검 습관)
+
+LOBLAB@orcl> SELECT cache_lobs, nocache_lobs, abstract_lobs FROM v$temporary_lobs
+  2  WHERE  sid = SYS_CONTEXT('USERENV','SID');
+
+CACHE_LOBS NOCACHE_LOBS ABSTRACT_LOBS
+---------- ------------ -------------
+         0            0             0
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- article 은 여기까지 쓴다. 실습 06 부터는 별도 테이블을 만든다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) 쓰기의 두 전제를 외운다.
+--      ① 행을 잠갔는가 (SELECT ... FOR UPDATE 또는 INSERT ... RETURNING)
+--      ② 그 트랜잭션 안인가 (커밋 뒤에는 로케이터를 다시 얻는다)
+--    애플리케이션의 LOB 오류 대부분이 ORA-22920 / ORA-22990 두 개다.
+--
+-- 2) 임시 LOB 은 반드시 FREETEMPORARY 한다. 예외 경로(EXCEPTION 블록)에도 넣는다.
+--    해제를 빠뜨리면 TEMP 를 물고 있다가 다른 세션의 정렬 작업까지 실패시킨다.
+--    누수 점검은 v$temporary_lobs 로 한다.
+--
+-- 3) 임시 LOB 은 TEMP 를 쓴다. 대용량 가공을 하는 배치가 여럿이면
+--    TEMP 크기를 그만큼 잡아야 한다(이 실습의 8백만 문자 하나가 17MB).
+--
+-- 4) 로케이터를 오래 들고 있으면 옛 값을 본다. 화면·리포트에서 "값이 안 바뀐다" 는
+--    문의가 있으면 로케이터 수명을 먼저 본다.
+--
+-- 5) NULL 과 EMPTY_CLOB() 을 구분해 설계한다.
+--    LOB 컬럼에 NOT NULL + DEFAULT EMPTY_CLOB() 을 주면 애플리케이션 코드가 단순해진다.
+--
+-- 6) 커밋 주기가 긴 배치라면 "로케이터 재획득 → 한 덩어리 쓰기 → 커밋" 루프로 구성한다.
+--    한 트랜잭션에서 수 GB 를 쓰면 UNDO 와 리두가 함께 커진다(실습 07).
+================================================================================

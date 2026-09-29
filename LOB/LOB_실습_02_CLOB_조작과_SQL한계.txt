@@ -1,0 +1,394 @@
+================================================================================
+ LOB 실습 02 : CLOB·NCLOB 조작과 SQL 의 한계
+ 과정      : Oracle Database 19c LOB 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 + AL16UTF16
+ 계정      : loblab (테이블스페이스 lobtbs)
+ 소요 시간 : 약 90분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 게시글 테이블(article)에 본문을 넣고 읽고 고친다.
+-- LOB 은 "SQL 로 넣고 PL/SQL 로 다룬다" 는 원칙을 손으로 확인하는 것이 목표다.
+--   ① SQL 리터럴의 한계와 우회 방법
+--   ② 표준 적재 패턴 : EMPTY_CLOB() + RETURNING + WRITEAPPEND
+--   ③ 읽기(GETLENGTH·SUBSTR·INSTR·COMPARE·READ)와 수정(WRITE·ERASE·TRIM·FRAGMENT_*)
+--   ④ SQL 에서 아예 막히는 것들 (비교·정렬·DISTINCT·인덱스)
+-- 작업 유형 : 데이터 조작 (장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 01 완료 (loblab, lobtbs)
+-- · SET SERVEROUTPUT ON  (DBMS_OUTPUT 을 쓴다)
+-- · SQL*Plus 의 LONG 기본값은 80 이다. CLOB 을 그대로 조회하려면 SET LONG 을 키운다.
+
+[oracle@oel7v9 ~]$ sqlplus loblab/oracle_4U
+
+LOBLAB@orcl> SET SERVEROUTPUT ON SIZE UNLIMITED
+LOBLAB@orcl> SET LINESIZE 140
+LOBLAB@orcl> WHENEVER SQLERROR CONTINUE
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+LOBLAB@orcl> CREATE TABLE article (
+  2    id      NUMBER PRIMARY KEY,
+  3    subject VARCHAR2(100 CHAR),
+  4    body    CLOB,
+  5    body_n  NCLOB
+  6  ) TABLESPACE lobtbs;
+
+Table created.
+
+-- VARCHAR2(100 CHAR) 로 선언했다. 바이트가 아니라 문자 100 자다.
+-- LOB 컬럼에는 이런 선택이 없다. CLOB 은 항상 문자 단위, BLOB 은 항상 바이트 단위다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행
+--------------------------------------------------------------------------------
+-- ────────────────────────────────────────────────
+-- 4-1. SQL 리터럴의 한계
+-- ────────────────────────────────────────────────
+-- RPAD 로 5000 자를 만들려 해도 SQL 의 VARCHAR2 한계(4000 바이트)에서 잘린다.
+
+LOBLAB@orcl> SELECT LENGTH(RPAD('A',5000,'A')) AS rpad5000,
+  2         LENGTH(RPAD('A',4001,'A')) AS rpad4001 FROM dual;
+
+  RPAD5000   RPAD4001
+---------- ----------
+      4000       4000
+
+-- 오류가 아니라 조용히 4000 으로 잘린다. 이 점이 더 위험하다.
+-- 적재 스크립트가 데이터를 잃고도 성공으로 끝날 수 있다.
+
+-- 4000 바이트를 넘는 '리터럴' 을 직접 쓰면 막힌다.
+-- (아래 리터럴은 여러 줄에 걸친 5500 자다. 지면에서는 …(생략)… 으로 줄여 보인다)
+
+LOBLAB@orcl> INSERT INTO article VALUES (1, '긴 리터럴', 'AAAA…(생략)…AAAA
+  2  AAAA…(생략)…AAAA
+  3  AAAA…(생략)…AAAA', NULL);
+INSERT INTO article VALUES (1, '긴 리터럴', 'AAAA…(생략)…AAAA
+                                            *
+ERROR at line 1:
+ORA-01704: string literal too long
+
+-- << 원인 파악 >>
+-- SQL 문 안의 문자 리터럴은 4000 바이트를 넘을 수 없다. CLOB 컬럼이어도 마찬가지다.
+-- 제한은 '컬럼' 이 아니라 'SQL 리터럴' 에 걸려 있다.
+-- 참고 : SQL*Plus 는 한 줄이 4999 자를 넘으면 문장을 서버에 보내기도 전에 버린다.
+--        SP2-0027: Input is too long (> 4999 characters) - line ignored
+
+-- << 수정 1 >> PL/SQL 변수(최대 32767)를 거친다.
+
+LOBLAB@orcl> DECLARE
+  2    v_txt VARCHAR2(32767) := RPAD('A',5000,'A');
+  3    v_c   CLOB;
+  4  BEGIN
+  5    INSERT INTO article VALUES (1, 'PL/SQL 변수', EMPTY_CLOB(), NULL) RETURNING body INTO v_c;
+  6    DBMS_LOB.WRITEAPPEND(v_c, LENGTH(v_txt), v_txt);
+  7    DBMS_OUTPUT.PUT_LINE('PL/SQL VARCHAR2 길이=' || LENGTH(v_txt) || '  CLOB 길이=' || DBMS_LOB.GETLENGTH(v_c));
+  8    COMMIT;
+  9  END;
+ 10  /
+PL/SQL VARCHAR2 길이=5000  CLOB 길이=5000
+
+PL/SQL procedure successfully completed.
+
+-- PL/SQL 의 RPAD 는 잘리지 않는다(5000). SQL 과 PL/SQL 의 한계가 다르다.
+
+-- << 수정 2 >> SQL 안에서 해결해야 한다면 TO_CLOB 으로 이어 붙인다.
+
+LOBLAB@orcl> INSERT INTO article VALUES (2, 'TO_CLOB 이어붙이기',
+  2    TO_CLOB(RPAD('A',4000,'A')) || TO_CLOB(RPAD('B',1500,'B')), NULL);
+
+1 row created.
+
+LOBLAB@orcl> COMMIT;
+
+Commit complete.
+
+LOBLAB@orcl> COL subject FOR a20
+LOBLAB@orcl> SELECT id, subject, DBMS_LOB.GETLENGTH(body) AS len FROM article ORDER BY id;
+
+        ID SUBJECT                     LEN
+---------- -------------------- ----------
+         1 PL/SQL 변수                5000
+         2 TO_CLOB 이어붙이기         5500
+
+-- CLOB 끼리 붙이면 4000 바이트 제한이 사라진다. 각 조각이 4000 이하이면 된다.
+
+-- ────────────────────────────────────────────────
+-- 4-2. 표준 적재 패턴 : EMPTY_CLOB() + RETURNING + WRITEAPPEND
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE v_c CLOB;
+  2  BEGIN
+  3    INSERT INTO article VALUES (3, 'WRITEAPPEND 반복', EMPTY_CLOB(), NULL) RETURNING body INTO v_c;
+  4    FOR i IN 1..10 LOOP
+  5      DBMS_LOB.WRITEAPPEND(v_c, 1000, RPAD('L'||TO_CHAR(i,'FM00'),1000,'.'));
+  6    END LOOP;
+  7    DBMS_OUTPUT.PUT_LINE('누적 길이=' || DBMS_LOB.GETLENGTH(v_c));
+  8    COMMIT;
+  9  END;
+ 10  /
+누적 길이=10000
+
+PL/SQL procedure successfully completed.
+
+-- 이 세 줄이 LOB 적재의 기본형이다.
+--   ① EMPTY_CLOB() 으로 빈 LOB 을 만들어 행을 넣는다 (NULL 과 다르다. NULL 이면 로케이터가 없다)
+--   ② RETURNING 으로 그 행의 로케이터를 받는다
+--   ③ 로케이터에 조각을 이어 쓴다 (네트워크로 한 번에 보내지 않아도 된다)
+
+-- ────────────────────────────────────────────────
+-- 4-3. 읽기 API
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> SELECT DBMS_LOB.GETLENGTH(body) AS len,
+  2         DBMS_LOB.SUBSTR(body, 20, 1)      AS first20,
+  3         DBMS_LOB.INSTR(body, 'L05', 1, 1) AS pos_l05,
+  4         DBMS_LOB.COMPARE(body, body)      AS cmp_self
+  5  FROM   article WHERE id = 3;
+
+       LEN FIRST20                 POS_L05   CMP_SELF
+---------- -------------------- ---------- ----------
+     10000 L01.................       4001          0
+
+--   GETLENGTH : 문자 수 (CLOB), 바이트 수 (BLOB)
+--   SUBSTR    : (LOB, 길이, 시작오프셋) — SQL 의 SUBSTR 과 인자 순서가 다르다. 최대 32767
+--   INSTR     : (LOB, 찾을값, 시작오프셋, n번째) — 5번째 조각이 4001 에서 시작한다
+--   COMPARE   : 같으면 0. 다르면 -1/1 (또는 NULL)
+
+-- SQL 함수도 CLOB 에 쓸 수 있다. 결과가 4000 바이트를 넘지 않는 범위에서만 안전하다.
+
+LOBLAB@orcl> SELECT LENGTH(body) AS sql_length, SUBSTR(body,1,10) AS sql_substr,
+  2         INSTR(body,'L05') AS sql_instr
+  3  FROM   article WHERE id = 3;
+
+SQL_LENGTH SQL_SUBSTR    SQL_INSTR
+---------- ---------- ------------
+     10000 L01.......         4001
+
+-- ────────────────────────────────────────────────
+-- 4-4. 수정 API : WRITE / ERASE / TRIM
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE
+  2    v_c CLOB; v_amt INTEGER;
+  3  BEGIN
+  4    SELECT body INTO v_c FROM article WHERE id=3 FOR UPDATE;   -- 쓰려면 행을 잠근다
+  5    DBMS_LOB.WRITE(v_c, 5, 1, 'HELLO');      -- 1번째부터 5문자 덮어쓰기
+  6    v_amt := 10;
+  7    DBMS_LOB.ERASE(v_c, v_amt, 11);          -- 11번째부터 10문자 지우기
+  8    DBMS_LOB.TRIM(v_c, 100);                 -- 100문자로 자르기
+  9    DBMS_OUTPUT.PUT_LINE('ERASE 가 지운 문자 수=' || v_amt || '  TRIM 후 길이=' || DBMS_LOB.GETLENGTH(v_c));
+ 10    DBMS_OUTPUT.PUT_LINE('앞 30문자=[' || DBMS_LOB.SUBSTR(v_c, 30, 1) || ']');
+ 11    COMMIT;
+ 12  END;
+ 13  /
+ERASE 가 지운 문자 수=10  TRIM 후 길이=100
+앞 30문자=[HELLO.....          ..........]
+
+PL/SQL procedure successfully completed.
+
+-- 중요한 성질 : ERASE 는 길이를 줄이지 않는다.
+--   지운 자리를 공백(CLOB) 또는 0(BLOB)으로 채운다. 위 출력의 가운데 10칸 공백이 그것이다.
+--   ERASE 의 두 번째 인자는 IN OUT 이다. 실제로 지운 양이 돌아온다.
+--   TRIM 은 길이를 실제로 줄인다(10000 → 100).
+
+-- ────────────────────────────────────────────────
+-- 4-5. 나눠 읽기 : READ
+-- ────────────────────────────────────────────────
+-- 큰 LOB 을 한 번에 변수로 받을 수 없다. 오프셋을 옮기며 버퍼 단위로 읽는다.
+
+LOBLAB@orcl> DECLARE
+  2    v_c CLOB; v_buf VARCHAR2(32767); v_amt INTEGER; v_off INTEGER := 1; v_cnt INTEGER := 0;
+  3  BEGIN
+  4    SELECT body INTO v_c FROM article WHERE id=3;
+  5    LOOP
+  6      v_amt := 20;                                   -- 요청량. 실제 읽은 양이 여기로 돌아온다
+  7      BEGIN DBMS_LOB.READ(v_c, v_amt, v_off, v_buf);
+  8      EXCEPTION WHEN NO_DATA_FOUND THEN EXIT; END;    -- 끝에 닿으면 NO_DATA_FOUND
+  9      v_cnt := v_cnt + 1; v_off := v_off + v_amt;
+ 10      IF v_cnt <= 2 THEN DBMS_OUTPUT.PUT_LINE(v_cnt || '번째 20문자=[' || v_buf || ']'); END IF;
+ 11    END LOOP;
+ 12    DBMS_OUTPUT.PUT_LINE('총 ' || v_cnt || '회 읽었다 (다음 오프셋 ' || v_off || ')');
+ 13  END;
+ 14  /
+1번째 20문자=[HELLO.....          ]
+2번째 20문자=[....................]
+총 5회 읽었다 (다음 오프셋 101)
+
+PL/SQL procedure successfully completed.
+
+-- 100 문자를 20 문자씩 5회에 읽었다. READ 는 끝에서 NO_DATA_FOUND 를 던지므로
+-- 예외 처리로 루프를 끝낸다. (길이를 미리 구해 반복 횟수를 계산해도 된다)
+
+-- ────────────────────────────────────────────────
+-- 4-6. SecureFile 전용 : FRAGMENT_INSERT / FRAGMENT_DELETE
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE v_c CLOB;
+  2  BEGIN
+  3    SELECT body INTO v_c FROM article WHERE id=3 FOR UPDATE;
+  4    DBMS_LOB.FRAGMENT_INSERT(v_c, 6, 11, '<INS> ');   -- 11번째 위치에 6문자 끼워넣기
+  5    DBMS_OUTPUT.PUT_LINE('FRAGMENT_INSERT 후 길이=' || DBMS_LOB.GETLENGTH(v_c));
+  6    DBMS_OUTPUT.PUT_LINE('앞 30문자=[' || DBMS_LOB.SUBSTR(v_c, 30, 1) || ']');
+  7    DBMS_LOB.FRAGMENT_DELETE(v_c, 6, 11);             -- 11번째부터 6문자 빼내기
+  8    DBMS_OUTPUT.PUT_LINE('FRAGMENT_DELETE 후 길이=' || DBMS_LOB.GETLENGTH(v_c));
+  9    COMMIT;
+ 10  END;
+ 11  /
+FRAGMENT_INSERT 후 길이=106
+앞 30문자=[HELLO.....<INS>           ....]
+FRAGMENT_DELETE 후 길이=100
+
+PL/SQL procedure successfully completed.
+
+-- ERASE 와 비교하면 차이가 분명하다.
+--   ERASE            : 자리를 비운다. 길이 그대로
+--   FRAGMENT_DELETE  : 뒤를 끌어당긴다. 길이가 줄어든다
+-- FRAGMENT_* 는 SecureFile 에서만 동작한다. BasicFile 이면 ORA-43856 이 난다.
+
+-- ────────────────────────────────────────────────
+-- 4-7. 한글과 NCLOB
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> UPDATE article SET body = TO_CLOB('가나다라마'), body_n = TO_NCLOB('가나다라마') WHERE id=2;
+
+1 row updated.
+
+LOBLAB@orcl> COMMIT;
+
+Commit complete.
+
+LOBLAB@orcl> SELECT DBMS_LOB.GETLENGTH(body) AS clob_chars, DBMS_LOB.GETLENGTH(body_n) AS nclob_chars,
+  2         LENGTH(body) AS len_c, LENGTHB(subject) AS subj_bytes
+  3  FROM   article WHERE id=2;
+
+CLOB_CHARS NCLOB_CHARS      LEN_C SUBJ_BYTES
+---------- ----------- ---------- ----------
+         5           5          5         23
+
+-- 읽는 법
+--   · CLOB·NCLOB 모두 '문자 수' 5 다. DB 문자집합이 AL32UTF8 이므로 둘의 차이가 없다.
+--     DB 문자집합이 한글을 담지 못하는 환경에서만 NCLOB 이 필요하다.
+--   · VARCHAR2 컬럼에는 LENGTHB 가 통한다. 'TO_CLOB 이어붙이기' 는 23 바이트다
+--     (한글 5자 × 3 + ASCII 8 = 23). 같은 함수를 CLOB 에 쓰면 아래처럼 막힌다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — SQL 에서 막히는 것들
+--------------------------------------------------------------------------------
+LOBLAB@orcl> SELECT id FROM article WHERE body = 'abc';
+SELECT id FROM article WHERE body = 'abc'
+                             *
+ERROR at line 1:
+ORA-00932: inconsistent datatypes: expected - got CLOB
+
+LOBLAB@orcl> SELECT DISTINCT body FROM article;
+SELECT DISTINCT body FROM article
+                *
+ERROR at line 1:
+ORA-00932: inconsistent datatypes: expected - got CLOB
+
+LOBLAB@orcl> SELECT id FROM article ORDER BY body;
+SELECT id FROM article ORDER BY body
+                                *
+ERROR at line 1:
+ORA-00932: inconsistent datatypes: expected - got CLOB
+
+LOBLAB@orcl> CREATE INDEX ix_article_body ON article(body);
+CREATE INDEX ix_article_body ON article(body)
+                                        *
+ERROR at line 1:
+ORA-02327: cannot create index on expression with datatype LOB
+
+LOBLAB@orcl> SELECT LENGTHB(body) FROM article WHERE id=2;
+SELECT LENGTHB(body) FROM article WHERE id=2
+                          *
+ERROR at line 1:
+ORA-22998: CLOB or NCLOB in multibyte character set not supported
+
+-- << 원인 파악 >>
+-- LOB 값은 '행 밖에 있을 수 있는 값' 이다. 정렬·그룹화·유일성 판정은 값 전체를
+-- 메모리에 올려 비교해야 하므로 Oracle 이 허용하지 않는다. 인덱스도 같은 이유다.
+--
+-- << 수정 — 각 상황의 대안 >>
+--   비교          DBMS_LOB.COMPARE(a, b) = 0
+--   같은 값 찾기  해시 컬럼을 따로 둔다 (예: STANDARD_HASH(DBMS_LOB.SUBSTR(...)) 또는 별도 체크섬)
+--   정렬·그룹화   정렬 키를 VARCHAR2 컬럼으로 뽑아 둔다 (제목·요약)
+--   전문 검색     Oracle Text 인덱스
+--                   CREATE INDEX ix_body ON article(body) INDEXTYPE IS CTXSYS.CONTEXT;
+--                   SELECT id FROM article WHERE CONTAINS(body, '검색어') > 0;
+--   바이트 길이   DBMS_LOB.GETLENGTH(문자 수)로 계산한다. CLOB 은 문자당 2바이트로 저장된다
+
+-- 비교의 대안을 확인해 둔다.
+
+LOBLAB@orcl> SELECT id FROM article a
+  2  WHERE  DBMS_LOB.COMPARE(a.body, TO_CLOB('가나다라마')) = 0;
+
+        ID
+----------
+         2
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+-- 6-1. SQL*Plus 에서 CLOB 을 그대로 보려면 SET LONG 이 필요하다
+
+LOBLAB@orcl> SET LONG 40
+LOBLAB@orcl> SELECT body FROM article WHERE id=3;
+
+BODY
+----------------------------------------
+HELLO.....          ..........
+..........
+
+-- 40 문자만 출력되고 줄바꿈 폭(LONGCHUNKSIZE 기본 80)에 맞춰 잘려 보인다.
+-- 기본값은 80 이므로 긴 본문을 조회하면 앞부분만 보인다. 확인용으로는 SUBSTR 이 안전하다.
+
+LOBLAB@orcl> SET LONG 4000
+LOBLAB@orcl> SELECT DBMS_LOB.SUBSTR(body, 40, 1) AS head40 FROM article WHERE id=3;
+
+HEAD40
+----------------------------------------
+HELLO.....          ....................
+
+-- 6-2. 최종 상태
+
+LOBLAB@orcl> SELECT id, subject, DBMS_LOB.GETLENGTH(body) AS body_len,
+  2         DBMS_LOB.GETLENGTH(body_n) AS body_n_len
+  3  FROM   article ORDER BY id;
+
+        ID SUBJECT                BODY_LEN BODY_N_LEN
+---------- -------------------- ---------- ----------
+         1 PL/SQL 변수                5000
+         2 TO_CLOB 이어붙이기            5          5
+         3 WRITEAPPEND 반복            100
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- article 은 실습 05(로케이터)에서 다시 쓴다. 지우지 않는다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) RPAD·CONCAT 같은 SQL 함수의 결과는 4000 바이트에서 조용히 잘린다.
+--    적재 스크립트가 오류 없이 데이터를 잃는 전형적인 경로다.
+--    길이 검증(DBMS_LOB.GETLENGTH)을 적재 직후에 넣는다.
+--
+-- 2) 적재는 EMPTY_CLOB() + RETURNING + WRITEAPPEND 를 기본형으로 쓴다.
+--    애플리케이션(JDBC/OCI)도 같은 순서다. INSERT 로 값을 한 번에 보내는 방식은
+--    4000 바이트 이하에서만 통한다.
+--
+-- 3) NULL 과 EMPTY_CLOB() 은 다르다.
+--    NULL 은 로케이터가 없어 DBMS_LOB 호출이 ORA-22275 로 실패한다.
+--    "빈 문서" 를 표현하려면 EMPTY_CLOB() 을 쓴다.
+--
+-- 4) ERASE 는 길이를 줄이지 않는다. 길이를 줄이려면 TRIM 또는 FRAGMENT_DELETE 다.
+--    "지웠는데 길이가 그대로" 라는 문의의 원인이다.
+--
+-- 5) LOB 에는 인덱스를 만들 수 없다. 검색 요건이 있으면 설계 단계에서
+--    Oracle Text 를 넣거나, 검색 대상 컬럼을 VARCHAR2 로 따로 둔다.
+--    운영에 들어간 뒤에 알면 되돌리기 어렵다.
+--
+-- 6) 정렬·중복 제거가 필요한 값은 애초에 LOB 이 아닌 컬럼으로 분리한다.
+--    본문은 CLOB, 제목·요약·해시는 VARCHAR2 가 실무의 표준 조합이다.
+================================================================================

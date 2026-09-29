@@ -1,0 +1,403 @@
+================================================================================
+ LOB 실습 08 : LONG → LOB 전환과 Data Pump 이관
+ 과정      : Oracle Database 19c LOB 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 계정      : loblab (디렉터리 객체 lob_dir)
+ 소요 시간 : 약 90분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 오래된 시스템을 인수했다. 본문 컬럼이 LONG 이고, 이관 계획을 세워야 한다.
+--   ① LONG 이 왜 쓸 수 없는 타입인지 오류로 확인한다
+--   ② TO_LOB(복제) 과 ALTER TABLE MODIFY(제자리) 두 가지 전환 방법
+--   ③ Data Pump 로 LOB 테이블을 내보내고 들여온다 — 무엇이 보존되고 무엇이 아닌가
+--   ④ BFILE 과 암호화 LOB 의 함정 두 가지
+-- 작업 유형 : 타입 전환·이관 (장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 03·04·06 완료 : file_store(5건), ext_doc(3건), s_enc(200건, 암호화 LOB)
+-- · 디렉터리 객체 lob_dir 에 loblab 의 READ·WRITE 권한 (덤프 파일을 여기에 쓴다)
+-- · OS 파일 : /home/oracle/lobfiles/manual.txt, photo.bin, big.dat
+
+[oracle@oel7v9 ~]$ sqlplus loblab/oracle_4U
+
+LOBLAB@orcl> SET SERVEROUTPUT ON SIZE UNLIMITED
+LOBLAB@orcl> SET LINESIZE 150
+LOBLAB@orcl> WHENEVER SQLERROR CONTINUE
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — LONG 컬럼을 만든다
+--------------------------------------------------------------------------------
+LOBLAB@orcl> CREATE TABLE legacy_note (id NUMBER PRIMARY KEY, note LONG) TABLESPACE lobtbs;
+
+Table created.
+
+LOBLAB@orcl> INSERT INTO legacy_note VALUES (1, RPAD('LONG 타입 본문 ',3000,'.'));
+
+1 row created.
+
+LOBLAB@orcl> INSERT INTO legacy_note VALUES (2, RPAD('두 번째 문서 ',2000,'.'));
+
+1 row created.
+
+LOBLAB@orcl> COMMIT;
+
+Commit complete.
+
+LOBLAB@orcl> COL column_name FOR a10
+LOBLAB@orcl> COL data_type FOR a10
+LOBLAB@orcl> SELECT column_name, data_type, data_length FROM user_tab_columns
+  2  WHERE  table_name='LEGACY_NOTE' ORDER BY column_id;
+
+COLUMN_NAM DATA_TYPE  DATA_LENGTH
+---------- ---------- -----------
+ID         NUMBER              22
+NOTE       LONG                 0
+
+LOBLAB@orcl> SELECT COUNT(*) AS long_lob_rows FROM user_lobs WHERE table_name='LEGACY_NOTE';
+
+LONG_LOB_ROWS
+-------------
+            0
+
+-- LONG 은 DATA_LENGTH 가 0 이고 user_lobs 에도 없다. LOB 이 아닌 별개의 옛 타입이다.
+-- 값은 테이블 블록 안에 이어 붙여 저장된다(행 체이닝을 일으킨다).
+
+--------------------------------------------------------------------------------
+[4] 작업 수행
+--------------------------------------------------------------------------------
+-- ────────────────────────────────────────────────
+-- 4-1. LONG 으로는 거의 아무것도 못 한다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> SELECT id FROM legacy_note WHERE note LIKE '%본문%';
+SELECT id FROM legacy_note WHERE note LIKE '%본문%'
+                                 *
+ERROR at line 1:
+ORA-00932: inconsistent datatypes: expected CHAR got LONG
+
+LOBLAB@orcl> SELECT LENGTH(note) FROM legacy_note WHERE id=1;
+SELECT LENGTH(note) FROM legacy_note WHERE id=1
+              *
+ERROR at line 1:
+ORA-00932: inconsistent datatypes: expected CHAR got LONG
+
+LOBLAB@orcl> CREATE TABLE legacy_copy AS SELECT * FROM legacy_note;
+CREATE TABLE legacy_copy AS SELECT * FROM legacy_note
+                                   *
+ERROR at line 1:
+ORA-00997: illegal use of LONG datatype
+
+-- << 원인 파악 >>
+-- LONG 은 SQL 에서 함수·조건·CTAS·서브쿼리에 쓸 수 없다. PL/SQL 변수로 받아
+-- 한 번에 32760 바이트씩 다루는 것이 전부다. 테이블당 한 개만 둘 수 있고,
+-- 파티셔닝·병렬·복제 기능과도 어울리지 않는다.
+-- LOB 이 도입된 8i 이후로는 호환성 때문에 남아 있는 타입이다.
+--
+-- << 수정 >> 전환한다. 방법은 두 가지다.
+
+-- ────────────────────────────────────────────────
+-- 4-2. 전환 ① TO_LOB 으로 복제하며 전환
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> CREATE TABLE note_clob AS SELECT id, TO_LOB(note) AS note FROM legacy_note;
+
+Table created.
+
+LOBLAB@orcl> SELECT column_name, data_type FROM user_tab_columns
+  2  WHERE  table_name='NOTE_CLOB' ORDER BY column_id;
+
+COLUMN_NAM DATA_TYPE
+---------- ----------
+ID         NUMBER
+NOTE       CLOB
+
+LOBLAB@orcl> SELECT id, DBMS_LOB.GETLENGTH(note) AS len FROM note_clob ORDER BY id;
+
+        ID        LEN
+---------- ----------
+         1       2996
+         2       1995
+
+-- TO_LOB 은 SELECT 목록에서만 쓸 수 있는 특수 함수다(WHERE 절에는 못 쓴다).
+-- 길이가 3000·2000 이 아니라 2996·1995 인 것은 RPAD 가 4000 '바이트' 한계에 맞춰
+-- 한글(3바이트)을 감안해 문자 수를 줄였기 때문이다(실습 02 의 리터럴 한계와 같은 원인).
+--
+-- 장점 : 원본을 남겨 두고 검증할 수 있다. 새 테이블에 LOB 저장 옵션을 마음대로 준다.
+-- 단점 : 공간이 두 배 필요하고, 이름 교체(RENAME)와 권한·인덱스·제약 재생성이 필요하다.
+--   CREATE TABLE note_new (id NUMBER, note CLOB) TABLESPACE lobtbs
+--     LOB (note) STORE AS SECUREFILE (COMPRESS MEDIUM);
+--   INSERT /*+ APPEND */ INTO note_new SELECT id, TO_LOB(note) FROM legacy_note;
+--   처럼 저장 옵션을 지정한 테이블에 넣는 것이 실무 형태다.
+
+-- ────────────────────────────────────────────────
+-- 4-3. 전환 ② ALTER TABLE MODIFY — 제자리 전환
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> ALTER TABLE legacy_note MODIFY (note CLOB);
+
+Table altered.
+
+LOBLAB@orcl> SELECT column_name, data_type FROM user_tab_columns
+  2  WHERE  table_name='LEGACY_NOTE' ORDER BY column_id;
+
+COLUMN_NAM DATA_TYPE
+---------- ----------
+ID         NUMBER
+NOTE       CLOB
+
+LOBLAB@orcl> COL table_name FOR a12
+LOBLAB@orcl> COL column_name FOR a8
+LOBLAB@orcl> SELECT table_name, column_name, securefile, in_row FROM user_lobs
+  2  WHERE  table_name='LEGACY_NOTE';
+
+TABLE_NAME   COLUMN_N SEC IN_
+------------ -------- --- ---
+LEGACY_NOTE  NOTE     YES YES
+
+LOBLAB@orcl> SELECT id, DBMS_LOB.GETLENGTH(note) AS len FROM legacy_note ORDER BY id;
+
+        ID        LEN
+---------- ----------
+         1       2996
+         2       1995
+
+-- 전환 뒤에는 SQL 검색이 된다.
+
+LOBLAB@orcl> SELECT id FROM legacy_note WHERE note LIKE '%본문%';
+
+        ID
+----------
+         1
+
+-- 한 문장으로 끝나고 데이터도 그대로다(2996·1995).
+-- 새로 만들어진 LOB 은 db_securefile 기본값에 따라 SecureFile·인라인이 되었다.
+-- 저장 옵션을 지정하려면 이렇게 쓴다.
+--   ALTER TABLE legacy_note MODIFY (note CLOB)
+--     LOB (note) STORE AS SECUREFILE (TABLESPACE lobtbs DISABLE STORAGE IN ROW);
+--
+-- 주의 : 테이블을 배타적으로 잠그고 모든 행을 다시 쓴다. 큰 테이블은 작업 창이 필요하다.
+--        무중단이 필요하면 DBMS_REDEFINITION(온라인 재정의)을 쓴다.
+--        전환은 되돌릴 수 없다(CLOB → LONG 은 불가). 반드시 백업 후 진행한다.
+
+-- ────────────────────────────────────────────────
+-- 4-4. Data Pump 로 내보내기
+-- ────────────────────────────────────────────────
+-- 내보낼 세 테이블의 현재 상태를 먼저 적어 둔다.
+
+LOBLAB@orcl> SELECT SUM(DBMS_LOB.GETLENGTH(content)) AS blob_bytes,
+  2         SUM(DBMS_LOB.GETLENGTH(text_content)) AS clob_chars FROM file_store;
+
+BLOB_BYTES CLOB_CHARS
+---------- ----------
+   2117006      10308
+
+LOBLAB@orcl> SELECT COUNT(*) AS enc_rows FROM s_enc;
+
+  ENC_ROWS
+----------
+       200
+
+LOBLAB@orcl> COL name FOR a8
+LOBLAB@orcl> SELECT id, name, DBMS_LOB.FILEEXISTS(f) AS file_exists FROM ext_doc ORDER BY id;
+
+        ID NAME     FILE_EXISTS
+---------- -------- -----------
+         1 manual             1
+         2 photo              1
+         3 ghost              0
+
+LOBLAB@orcl> EXIT
+
+[oracle@oel7v9 ~]$ cd /home/oracle/lobfiles
+[oracle@oel7v9 lobfiles]$ expdp loblab/oracle_4U directory=LOB_DIR dumpfile=lob_tabs.dmp \
+>   logfile=lob_exp.log tables=file_store,ext_doc,s_enc reuse_dumpfiles=y
+
+. . exported "LOBLAB"."EXT_DOC"                          5.984 KB       3 rows
+. . exported "LOBLAB"."FILE_STORE"                       2.045 MB       5 rows
+. . exported "LOBLAB"."S_ENC"                            39.07 MB     200 rows
+ORA-39173: Encrypted data has been stored unencrypted in dump file set.
+Master table "LOBLAB"."SYS_EXPORT_TABLE_01" successfully loaded/unloaded
+Dump file set for LOBLAB.SYS_EXPORT_TABLE_01 is:
+Job "LOBLAB"."SYS_EXPORT_TABLE_01" successfully completed at Tue Sep 29 09:49:55 2026 elapsed 0 00:00:19
+
+[oracle@oel7v9 lobfiles]$ ls -l lob_tabs.dmp
+-rw-r-----. 1 oracle dba 43360256 Sep 29 09:49 lob_tabs.dmp
+
+-- 여기서 세 가지를 읽는다.
+--   ① EXT_DOC 3건이 5.984 KB 다. BFILE 이 가리키는 파일(7.5KB + 20KB)은 들어가지 않았다.
+--      포인터(디렉터리 객체 이름 + 파일명)만 나갔다는 뜻이다.
+--   ② FILE_STORE 5건이 2.045 MB. BLOB·CLOB 데이터는 그대로 덤프에 들어간다.
+--   ③ ORA-39173 : "암호화된 데이터가 덤프에 암호화되지 않은 상태로 저장되었다."
+--      경고이므로 작업은 성공한다. 그러나 보안 관점에서는 사고다(아래 [6-2]).
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 지우고 다시 들여온다
+--------------------------------------------------------------------------------
+[oracle@oel7v9 lobfiles]$ sqlplus loblab/oracle_4U
+
+LOBLAB@orcl> DROP TABLE file_store PURGE;
+LOBLAB@orcl> DROP TABLE ext_doc PURGE;
+LOBLAB@orcl> DROP TABLE s_enc PURGE;
+
+Table dropped.   (세 번)
+
+LOBLAB@orcl> EXIT
+
+[oracle@oel7v9 lobfiles]$ impdp loblab/oracle_4U directory=LOB_DIR dumpfile=lob_tabs.dmp \
+>   logfile=lob_imp.log
+
+Master table "LOBLAB"."SYS_IMPORT_FULL_01" successfully loaded/unloaded
+. . imported "LOBLAB"."EXT_DOC"                          5.984 KB       3 rows
+. . imported "LOBLAB"."FILE_STORE"                       2.045 MB       5 rows
+. . imported "LOBLAB"."S_ENC"                            39.07 MB     200 rows
+Job "LOBLAB"."SYS_IMPORT_FULL_01" successfully completed at Tue Sep 29 09:50:11 2026 elapsed 0 00:00:11
+
+-- 내보내기 19초, 들여오기 11초. 39MB 짜리 암호화 LOB 테이블이 가장 오래 걸린다.
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+[oracle@oel7v9 lobfiles]$ sqlplus loblab/oracle_4U
+
+-- 6-1. LOB 데이터와 저장 속성이 보존되었는가
+
+LOBLAB@orcl> SELECT SUM(DBMS_LOB.GETLENGTH(content)) AS blob_bytes,
+  2         SUM(DBMS_LOB.GETLENGTH(text_content)) AS clob_chars FROM file_store;
+
+BLOB_BYTES CLOB_CHARS
+---------- ----------
+   2117006      10308
+
+LOBLAB@orcl> COL table_name FOR a12
+LOBLAB@orcl> SELECT table_name, securefile, encrypt, compression, in_row FROM user_lobs
+  2  WHERE  table_name IN ('FILE_STORE','S_ENC') ORDER BY 1, 2;
+
+TABLE_NAME   SEC ENCR COMPRE IN_
+------------ --- ---- ------ ---
+FILE_STORE   YES NO   NO     YES
+FILE_STORE   YES NO   NO     YES
+S_ENC        YES YES  NO     NO
+
+-- 내보내기 전 값(2117006 / 10308)과 정확히 같다. LOB 데이터는 완전히 보존된다.
+-- SecureFile·ENCRYPT·DISABLE STORAGE IN ROW 같은 저장 속성도 살아 돌아왔다.
+--   (FILE_STORE 가 두 행인 것은 LOB 컬럼이 두 개이기 때문이다)
+
+-- 6-2. BFILE 은 포인터만 돌아왔다
+
+LOBLAB@orcl> COL name FOR a8
+LOBLAB@orcl> SELECT id, name, DBMS_LOB.FILEEXISTS(f) AS file_exists FROM ext_doc ORDER BY id;
+
+        ID NAME     FILE_EXISTS
+---------- -------- -----------
+         1 manual             1
+         2 photo              1
+         3 ghost              0
+
+-- 여기서 "복구되었다" 고 판단하면 안 된다. 같은 서버의 파일이 그대로 있어서 1 인 것이다.
+-- 파일을 옮겨 보면 드러난다.
+
+LOBLAB@orcl> HOST mv /home/oracle/lobfiles/manual.txt /home/oracle/lobfiles/manual.txt.moved
+
+LOBLAB@orcl> SELECT id, name, DBMS_LOB.FILEEXISTS(f) AS after_move FROM ext_doc WHERE id=1;
+
+        ID NAME     AFTER_MOVE
+---------- -------- ----------
+         1 manual            0
+
+LOBLAB@orcl> HOST mv /home/oracle/lobfiles/manual.txt.moved /home/oracle/lobfiles/manual.txt
+
+LOBLAB@orcl> SELECT id, name, DBMS_LOB.FILEEXISTS(f) AS restored FROM ext_doc WHERE id=1;
+
+        ID NAME       RESTORED
+---------- -------- ----------
+         1 manual            1
+
+-- 다른 서버로 이관했다면 이 상태로 시작한다(파일이 없으니 전부 0).
+-- BFILE 이관 절차는 두 갈래여야 한다.
+--   ① Data Pump 로 테이블(포인터)을 옮긴다
+--   ② rsync·scp·스토리지 복제로 파일을 옮긴다
+--   ③ 대상 서버의 디렉터리 객체 경로를 맞춘다 (CREATE OR REPLACE DIRECTORY)
+-- 셋 중 하나라도 빠지면 첨부가 전부 깨진다.
+
+-- 6-3. 암호화 LOB 을 안전하게 반출하려면
+
+[oracle@oel7v9 lobfiles]$ expdp loblab/oracle_4U directory=LOB_DIR dumpfile=enc.dmp \
+>   logfile=enc.log tables=s_enc reuse_dumpfiles=y
+
+. . exported "LOBLAB"."S_ENC"                            39.07 MB     200 rows
+ORA-39173: Encrypted data has been stored unencrypted in dump file set.
+Job "LOBLAB"."SYS_EXPORT_TABLE_01" successfully completed at Tue Sep 29 09:50:30 2026 elapsed 0 00:00:16
+
+[oracle@oel7v9 lobfiles]$ expdp loblab/oracle_4U directory=LOB_DIR dumpfile=enc_pw.dmp \
+>   logfile=enc_pw.log tables=s_enc \
+>   encryption=encrypted_columns_only encryption_password=oracle_4U reuse_dumpfiles=y
+
+. . exported "LOBLAB"."S_ENC"                            39.07 MB     200 rows
+Job "LOBLAB"."SYS_EXPORT_TABLE_01" successfully completed at Tue Sep 29 09:50:48 2026 elapsed 0 00:00:15
+
+[oracle@oel7v9 lobfiles]$ ls -l enc.dmp enc_pw.dmp
+-rw-r-----. 1 oracle dba 41152512 Sep 29 09:50 enc.dmp
+-rw-r-----. 1 oracle dba 41152512 Sep 29 09:50 enc_pw.dmp
+
+-- ENCRYPTION_PASSWORD 를 주면 ORA-39173 이 사라진다. 크기는 같다(암호화는 크기를 바꾸지 않는다).
+-- 들여올 때 같은 암호를 줘야 한다.
+--   impdp ... encryption_password=oracle_4U
+-- 암호를 잃으면 그 덤프의 암호화 컬럼은 복원할 수 없다.
+--
+-- 선택지 정리
+--   ENCRYPTION=ENCRYPTED_COLUMNS_ONLY : 암호화 컬럼만 암호화해 기록
+--   ENCRYPTION=ALL                    : 덤프 전체를 암호화 (메타데이터까지)
+--   ENCRYPTION_MODE=TRANSPARENT       : 지갑을 쓰는 방식(같은 지갑이 있는 DB 로만 복원 가능)
+--   (Advanced Security 옵션이다. 라이선스를 확인한다)
+
+--------------------------------------------------------------------------------
+[7] 정리 — 실습 환경 전체 철거
+--------------------------------------------------------------------------------
+-- 여기까지가 LOB 실습의 마지막이다. 과정안내의 "실습 뒤 정리" 를 실행한다.
+
+LOBLAB@orcl> EXIT
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SYS@orcl> DROP USER loblab CASCADE;
+SYS@orcl> DROP TABLESPACE lobtbs  INCLUDING CONTENTS AND DATAFILES;
+SYS@orcl> DROP TABLESPACE lobmssm INCLUDING CONTENTS AND DATAFILES;
+SYS@orcl> DROP DIRECTORY lob_dir;
+
+User dropped.
+Tablespace dropped.
+Tablespace dropped.
+Directory dropped.
+
+SYS@orcl> EXIT
+[oracle@oel7v9 ~]$ rm -rf /home/oracle/lobfiles
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) LONG 은 신규 설계에서 쓰지 않는다. 인수한 시스템에 있으면 전환 계획을 세운다.
+--    전환 판단
+--      작은 테이블·짧은 정지 허용  → ALTER TABLE MODIFY (한 문장, 되돌릴 수 없음)
+--      큰 테이블·저장 옵션 변경    → 새 테이블 + TO_LOB + INSERT /*+ APPEND */
+--      무중단                      → DBMS_REDEFINITION
+--    전환 전 백업은 예외 없이 받는다.
+--
+-- 2) LONG 이 남아 있는지 정기 점검한다.
+--      SELECT owner, table_name, column_name FROM dba_tab_columns
+--       WHERE data_type IN ('LONG','LONG RAW') AND owner NOT LIKE 'SYS%';
+--
+-- 3) Data Pump 는 LOB 데이터와 저장 속성을 보존한다. 다만 큰 LOB 이 있으면
+--    덤프 크기와 시간이 LOB 에 지배된다(이 실습에서 39MB 테이블이 전체의 90%).
+--    필요하면 QUERY 로 범위를 나누거나 PARALLEL 을 쓴다.
+--
+-- 4) BFILE 이 있는 시스템의 이관·복구 절차는 반드시 세 단계(테이블·파일·디렉터리 객체)로
+--    문서화한다. Data Pump 로그가 "성공" 이어도 파일은 옮겨지지 않는다.
+--
+-- 5) 암호화 LOB 을 반출할 때 ORA-39173 을 경고로 넘기지 않는다.
+--    덤프 파일은 DB 밖으로 나가는 파일이다. ENCRYPTION_PASSWORD 없이 만든 덤프는
+--    지갑 없이도 읽을 수 있는 상태로 나간 것이다. 암호는 별도 경로로 전달·보관한다.
+--
+-- 6) 이관 검증은 "행 수" 가 아니라 "LOB 길이 합계" 로 한다.
+--      SELECT COUNT(*), SUM(DBMS_LOB.GETLENGTH(col)) FROM t;
+--    행 수만 비교하면 LOB 이 비어 있어도 통과한다.
+================================================================================

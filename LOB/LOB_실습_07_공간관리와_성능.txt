@@ -1,0 +1,534 @@
+================================================================================
+ LOB 실습 07 : 공간 관리와 성능 (SPACE_USAGE · MOVE · 리두 · 캐시)
+ 과정      : Oracle Database 19c LOB 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / 8K 블록
+ 계정      : loblab (테이블스페이스 lobtbs)
+ 소요 시간 : 약 100분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- "첨부를 많이 지웠는데 데이터파일이 줄지 않는다" 는 문의로 시작한다.
+--   ① LOB 세그먼트의 실제 사용량을 DBMS_SPACE.SPACE_USAGE 로 본다
+--   ② 삭제·RETENTION·SHRINK·MOVE 가 각각 무엇을 하는지 수치로 확인한다
+--   ③ 적재 성능에 직결되는 LOGGING / NOLOGGING / FILESYSTEM_LIKE_LOGGING 의 리두량
+--   ④ 읽기 성능에 직결되는 CACHE / NOCACHE 의 물리 읽기
+-- 작업 유형 : 공간·성능 관리 (장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 06 완료. s_plain(200건 × 102,400 문자), s_basic, s_dedup 등이 있다
+-- · loblab 에 v_$mystat, v_$statname 조회 권한이 있다 (과정안내의 환경 준비에 포함)
+-- · DBMS_SPACE.SPACE_USAGE 는 SecureFile 용 시그니처를 쓴다
+--     (segment_owner, segment_name, segment_type,
+--      segment_size_blocks, segment_size_bytes,
+--      used_blocks, used_bytes, expired_blocks, expired_bytes,
+--      unexpired_blocks, unexpired_bytes)
+--   ASSM 세그먼트용 시그니처(unformatted_blocks, fs1_blocks …)와 인자 개수가 달라
+--   섞어 쓰면 PLS-00306 이 난다.
+
+[oracle@oel7v9 ~]$ sqlplus loblab/oracle_4U
+
+LOBLAB@orcl> SET SERVEROUTPUT ON SIZE UNLIMITED
+LOBLAB@orcl> SET LINESIZE 160
+LOBLAB@orcl> WHENEVER SQLERROR CONTINUE
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+LOBLAB@orcl> SELECT COUNT(*) AS rows_now FROM s_plain;
+
+  ROWS_NOW
+----------
+       200
+
+LOBLAB@orcl> COL segment_name FOR a26
+LOBLAB@orcl> SELECT segment_name, bytes/1024/1024 AS seg_mb FROM user_segments
+  2  WHERE  segment_name IN (SELECT segment_name FROM user_lobs WHERE table_name='S_PLAIN');
+
+SEGMENT_NAME                   SEG_MB
+-------------------------- ----------
+SYS_LOB0000075164C00002$$     48.1875
+
+-- 3-1. 세그먼트 안을 들여다본다
+
+LOBLAB@orcl> DECLARE
+  2    v_seg VARCHAR2(30);
+  3    v_sb NUMBER; v_sby NUMBER; v_ub NUMBER; v_uby NUMBER;
+  4    v_eb NUMBER; v_eby NUMBER; v_xb NUMBER; v_xby NUMBER;
+  5  BEGIN
+  6    SELECT segment_name INTO v_seg FROM user_lobs WHERE table_name = 'S_PLAIN';
+  7    DBMS_SPACE.SPACE_USAGE(USER, v_seg, 'LOB', v_sb, v_sby, v_ub, v_uby, v_eb, v_eby, v_xb, v_xby);
+  8    DBMS_OUTPUT.PUT_LINE('적재 직후 : 세그먼트 ' || v_sb || ' 블록(' || ROUND(v_sby/1024/1024,1)
+  9      || ' MB), 사용 ' || v_ub || ', 만료 ' || v_eb || ', 미만료 ' || v_xb);
+ 10  END;
+ 11  /
+적재 직후 : 세그먼트 6168 블록(48.2 MB), 사용 5200, 만료 881, 미만료 0
+
+PL/SQL procedure successfully completed.
+
+-- 네 숫자의 뜻
+--   세그먼트 : 할당된 전체 블록 (dba_segments.blocks 와 같다)
+--   사용     : 현재 LOB 데이터가 들어 있는 블록
+--   만료     : 이전 버전이었으나 보존 기간이 지나 '재사용 가능' 한 블록
+--   미만료   : 이전 버전이고 RETENTION 때문에 아직 재사용할 수 없는 블록
+-- 적재만 한 직후라 미만료가 0 이고, 만료 881 은 적재 중 생긴 여유 공간이다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행
+--------------------------------------------------------------------------------
+-- ────────────────────────────────────────────────
+-- 4-1. 90% 를 지운다 — 세그먼트는 줄지 않는다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DELETE FROM s_plain WHERE id > 20;
+
+180 rows deleted.
+
+LOBLAB@orcl> COMMIT;
+
+Commit complete.
+
+LOBLAB@orcl> SELECT COUNT(*) AS rows_after_delete FROM s_plain;
+
+ROWS_AFTER_DELETE
+-----------------
+               20
+
+LOBLAB@orcl> (위 3-1 의 SPACE_USAGE 블록을 다시 실행)
+90% 삭제 후 : 세그먼트 6168 블록(48.2 MB), 사용 520, 만료 881, 미만료 4680
+
+LOBLAB@orcl> SELECT segment_name, bytes/1024/1024 AS seg_mb FROM user_segments
+  2  WHERE  segment_name IN (SELECT segment_name FROM user_lobs WHERE table_name='S_PLAIN');
+
+SEGMENT_NAME                   SEG_MB
+-------------------------- ----------
+SYS_LOB0000075164C00002$$     48.1875
+
+-- 읽는 법 — 문의의 답이 여기 있다
+--   · 사용 5200 → 520 으로 줄었다. 데이터는 확실히 지워졌다.
+--   · 그런데 세그먼트는 6168 블록(48.2MB) 그대로다. 데이터파일도 줄지 않는다.
+--   · 지워진 4680 블록이 '미만료' 로 옮겨졌다. RETENTION(기본 DEFAULT = UNDO 설정)
+--     때문에 아직 재사용할 수 없는 상태다.
+--   · 즉 삭제는 "공간을 비우는" 것이 아니라 "재사용 후보로 바꾸는" 작업이다.
+--     새 데이터를 넣으면 이 공간을 다시 쓴다. 파일 크기를 줄이려면 별도 작업이 필요하다.
+
+-- ────────────────────────────────────────────────
+-- 4-2. SHRINK SPACE 는 SecureFile 에서 막힌다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> ALTER TABLE s_plain MODIFY LOB (c) (SHRINK SPACE);
+ALTER TABLE s_plain MODIFY LOB (c) (SHRINK SPACE)
+*
+ERROR at line 1:
+ORA-10635: Invalid segment or tablespace type
+
+-- << 원인 파악 >>
+-- SHRINK SPACE 는 BasicFile LOB 과 일반 세그먼트용 기능이다.
+-- SecureFile LOB 은 지원하지 않는다. 오류 문구가 불친절하지만 원인은 이것이다.
+--
+-- << 수정 >> 두 단계로 공간을 회수한다.
+--   ① RETENTION 을 줄여 '미만료' 를 '만료' 로 바꾼다 (재사용 가능 상태로)
+--   ② MOVE LOB 으로 세그먼트를 재작성한다 (파일 크기를 실제로 줄인다)
+
+-- ────────────────────────────────────────────────
+-- 4-3. RETENTION 을 바꾼다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> COL table_name FOR a10
+LOBLAB@orcl> SELECT table_name, retention_type FROM user_lobs WHERE table_name='S_PLAIN';
+
+TABLE_NAME RETENTI
+---------- -------
+S_PLAIN    DEFAULT
+
+LOBLAB@orcl> ALTER TABLE s_plain MODIFY LOB (c) (RETENTION NONE);
+
+Table altered.
+
+LOBLAB@orcl> SELECT table_name, retention_type FROM user_lobs WHERE table_name='S_PLAIN';
+
+TABLE_NAME RETENTI
+---------- -------
+S_PLAIN    NONE
+
+LOBLAB@orcl> (SPACE_USAGE 재실행)
+RETENTION NONE 후 : 세그먼트 6168 블록(48.2 MB), 사용 520, 만료 5561, 미만료 0
+
+-- 미만료 4680 이 만료로 넘어갔다(881 + 4680 = 5561).
+-- 세그먼트 크기는 여전히 48.2MB 지만, 이제 그 공간을 새 데이터가 즉시 쓸 수 있다.
+--
+-- 주의 : RETENTION NONE 은 이전 버전을 보관하지 않는다는 뜻이다.
+--        LOB 로케이터를 오래 들고 읽는 세션(실습 05 의 읽기 일관성)이 ORA-22924
+--        (snapshot too old) 로 실패할 수 있다. 운영에서는 AUTO 나 MIN 을 쓴다.
+
+-- ────────────────────────────────────────────────
+-- 4-4. MOVE LOB 으로 실제 회수
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> ALTER TABLE s_plain MOVE LOB (c) STORE AS (TABLESPACE lobtbs);
+
+Table altered.
+
+LOBLAB@orcl> (SPACE_USAGE 재실행)
+MOVE 후 : 세그먼트 656 블록(5.1 MB), 사용 520, 만료 62, 미만료 0
+
+LOBLAB@orcl> SELECT segment_name, bytes/1024/1024 AS seg_mb FROM user_segments
+  2  WHERE  segment_name IN (SELECT segment_name FROM user_lobs WHERE table_name='S_PLAIN');
+
+SEGMENT_NAME                   SEG_MB
+-------------------------- ----------
+SYS_LOB0000075164C00002$$       5.125
+
+LOBLAB@orcl> SELECT COUNT(*) AS rows_final, MIN(DBMS_LOB.GETLENGTH(c)) AS chars FROM s_plain;
+
+ROWS_FINAL      CHARS
+---------- ----------
+        20     102400
+
+-- 48.2MB → 5.1MB. 남은 20건(각 102,400 문자 × 2바이트 ≈ 4MB)에 맞는 크기가 되었다.
+-- 데이터는 그대로다(20건, 102,400 문자).
+-- MOVE LOB 은 LOB 세그먼트만 재작성한다. 테이블·인덱스는 건드리지 않는다.
+-- 작업 중에는 그 테이블에 DML 을 할 수 없다(배타 잠금). 무중단이 필요하면
+-- DBMS_REDEFINITION(온라인 재정의)을 쓴다.
+
+-- ────────────────────────────────────────────────
+-- 4-5. LOB 만 다른 테이블스페이스로
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> COL tablespace_name FOR a16
+LOBLAB@orcl> SELECT table_name, tablespace_name FROM user_lobs WHERE table_name='S_PLAIN';
+
+TABLE_NAME TABLESPACE_NAME
+---------- ----------------
+S_PLAIN    LOBTBS
+
+LOBLAB@orcl> ALTER TABLE s_plain MOVE LOB (c) STORE AS (TABLESPACE users);
+
+Table altered.
+
+LOBLAB@orcl> SELECT table_name, tablespace_name FROM user_lobs WHERE table_name='S_PLAIN';
+
+TABLE_NAME TABLESPACE_NAME
+---------- ----------------
+S_PLAIN    USERS
+
+LOBLAB@orcl> SELECT COUNT(*) AS rows_ok FROM s_plain;
+
+   ROWS_OK
+----------
+        20
+
+LOBLAB@orcl> ALTER TABLE s_plain MOVE LOB (c) STORE AS (TABLESPACE lobtbs);   -- 되돌린다
+
+Table altered.
+
+-- 테이블은 그대로 두고 LOB 만 옮길 수 있다.
+-- 용도 : LOB 만 값싼 디스크로 내리기, LOB 만 백업 주기를 다르게 하기,
+--        테이블스페이스 단위 암호화 적용, 조각난 세그먼트 재작성.
+
+-- ────────────────────────────────────────────────
+-- 4-6. BasicFile 이라면 SHRINK 가 동작한다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> INSERT INTO s_basic SELECT id, c FROM s_dedup WHERE id <= 100;
+
+100 rows created.
+
+LOBLAB@orcl> COMMIT;
+
+Commit complete.
+
+LOBLAB@orcl> SELECT segment_name, bytes/1024/1024 AS basic_mb FROM user_segments
+  2  WHERE  segment_name IN (SELECT segment_name FROM user_lobs WHERE table_name='S_BASIC');
+
+SEGMENT_NAME                 BASIC_MB
+-------------------------- ----------
+SYS_LOB0000075151C00002$$          21
+
+LOBLAB@orcl> DELETE FROM s_basic WHERE MOD(id,4) <> 0;
+
+75 rows deleted.
+
+LOBLAB@orcl> COMMIT;
+
+Commit complete.
+
+LOBLAB@orcl> ALTER TABLE s_basic MODIFY LOB (c) (SHRINK SPACE);
+
+Table altered.
+
+LOBLAB@orcl> SELECT segment_name, bytes/1024/1024 AS basic_mb_after FROM user_segments
+  2  WHERE  segment_name IN (SELECT segment_name FROM user_lobs WHERE table_name='S_BASIC');
+
+SEGMENT_NAME               BASIC_MB_AFTER
+-------------------------- --------------
+SYS_LOB0000075151C00002$$          6.9375
+
+LOBLAB@orcl> SELECT COUNT(*) AS basic_rows FROM s_basic;
+
+BASIC_ROWS
+----------
+        25
+
+-- BasicFile 은 21MB → 6.94MB 로 줄었다(25건 남음).
+-- SecureFile 은 SHRINK 가 없고 MOVE 로 같은 일을 한다. 방법이 다를 뿐 목적은 같다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 적재 성능 : 리두
+--------------------------------------------------------------------------------
+LOBLAB@orcl> CREATE TABLE lg_log   (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (DISABLE STORAGE IN ROW NOCACHE LOGGING);
+LOBLAB@orcl> CREATE TABLE lg_nolog (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (DISABLE STORAGE IN ROW NOCACHE NOLOGGING);
+LOBLAB@orcl> CREATE TABLE lg_fs    (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (DISABLE STORAGE IN ROW NOCACHE FILESYSTEM_LIKE_LOGGING);
+
+Table created.   (세 번)
+
+-- 주의 : 절의 순서가 정해져 있다. NOCACHE 를 LOGGING 절 앞에 둔다.
+--        (DISABLE STORAGE IN ROW LOGGING) 처럼 쓰면 ORA-22853 이 난다.
+
+LOBLAB@orcl> COL table_name FOR a10
+LOBLAB@orcl> SELECT table_name, logging, cache FROM user_lobs
+  2  WHERE  table_name LIKE 'LG!_%' ESCAPE '!' ORDER BY 1;
+
+TABLE_NAME LOGGING CACHE
+---------- ------- ----------
+LG_FS      NO      NO
+LG_LOG     YES     NO
+LG_NOLOG   NO      NO
+
+-- user_lobs 는 NOLOGGING 과 FILESYSTEM_LIKE_LOGGING 을 구분하지 못한다(둘 다 NO).
+-- 구분이 필요하면 DBMS_METADATA.GET_DDL 로 원본 DDL 을 본다.
+
+LOBLAB@orcl> DECLARE
+  2    v_unit VARCHAR2(400) := RPAD('REDO TEST LINE abcdefghij 0123456789 ',200,'.');
+  3    v_before NUMBER; v_after NUMBER; v_l CLOB;
+  4    FUNCTION redo_now RETURN NUMBER IS v NUMBER;
+  5    BEGIN
+  6      SELECT s.value INTO v FROM v$mystat s JOIN v$statname n ON n.statistic# = s.statistic#
+  7       WHERE n.name = 'redo size';
+  8      RETURN v;
+  9    END;
+ 10    PROCEDURE load(p_tab VARCHAR2) IS
+ 11    BEGIN
+ 12      v_before := redo_now();
+ 13      FOR i IN 1..20 LOOP
+ 14        EXECUTE IMMEDIATE 'INSERT INTO ' || p_tab || ' VALUES (:1, EMPTY_CLOB()) RETURNING c INTO :2'
+ 15          USING i RETURNING INTO v_l;
+ 16        FOR j IN 1..512 LOOP DBMS_LOB.WRITEAPPEND(v_l, 200, v_unit); END LOOP;
+ 17      END LOOP;
+ 18      COMMIT;
+ 19      v_after := redo_now();
+ 20      DBMS_OUTPUT.PUT_LINE(RPAD(p_tab,10) || ' 리두 = ' || TO_CHAR(ROUND((v_after-v_before)/1024/1024,2)) || ' MB');
+ 21    END;
+ 22  BEGIN
+ 23    load('lg_log'); load('lg_nolog'); load('lg_fs');
+ 24  END;
+ 25  /
+lg_log     리두 = 6.45 MB
+lg_nolog   리두 = 3.06 MB
+lg_fs      리두 = 3.06 MB
+
+PL/SQL procedure successfully completed.
+
+LOBLAB@orcl> SELECT l.table_name, l.logging, s.bytes/1024/1024 AS lob_mb
+  2  FROM   user_lobs l JOIN user_segments s ON s.segment_name=l.segment_name
+  3  WHERE  l.table_name LIKE 'LG!_%' ESCAPE '!' ORDER BY 1;
+
+TABLE_NAME LOGGING     LOB_MB
+---------- ------- ----------
+LG_FS      NO          6.1875
+LG_LOG     YES         6.1875
+LG_NOLOG   NO          6.1875
+
+-- 해석
+--   같은 데이터(20건 × 102,400 문자 ≈ 4MB, 세그먼트 6.19MB)를 넣었는데
+--   리두가 6.45MB vs 3.06MB 로 두 배 차이 난다.
+--   NOLOGGING 도 3.06MB 가 남는다 — LOB 데이터는 기록하지 않지만
+--   메타데이터·UNDO 관련 리두는 계속 생긴다. "리두가 0" 이 되지는 않는다.
+--   FILESYSTEM_LIKE_LOGGING 은 SecureFile 전용이며 이 데이터에서는 NOLOGGING 과 같았다.
+--
+-- 중요 : NOLOGGING 으로 넣은 LOB 은 미디어 복구로 되살아나지 않는다.
+--   · 적재 직후 백업이 필수다.
+--   · ARCHIVELOG + FORCE LOGGING 이면 이 설정은 무시되고 항상 기록된다(Data Guard 환경 필수).
+--   · 대량 초기 적재에만 쓰고, 적재가 끝나면 LOGGING 으로 되돌린다.
+--       ALTER TABLE lg_nolog MODIFY LOB (c) (LOGGING);
+
+--------------------------------------------------------------------------------
+[6] 검증 — 읽기 성능 : CACHE
+--------------------------------------------------------------------------------
+LOBLAB@orcl> CREATE TABLE r_nocache (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (DISABLE STORAGE IN ROW NOCACHE);
+LOBLAB@orcl> CREATE TABLE r_cache   (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (DISABLE STORAGE IN ROW CACHE);
+
+Table created.   (두 번)
+
+-- 같은 데이터 50건(각 51,200 문자 = 약 100KB)을 양쪽에 넣는다 (내용은 모두 동일)
+
+LOBLAB@orcl> DECLARE v_l CLOB; v_u VARCHAR2(400) := RPAD('CACHE TEST LINE ',200,'-');
+  2  BEGIN
+  3    FOR i IN 1..50 LOOP
+  4      INSERT INTO r_nocache VALUES (i, EMPTY_CLOB()) RETURNING c INTO v_l;
+  5      FOR j IN 1..256 LOOP DBMS_LOB.WRITEAPPEND(v_l, 200, v_u); END LOOP;
+  6      INSERT INTO r_cache VALUES (i, EMPTY_CLOB()) RETURNING c INTO v_l;
+  7      FOR j IN 1..256 LOOP DBMS_LOB.WRITEAPPEND(v_l, 200, v_u); END LOOP;
+  8    END LOOP;
+  9    COMMIT;
+ 10  END;
+ 11  /
+
+PL/SQL procedure successfully completed.
+
+LOBLAB@orcl> SELECT table_name, cache, logging FROM user_lobs
+  2  WHERE  table_name IN ('R_NOCACHE','R_CACHE') ORDER BY 1;
+
+TABLE_NAME CACHE      LOGGING
+---------- ---------- -------
+R_CACHE    YES        YES
+R_NOCACHE  NO         YES
+
+LOBLAB@orcl> DECLARE
+  2    FUNCTION pr RETURN NUMBER IS v NUMBER;
+  3    BEGIN
+  4      SELECT s.value INTO v FROM v$mystat s JOIN v$statname n ON n.statistic#=s.statistic#
+  5       WHERE n.name='physical reads';
+  6      RETURN v;
+  7    END;
+  8    PROCEDURE read_all(p_tab VARCHAR2, p_label VARCHAR2) IS
+  9      v_b NUMBER; v_a NUMBER; v_sum NUMBER;
+ 10    BEGIN
+ 11      v_b := pr();
+ 12      EXECUTE IMMEDIATE 'SELECT SUM(DBMS_LOB.GETLENGTH(c)) + SUM(LENGTH(DBMS_LOB.SUBSTR(c,2000,1))) FROM ' || p_tab INTO v_sum;
+ 13      v_a := pr();
+ 14      DBMS_OUTPUT.PUT_LINE(RPAD(p_label,16) || ' 물리 읽기 = ' || (v_a - v_b) || ' 블록');
+ 15    END;
+ 16  BEGIN
+ 17    read_all('r_nocache','NOCACHE 1회차'); read_all('r_nocache','NOCACHE 2회차');
+ 18    read_all('r_cache',  'CACHE 1회차');   read_all('r_cache',  'CACHE 2회차');
+ 19  END;
+ 20  /
+NOCACHE 1회차    물리 읽기 = 100 블록
+NOCACHE 2회차    물리 읽기 = 100 블록
+CACHE 1회차      물리 읽기 = 0 블록
+CACHE 2회차      물리 읽기 = 0 블록
+
+PL/SQL procedure successfully completed.
+
+-- 해석
+--   NOCACHE : 읽을 때마다 디스크에서 100 블록을 읽는다. 재읽기에도 이득이 없다.
+--   CACHE   : 적재 때 버퍼 캐시에 들어간 블록이 남아 있어 물리 읽기가 0 이다.
+--   자주 읽는 작은 LOB(썸네일·아이콘·공통 양식)은 CACHE 가 유리하다.
+--   한 번 읽고 버리는 큰 LOB 은 NOCACHE 가 맞다. CACHE 로 두면 버퍼 캐시를 밀어내
+--   다른 테이블의 조회까지 느려진다.
+
+-- 6-1. 속성은 나중에도 바꿀 수 있다
+
+LOBLAB@orcl> ALTER TABLE r_nocache MODIFY LOB (c) (CACHE);
+
+Table altered.
+
+LOBLAB@orcl> SELECT table_name, cache FROM user_lobs WHERE table_name='R_NOCACHE';
+
+TABLE_NAME CACHE
+---------- ----------
+R_NOCACHE  YES
+
+LOBLAB@orcl> SELECT segment_name, bytes/1024/1024 AS mb FROM user_segments
+  2  WHERE  segment_name IN (SELECT segment_name FROM user_lobs WHERE table_name='R_NOCACHE');
+
+SEGMENT_NAME                       MB
+-------------------------- ----------
+SYS_LOB0000075200C00002$$      7.1875
+
+-- 6-2. 중복 제거·압축을 나중에 거는 경우 — 세그먼트는 바로 줄지 않는다
+
+LOBLAB@orcl> ALTER TABLE r_nocache MODIFY LOB (c) (DEDUPLICATE);
+
+Table altered.
+
+LOBLAB@orcl> ALTER TABLE r_nocache MODIFY LOB (c) (COMPRESS HIGH);
+
+Table altered.
+
+LOBLAB@orcl> SELECT table_name, deduplication, compression FROM user_lobs
+  2  WHERE  table_name='R_NOCACHE';
+
+TABLE_NAME DEDUPLICATION   COMPRE
+---------- --------------- ------
+R_NOCACHE  LOB             HIGH
+
+LOBLAB@orcl> SELECT segment_name, bytes/1024/1024 AS mb_after_alter FROM user_segments
+  2  WHERE  segment_name IN (SELECT segment_name FROM user_lobs WHERE table_name='R_NOCACHE');
+
+SEGMENT_NAME               MB_AFTER_ALTER
+-------------------------- --------------
+SYS_LOB0000075200C00002$$         16.1875
+
+LOBLAB@orcl> (SPACE_USAGE 를 R_NOCACHE 로 실행)
+ALTER 직후 : 세그먼트 2072 블록(16.2 MB), 사용 638, 만료 692, 미만료 663
+
+-- 7.19MB → 16.19MB 로 오히려 커졌다.
+-- ALTER 가 LOB 을 새 형식으로 다시 쓰면서 옛 버전이 세그먼트에 남았기 때문이다.
+-- '사용' 은 638 블록(5MB)으로 이미 줄어 있다. 남은 것은 만료·미만료 공간이다.
+
+LOBLAB@orcl> ALTER TABLE r_nocache MOVE LOB (c) STORE AS (TABLESPACE lobtbs);
+
+Table altered.
+
+LOBLAB@orcl> (SPACE_USAGE 재실행)
+MOVE 후 : 세그먼트 144 블록(1.1 MB), 사용 1, 만료 77, 미만료 0
+
+LOBLAB@orcl> SELECT segment_name, bytes/1024/1024 AS mb_after_move FROM user_segments
+  2  WHERE  segment_name IN (SELECT segment_name FROM user_lobs WHERE table_name='R_NOCACHE');
+
+SEGMENT_NAME                MB_AFTER_MOVE
+-------------------------- --------------
+SYS_LOB0000075200C00002$$           1.125
+
+LOBLAB@orcl> SELECT COUNT(*) AS rows_ok, MIN(DBMS_LOB.GETLENGTH(c)) AS chars,
+  2         COUNT(DISTINCT DBMS_LOB.SUBSTR(c,50,1)) AS distinct_head FROM r_nocache;
+
+   ROWS_OK      CHARS DISTINCT_HEAD
+---------- ---------- -------------
+        50      51200             1
+
+-- 7.19MB → (ALTER) 16.19MB → (MOVE) 1.13MB.
+-- 50건이 모두 같은 내용(DISTINCT_HEAD=1)이어서 중복 제거가 '사용 1 블록' 까지 줄였다.
+-- 순서가 중요하다 : 속성 변경(ALTER) → 재작성(MOVE). ALTER 만 하고 끝내면
+-- "압축을 걸었는데 더 커졌다" 는 결과를 보게 된다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- 이 실습의 테이블은 실습 08 에서 일부(s_enc)만 쓴다.
+-- 공간이 부족하면 아래를 지운다.
+--   DROP TABLE lg_log PURGE;  DROP TABLE lg_nolog PURGE;  DROP TABLE lg_fs PURGE;
+--   DROP TABLE r_cache PURGE; DROP TABLE r_nocache PURGE;
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) "지웠는데 파일이 안 줄어요" 의 표준 답변 순서
+--      ① SPACE_USAGE 로 사용/만료/미만료를 본다
+--      ② 미만료가 크면 RETENTION 설정을 확인한다
+--      ③ 파일 크기를 줄여야 하면 MOVE LOB (SecureFile) 또는 SHRINK SPACE (BasicFile)
+--      ④ 무중단이 필요하면 DBMS_REDEFINITION
+--    dba_segments 만 보고 판단하면 원인을 못 찾는다.
+--
+-- 2) SecureFile 에는 SHRINK SPACE 가 없다(ORA-10635). MOVE 가 그 자리를 대신한다.
+--    MOVE 는 배타 잠금을 잡으므로 작업 창을 확보한다.
+--
+-- 3) RETENTION NONE 은 공간 회수에는 유리하지만 읽기 일관성을 희생한다.
+--    긴 조회·리포트가 도는 시스템에서는 AUTO 또는 MIN <초> 를 쓴다.
+--
+-- 4) 대량 적재는 NOLOGGING(또는 FILESYSTEM_LIKE_LOGGING)으로 리두를 반으로 줄일 수 있다.
+--    대가는 복구 불가다. 적재 직후 백업 → LOGGING 복귀를 절차로 묶는다.
+--    Data Guard 를 쓰면 FORCE LOGGING 때문에 효과가 없다(그리고 그래야 한다).
+--
+-- 5) CACHE 결정은 "재읽기 빈도" 로 한다. 자주 읽는 작은 LOB 만 CACHE 로 둔다.
+--    큰 LOB 을 CACHE 로 두면 버퍼 캐시가 LOB 에 점령된다.
+--
+-- 6) 속성 변경 뒤에는 반드시 MOVE 로 마무리한다. ALTER 만으로는 기존 데이터가
+--    새 형식으로 정리되지 않고 세그먼트만 커진다.
+--
+-- 7) 정기 점검 쿼리를 하나 만들어 둔다 — 사용률이 낮은 LOB 세그먼트 찾기.
+--    (SPACE_USAGE 를 반복 호출하는 PL/SQL 로 작성하고 used/segment 비율을 기록한다)
+================================================================================

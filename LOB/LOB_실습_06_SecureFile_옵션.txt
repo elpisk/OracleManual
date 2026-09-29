@@ -1,0 +1,302 @@
+================================================================================
+ LOB 실습 06 : SecureFile 과 BasicFile, 중복 제거·압축·암호화
+ 과정      : Oracle Database 19c LOB 실습
+ 환경      : Oracle 19.3.0 EE / Oracle Linux 7 / non-CDB ORCL / db_securefile=PREFERRED
+ 계정      : loblab (테이블스페이스 lobtbs=ASSM, lobmssm=MSSM)
+ 소요 시간 : 약 90분
+ 라이선스  : COMPRESS 는 Advanced Compression, ENCRYPT 는 Advanced Security 옵션이다.
+             학습 목적으로 실행하며, 운영 적용 전 계약을 확인한다.
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 첨부파일 보관 테이블의 저장 방식을 고른다.
+--   ① BasicFile 과 SecureFile 의 차이와 전제 조건
+--   ② 두 방식에서 서로 쓸 수 없는 절 (오류로 확인)
+--   ③ 같은 데이터를 여섯 구성에 넣어 공간을 비교 — 중복 제거·압축·암호화의 실제 효과
+-- 작업 유형 : 저장 옵션 설계 (장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 01 완료. lobtbs(ASSM), lobmssm(MSSM) 두 테이블스페이스가 있다
+-- · db_securefile = PREFERRED (19c 기본). 값의 뜻은 아래와 같다
+--     PERMITTED : SecureFile 을 허용하되 기본은 BasicFile
+--     PREFERRED : 가능하면 SecureFile (ASSM 이 아니면 BasicFile 로 만든다)
+--     ALWAYS    : ASSM 이면 SecureFile 로 강제, 아니면 오류
+--     FORCE     : 항상 SecureFile 로 강제
+--     IGNORE    : SECUREFILE 지정을 무시하고 BasicFile
+-- · ENCRYPT 절을 쓰려면 TDE 지갑(키스토어)이 열려 있어야 한다
+--     SYS@orcl> SELECT wrl_type, status, wallet_type FROM v$encryption_wallet;
+--     FILE   OPEN   AUTOLOGIN        ← 이 상태여야 4-4 가 성공한다
+--   지갑이 없으면 ORA-28365(wallet is not open) 계열 오류가 난다. 지갑 구성은 보안 과정에서 다룬다.
+
+[oracle@oel7v9 ~]$ sqlplus loblab/oracle_4U
+
+LOBLAB@orcl> SET SERVEROUTPUT ON SIZE UNLIMITED
+LOBLAB@orcl> SET LINESIZE 160
+LOBLAB@orcl> WHENEVER SQLERROR CONTINUE
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — 두 방식을 나란히 만든다
+--------------------------------------------------------------------------------
+LOBLAB@orcl> CREATE TABLE s_basic  (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS BASICFILE  (DISABLE STORAGE IN ROW);
+
+Table created.
+
+LOBLAB@orcl> CREATE TABLE s_secure (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (DISABLE STORAGE IN ROW);
+
+Table created.
+
+LOBLAB@orcl> COL table_name FOR a12
+LOBLAB@orcl> SELECT table_name, securefile, pctversion, retention_type, retention_value
+  2  FROM   user_lobs WHERE table_name IN ('S_BASIC','S_SECURE') ORDER BY 1;
+
+TABLE_NAME   SEC PCTVERSION RETENTI RETENTION_VALUE
+------------ --- ---------- ------- ---------------
+S_BASIC      NO             YES
+S_SECURE     YES            DEFAULT
+
+-- 읽는 법
+--   · BasicFile 은 이전 버전 공간을 PCTVERSION 으로 관리한다(여기서는 'YES' = 기본 정책 사용).
+--   · SecureFile 은 RETENTION 으로 관리한다(DEFAULT = UNDO 설정을 따른다).
+--   · 두 열은 상호 배타적이다. 한쪽을 쓰면 다른 쪽은 비어 있다.
+--   · 19c 에서 BasicFile 은 여전히 만들어지지만 신규 설계에는 권장되지 않는다
+--     (압축·중복 제거·암호화·FRAGMENT_* API 를 쓸 수 없다).
+
+--------------------------------------------------------------------------------
+[4] 작업 수행
+--------------------------------------------------------------------------------
+-- ────────────────────────────────────────────────
+-- 4-1. SecureFile 은 ASSM 테이블스페이스에서만 만들어진다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> CREATE TABLE s_mssm (id NUMBER, c CLOB) TABLESPACE lobmssm
+  2    LOB (c) STORE AS SECUREFILE (DISABLE STORAGE IN ROW);
+CREATE TABLE s_mssm (id NUMBER, c CLOB) TABLESPACE lobmssm LOB (c) STORE AS SECUREFILE (DISABLE STORAGE IN ROW)
+*
+ERROR at line 1:
+ORA-43853: SECUREFILE lobs cannot be used in non-ASSM tablespace "LOBMSSM"
+
+-- << 원인 파악 >>
+-- SecureFile 의 공간 관리(비트맵·RETENTION·중복 제거)는 ASSM 구조를 전제한다.
+-- lobmssm 은 SEGMENT SPACE MANAGEMENT MANUAL 이므로 만들 수 없다.
+--
+-- << 수정 >> 같은 테이블스페이스라도 BasicFile 은 만들어진다.
+--            (또는 ASSM 테이블스페이스로 옮긴다 — 실무에서는 후자가 맞다)
+
+LOBLAB@orcl> CREATE TABLE s_mssm_basic (id NUMBER, c CLOB) TABLESPACE lobmssm
+  2    LOB (c) STORE AS BASICFILE (DISABLE STORAGE IN ROW);
+
+Table created.
+
+LOBLAB@orcl> COL tablespace_name FOR a10
+LOBLAB@orcl> SELECT table_name, securefile, tablespace_name FROM user_lobs
+  2  WHERE  table_name LIKE 'S!_MSSM%' ESCAPE '!';
+
+TABLE_NAME   SEC TABLESPACE
+------------ --- ----------
+S_MSSM_BASIC NO  LOBMSSM
+
+-- 오래된 데이터베이스를 인수하면 MSSM 테이블스페이스가 남아 있는 경우가 있다.
+-- "SecureFile 로 만들었는데 왜 BasicFile 인가" 의 원인이 대부분 이것이다
+-- (db_securefile=PREFERRED 이면 오류 없이 BasicFile 로 만들어지기도 한다).
+
+-- ────────────────────────────────────────────────
+-- 4-2. 서로 쓸 수 없는 절
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> CREATE TABLE s_bad1 (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS BASICFILE (COMPRESS HIGH);
+CREATE TABLE s_bad1 (id NUMBER, c CLOB) TABLESPACE lobtbs LOB (c) STORE AS BASICFILE (COMPRESS HIGH)
+*
+ERROR at line 1:
+ORA-43856: Unsupported LOB type for SECUREFILE LOB operation
+
+LOBLAB@orcl> CREATE TABLE s_bad2 (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (PCTVERSION 20);
+CREATE TABLE s_bad2 (id NUMBER, c CLOB) TABLESPACE lobtbs LOB (c) STORE AS SECUREFILE (PCTVERSION 20)
+                                                                                                    *
+ERROR at line 1:
+ORA-22853: invalid LOB storage option specification
+
+-- << 원인 파악 >>
+--   ORA-43856 : COMPRESS·DEDUPLICATE·ENCRYPT 는 SecureFile 전용 기능이다.
+--               BasicFile 에 쓰면 "SecureFile 전용 작업" 이라고 알려 준다.
+--   ORA-22853 : PCTVERSION 은 BasicFile 전용이다. SecureFile 에는 구문 자체가 없다.
+--
+-- << 수정 >> 기능으로 방식을 정한다.
+--   압축·중복 제거·암호화·FRAGMENT_* 가 필요하면 SECUREFILE (사실상 항상)
+--   PCTVERSION 으로 관리하던 옛 스크립트는 RETENTION 으로 옮긴다
+
+-- ────────────────────────────────────────────────
+-- 4-3. 비교용 여섯 테이블
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> CREATE TABLE s_plain  (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (DISABLE STORAGE IN ROW);
+LOBLAB@orcl> CREATE TABLE s_dedup  (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (DEDUPLICATE DISABLE STORAGE IN ROW);
+LOBLAB@orcl> CREATE TABLE s_comp_l (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (COMPRESS LOW DISABLE STORAGE IN ROW);
+LOBLAB@orcl> CREATE TABLE s_comp_m (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (COMPRESS MEDIUM DISABLE STORAGE IN ROW);
+LOBLAB@orcl> CREATE TABLE s_comp_h (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (COMPRESS HIGH DISABLE STORAGE IN ROW);
+LOBLAB@orcl> CREATE TABLE s_enc    (id NUMBER, c CLOB) TABLESPACE lobtbs
+  2    LOB (c) STORE AS SECUREFILE (ENCRYPT USING 'AES256' DISABLE STORAGE IN ROW);
+
+Table created.   (여섯 번)
+
+LOBLAB@orcl> SELECT table_name, securefile, deduplication, compression, encrypt FROM user_lobs
+  2  WHERE  table_name LIKE 'S!_%' ESCAPE '!' ORDER BY 1;
+
+TABLE_NAME   SEC DEDUPLICATION   COMPRE ENCR
+------------ --- --------------- ------ ----
+S_BASIC      NO  NONE            NONE   NONE
+S_COMP_H     YES NO              HIGH   NO
+S_COMP_L     YES NO              LOW    NO
+S_COMP_M     YES NO              MEDIUM NO
+S_DEDUP      YES LOB             NO     NO
+S_ENC        YES NO              NO     YES
+S_MSSM_BASIC NO  NONE            NONE   NONE
+S_PLAIN      YES NO              NO     NO
+S_SECURE     YES NO              NO     NO
+
+9 rows selected.
+
+-- BasicFile 두 개는 세 열이 모두 NONE 이다("해당 없음"). SecureFile 은 NO/YES 로 값이 있다.
+-- DEDUPLICATION = LOB 은 "LOB 단위로 중복 제거" 라는 뜻이다.
+
+-- ENCRYPT 절이 성공했다는 것은 지갑이 열려 있다는 뜻이다.
+-- (loblab 에게는 v$encryption_wallet 권한이 없어 조회하면 ORA-00942 가 난다. SYS 로 확인한다)
+
+-- ────────────────────────────────────────────────
+-- 4-4. 같은 데이터 200건을 여섯 구성에 적재
+-- ────────────────────────────────────────────────
+-- 반복되는 텍스트 200자를 512번 이어 붙여 102,400 문자(약 200KB)를 만든다.
+-- 200건 모두 내용이 완전히 같다. 중복 제거의 상한을 보기 위한 설정이다.
+
+LOBLAB@orcl> DECLARE
+  2    v_unit VARCHAR2(400) := RPAD('ORACLE LOB COMPRESSION TEST LINE abcdefghij 0123456789 ',200,'.');
+  3    PROCEDURE load_one(p_tab VARCHAR2) IS
+  4      v_l CLOB;
+  5    BEGIN
+  6      FOR i IN 1..200 LOOP
+  7        EXECUTE IMMEDIATE 'INSERT INTO ' || p_tab || ' VALUES (:1, EMPTY_CLOB()) RETURNING c INTO :2'
+  8          USING i RETURNING INTO v_l;
+  9        FOR j IN 1..512 LOOP DBMS_LOB.WRITEAPPEND(v_l, 200, v_unit); END LOOP;
+ 10      END LOOP;
+ 11      COMMIT;
+ 12    END;
+ 13  BEGIN
+ 14    load_one('s_plain');  load_one('s_dedup');  load_one('s_comp_l');
+ 15    load_one('s_comp_m'); load_one('s_comp_h'); load_one('s_enc');
+ 16    DBMS_OUTPUT.PUT_LINE('여섯 테이블에 각각 200건(각 102,400 문자) 적재 완료');
+ 17  END;
+ 18  /
+여섯 테이블에 각각 200건(각 102,400 문자) 적재 완료
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 공간 비교
+--------------------------------------------------------------------------------
+LOBLAB@orcl> COL table_name FOR a10
+LOBLAB@orcl> SELECT l.table_name, l.deduplication, l.compression, l.encrypt,
+  2         s.bytes/1024/1024 AS lob_mb, s.blocks
+  3  FROM   user_lobs l JOIN user_segments s ON s.segment_name = l.segment_name
+  4  WHERE  l.table_name IN ('S_PLAIN','S_DEDUP','S_COMP_L','S_COMP_M','S_COMP_H','S_ENC')
+  5  ORDER BY s.bytes;
+
+TABLE_NAME DEDUPLICATION   COMPRE ENCR     LOB_MB     BLOCKS
+---------- --------------- ------ ---- ---------- ----------
+S_DEDUP    LOB             NO     NO      1.1875        152
+S_COMP_L   NO              LOW    NO      3.1875        408
+S_COMP_H   NO              HIGH   NO      3.1875        408
+S_COMP_M   NO              MEDIUM NO      3.1875        408
+S_ENC      NO              NO     YES    48.1875       6168
+S_PLAIN    NO              NO     NO     48.1875       6168
+
+6 rows selected.
+
+LOBLAB@orcl> SELECT COUNT(*) AS rows_each, MIN(DBMS_LOB.GETLENGTH(c)) AS chars FROM s_plain;
+
+ ROWS_EACH      CHARS
+---------- ----------
+       200     102400
+
+-- 해석
+--   기본(S_PLAIN) 48.19MB = 200건 × 102,400 문자 × 2바이트 + 세그먼트 오버헤드.
+--     여기서도 CLOB 이 문자당 2바이트로 저장된다는 사실이 확인된다(실습 01).
+--   압축 3.19MB (15배 축소). LOW/MEDIUM/HIGH 가 모두 같다.
+--     이 데이터가 200자 단위 반복이라 어떤 알고리즘이든 한계까지 줄었기 때문이다.
+--     실제 문서·로그는 LOW < MEDIUM < HIGH 순으로 차이가 나고 CPU 비용도 그 순서다.
+--     이미 압축된 파일(JPEG·ZIP·동영상)은 거의 줄지 않는다. 압축을 걸면 CPU 만 쓴다.
+--   중복 제거 1.19MB. 200건이 완전히 동일하므로 실제로는 한 벌만 저장되었다.
+--     같은 첨부가 여러 행에 반복되는 업무(공통 양식, 전달된 메일 첨부)에서만 이만큼 효과가 난다.
+--     내용이 1바이트라도 다르면 별개로 저장된다(해시 기반).
+--   암호화 48.19MB. 기본과 완전히 같다. 암호화는 공간을 늘리지 않는다.
+--     비용은 CPU 와 키 관리이고, 이득은 저장 매체가 유출되어도 읽히지 않는다는 점이다.
+
+--------------------------------------------------------------------------------
+[6] 검증
+--------------------------------------------------------------------------------
+-- 6-1. 압축·암호화는 애플리케이션에 투명하다
+
+LOBLAB@orcl> SELECT DBMS_LOB.COMPARE(a.c, b.c) AS plain_vs_comp
+  2  FROM   s_plain a, s_comp_h b WHERE a.id=1 AND b.id=1;
+
+PLAIN_VS_COMP
+-------------
+            0
+
+LOBLAB@orcl> COL enc_head FOR a44
+LOBLAB@orcl> SELECT DBMS_LOB.SUBSTR(c, 40, 1) AS enc_head FROM s_enc WHERE id=1;
+
+ENC_HEAD
+--------------------------------------------
+ORACLE LOB COMPRESSION TEST LINE abcdefg
+
+-- 압축한 LOB 과 원본이 동일(0)하고, 암호화한 LOB 도 평문으로 읽힌다.
+-- 애플리케이션 코드는 바꿀 필요가 없다. 디스크에 어떻게 놓이는지만 달라진다.
+-- (암호화가 막아 주는 것은 "데이터파일·백업 파일을 직접 읽는 경로" 다.
+--  DB 에 접속해 SELECT 할 수 있는 사용자에게는 평문으로 보인다)
+
+-- 6-2. 실습 07 을 위한 기준값을 남긴다
+
+LOBLAB@orcl> SELECT SUM(bytes)/1024/1024 AS lobtbs_used_mb FROM user_segments;
+
+LOBTBS_USED_MB
+--------------
+       114.875
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- 여섯 테이블은 실습 07(공간 관리)에서 그대로 쓴다. 지우지 않는다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) 신규 설계는 SecureFile 이 기본이다. BasicFile 을 고를 이유는 사실상 없다.
+--    단 ASSM 테이블스페이스여야 한다(ORA-43853). 인수받은 DB 는 이것부터 확인한다.
+--
+-- 2) "SecureFile 로 만들었는데 BasicFile 인" 경우를 정기 점검한다.
+--      SELECT table_name, column_name FROM dba_lobs WHERE securefile='NO' AND owner NOT LIKE 'SYS%';
+--    db_securefile=PREFERRED 는 조용히 BasicFile 로 만들기도 한다.
+--
+-- 3) 압축 등급은 데이터로 결정한다. 표본을 실제로 넣어 보고 크기를 비교한다.
+--    이 실습처럼 LOW/MEDIUM/HIGH 가 같게 나오면 가장 싼 LOW 를 쓰는 것이 합리적이다.
+--    이미 압축된 바이너리에는 걸지 않는다.
+--
+-- 4) 중복 제거는 "같은 파일이 여러 행에 붙는가" 를 먼저 세어 본다.
+--    효과가 없으면 해시 계산 비용만 추가된다.
+--
+-- 5) 암호화는 공간을 늘리지 않지만 CPU 를 쓰고 지갑 관리 책임이 생긴다.
+--    지갑을 잃으면 데이터를 영구히 읽을 수 없다. 백업·이관 절차에 지갑을 반드시 포함한다.
+--    Data Pump 로 반출할 때의 주의사항은 실습 08 에서 다룬다.
+--
+-- 6) 압축·중복 제거는 Advanced Compression, 암호화는 Advanced Security 옵션이다.
+--    EE 바이너리에서 명령이 실행되는 것과 라이선스 보유는 별개다.
+--    사용 흔적은 dba_feature_usage_statistics 에 남아 감사 대상이 된다.
+================================================================================

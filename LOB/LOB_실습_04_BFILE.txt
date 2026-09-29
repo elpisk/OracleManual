@@ -1,0 +1,372 @@
+================================================================================
+ LOB 실습 04 : BFILE — 데이터베이스 밖의 파일을 가리키는 타입
+ 과정      : Oracle Database 19c LOB 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL
+ 계정      : loblab (디렉터리 객체 lob_dir → /home/oracle/lobfiles)
+ 소요 시간 : 약 70분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 원본 스캔 이미지를 DB 밖에 두고 경로만 관리하는 설계를 실습한다.
+-- BFILE 이 다른 LOB 과 근본적으로 다른 네 가지를 확인한다.
+--   ① LOB 세그먼트가 없다 (데이터가 DB 안에 없다)
+--   ② 읽기 전용이다 (쓰기 API 가 타입 단계에서 막힌다)
+--   ③ 트랜잭션 통제를 받지 않는다 (OS 파일이 바뀌면 값도 바뀐다)
+--   ④ 파일이 사라지면 조회가 실패한다 (DB 백업으로 복구되지 않는다)
+-- 작업 유형 : 타입 성질 확인 (장애 복구 아님)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 03 완료 (/home/oracle/lobfiles 에 manual.txt 7566바이트, photo.bin 12288바이트, big.dat 2MB)
+-- · 디렉터리 객체 lob_dir 과 loblab 의 READ 권한
+
+[oracle@oel7v9 ~]$ sqlplus loblab/oracle_4U
+
+LOBLAB@orcl> SET SERVEROUTPUT ON SIZE UNLIMITED
+LOBLAB@orcl> SET LINESIZE 140
+LOBLAB@orcl> WHENEVER SQLERROR CONTINUE
+
+LOBLAB@orcl> COL directory_path FOR a30
+LOBLAB@orcl> COL directory_name FOR a12
+LOBLAB@orcl> SELECT directory_name, directory_path FROM all_directories
+  2  WHERE  directory_name='LOB_DIR';
+
+DIRECTORY_NA DIRECTORY_PATH
+------------ ------------------------------
+LOB_DIR      /home/oracle/lobfiles
+
+LOBLAB@orcl> COL grantee FOR a10
+LOBLAB@orcl> COL privilege FOR a10
+LOBLAB@orcl> SELECT grantee, privilege FROM user_tab_privs
+  2  WHERE  table_name='LOB_DIR' ORDER BY 2;
+
+GRANTEE    PRIVILEGE
+---------- ----------
+LOBLAB     READ
+LOBLAB     WRITE
+
+-- BFILE 을 읽으려면 디렉터리 객체에 READ 가 있어야 한다.
+-- WRITE 는 BFILE 에는 쓰이지 않는다(읽기 전용). UTL_FILE 로 파일을 쓸 때만 필요하다.
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+LOBLAB@orcl> CREATE TABLE ext_doc (
+  2    id   NUMBER PRIMARY KEY,
+  3    name VARCHAR2(20),
+  4    f    BFILE
+  5  ) TABLESPACE lobtbs;
+
+Table created.
+
+-- 값은 BFILENAME(디렉터리객체, 파일명) 으로 만든다. 파일이 없어도 등록은 된다.
+
+LOBLAB@orcl> INSERT INTO ext_doc VALUES (1, 'manual', BFILENAME('LOB_DIR','manual.txt'));
+
+1 row created.
+
+LOBLAB@orcl> INSERT INTO ext_doc VALUES (2, 'photo',  BFILENAME('LOB_DIR','photo.bin'));
+
+1 row created.
+
+LOBLAB@orcl> INSERT INTO ext_doc VALUES (3, 'ghost',  BFILENAME('LOB_DIR','ghost.txt'));
+
+1 row created.
+
+LOBLAB@orcl> COMMIT;
+
+Commit complete.
+
+LOBLAB@orcl> COL name FOR a8
+LOBLAB@orcl> SELECT id, name, DBMS_LOB.FILEEXISTS(f) AS exists_flag FROM ext_doc ORDER BY id;
+
+        ID NAME     EXISTS_FLAG
+---------- -------- -----------
+         1 manual             1
+         2 photo              1
+         3 ghost              0
+
+-- ghost.txt 는 없는 파일이지만 INSERT 는 성공했다.
+-- BFILE 컬럼은 '이름' 만 저장한다. 파일 존재 여부를 검사하지 않는다.
+-- 무결성은 애플리케이션이 FILEEXISTS 로 직접 확인해야 한다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행
+--------------------------------------------------------------------------------
+-- ────────────────────────────────────────────────
+-- 4-1. LOB 세그먼트가 없다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> SELECT COUNT(*) AS bfile_lob_rows FROM user_lobs WHERE table_name='EXT_DOC';
+
+BFILE_LOB_ROWS
+--------------
+             0
+
+LOBLAB@orcl> SELECT COUNT(*) AS bfile_segments FROM user_segments
+  2  WHERE  segment_type LIKE 'LOB%'
+  3    AND  segment_name IN (SELECT segment_name FROM user_lobs WHERE table_name='EXT_DOC');
+
+BFILE_SEGMENTS
+--------------
+             0
+
+-- user_lobs 는 'DB 안에 저장되는 LOB' 의 저장 속성 뷰다. BFILE 은 대상이 아니다.
+-- 그래서 CHUNK·CACHE·LOGGING·SecureFile 같은 저장 옵션이 BFILE 에는 존재하지 않는다.
+
+-- ────────────────────────────────────────────────
+-- 4-2. 읽기 : FILEGETNAME / GETLENGTH / FILEOPEN / SUBSTR
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE
+  2    v_dir VARCHAR2(30); v_fn VARCHAR2(255); v_f BFILE;
+  3  BEGIN
+  4    SELECT f INTO v_f FROM ext_doc WHERE id=1;
+  5    DBMS_LOB.FILEGETNAME(v_f, v_dir, v_fn);
+  6    DBMS_OUTPUT.PUT_LINE('디렉터리 객체=' || v_dir || '  파일명=' || v_fn);
+  7    DBMS_OUTPUT.PUT_LINE('GETLENGTH(바이트)=' || DBMS_LOB.GETLENGTH(v_f));
+  8    DBMS_LOB.FILEOPEN(v_f, DBMS_LOB.FILE_READONLY);
+  9    DBMS_OUTPUT.PUT_LINE('FILEISOPEN=' || DBMS_LOB.FILEISOPEN(v_f));
+ 10    DBMS_OUTPUT.PUT_LINE('앞 30바이트=[' || UTL_RAW.CAST_TO_VARCHAR2(DBMS_LOB.SUBSTR(v_f, 30, 1)) || ']');
+ 11    DBMS_LOB.FILECLOSE(v_f);
+ 12    DBMS_OUTPUT.PUT_LINE('닫은 뒤 FILEISOPEN=' || DBMS_LOB.FILEISOPEN(v_f));
+ 13  END;
+ 14  /
+디렉터리 객체=LOB_DIR  파일명=manual.txt
+GETLENGTH(바이트)=7566
+FILEISOPEN=1
+앞 30바이트=[LOB 실습 안내 문서
+=====]
+닫은 뒤 FILEISOPEN=0
+
+PL/SQL procedure successfully completed.
+
+-- 읽는 법
+--   · GETLENGTH 는 파일 크기(바이트)다. CLOB 처럼 문자 수가 아니다.
+--     BFILE 은 문자집합 개념이 없다. 바이트 열일 뿐이다.
+--   · DBMS_LOB.SUBSTR(BFILE) 은 RAW 를 돌려준다. 그래서 UTL_RAW.CAST_TO_VARCHAR2 로 감쌌다.
+--     한글이 3바이트이므로 30바이트는 '문자 30개' 가 아니다(출력이 문서 첫 줄+일부).
+--   · FILEOPEN 없이 GETLENGTH 는 되지만, SUBSTR·READ 는 열어야 한다.
+--     세션에서 동시에 열 수 있는 BFILE 개수는 session_max_open_files 로 제한된다(기본 10).
+--     반드시 FILECLOSE 한다.
+
+-- ────────────────────────────────────────────────
+-- 4-3. 읽기 전용이다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE v_f BFILE;
+  2  BEGIN
+  3    SELECT f INTO v_f FROM ext_doc WHERE id=1 FOR UPDATE;
+  4    DBMS_LOB.WRITEAPPEND(v_f, 3, UTL_RAW.CAST_TO_RAW('XYZ'));
+  5  END;
+  6  /
+  DBMS_LOB.WRITEAPPEND(v_f, 3, UTL_RAW.CAST_TO_RAW('XYZ'));
+  *
+ERROR at line 4:
+ORA-06550: line 4, column 3:
+PLS-00306: wrong number or types of arguments in call to 'WRITEAPPEND'
+ORA-06550: line 4, column 3:
+PL/SQL: Statement ignored
+
+-- << 원인 파악 >>
+-- 실행 시점 오류가 아니라 '컴파일 오류' 다. DBMS_LOB.WRITEAPPEND 에는
+-- BLOB·CLOB 용 오버로드만 있고 BFILE 용이 없다. 즉 타입 설계상 쓰기가 불가능하다.
+-- WRITE·TRIM·ERASE·APPEND·FRAGMENT_* 모두 같다.
+--
+-- << 수정 >> 파일 내용을 바꾸려면 OS 에서 바꾸거나(아래 4-4),
+--            DB 안에서 다루려면 BLOB/CLOB 으로 옮긴다.
+
+LOBLAB@orcl> DECLARE
+  2    v_f BFILE; v_c CLOB; d_off INTEGER := 1; s_off INTEGER := 1; lang INTEGER := 0; warn INTEGER;
+  3  BEGIN
+  4    SELECT f INTO v_f FROM ext_doc WHERE id=1;
+  5    DBMS_LOB.CREATETEMPORARY(v_c, TRUE);
+  6    DBMS_LOB.FILEOPEN(v_f, DBMS_LOB.FILE_READONLY);
+  7    DBMS_LOB.LOADCLOBFROMFILE(v_c, v_f, DBMS_LOB.LOBMAXSIZE, d_off, s_off,
+  8                              NLS_CHARSET_ID('AL32UTF8'), lang, warn);
+  9    DBMS_LOB.FILECLOSE(v_f);
+ 10    DBMS_OUTPUT.PUT_LINE('BFILE 을 CLOB 으로 옮긴 길이=' || DBMS_LOB.GETLENGTH(v_c) || ' 문자');
+ 11    DBMS_LOB.FREETEMPORARY(v_c);
+ 12  END;
+ 13  /
+BFILE 을 CLOB 으로 옮긴 길이=5154 문자
+
+PL/SQL procedure successfully completed.
+
+-- BFILE → CLOB 은 실습 03 의 LOADCLOBFROMFILE 과 같은 방법이다.
+-- "외부 파일로 두었다가 필요할 때 DB 로 흡수" 하는 이관 경로가 이것이다.
+
+-- ────────────────────────────────────────────────
+-- 4-4. 트랜잭션 통제를 받지 않는다
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> SELECT DBMS_LOB.GETLENGTH(f) AS len_before FROM ext_doc WHERE id=2;
+
+LEN_BEFORE
+----------
+     12288
+
+-- OS 에서 파일을 교체한다 (DB 는 아무 것도 모른다)
+
+LOBLAB@orcl> HOST dd if=/dev/urandom of=/home/oracle/lobfiles/photo.bin bs=1024 count=20 2>/dev/null
+
+LOBLAB@orcl> SELECT DBMS_LOB.GETLENGTH(f) AS len_after FROM ext_doc WHERE id=2;
+
+ LEN_AFTER
+----------
+     20480
+
+-- 같은 행, 같은 컬럼인데 값이 바뀌었다. UPDATE 도 COMMIT 도 없었다.
+-- BFILE 은 '읽을 때마다 OS 파일을 본다'. 읽기 일관성·UNDO·REDO 가 적용되지 않는다.
+-- 감사·이력 관리가 필요한 데이터에 BFILE 을 쓰면 안 되는 이유다.
+
+-- ────────────────────────────────────────────────
+-- 4-5. 한 세션이 동시에 열 수 있는 파일 수
+-- ────────────────────────────────────────────────
+LOBLAB@orcl> DECLARE
+  2    TYPE t_arr IS TABLE OF BFILE INDEX BY PLS_INTEGER;
+  3    v_arr t_arr;
+  4  BEGIN
+  5    FOR i IN 1..12 LOOP
+  6      v_arr(i) := BFILENAME('LOB_DIR','manual.txt');
+  7      DBMS_LOB.FILEOPEN(v_arr(i), DBMS_LOB.FILE_READONLY);
+  8      DBMS_OUTPUT.PUT_LINE(i || '번째 파일 열기 성공');
+  9    END LOOP;
+ 10  END;
+ 11  /
+1번째 파일 열기 성공
+2번째 파일 열기 성공
+3번째 파일 열기 성공
+4번째 파일 열기 성공
+5번째 파일 열기 성공
+6번째 파일 열기 성공
+7번째 파일 열기 성공
+8번째 파일 열기 성공
+9번째 파일 열기 성공
+10번째 파일 열기 성공
+DECLARE
+*
+ERROR at line 1:
+ORA-22290: operation would exceed the maximum number of opened files or LOBs
+ORA-06512: at "SYS.DBMS_LOB", line 822
+ORA-06512: at line 7
+
+-- << 원인 파악 >>
+-- session_max_open_files 파라미터가 한 세션의 동시 열기 수를 제한한다. 기본값은 10 이다.
+--   SYS@orcl> SHOW PARAMETER session_max_open_files
+--   session_max_open_files               integer     10
+-- 11번째에서 막혔다. 루프에서 FILECLOSE 를 빠뜨리면 반드시 이 오류를 만난다.
+--
+-- << 수정 >> 여는 즉시 닫는다. 예외 경로에도 FILECLOSE 를 둔다.
+--   BEGIN
+--     DBMS_LOB.FILEOPEN(v_f, DBMS_LOB.FILE_READONLY);
+--     ... 읽기 ...
+--     DBMS_LOB.FILECLOSE(v_f);
+--   EXCEPTION WHEN OTHERS THEN
+--     IF DBMS_LOB.FILEISOPEN(v_f) = 1 THEN DBMS_LOB.FILECLOSE(v_f); END IF;
+--     RAISE;
+--   END;
+-- 한 번에 많은 파일을 다뤄야 하면 DBMS_LOB.FILECLOSEALL 로 세션의 열린 파일을 모두 닫는다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 파일이 사라지면
+--------------------------------------------------------------------------------
+LOBLAB@orcl> HOST mv /home/oracle/lobfiles/photo.bin /home/oracle/lobfiles/photo.bin.bak
+
+LOBLAB@orcl> SELECT DBMS_LOB.GETLENGTH(f) AS len_moved FROM ext_doc WHERE id=2;
+SELECT DBMS_LOB.GETLENGTH(f) AS len_moved FROM ext_doc WHERE id=2
+       *
+ERROR at line 1:
+ORA-22288: file or LOB operation GETLENGTH failed
+No such file or directory
+ORA-06512: at "SYS.DBMS_LOB", line 867
+
+-- << 원인 파악 >>
+-- 행은 그대로 있고 포인터도 그대로다. 가리키는 파일만 없다.
+-- 조회 한 건 때문에 SELECT 전체가 실패한다. 목록 화면이 통째로 깨지는 사고가 이것이다.
+--
+-- << 수정 >> 조회에 FILEEXISTS 를 끼워 방어한다.
+
+LOBLAB@orcl> SELECT id, name, DBMS_LOB.FILEEXISTS(f) AS exists_flag FROM ext_doc ORDER BY id;
+
+        ID NAME     EXISTS_FLAG
+---------- -------- -----------
+         1 manual             1
+         2 photo              0
+         3 ghost              0
+
+-- FILEEXISTS 는 파일이 없어도 오류 없이 0 을 돌려준다.
+-- 실무 조회는 이렇게 쓴다.
+--   SELECT id, name,
+--          CASE WHEN DBMS_LOB.FILEEXISTS(f)=1 THEN DBMS_LOB.GETLENGTH(f) END AS len
+--   FROM   ext_doc;
+
+LOBLAB@orcl> HOST mv /home/oracle/lobfiles/photo.bin.bak /home/oracle/lobfiles/photo.bin
+
+LOBLAB@orcl> SELECT DBMS_LOB.GETLENGTH(f) AS len_restored FROM ext_doc WHERE id=2;
+
+LEN_RESTORED
+------------
+       20480
+
+--------------------------------------------------------------------------------
+[6] 검증 — 롤백이 되돌리는 것과 되돌리지 못하는 것
+--------------------------------------------------------------------------------
+-- 포인터 자체는 일반 컬럼처럼 트랜잭션의 보호를 받는다.
+
+LOBLAB@orcl> UPDATE ext_doc SET f = BFILENAME('LOB_DIR','big.dat') WHERE id=3;
+
+1 row updated.
+
+LOBLAB@orcl> SELECT id, name, DBMS_LOB.FILEEXISTS(f) AS exists_flag,
+  2         DBMS_LOB.GETLENGTH(f) AS len FROM ext_doc WHERE id=3;
+
+        ID NAME     EXISTS_FLAG        LEN
+---------- -------- ----------- ----------
+         3 ghost              1    2097152
+
+LOBLAB@orcl> ROLLBACK;
+
+Rollback complete.
+
+LOBLAB@orcl> SELECT id, name, DBMS_LOB.FILEEXISTS(f) AS exists_flag FROM ext_doc WHERE id=3;
+
+        ID NAME     EXISTS_FLAG
+---------- -------- -----------
+         3 ghost              0
+
+-- 정리
+--   포인터(어느 파일을 가리키는가)  → 트랜잭션 대상. 롤백으로 되돌아온다
+--   파일 내용(그 파일이 무엇인가)   → 트랜잭션 밖. 롤백으로 되돌아오지 않는다
+--
+-- 그래서 "파일을 지우고 커밋하지 않았으니 괜찮다" 는 논리가 성립하지 않는다.
+-- 파일 삭제·교체는 DB 트랜잭션과 별개로 관리해야 한다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- ext_doc 은 실습 08(Data Pump 에서 BFILE 이 어떻게 되는가)에서 다시 쓴다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1) BFILE 은 "DB 가 파일 경로를 기억해 주는 기능" 이다. 그 이상을 기대하지 않는다.
+--    무결성·이력·동시성·백업 모두 애플리케이션과 운영 절차의 책임이다.
+--
+-- 2) 백업 설계가 둘로 갈린다.
+--    DB 백업(RMAN)은 포인터만 지킨다. 파일은 별도 백업 대상이다.
+--    복구 훈련에서 "DB 는 복구했는데 첨부가 전부 깨진" 사고가 여기서 나온다.
+--    실습 08 에서 Data Pump 로도 파일이 따라가지 않는 것을 확인한다.
+--
+-- 3) 디렉터리 객체 이름을 데이터에 박아 두는 셈이므로 경로 이관이 어렵다.
+--    서버 경로가 바뀌면 CREATE OR REPLACE DIRECTORY 로 디렉터리 객체의 경로만 바꾼다.
+--    (행 데이터를 고치지 않아도 된다 — BFILENAME 에는 객체 이름만 들어 있다)
+--
+-- 4) 읽기 전용이므로 "업로드" 기능에는 쓸 수 없다. 업로드는 BLOB,
+--    이미 존재하는 대용량 아카이브 참조는 BFILE 이 맞다.
+--
+-- 5) 세션이 열 수 있는 BFILE 개수는 session_max_open_files(기본 10)로 제한된다(4-5 실측).
+--    루프에서 FILECLOSE 를 빠뜨리면 11번째에서 ORA-22290 이 난다. FILECLOSEALL 도 알아 둔다.
+--
+-- 6) 대안 검토 : 19c 에서 수백 MB 이상 파일을 다룰 때는 BFILE 외에
+--    외부 테이블·DBFS·오브젝트 스토리지 연동도 후보다. BFILE 을 고르는 근거는
+--    "DB 트랜잭션과 무관하게 불변인 파일" 이라는 점이어야 한다.
+================================================================================
