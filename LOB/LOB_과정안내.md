@@ -521,6 +521,9 @@ SYS@orcl> CREATE OR REPLACE DIRECTORY lob_dir AS '/home/oracle/lobfiles';
 SYS@orcl> GRANT READ, WRITE ON DIRECTORY lob_dir TO loblab;
 ```
 
+실습용 파일 3종(`manual.txt` 7,566바이트 · `photo.bin` 12,288바이트 · `big.dat` 2MB)은
+저장소의 `LOB/lobfiles/` 에 동봉돼 있다. 서버로 복사해 쓰거나 실습 00 의 명령으로 직접 만들면 된다.
+
 ```bash
 [oracle@oel7v9 ~]$ mkdir -p /home/oracle/lobfiles
 ```
