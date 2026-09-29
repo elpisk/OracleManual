@@ -1,0 +1,626 @@
+================================================================================
+ IOT · CLUSTER 실습 02 : OVERFLOW · INCLUDING · PCTTHRESHOLD
+ 과정      : Oracle Database 19c IOT · CLUSTER 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 50분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- IOT 는 데이터를 인덱스 리프 블록에 담는다. 그런데 행이 너무 크면 담을 수 없다.
+-- 리프 블록 하나에 행 하나만 들어가면 B*Tree 가 깊어져 인덱스 구실을 못 한다.
+-- 그래서 Oracle 은 행의 일부를 떼어 낼 곳(OVERFLOW 세그먼트) 을 요구한다.
+--
+--   [인덱스 세그먼트]  기본키 + 자주 쓰는 앞쪽 컬럼
+--   [오버플로 세그먼트] 나머지 큰 컬럼
+--
+-- 어디서 자를지는 두 가지 방법으로 정한다.
+--   PCTTHRESHOLD n   블록의 n% 를 넘으면 그 지점부터 잘라 낸다 (기본 50)
+--   INCLUDING col    그 컬럼까지 인덱스에 두고 이후 컬럼은 전부 오버플로로 (권장)
+--
+-- 목표
+--   (1) OVERFLOW 가 없으면 CREATE 자체가 거부되는 것을 확인한다
+--   (2) INCLUDING 으로 자르는 위치를 지정하고 딕셔너리에서 확인한다
+--   (3) 인덱스만 읽는 조회와 오버플로까지 읽는 조회의 비용 차이를 측정한다
+--   (4) PCTTHRESHOLD 의 유효 범위를 확인한다
+--   (5) 비트맵 인덱스에 MAPPING TABLE 이 필요한 이유를 본다
+-- 작업 유형 : 구조 설계
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 01 을 마쳤다 (IOT 의 기본 구조를 이해하고 있다)
+-- · USERS 테이블스페이스에 50MB 이상 여유
+-- · 블록 크기 8K 를 전제로 한다. 임계값 계산이 블록 크기에 비례하므로
+--   16K 블록 환경에서는 같은 정의가 통과할 수 있다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — 큰 행은 OVERFLOW 없이 만들 수 없다
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.iot_noovf (
+  2    id   NUMBER,
+  3    txt  VARCHAR2(4000),
+  4    CONSTRAINT iot_noovf_pk PRIMARY KEY (id)
+  5  )
+  6  ORGANIZATION INDEX TABLESPACE users;
+CREATE TABLE hr.iot_noovf (
+*
+ERROR at line 1:
+ORA-01429: Index-Organized Table: no data segment to store overflow row-pieces
+
+-- ORA-01429: Index-Organized Table: no data segment to store overflow row-pieces
+--   중요한 점 : INSERT 할 때가 아니라 CREATE TABLE 할 때 거부된다.
+--   Oracle 은 선언된 컬럼의 최대 길이로 판단한다. 실제 데이터가 작아도 마찬가지다.
+--   VARCHAR2(4000) 하나만 있어도 8K 블록의 50%(약 3950바이트) 를 넘으므로 막힌다.
+
+SYS@orcl> CREATE TABLE hr.iot_small (
+  2    id   NUMBER,
+  3    txt  VARCHAR2(400),
+  4    CONSTRAINT iot_small_pk PRIMARY KEY (id)
+  5  )
+  6  ORGANIZATION INDEX TABLESPACE users;
+
+Table created.
+
+SYS@orcl> COL table_name FORMAT a20
+SYS@orcl> COL iot_name FORMAT a14
+SYS@orcl> COL index_name FORMAT a18
+SYS@orcl> COL include_column FORMAT 99999
+SYS@orcl> SELECT table_name, iot_type, iot_name FROM dba_tables
+  2  WHERE  owner='HR' AND (table_name='IOT_SMALL' OR iot_name='IOT_SMALL') ORDER BY table_name;
+
+TABLE_NAME           IOT_TYPE     IOT_NAME
+-------------------- ------------ --------------
+IOT_SMALL            IOT
+
+SYS@orcl> SELECT index_name, index_type, pct_threshold, include_column FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='IOT_SMALL';
+
+INDEX_NAME         INDEX_TYPE                  PCT_THRESHOLD INCLUDE_COLUMN
+------------------ --------------------------- ------------- --------------
+IOT_SMALL_PK       IOT - TOP                              50              0
+
+-- VARCHAR2(400) 이면 최대 행 길이가 임계값 안에 들어오므로 OVERFLOW 없이 만들어진다.
+-- dba_indexes 를 보면 pct_threshold 가 기본값 50 이고 include_column 은 비어 있다.
+--
+-- 기억할 점 : IOT 의 pct_threshold · include_column 은 dba_tables 가 아니라
+--             **dba_indexes** 에 있다. dba_tables 에 그 컬럼은 없다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — OVERFLOW 를 준다
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.iot_ovf (
+  2    id   NUMBER,
+  3    txt  VARCHAR2(4000),
+  4    CONSTRAINT iot_ovf_pk PRIMARY KEY (id)
+  5  )
+  6  ORGANIZATION INDEX TABLESPACE users
+  7  OVERFLOW TABLESPACE users;
+
+Table created.
+
+SYS@orcl> SELECT table_name, iot_type, iot_name FROM dba_tables
+  2  WHERE  owner='HR' AND (table_name='IOT_OVF' OR iot_name='IOT_OVF') ORDER BY table_name;
+
+TABLE_NAME           IOT_TYPE     IOT_NAME
+-------------------- ------------ --------------
+IOT_OVF              IOT
+SYS_IOT_OVER_76354   IOT_OVERFLOW IOT_OVF
+
+SYS@orcl> SELECT index_name, index_type, pct_threshold, include_column FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='IOT_OVF';
+
+INDEX_NAME         INDEX_TYPE                  PCT_THRESHOLD INCLUDE_COLUMN
+------------------ --------------------------- ------------- --------------
+IOT_OVF_PK         IOT - TOP                              50              0
+
+SYS@orcl> INSERT INTO hr.iot_ovf VALUES (1, RPAD('x', 100, 'x'));
+
+1 row created.
+
+SYS@orcl> INSERT INTO hr.iot_ovf VALUES (2, RPAD('x', 4000, 'x'));
+
+1 row created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT id, LENGTH(txt) AS len FROM hr.iot_ovf ORDER BY id;
+
+        ID        LEN
+---------- ----------
+         1        100
+         2       4000
+
+SYS@orcl> COL segment_name FORMAT a22
+SYS@orcl> SELECT segment_name, segment_type, bytes/1024 AS kb FROM dba_segments
+  2  WHERE  owner='HR' AND (segment_name='IOT_OVF_PK' OR segment_name LIKE 'SYS_IOT_OVER%')
+  3  ORDER  BY segment_name;
+
+SEGMENT_NAME           SEGMENT_TYPE               KB
+---------------------- ------------------ ----------
+IOT_OVF_PK             INDEX                      64
+SYS_IOT_OVER_76354     TABLE                      64
+
+-- OVERFLOW 절 하나로 통과한다. 그리고 두 가지가 눈에 보인다.
+--   dba_tables 에 행이 두 개 생긴다
+--     IOT_OVF            iot_type = IOT           (본체)
+--     SYS_IOT_OVER_76337 iot_type = IOT_OVERFLOW  (오버플로, iot_name 이 본체를 가리킨다)
+--   dba_segments 에도 두 개가 생긴다
+--     IOT_OVF_PK         INDEX  (인덱스 = 테이블)
+--     SYS_IOT_OVER_76337 TABLE  (오버플로는 일반 힙 세그먼트다)
+--
+-- 4000바이트 행도 100바이트 행도 문제없이 들어간다.
+-- 임계값을 넘는 행만 뒷부분이 오버플로로 간다.
+
+SYS@orcl> ALTER TABLE hr.iot_small ADD OVERFLOW TABLESPACE users;
+
+Table created.
+
+SYS@orcl> SELECT table_name, iot_type, iot_name FROM dba_tables
+  2  WHERE  owner='HR' AND (table_name='IOT_SMALL' OR iot_name='IOT_SMALL') ORDER BY table_name;
+
+TABLE_NAME           IOT_TYPE     IOT_NAME
+-------------------- ------------ --------------
+IOT_SMALL            IOT
+SYS_IOT_OVER_76352   IOT_OVERFLOW IOT_SMALL
+
+-- 이미 만든 IOT 에 나중에 OVERFLOW 를 붙일 수도 있다.
+-- (출력이 "Table created." 로 나오는 것은 오버플로 세그먼트가 새로 만들어지기 때문이다)
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — INCLUDING 으로 자를 위치를 정한다
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp_iot_ovf (
+  2    emp_id    NUMBER,
+  3    emp_name  VARCHAR2(50),
+  4    emp_email VARCHAR2(200),
+  5    emp_notes VARCHAR2(2000),
+  6    CONSTRAINT emp_iot_ovf_pk PRIMARY KEY (emp_id)
+  7  )
+  8  ORGANIZATION INDEX
+  9  TABLESPACE users
+ 10  PCTFREE 0
+ 11  INCLUDING emp_email
+ 12  OVERFLOW TABLESPACE users;
+
+Table created.
+
+SYS@orcl> SELECT table_name, iot_type, iot_name FROM dba_tables
+  2  WHERE  owner='HR' AND (table_name='EMP_IOT_OVF' OR iot_name='EMP_IOT_OVF') ORDER BY table_name;
+
+TABLE_NAME           IOT_TYPE     IOT_NAME
+-------------------- ------------ --------------
+EMP_IOT_OVF          IOT
+SYS_IOT_OVER_76358   IOT_OVERFLOW EMP_IOT_OVF
+
+SYS@orcl> SELECT index_name, index_type, pct_threshold, include_column FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_IOT_OVF';
+
+INDEX_NAME         INDEX_TYPE                  PCT_THRESHOLD INCLUDE_COLUMN
+------------------ --------------------------- ------------- --------------
+EMP_IOT_OVF_PK     IOT - TOP                              50              3
+
+SYS@orcl> COL column_name FORMAT a12
+SYS@orcl> SELECT column_id, column_name, data_type, data_length FROM dba_tab_columns
+  2  WHERE  owner='HR' AND table_name='EMP_IOT_OVF' ORDER BY column_id;
+
+ COLUMN_ID COLUMN_NAME  DATA_TYPE                                                                                                                        DATA_LENGTH
+---------- ------------ -------------------------------------------------------------------------------------------------------------------------------- -----------
+         1 EMP_ID       NUMBER                                                                                                                                    22
+         2 EMP_NAME     VARCHAR2                                                                                                                                  50
+         3 EMP_EMAIL    VARCHAR2                                                                                                                                 200
+         4 EMP_NOTES    VARCHAR2                                                                                                                                2000
+
+-- include_column = 3 이다. 컬럼 이름이 아니라 **컬럼 번호**로 저장된다.
+-- 3번 컬럼이 emp_email 이므로 다음과 같이 나뉘었다.
+--   인덱스 세그먼트  : emp_id(1) · emp_name(2) · emp_email(3)
+--   오버플로 세그먼트 : emp_notes(4)
+--
+-- INCLUDING 을 쓰면 크기와 무관하게 위치로 자른다. 그래서 예측 가능하다.
+-- PCTTHRESHOLD 는 행마다 길이가 달라 어떤 행은 인덱스에, 어떤 행은 오버플로에 간다.
+-- 설계할 때는 INCLUDING 을 쓰는 편이 낫다. 단, 컬럼 순서를 먼저 정리해야 한다.
+
+SYS@orcl> BEGIN
+  2    FOR i IN 1..2000 LOOP
+  3      INSERT INTO hr.emp_iot_ovf VALUES (
+  4        i, 'Employee ' || i, 'employee' || i || '@example.com', RPAD('notes ', 1500, 'x'));
+  5    END LOOP;
+  6    COMMIT;
+  7  END;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_IOT_OVF')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT segment_name, segment_type, bytes/1024 AS kb, blocks FROM dba_segments
+  2  WHERE  owner='HR' AND (segment_name = 'EMP_IOT_OVF_PK' OR segment_name LIKE 'SYS_IOT_OVER%')
+  3  ORDER  BY segment_name;
+
+SEGMENT_NAME           SEGMENT_TYPE               KB     BLOCKS
+---------------------- ------------------ ---------- ----------
+EMP_IOT_OVF_PK         INDEX                     192         24
+SYS_IOT_OVER_76354     TABLE                      64          8
+SYS_IOT_OVER_76358     TABLE                    5120        640
+
+SYS@orcl> SELECT table_name, iot_type, blocks, num_rows, avg_row_len FROM dba_tables
+  2  WHERE  owner='HR' AND (table_name='EMP_IOT_OVF' OR iot_name='EMP_IOT_OVF') ORDER BY table_name;
+
+TABLE_NAME           IOT_TYPE         BLOCKS   NUM_ROWS AVG_ROW_LEN
+-------------------- ------------ ---------- ---------- -----------
+EMP_IOT_OVF          IOT                           2000        1542
+SYS_IOT_OVER_76358   IOT_OVERFLOW        622          0           0
+
+SYS@orcl> SELECT index_name, blevel, leaf_blocks, num_rows FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_IOT_OVF';
+
+INDEX_NAME             BLEVEL LEAF_BLOCKS   NUM_ROWS
+------------------ ---------- ----------- ----------
+EMP_IOT_OVF_PK              1          14       2000
+
+-- 세그먼트 크기가 설계 의도를 그대로 보여 준다.
+--   EMP_IOT_OVF_PK     (인덱스)   192KB /  24 블록  <- 키 + 이름 + 메일
+--   SYS_IOT_OVER_76358 (오버플로) 5120KB / 640 블록  <- 1500바이트 메모 2000건
+--
+-- dba_tables 를 보면 본체는 blocks 가 비어 있고 오버플로는 622 블록으로 나온다.
+-- avg_row_len 1542 는 본체 쪽 통계이며 오버플로 부분까지 합친 전체 행 길이다.
+
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ emp_id, emp_email FROM hr.emp_iot_ovf WHERE emp_id = 500;
+
+    EMP_ID
+----------
+EMP_EMAIL
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+       500
+employee500@example.com
+
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  0wa3gurtn1g2z, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ emp_id, emp_email FROM
+hr.emp_iot_ovf WHERE emp_id = 500
+
+Plan hash value: 942233377
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |      1 |00:00:00.01 |       2 |
+|*  1 |  INDEX UNIQUE SCAN| EMP_IOT_OVF_PK |      1 |      1 |      1 |00:00:00.01 |       2 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("EMP_ID"=500)
+
+
+19 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ emp_id, LENGTH(emp_notes) AS notes_len
+  2  FROM   hr.emp_iot_ovf WHERE emp_id = 500;
+
+    EMP_ID  NOTES_LEN
+---------- ----------
+       500       1500
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  5yntq12r5k04u, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ emp_id, LENGTH(emp_notes) AS
+notes_len FROM   hr.emp_iot_ovf WHERE emp_id = 500
+
+Plan hash value: 942233377
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |      1 |00:00:00.01 |       3 |
+|*  1 |  INDEX UNIQUE SCAN| EMP_IOT_OVF_PK |      1 |      1 |      1 |00:00:00.01 |       3 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("EMP_ID"=500)
+
+
+19 rows selected.
+
+-- 단건 조회에서 이미 차이가 보인다.
+--   emp_email 까지만 (인덱스 안)      Buffers 2
+--   emp_notes 포함  (오버플로 접근)   Buffers 3   <- 오버플로 블록 하나를 더 읽었다
+--
+-- 계획 모양은 둘 다 INDEX UNIQUE SCAN 한 줄이다.
+-- 오버플로 접근은 계획에 별도 단계로 나타나지 않는다. Buffers 로만 보인다.
+-- 이것이 IOT 성능 분석에서 실측 Buffers 를 꼭 봐야 하는 이유다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 범위 조회에서는 차이가 폭발한다
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM hr.emp_iot_ovf
+  2  WHERE  emp_id BETWEEN 1 AND 1000;
+
+COUNT(EMP_EMAIL)
+----------------
+            1000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  gc1k90g1fn2j0, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM
+hr.emp_iot_ovf WHERE  emp_id BETWEEN 1 AND 1000
+
+Plan hash value: 3129316522
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |      1 |00:00:00.01 |       8 |
+|   1 |  SORT AGGREGATE   |                |      1 |      1 |      1 |00:00:00.01 |       8 |
+|*  2 |   INDEX RANGE SCAN| EMP_IOT_OVF_PK |      1 |   1000 |   1000 |00:00:00.01 |       8 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("EMP_ID">=1 AND "EMP_ID"<=1000)
+
+
+20 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(emp_notes) FROM hr.emp_iot_ovf
+  2  WHERE  emp_id BETWEEN 1 AND 1000;
+
+COUNT(EMP_NOTES)
+----------------
+            1000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  dvm9vnh8qcfcu, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(emp_notes) FROM
+hr.emp_iot_ovf WHERE  emp_id BETWEEN 1 AND 1000
+
+Plan hash value: 3129316522
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |      1 |00:00:00.01 |     258 |
+|   1 |  SORT AGGREGATE   |                |      1 |      1 |      1 |00:00:00.01 |     258 |
+|*  2 |   INDEX RANGE SCAN| EMP_IOT_OVF_PK |      1 |   1000 |   1000 |00:00:00.01 |     258 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("EMP_ID">=1 AND "EMP_ID"<=1000)
+
+
+20 rows selected.
+
+--   조건 1000건 · emp_email 까지 (인덱스 안)   Buffers      8
+--   조건 1000건 · emp_notes 포함 (오버플로)    Buffers    258
+--
+-- 32배다. 오버플로는 힙 세그먼트이므로 행마다 흩어져 있고, 키 순서로 모여 있지 않다.
+-- 따라서 IOT 설계의 핵심 판단은 이것이다.
+--
+--   "자주 조회하는 컬럼을 모두 INCLUDING 안쪽에 넣었는가"
+--
+-- 넣지 못했다면 IOT 로 얻는 이득이 사라진다. 그때는 힙 + 인덱스가 낫다.
+
+SYS@orcl> CREATE TABLE hr.emp_iot_thr (
+  2    emp_id    NUMBER,
+  3    emp_name  VARCHAR2(50),
+  4    emp_notes VARCHAR2(2000),
+  5    CONSTRAINT emp_iot_thr_pk PRIMARY KEY (emp_id)
+  6  )
+  7  ORGANIZATION INDEX TABLESPACE users
+  8  PCTTHRESHOLD 10
+  9  OVERFLOW TABLESPACE users;
+
+Table created.
+
+SYS@orcl> SELECT index_name, pct_threshold, include_column FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_IOT_THR';
+
+INDEX_NAME         PCT_THRESHOLD INCLUDE_COLUMN
+------------------ ------------- --------------
+EMP_IOT_THR_PK                10              0
+
+SYS@orcl> INSERT INTO hr.emp_iot_thr VALUES (1, 'short', RPAD('a', 100, 'a'));
+
+1 row created.
+
+SYS@orcl> INSERT INTO hr.emp_iot_thr VALUES (2, 'long',  RPAD('b', 1500, 'b'));
+
+1 row created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_IOT_THR')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT segment_name, segment_type, bytes/1024 AS kb FROM dba_segments
+  2  WHERE  owner='HR' AND (segment_name='EMP_IOT_THR_PK' OR segment_name LIKE 'SYS_IOT_OVER%')
+  3  ORDER  BY segment_name;
+
+SEGMENT_NAME           SEGMENT_TYPE               KB
+---------------------- ------------------ ----------
+EMP_IOT_THR_PK         INDEX                      64
+SYS_IOT_OVER_76354     TABLE                      64
+SYS_IOT_OVER_76358     TABLE                    5120
+SYS_IOT_OVER_76361     TABLE                      64
+
+SYS@orcl> SELECT emp_id, LENGTH(emp_notes) AS len FROM hr.emp_iot_thr ORDER BY emp_id;
+
+    EMP_ID        LEN
+---------- ----------
+         1        100
+         2       1500
+
+SYS@orcl> ALTER TABLE hr.emp_iot_thr PCTTHRESHOLD 60;
+ALTER TABLE hr.emp_iot_thr PCTTHRESHOLD 60
+                                        *
+ERROR at line 1:
+ORA-25179: invalid PCTTHRESHOLD storage option value
+
+
+SYS@orcl> ALTER TABLE hr.emp_iot_thr PCTTHRESHOLD 40;
+
+Table altered.
+
+SYS@orcl> SELECT index_name, pct_threshold FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_IOT_THR';
+
+INDEX_NAME         PCT_THRESHOLD
+------------------ -------------
+EMP_IOT_THR_PK                40
+
+-- PCTTHRESHOLD 를 읽는 법
+--   유효 범위는 1 ~ 50 이다. 51 이상은 ORA-25179 다.
+--     블록의 절반을 넘는 행을 인덱스에 두면 리프 블록에 행이 하나만 들어가므로 금지한다.
+--   PCTTHRESHOLD 만 쓰면 include_column 이 0 이다 (지정하지 않았다는 뜻).
+--   나중에 ALTER TABLE ... PCTTHRESHOLD n 으로 바꿀 수 있고, 기존 행은 그대로 남는다.
+--   즉 바꿔도 이미 저장된 행이 재배치되지는 않는다. 새로 넣는 행부터 적용된다.
+
+SYS@orcl> CREATE BITMAP INDEX hr.emp_iot_ovf_bmx ON hr.emp_iot_ovf(emp_name);
+CREATE BITMAP INDEX hr.emp_iot_ovf_bmx ON hr.emp_iot_ovf(emp_name)
+                                             *
+ERROR at line 1:
+ORA-28669: bitmap index can not be created on an IOT with no mapping table
+
+
+SYS@orcl> CREATE TABLE hr.emp_iot_map (
+  2    id NUMBER, code VARCHAR2(10), CONSTRAINT emp_iot_map_pk PRIMARY KEY (id))
+  3  ORGANIZATION INDEX TABLESPACE users MAPPING TABLE;
+
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp_iot_map VALUES (1,'A');
+
+1 row created.
+
+SYS@orcl> INSERT INTO hr.emp_iot_map VALUES (2,'B');
+
+1 row created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> CREATE BITMAP INDEX hr.emp_iot_map_bmx ON hr.emp_iot_map(code);
+
+Index created.
+
+SYS@orcl> SELECT table_name, iot_type, iot_name FROM dba_tables
+  2  WHERE  owner='HR' AND (table_name='EMP_IOT_MAP' OR iot_name='EMP_IOT_MAP') ORDER BY table_name;
+
+TABLE_NAME           IOT_TYPE     IOT_NAME
+-------------------- ------------ --------------
+EMP_IOT_MAP          IOT
+SYS_IOT_MAP_76364    IOT_MAPPING  EMP_IOT_MAP
+
+SYS@orcl> SELECT index_name, index_type FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_IOT_MAP' ORDER BY index_name;
+
+INDEX_NAME         INDEX_TYPE
+------------------ ---------------------------
+EMP_IOT_MAP_BMX    BITMAP
+EMP_IOT_MAP_PK     IOT - TOP
+
+SYS@orcl> SELECT segment_name, segment_type FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name LIKE '%MAP%' ORDER BY segment_name;
+
+SEGMENT_NAME           SEGMENT_TYPE
+---------------------- ------------------
+EMP_IOT_MAP_BMX        INDEX
+EMP_IOT_MAP_PK         INDEX
+SYS_IOT_MAP_76364      TABLE
+
+-- ORA-28669: bitmap index can not be created on an IOT with no mapping table
+--   비트맵 인덱스는 물리 ROWID 를 비트 위치로 쓴다. IOT 는 논리 ROWID 라 불가능하다.
+--   그래서 Oracle 은 "논리 ROWID <-> 물리 ROWID" 대응표(MAPPING TABLE) 를 요구한다.
+--   MAPPING TABLE 절을 주면 SYS_IOT_MAP_nnn 힙 테이블이 하나 더 생기고
+--   그 위에 비트맵 인덱스를 만들 수 있다 (iot_type = IOT_MAPPING).
+--
+--   비용 : 세그먼트가 하나 더 늘고 DML 마다 대응표를 유지해야 한다.
+--          IOT 에 비트맵 인덱스가 정말 필요한지 먼저 따져 본다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- 실습 03 은 새 테이블을 쓴다. 여기서 만든 것은 지운다.
+--   DROP TABLE hr.iot_small PURGE;
+--   DROP TABLE hr.iot_ovf PURGE;
+--   DROP TABLE hr.emp_iot_ovf PURGE;
+--   DROP TABLE hr.emp_iot_thr PURGE;
+--   DROP TABLE hr.emp_iot_map PURGE;
+-- IOT 를 지우면 오버플로·매핑 세그먼트도 함께 사라진다. 따로 지울 필요가 없다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. OVERFLOW 는 선택이 아니라 대부분 필수다.
+--    VARCHAR2(4000) 이나 긴 설명 컬럼이 하나라도 있으면 CREATE 가 막힌다.
+--    설계 단계에서 OVERFLOW 테이블스페이스를 어디로 할지 함께 정한다.
+--
+-- 2. INCLUDING 을 쓰고, 컬럼 순서를 조회 빈도 순으로 정렬한다.
+--    자주 쓰는 컬럼을 앞에 모아 INCLUDING 안쪽에 넣는 것이 IOT 설계의 핵심이다.
+--    실측에서 그 경계 하나로 범위 조회 Buffers 가 8 대 258 로 갈렸다.
+--
+-- 3. 오버플로 접근은 실행계획에 보이지 않는다.
+--    계획은 INDEX UNIQUE SCAN 한 줄로 똑같다. Buffers·Reads 로만 구분된다.
+--    IOT 튜닝은 반드시 ALLSTATS LAST 실측으로 한다.
+--
+-- 4. PCTTHRESHOLD 는 1~50 이고 이후 변경은 새 행에만 적용된다.
+--    이미 저장된 행을 재배치하려면 ALTER TABLE ... MOVE 로 다시 써야 한다.
+--
+-- 5. 비트맵 인덱스가 필요하면 MAPPING TABLE 을 만들어야 한다.
+--    세그먼트와 DML 비용이 늘어난다. 이 조건이 걸리면 힙을 다시 검토한다.
+--
+-- 6. 이 실습에서 본 오류
+--    ORA-01429  OVERFLOW 없이 큰 행을 가진 IOT 생성  -> OVERFLOW 절 추가
+--    ORA-25179  PCTTHRESHOLD 51 이상                 -> 1~50 범위로
+--    ORA-28669  MAPPING TABLE 없이 비트맵 인덱스      -> MAPPING TABLE 절 추가
+================================================================================
+ 실습 02 끝
+================================================================================

@@ -1,0 +1,551 @@
+================================================================================
+ IOT · CLUSTER 실습 01 : IOT(인덱스 구성 테이블) 의 구조
+ 과정      : Oracle Database 19c IOT · CLUSTER 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 45분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 일반 테이블(heap) 은 데이터를 넣은 순서대로 아무 블록에나 담고, 인덱스는 따로 만든다.
+-- IOT(Index Organized Table) 는 그 둘을 하나로 합친다. 테이블 자체가 B*Tree 인덱스다.
+--
+--   heap :  [테이블 세그먼트] + [인덱스 세그먼트]   -> 조회할 때 두 번 읽는다
+--   IOT  :  [인덱스 세그먼트 하나]                 -> 한 번에 끝난다
+--
+-- 목표
+--   (1) ORGANIZATION INDEX 구문과 기본키 필수 조건을 확인한다
+--   (2) 세그먼트가 인덱스 하나뿐이라는 것을 딕셔너리로 확인한다
+--   (3) 실행계획에서 TABLE ACCESS BY INDEX ROWID 단계가 사라지는 것을 본다
+--   (4) 정렬(SORT ORDER BY) 이 필요 없어지는 것을 힙과 나란히 비교한다
+--   (5) IOT 의 ROWID 는 물리 주소가 아니라 논리 주소임을 확인한다
+-- 작업 유형 : 구조 확인
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · HR 스키마가 있고 USERS 테이블스페이스에 100MB 이상 여유가 있다
+-- · IOT 는 Partitioning 같은 별도 옵션이 필요 없다. Standard Edition 에서도 쓸 수 있다
+-- · 실습은 원본 교안 표기를 따라 SYS 로 진행한다.
+--   실무에서는 스키마 소유자나 전용 관리 계정으로 하는 것이 맞다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT banner_full FROM v$version;
+
+BANNER_FULL
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+
+SYS@orcl> SHOW PARAMETER db_block_size
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+db_block_size                        integer     8192
+SYS@orcl> SELECT tablespace_name, extent_management, allocation_type, segment_space_management
+  2  FROM   dba_tablespaces WHERE tablespace_name = 'USERS';
+
+TABLESPACE_NAME                EXTENT_MAN ALLOCATIO SEGMEN
+------------------------------ ---------- --------- ------
+USERS                          LOCAL      SYSTEM    AUTO
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — IOT 를 만든다
+--------------------------------------------------------------------------------
+-- IOT 는 기본키가 없으면 존재할 수 없다. 기본키가 곧 저장 순서이기 때문이다.
+
+SYS@orcl> CREATE TABLE hr.iot_nopk (id NUMBER, txt VARCHAR2(50))
+  2  ORGANIZATION INDEX TABLESPACE users;
+ORGANIZATION INDEX TABLESPACE users
+             *
+ERROR at line 2:
+ORA-25175: no PRIMARY KEY constraint found
+
+-- ORA-25175: no PRIMARY KEY constraint found
+--   ORGANIZATION INDEX 를 쓰려면 PRIMARY KEY 를 함께 정의해야 한다.
+--   UNIQUE 제약으로는 안 된다. 기본키여야 한다.
+
+-- 기본키를 주고 다시 만든다. PCTFREE 0 은 IOT 에서 흔히 쓰는 설정이다.
+-- 값이 중간에 끼어드는 일이 적다면 블록을 꽉 채우는 쪽이 낫다.
+
+SYS@orcl> CREATE TABLE hr.emp_iot (
+  2    emp_id    NUMBER,
+  3    emp_name  VARCHAR2(50),
+  4    emp_email VARCHAR2(200),
+  5    emp_notes VARCHAR2(400),
+  6    CONSTRAINT emp_iot_pk PRIMARY KEY (emp_id)
+  7  )
+  8  ORGANIZATION INDEX
+  9  TABLESPACE users
+ 10  PCTFREE 0;
+
+Table created.
+
+SYS@orcl> COL table_name FORMAT a14
+SYS@orcl> COL iot_name FORMAT a14
+SYS@orcl> COL index_name FORMAT a14
+SYS@orcl> COL segment_name FORMAT a18
+SYS@orcl> COL tablespace_name FORMAT a10
+SYS@orcl> COL constraint_name FORMAT a16
+SYS@orcl> SELECT table_name, iot_type, iot_name, blocks, num_rows, pct_free
+  2  FROM   dba_tables WHERE owner='HR' AND (table_name='EMP_IOT' OR iot_name='EMP_IOT');
+
+TABLE_NAME     IOT_TYPE     IOT_NAME           BLOCKS   NUM_ROWS   PCT_FREE
+-------------- ------------ -------------- ---------- ---------- ----------
+EMP_IOT        IOT                                                        0
+
+SYS@orcl> SELECT index_name, index_type, table_name, uniqueness, tablespace_name
+  2  FROM   dba_indexes WHERE owner='HR' AND table_name='EMP_IOT';
+
+INDEX_NAME     INDEX_TYPE                  TABLE_NAME     UNIQUENES TABLESPACE
+-------------- --------------------------- -------------- --------- ----------
+EMP_IOT_PK     IOT - TOP                   EMP_IOT        UNIQUE    USERS
+
+SYS@orcl> SELECT segment_name, segment_type, tablespace_name, bytes/1024 AS kb, blocks
+  2  FROM   dba_segments WHERE owner='HR' AND segment_name LIKE '%IOT%';
+
+no rows selected
+
+SYS@orcl> SELECT constraint_name, constraint_type, status FROM dba_constraints
+  2  WHERE  owner='HR' AND table_name='EMP_IOT';
+
+CONSTRAINT_NAME  C STATUS
+---------------- - --------
+EMP_IOT_PK       P ENABLED
+
+-- 딕셔너리를 읽는 법
+--   dba_tables.iot_type = 'IOT'      이 테이블은 IOT 다
+--   dba_tables.blocks   = 비어 있다  테이블 세그먼트가 없으므로 블록 수도 없다
+--   dba_indexes.index_type = 'IOT - TOP'
+--                                    이 인덱스가 곧 테이블이다
+--   dba_segments        = 아직 한 건도 없다
+--                                    19c 는 세그먼트 생성을 미룬다(deferred)
+--
+-- 기억할 점 : IOT 의 크기·블록 수·통계는 dba_tables 가 아니라 dba_indexes 를 봐야 한다.
+--             모니터링 쿼리가 dba_tables.blocks 만 쓰면 IOT 는 전부 NULL 로 보인다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 데이터를 넣고 세그먼트를 본다
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE SEQUENCE hr.iot_seq START WITH 1;
+
+Sequence created.
+
+SYS@orcl> BEGIN
+  2    FOR i IN 1..2000 LOOP
+  3      INSERT INTO hr.emp_iot (emp_id, emp_name, emp_email, emp_notes)
+  4      VALUES (hr.iot_seq.NEXTVAL,
+  5              'Employee ' || i,
+  6              'employee' || i || '@example.com',
+  7              'Notes for employee ' || i || ' - sample text.');
+  8    END LOOP;
+  9    COMMIT;
+ 10  END;
+ 11  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> CREATE TABLE hr.emp_heap0 TABLESPACE users PCTFREE 0 AS SELECT * FROM hr.emp_iot;
+
+Table created.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_IOT')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_HEAP0')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT table_name, iot_type, blocks, num_rows, avg_row_len FROM dba_tables
+  2  WHERE  owner='HR' AND table_name IN ('EMP_IOT','EMP_HEAP0') ORDER BY table_name;
+
+TABLE_NAME     IOT_TYPE         BLOCKS   NUM_ROWS AVG_ROW_LEN
+-------------- ------------ ---------- ---------- -----------
+EMP_HEAP0                           26       2000          79
+EMP_IOT        IOT                           2000          79
+
+SYS@orcl> SELECT index_name, blevel, leaf_blocks, num_rows, clustering_factor FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_IOT';
+
+INDEX_NAME         BLEVEL LEAF_BLOCKS   NUM_ROWS CLUSTERING_FACTOR
+-------------- ---------- ----------- ---------- -----------------
+EMP_IOT_PK              1          23       2000                 0
+
+SYS@orcl> SELECT segment_name, segment_type, bytes/1024 AS kb, blocks FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name IN ('EMP_IOT_PK','EMP_HEAP0') ORDER BY segment_name;
+
+SEGMENT_NAME       SEGMENT_TYPE               KB     BLOCKS
+------------------ ------------------ ---------- ----------
+EMP_HEAP0          TABLE                     256         32
+EMP_IOT_PK         INDEX                     256         32
+
+-- 관찰
+--   · 세그먼트가 EMP_IOT_PK 하나뿐이다. 256KB / 32 블록.
+--     비교용 힙 테이블(EMP_HEAP0) 은 테이블 세그먼트와 인덱스 세그먼트가 따로 생긴다.
+--   · dba_tables.blocks 는 IOT 에서 여전히 비어 있고, dba_indexes 에
+--     blevel 1 · leaf_blocks 23 으로 실제 크기가 들어 있다.
+--   · clustering_factor 가 0 이다. IOT 는 인덱스 순서 = 데이터 순서이므로
+--     클러스터링 팩터라는 개념 자체가 필요 없다. 옵티마이저도 0 으로 둔다.
+
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ emp_id, emp_name FROM hr.emp_iot WHERE emp_id = 500;
+
+    EMP_ID EMP_NAME
+---------- --------------------------------------------------
+       500 Employee 500
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  8fpsjmkvxmkyy, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ emp_id, emp_name FROM hr.emp_iot
+WHERE emp_id = 500
+
+Plan hash value: 4284943399
+
+------------------------------------------------------------------------------------------
+| Id  | Operation         | Name       | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |            |      1 |        |      1 |00:00:00.01 |       2 |
+|*  1 |  INDEX UNIQUE SCAN| EMP_IOT_PK |      1 |      1 |      1 |00:00:00.01 |       2 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("EMP_ID"=500)
+
+
+19 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_iot
+  2  WHERE  emp_id BETWEEN 100 AND 200;
+
+  COUNT(*)
+----------
+       101
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  4a9b4ykhwrvft, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_iot WHERE
+emp_id BETWEEN 100 AND 200
+
+Plan hash value: 1235474887
+
+------------------------------------------------------------------------------------------
+| Id  | Operation         | Name       | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |            |      1 |        |      1 |00:00:00.01 |       3 |
+|   1 |  SORT AGGREGATE   |            |      1 |      1 |      1 |00:00:00.01 |       3 |
+|*  2 |   INDEX RANGE SCAN| EMP_IOT_PK |      1 |    102 |    101 |00:00:00.01 |       3 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("EMP_ID">=100 AND "EMP_ID"<=200)
+
+
+20 rows selected.
+
+-- 이 두 계획이 IOT 의 존재 이유다.
+--
+--   조건            | 계획                              | Buffers
+--   ----------------|-----------------------------------|--------
+--   emp_id = 500    | INDEX UNIQUE SCAN 만              |    2
+--   emp_id 100~200  | INDEX RANGE SCAN 만               |    3
+--
+-- 힙 테이블이라면 INDEX UNIQUE SCAN 다음에
+-- TABLE ACCESS BY INDEX ROWID 가 한 줄 더 붙는다 (실습 04 에서 나란히 비교한다).
+-- IOT 는 인덱스 리프 블록에 데이터가 이미 있으므로 그 단계가 없다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 정렬과 ROWID
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT * FROM (SELECT /*+ gather_plan_statistics */ emp_id FROM hr.emp_iot ORDER BY emp_id)
+  2  WHERE  ROWNUM <= 5;
+
+    EMP_ID
+----------
+         1
+         2
+         3
+         4
+         5
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  7sxnykwdvtgkf, child number 0
+-------------------------------------
+SELECT * FROM (SELECT /*+ gather_plan_statistics */ emp_id FROM
+hr.emp_iot ORDER BY emp_id) WHERE  ROWNUM <= 5
+
+Plan hash value: 2522580069
+
+------------------------------------------------------------------------------------------
+| Id  | Operation         | Name       | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |            |      1 |        |      5 |00:00:00.01 |       3 |
+|*  1 |  COUNT STOPKEY    |            |      1 |        |      5 |00:00:00.01 |       3 |
+|   2 |   VIEW            |            |      1 |      5 |      5 |00:00:00.01 |       3 |
+|   3 |    INDEX FULL SCAN| EMP_IOT_PK |      1 |   2000 |      5 |00:00:00.01 |       3 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(ROWNUM<=5)
+
+
+21 rows selected.
+
+SYS@orcl> SELECT * FROM (SELECT /*+ gather_plan_statistics */ emp_id FROM hr.emp_heap0 ORDER BY emp_id)
+  2  WHERE  ROWNUM <= 5;
+
+    EMP_ID
+----------
+         1
+         2
+         3
+         4
+         5
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  asnnxqhrudzpx, child number 0
+-------------------------------------
+SELECT * FROM (SELECT /*+ gather_plan_statistics */ emp_id FROM
+hr.emp_heap0 ORDER BY emp_id) WHERE  ROWNUM <= 5
+
+Plan hash value: 3980278042
+
+--------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name      | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+--------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |           |      1 |        |      5 |00:00:00.01 |      24 |       |       |          |
+|*  1 |  COUNT STOPKEY          |           |      1 |        |      5 |00:00:00.01 |      24 |       |       |          |
+|   2 |   VIEW                  |           |      1 |   2000 |      5 |00:00:00.01 |      24 |       |       |          |
+|*  3 |    SORT ORDER BY STOPKEY|           |      1 |   2000 |      5 |00:00:00.01 |      24 |  2048 |  2048 | 2048  (0)|
+|   4 |     TABLE ACCESS FULL   | EMP_HEAP0 |      1 |   2000 |   2000 |00:00:00.01 |      24 |       |       |          |
+--------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(ROWNUM<=5)
+   3 - filter(ROWNUM<=5)
+
+
+23 rows selected.
+
+-- 정렬 비교
+--   IOT  : INDEX FULL SCAN                      Buffers 3,  정렬 연산 없음
+--   heap : SORT ORDER BY STOPKEY + FULL SCAN    Buffers 24, Used-Mem 2048
+--
+-- IOT 는 키 순서로 저장돼 있으므로 ORDER BY 기본키에 정렬이 필요 없다.
+-- 페이징 쿼리(ORDER BY 키 + ROWNUM) 에서 이 차이가 크게 나타난다.
+
+SYS@orcl> SELECT emp_id FROM hr.emp_iot WHERE ROWNUM <= 5;
+
+    EMP_ID
+----------
+        98
+        99
+       100
+       101
+       102
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ emp_id FROM hr.emp_iot WHERE ROWNUM <= 5;
+
+    EMP_ID
+----------
+        98
+        99
+       100
+       101
+       102
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  b5gn8xv5y0nxh, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ emp_id FROM hr.emp_iot WHERE
+ROWNUM <= 5
+
+Plan hash value: 3251017722
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation             | Name       | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |            |      1 |        |      5 |00:00:00.01 |       7 |
+|*  1 |  COUNT STOPKEY        |            |      1 |        |      5 |00:00:00.01 |       7 |
+|   2 |   INDEX FAST FULL SCAN| EMP_IOT_PK |      1 |      5 |      5 |00:00:00.01 |       7 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(ROWNUM<=5)
+
+
+20 rows selected.
+
+-- 다만 착각하기 쉬운 지점이 있다.
+--   ORDER BY 를 쓰지 않으면 순서를 보장하지 않는다.
+--   위 결과는 98, 99, 100... 으로 1부터 시작하지 않았다.
+--   INDEX FAST FULL SCAN 은 리프 블록을 물리적 순서로 멀티블록 읽기 하므로
+--   키 순서가 아니다. 순서가 필요하면 반드시 ORDER BY 를 쓴다.
+
+SYS@orcl> COL heap_rowid FORMAT a20
+SYS@orcl> COL iot_rowid FORMAT a44
+SYS@orcl> SELECT ROWID AS heap_rowid, LENGTH(ROWID) AS len FROM hr.emp_heap0 WHERE emp_id = 5;
+
+HEAP_ROWID                  LEN
+-------------------- ----------
+AAASofAAHAAAAH8ABe           18
+
+SYS@orcl> SELECT ROWID AS iot_rowid, LENGTH(ROWID) AS len FROM hr.emp_iot WHERE emp_id = 5;
+
+IOT_ROWID                                           LEN
+-------------------------------------------- ----------
+*BAHAAd8CwQb+                                        13
+
+SYS@orcl> SELECT dbms_rowid.rowid_type(ROWID) AS rowid_type FROM hr.emp_heap0 WHERE emp_id = 5;
+
+ROWID_TYPE
+----------
+         1
+
+SYS@orcl> SELECT dbms_rowid.rowid_type(ROWID) AS rowid_type FROM hr.emp_iot WHERE emp_id = 5;
+SELECT dbms_rowid.rowid_type(ROWID) AS rowid_type FROM hr.emp_iot WHERE emp_id = 5
+       *
+ERROR at line 1:
+ORA-06553: PLS-306: wrong number or types of arguments in call to 'ROWID_TYPE'
+
+-- ROWID 비교
+--   heap : AAASoVAAHAAAAH7AAE   18자, 물리 주소(파일·블록·행 번호)
+--   IOT  : *BAHAAd8CwQb+        13자, 앞에 * 가 붙는 논리 ROWID(UROWID)
+--
+-- IOT 의 ROWID 는 기본키 값을 담은 논리 주소다. 길이도 키 길이에 따라 달라진다.
+-- DBMS_ROWID 패키지는 물리 ROWID 전용이므로 IOT 에 쓰면 PLS-306 이다.
+-- 애플리케이션이 ROWID 를 붙잡아 재사용하는 구조라면 IOT 전환 전에 반드시 확인해야 한다.
+
+--------------------------------------------------------------------------------
+[7] 정리 — IOT 의 두 가지 제약
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLE hr.emp_iot DROP CONSTRAINT emp_iot_pk;
+ALTER TABLE hr.emp_iot DROP CONSTRAINT emp_iot_pk
+*
+ERROR at line 1:
+ORA-25188: cannot drop/disable/defer the primary key constraint for index-organized tables or sorted hash cluster
+
+
+SYS@orcl> ALTER TABLE hr.emp_iot DROP PRIMARY KEY;
+ALTER TABLE hr.emp_iot DROP PRIMARY KEY
+*
+ERROR at line 1:
+ORA-25188: cannot drop/disable/defer the primary key constraint for index-organized tables or sorted hash cluster
+
+-- ORA-25188: cannot drop/disable/defer the primary key constraint for
+--            index-organized tables or sorted hash cluster
+--   기본키는 IOT 의 저장 구조 자체다. 떼어 낼 수도, 비활성화할 수도 없다.
+--   기본키를 바꾸려면 테이블을 다시 만들어야 한다 (실습 08).
+
+SYS@orcl> ALTER TABLE hr.emp_iot COALESCE;
+
+Table altered.
+
+SYS@orcl> ALTER TABLE hr.emp_iot MOVE TABLESPACE users;
+
+Table altered.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_IOT')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT segment_name, bytes/1024 AS kb, blocks FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name LIKE '%IOT%';
+
+SEGMENT_NAME               KB     BLOCKS
+------------------ ---------- ----------
+EMP_IOT_PK                256         32
+
+SYS@orcl> SELECT index_name, blevel, leaf_blocks FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_IOT';
+
+INDEX_NAME         BLEVEL LEAF_BLOCKS
+-------------- ---------- -----------
+EMP_IOT_PK              1          23
+
+-- 재구성 명령 두 가지
+--   ALTER TABLE ... COALESCE          인접한 리프 블록을 합쳐 조각을 줄인다 (온라인, 가볍다)
+--   ALTER TABLE ... MOVE [TABLESPACE] 세그먼트를 다시 쓴다 (무겁다, 보조 인덱스에 영향)
+--   이 실습에서는 조각이 없어 크기가 그대로였다. 효과는 실습 04·05 에서 확인한다.
+--
+-- hr.emp_iot 와 hr.emp_heap0 은 실습 02 에서 쓰지 않는다. 여기서 지워도 된다.
+--   DROP TABLE hr.emp_iot PURGE;
+--   DROP TABLE hr.emp_heap0 PURGE;
+--   DROP SEQUENCE hr.iot_seq;
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. IOT 는 "기본키로만 조회하는 테이블" 을 위한 구조다.
+--    코드 테이블, 매핑 테이블, 이력 조회 키가 명확한 테이블이 대상이다.
+--    실제로 HR 샘플 스키마의 COUNTRIES 가 IOT 다 (실습 08 에서 확인한다).
+--
+-- 2. 세그먼트가 하나라는 사실이 모든 성질의 출발점이다.
+--    조회는 한 번에 끝나고, 정렬이 필요 없고, 공간은 절약되지만,
+--    반대로 모든 컬럼이 인덱스 안에 들어가므로 인덱스가 커진다 (실습 04).
+--
+-- 3. 모니터링 쿼리를 고쳐야 한다.
+--    IOT 의 크기·통계는 dba_indexes 에 있다. dba_tables.blocks 는 NULL 이다.
+--    세그먼트 이름도 테이블 이름이 아니라 기본키 인덱스 이름이다.
+--
+-- 4. ROWID 가 논리 주소다.
+--    DBMS_ROWID 를 쓰는 코드, ROWID 를 화면에 들고 다니는 코드,
+--    ROWID 로 재접근하는 배치는 IOT 전환 대상에서 제외하거나 함께 수정한다.
+--
+-- 5. 기본키는 나중에 바꿀 수 없다.
+--    IOT 를 고른다는 것은 기본키 설계를 확정한다는 뜻이다.
+--    키가 바뀔 가능성이 있으면 힙으로 둔다.
+--
+-- 6. 이 실습에서 본 오류
+--    ORA-25175  기본키 없이 ORGANIZATION INDEX   -> PRIMARY KEY 를 정의한다
+--    ORA-25188  IOT 의 기본키 제거·비활성화        -> 테이블 재생성 (실습 08)
+--    PLS-00306  IOT 의 ROWID 를 DBMS_ROWID 에 전달 -> 물리 ROWID 전용 패키지다
+================================================================================
+ 실습 01 끝
+================================================================================

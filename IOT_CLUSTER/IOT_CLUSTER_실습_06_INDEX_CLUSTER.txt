@@ -1,0 +1,569 @@
+================================================================================
+ IOT · CLUSTER 실습 06 : 인덱스 클러스터 (INDEX CLUSTER)
+ 과정      : Oracle Database 19c IOT · CLUSTER 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 50분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 클러스터(cluster) 는 여러 테이블의 행을 **같은 블록에** 담는 구조다.
+-- 부서 10 의 부서 행 하나와 그 부서 직원 행 전부를 한 블록에 모아 두면
+-- 조인할 때 블록 하나만 읽으면 된다. 그것이 클러스터의 아이디어다.
+--
+--   일반 구조 : [DEPT 블록] ... [EMP 블록] [EMP 블록] ...   -> 여러 블록을 읽는다
+--   클러스터  : [deptno=10 : DEPT 1행 + EMP n행]            -> 한 블록에 모여 있다
+--
+-- 인덱스 클러스터는 클러스터 키 값을 인덱스로 찾아 그 블록으로 간다.
+--
+-- 목표
+--   (1) CREATE CLUSTER · SIZE 절의 의미를 이해한다
+--   (2) 클러스터 인덱스가 없으면 쓸 수 없다는 것을 확인한다 (ORA-02032)
+--   (3) 두 테이블을 같은 클러스터에 두고 딕셔너리 세 개를 읽는다
+--   (4) ANALYZE CLUSTER 로 avg_blocks_per_key 를 얻고 그 의미를 본다
+--   (5) 조인 실행계획에서 TABLE ACCESS CLUSTER 를 확인한다
+-- 작업 유형 : 구조 확인
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · USERS 테이블스페이스에 여유가 조금 있으면 된다 (이 실습은 1MB 도 쓰지 않는다)
+-- · 클러스터는 별도 옵션이 필요 없다. Standard Edition 에서도 쓸 수 있다
+-- · 클러스터는 Oracle 초기부터 있는 기능이고 지금은 거의 쓰이지 않는다.
+--   왜 쓰이지 않는지를 실측으로 이해하는 것이 이 실습의 목적이기도 하다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — 클러스터를 만든다
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE CLUSTER hr.personnel_cluster (
+  2    deptno NUMBER(2)
+  3  ) SIZE 512 TABLESPACE users;
+
+Cluster created.
+
+SYS@orcl> COL cluster_name FORMAT a20
+SYS@orcl> COL segment_name FORMAT a20
+SYS@orcl> SELECT cluster_name, cluster_type, function, key_size, hashkeys,
+  2         single_table, avg_blocks_per_key
+  3  FROM   dba_clusters WHERE owner='HR';
+
+CLUSTER_NAME         CLUST FUNCTION          KEY_SIZE   HASHKEYS SINGLE_TABLE         AVG_BLOCKS_PER_KEY
+-------------------- ----- --------------- ---------- ---------- -------------------- ------------------
+PERSONNEL_CLUSTER    INDEX                        512          0     N
+
+SYS@orcl> SELECT segment_name, segment_type, bytes/1024 AS kb FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name = 'PERSONNEL_CLUSTER';
+
+SEGMENT_NAME         SEGMENT_TYPE               KB
+-------------------- ------------------ ----------
+PERSONNEL_CLUSTER    CLUSTER                    64
+
+-- SIZE 512 의 의미
+--   하나의 클러스터 키 값이 쓸 것으로 예상하는 바이트 수다.
+--   8K 블록이면 8192 / 512 = 16, 즉 블록 하나에 키 16개를 담도록 계산한다.
+--   너무 작게 잡으면 한 키의 행이 여러 블록으로 흘러넘치고(체인),
+--   너무 크게 잡으면 블록이 비어서 공간이 낭비된다.
+--   -> 키 하나당 평균 데이터 크기를 먼저 추정해야 한다. 이것이 클러스터 설계의 어려움이다.
+--
+-- dba_clusters 를 읽는 법
+--   cluster_type = INDEX   인덱스 클러스터 (해시 클러스터는 HASH)
+--   hashkeys = 0           인덱스 클러스터이므로 해시 키가 없다
+--   single_table = N       여러 테이블을 담을 수 있다
+--   avg_blocks_per_key     아직 비어 있다. ANALYZE CLUSTER 를 해야 채워진다
+--
+-- 세그먼트가 CLUSTER 타입으로 하나 생겼다. 이 세그먼트에 모든 테이블의 행이 들어간다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 클러스터 인덱스가 먼저다
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.dept_clu (
+  2    deptno NUMBER(2) PRIMARY KEY,
+  3    dname  VARCHAR2(14)
+  4  ) CLUSTER hr.personnel_cluster (deptno);
+
+Table created.
+
+SYS@orcl> INSERT INTO hr.dept_clu VALUES (10, 'ACCOUNTING');
+INSERT INTO hr.dept_clu VALUES (10, 'ACCOUNTING')
+               *
+ERROR at line 1:
+ORA-02032: clustered tables cannot be used before the cluster index is built
+
+-- ORA-02032: clustered tables cannot be used before the cluster index is built
+--   테이블은 만들어졌지만 쓸 수 없다.
+--   클러스터 키 값 -> 블록 을 찾을 수단이 없으므로 INSERT 도 SELECT 도 막힌다.
+--   순서가 정해져 있다 : CREATE CLUSTER -> CREATE INDEX ON CLUSTER -> CREATE TABLE ... CLUSTER
+
+SYS@orcl> CREATE INDEX hr.personnel_cluster_idx ON CLUSTER hr.personnel_cluster TABLESPACE users;
+
+Index created.
+
+SYS@orcl> COL index_name FORMAT a24
+SYS@orcl> COL table_name FORMAT a18
+SYS@orcl> SELECT index_name, index_type, table_name, table_type, status FROM dba_indexes
+  2  WHERE  owner='HR' AND table_type = 'CLUSTER';
+
+INDEX_NAME               INDEX_TYPE                  TABLE_NAME         TABLE_TYPE  STATUS
+------------------------ --------------------------- ------------------ ----------- --------
+PERSONNEL_CLUSTER_IDX    CLUSTER                     PERSONNEL_CLUSTER  CLUSTER     VALID
+
+SYS@orcl> INSERT INTO hr.dept_clu VALUES (10, 'ACCOUNTING');
+
+1 row created.
+
+SYS@orcl> INSERT INTO hr.dept_clu VALUES (20, 'RESEARCH');
+
+1 row created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+-- 클러스터 인덱스는 일반 인덱스와 다르다.
+--   index_type = CLUSTER
+--   table_name = PERSONNEL_CLUSTER  (테이블이 아니라 클러스터를 가리킨다)
+--   table_type = CLUSTER
+--   -> 인덱스 점검 쿼리에서 table_type='CLUSTER' 로 걸러 낼 수 있다.
+--
+-- 인덱스가 생기자 INSERT 가 통과한다.
+
+SYS@orcl> CREATE TABLE hr.emp_clu (
+  2    empno  NUMBER(6) PRIMARY KEY,
+  3    ename  VARCHAR2(20),
+  4    deptno NUMBER(2)
+  5  ) CLUSTER hr.personnel_cluster (deptno);
+
+Table created.
+
+SYS@orcl> INSERT INTO hr.emp_clu VALUES (7001, 'SMITH', 10);
+
+1 row created.
+
+SYS@orcl> INSERT INTO hr.emp_clu VALUES (7002, 'ALLEN', 10);
+
+1 row created.
+
+SYS@orcl> INSERT INTO hr.emp_clu VALUES (7003, 'WARD',  20);
+
+1 row created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT table_name, cluster_name, blocks, num_rows FROM dba_tables
+  2  WHERE  owner='HR' AND cluster_name = 'PERSONNEL_CLUSTER' ORDER BY table_name;
+
+TABLE_NAME         CLUSTER_NAME             BLOCKS   NUM_ROWS
+------------------ -------------------- ---------- ----------
+DEPT_CLU           PERSONNEL_CLUSTER
+EMP_CLU            PERSONNEL_CLUSTER
+
+SYS@orcl> COL clu_column_name FORMAT a14
+SYS@orcl> COL tab_column_name FORMAT a14
+SYS@orcl> SELECT cluster_name, clu_column_name, table_name, tab_column_name
+  2  FROM   dba_clu_columns WHERE owner='HR' AND cluster_name='PERSONNEL_CLUSTER'
+  3  ORDER  BY table_name;
+
+CLUSTER_NAME         CLU_COLUMN_NAM TABLE_NAME         TAB_COLUMN_NAM
+-------------------- -------------- ------------------ --------------
+PERSONNEL_CLUSTER    DEPTNO         DEPT_CLU           DEPTNO
+PERSONNEL_CLUSTER    DEPTNO         EMP_CLU            DEPTNO
+
+SYS@orcl> SELECT segment_name, segment_type, bytes/1024 AS kb, blocks FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name IN ('PERSONNEL_CLUSTER','PERSONNEL_CLUSTER_IDX',
+  3                                         'DEPT_CLU','EMP_CLU')
+  4  ORDER  BY segment_name;
+
+SEGMENT_NAME         SEGMENT_TYPE               KB     BLOCKS
+-------------------- ------------------ ---------- ----------
+PERSONNEL_CLUSTER    CLUSTER                    64          8
+PERSONNEL_CLUSTER_ID INDEX                      64          8
+X
+
+-- 딕셔너리 세 개를 읽는다.
+--   dba_tables.cluster_name   그 테이블이 어느 클러스터에 속하는가
+--                             blocks · num_rows 는 통계 수집 전이라 비어 있다
+--   dba_clu_columns           클러스터 정의 컬럼 <-> 테이블 컬럼 매핑
+--                             테이블마다 컬럼 이름이 달라도 된다
+--   dba_segments              **DEPT_CLU · EMP_CLU 세그먼트가 없다**
+--                             두 테이블의 데이터가 모두 PERSONNEL_CLUSTER 세그먼트에 있다
+--
+-- 이것이 클러스터의 핵심이다. 테이블은 논리적 이름일 뿐이고 저장은 클러스터 단위다.
+-- 따라서 테이블 하나만 TRUNCATE · MOVE · 압축하는 것이 불가능하거나 제한된다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — avg_blocks_per_key
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT cluster_name, avg_blocks_per_key FROM dba_clusters WHERE owner='HR';
+
+CLUSTER_NAME         AVG_BLOCKS_PER_KEY
+-------------------- ------------------
+PERSONNEL_CLUSTER
+
+SYS@orcl> ANALYZE CLUSTER hr.personnel_cluster COMPUTE STATISTICS;
+
+Cluster analyzed.
+
+SYS@orcl> SELECT cluster_name, avg_blocks_per_key FROM dba_clusters WHERE owner='HR';
+
+CLUSTER_NAME         AVG_BLOCKS_PER_KEY
+-------------------- ------------------
+PERSONNEL_CLUSTER                     1
+
+-- avg_blocks_per_key = 1 이다.
+--   "클러스터 키 하나를 읽으려면 평균 블록 1개를 읽으면 된다" 는 뜻이다.
+--   1 이 이상적인 값이다. 클러스터를 쓰는 목적이 바로 이 값을 1 로 만드는 것이다.
+--
+-- 주의 : 이 값은 dbms_stats 로 채워지지 않는다. ANALYZE CLUSTER 명령을 써야 한다.
+--        옛 명령이지만 클러스터에는 여전히 필요하다.
+
+SYS@orcl> BEGIN
+  2    FOR i IN 1..5000 LOOP
+  3      INSERT INTO hr.emp_clu VALUES (i, 'USER' || i, 10);
+  4    END LOOP;
+  5    COMMIT;
+  6  END;
+  7  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> ANALYZE CLUSTER hr.personnel_cluster COMPUTE STATISTICS;
+
+Cluster analyzed.
+
+SYS@orcl> SELECT cluster_name, avg_blocks_per_key FROM dba_clusters WHERE owner='HR';
+
+CLUSTER_NAME         AVG_BLOCKS_PER_KEY
+-------------------- ------------------
+PERSONNEL_CLUSTER                     7
+
+SYS@orcl> SELECT table_name, cluster_name, blocks, num_rows FROM dba_tables
+  2  WHERE  owner='HR' AND cluster_name='PERSONNEL_CLUSTER' ORDER BY table_name;
+
+TABLE_NAME         CLUSTER_NAME             BLOCKS   NUM_ROWS
+------------------ -------------------- ---------- ----------
+DEPT_CLU           PERSONNEL_CLUSTER            20          2
+EMP_CLU            PERSONNEL_CLUSTER            20       5003
+
+SYS@orcl> SELECT segment_name, bytes/1024 AS kb, blocks FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name IN ('PERSONNEL_CLUSTER','PERSONNEL_CLUSTER_IDX')
+  3  ORDER  BY segment_name;
+
+SEGMENT_NAME                 KB     BLOCKS
+-------------------- ---------- ----------
+PERSONNEL_CLUSTER           192         24
+PERSONNEL_CLUSTER_ID         64          8
+X
+
+-- 부서 10 에 5000건을 넣었다.
+--   avg_blocks_per_key  1 -> 7
+--   클러스터 세그먼트   64KB -> 192KB
+--   dba_tables.blocks   두 테이블 모두 20 (클러스터 블록을 공유하므로 같은 값이다)
+--
+-- 7 이 되었다는 것은 키 하나를 읽으려면 블록 7개를 읽어야 한다는 뜻이다.
+-- 클러스터의 이점이 그만큼 줄었다.
+--
+-- 원인은 SIZE 512 로 잡았는데 한 키의 데이터가 그보다 훨씬 커진 것이다.
+-- 클러스터는 **키마다 행 수가 비슷하고 예측 가능할 때만** 제대로 동작한다.
+-- 한 키에 데이터가 몰리는 구조(편중) 에서는 금방 무너진다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 조인과 단일 테이블 조회
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.dept_heap TABLESPACE users AS SELECT * FROM hr.dept_clu;
+
+Table created.
+
+SYS@orcl> CREATE TABLE hr.emp_heap_c TABLESPACE users AS SELECT * FROM hr.emp_clu;
+
+Table created.
+
+SYS@orcl> ALTER TABLE hr.dept_heap   ADD CONSTRAINT dept_heap_pk   PRIMARY KEY (deptno);
+
+Table altered.
+
+SYS@orcl> ALTER TABLE hr.emp_heap_c  ADD CONSTRAINT emp_heap_c_pk  PRIMARY KEY (empno);
+
+Table altered.
+
+SYS@orcl> CREATE INDEX hr.emp_heap_c_ix ON hr.emp_heap_c(deptno) TABLESPACE users;
+
+Index created.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','DEPT_HEAP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_HEAP_C')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','DEPT_CLU')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_CLU')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SET ARRAYSIZE 1000
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(e.ename)
+  2  FROM   hr.dept_clu d, hr.emp_clu e
+  3  WHERE  d.deptno = e.deptno AND d.deptno = 10;
+
+COUNT(E.ENAME)
+--------------
+          5002
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  1kgg7zbhgauum, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(e.ename) FROM   hr.dept_clu
+d, hr.emp_clu e WHERE  d.deptno = e.deptno AND d.deptno = 10
+
+Plan hash value: 804897483
+
+----------------------------------------------------------------------------------------------------------
+| Id  | Operation              | Name                  | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT       |                       |      1 |        |      1 |00:00:00.01 |      16 |
+|   1 |  SORT AGGREGATE        |                       |      1 |      1 |      1 |00:00:00.01 |      16 |
+|   2 |   NESTED LOOPS         |                       |      1 |   2502 |   5002 |00:00:00.01 |      16 |
+|*  3 |    INDEX UNIQUE SCAN   | SYS_C007956           |      1 |      1 |      1 |00:00:00.01 |       1 |
+|   4 |    TABLE ACCESS CLUSTER| EMP_CLU               |      1 |   2502 |   5002 |00:00:00.01 |      15 |
+|*  5 |     INDEX UNIQUE SCAN  | PERSONNEL_CLUSTER_IDX |      1 |      1 |      1 |00:00:00.01 |       1 |
+----------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("D"."DEPTNO"=10)
+   5 - access("E"."DEPTNO"=10)
+
+
+24 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(e.ename)
+  2  FROM   hr.dept_heap d, hr.emp_heap_c e
+  3  WHERE  d.deptno = e.deptno AND d.deptno = 10;
+
+COUNT(E.ENAME)
+--------------
+          5002
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  dx4w6vkaymbmf, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(e.ename) FROM   hr.dept_heap
+d, hr.emp_heap_c e WHERE  d.deptno = e.deptno AND d.deptno = 10
+
+Plan hash value: 3957703763
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation           | Name         | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |              |      1 |        |      1 |00:00:00.01 |      18 |
+|   1 |  SORT AGGREGATE     |              |      1 |      1 |      1 |00:00:00.01 |      18 |
+|   2 |   NESTED LOOPS      |              |      1 |   2502 |   5002 |00:00:00.01 |      18 |
+|*  3 |    INDEX UNIQUE SCAN| DEPT_HEAP_PK |      1 |      1 |      1 |00:00:00.01 |       1 |
+|*  4 |    TABLE ACCESS FULL| EMP_HEAP_C   |      1 |   2502 |   5002 |00:00:00.01 |      17 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("D"."DEPTNO"=10)
+   4 - filter("E"."DEPTNO"=10)
+
+
+23 rows selected.
+
+-- 조인 비용 비교 (부서 10 의 직원 5002명)
+--
+--   구조       | 계획                                         | Buffers
+--   -----------|----------------------------------------------|--------
+--   클러스터   | NESTED LOOPS + TABLE ACCESS CLUSTER          |   16
+--   일반 테이블| NESTED LOOPS + TABLE ACCESS FULL(EMP_HEAP_C) |   18
+--
+-- 차이가 16 대 18 로 작다. 데이터가 작아서 힙 쪽도 풀 스캔 17블록으로 끝났기 때문이다.
+-- 클러스터의 이득이 나타나는 조건은 다음과 같다.
+--   · 키가 아주 많고 (부서가 수만 개)
+--   · 키마다 행 수가 적고 균일하며 (부서당 직원 10명 정도)
+--   · 항상 키 하나씩 조인해서 읽는다
+-- 이 조건에서는 힙이 인덱스 + 테이블 접근을 반복하는 동안 클러스터는 블록 1개로 끝난다.
+--
+-- TABLE ACCESS CLUSTER 라는 연산 이름을 기억한다.
+-- 그 아래에 INDEX UNIQUE SCAN (클러스터 인덱스) 가 붙는 것이 클러스터 접근의 형태다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_clu WHERE deptno = 10;
+
+  COUNT(*)
+----------
+      5002
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  51agyj863c1n0, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_clu WHERE
+deptno = 10
+
+Plan hash value: 70677245
+
+---------------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name                  | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |                       |      1 |        |      1 |00:00:00.01 |      15 |
+|   1 |  SORT AGGREGATE       |                       |      1 |      1 |      1 |00:00:00.01 |      15 |
+|   2 |   TABLE ACCESS CLUSTER| EMP_CLU               |      1 |   2502 |   5002 |00:00:00.01 |      15 |
+|*  3 |    INDEX UNIQUE SCAN  | PERSONNEL_CLUSTER_IDX |      1 |      1 |      1 |00:00:00.01 |       1 |
+---------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("DEPTNO"=10)
+
+
+21 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_clu WHERE empno = 3000;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  9k991640q7861, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_clu WHERE
+empno = 3000
+
+Plan hash value: 1969415925
+
+--------------------------------------------------------------------------------------------
+| Id  | Operation          | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |             |      1 |        |      1 |00:00:00.01 |       2 |
+|   1 |  SORT AGGREGATE    |             |      1 |      1 |      1 |00:00:00.01 |       2 |
+|*  2 |   INDEX UNIQUE SCAN| SYS_C007957 |      1 |      1 |      1 |00:00:00.01 |       2 |
+--------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("EMPNO"=3000)
+
+
+20 rows selected.
+
+-- 단일 테이블 조회
+--   클러스터 키 조건 (deptno=10)  -> TABLE ACCESS CLUSTER, Buffers 15
+--   비클러스터 키 조건 (empno)    -> 기본키 인덱스를 타고 Buffers 2
+--
+-- 클러스터 테이블에도 일반 인덱스(기본키) 를 만들 수 있다.
+-- 클러스터 키로 읽을 때만 클러스터 접근이고, 그 외에는 평범한 인덱스 접근이다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+SYS@orcl> DROP TABLE hr.emp_clu PURGE;
+
+Table dropped.
+
+SYS@orcl> DROP CLUSTER hr.personnel_cluster;
+DROP CLUSTER hr.personnel_cluster
+*
+ERROR at line 1:
+ORA-00951: cluster not empty
+
+
+SYS@orcl> DROP CLUSTER hr.personnel_cluster INCLUDING TABLES;
+
+Cluster dropped.
+
+SYS@orcl> SELECT COUNT(*) AS clusters FROM dba_clusters WHERE owner='HR';
+
+  CLUSTERS
+----------
+         0
+
+SYS@orcl> SELECT COUNT(*) AS leftover FROM dba_tables WHERE owner='HR'
+  2  AND    table_name IN ('DEPT_CLU','EMP_CLU');
+
+  LEFTOVER
+----------
+         0
+
+-- 클러스터를 지우는 법
+--   DROP CLUSTER ...                    -> 테이블이 남아 있으면 ORA-00951
+--   DROP CLUSTER ... INCLUDING TABLES   -> 속한 테이블까지 함께 지운다
+--   DROP TABLE 로 테이블을 먼저 다 지우고 나서 DROP CLUSTER 를 해도 된다
+--
+-- 비교용으로 만든 힙 테이블은 따로 지운다.
+--   DROP TABLE hr.dept_heap PURGE;
+--   DROP TABLE hr.emp_heap_c PURGE;
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. 인덱스 클러스터는 신규 설계에 거의 쓰지 않는다.
+--    이유는 세 가지다.
+--      · SIZE 추정이 어렵고 틀리면 avg_blocks_per_key 가 커져 이득이 사라진다
+--      · 테이블 단위 관리(TRUNCATE · MOVE · 파티션) 가 제한된다
+--      · 대량 INSERT 가 느리고 공간 낭비가 크다
+--    같은 목적(조인 블록 지역성) 은 지금은 파티션·IOT·머티리얼라이즈드 뷰로 달성한다.
+--
+-- 2. 그래도 알아야 하는 이유는 진단이다.
+--    실행계획에 TABLE ACCESS CLUSTER 가 보이면 그 테이블은 클러스터에 속해 있고,
+--    세그먼트·통계·관리 방법이 전부 다르다. 모르면 원인을 찾을 수 없다.
+--
+-- 3. 순서를 외운다.
+--    CREATE CLUSTER -> CREATE INDEX ON CLUSTER -> CREATE TABLE ... CLUSTER
+--    인덱스를 빼먹으면 ORA-02032 다. 복구 스크립트를 짤 때도 이 순서를 지켜야 한다.
+--
+-- 4. avg_blocks_per_key 가 클러스터의 건강 지표다.
+--      SELECT cluster_name, avg_blocks_per_key FROM dba_clusters;
+--    1 에 가까우면 정상, 커지면 SIZE 를 다시 잡고 재구성해야 한다.
+--    값을 채우려면 ANALYZE CLUSTER COMPUTE STATISTICS 를 돌려야 한다 (dbms_stats 아님).
+--
+-- 5. 세그먼트가 클러스터 단위라는 것을 기억한다.
+--    dba_segments 에 테이블 이름이 없다. 용량 산정 쿼리가 테이블 기준이면 누락된다.
+--      SELECT segment_name, segment_type, bytes FROM dba_segments
+--      WHERE  segment_type = 'CLUSTER';
+--
+-- 6. 이 실습에서 본 오류
+--    ORA-02032  클러스터 인덱스 없이 사용        -> CREATE INDEX ON CLUSTER
+--    ORA-00951  테이블이 남은 클러스터 DROP      -> INCLUDING TABLES
+================================================================================
+ 실습 06 끝
+================================================================================

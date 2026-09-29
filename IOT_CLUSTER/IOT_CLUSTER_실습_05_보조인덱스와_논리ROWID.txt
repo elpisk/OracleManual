@@ -1,0 +1,578 @@
+================================================================================
+ IOT · CLUSTER 실습 05 : 보조 인덱스 · 논리 ROWID · 압축 · 파티션
+ 과정      : Oracle Database 19c IOT · CLUSTER 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 50분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 실습 04 에서 IOT 의 약점을 봤다. 기본키가 아닌 조건은 전체 스캔이다.
+-- 보완책은 보조 인덱스(secondary index) 다. 그런데 IOT 의 보조 인덱스는
+-- 힙의 인덱스와 동작이 다르다. 물리 ROWID 가 없기 때문이다.
+--
+--   힙의 인덱스  : 키 + 물리 ROWID          -> 곧바로 그 블록으로 간다
+--   IOT의 보조   : 키 + 논리 ROWID(기본키값) -> 기본키 인덱스를 다시 타야 한다
+--                  + 물리 추측(physical guess) -> 맞으면 한 번에 간다
+--
+-- 추측이 맞는 비율이 dba_indexes.pct_direct_access 다. 이 값이 IOT 운영의 핵심 지표다.
+--
+-- 목표
+--   (1) 보조 인덱스를 만들고 "인덱스를 두 번 타는" 실행계획을 읽는다
+--   (2) pct_direct_access 가 100 인 상태를 확인한다
+--   (3) ALTER TABLE ... MOVE 로 추측을 깨뜨리고 비용 증가를 측정한다
+--   (4) ALTER INDEX ... UPDATE BLOCK REFERENCES 로 복구한다
+--   (5) IOT 키 압축(COMPRESS n) 효과를 측정한다
+--   (6) IOT 가 못 하는 것과 할 수 있는 것(파티션) 을 확인한다
+-- 작업 유형 : 인덱스 운영
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 04 의 hr.emp_iot_cmp 가 있다 (12만 건, 53MB)
+-- · USERS 테이블스페이스에 100MB 이상 여유
+-- · ANALYZE INDEX 를 쓴다. pct_direct_access 는 dbms_stats 로는 채워지지 않는 값이 있어
+--   전통적인 ANALYZE 명령이 필요하다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — 보조 인덱스를 만든다
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE INDEX hr.emp_iot_cmp_ix1 ON hr.emp_iot_cmp(emp_name) TABLESPACE users;
+
+Index created.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_IOT_CMP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL index_name FORMAT a20
+SYS@orcl> SELECT index_name, index_type, uniqueness, blevel, leaf_blocks, pct_direct_access
+  2  FROM   dba_indexes WHERE owner='HR' AND table_name='EMP_IOT_CMP' ORDER BY index_name;
+
+INDEX_NAME           INDEX_TYPE                  UNIQUENES     BLEVEL LEAF_BLOCKS PCT_DIRECT_ACCESS
+-------------------- --------------------------- --------- ---------- ----------- -----------------
+EMP_IOT_CMP_IX1      NORMAL                      NONUNIQUE          2         518               100
+EMP_IOT_CMP_PK       IOT - TOP                   UNIQUE             2        6668                 0
+
+SYS@orcl> COL segment_name FORMAT a20
+SYS@orcl> SELECT segment_name, segment_type, bytes/1024/1024 AS mb FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name LIKE 'EMP_IOT_CMP%' ORDER BY segment_name;
+
+SEGMENT_NAME         SEGMENT_TYPE               MB
+-------------------- ------------------ ----------
+EMP_IOT_CMP_IX1      INDEX                       5
+EMP_IOT_CMP_PK       INDEX                      53
+
+-- 딕셔너리 읽기
+--   EMP_IOT_CMP_PK   IOT - TOP   <- 테이블 본체
+--   EMP_IOT_CMP_IX1  NORMAL      <- 보조 인덱스, pct_direct_access 100
+--
+-- 보조 인덱스는 별도 세그먼트를 갖는다 (5MB).
+-- IOT 는 "세그먼트 하나" 라는 설명이 있지만, 보조 인덱스를 만들면 늘어난다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 인덱스를 두 번 타는 계획
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ emp_id, emp_email FROM hr.emp_iot_cmp
+  2  WHERE  emp_name = 'Employee 50000';
+
+    EMP_ID
+----------
+EMP_EMAIL
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+     50000
+employee50000@example.com
+
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  7zcnxbv0pqwv6, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ emp_id, emp_email FROM
+hr.emp_iot_cmp WHERE  emp_name = 'Employee 50000'
+
+Plan hash value: 1320275304
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation         | Name            | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                 |      1 |        |      1 |00:00:00.01 |       5 |
+|*  1 |  INDEX UNIQUE SCAN| EMP_IOT_CMP_PK  |      1 |      1 |      1 |00:00:00.01 |       5 |
+|*  2 |   INDEX RANGE SCAN| EMP_IOT_CMP_IX1 |      1 |      1 |      1 |00:00:00.01 |       4 |
+-----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("EMP_NAME"='Employee 50000')
+   2 - access("EMP_NAME"='Employee 50000')
+
+
+21 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ emp_id FROM hr.emp_iot_cmp
+  2  WHERE  emp_name = 'Employee 50000';
+
+    EMP_ID
+----------
+     50000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  fs1wqbhmptgbj, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ emp_id FROM hr.emp_iot_cmp WHERE
+emp_name = 'Employee 50000'
+
+Plan hash value: 118821285
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation        | Name            | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |                 |      1 |        |      1 |00:00:00.01 |       4 |
+|*  1 |  INDEX RANGE SCAN| EMP_IOT_CMP_IX1 |      1 |      1 |      1 |00:00:00.01 |       4 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("EMP_NAME"='Employee 50000')
+
+
+19 rows selected.
+
+-- 첫 번째 계획이 IOT 보조 인덱스의 특징이다.
+--
+--   |   1 |  INDEX UNIQUE SCAN| EMP_IOT_CMP_PK  |  <- 상위: 기본키 인덱스
+--   |   2 |   INDEX RANGE SCAN| EMP_IOT_CMP_IX1 |  <- 하위: 보조 인덱스
+--
+-- 힙이라면 INDEX RANGE SCAN + TABLE ACCESS BY INDEX ROWID 다.
+-- IOT 는 테이블 접근이 없는 대신 기본키 인덱스 접근이 그 자리를 채운다.
+-- Buffers 5 = 보조 인덱스 4 + 기본키 인덱스 1.
+--
+-- 두 번째 계획은 emp_id(기본키) 만 필요하므로 보조 인덱스에서 끝난다. Buffers 4.
+-- 보조 인덱스에 이미 기본키 값이 들어 있기 때문이다.
+-- -> 보조 인덱스만으로 답이 나오는 쿼리는 IOT 에서 특히 싸다.
+
+SYS@orcl> ANALYZE INDEX hr.emp_iot_cmp_ix1 COMPUTE STATISTICS;
+
+Index analyzed.
+
+SYS@orcl> SELECT index_name, blevel, leaf_blocks, pct_direct_access, status FROM dba_indexes
+  2  WHERE  owner='HR' AND index_name='EMP_IOT_CMP_IX1';
+
+INDEX_NAME               BLEVEL LEAF_BLOCKS PCT_DIRECT_ACCESS STATUS
+-------------------- ---------- ----------- ----------------- --------
+EMP_IOT_CMP_IX1               2         518               100 VALID
+
+-- pct_direct_access = 100 이다.
+--   보조 인덱스가 담고 있는 물리 추측이 100% 유효하다는 뜻이다.
+--   그래서 기본키 인덱스를 처음부터 타지 않고 추측한 블록으로 바로 간다.
+--   위 계획의 Buffers 5 가 그 결과다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — MOVE 가 추측을 깨뜨린다
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLE hr.emp_iot_cmp MOVE TABLESPACE users;
+
+Table altered.
+
+SYS@orcl> SELECT index_name, status, pct_direct_access FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_IOT_CMP' ORDER BY index_name;
+
+INDEX_NAME           STATUS   PCT_DIRECT_ACCESS
+-------------------- -------- -----------------
+EMP_IOT_CMP_IX1      VALID                    0
+EMP_IOT_CMP_PK       VALID                    0
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ emp_id, emp_email FROM hr.emp_iot_cmp
+  2  WHERE  emp_name = 'Employee 50000';
+
+    EMP_ID
+----------
+EMP_EMAIL
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+     50000
+employee50000@example.com
+
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  7zcnxbv0pqwv6, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ emp_id, emp_email FROM
+hr.emp_iot_cmp WHERE  emp_name = 'Employee 50000'
+
+Plan hash value: 1320275304
+
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation         | Name            | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+--------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                 |      1 |        |      1 |00:00:00.01 |       7 |      2 |
+|*  1 |  INDEX UNIQUE SCAN| EMP_IOT_CMP_PK  |      1 |      1 |      1 |00:00:00.01 |       7 |      2 |
+|*  2 |   INDEX RANGE SCAN| EMP_IOT_CMP_IX1 |      1 |      1 |      1 |00:00:00.01 |       4 |      0 |
+--------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("EMP_NAME"='Employee 50000')
+   2 - access("EMP_NAME"='Employee 50000')
+
+
+21 rows selected.
+
+SYS@orcl> ANALYZE INDEX hr.emp_iot_cmp_ix1 COMPUTE STATISTICS;
+
+Index analyzed.
+
+SYS@orcl> SELECT index_name, pct_direct_access FROM dba_indexes
+  2  WHERE  owner='HR' AND index_name='EMP_IOT_CMP_IX1';
+
+INDEX_NAME           PCT_DIRECT_ACCESS
+-------------------- -----------------
+EMP_IOT_CMP_IX1                      0
+
+-- MOVE 직후
+--   pct_direct_access  100 -> 0
+--   같은 조회 Buffers    5 -> 7, 물리 읽기 2 발생
+--
+-- MOVE 는 세그먼트를 다시 써서 모든 리프 블록의 물리 위치를 바꾼다.
+-- 보조 인덱스에 저장된 추측은 전부 무효가 되고, 기본키 인덱스를 처음부터 타게 된다.
+-- 인덱스 상태는 VALID 다. **UNUSABLE 이 되지 않는다.**
+--   -> 오류가 나지 않는다. 조용히 느려진다. 이것이 위험한 이유다.
+--
+-- 참고 : ANALYZE 를 다시 해도 0 이다. 통계가 틀린 것이 아니라 추측이 실제로 깨진 것이다.
+
+SYS@orcl> ALTER INDEX hr.emp_iot_cmp_ix1 UPDATE BLOCK REFERENCES;
+
+Index altered.
+
+SYS@orcl> ANALYZE INDEX hr.emp_iot_cmp_ix1 COMPUTE STATISTICS;
+
+Index analyzed.
+
+SYS@orcl> SELECT index_name, pct_direct_access FROM dba_indexes
+  2  WHERE  owner='HR' AND index_name='EMP_IOT_CMP_IX1';
+
+INDEX_NAME           PCT_DIRECT_ACCESS
+-------------------- -----------------
+EMP_IOT_CMP_IX1                    100
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ emp_id, emp_email FROM hr.emp_iot_cmp
+  2  WHERE  emp_name = 'Employee 50000';
+
+    EMP_ID
+----------
+EMP_EMAIL
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+     50000
+employee50000@example.com
+
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  7zcnxbv0pqwv6, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ emp_id, emp_email FROM
+hr.emp_iot_cmp WHERE  emp_name = 'Employee 50000'
+
+Plan hash value: 1320275304
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation         | Name            | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                 |      1 |        |      1 |00:00:00.01 |       5 |
+|*  1 |  INDEX UNIQUE SCAN| EMP_IOT_CMP_PK  |      1 |      1 |      1 |00:00:00.01 |       5 |
+|*  2 |   INDEX RANGE SCAN| EMP_IOT_CMP_IX1 |      1 |      1 |      1 |00:00:00.01 |       4 |
+-----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("EMP_NAME"='Employee 50000')
+   2 - access("EMP_NAME"='Employee 50000')
+
+
+21 rows selected.
+
+-- 복구는 ALTER INDEX ... UPDATE BLOCK REFERENCES 다.
+--   pct_direct_access  0 -> 100
+--   Buffers            7 -> 5
+--
+-- REBUILD 도 같은 효과가 있지만 UPDATE BLOCK REFERENCES 가 훨씬 가볍다.
+-- 인덱스를 다시 만들지 않고 추측 값만 갱신하기 때문이다.
+--
+-- 절차로 묶어 둘 것
+--   ALTER TABLE <IOT> MOVE ...;
+--   ALTER INDEX <보조인덱스> UPDATE BLOCK REFERENCES;   -- 보조 인덱스마다
+--   ANALYZE INDEX <보조인덱스> COMPUTE STATISTICS;      -- 확인용
+
+--------------------------------------------------------------------------------
+[6] 검증 — 키 압축
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.iot_comp (
+  2    region  VARCHAR2(10),
+  3    city    VARCHAR2(20),
+  4    seq     NUMBER,
+  5    memo    VARCHAR2(100),
+  6    CONSTRAINT iot_comp_pk PRIMARY KEY (region, city, seq)
+  7  )
+  8  ORGANIZATION INDEX TABLESPACE users PCTFREE 0 COMPRESS 2;
+
+Table created.
+
+SYS@orcl> CREATE TABLE hr.iot_nocomp (
+  2    region  VARCHAR2(10),
+  3    city    VARCHAR2(20),
+  4    seq     NUMBER,
+  5    memo    VARCHAR2(100),
+  6    CONSTRAINT iot_nocomp_pk PRIMARY KEY (region, city, seq)
+  7  )
+  8  ORGANIZATION INDEX TABLESPACE users PCTFREE 0;
+
+Table created.
+
+SYS@orcl> BEGIN
+  2    FOR i IN 1..50000 LOOP
+  3      INSERT INTO hr.iot_comp   VALUES ('REGION_01','SEOUL_METRO_CITY', i, RPAD('m',80,'m'));
+  4      INSERT INTO hr.iot_nocomp VALUES ('REGION_01','SEOUL_METRO_CITY', i, RPAD('m',80,'m'));
+  5    END LOOP;
+  6    COMMIT;
+  7  END;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','IOT_COMP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','IOT_NOCOMP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT index_name, prefix_length, compression, blevel, leaf_blocks FROM dba_indexes
+  2  WHERE  owner='HR' AND index_name IN ('IOT_COMP_PK','IOT_NOCOMP_PK') ORDER BY index_name;
+
+INDEX_NAME           PREFIX_LENGTH COMPRESSION       BLEVEL LEAF_BLOCKS
+-------------------- ------------- ------------- ---------- -----------
+IOT_COMP_PK                      2 ENABLED                2         587
+IOT_NOCOMP_PK                      DISABLED               2         756
+
+SYS@orcl> SELECT segment_name, bytes/1024/1024 AS mb, blocks FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name IN ('IOT_COMP_PK','IOT_NOCOMP_PK') ORDER BY segment_name;
+
+SEGMENT_NAME                 MB     BLOCKS
+-------------------- ---------- ----------
+IOT_COMP_PK                   5        640
+IOT_NOCOMP_PK                 7        896
+
+-- COMPRESS 2 는 "선두 2개 컬럼의 중복을 제거한다" 는 뜻이다.
+-- 이 테이블은 region · city 가 모든 행에서 같으므로 압축 효과가 최대로 나타난다.
+--
+--   구성          | prefix_length | compression | leaf_blocks | 세그먼트
+--   --------------|---------------|-------------|-------------|----------
+--   COMPRESS 2    |       2       | ENABLED     |     587     |   5MB
+--   압축 없음     |               | DISABLED    |     756     |   7MB
+--
+--   5만 건에서 7MB -> 5MB (약 29% 감소), 리프 블록 756 -> 587 이다.
+--
+-- IOT 는 데이터 전체가 인덱스이므로 키 압축 효과가 테이블 전체 크기에 직접 반영된다.
+-- 선두 컬럼이 반복되는 복합 기본키(지역+도시+일련번호 같은) 에서 특히 효과가 크다.
+-- prefix_length 는 dba_indexes 에서 확인한다.
+
+SYS@orcl> CREATE TABLE hr.iot_long (
+  2    id NUMBER, txt LONG, CONSTRAINT iot_long_pk PRIMARY KEY (id))
+  3  ORGANIZATION INDEX TABLESPACE users;
+ORGANIZATION INDEX TABLESPACE users
+             *
+ERROR at line 3:
+ORA-02160: index-organized table can not contain columns of type LONG
+
+
+SYS@orcl> CREATE TABLE hr.iot_uniq (
+  2    id NUMBER UNIQUE, txt VARCHAR2(50))
+  3  ORGANIZATION INDEX TABLESPACE users;
+ORGANIZATION INDEX TABLESPACE users
+             *
+ERROR at line 3:
+ORA-25175: no PRIMARY KEY constraint found
+
+
+SYS@orcl> ALTER TABLE hr.iot_comp ADD (note VARCHAR2(50));
+
+Table altered.
+
+SYS@orcl> SELECT column_id, column_name FROM dba_tab_columns
+  2  WHERE  owner='HR' AND table_name='IOT_COMP' ORDER BY column_id;
+
+ COLUMN_ID COLUMN_NAME
+---------- --------------------------------------------------------------------------------------------------------------------------------
+         1 REGION
+         2 CITY
+         3 SEQ
+         4 MEMO
+         5 NOTE
+
+-- IOT 가 못 하는 것 두 가지
+--   ORA-02160: index-organized table can not contain columns of type LONG
+--     LONG 컬럼은 불가능하다. CLOB·BLOB 은 가능하다 (LOB 은 별도 세그먼트로 빠진다).
+--   ORA-25175: no PRIMARY KEY constraint found
+--     UNIQUE 제약으로는 IOT 를 만들 수 없다. 반드시 PRIMARY KEY 여야 한다.
+--
+-- 할 수 있는 것
+--   ALTER TABLE ... ADD (컬럼) 은 된다. 추가된 컬럼은 맨 뒤(4번) 에 붙는다.
+--   INCLUDING 을 쓰고 있었다면 추가 컬럼은 오버플로 쪽으로 간다는 점을 기억한다.
+
+SYS@orcl> CREATE TABLE hr.iot_part (
+  2    yyyymm  VARCHAR2(6),
+  3    seq     NUMBER,
+  4    memo    VARCHAR2(100),
+  5    CONSTRAINT iot_part_pk PRIMARY KEY (yyyymm, seq)
+  6  )
+  7  ORGANIZATION INDEX TABLESPACE users
+  8  PARTITION BY RANGE (yyyymm)
+  9  (PARTITION p202501 VALUES LESS THAN ('202502'),
+ 10   PARTITION p202502 VALUES LESS THAN ('202503'),
+ 11   PARTITION pmax    VALUES LESS THAN (MAXVALUE));
+
+Table created.
+
+SYS@orcl> INSERT INTO hr.iot_part VALUES ('202501', 1, 'a');
+
+1 row created.
+
+SYS@orcl> INSERT INTO hr.iot_part VALUES ('202502', 2, 'b');
+
+1 row created.
+
+SYS@orcl> INSERT INTO hr.iot_part VALUES ('202512', 3, 'c');
+
+1 row created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> COL table_name FORMAT a16
+SYS@orcl> COL partition_name FORMAT a10
+SYS@orcl> SELECT table_name, iot_type, partitioned FROM dba_tables
+  2  WHERE  owner='HR' AND table_name='IOT_PART';
+
+TABLE_NAME       IOT_TYPE     PAR
+---------------- ------------ ---
+IOT_PART         IOT          YES
+
+SYS@orcl> SELECT partition_name, high_value, segment_created FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='IOT_PART_PK' ORDER BY partition_position;
+
+PARTITION_
+----------
+HIGH_VALUE
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SEG
+---
+P202501
+'202502'
+YES
+
+P202502
+'202503'
+YES
+
+PMAX
+MAXVALUE
+YES
+
+
+SYS@orcl> SELECT segment_name, partition_name, segment_type, bytes/1024 AS kb FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name='IOT_PART_PK' ORDER BY partition_name;
+
+SEGMENT_NAME         PARTITION_ SEGMENT_TYPE               KB
+-------------------- ---------- ------------------ ----------
+IOT_PART_PK          P202501    INDEX PARTITION            64
+IOT_PART_PK          P202502    INDEX PARTITION            64
+IOT_PART_PK          PMAX       INDEX PARTITION            64
+
+SYS@orcl> SELECT COUNT(*) AS p202501 FROM hr.iot_part PARTITION (p202501);
+
+   P202501
+----------
+         1
+
+-- IOT 도 파티션할 수 있다.
+--   dba_tables : iot_type IOT, partitioned YES
+--   파티션 정보는 dba_tab_partitions 가 아니라 **dba_ind_partitions** 에 있다.
+--     인덱스가 곧 테이블이므로 파티션도 인덱스 파티션으로 관리된다.
+--   세그먼트도 INDEX PARTITION 으로 잡힌다.
+--   PARTITION (이름) 표기로 파티션 단위 조회가 된다.
+--
+-- 제약 : 파티션 IOT 의 기본키는 파티션 키를 포함해야 한다 (LOCAL 인덱스와 같은 이유).
+--        위 예제는 기본키 (yyyymm, seq) 에 파티션 키 yyyymm 이 들어 있어 통과했다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- 실습 06 은 클러스터로 넘어간다. IOT 쪽 객체는 여기서 정리해도 된다.
+--   DROP TABLE hr.iot_comp PURGE;
+--   DROP TABLE hr.iot_nocomp PURGE;
+--   DROP TABLE hr.iot_part PURGE;
+-- hr.emp_iot_cmp 는 실습 08 의 점검 쿼리에서 다시 등장한다. 남겨 둔다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. IOT 에 보조 인덱스를 만들면 세그먼트가 늘어난다.
+--    "IOT 는 세그먼트 하나" 라는 말은 보조 인덱스가 없을 때의 이야기다.
+--    보조 인덱스가 여러 개면 힙 + 인덱스 구성과 공간 차이가 없어진다.
+--
+-- 2. pct_direct_access 를 상시 감시한다.
+--      SELECT i.index_name, i.pct_direct_access FROM dba_indexes i, dba_tables t
+--      WHERE  i.index_type='NORMAL' AND t.table_name=i.table_name
+--      AND    t.owner=i.owner AND t.iot_type='IOT' AND i.pct_direct_access < 100;
+--    이 값이 낮아지면 보조 인덱스 조회가 조용히 비싸진다. 오류는 나지 않는다.
+--
+-- 3. MOVE 뒤에는 반드시 UPDATE BLOCK REFERENCES 를 한다.
+--    IOT 재구성 절차서에 이 한 줄을 넣지 않으면 성능이 서서히 나빠진다.
+--    REBUILD 보다 가볍고 온라인으로 가능하다.
+--
+-- 4. 보조 인덱스만으로 답이 나오는 쿼리를 노려 설계한다.
+--    보조 인덱스에는 기본키 값이 들어 있으므로 (보조키, 기본키) 조합 조회는 매우 싸다.
+--    실측에서 Buffers 4 로 끝났다.
+--
+-- 5. 키 압축은 IOT 에서 효과가 크다.
+--    데이터 전체가 인덱스이므로 선두 컬럼 중복 제거가 테이블 크기를 바로 줄인다.
+--    복합 기본키의 선두가 반복되는 구조라면 COMPRESS n 을 먼저 검토한다.
+--
+-- 6. 이 실습에서 본 오류
+--    ORA-02160  IOT 에 LONG 컬럼            -> CLOB 으로 바꾼다
+--    ORA-25175  UNIQUE 만 있고 PRIMARY KEY 없음 -> 기본키를 정의한다
+================================================================================
+ 실습 05 끝
+================================================================================

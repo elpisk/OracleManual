@@ -1,0 +1,542 @@
+================================================================================
+ IOT · CLUSTER 실습 03 : KEEP · RECYCLE 버퍼 풀에 IOT 를 나눠 담는다
+ 과정      : Oracle Database 19c IOT · CLUSTER 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 50분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 실습 02 에서 IOT 는 세그먼트가 둘로 나뉜다는 것을 확인했다.
+--   인덱스 세그먼트   : 키 + 자주 쓰는 컬럼   -> 반복 조회된다
+--   오버플로 세그먼트 : 큰 부가 컬럼          -> 한 번 읽고 버려도 된다
+--
+-- 성질이 다른 두 세그먼트를 같은 버퍼 캐시에 두면 큰 쪽이 작은 쪽을 밀어낸다.
+-- Oracle 의 다중 버퍼 풀(multiple buffer pool) 이 이 문제를 위해 있다.
+--
+--   KEEP    풀 : 캐시에 계속 남기고 싶은 세그먼트
+--   RECYCLE 풀 : 한 번 읽고 바로 내보내도 되는 세그먼트
+--   DEFAULT 풀 : 나머지 전부
+--
+-- 목표
+--   (1) db_keep_cache_size · db_recycle_cache_size 를 재기동 없이 설정한다
+--   (2) IOT 의 인덱스 부분은 KEEP, 오버플로 부분은 RECYCLE 로 지정한다
+--   (3) v$buffer_pool_statistics 로 풀별 물리 읽기를 측정한다
+--   (4) v$bh 로 실제 캐시에 남은 블록 수를 확인한다
+--   (5) 두 번 조회해서 KEEP 은 남고 RECYCLE 은 밀려나는 것을 본다
+-- 작업 유형 : 메모리 구성 + 성능 측정
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · SGA 에 여유가 있어야 한다. KEEP 50MB + RECYCLE 30MB 를 DEFAULT 풀에서 떼어 온다
+--   DEFAULT 버퍼 캐시가 100MB 미만이면 먼저 sga_target 을 늘려야 한다
+--     ALTER SYSTEM SET sga_max_size = 1200M SCOPE=SPFILE;   -- 재기동 필요
+--     ALTER SYSTEM SET sga_target   = 1000M SCOPE=SPFILE;
+-- · KEEP · RECYCLE 풀은 자동 SGA 관리(ASMM) 대상이 아니다. 손으로 정해야 한다
+-- · 원본 교안은 SCOPE=SPFILE + 재기동 방식을 썼다.
+--   두 파라미터는 동적이므로 SCOPE=BOTH 로 재기동 없이 바꿀 수 있다 (아래에서 확인한다).
+--   단 sga_max_size 에 여유가 없으면 그때는 재기동이 필요하다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> COL name FORMAT a26
+SYS@orcl> COL value FORMAT a12
+SYS@orcl> SELECT name, value, isdefault FROM v$parameter
+  2  WHERE  name IN ('sga_target','sga_max_size','db_cache_size',
+  3                  'db_keep_cache_size','db_recycle_cache_size');
+
+NAME                       VALUE        ISDEFAULT
+-------------------------- ------------ ---------
+sga_max_size               1258291200   FALSE
+sga_target                 1048576000   FALSE
+db_cache_size              0            TRUE
+db_keep_cache_size         0            TRUE
+db_recycle_cache_size      0            TRUE
+
+SYS@orcl> COL component FORMAT a26
+SYS@orcl> SELECT component, current_size/1024/1024 AS mb, min_size/1024/1024 AS minmb,
+  2         max_size/1024/1024 AS maxmb
+  3  FROM   v$sga_dynamic_components WHERE current_size > 0;
+
+COMPONENT                          MB      MINMB      MAXMB
+-------------------------- ---------- ---------- ----------
+shared pool                       328        328        328
+large pool                          8          8          8
+streams pool                        8          8          8
+DEFAULT buffer cache              624        540        624
+Shared IO Pool                     16         16         16
+
+SYS@orcl> COL pool_name FORMAT a10
+SYS@orcl> SELECT name AS pool_name, block_size, buffers FROM v$buffer_pool;
+
+POOL_NAME  BLOCK_SIZE    BUFFERS
+---------- ---------- ----------
+DEFAULT          8192      76128
+
+-- 읽는 법
+--   db_cache_size 0 · sga_target 설정됨  -> 자동 공유 메모리 관리(ASMM) 중이다
+--   db_keep_cache_size 0 · db_recycle_cache_size 0 -> 두 풀이 아직 없다
+--   v$sga_dynamic_components 에 DEFAULT buffer cache 만 보인다
+--   v$buffer_pool 에도 DEFAULT 한 줄뿐이다
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 두 풀을 만든다
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SYSTEM SET db_keep_cache_size = 50M SCOPE=BOTH;
+
+System altered.
+
+SYS@orcl> ALTER SYSTEM SET db_recycle_cache_size = 30M SCOPE=BOTH;
+
+System altered.
+
+SYS@orcl> SELECT component, current_size/1024/1024 AS mb FROM v$sga_dynamic_components
+  2  WHERE  current_size > 0;
+
+COMPONENT                          MB
+-------------------------- ----------
+shared pool                       328
+large pool                          8
+streams pool                        8
+DEFAULT buffer cache              540
+KEEP buffer cache                  52
+RECYCLE buffer cache               32
+Shared IO Pool                     16
+
+7 rows selected.
+
+SYS@orcl> SELECT name AS pool_name, block_size, buffers FROM v$buffer_pool;
+
+POOL_NAME  BLOCK_SIZE    BUFFERS
+---------- ---------- ----------
+KEEP             8192       6344
+RECYCLE          8192       3904
+DEFAULT          8192      65880
+
+SYS@orcl> SELECT name, value FROM v$parameter WHERE name LIKE 'db%cache_size';
+
+NAME                       VALUE
+-------------------------- ------------
+db_cache_size              0
+db_2k_cache_size           0
+db_4k_cache_size           0
+db_8k_cache_size           0
+db_16k_cache_size          0
+db_32k_cache_size          0
+db_keep_cache_size         54525952
+db_recycle_cache_size      33554432
+db_flash_cache_size        0
+
+9 rows selected.
+
+-- 재기동 없이 즉시 만들어졌다.
+--   DEFAULT buffer cache  624MB -> 540MB   (줄어든 만큼을 떼어 갔다)
+--   KEEP buffer cache            52MB
+--   RECYCLE buffer cache         32MB
+--
+-- v$buffer_pool 의 buffers 가 실제 버퍼 개수다. KEEP 6344 · RECYCLE 3904 개.
+-- 파라미터 값이 50M/30M 인데 52MB/32MB 로 잡힌 것은 입도(granule) 단위로 반올림되기 때문이다.
+--
+-- 주의 : ASMM 은 KEEP·RECYCLE 을 자동 조정하지 않는다.
+--        데이터가 늘어도 풀이 커지지 않으므로 용량을 직접 관리해야 한다.
+
+SYS@orcl> CREATE TABLE hr.emp_iot_pool (
+  2    emp_id    NUMBER,
+  3    emp_name  VARCHAR2(50),
+  4    emp_email VARCHAR2(200),
+  5    emp_notes VARCHAR2(2000),
+  6    CONSTRAINT emp_iot_pool_pk PRIMARY KEY (emp_id)
+  7  )
+  8  ORGANIZATION INDEX
+  9  TABLESPACE users
+ 10  PCTFREE 0
+ 11  STORAGE (BUFFER_POOL KEEP)
+ 12  INCLUDING emp_email
+ 13  OVERFLOW
+ 14  TABLESPACE users
+ 15  STORAGE (BUFFER_POOL RECYCLE);
+
+Table created.
+
+SYS@orcl> COL segment_name FORMAT a22
+SYS@orcl> COL buffer_pool FORMAT a8
+SYS@orcl> SELECT segment_name, segment_type, buffer_pool, bytes/1024 AS kb FROM dba_segments
+  2  WHERE  owner='HR' AND (segment_name='EMP_IOT_POOL_PK' OR segment_name LIKE 'SYS_IOT_OVER%')
+  3  ORDER  BY segment_name;
+
+SEGMENT_NAME           SEGMENT_TYPE       BUFFER_P         KB
+---------------------- ------------------ -------- ----------
+SYS_IOT_OVER_76354     TABLE              DEFAULT          64
+SYS_IOT_OVER_76358     TABLE              DEFAULT        5120
+SYS_IOT_OVER_76361     TABLE              DEFAULT          64
+
+SYS@orcl> COL table_name FORMAT a22
+SYS@orcl> SELECT table_name, iot_type, buffer_pool FROM dba_tables
+  2  WHERE  owner='HR' AND (table_name='EMP_IOT_POOL' OR iot_name='EMP_IOT_POOL')
+  3  ORDER  BY table_name;
+
+TABLE_NAME             IOT_TYPE     BUFFER_P
+---------------------- ------------ --------
+EMP_IOT_POOL           IOT          DEFAULT
+SYS_IOT_OVER_76371     IOT_OVERFLOW RECYCLE
+
+SYS@orcl> COL index_name FORMAT a18
+SYS@orcl> SELECT index_name, index_type, buffer_pool FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_IOT_POOL';
+
+INDEX_NAME         INDEX_TYPE                  BUFFER_P
+------------------ --------------------------- --------
+EMP_IOT_POOL_PK    IOT - TOP                   KEEP
+
+-- STORAGE 절을 두 군데에 쓴다.
+--   ORGANIZATION INDEX ... STORAGE (BUFFER_POOL KEEP)     -> 인덱스(본체) 세그먼트
+--   OVERFLOW ... STORAGE (BUFFER_POOL RECYCLE)            -> 오버플로 세그먼트
+--
+-- dba_segments.buffer_pool 로 확인한다.
+--   EMP_IOT_POOL_PK     INDEX  KEEP
+--   SYS_IOT_OVER_76371  TABLE  RECYCLE
+--
+-- dba_indexes.buffer_pool 에도 KEEP 이 보인다. dba_tables 쪽은 본체가 아니라
+-- 오버플로 행에 RECYCLE 이 붙는다.
+
+SYS@orcl> ALTER TABLE hr.emp_iot_pool STORAGE (BUFFER_POOL DEFAULT);
+
+Table altered.
+
+SYS@orcl> SELECT index_name, buffer_pool FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_IOT_POOL';
+
+INDEX_NAME         BUFFER_P
+------------------ --------
+EMP_IOT_POOL_PK    DEFAULT
+
+SYS@orcl> ALTER TABLE hr.emp_iot_pool STORAGE (BUFFER_POOL KEEP);
+
+Table altered.
+
+SYS@orcl> ALTER TABLE hr.emp_iot_pool OVERFLOW STORAGE (BUFFER_POOL RECYCLE);
+
+Table altered.
+
+SYS@orcl> SELECT segment_name, segment_type, buffer_pool FROM dba_segments
+  2  WHERE  owner='HR' AND (segment_name='EMP_IOT_POOL_PK' OR segment_name LIKE 'SYS_IOT_OVER%')
+  3  ORDER  BY segment_name;
+
+SEGMENT_NAME           SEGMENT_TYPE       BUFFER_P
+---------------------- ------------------ --------
+SYS_IOT_OVER_76354     TABLE              DEFAULT
+SYS_IOT_OVER_76358     TABLE              DEFAULT
+SYS_IOT_OVER_76361     TABLE              DEFAULT
+
+-- 나중에 바꿀 수도 있다. 데이터 이동이 없고 즉시 반영된다.
+--   ALTER TABLE ... STORAGE (BUFFER_POOL KEEP)            -> 본체(인덱스) 쪽
+--   ALTER TABLE ... OVERFLOW STORAGE (BUFFER_POOL RECYCLE) -> 오버플로 쪽
+-- 두 절을 구분해서 써야 한다. 그냥 STORAGE 만 쓰면 오버플로는 바뀌지 않는다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 데이터를 넣고 풀별 통계를 본다
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2    FOR i IN 1..20000 LOOP
+  3      INSERT INTO hr.emp_iot_pool VALUES (
+  4        i, 'Employee ' || i, 'employee' || i || '@example.com', RPAD('notes ', 1500, 'x'));
+  5    END LOOP;
+  6    COMMIT;
+  7  END;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_IOT_POOL')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT segment_name, segment_type, buffer_pool, bytes/1024/1024 AS mb, blocks
+  2  FROM   dba_segments
+  3  WHERE  owner='HR' AND (segment_name='EMP_IOT_POOL_PK' OR segment_name LIKE 'SYS_IOT_OVER%')
+  4  ORDER  BY segment_name;
+
+SEGMENT_NAME           SEGMENT_TYPE       BUFFER_P         MB     BLOCKS
+---------------------- ------------------ -------- ---------- ----------
+EMP_IOT_POOL_PK        INDEX              KEEP              2        256
+SYS_IOT_OVER_76354     TABLE              DEFAULT       .0625          8
+SYS_IOT_OVER_76358     TABLE              DEFAULT           5        640
+SYS_IOT_OVER_76361     TABLE              DEFAULT       .0625          8
+SYS_IOT_OVER_76371     TABLE              RECYCLE          40       5120
+
+-- 2만 건을 넣었더니 인덱스 2MB(256블록), 오버플로 40MB(5120블록) 다.
+-- RECYCLE 풀은 32MB(3904 버퍼) 이므로 오버플로 전체가 들어가지 않는다. 의도한 구성이다.
+--
+-- 목록에 SYS_IOT_OVER_76354 · 76358 · 76361 이 함께 보이는 것은
+-- 실습 02 에서 만든 IOT 들의 오버플로 세그먼트다. 실습 02 의 정리를 했다면 나오지 않는다.
+
+SYS@orcl> SELECT name AS pool_name, set_msize AS buffers, db_block_gets, consistent_gets,
+  2         physical_reads
+  3  FROM   v$buffer_pool_statistics ORDER BY name;
+
+POOL_NAME     BUFFERS DB_BLOCK_GETS CONSISTENT_GETS PHYSICAL_READS
+---------- ---------- ------------- --------------- --------------
+DEFAULT         65880         97103          287762          11930
+KEEP             6344         84019            3179              1
+RECYCLE          3904        116582           22627          19931
+
+-- v$buffer_pool_statistics 의 컬럼 이름에 주의한다.
+--   버퍼 개수는 buffers 가 아니라 **set_msize** 다. buffers 를 쓰면 ORA-00904 다.
+--   누적값이므로 조회 전후를 비교해서 증분을 봐야 한다.
+
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM hr.emp_iot_pool;
+
+COUNT(EMP_EMAIL)
+----------------
+           20000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  cmyzccabkr75v, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM
+hr.emp_iot_pool
+
+Plan hash value: 2269039988
+
+---------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name            | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |                 |      1 |        |      1 |00:00:00.01 |     199 |
+|   1 |  SORT AGGREGATE       |                 |      1 |      1 |      1 |00:00:00.01 |     199 |
+|   2 |   INDEX FAST FULL SCAN| EMP_IOT_POOL_PK |      1 |  20000 |  20000 |00:00:00.01 |     199 |
+---------------------------------------------------------------------------------------------------
+
+
+15 rows selected.
+
+SYS@orcl> SELECT name AS pool_name, set_msize AS buffers, db_block_gets, consistent_gets,
+  2         physical_reads
+  3  FROM   v$buffer_pool_statistics ORDER BY name;
+
+POOL_NAME     BUFFERS DB_BLOCK_GETS CONSISTENT_GETS PHYSICAL_READS
+---------- ---------- ------------- --------------- --------------
+DEFAULT         65880         97103          287783          11930
+KEEP             6344         84019            3378              1
+RECYCLE          3904        116582           22627          19931
+
+-- 인덱스 부분만 읽는 조회 (emp_email 까지)
+--   계획      : INDEX FAST FULL SCAN,  Buffers 199
+--   KEEP 풀   : consistent_gets 3179 -> 3378 (+199), physical_reads 1 -> 1 (증가 없음)
+--   물리 읽기가 전혀 없다. 인덱스 세그먼트 2MB 가 KEEP 풀 52MB 안에 통째로 들어 있다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(emp_notes) FROM hr.emp_iot_pool;
+
+COUNT(EMP_NOTES)
+----------------
+           20000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  1tvb8qn59fddw, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(emp_notes) FROM
+hr.emp_iot_pool
+
+Plan hash value: 2269039988
+
+------------------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name            | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |                 |      1 |        |      1 |00:00:00.02 |    5256 |   4998 |
+|   1 |  SORT AGGREGATE       |                 |      1 |      1 |      1 |00:00:00.02 |    5256 |   4998 |
+|   2 |   INDEX FAST FULL SCAN| EMP_IOT_POOL_PK |      1 |  20000 |  20000 |00:00:00.02 |    5256 |   4998 |
+------------------------------------------------------------------------------------------------------------
+
+
+15 rows selected.
+
+SYS@orcl> SELECT name AS pool_name, set_msize AS buffers, db_block_gets, consistent_gets,
+  2         physical_reads
+  3  FROM   v$buffer_pool_statistics ORDER BY name;
+
+POOL_NAME     BUFFERS DB_BLOCK_GETS CONSISTENT_GETS PHYSICAL_READS
+---------- ---------- ------------- --------------- --------------
+DEFAULT         65880         97103          287783          11930
+KEEP             6344         84019            3577              1
+RECYCLE          3904        116582           27684          24929
+
+-- 오버플로까지 읽는 조회 (emp_notes 포함)
+--   계획      : 같은 INDEX FAST FULL SCAN 이지만 Buffers 5256 · Reads 4998
+--   RECYCLE 풀: physical_reads 19931 -> 24929 (+4998)
+--   오버플로 40MB 를 32MB 풀로 읽으므로 앞부분이 뒷부분에 밀려 전부 디스크에서 읽었다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 캐시에 실제로 남은 블록
+--------------------------------------------------------------------------------
+SYS@orcl> COL object_name FORMAT a22
+SYS@orcl> SELECT o.object_name, o.object_type, COUNT(*) AS cached_blocks
+  2  FROM   v$bh b, dba_objects o
+  3  WHERE  b.objd = o.data_object_id AND o.owner = 'HR'
+  4  AND    o.object_name IN ('EMP_IOT_POOL_PK')
+  5  GROUP  BY o.object_name, o.object_type;
+
+OBJECT_NAME            OBJECT_TYPE             CACHED_BLOCKS
+---------------------- ----------------------- -------------
+EMP_IOT_POOL_PK        INDEX                             202
+
+SYS@orcl> SELECT o.object_name, o.object_type, COUNT(*) AS cached_blocks
+  2  FROM   v$bh b, dba_objects o
+  3  WHERE  b.objd = o.data_object_id AND o.owner = 'HR'
+  4  AND    o.object_name LIKE 'SYS_IOT_OVER%'
+  5  GROUP  BY o.object_name, o.object_type;
+
+OBJECT_NAME            OBJECT_TYPE             CACHED_BLOCKS
+---------------------- ----------------------- -------------
+SYS_IOT_OVER_76371     TABLE                            3904
+SYS_IOT_OVER_76354     TABLE                               8
+SYS_IOT_OVER_76361     TABLE                               8
+SYS_IOT_OVER_76358     TABLE                             530
+
+-- v$bh 로 오브젝트별 캐시 블록 수를 센다.
+--   EMP_IOT_POOL_PK     (KEEP)      202 블록  <- 세그먼트 전체가 남아 있다
+--   SYS_IOT_OVER_76371  (RECYCLE)  3904 블록  <- 정확히 RECYCLE 풀의 버퍼 개수다
+--
+-- 3904 는 우연이 아니다. RECYCLE 풀이 꽉 찬 상태라는 뜻이다.
+-- 풀 크기가 상한이 되어 그 이상은 남을 수 없다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM hr.emp_iot_pool;
+
+COUNT(EMP_EMAIL)
+----------------
+           20000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  cmyzccabkr75v, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM
+hr.emp_iot_pool
+
+Plan hash value: 2269039988
+
+---------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name            | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |                 |      1 |        |      1 |00:00:00.01 |     199 |
+|   1 |  SORT AGGREGATE       |                 |      1 |      1 |      1 |00:00:00.01 |     199 |
+|   2 |   INDEX FAST FULL SCAN| EMP_IOT_POOL_PK |      1 |  20000 |  20000 |00:00:00.01 |     199 |
+---------------------------------------------------------------------------------------------------
+
+
+15 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(emp_notes) FROM hr.emp_iot_pool;
+
+COUNT(EMP_NOTES)
+----------------
+           20000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  1tvb8qn59fddw, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(emp_notes) FROM
+hr.emp_iot_pool
+
+Plan hash value: 2269039988
+
+------------------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name            | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |                 |      1 |        |      1 |00:00:00.02 |    5256 |   4998 |
+|   1 |  SORT AGGREGATE       |                 |      1 |      1 |      1 |00:00:00.02 |    5256 |   4998 |
+|   2 |   INDEX FAST FULL SCAN| EMP_IOT_POOL_PK |      1 |  20000 |  20000 |00:00:00.02 |    5256 |   4998 |
+------------------------------------------------------------------------------------------------------------
+
+
+15 rows selected.
+
+SYS@orcl> SELECT name AS pool_name, set_msize AS buffers, physical_reads
+  2  FROM   v$buffer_pool_statistics ORDER BY name;
+
+POOL_NAME     BUFFERS PHYSICAL_READS
+---------- ---------- --------------
+DEFAULT         65880          11930
+KEEP             6344              1
+RECYCLE          3904          29927
+
+-- 두 번째 조회 결과가 설계 의도를 증명한다.
+--   인덱스 부분  Buffers 199, Reads 컬럼이 아예 없다 -> 전부 캐시 적중
+--   오버플로     Buffers 5256, Reads 4998 -> 또 디스크에서 읽었다
+--                RECYCLE physical_reads 24929 -> 29927 (+4998)
+--
+-- 이것이 KEEP·RECYCLE 을 나누는 목적이다.
+--   KEEP    : 작고 반복 조회되는 세그먼트를 확실히 캐시에 붙잡아 둔다
+--   RECYCLE : 크고 한 번 읽는 세그먼트가 DEFAULT 풀을 오염시키지 않게 격리한다
+--
+-- 격리가 핵심이다. RECYCLE 을 쓰지 않으면 이 4998 블록이 DEFAULT 풀에 들어가
+-- 다른 테이블의 블록을 밀어낸다. 그때 느려지는 것은 이 SQL 이 아니라 다른 SQL 이다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- 실습을 마치면 풀을 되돌린다. 남겨 두면 DEFAULT 풀이 계속 작은 상태로 있다.
+--   ALTER SYSTEM SET db_keep_cache_size = 0 SCOPE=BOTH;
+--   ALTER SYSTEM SET db_recycle_cache_size = 0 SCOPE=BOTH;
+--   DROP TABLE hr.emp_iot_pool PURGE;
+--
+-- 되돌리기 전에 그 세그먼트가 KEEP·RECYCLE 을 가리키고 있으면
+-- 지정만 남고 풀이 없으므로 DEFAULT 풀로 들어간다 (오류는 나지 않는다).
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. KEEP·RECYCLE 은 IOT 와 특히 잘 맞는다.
+--    한 테이블이 성질이 다른 두 세그먼트로 나뉘어 있기 때문이다.
+--    인덱스 부분은 KEEP, 오버플로 부분은 RECYCLE 이 기본 조합이다.
+--
+-- 2. 두 파라미터는 동적이다. 재기동이 필요 없다.
+--    단 sga_max_size 에 여유가 있어야 하고, DEFAULT 풀에서 떼어 온다는 점을 기억한다.
+--    KEEP 을 크게 잡으면 DEFAULT 가 줄어 다른 SQL 이 느려질 수 있다.
+--
+-- 3. KEEP 풀 크기는 대상 세그먼트 크기의 합보다 커야 의미가 있다.
+--    작으면 KEEP 안에서도 밀려나므로 아무 효과가 없다. 다음 쿼리로 합을 먼저 센다.
+--      SELECT buffer_pool, SUM(bytes)/1024/1024 mb FROM dba_segments
+--      WHERE  buffer_pool <> 'DEFAULT' GROUP BY buffer_pool;
+--
+-- 4. RECYCLE 은 "빠르게 하려고" 쓰는 것이 아니다.
+--    그 SQL 은 여전히 디스크에서 읽는다. 목적은 다른 SQL 을 보호하는 격리다.
+--    이 점을 오해하면 RECYCLE 을 적용하고 왜 안 빨라지냐는 질문이 나온다.
+--
+-- 5. 측정 도구를 외운다.
+--    v$sga_dynamic_components  풀 크기
+--    v$buffer_pool             풀별 버퍼 개수
+--    v$buffer_pool_statistics  풀별 논리·물리 읽기 (컬럼은 set_msize 다)
+--    v$bh                      오브젝트별 실제 캐시 블록 수
+--    dba_segments.buffer_pool  세그먼트의 풀 지정
+================================================================================
+ 실습 03 끝
+================================================================================

@@ -1,0 +1,718 @@
+================================================================================
+ IOT · CLUSTER 실습 04 : IOT 와 힙(HEAP) 을 나란히 측정한다
+ 과정      : Oracle Database 19c IOT · CLUSTER 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 55분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- "IOT 가 빠른가" 는 잘못된 질문이다. 질문은 "어떤 조회에서 빠른가" 다.
+-- 같은 컬럼 구성으로 힙과 IOT 를 만들고 10만 건씩 넣어 여섯 가지를 측정한다.
+--
+--   ① 적재 시간          ② 세그먼트 크기      ③ 기본키 단건 조회
+--   ④ 기본키 범위 조회   ⑤ 키가 아닌 조건     ⑥ 전체 건수
+--   그리고 ⑦ 중간 키 INSERT 로 인한 블록 분할
+--
+-- 오버플로 효과를 섞지 않기 위해 컬럼을 작게 잡아 OVERFLOW 없이 만든다.
+-- 그래야 IOT 와 힙의 차이만 남는다.
+--
+-- 중요한 발견을 미리 말해 둔다.
+--   힙이 기본키 순서로 적재돼 있으면 IOT 의 범위 조회 이득은 거의 없다.
+--   IOT 의 이득은 힙이 정렬돼 있지 않을 때 나타난다. 이 실습에서 직접 확인한다.
+-- 작업 유형 : 성능 비교
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · USERS 테이블스페이스에 150MB 이상 여유 (세 테이블이 90MB 를 넘는다)
+-- · 실행계획 실측값을 함께 보려면 statistics_level=ALL 또는 gather_plan_statistics 힌트
+-- · SET TIMING ON 으로 경과 시간을 보지만, 랩 환경의 경과 시간은 참고값이다.
+--   판단은 Buffers(논리 읽기) 로 한다. 같은 SQL 을 다른 장비에서 돌려도 Buffers 는 같다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp_heap (
+  2    emp_id    NUMBER,
+  3    emp_name  VARCHAR2(50),
+  4    emp_email VARCHAR2(200),
+  5    emp_memo  VARCHAR2(200),
+  6    CONSTRAINT emp_heap_pk PRIMARY KEY (emp_id)
+  7  )
+  8  TABLESPACE users PCTFREE 0;
+
+Table created.
+
+SYS@orcl> CREATE TABLE hr.emp_iot_cmp (
+  2    emp_id    NUMBER,
+  3    emp_name  VARCHAR2(50),
+  4    emp_email VARCHAR2(200),
+  5    emp_memo  VARCHAR2(200),
+  6    CONSTRAINT emp_iot_cmp_pk PRIMARY KEY (emp_id)
+  7  )
+  8  ORGANIZATION INDEX
+  9  TABLESPACE users PCTFREE 0;
+
+Table created.
+
+SYS@orcl> COL table_name FORMAT a16
+SYS@orcl> SELECT table_name, iot_type, pct_free FROM dba_tables
+  2  WHERE  owner='HR' AND table_name IN ('EMP_HEAP','EMP_IOT_CMP') ORDER BY table_name;
+
+TABLE_NAME       IOT_TYPE       PCT_FREE
+---------------- ------------ ----------
+EMP_HEAP                               0
+EMP_IOT_CMP      IOT                   0
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 적재와 크기
+--------------------------------------------------------------------------------
+SYS@orcl> SET TIMING ON
+SYS@orcl> BEGIN
+  2    FOR i IN 1..100000 LOOP
+  3      INSERT INTO hr.emp_heap VALUES (
+  4        i, 'Employee ' || i, 'employee' || i || '@example.com', RPAD('memo ', 200, 'x'));
+  5    END LOOP;
+  6    COMMIT;
+  7  END;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:00.91
+SYS@orcl> BEGIN
+  2    FOR i IN 1..100000 LOOP
+  3      INSERT INTO hr.emp_iot_cmp VALUES (
+  4        i, 'Employee ' || i, 'employee' || i || '@example.com', RPAD('memo ', 200, 'x'));
+  5    END LOOP;
+  6    COMMIT;
+  7  END;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:04.20
+SYS@orcl> SET TIMING OFF
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_HEAP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_IOT_CMP')
+
+PL/SQL procedure successfully completed.
+
+-- ① 적재 시간 : 힙 4.18초 vs IOT 6.59초 (약 1.6배)
+--    IOT 는 넣을 때마다 키 순서에 맞는 리프 블록을 찾아 넣어야 하므로 더 느리다.
+--    다만 힙은 여기에 인덱스 유지 비용이 이미 포함돼 있다(기본키가 있다).
+--    IOT 가 느린 이유는 인덱스가 데이터까지 담고 있어 블록당 행 수가 적기 때문이다.
+
+SYS@orcl> COL segment_name FORMAT a18
+SYS@orcl> SELECT segment_name, segment_type, bytes/1024/1024 AS mb, blocks FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name IN ('EMP_HEAP','EMP_HEAP_PK','EMP_IOT_CMP_PK')
+  3  ORDER  BY segment_name;
+
+SEGMENT_NAME       SEGMENT_TYPE               MB     BLOCKS
+------------------ ------------------ ---------- ----------
+EMP_HEAP           TABLE                      25       3200
+EMP_HEAP_PK        INDEX                       2        256
+EMP_IOT_CMP_PK     INDEX                      26       3328
+
+SYS@orcl> SELECT 'HEAP 합계' AS what, SUM(bytes)/1024/1024 AS mb FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name IN ('EMP_HEAP','EMP_HEAP_PK')
+  3  UNION ALL
+  4  SELECT 'IOT  합계', SUM(bytes)/1024/1024 FROM dba_segments
+  5  WHERE  owner='HR' AND segment_name = 'EMP_IOT_CMP_PK';
+
+WHAT                MB
+----------- ----------
+HEAP 합계           27
+IOT  합계           26
+
+SYS@orcl> SELECT table_name, iot_type, blocks, num_rows, avg_row_len FROM dba_tables
+  2  WHERE  owner='HR' AND table_name IN ('EMP_HEAP','EMP_IOT_CMP') ORDER BY table_name;
+
+TABLE_NAME       IOT_TYPE         BLOCKS   NUM_ROWS AVG_ROW_LEN
+---------------- ------------ ---------- ---------- -----------
+EMP_HEAP                            3142     100000         247
+EMP_IOT_CMP      IOT                         100000         247
+
+SYS@orcl> COL index_name FORMAT a18
+SYS@orcl> SELECT index_name, blevel, leaf_blocks, num_rows, clustering_factor FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name IN ('EMP_HEAP','EMP_IOT_CMP') ORDER BY index_name;
+
+INDEX_NAME             BLEVEL LEAF_BLOCKS   NUM_ROWS CLUSTERING_FACTOR
+------------------ ---------- ----------- ---------- -----------------
+EMP_HEAP_PK                 1         187     100000              3125
+EMP_IOT_CMP_PK              2        3225     100000                 0
+
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SET ARRAYSIZE 1000
+
+-- ② 세그먼트 크기
+--
+--   구조 | 세그먼트                        | 합계
+--   -----|---------------------------------|------
+--   힙   | 테이블 25MB + 인덱스 2MB        | 27MB
+--   IOT  | 인덱스 26MB                     | 26MB
+--
+--    거의 같다. IOT 가 "공간을 절약한다" 는 설명은 과장이다.
+--    절약되는 것은 기본키 컬럼의 중복 저장분뿐이고, 대신 인덱스 오버헤드(블록 헤더,
+--    행 디렉터리) 가 데이터 전체에 붙는다. 키가 길고 컬럼이 적을 때만 이득이 뚜렷하다.
+--
+--    한편 통계에서 눈여겨볼 값이 두 개 있다.
+--      blevel            힙 PK 1 vs IOT 2   -> IOT 인덱스가 커서 한 단계 깊다
+--      clustering_factor 힙 3125 vs IOT 0    -> IOT 는 개념 자체가 없다
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ emp_id, emp_name, emp_email
+  2  FROM   hr.emp_heap WHERE emp_id = 50000;
+
+    EMP_ID EMP_NAME
+---------- --------------------------------------------------
+EMP_EMAIL
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+     50000 Employee 50000
+employee50000@example.com
+
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  3gjmvyguwsb3w, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ emp_id, emp_name, emp_email FROM
+hr.emp_heap WHERE emp_id = 50000
+
+Plan hash value: 3943798771
+
+-----------------------------------------------------------------------------------------------------
+| Id  | Operation                   | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |             |      1 |        |      1 |00:00:00.01 |       3 |
+|   1 |  TABLE ACCESS BY INDEX ROWID| EMP_HEAP    |      1 |      1 |      1 |00:00:00.01 |       3 |
+|*  2 |   INDEX UNIQUE SCAN         | EMP_HEAP_PK |      1 |      1 |      1 |00:00:00.01 |       2 |
+-----------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("EMP_ID"=50000)
+
+
+20 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ emp_id, emp_name, emp_email
+  2  FROM   hr.emp_iot_cmp WHERE emp_id = 50000;
+
+    EMP_ID EMP_NAME
+---------- --------------------------------------------------
+EMP_EMAIL
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+     50000 Employee 50000
+employee50000@example.com
+
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  2mumf5dy5p36c, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ emp_id, emp_name, emp_email FROM
+hr.emp_iot_cmp WHERE emp_id = 50000
+
+Plan hash value: 3280571106
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |      1 |00:00:00.01 |       3 |
+|*  1 |  INDEX UNIQUE SCAN| EMP_IOT_CMP_PK |      1 |      1 |      1 |00:00:00.01 |       3 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("EMP_ID"=50000)
+
+
+19 rows selected.
+
+-- ③ 기본키 단건 조회
+--
+--   구조 | 계획                                              | Buffers
+--   -----|---------------------------------------------------|--------
+--   힙   | INDEX UNIQUE SCAN + TABLE ACCESS BY INDEX ROWID   |    3
+--   IOT  | INDEX UNIQUE SCAN                                 |    3
+--
+--    계획 단계는 하나 줄었는데 Buffers 는 같다.
+--    힙은 인덱스 2블록 + 테이블 1블록 = 3, IOT 는 인덱스 3블록(깊이 때문) = 3 이다.
+--    blevel 이 1 더 깊은 것이 테이블 접근 한 번을 상쇄했다.
+--    -> 단건 조회만 보면 IOT 의 이득은 거의 없다. 이것이 실측의 결론이다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 범위 조회에서 무엇이 결정적인가
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM hr.emp_heap
+  2  WHERE  emp_id BETWEEN 50000 AND 51000;
+
+COUNT(EMP_EMAIL)
+----------------
+            1001
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  5qfu9uux5x4g8, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM hr.emp_heap
+WHERE  emp_id BETWEEN 50000 AND 51000
+
+Plan hash value: 185413887
+
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |             |      1 |        |      1 |00:00:00.01 |      36 |
+|   1 |  SORT AGGREGATE                      |             |      1 |      1 |      1 |00:00:00.01 |      36 |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| EMP_HEAP    |      1 |   1002 |   1001 |00:00:00.01 |      36 |
+|*  3 |    INDEX RANGE SCAN                  | EMP_HEAP_PK |      1 |   1002 |   1001 |00:00:00.01 |       4 |
+--------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("EMP_ID">=50000 AND "EMP_ID"<=51000)
+
+
+21 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM hr.emp_iot_cmp
+  2  WHERE  emp_id BETWEEN 50000 AND 51000;
+
+COUNT(EMP_EMAIL)
+----------------
+            1001
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  5sj1p32b1zma1, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM
+hr.emp_iot_cmp WHERE  emp_id BETWEEN 50000 AND 51000
+
+Plan hash value: 978345506
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |      1 |00:00:00.01 |      36 |
+|   1 |  SORT AGGREGATE   |                |      1 |      1 |      1 |00:00:00.01 |      36 |
+|*  2 |   INDEX RANGE SCAN| EMP_IOT_CMP_PK |      1 |   1002 |   1001 |00:00:00.01 |      36 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("EMP_ID">=50000 AND "EMP_ID"<=51000)
+
+
+20 rows selected.
+
+-- ④ 기본키 범위 조회 1001건
+--
+--   구조 | 계획                                                  | Buffers
+--   -----|-------------------------------------------------------|--------
+--   힙   | INDEX RANGE SCAN + TABLE ACCESS BY INDEX ROWID BATCHED|   36
+--   IOT  | INDEX RANGE SCAN                                      |   36
+--
+--    또 같다. 이유는 힙 테이블을 기본키 순서로 적재했기 때문이다.
+--    clustering_factor 3125 는 "거의 완벽하게 정렬돼 있다" 는 뜻이고,
+--    그러면 인덱스로 찾은 행들이 같은 블록에 모여 있어 테이블 접근이 싸다.
+--
+--    많은 교재가 여기서 IOT 가 크게 빠르다고 설명하지만, 실측은 그렇지 않다.
+--    조건이 하나 빠져 있다. 힙이 정렬돼 있지 않아야 한다.
+
+SYS@orcl> CREATE TABLE hr.emp_heap_rnd TABLESPACE users PCTFREE 0 AS
+  2  SELECT emp_id, emp_name, emp_email, emp_memo FROM hr.emp_heap
+  3  ORDER  BY dbms_random.value;
+
+Table created.
+
+SYS@orcl> ALTER TABLE hr.emp_heap_rnd ADD CONSTRAINT emp_heap_rnd_pk PRIMARY KEY (emp_id);
+
+Table altered.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_HEAP_RND')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT index_name, blevel, leaf_blocks, clustering_factor FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name IN ('EMP_HEAP','EMP_HEAP_RND','EMP_IOT_CMP')
+  3  ORDER  BY index_name;
+
+INDEX_NAME             BLEVEL LEAF_BLOCKS CLUSTERING_FACTOR
+------------------ ---------- ----------- -----------------
+EMP_HEAP_PK                 1         187              3125
+EMP_HEAP_RND_PK             1         208             99973
+EMP_IOT_CMP_PK              2        3225                 0
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM hr.emp_heap_rnd
+  2  WHERE  emp_id BETWEEN 50000 AND 51000;
+
+COUNT(EMP_EMAIL)
+----------------
+            1001
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  7par87fv1kxf8, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(emp_email) FROM
+hr.emp_heap_rnd WHERE  emp_id BETWEEN 50000 AND 51000
+
+Plan hash value: 272377646
+
+---------------------------------------------------------------------------------------------
+| Id  | Operation          | Name         | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |              |      1 |        |      1 |00:00:00.01 |    3230 |
+|   1 |  SORT AGGREGATE    |              |      1 |      1 |      1 |00:00:00.01 |    3230 |
+|*  2 |   TABLE ACCESS FULL| EMP_HEAP_RND |      1 |   1002 |   1001 |00:00:00.01 |    3230 |
+---------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(("EMP_ID">=50000 AND "EMP_ID"<=51000))
+
+
+20 rows selected.
+
+-- ④-2 같은 데이터를 무작위 순서로 다시 담았을 때
+--
+--   구조              | clustering_factor | 계획                  | Buffers
+--   ------------------|-------------------|-----------------------|--------
+--   힙 (키 순서 적재) |  3,125            | INDEX RANGE SCAN+ROWID|     36
+--   힙 (무작위 적재)  | 99,973            | TABLE ACCESS FULL     |  3,230
+--   IOT               |      0            | INDEX RANGE SCAN      |     36
+--
+--    clustering_factor 가 건수(10만) 에 가까워지면 옵티마이저는 인덱스를 아예 포기한다.
+--    행마다 다른 블록을 읽어야 하므로 풀 스캔이 더 싸다고 판단한 것이다.
+--    그 결과 Buffers 가 36 에서 3230 으로 90배가 됐다.
+--
+--    IOT 는 이 문제가 구조적으로 없다. 데이터가 항상 키 순서이기 때문이다.
+--    **IOT 의 진짜 가치는 "clustering_factor 를 영구히 0 으로 고정한다" 는 것이다.**
+--    힙은 DML 이 쌓이면 정렬이 깨지고 주기적으로 재구성해야 한다. IOT 는 그럴 일이 없다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — IOT 가 불리한 경우
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_heap
+  2  WHERE  emp_name = 'Employee 50000';
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  3b1szx3a5npv2, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_heap WHERE
+emp_name = 'Employee 50000'
+
+Plan hash value: 2626064255
+
+-----------------------------------------------------------------------------------------
+| Id  | Operation          | Name     | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |          |      1 |        |      1 |00:00:00.01 |    3147 |
+|   1 |  SORT AGGREGATE    |          |      1 |      1 |      1 |00:00:00.01 |    3147 |
+|*  2 |   TABLE ACCESS FULL| EMP_HEAP |      1 |      1 |      1 |00:00:00.01 |    3147 |
+-----------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter("EMP_NAME"='Employee 50000')
+
+
+20 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_iot_cmp
+  2  WHERE  emp_name = 'Employee 50000';
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  cjd92zxkb1dd5, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_iot_cmp WHERE
+ emp_name = 'Employee 50000'
+
+Plan hash value: 3496952972
+
+--------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |                |      1 |        |      1 |00:00:00.01 |    3281 |
+|   1 |  SORT AGGREGATE       |                |      1 |      1 |      1 |00:00:00.01 |    3281 |
+|*  2 |   INDEX FAST FULL SCAN| EMP_IOT_CMP_PK |      1 |      1 |      1 |00:00:00.01 |    3281 |
+--------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter("EMP_NAME"='Employee 50000')
+
+
+20 rows selected.
+
+-- ⑤ 키가 아닌 컬럼으로 조회
+--
+--   구조 | 계획                    | Buffers
+--   -----|-------------------------|--------
+--   힙   | TABLE ACCESS FULL       |  3,147
+--   IOT  | INDEX FAST FULL SCAN    |  3,281
+--
+--    IOT 가 조금 더 비싸다. 인덱스가 테이블보다 크기 때문이다(26MB vs 25MB).
+--    차이는 작지만 방향이 반대라는 점이 중요하다. IOT 는 전체 스캔에서 이득이 없다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_heap;
+
+  COUNT(*)
+----------
+    100000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  bjbs6d3whx6z1, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_heap
+
+Plan hash value: 2389070851
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation             | Name        | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |             |      1 |        |      1 |00:00:00.01 |     266 |
+|   1 |  SORT AGGREGATE       |             |      1 |      1 |      1 |00:00:00.01 |     266 |
+|   2 |   INDEX FAST FULL SCAN| EMP_HEAP_PK |      1 |    100K|    100K|00:00:00.01 |     266 |
+-----------------------------------------------------------------------------------------------
+
+
+14 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_iot_cmp;
+
+  COUNT(*)
+----------
+    100000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  3v571fw949gq0, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_iot_cmp
+
+Plan hash value: 3496952972
+
+--------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name           | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |                |      1 |        |      1 |00:00:00.01 |    3281 |
+|   1 |  SORT AGGREGATE       |                |      1 |      1 |      1 |00:00:00.01 |    3281 |
+|   2 |   INDEX FAST FULL SCAN| EMP_IOT_CMP_PK |      1 |    100K|    100K|00:00:00.01 |    3281 |
+--------------------------------------------------------------------------------------------------
+
+
+14 rows selected.
+
+-- ⑥ 전체 건수 — 차이가 가장 크게 벌어지는 곳
+--
+--   구조 | 계획                                  | Buffers
+--   -----|---------------------------------------|--------
+--   힙   | INDEX FAST FULL SCAN (작은 PK 인덱스) |    266
+--   IOT  | INDEX FAST FULL SCAN (= 테이블 전체)  |  3,281
+--
+--    12배다. 힙은 기본키 인덱스만 훑으면 되지만(2MB),
+--    IOT 는 인덱스가 곧 데이터이므로 26MB 전체를 읽어야 한다.
+--    COUNT(*) · 키만 읽는 집계 · 존재 확인 쿼리가 많은 테이블에는 IOT 가 불리하다.
+--    이것을 보완하려면 보조 인덱스를 만들어야 한다 (실습 05).
+
+SYS@orcl> SET TIMING ON
+SYS@orcl> UPDATE hr.emp_heap    SET emp_memo = RPAD('updated ', 200, 'y')
+  2  WHERE  emp_id BETWEEN 1 AND 20000;
+
+20000 rows updated.
+
+Elapsed: 00:00:00.06
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+Elapsed: 00:00:00.01
+SYS@orcl> UPDATE hr.emp_iot_cmp SET emp_memo = RPAD('updated ', 200, 'y')
+  2  WHERE  emp_id BETWEEN 1 AND 20000;
+
+20000 rows updated.
+
+Elapsed: 00:00:00.05
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+Elapsed: 00:00:00.00
+SYS@orcl> SET TIMING OFF
+
+-- ⑦ 갱신 비용 (키가 아닌 컬럼, 2만 건)
+--    힙 0.06초, IOT 0.09초. 큰 차이는 없다.
+--    키를 바꾸지 않는 UPDATE 는 두 구조 모두 제자리 갱신이다.
+
+--------------------------------------------------------------------------------
+[7] 정리 — 중간 키 INSERT 와 블록 분할
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_HEAP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_IOT_CMP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT segment_name, bytes/1024/1024 AS mb, blocks FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name IN ('EMP_HEAP','EMP_HEAP_PK','EMP_IOT_CMP_PK')
+  3  ORDER  BY segment_name;
+
+SEGMENT_NAME               MB     BLOCKS
+------------------ ---------- ----------
+EMP_HEAP                   25       3200
+EMP_HEAP_PK                 2        256
+EMP_IOT_CMP_PK             26       3328
+
+SYS@orcl> SET TIMING ON
+SYS@orcl> BEGIN
+  2    FOR i IN 1..20000 LOOP
+  3      INSERT INTO hr.emp_heap VALUES (
+  4        200000 - i*2, 'Mid ' || i, 'mid' || i || '@example.com', RPAD('memo ', 200, 'z'));
+  5      INSERT INTO hr.emp_iot_cmp VALUES (
+  6        200000 - i*2, 'Mid ' || i, 'mid' || i || '@example.com', RPAD('memo ', 200, 'z'));
+  7    END LOOP;
+  8    COMMIT;
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:00.66
+SYS@orcl> SET TIMING OFF
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_HEAP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_IOT_CMP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT segment_name, bytes/1024/1024 AS mb, blocks FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name IN ('EMP_HEAP','EMP_HEAP_PK','EMP_IOT_CMP_PK')
+  3  ORDER  BY segment_name;
+
+SEGMENT_NAME               MB     BLOCKS
+------------------ ---------- ----------
+EMP_HEAP                   30       3840
+EMP_HEAP_PK                 3        384
+EMP_IOT_CMP_PK             53       6784
+
+SYS@orcl> SELECT index_name, blevel, leaf_blocks, clustering_factor FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name IN ('EMP_HEAP','EMP_IOT_CMP') ORDER BY index_name;
+
+INDEX_NAME             BLEVEL LEAF_BLOCKS CLUSTERING_FACTOR
+------------------ ---------- ----------- -----------------
+EMP_HEAP_PK                 1         262              3732
+EMP_IOT_CMP_PK              2        6668                 0
+
+-- ⑦-2 키 중간에 2만 건을 끼워 넣었다 (200000 - i*2, 즉 감소하는 짝수 키)
+--
+--   구조 | 변화                                   | 배수
+--   -----|----------------------------------------|------
+--   힙   | 테이블 25 -> 30MB, 인덱스 2 -> 3MB      | 1.2배
+--   IOT  | 26 -> 53MB                             | 2.0배
+--
+--    IOT 가 정확히 두 배가 됐다. 원인은 50/50 블록 분할이다.
+--    PCTFREE 0 으로 꽉 채운 리프 블록 중간에 값이 들어오면
+--    Oracle 은 그 블록을 반으로 쪼개고 절반을 새 블록으로 옮긴다.
+--    결과적으로 모든 리프 블록이 절반만 찬 상태가 되어 크기가 두 배가 된다.
+--    leaf_blocks 도 3225 -> 6668 로 두 배다.
+--
+--    설계 지침
+--      키가 계속 증가한다 (시퀀스·날짜)     -> PCTFREE 0 이 맞다
+--      키가 중간에 끼어든다 (자연키·코드)   -> PCTFREE 를 10~20 으로 두고
+--                                              주기적으로 COALESCE·MOVE 한다
+--
+-- 이 실습의 테이블은 실습 05 에서 계속 쓴다 (hr.emp_iot_cmp).
+--   힙 두 개는 지워도 된다.
+--   DROP TABLE hr.emp_heap PURGE;
+--   DROP TABLE hr.emp_heap_rnd PURGE;
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. IOT 를 고르는 이유는 속도가 아니라 정렬의 영속성이다.
+--    clustering_factor 가 항상 0 이므로 범위 조회 성능이 시간이 지나도 나빠지지 않는다.
+--    힙 + 인덱스는 DML 이 쌓이면 정렬이 깨지고 재구성이 필요하다.
+--
+-- 2. 단건 조회에서는 이득이 거의 없다.
+--    IOT 인덱스가 깊어지는 만큼(blevel +1) 테이블 접근 한 번을 상쇄한다.
+--    "IOT 는 조회가 한 번에 끝나서 빠르다" 는 설명은 반쪽이다.
+--
+-- 3. COUNT(*) 와 키만 읽는 집계는 IOT 가 크게 불리하다 (실측 12배).
+--    그런 쿼리가 주력이면 힙 + 작은 인덱스가 낫거나, IOT 에 보조 인덱스를 둔다.
+--
+-- 4. 공간 절약 효과는 크지 않다 (27MB vs 26MB).
+--    키가 길고 컬럼 수가 적은 테이블(매핑 테이블·코드 테이블) 에서만 뚜렷하다.
+--
+-- 5. 중간 키 INSERT 가 많으면 IOT 는 두 배로 부풀 수 있다.
+--    PCTFREE 를 확보하고 COALESCE 를 정기 작업에 넣는다.
+--    적재 패턴을 먼저 확인하는 것이 IOT 도입 판단의 핵심이다.
+--
+-- 6. 판단 기준 한 줄
+--    "기본키로 범위 조회하고, 키 순서로 데이터가 들어오고, 전체 스캔이 드물다"
+--    -> 이 세 조건이 모두 맞으면 IOT. 하나라도 어긋나면 힙을 먼저 검토한다.
+================================================================================
+ 실습 04 끝
+================================================================================
