@@ -3,30 +3,52 @@
 -- ============================================================================
 --  출처 : 진료비청구심사_스키마_생성스크립트_수정본.md 의 「수정된 전체 스크립트」
 --         (원본 PDF 스크립트를 검토해 찾은 9건을 반영한 판)
---  용도 : SQL 튜닝 / SQL 고급활용 실습 스키마를 빈 계정에 한 번에 만든다.
---         진료비청구심사_실습문제_50제 · SQL고급활용_문제_50제 가 쓰는 표들이다.
+--  용도 : SQL 튜닝 / SQL 고급활용 실습 스키마를 SQLT 계정에 한 번에 만든다.
+--         SQL튜닝_Ch01~Ch14_실습 · 진료비청구심사_실습문제_50제 ·
+--         SQL고급활용_문제_50제 가 모두 이 7개 표를 쓴다.
 --
 --  실행 방법
---      $ sqlplus 실습계정/비밀번호@orcl @진료비청구심사_스키마_생성.sql
+--      $ sqlplus sqlt/sqlt@orcl @진료비청구심사_스키마_생성.sql
 --      SQL Developer 라면 F5(스크립트 실행). F9(문장 실행)로는 돌아가지 않는다.
 --
---  필요 권한 : CREATE TABLE, CREATE SEQUENCE, 테이블스페이스 QUOTA
---              (CONNECT + RESOURCE 롤이면 충분하다)
+--  계정이 없으면 SYS 로 먼저 만든다. 현재 랩의 SQLT 와 같은 권한 구성이다.
+--      CREATE USER sqlt IDENTIFIED BY sqlt DEFAULT TABLESPACE users;
+--      GRANT CONNECT, RESOURCE, PLUSTRACE, SELECT_CATALOG_ROLE TO sqlt;
+--      GRANT CREATE VIEW, UNLIMITED TABLESPACE TO sqlt;
+--      -- PLUSTRACE 는 AUTOTRACE(Ch14), SELECT_CATALOG_ROLE 은 V$SQL 조회에 쓴다.
 --
---  실측 (19.3.0.0 / OEL7 / 문서 기준 전량, 2026-09-30)
---      전체          1분 51초
---        1단계(마스터 6.1만 건)      1.92 초
---        2단계(청구 30만 건 루프)  1분 42.76 초   <- 대부분이 여기다
---        3단계(로그 50만 건)         3.72 초
---        통계 수집 7개               1.6 초
---      세그먼트 총 179.1 MB (표 134 MB + 인덱스 45 MB)
+--  실측 (19.3.0.0 / OEL7 / 위 DEFINE 그대로 전량 2회, 2026-09-30)
+--      전체          1분 24초 ~ 1분 51초
+--        1단계(마스터 6.1만 건)     1.7 ~  1.9 초
+--        2단계(청구 30만 건 루프) 1분 16초 ~ 1분 43초   <- 대부분이 여기다
+--        3단계(로그 50만 건)        2.9 ~  3.7 초
+--        통계 수집                  2.8 초
+--      세그먼트 총 179.1 MB (표 134 MB + 인덱스 45 MB). 두 번 다 같았고
+--      현재 SQLT 스키마의 179.1 MB 와도 같다.
 --      -> 테이블스페이스 여유를 200 MB 이상 확보하고 시작한다.
 --      장비가 느리면 2단계가 길어진다. 아래 DEFINE 을 줄여 소량으로 한 번
 --      돌려 확인한 뒤 전량을 실행하는 것을 권한다.
 --
---  !! 주의 : 0단계에서 표 7개와 시퀀스 2개를 PURGE 로 DROP 한다.
---            같은 이름의 표가 이미 있는 계정에서 돌리면 그 데이터는 사라진다.
---            SYS / SYSTEM 으로는 실행되지 않도록 앞에서 막아 두었다.
+--  !! 주의 1 : 0단계에서 표 7개와 시퀀스 2개를 PURGE 로 DROP 한다.
+--              이미 데이터가 있는 SQLT 에 그대로 돌리면 그 데이터는 사라진다.
+--              SYS / SYSTEM 으로는 실행되지 않도록 앞에서 막아 두었다.
+--
+--  !! 주의 2 : 이 스크립트는 이미 실측이 끝난 SQLT 스키마를 "다시 만드는" 용도가
+--              아니다. 건당 상세 개수(1~5)와 부상병 추가(33%)를 DBMS_RANDOM 으로
+--              뽑으므로, 다시 돌리면 아래 두 건수가 수백 건 단위로 달라진다.
+--
+--                              현재 SQLT (교안 실측 기준)   재생성 시
+--                CLAIM_DETAILS         899,894             약 90만 (±수백)
+--                DISEASES              399,551             약 40만 (±수백)
+--
+--              나머지 5개 표(1,000 / 50,000 / 10,000 / 300,000 / 500,000)는
+--              루프 상한이 정한 값이라 항상 똑같이 나온다.
+--              SQL튜닝_Ch01~Ch14_실습 의 A-Rows·Buffers 는 현재 데이터를 전제로
+--              측정한 값이다. 재생성하면 그 숫자가 미세하게 어긋난다. 실습 기록을
+--              그대로 재현해야 한다면 이 스크립트를 SQLT 에 돌리지 말고, 비교용
+--              별도 계정에 만들어 쓴다.
+--              (학생마다 같은 데이터를 주고 싶으면 2단계 맨 앞에서
+--               DBMS_RANDOM.SEED(1) 을 호출하면 재현 가능해진다)
 --
 --  주석 표기
 --      [수정 N]    .md 「발견된 문제점」 표의 N 번 항목 (생성 로직 자체의 수정)
@@ -50,14 +72,15 @@ WHENEVER OSERROR  EXIT FAILURE
 SPOOL claim_schema_build.log
 
 -- ---------------------------------------------------------------------------
--- [실행 보완] 생성 건수. 소량 시험 실행은 이 값들만 줄이면 된다.
---   문서 기준 전량 :  1000 / 50000 / 10000 / 300000 / 300000 / 200000
+-- [실행 보완] 생성 건수를 한 곳에 모았다. 아래 값이 원본(= 현재 SQLT) 그대로다.
+--   바꾸지 말 것. 소량으로 한 번 시험해 볼 때만 줄이고, 본 실행은 이 값으로 한다.
 --   빠른 확인용 예 :    50 /  2000 /  1000 /   2000 /   2000 /   1000
 --
---   n_drug 주의 : .md 코드블록의 루프는 1..20000 이지만, 같은 문서의
---   DBMS_OUTPUT 문구("10,000건 생성 완료")와 「수정 후 기대 결과」표는 10,000
---   이다. 문서 안에서 어긋나 있으므로 값을 여기 한 곳으로 모았다.
---   2만 건이 필요하면 n_drug 만 20000 으로 바꾼다.
+--   n_drug 은 10000 이 맞다. .md 코드블록의 루프만 1..20000 으로 적혀 있고,
+--   같은 문서의 DBMS_OUTPUT 문구·「기대 결과」표는 10,000 이며, 실측이 끝난
+--   SQLT.DRUG_MASTER 도 10,000 건이다(2026-09-30 확인). 코드블록이 오기다.
+--   CLAIM_DETAILS 의 DRUG_CODE 도 D000000001~D000010000 에서만 뽑으므로
+--   n_drug 을 20000 으로 올리면 뒤 10,000 건은 아무도 참조하지 않는 사표가 된다.
 --
 --   n_claim 주의 : CLAIM_ID 가 LPAD(i,7,'0') 이라 9,999,999 까지만 안전하다.
 -- ---------------------------------------------------------------------------
@@ -420,17 +443,21 @@ PROMPT ============================================================
 PROMPT  6. 통계 수집
 PROMPT ============================================================
 
--- [실행 보완] .md 는 스키마명을 'ALICE' 로 박아 두었다. 다른 계정에서 실행하면
---             ORA-20000(object does not exist) 이 난다. 접속 계정(USER)을 쓴다.
---             1~50번 병원 쏠림을 옵티마이저가 보려면 히스토그램이 필요하므로
---             method_opt 은 기본값(FOR ALL COLUMNS SIZE AUTO)을 그대로 쓴다.
-EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, 'HOSPITALS',      cascade => TRUE);
-EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, 'PATIENTS',       cascade => TRUE);
-EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, 'DRUG_MASTER',    cascade => TRUE);
-EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, 'MEDICAL_CLAIMS', cascade => TRUE);
-EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, 'CLAIM_DETAILS',  cascade => TRUE);
-EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, 'DISEASES',       cascade => TRUE);
-EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, 'REVIEW_LOG',     cascade => TRUE);
+-- [실행 보완] 두 가지를 고쳤다.
+--
+--  (1) .md 는 스키마명을 'ALICE' 로 박아 두었다. SQLT 로 실행하면 ORA-20000
+--      (object does not exist) 이 난다. 접속 계정(USER)을 쓴다.
+--
+--  (2) method_opt 를 기본값(FOR ALL COLUMNS SIZE AUTO)으로 두면 안 된다.
+--      AUTO 는 "WHERE 에 쓰인 적이 있는 컬럼" 전부에 히스토그램을 만들어서
+--      MEDICAL_CLAIMS 의 CLAIM_ID·CLAIM_TYPE·DEPT_CODE·RECEIPT_DATE·
+--      REVIEW_STATUS·TOTAL_AMT 까지 붙는다. 그러면 SQL튜닝_Ch01~Ch14_실습 의
+--      E-Rows 가 교안 기록과 달라진다.
+--      이 과정의 기준 상태는 "히스토그램은 MEDICAL_CLAIMS.HOSP_ID 하나(HYBRID
+--      254 버킷)" 이다 -- SQL튜닝_Ch01_실습_01 의 [2], Ch13_실습_03 의 [3] 과
+--      같은 Day 0 준비 명령을 그대로 쓴다.
+EXEC DBMS_STATS.GATHER_SCHEMA_STATS(USER, METHOD_OPT => 'FOR ALL COLUMNS SIZE 1');
+EXEC DBMS_STATS.GATHER_TABLE_STATS(USER, 'MEDICAL_CLAIMS', METHOD_OPT => 'FOR ALL COLUMNS SIZE 1 FOR COLUMNS SIZE 254 HOSP_ID', NO_INVALIDATE => FALSE);
 
 PROMPT
 PROMPT ============================================================
@@ -441,20 +468,56 @@ SET TIMING OFF
 COLUMN TNAME FORMAT A16
 
 PROMPT
-PROMPT === 7-1. 테이블별 건수 ===========================================
-SELECT 'HOSPITALS' TNAME, COUNT(*) CNT FROM HOSPITALS
-UNION ALL
-SELECT 'PATIENTS', COUNT(*) FROM PATIENTS
-UNION ALL
-SELECT 'DRUG_MASTER', COUNT(*) FROM DRUG_MASTER
-UNION ALL
-SELECT 'MEDICAL_CLAIMS', COUNT(*) FROM MEDICAL_CLAIMS
-UNION ALL
-SELECT 'CLAIM_DETAILS', COUNT(*) FROM CLAIM_DETAILS
-UNION ALL
-SELECT 'DISEASES', COUNT(*) FROM DISEASES        -- 수정 후 약 39만~40만 건으로 나와야 정상
-UNION ALL
-SELECT 'REVIEW_LOG', COUNT(*) FROM REVIEW_LOG;
+PROMPT === 7-1. 테이블별 건수 (교안 기준값과 비교) =======================
+PROMPT ( 기준값 = SQL튜닝_Ch01_실습_01 의 [1] 에 실린 숫자.
+PROMPT   CLAIM_DETAILS·DISEASES 만 DBMS_RANDOM 탓에 수백 건 흔들린다 )
+COLUMN "기준값" FORMAT A12
+COLUMN "판정"   FORMAT A6
+SELECT t.tname AS TNAME, c.cnt AS CNT, t.base AS "기준값",
+       CASE WHEN t.exact = 'Y' AND c.cnt = t.n           THEN '일치'
+            WHEN t.exact = 'Y'                           THEN '불일치'
+            WHEN ABS(c.cnt - t.n) <= t.n * 0.01          THEN '범위내'
+            ELSE '벗어남' END AS "판정"
+FROM  (SELECT 'HOSPITALS'      tname, 1000   n, '1,000'         base, 'Y' exact FROM dual UNION ALL
+       SELECT 'PATIENTS',              50000,   '50,000',            'Y' FROM dual UNION ALL
+       SELECT 'DRUG_MASTER',           10000,   '10,000',            'Y' FROM dual UNION ALL
+       SELECT 'MEDICAL_CLAIMS',       300000,   '300,000',           'Y' FROM dual UNION ALL
+       SELECT 'CLAIM_DETAILS',        899894,   '899,894 상당',       'N' FROM dual UNION ALL
+       SELECT 'DISEASES',             399551,   '399,551 상당',       'N' FROM dual UNION ALL
+       SELECT 'REVIEW_LOG',           500000,   '500,000',           'Y' FROM dual) t
+      JOIN
+      (SELECT 'HOSPITALS' tname, COUNT(*) cnt FROM HOSPITALS      UNION ALL
+       SELECT 'PATIENTS',        COUNT(*)     FROM PATIENTS       UNION ALL
+       SELECT 'DRUG_MASTER',     COUNT(*)     FROM DRUG_MASTER    UNION ALL
+       SELECT 'MEDICAL_CLAIMS',  COUNT(*)     FROM MEDICAL_CLAIMS UNION ALL
+       SELECT 'CLAIM_DETAILS',   COUNT(*)     FROM CLAIM_DETAILS  UNION ALL
+       SELECT 'DISEASES',        COUNT(*)     FROM DISEASES       UNION ALL
+       SELECT 'REVIEW_LOG',      COUNT(*)     FROM REVIEW_LOG) c
+      ON c.tname = t.tname
+ORDER BY DECODE(t.tname, 'HOSPITALS',1,'PATIENTS',2,'DRUG_MASTER',3,
+                         'MEDICAL_CLAIMS',4,'CLAIM_DETAILS',5,'DISEASES',6,7);
+
+PROMPT
+PROMPT === 7-1b. 교안 기준 상태 : 인덱스는 PK 7개만 =====================
+PROMPT ( IX_ 로 시작하는 인덱스가 보이면 Ch04~Ch12 의 Buffers 가 달라진다 )
+COLUMN table_name FORMAT A16
+COLUMN index_name FORMAT A20
+SELECT table_name, index_name, uniqueness FROM user_indexes ORDER BY table_name;
+
+PROMPT
+PROMPT === 7-1c. 교안 기준 상태 : 히스토그램은 HOSP_ID 하나 =============
+PROMPT ( 아래가 딱 1행(MEDICAL_CLAIMS / HOSP_ID / HYBRID / 254) 이어야 한다 )
+COLUMN column_name FORMAT A14
+SELECT table_name, column_name, histogram, num_buckets
+FROM   user_tab_col_statistics WHERE histogram <> 'NONE'
+ORDER  BY table_name, column_name;
+
+PROMPT
+PROMPT === 7-1d. 제약 13개 (PK 7 + FK 6) ===============================
+SELECT COUNT(*) AS "제약수",
+       COUNT(CASE WHEN constraint_type = 'P' THEN 1 END) AS "PK",
+       COUNT(CASE WHEN constraint_type = 'R' THEN 1 END) AS "FK"
+FROM   user_constraints WHERE constraint_type IN ('P','R');
 
 -- ---------------------------------------------------------------------------
 -- [실행 보완] 아래 7-2 ~ 7-9 는 .md 「발견된 문제점」 9건이 실제로 고쳐졌는지
