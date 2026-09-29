@@ -1,0 +1,580 @@
+================================================================================
+ 파티셔닝 실습 08 : 파티션 프루닝 — 실행계획 읽는 법
+ 과정      : Oracle Database 19c 파티셔닝 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 55분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 파티셔닝을 하는 이유의 절반은 프루닝(pruning) 이다.
+-- 읽지 않아도 되는 파티션을 아예 건드리지 않는 것, 그것뿐이다.
+-- 그러므로 "프루닝이 됐는지" 를 실행계획에서 판정하는 능력이 이 과정의 핵심 기술이다.
+--
+-- 53만 5천 건 테이블을 만들어 다음을 각각 측정한다.
+--   정적 프루닝 (상수 조건)        -> SINGLE / ITERATOR
+--   동적 프루닝 (바인드 변수)      -> KEY / KEY
+--   IN 리스트                      -> INLIST / KEY(I)
+--   프루닝 실패 세 가지            -> ALL
+--   조인에 의한 실행 시점 프루닝   -> KEY(AP) / 블룸 필터(:BF0000)
+-- 작업 유형 : 성능 분석
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 07 의 hr.sal_emp 가 남아 있다 ([6] 의 조인 예제에서 쓴다)
+-- · USERS 테이블스페이스에 최소 60MB 의 여유
+-- · 실행계획에 실측값(A-Rows·Buffers) 을 함께 보려면 두 가지가 필요하다
+--     ① ALTER SESSION SET statistics_level = ALL   또는
+--        /*+ gather_plan_statistics */ 힌트
+--     ② dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION')
+--   +PARTITION 을 빼면 Pstart/Pstop 컬럼이 나오지 않는다. 이 실습에서는 필수다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — 53만 건 테이블
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp_big
+  2  PARTITION BY RANGE (salary)
+  3  (PARTITION part1 VALUES LESS THAN (5000),
+  4   PARTITION part2 VALUES LESS THAN (10000),
+  5   PARTITION part3 VALUES LESS THAN (30000),
+  6   PARTITION pmax  VALUES LESS THAN (MAXVALUE))
+  7  TABLESPACE users
+  8  AS SELECT ROWNUM AS employee_id, e.last_name, e.first_name, e.hire_date,
+  9            e.job_id, e.salary, e.manager_id, e.department_id
+ 10     FROM   hr.employees e, (SELECT LEVEL AS id FROM dual CONNECT BY LEVEL <= 5000);
+
+Table created.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_BIG',granularity=>'AUTO',degree=>2)
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL partition_name FORMAT a8
+SYS@orcl> COL high_value FORMAT a10
+SYS@orcl> SELECT partition_position, partition_name, high_value, num_rows, blocks, avg_row_len
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='EMP_BIG'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE   NUM_ROWS     BLOCKS AVG_ROW_LEN
+------------------ -------- ---------- ---------- ---------- -----------
+                 1 PART1    5000           245000       1758          46
+                 2 PART2    10000          195000       1370          45
+                 3 PART3    30000           95000        669          44
+                 4 PMAX     MAXVALUE            0          0           0
+
+SYS@orcl> SELECT num_rows, blocks, avg_row_len FROM dba_tables WHERE owner='HR' AND table_name='EMP_BIG';
+
+  NUM_ROWS     BLOCKS AVG_ROW_LEN
+---------- ---------- -----------
+    535000       3797          45
+
+SYS@orcl> SELECT SUM(bytes)/1024/1024 AS total_mb FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name='EMP_BIG';
+
+  TOTAL_MB
+----------
+        40
+
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SET ARRAYSIZE 1000
+
+-- 107건 x 5000 = 535,000 건. 전체 3797 블록(약 30MB) 이고 세그먼트는 40MB 다.
+-- 급여 분포 때문에 part1 이 24만 5천, part2 가 19만 5천, part3 가 9만 5천,
+-- pmax 는 0건이다. 프루닝 효과를 블록 수로 비교하기에 충분한 크기다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 정적 프루닝
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE salary BETWEEN 5000 AND 8000;
+
+  COUNT(*)
+----------
+    125000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  ftz1p3ybp8dt6, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE
+salary BETWEEN 5000 AND 8000
+
+Plan hash value: 3750428050
+
+----------------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name    | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+----------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |         |      1 |        |       |       |      1 |00:00:00.01 |    1338 |   1336 |
+|   1 |  SORT AGGREGATE         |         |      1 |      1 |       |       |      1 |00:00:00.01 |    1338 |   1336 |
+|   2 |   PARTITION RANGE SINGLE|         |      1 |    120K|     2 |     2 |    125K|00:00:00.01 |    1338 |   1336 |
+|*  3 |    TABLE ACCESS FULL    | EMP_BIG |      1 |    120K|     2 |     2 |    125K|00:00:00.01 |    1338 |   1336 |
+----------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter("SALARY"<=8000)
+
+
+21 rows selected.
+
+-- PARTITION RANGE SINGLE / Pstart 2 / Pstop 2 / Starts 1 / Buffers 1338.
+-- 파티션 하나만 읽었다. 조건값이 파싱 시점에 상수로 주어졌으므로
+-- 옵티마이저가 계획을 만들 때 이미 "2번 파티션" 이라고 확정했다. 이것이 정적 프루닝이다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE salary BETWEEN 3000 AND 8000;
+
+  COUNT(*)
+----------
+    250000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  caq3vh8wa2yf8, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE
+salary BETWEEN 3000 AND 8000
+
+Plan hash value: 1922893587
+
+------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                 | Name    | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT          |         |      1 |        |       |       |      1 |00:00:00.01 |    3064 |   3060 |
+|   1 |  SORT AGGREGATE           |         |      1 |      1 |       |       |      1 |00:00:00.01 |    3064 |   3060 |
+|   2 |   PARTITION RANGE ITERATOR|         |      1 |    140K|     1 |     2 |    250K|00:00:00.01 |    3064 |   3060 |
+|*  3 |    TABLE ACCESS FULL      | EMP_BIG |      2 |    140K|     1 |     2 |    250K|00:00:00.01 |    3064 |   3060 |
+------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(("SALARY"<=8000 AND "SALARY">=3000))
+
+
+21 rows selected.
+
+-- 조건 범위를 넓히면 PARTITION RANGE ITERATOR / 1-2 가 된다.
+-- Starts 는 여전히 1 이지만 하위 TABLE ACCESS FULL 이 두 파티션을 순회한다.
+-- Buffers 3064 = 1338 + 1726 정도로, 읽은 파티션 수만큼 늘었다.
+--
+-- 정리 : 상수 조건이면 Pstart/Pstop 에 숫자가 찍힌다. 숫자가 보이면 정적 프루닝이다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 동적 프루닝과 IN 리스트
+--------------------------------------------------------------------------------
+SYS@orcl> VARIABLE b_start NUMBER
+SYS@orcl> VARIABLE b_stop  NUMBER
+SYS@orcl> EXEC :b_start := 5000
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC :b_stop  := 8000
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big
+  2  WHERE  salary BETWEEN :b_start AND :b_stop;
+
+  COUNT(*)
+----------
+    125000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  23j3bdtpxpbch, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE
+salary BETWEEN :b_start AND :b_stop
+
+Plan hash value: 2442040462
+
+-------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name    | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+-------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |         |      1 |        |       |       |      1 |00:00:00.01 |    1338 |   1336 |
+|   1 |  SORT AGGREGATE            |         |      1 |      1 |       |       |      1 |00:00:00.01 |    1338 |   1336 |
+|*  2 |   FILTER                   |         |      1 |        |       |       |    125K|00:00:00.01 |    1338 |   1336 |
+|   3 |    PARTITION RANGE ITERATOR|         |      1 |    120K|   KEY |   KEY |    125K|00:00:00.01 |    1338 |   1336 |
+|*  4 |     TABLE ACCESS FULL      | EMP_BIG |      1 |    120K|   KEY |   KEY |    125K|00:00:00.01 |    1338 |   1336 |
+-------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(:B_STOP>=:B_START)
+   4 - filter(("SALARY"<=:B_STOP AND "SALARY">=:B_START))
+
+
+23 rows selected.
+
+-- Pstart/Pstop 이 KEY / KEY 다. 숫자가 아니다.
+-- "실행할 때 바인드 값을 보고 정한다" 는 뜻이며 이것이 동적 프루닝이다.
+--
+-- 중요한 확인 : Buffers 가 1338 이다. 정적 프루닝과 똑같다.
+--   KEY 라고 해서 전부 읽는 것이 아니다. 실행 시점에 한 파티션만 읽었다.
+--   실습 01 의 파티션 뷰는 바인드 변수에서 세 분기를 다 읽었다.
+--   파티션 테이블은 그렇지 않다. 이것이 두 방식의 결정적 차이다.
+--
+-- 판정법 : KEY 가 보이면 Starts 와 Buffers 로 실제 읽은 양을 확인한다.
+--          계획만 보고 "프루닝이 안 됐다" 고 단정하면 틀린다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE salary IN (2500, 24000);
+
+  COUNT(*)
+----------
+     35000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  4zhcyv3xa7sp0, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE
+salary IN (2500, 24000)
+
+Plan hash value: 3113840700
+
+----------------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name    | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+----------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |         |      1 |        |       |       |      1 |00:00:00.01 |    2378 |   2375 |
+|   1 |  SORT AGGREGATE         |         |      1 |      1 |       |       |      1 |00:00:00.01 |    2378 |   2375 |
+|   2 |   PARTITION RANGE INLIST|         |      1 |  18448 |KEY(I) |KEY(I) |  35000 |00:00:00.01 |    2378 |   2375 |
+|*  3 |    TABLE ACCESS FULL    | EMP_BIG |      2 |  18448 |KEY(I) |KEY(I) |  35000 |00:00:00.01 |    2378 |   2375 |
+----------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(("SALARY"=2500 OR "SALARY"=24000))
+
+
+21 rows selected.
+
+-- IN 리스트는 PARTITION RANGE INLIST / KEY(I) 다.
+-- (I) 는 inlist 를 뜻한다. Starts=2 로 두 파티션을 읽었다. Buffers 2378.
+-- 값 두 개가 서로 다른 파티션에 있으므로 두 개만 읽은 것이다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 프루닝이 깨지는 세 가지
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big
+  2  WHERE  salary + 0 BETWEEN 5000 AND 8000;
+
+  COUNT(*)
+----------
+    125000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  3jfd7sa01a2jq, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE
+salary + 0 BETWEEN 5000 AND 8000
+
+Plan hash value: 2292081803
+
+-------------------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name    | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+-------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |         |      1 |        |       |       |      1 |00:00:00.02 |    3716 |   3711 |
+|   1 |  SORT AGGREGATE      |         |      1 |      1 |       |       |      1 |00:00:00.02 |    3716 |   3711 |
+|   2 |   PARTITION RANGE ALL|         |      1 |  91736 |     1 |     4 |    125K|00:00:00.02 |    3716 |   3711 |
+|*  3 |    TABLE ACCESS FULL | EMP_BIG |      4 |  91736 |     1 |     4 |    125K|00:00:00.02 |    3716 |   3711 |
+-------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(("SALARY"+0<=8000 AND "SALARY"+0>=5000))
+
+
+21 rows selected.
+
+-- (1) 파티션 키에 연산을 하면 깨진다. salary + 0 은 더 이상 파티션 키가 아니다.
+--     PARTITION RANGE ALL / 1-4 / Starts 4 / Buffers 3716. 전부 읽었다.
+--     +0, *1, NVL(키,0), 키||'' 전부 같은 결과다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big
+  2  WHERE  TO_CHAR(salary) = '6000';
+
+  COUNT(*)
+----------
+     10000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  3cbftjf0m5t7t, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE
+TO_CHAR(salary) = '6000'
+
+Plan hash value: 2292081803
+
+-------------------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name    | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+-------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |         |      1 |        |       |       |      1 |00:00:00.04 |    3716 |   3711 |
+|   1 |  SORT AGGREGATE      |         |      1 |      1 |       |       |      1 |00:00:00.04 |    3716 |   3711 |
+|   2 |   PARTITION RANGE ALL|         |      1 |   9224 |     1 |     4 |  10000 |00:00:00.04 |    3716 |   3711 |
+|*  3 |    TABLE ACCESS FULL | EMP_BIG |      4 |   9224 |     1 |     4 |  10000 |00:00:00.04 |    3716 |   3711 |
+-------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(TO_CHAR("SALARY")='6000')
+
+
+21 rows selected.
+
+-- (2) 형 변환도 같다. TO_CHAR(salary) 는 파티션 키가 아니다.
+--     더 위험한 경우는 암시적 형 변환이다. 문자형 파티션 키에 숫자를 비교하면
+--     Oracle 이 키 쪽에 TO_NUMBER 를 씌우면서 조용히 프루닝이 사라진다.
+--     -> 파티션 키의 타입과 조건값의 타입을 반드시 일치시킨다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE department_id = 50;
+
+  COUNT(*)
+----------
+    225000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  475hc8k2cakxp, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE
+department_id = 50
+
+Plan hash value: 2292081803
+
+-------------------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name    | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+-------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |         |      1 |        |       |       |      1 |00:00:00.01 |    3716 |   3711 |
+|   1 |  SORT AGGREGATE      |         |      1 |      1 |       |       |      1 |00:00:00.01 |    3716 |   3711 |
+|   2 |   PARTITION RANGE ALL|         |      1 |  48182 |     1 |     4 |    225K|00:00:00.01 |    3716 |   3711 |
+|*  3 |    TABLE ACCESS FULL | EMP_BIG |      4 |  48182 |     1 |     4 |    225K|00:00:00.01 |    3716 |   3711 |
+-------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter("DEPARTMENT_ID"=50)
+
+
+21 rows selected.
+
+-- (3) 파티션 키가 조건에 아예 없으면 당연히 전부 읽는다.
+--     Buffers 3716 은 (1)(2) 와 같다. 즉 프루닝 실패는 모두 같은 비용이다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big
+  2  WHERE  salary < 5000 OR department_id = 50;
+
+  COUNT(*)
+----------
+    270000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  4bavgb7ra8qfg, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_big WHERE
+salary < 5000 OR department_id = 50
+
+Plan hash value: 2292081803
+
+-------------------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name    | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+-------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |         |      1 |        |       |       |      1 |00:00:00.02 |    3716 |   3711 |
+|   1 |  SORT AGGREGATE      |         |      1 |      1 |       |       |      1 |00:00:00.02 |    3716 |   3711 |
+|   2 |   PARTITION RANGE ALL|         |      1 |    112K|     1 |     4 |    270K|00:00:00.02 |    3716 |   3711 |
+|*  3 |    TABLE ACCESS FULL | EMP_BIG |      4 |    112K|     1 |     4 |    270K|00:00:00.02 |    3716 |   3711 |
+-------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(("SALARY"<5000 OR "DEPARTMENT_ID"=50))
+
+
+21 rows selected.
+
+-- OR 로 묶인 조건도 전체 스캔이 된다.
+--   salary < 5000 OR department_id = 50
+--   파티션 키가 없는 쪽 조건 때문에 어느 파티션에도 답이 있을 수 있으므로 전부 읽어야 한다.
+--   OR 를 UNION ALL 로 분해하면 앞쪽 분기만 프루닝된다. 튜닝 관점에서 검토할 만하다.
+
+--------------------------------------------------------------------------------
+[7] 정리 — 조인이 만드는 실행 시점 프루닝
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*)
+  2  FROM   hr.emp_big b, hr.employees s
+  3  WHERE  b.salary = s.salary AND s.employee_id = 103;
+
+  COUNT(*)
+----------
+     20000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  bjtmjgjk5y8wg, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM   hr.emp_big b,
+hr.employees s WHERE  b.salary = s.salary AND s.employee_id = 103
+
+Plan hash value: 3050288026
+
+----------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name          | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+----------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |               |      1 |        |       |       |      1 |00:00:00.01 |    1340 |   1336 |
+|   1 |  SORT AGGREGATE               |               |      1 |      1 |       |       |      1 |00:00:00.01 |    1340 |   1336 |
+|   2 |   NESTED LOOPS                |               |      1 |   9224 |       |       |  20000 |00:00:00.01 |    1340 |   1336 |
+|   3 |    TABLE ACCESS BY INDEX ROWID| EMPLOYEES     |      1 |      1 |       |       |      1 |00:00:00.01 |       2 |      0 |
+|*  4 |     INDEX UNIQUE SCAN         | EMP_EMP_ID_PK |      1 |      1 |       |       |      1 |00:00:00.01 |       1 |      0 |
+|   5 |    PARTITION RANGE AND        |               |      1 |   9224 |KEY(AP)|KEY(AP)|  20000 |00:00:00.01 |    1338 |   1336 |
+|*  6 |     TABLE ACCESS FULL         | EMP_BIG       |      1 |   9224 |KEY(AP)|KEY(AP)|  20000 |00:00:00.01 |    1338 |   1336 |
+----------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - access("S"."EMPLOYEE_ID"=103)
+   6 - filter(("B"."SALARY"="S"."SALARY" AND "B"."SALARY">0))
+
+
+25 rows selected.
+
+-- PARTITION RANGE AND / KEY(AP) 가 나왔다. AP 는 AND-Pruning 이다.
+-- 조인 상대(employees) 에서 employee_id=103 의 salary 를 먼저 읽고
+-- 그 값으로 emp_big 의 파티션을 실행 시점에 골랐다. Buffers 1338 — 한 파티션만 읽었다.
+-- 조건절에 파티션 키가 없어도 조인 상대가 값을 공급하면 프루닝이 된다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics use_hash(b s) */ COUNT(*)
+  2  FROM   hr.emp_big b, hr.sal_emp s
+  3  WHERE  b.salary = s.salary AND s.employee_id = 102;
+
+  COUNT(*)
+----------
+     10000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  7nj2yghvbfqxs, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics use_hash(b s) */ COUNT(*) FROM
+hr.emp_big b, hr.sal_emp s WHERE  b.salary = s.salary AND s.employee_id
+= 102
+
+Plan hash value: 3824357206
+
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name    | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |  OMem |  1Mem | Used-Mem |
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |         |      1 |        |       |       |      1 |00:00:00.01 |     667 |    651 |       |       |          |
+|   1 |  SORT AGGREGATE               |         |      1 |      1 |       |       |      1 |00:00:00.01 |     667 |    651 |       |       |          |
+|*  2 |   HASH JOIN                   |         |      1 |   9224 |       |       |  10000 |00:00:00.01 |     667 |    651 |  2402K|  2402K|  775K (0)|
+|   3 |    PART JOIN FILTER CREATE    | :BF0000 |      1 |      1 |       |       |      1 |00:00:00.01 |      14 |      0 |       |       |          |
+|   4 |     PARTITION RANGE ALL       |         |      1 |      1 |     1 |     5 |      1 |00:00:00.01 |      14 |      0 |       |       |          |
+|*  5 |      TABLE ACCESS FULL        | SAL_EMP |      5 |      1 |     1 |     5 |      1 |00:00:00.01 |      14 |      0 |       |       |          |
+|   6 |    PARTITION RANGE JOIN-FILTER|         |      1 |    535K|:BF0000|:BF0000|  95000 |00:00:00.01 |     652 |    651 |       |       |          |
+|   7 |     TABLE ACCESS FULL         | EMP_BIG |      1 |    535K|:BF0000|:BF0000|  95000 |00:00:00.01 |     652 |    651 |       |       |          |
+-------------------------------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("B"."SALARY"="S"."SALARY")
+   5 - filter("S"."EMPLOYEE_ID"=102)
+
+
+27 rows selected.
+
+-- 해시 조인이면 블룸 필터로 프루닝한다.
+--   PART JOIN FILTER CREATE :BF0000   빌드 쪽에서 필터를 만든다
+--   PARTITION RANGE JOIN-FILTER       프로브 쪽이 그 필터로 파티션을 고른다
+--   A-Rows 95000 — part3(9만 5천 건) 하나만 읽었다. Buffers 652.
+--   전체 스캔(3716) 의 1/5 다.
+--
+-- Pstart/Pstop 값 읽는 표 (지금까지 나온 것 전부)
+--
+--   표시      | 의미
+--   ----------|--------------------------------------------------------------
+--   2 / 2     | 2번 파티션 하나 (정적 프루닝)
+--   1 / 2     | 1~2번 파티션 (정적, 범위)
+--   1 / 4     | 전체 (프루닝 없음)
+--   KEY       | 실행 시점 결정 (바인드 변수)
+--   KEY(I)    | 실행 시점 결정, IN 리스트
+--   KEY(AP)   | 실행 시점 결정, 조인 상대가 값 공급 (AND-Pruning)
+--   :BF0000   | 블룸 필터로 결정 (해시 조인)
+--
+-- 이 실습의 테이블은 다음 실습에서 쓰지 않는다.
+--   DROP TABLE hr.emp_big PURGE;
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. 프루닝 판정은 세 값을 함께 본다. 연산 이름 · Pstart/Pstop · Starts.
+--    연산 이름에 ALL 이 있으면 무조건 실패다. SINGLE·ITERATOR·INLIST 는 성공이다.
+--    KEY 계열은 Starts 와 Buffers 로 실제 읽은 양을 확인해야 판정할 수 있다.
+--
+-- 2. 파티션 키에는 아무 연산도 하지 않는다.
+--    이것은 인덱스 컬럼을 가공하지 말라는 원칙과 완전히 같다.
+--    함수·연산·형 변환이 필요하면 조건값 쪽을 가공한다.
+--
+-- 3. 암시적 형 변환이 가장 찾기 어려운 원인이다.
+--    문자형 파티션 키(예: yyyymm VARCHAR2(6)) 에 숫자를 넣는 코드가 흔하다.
+--    파티션 키는 되도록 DATE 나 NUMBER 로 잡고, 문자형이면 조건값도 문자로 준다.
+--
+-- 4. 성능 검증은 운영과 같은 형태로 한다.
+--    상수로 테스트하면 정적 프루닝이라 항상 빠르다.
+--    애플리케이션은 바인드 변수를 쓰므로 바인드로 다시 측정해야 한다.
+--
+-- 5. 조인 프루닝(KEY(AP) · 블룸 필터) 은 설계할 수 있는 최적화다.
+--    큰 파티션 테이블을 작은 차원 테이블과 조인하는 형태(스타 스키마) 에서 자동으로 걸린다.
+--    반대로 조인 순서가 뒤집히면 사라진다. 계획이 바뀌면 이것부터 확인한다.
+--
+-- 6. 파티션 키 선택은 조회 패턴이 결정한다.
+--    v$sql 에서 그 테이블을 읽는 상위 SQL 의 WHERE 절을 모아 빈도를 세고,
+--    가장 많이 쓰이는 컬럼을 키로 잡는다. 관리 편의보다 조회 패턴이 우선이다.
+================================================================================
+ 실습 08 끝
+================================================================================

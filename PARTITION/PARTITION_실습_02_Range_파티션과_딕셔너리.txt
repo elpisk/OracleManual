@@ -1,0 +1,414 @@
+================================================================================
+ 파티셔닝 실습 02 : RANGE 파티션과 딕셔너리 읽기
+ 과정      : Oracle Database 19c 파티셔닝 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 50분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 입사일(hire_date) 로 연도별 RANGE 파티션 테이블을 만든다.
+-- RANGE 는 가장 많이 쓰이는 방식이다. 날짜로 자르는 이력·로그·거래 테이블이 전부 이것이다.
+--
+-- 목표
+--   (1) CREATE TABLE ... PARTITION BY RANGE 구문을 손에 익힌다
+--   (2) 파티션 정보를 어느 딕셔너리에서 보는지 외운다
+--       dba_part_tables / dba_tab_partitions / dba_part_key_columns
+--   (3) 파티션 하나가 세그먼트 하나임을 확인한다 (그리고 8MB 라는 사실을 만난다)
+--   (4) PARTITION (이름) · PARTITION FOR (값) 로 한 파티션만 조회한다
+--   (5) 프루닝이 되는 계획과 안 되는 계획을 나란히 본다
+-- 작업 유형 : 구조 확인
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 01 의 뒷정리가 끝나 있다 (hr.part1~3, hr.emp_part_vw 없음)
+-- · hr.employees 의 입사일은 2001-01-13 ~ 2008-04-21 이다
+--   따라서 2005·2006·2007 경계로 자르면 pmax 에 2007~2008년 데이터가 모인다
+-- · USERS 테이블스페이스에 최소 40MB 의 여유가 필요하다 (이유는 [5] 에서 밝혀진다)
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — RANGE 파티션 테이블 생성
+--------------------------------------------------------------------------------
+-- VALUES LESS THAN 은 "미만" 이다. 경계값 자신은 다음 파티션으로 간다.
+-- 마지막 MAXVALUE 파티션이 없으면 범위를 넘는 값은 INSERT 가 실패한다([6] 에서 확인).
+-- CREATE TABLE ... AS SELECT 로 만들면서 데이터까지 한 번에 넣는다.
+
+SYS@orcl> CREATE TABLE hr.emp_yr
+  2  PARTITION BY RANGE (hire_date)
+  3  (PARTITION p2004 VALUES LESS THAN (TO_DATE('2005-01-01','YYYY-MM-DD')),
+  4   PARTITION p2005 VALUES LESS THAN (TO_DATE('2006-01-01','YYYY-MM-DD')),
+  5   PARTITION p2006 VALUES LESS THAN (TO_DATE('2007-01-01','YYYY-MM-DD')),
+  6   PARTITION pmax  VALUES LESS THAN (MAXVALUE))
+  7  TABLESPACE users
+  8  AS SELECT employee_id, last_name, salary, hire_date, department_id FROM hr.employees;
+
+Table created.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 딕셔너리 세 개를 읽는다
+--------------------------------------------------------------------------------
+-- 통계를 아직 수집하지 않았으므로 num_rows / blocks / avg_row_len 은 비어 있다.
+-- high_value 는 LONG 타입이다. SUBSTR·비교·조인이 안 되고 SET LONG 으로 길이를 늘려야 보인다.
+
+SYS@orcl> COL table_name FORMAT a10
+SYS@orcl> COL partition_name FORMAT a8
+SYS@orcl> COL high_value FORMAT a46
+SYS@orcl> COL tablespace_name FORMAT a10
+SYS@orcl> SELECT partition_position, partition_name, high_value, tablespace_name,
+  2         num_rows, blocks, avg_row_len
+  3  FROM   dba_tab_partitions
+  4  WHERE  table_owner = 'HR' AND table_name = 'EMP_YR'
+  5  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE                                     TABLESPACE   NUM_ROWS     BLOCKS AVG_ROW_LEN
+------------------ -------- ---------------------------------------------- ---------- ---------- ---------- -----------
+                 1 P2004    TO_DATE(' 2005-01-01 00:00:00', 'SYYYY-MM-DD H USERS
+                            H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 2 P2005    TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD H USERS
+                            H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 3 P2006    TO_DATE(' 2007-01-01 00:00:00', 'SYYYY-MM-DD H USERS
+                            H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 4 PMAX     MAXVALUE                                       USERS
+
+-- 통계를 수집하면 파티션별 건수가 채워진다.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_YR')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT partition_position, partition_name, num_rows, blocks, avg_row_len
+  2  FROM   dba_tab_partitions
+  3  WHERE  table_owner = 'HR' AND table_name = 'EMP_YR'
+  4  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO   NUM_ROWS     BLOCKS AVG_ROW_LEN
+------------------ -------- ---------- ---------- -----------
+                 1 P2004            24         19          25
+                 2 P2005            29         19          25
+                 3 P2006            24         19          25
+                 4 PMAX             30         19          25
+
+SYS@orcl> SELECT num_rows, blocks, avg_row_len FROM dba_tables
+  2  WHERE  owner='HR' AND table_name='EMP_YR';
+
+  NUM_ROWS     BLOCKS AVG_ROW_LEN
+---------- ---------- -----------
+       107         76          25
+
+-- 24 + 29 + 24 + 30 = 107. 테이블 전체 통계(num_rows 107) 와 합이 맞는다.
+-- 파티션 통계와 테이블 통계는 별도로 저장된다. 옵티마이저는 조건에 따라 둘 중 하나를 쓴다.
+
+-- 파티션 방식과 파티션 개수는 dba_part_tables 에 있다.
+
+SYS@orcl> SELECT partitioning_type, partition_count, def_tablespace_name, status
+  2  FROM   dba_part_tables WHERE owner='HR' AND table_name='EMP_YR';
+
+PARTITION PARTITION_COUNT DEF_TABLESPACE_NAME            STATUS
+--------- --------------- ------------------------------ --------
+RANGE                   4 USERS                          VALID
+
+SYS@orcl> COL name FORMAT a10
+SYS@orcl> COL column_name FORMAT a14
+SYS@orcl> SELECT owner, name, object_type, column_name, column_position
+  2  FROM   dba_part_key_columns WHERE owner='HR' AND name='EMP_YR';
+
+OWNER                                                                                                                            NAME       OBJEC COLUMN_NAME    COLUMN_POSITION
+-------------------------------------------------------------------------------------------------------------------------------- ---------- ----- -------------- ---------------
+HR                                                                                                                               EMP_YR     TABLE HIRE_DATE                    1
+
+-- 파티션 키 컬럼은 dba_part_key_columns 다. 여러 컬럼이면 column_position 으로 순서를 본다.
+-- 주의 : 이 뷰의 컬럼 이름은 table_name 이 아니라 name 이다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 세그먼트와 파티션 단위 조회
+--------------------------------------------------------------------------------
+SYS@orcl> COL segment_name FORMAT a10
+SYS@orcl> SELECT segment_name, partition_name, segment_type, bytes/1024 AS kb, blocks, extents
+  2  FROM   dba_segments WHERE owner='HR' AND segment_name='EMP_YR'
+  3  ORDER  BY partition_name;
+
+SEGMENT_NA PARTITIO SEGMENT_TYPE               KB     BLOCKS    EXTENTS
+---------- -------- ------------------ ---------- ---------- ----------
+EMP_YR     P2004    TABLE PARTITION          8192       1024          1
+EMP_YR     P2005    TABLE PARTITION          8192       1024          1
+EMP_YR     P2006    TABLE PARTITION          8192       1024          1
+EMP_YR     PMAX     TABLE PARTITION          8192       1024          1
+
+-- 파티션 하나가 세그먼트 하나다. segment_type 이 TABLE PARTITION 으로 나온다.
+--
+-- 여기서 눈에 걸리는 숫자가 있다. 파티션마다 8192KB(8MB) · 1024블록 · 익스텐트 1개다.
+-- 107건짜리 테이블이 32MB 를 잡았다. USERS 는 초기 익스텐트 64KB 의 AUTOALLOCATE 인데도 그렇다.
+-- 이유는 숨은 파라미터다.
+--
+--   _partition_large_extents = TRUE   (12c 이후 기본값)
+--     파티션 세그먼트의 첫 익스텐트를 8MB 로 잡는다. 대용량 스캔 성능을 위한 기본값이다.
+--   _index_partition_large_extents = FALSE
+--     인덱스 파티션은 해당되지 않는다 (실습 09 에서 확인한다)
+--
+-- 운영에서 의미하는 것
+--   · 파티션 100개를 만들면 데이터가 없어도 800MB 를 먼저 잡는다
+--   · 월별 파티션을 5년치 미리 만들어 두는 설계는 용량 계획을 다시 해야 한다
+--   · 작은 파티션이 많은 설계라면 테이블스페이스를 UNIFORM SIZE 로 만들거나
+--     세그먼트 생성을 늦추는(deferred) 쪽을 검토한다 (실습 03 에서 다룬다)
+
+-- 이제 파티션 하나만 조회해 본다.
+
+SYS@orcl> SELECT COUNT(*) AS all_rows FROM hr.emp_yr;
+
+  ALL_ROWS
+----------
+       107
+
+SYS@orcl> SELECT COUNT(*) AS p2004 FROM hr.emp_yr PARTITION (p2004);
+
+     P2004
+----------
+        24
+
+SYS@orcl> SELECT COUNT(*) AS p2005 FROM hr.emp_yr PARTITION (p2005);
+
+     P2005
+----------
+        29
+
+SYS@orcl> SELECT COUNT(*) AS p2006 FROM hr.emp_yr PARTITION (p2006);
+
+     P2006
+----------
+        24
+
+SYS@orcl> SELECT COUNT(*) AS pmax  FROM hr.emp_yr PARTITION (pmax);
+
+      PMAX
+----------
+        30
+
+SYS@orcl> SELECT COUNT(*) AS pfor FROM hr.emp_yr PARTITION FOR (TO_DATE('2005-06-01','YYYY-MM-DD'));
+
+      PFOR
+----------
+        29
+
+SYS@orcl> SELECT COUNT(*) AS wrong_name FROM hr.emp_yr PARTITION (p2099);
+SELECT COUNT(*) AS wrong_name FROM hr.emp_yr PARTITION (p2099)
+                                                        *
+ERROR at line 1:
+ORA-02149: Specified partition does not exist
+
+-- 세 가지 표기를 기억한다.
+--   PARTITION (p2005)                        이름으로 지정
+--   PARTITION FOR (값)                       값이 속한 파티션을 찾아서 지정
+--                                            SYS_P 로 자동 생성된 이름을 모를 때 유용하다
+--   없는 이름                                ORA-02149
+--
+-- PARTITION FOR (TO_DATE('2005-06-01')) 이 p2005 와 같은 29건을 돌려줬다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 프루닝과 경계
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_yr
+  2  WHERE  hire_date >= TO_DATE('2005-01-01','YYYY-MM-DD')
+  3  AND    hire_date <  TO_DATE('2006-01-01','YYYY-MM-DD');
+
+  COUNT(*)
+----------
+        29
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  42xyd67x5cbfd, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_yr WHERE
+hire_date >= TO_DATE('2005-01-01','YYYY-MM-DD') AND    hire_date <
+TO_DATE('2006-01-01','YYYY-MM-DD')
+
+Plan hash value: 3894278672
+
+------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name   | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |        |      1 |        |       |       |      1 |00:00:00.01 |       2 |
+|   1 |  SORT AGGREGATE         |        |      1 |      1 |       |       |      1 |00:00:00.01 |       2 |
+|   2 |   PARTITION RANGE SINGLE|        |      1 |     29 |     2 |     2 |     29 |00:00:00.01 |       2 |
+|   3 |    TABLE ACCESS FULL    | EMP_YR |      1 |     29 |     2 |     2 |     29 |00:00:00.01 |       2 |
+------------------------------------------------------------------------------------------------------------
+
+
+17 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_yr WHERE salary > 10000;
+
+  COUNT(*)
+----------
+        15
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  fkbhxtxudbzug, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_yr WHERE
+salary > 10000
+
+Plan hash value: 3858821582
+
+---------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name   | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |        |      1 |        |       |       |      1 |00:00:00.01 |       8 |
+|   1 |  SORT AGGREGATE      |        |      1 |      1 |       |       |      1 |00:00:00.01 |       8 |
+|   2 |   PARTITION RANGE ALL|        |      1 |     68 |     1 |     4 |     15 |00:00:00.01 |       8 |
+|*  3 |    TABLE ACCESS FULL | EMP_YR |      4 |     68 |     1 |     4 |     15 |00:00:00.01 |       8 |
+---------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter("SALARY">10000)
+
+
+21 rows selected.
+
+-- 두 계획의 차이가 파티셔닝의 전부라고 해도 된다.
+--
+--   조건        | 연산                    | Pstart/Pstop | Starts | Buffers
+--   ------------|-------------------------|--------------|--------|--------
+--   hire_date   | PARTITION RANGE SINGLE  | 2 / 2        | 1      | 2
+--   salary      | PARTITION RANGE ALL     | 1 / 4        | 4      | 8
+--
+-- · Pstart/Pstop 은 읽을 파티션의 번호 범위다. 2/2 는 두 번째 파티션 하나만 읽었다는 뜻이다.
+-- · SINGLE / ITERATOR / ALL / INLIST 같은 연산 이름으로 프루닝 정도를 바로 알 수 있다.
+-- · 파티션 키가 조건에 없으면 프루닝이 없다. 전부 읽는다.
+--   -> 파티션 키 선택이 곧 성능 설계다. 자주 쓰는 조건 컬럼을 키로 잡아야 한다.
+
+-- 경계를 넘는 값은 어디로 가는가. MAXVALUE 없이 만들어 본다.
+
+SYS@orcl> CREATE TABLE hr.emp_yr_nomax
+  2  PARTITION BY RANGE (hire_date)
+  3  (PARTITION p2004 VALUES LESS THAN (TO_DATE('2005-01-01','YYYY-MM-DD')),
+  4   PARTITION p2005 VALUES LESS THAN (TO_DATE('2006-01-01','YYYY-MM-DD')))
+  5  TABLESPACE users
+  6  AS SELECT employee_id, last_name, salary, hire_date, department_id FROM hr.employees
+  7  WHERE  hire_date < TO_DATE('2006-01-01','YYYY-MM-DD');
+
+Table created.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_yr_nomax;
+
+  COUNT(*)
+----------
+        53
+
+SYS@orcl> INSERT INTO hr.emp_yr_nomax VALUES (900,'NEWCOMER',3000,TO_DATE('2007-03-01','YYYY-MM-DD'),10);
+INSERT INTO hr.emp_yr_nomax VALUES (900,'NEWCOMER',3000,TO_DATE('2007-03-01','YYYY-MM-DD'),10)
+               *
+ERROR at line 1:
+ORA-14400: inserted partition key does not map to any partition
+
+
+SYS@orcl> SELECT partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_YR_NOMAX' ORDER BY partition_position;
+
+PARTITIO HIGH_VALUE
+-------- ----------------------------------------------
+P2004    TO_DATE(' 2005-01-01 00:00:00', 'SYYYY-MM-DD H
+         H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+P2005    TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD H
+         H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+
+SYS@orcl> DROP TABLE hr.emp_yr_nomax PURGE;
+
+Table dropped.
+
+-- ORA-14400 : inserted partition key does not map to any partition
+--   RANGE 파티션에서 가장 많이 보는 오류다. 운영 중 야간 배치가 이것 때문에 죽는다.
+--   대책 세 가지
+--     ① MAXVALUE 파티션을 둔다 (가장 간단, 단 그 파티션이 계속 커진다)
+--     ② INTERVAL 파티션으로 자동 생성하게 한다 (실습 03)
+--     ③ 미래 파티션을 미리 만들어 두고 주기적으로 추가한다 (자동화 필요)
+
+-- 파티션 키 컬럼은 지울 수 없다.
+
+SYS@orcl> ALTER TABLE hr.emp_yr DROP COLUMN hire_date;
+ALTER TABLE hr.emp_yr DROP COLUMN hire_date
+                                  *
+ERROR at line 1:
+ORA-12984: cannot drop partitioning column
+
+
+SYS@orcl> SELECT COUNT(*) AS objs FROM dba_tables WHERE owner='HR' AND table_name='EMP_YR';
+
+      OBJS
+----------
+         1
+
+-- ORA-12984 : cannot drop partitioning column
+--   파티션 키는 테이블 구조의 일부다. 키를 바꾸려면 테이블을 다시 만들어야 한다
+--   (또는 DBMS_REDEFINITION 으로 온라인 재정의).
+--   그래서 키 선택은 되돌리기 어려운 결정이다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- hr.emp_yr 은 실습 03 에서 계속 쓴다. 지우지 않는다.
+-- [5] 에서 확인한 대로 107건이 네 파티션에 24 / 29 / 24 / 30 으로 들어 있다.
+-- 실습 03 은 이 테이블을 INTERVAL 로 바꾸려는 시도로 시작한다.
+--
+-- 이 실습을 여기서 끝내고 환경을 되돌리려면 다음 한 줄이면 된다.
+--   DROP TABLE hr.emp_yr PURGE;
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. 파티션 정보를 보는 딕셔너리 네 개만 외운다.
+--      dba_part_tables        방식(RANGE/LIST/HASH) · 파티션 수 · 기본 테이블스페이스
+--      dba_tab_partitions     파티션별 경계값 · 통계 · 테이블스페이스 · LOGGING
+--      dba_tab_subpartitions  서브파티션 (실습 05)
+--      dba_part_key_columns   파티션 키 컬럼과 순서   (서브파티션은 dba_subpart_key_columns)
+--    인덱스는 dba_part_indexes / dba_ind_partitions 다 (실습 09·10).
+--
+-- 2. high_value 는 LONG 이다. WHERE 에 쓸 수 없고 SUBSTR 도 안 된다.
+--    스크립트에서 다뤄야 하면 PL/SQL 변수로 받거나 XMLTYPE(dbms_xmlgen) 을 쓴다.
+--
+-- 3. 파티션 개수만큼 세그먼트가 생기고, 기본값으로 각각 8MB 를 먼저 잡는다.
+--    "파티션을 잘게 쪼개면 좋다" 는 직관은 용량과 재귀 호출 비용 때문에 틀릴 수 있다.
+--    파티션 하나가 최소 수십만 건 이상은 되도록 설계한다.
+--
+-- 4. MAXVALUE 파티션은 안전장치이자 함정이다.
+--    안전장치 : ORA-14400 을 막는다
+--    함정     : 미래 데이터가 전부 그 하나에 쌓여 프루닝 효과가 사라진다
+--    정기적으로 SPLIT 해서 잘라 내는 절차를 함께 만들어야 한다 (실습 06).
+--
+-- 5. 이 실습에서 본 오류
+--    ORA-02149  없는 파티션 이름 지정        -> dba_tab_partitions 로 이름 확인
+--    ORA-14400  경계에 맞는 파티션 없음      -> MAXVALUE 또는 INTERVAL
+--    ORA-12984  파티션 키 컬럼 삭제          -> 재생성 또는 온라인 재정의
+================================================================================
+ 실습 02 끝
+================================================================================

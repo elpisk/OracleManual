@@ -1,0 +1,436 @@
+================================================================================
+ 파티셔닝 실습 03 : INTERVAL 파티션 — 파티션을 자동으로 만든다
+ 과정      : Oracle Database 19c 파티셔닝 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 45분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- RANGE 파티션의 가장 큰 운영 부담은 "미래 파티션을 누가 만들어 주는가" 다.
+-- 안 만들어 두면 ORA-14400 으로 배치가 죽고, MAXVALUE 를 두면 그 하나가 계속 커진다.
+-- INTERVAL 파티션(11g 도입)은 값이 들어올 때 파티션을 자동으로 만든다.
+--
+-- 목표
+--   (1) RANGE 테이블을 INTERVAL 로 바꾸려다 실패하는 이유를 본다 (MAXVALUE 와 공존 불가)
+--   (2) INTERVAL 파티션을 만들고 자동 생성되는 SYS_P 파티션을 관찰한다
+--   (3) partition_count 가 1048575 로 보이는 이유를 이해한다
+--   (4) 자동 생성된 이름을 의미 있는 이름으로 바꾼다 (RENAME PARTITION FOR)
+--   (5) INTERVAL 을 해제하면 어떻게 되는지 확인한다
+-- 작업 유형 : 구조 변경
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 02 의 hr.emp_yr 이 RANGE 4파티션(p2004/p2005/p2006/pmax) 으로 있다
+-- · NLS_DATE_FORMAT 이 YYYY-MM-DD HH24:MI:SS 로 설정돼 있다
+--   (아니면 TO_DATE 결과 표시가 달라 보인다)
+-- · INTERVAL 파티션은 숫자·날짜 등 산술이 가능한 단일 키에만 쓸 수 있다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — 간격을 만드는 함수
+--------------------------------------------------------------------------------
+-- INTERVAL 절에는 "간격" 을 나타내는 식을 쓴다. 날짜라면 다음 두 함수다.
+--   NUMTOYMINTERVAL(n,'YEAR'|'MONTH')   연·월 간격
+--   NUMTODSINTERVAL(n,'DAY'|'HOUR'|...) 일·시 간격
+-- 숫자 키라면 그냥 상수를 쓴다 : INTERVAL (10000)
+
+SYS@orcl> COL d FORMAT a20
+SYS@orcl> SELECT TO_CHAR(DATE '2026-01-01' + NUMTOYMINTERVAL(1,'year'),'YYYY-MM-DD') AS plus_1y,
+  2         TO_CHAR(DATE '2026-01-01' + NUMTOYMINTERVAL(1,'month'),'YYYY-MM-DD') AS plus_1m,
+  3         TO_CHAR(DATE '2026-01-01' + NUMTODSINTERVAL(7,'day'),'YYYY-MM-DD') AS plus_7d
+  4  FROM   dual;
+
+PLUS_1Y    PLUS_1M    PLUS_7D
+---------- ---------- ----------
+2027-01-01 2026-02-01 2026-01-08
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 기존 테이블을 바꿔 보고, 새로 만든다
+--------------------------------------------------------------------------------
+-- 먼저 실습 02 의 테이블을 그대로 INTERVAL 로 바꿔 본다.
+
+SYS@orcl> ALTER TABLE hr.emp_yr SET INTERVAL (NUMTOYMINTERVAL(1,'year'));
+ALTER TABLE hr.emp_yr SET INTERVAL (NUMTOYMINTERVAL(1,'year'))
+*
+ERROR at line 1:
+ORA-14759: SET INTERVAL is not legal on this table.
+
+-- ORA-14759: SET INTERVAL is not legal on this table.
+--   원인은 pmax(MAXVALUE) 파티션이다.
+--   INTERVAL 은 "마지막 파티션 뒤로 간격을 이어 붙이는" 방식이므로
+--   끝이 MAXVALUE 로 막혀 있으면 이어 붙일 자리가 없다.
+--   바꾸려면 먼저 MAXVALUE 파티션을 DROP 하거나 SPLIT 해야 한다.
+
+-- 그래서 새로 만든다. MAXVALUE 파티션을 두지 않는다.
+
+SYS@orcl> DROP TABLE hr.emp_yr PURGE;
+
+Table dropped.
+
+SYS@orcl> CREATE TABLE hr.emp_yr
+  2  PARTITION BY RANGE (hire_date) INTERVAL (NUMTOYMINTERVAL(1,'year'))
+  3  (PARTITION p2004 VALUES LESS THAN (TO_DATE('2005-01-01','YYYY-MM-DD')),
+  4   PARTITION p2005 VALUES LESS THAN (TO_DATE('2006-01-01','YYYY-MM-DD')),
+  5   PARTITION p2006 VALUES LESS THAN (TO_DATE('2007-01-01','YYYY-MM-DD')))
+  6  TABLESPACE users
+  7  AS SELECT employee_id, last_name, salary, hire_date, department_id FROM hr.employees;
+
+Table created.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 자동 생성된 파티션
+--------------------------------------------------------------------------------
+SYS@orcl> COL partition_name FORMAT a10
+SYS@orcl> COL high_value FORMAT a46
+SYS@orcl> COL interval_expr FORMAT a26
+SYS@orcl> SELECT partition_position, partition_name, high_value, interval AS is_interval,
+  2         segment_created
+  3  FROM   dba_tab_partitions
+  4  WHERE  table_owner='HR' AND table_name='EMP_YR' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITION_ HIGH_VALUE                                     IS_ SEGM
+------------------ ---------- ---------------------------------------------- --- ----
+                 1 P2004      TO_DATE(' 2005-01-01 00:00:00', 'SYYYY-MM-DD H NO  YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 2 P2005      TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD H NO  YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 3 P2006      TO_DATE(' 2007-01-01 00:00:00', 'SYYYY-MM-DD H NO  YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 4 SYS_P612   TO_DATE(' 2008-01-01 00:00:00', 'SYYYY-MM-DD H YES YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 5 SYS_P613   TO_DATE(' 2009-01-01 00:00:00', 'SYYYY-MM-DD H YES YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+
+SYS@orcl> SELECT partitioning_type, partition_count, interval AS interval_expr FROM dba_part_tables
+  2  WHERE  owner='HR' AND table_name='EMP_YR';
+
+PARTITION PARTITION_COUNT INTERVAL_EXPR
+--------- --------------- --------------------------
+RANGE             1048575 NUMTOYMINTERVAL(1,'YEAR')
+
+-- 읽는 법
+--   · 정의할 때 3개만 썼는데 5개가 됐다.
+--     CTAS 가 2007년·2008년 데이터를 넣으면서 SYS_P612 · SYS_P613 을 자동으로 만들었다.
+--   · interval 컬럼(IS_INTERVAL) 이 구분을 알려 준다.
+--       NO  = 만들 때 손으로 정의한 파티션
+--       YES = 간격 규칙으로 자동 생성된 파티션
+--   · high_value 를 보면 자동 생성 파티션도 1년 단위로 정확히 끊겼다.
+--   · partition_count 가 1048575 다. 실제 개수가 아니라 "이론상 상한" 이다.
+--     INTERVAL 테이블의 최대 파티션 수가 1048575(2^20-1) 이기 때문에 그렇게 보인다.
+--     실제 개수는 dba_tab_partitions 를 COUNT 해야 한다.
+
+-- INTERVAL 테이블에는 파티션을 손으로 추가할 수 없다.
+
+SYS@orcl> ALTER TABLE hr.emp_yr ADD PARTITION pmax VALUES LESS THAN (MAXVALUE);
+ALTER TABLE hr.emp_yr ADD PARTITION pmax VALUES LESS THAN (MAXVALUE)
+               *
+ERROR at line 1:
+ORA-14760: ADD PARTITION is not permitted on Interval partitioned objects
+
+-- ORA-14760: ADD PARTITION is not permitted on Interval partitioned objects
+--   MAXVALUE 뿐 아니라 모든 ADD PARTITION 이 막힌다.
+--   파티션 추가는 데이터 INSERT 가 대신한다. 그것이 이 방식의 취지다.
+--   (앞쪽 구간을 늘리고 싶으면 SPLIT 은 가능하다)
+
+-- 한참 뒤의 값을 넣어 본다.
+
+SYS@orcl> SELECT COUNT(*) AS before_cnt FROM hr.emp_yr;
+
+BEFORE_CNT
+----------
+       107
+
+SYS@orcl> INSERT INTO hr.emp_yr VALUES (900,'NEWCOMER',3000,TO_DATE('2012-03-01','YYYY-MM-DD'),10);
+
+1 row created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, interval, segment_created
+  2  FROM   dba_tab_partitions
+  3  WHERE  table_owner='HR' AND table_name='EMP_YR' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITION_ HIGH_VALUE                                     INT SEGM
+------------------ ---------- ---------------------------------------------- --- ----
+                 1 P2004      TO_DATE(' 2005-01-01 00:00:00', 'SYYYY-MM-DD H NO  YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 2 P2005      TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD H NO  YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 3 P2006      TO_DATE(' 2007-01-01 00:00:00', 'SYYYY-MM-DD H NO  YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 4 SYS_P612   TO_DATE(' 2008-01-01 00:00:00', 'SYYYY-MM-DD H YES YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 5 SYS_P613   TO_DATE(' 2009-01-01 00:00:00', 'SYYYY-MM-DD H YES YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 6 SYS_P614   TO_DATE(' 2013-01-01 00:00:00', 'SYYYY-MM-DD H YES YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+
+6 rows selected.
+
+-- 2012-03-01 한 건을 넣었더니 SYS_P614(2013-01-01 미만) 가 생겼다.
+-- 중요한 점 : 2009 ~ 2011 구간 파티션은 만들어지지 않았다.
+--   INTERVAL 은 "필요한 구간만" 만든다. 빈 구간을 채우지 않는다.
+--   따라서 파티션 번호(partition_position) 와 달력 연도는 일치하지 않는다.
+--   Pstart/Pstop 을 연도로 해석하면 안 된다.
+
+SYS@orcl> SELECT segment_name, partition_name, bytes/1024 AS kb, blocks
+  2  FROM   dba_segments WHERE owner='HR' AND segment_name='EMP_YR'
+  3  ORDER  BY partition_name;
+
+SEGMENT_NAME                                                                                                                     PARTITION_         KB     BLOCKS
+-------------------------------------------------------------------------------------------------------------------------------- ---------- ---------- ----------
+EMP_YR                                                                                                                           P2004            8192       1024
+EMP_YR                                                                                                                           P2005            8192       1024
+EMP_YR                                                                                                                           P2006            8192       1024
+EMP_YR                                                                                                                           SYS_P612         8192       1024
+EMP_YR                                                                                                                           SYS_P613         8192       1024
+EMP_YR                                                                                                                           SYS_P614         8192       1024
+
+6 rows selected.
+
+-- 자동 생성 파티션도 8MB 짜리 세그먼트를 갖는다.
+-- 한 건 때문에 8MB 가 생겼다는 뜻이다.
+-- 데이터가 드문드문 들어오는 테이블에 좁은 간격(일별·시간별)을 주면
+-- 세그먼트 수와 용량이 빠르게 늘어난다. 간격은 데이터 유입량에 맞춰 정한다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 이름 바꾸기와 INTERVAL 해제
+--------------------------------------------------------------------------------
+-- SYS_P614 같은 이름은 스크립트에 쓸 수 없다. 재현성이 없기 때문이다.
+-- RENAME PARTITION FOR (값) 을 쓰면 이름을 몰라도 바꿀 수 있다.
+
+SYS@orcl> SELECT partition_name FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_YR' AND partition_name LIKE 'SYS_P%';
+
+PARTITION_
+----------
+SYS_P612
+SYS_P613
+SYS_P614
+
+SYS@orcl> ALTER TABLE hr.emp_yr RENAME PARTITION FOR (TO_DATE('2012-03-01','YYYY-MM-DD')) TO p2012;
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, interval
+  2  FROM   dba_tab_partitions
+  3  WHERE  table_owner='HR' AND table_name='EMP_YR' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITION_ HIGH_VALUE                                     INT
+------------------ ---------- ---------------------------------------------- ---
+                 1 P2004      TO_DATE(' 2005-01-01 00:00:00', 'SYYYY-MM-DD H NO
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 2 P2005      TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD H NO
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 3 P2006      TO_DATE(' 2007-01-01 00:00:00', 'SYYYY-MM-DD H NO
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 4 SYS_P612   TO_DATE(' 2008-01-01 00:00:00', 'SYYYY-MM-DD H YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 5 SYS_P613   TO_DATE(' 2009-01-01 00:00:00', 'SYYYY-MM-DD H YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 6 P2012      TO_DATE(' 2013-01-01 00:00:00', 'SYYYY-MM-DD H YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+
+6 rows selected.
+
+-- 이제 파티션 삭제를 확인한다.
+
+SYS@orcl> ALTER TABLE hr.emp_yr DROP PARTITION p2004;
+
+Table altered.
+
+SYS@orcl> ALTER TABLE hr.emp_yr DROP PARTITION p2012;
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, interval
+  2  FROM   dba_tab_partitions
+  3  WHERE  table_owner='HR' AND table_name='EMP_YR' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITION_ HIGH_VALUE                                     INT
+------------------ ---------- ---------------------------------------------- ---
+                 1 P2005      TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD H NO
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 2 P2006      TO_DATE(' 2007-01-01 00:00:00', 'SYYYY-MM-DD H NO
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 3 SYS_P612   TO_DATE(' 2008-01-01 00:00:00', 'SYYYY-MM-DD H YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 4 SYS_P613   TO_DATE(' 2009-01-01 00:00:00', 'SYYYY-MM-DD H YES
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+-- 관찰
+--   · 맨 앞의 RANGE 파티션(p2004) 을 지웠다. 남은 파티션이 앞으로 당겨졌다.
+--   · 자동 생성 파티션(p2012) 도 똑같이 지울 수 있다.
+--   · 지운 구간에 데이터가 다시 들어오면 그 구간 파티션이 또 자동으로 생긴다.
+--     (RANGE 였다면 ORA-14400 이다)
+
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_YR')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_yr
+  2  WHERE  hire_date >= TO_DATE('2006-01-01','YYYY-MM-DD')
+  3  AND    hire_date <  TO_DATE('2007-01-01','YYYY-MM-DD');
+
+  COUNT(*)
+----------
+        24
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  9wh59ykp1vpdh, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_yr WHERE
+hire_date >= TO_DATE('2006-01-01','YYYY-MM-DD') AND    hire_date <
+TO_DATE('2007-01-01','YYYY-MM-DD')
+
+Plan hash value: 3894278672
+
+------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name   | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |        |      1 |        |       |       |      1 |00:00:00.01 |       2 |
+|   1 |  SORT AGGREGATE         |        |      1 |      1 |       |       |      1 |00:00:00.01 |       2 |
+|   2 |   PARTITION RANGE SINGLE|        |      1 |     24 |     2 |     2 |     24 |00:00:00.01 |       2 |
+|*  3 |    TABLE ACCESS FULL    | EMP_YR |      1 |     24 |     2 |     2 |     24 |00:00:00.01 |       2 |
+------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(("HIRE_DATE">=TO_DATE(' 2006-01-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND
+              "HIRE_DATE"<TO_DATE(' 2007-01-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss')))
+
+
+23 rows selected.
+
+-- 프루닝은 RANGE 와 완전히 같다. PARTITION RANGE SINGLE, Pstart/Pstop 2/2.
+-- INTERVAL 은 "파티션을 만드는 방법" 만 다르고 읽는 방식은 RANGE 다.
+
+-- 마지막으로 INTERVAL 을 해제해 본다.
+
+SYS@orcl> ALTER TABLE hr.emp_yr SET INTERVAL ();
+
+Table altered.
+
+SYS@orcl> SELECT partitioning_type, partition_count, interval AS interval_expr FROM dba_part_tables
+  2  WHERE  owner='HR' AND table_name='EMP_YR';
+
+PARTITION PARTITION_COUNT INTERVAL_EXPR
+--------- --------------- --------------------------
+RANGE                   4
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, interval
+  2  FROM   dba_tab_partitions
+  3  WHERE  table_owner='HR' AND table_name='EMP_YR' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITION_ HIGH_VALUE                                     INT
+------------------ ---------- ---------------------------------------------- ---
+                 1 P2005      TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD H NO
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 2 P2006      TO_DATE(' 2007-01-01 00:00:00', 'SYYYY-MM-DD H NO
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 3 SYS_P612   TO_DATE(' 2008-01-01 00:00:00', 'SYYYY-MM-DD H NO
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 4 SYS_P613   TO_DATE(' 2009-01-01 00:00:00', 'SYYYY-MM-DD H NO
+                              H24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+
+SYS@orcl> INSERT INTO hr.emp_yr VALUES (901,'AFTER_UNSET',3000,TO_DATE('2013-03-01','YYYY-MM-DD'),10);
+INSERT INTO hr.emp_yr VALUES (901,'AFTER_UNSET',3000,TO_DATE('2013-03-01','YYYY-MM-DD'),10)
+               *
+ERROR at line 1:
+ORA-14400: inserted partition key does not map to any partition
+
+
+SYS@orcl> ROLLBACK;
+
+Rollback complete.
+
+-- 관찰
+--   · SET INTERVAL () 로 해제하면 partition_count 가 실제 개수(4) 로 바뀐다.
+--   · 기존 자동 생성 파티션은 그대로 남지만 interval 표시가 전부 NO 로 바뀐다.
+--     즉 평범한 RANGE 파티션이 된다.
+--   · 그 뒤에 범위를 넘는 값을 넣으면 다시 ORA-14400 이다.
+--   -> INTERVAL 은 언제든 켜고 끌 수 있는 속성이다. 데이터 이동이 없다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- 실습 04 는 새 테이블(emp_hash · emp_list) 을 쓴다. emp_yr 은 여기서 지운다.
+--   DROP TABLE hr.emp_yr PURGE;
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. INTERVAL 파티션은 "미래 파티션 관리" 문제를 없앤다.
+--    월별 파티션 테이블의 대부분은 INTERVAL 로 만드는 것이 맞다.
+--    대신 파티션 이름을 예측할 수 없으므로 운영 스크립트는
+--    PARTITION FOR (값) 표기나 dba_tab_partitions 조회로 이름을 찾아 써야 한다.
+--
+-- 2. MAXVALUE 와 INTERVAL 은 공존할 수 없다(ORA-14759).
+--    둘 중 하나를 고르는 것이고, 실무에서는 INTERVAL 이 거의 항상 낫다.
+--
+-- 3. partition_count = 1048575 를 실제 개수로 착각하지 않는다.
+--    모니터링 쿼리는 SELECT COUNT(*) FROM dba_tab_partitions 로 센다.
+--
+-- 4. 간격은 데이터 유입 속도에 맞춘다.
+--    파티션 하나가 8MB 를 먼저 잡으므로(실습 02) 하루 몇 건 들어오는 테이블에
+--    일별 간격을 주면 낭비가 크다. 월별·분기별부터 검토한다.
+--
+-- 5. 이력 보관 정책과 함께 설계한다.
+--    자동 생성은 편하지만 자동 삭제는 없다.
+--    오래된 파티션을 DROP 하거나 EXCHANGE 로 떼어 내는 작업(실습 06·07)은 여전히 필요하다.
+--
+-- 6. 이 실습에서 본 오류
+--    ORA-14759  MAXVALUE 가 있는 테이블에 SET INTERVAL   -> MAXVALUE 제거 후 재시도
+--    ORA-14760  INTERVAL 테이블에 ADD PARTITION          -> INSERT 로 대신한다
+--    ORA-14400  INTERVAL 해제 뒤 범위 밖 INSERT          -> 다시 켜거나 파티션 추가
+================================================================================
+ 실습 03 끝
+================================================================================

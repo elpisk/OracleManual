@@ -1,0 +1,577 @@
+================================================================================
+ 파티셔닝 실습 11 : Data Pump 로 파티션을 내보내고 들여온다
+ 과정      : Oracle Database 19c 파티셔닝 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (SQL) + system (Data Pump), 대상 스키마 HR
+ 소요 시간 : 약 55분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 파티션 테이블은 Data Pump 에서 세 가지 단위로 다룰 수 있다.
+--   테이블 전체          tables=hr.sal_emp
+--   파티션 하나          tables=hr.sal_emp:part2
+--   파티션을 독립 테이블로  partition_options=departition
+--
+-- 이 실습은 실제 장애 대응 순서를 그대로 따라간다.
+--   내보낸다 -> 테이블을 잃는다 -> 되살린다 -> 파티션 하나를 실수로 지운다
+--   -> 덤프에서 DDL 만 뽑아 구조를 확인한다 -> 구조를 복구한다
+--   -> 그 파티션 데이터만 다시 넣는다 -> 파티션 단위 백업·복원을 연습한다
+--
+-- 목표
+--   (1) expdp / impdp 가 파티션을 어떻게 보고하는지 읽는다
+--   (2) sqlfile 로 덤프에서 DDL 만 추출한다
+--   (3) partition_options=merge 로 특정 파티션 데이터만 넣는다
+--   (4) content=data_only 로 데이터만 복원한다
+--   (5) partition_options=departition 으로 파티션을 독립 테이블로 떼어 낸다
+-- 작업 유형 : 논리 백업·복구
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 디렉터리 객체와 OS 디렉터리가 필요하다 (SYS 로 미리 준비한다)
+--     [oracle@oel7v9 ~]$ mkdir -p /home/oracle/datapump
+--     SYS@orcl> CREATE OR REPLACE DIRECTORY dirpump AS '/home/oracle/datapump';
+--     SYS@orcl> GRANT READ, WRITE ON DIRECTORY dirpump TO system;
+-- · system 비밀번호를 알고 있어야 한다 (이 랩은 oracle_4U)
+-- · 실습 07 이후의 hr.sal_emp 는 상태가 복잡하므로 이 실습은 새로 만들어 시작한다
+-- · USERS 에 최소 40MB 여유
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — 깨끗한 파티션 테이블
+--------------------------------------------------------------------------------
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+SYS@orcl> DROP TABLE hr.sal_emp PURGE;
+
+Table dropped.
+
+SYS@orcl> CREATE TABLE hr.sal_emp
+  2  PARTITION BY RANGE (salary)
+  3  (PARTITION part1 VALUES LESS THAN (5000),
+  4   PARTITION part2 VALUES LESS THAN (15000),
+  5   PARTITION part3 VALUES LESS THAN (25000),
+  6   PARTITION pmax  VALUES LESS THAN (MAXVALUE))
+  7  TABLESPACE users
+  8  AS SELECT employee_id, last_name, salary, department_id FROM hr.employees;
+
+Table created.
+
+SYS@orcl> INSERT INTO hr.sal_emp VALUES (900,'highpay',40000,10);
+
+1 row created.
+
+SYS@orcl> INSERT INTO hr.sal_emp VALUES (901,'toppay',52000,20);
+
+1 row created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','SAL_EMP',granularity=>'AUTO')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL partition_name FORMAT a8
+SYS@orcl> COL high_value FORMAT a10
+SYS@orcl> SELECT partition_position, partition_name, high_value, num_rows, blocks
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='SAL_EMP'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE   NUM_ROWS     BLOCKS
+------------------ -------- ---------- ---------- ----------
+                 1 PART1    5000               49         19
+                 2 PART2    15000              55         19
+                 3 PART3    25000               3         19
+                 4 PMAX     MAXVALUE            2       1006
+
+SYS@orcl> COL directory_name FORMAT a12
+SYS@orcl> COL directory_path FORMAT a24
+SYS@orcl> SELECT directory_name, directory_path FROM dba_directories WHERE directory_name='DIRPUMP';
+
+DIRECTORY_NA DIRECTORY_PATH
+------------ ------------------------
+DIRPUMP      /home/oracle/datapump
+
+-- 49 / 55 / 3 / 2 = 109 건이다.
+-- pmax 의 blocks 가 1006 인 것은 실습 07 에서 본 현상이다.
+-- CTAS 로 비어 있던 pmax 에 두 건을 INSERT 하면서 8MB 익스텐트 전체가 포맷됐다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 테이블 전체 내보내기
+--------------------------------------------------------------------------------
+SYS@orcl> EXIT
+[oracle@oel7v9 ~]$ cd /home/oracle/datapump && rm -f *.dmp *.log *.sql && expdp \
+                   system/oracle_4U directory=dirpump tables=hr.sal_emp dumpfile=hr_sal_emp.dmp \
+                   logfile=hr_sal_emp_exp.log
+
+Export: Release 19.0.0.0.0 - Production on Tue Sep 29 11:55:24 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle and/or its affiliates.  All rights reserved.
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Starting "SYSTEM"."SYS_EXPORT_TABLE_01":  system/******** directory=dirpump tables=hr.sal_emp dumpfile=hr_sal_emp.dmp logfile=hr_sal_emp_exp.log 
+Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+Processing object type TABLE_EXPORT/TABLE/TABLE
+. . exported "HR"."SAL_EMP":"PART2"                      7.601 KB      55 rows
+. . exported "HR"."SAL_EMP":"PART1"                      7.468 KB      49 rows
+. . exported "HR"."SAL_EMP":"PART3"                      6.531 KB       3 rows
+. . exported "HR"."SAL_EMP":"PMAX"                       6.507 KB       2 rows
+Master table "SYSTEM"."SYS_EXPORT_TABLE_01" successfully loaded/unloaded
+******************************************************************************
+Dump file set for SYSTEM.SYS_EXPORT_TABLE_01 is:
+  /home/oracle/datapump/hr_sal_emp.dmp
+Job "SYSTEM"."SYS_EXPORT_TABLE_01" successfully completed at Tue Sep 29 11:55:34 2026 elapsed 0 00:00:09
+
+-- expdp 출력을 읽는 법
+--   . . exported "HR"."SAL_EMP":"PART2"   7.601 KB  55 rows
+--   파티션마다 한 줄씩 보고한다. 파티션별 건수를 여기서 확인할 수 있다.
+--   즉 expdp 로그는 그 자체로 파티션별 건수 증빙이 된다. 이관 검증에 쓴다.
+--   작업 단위는 파티션이므로 PARALLEL 을 주면 파티션 단위로 병렬 처리된다.
+
+[oracle@oel7v9 ~]$ ls -l /home/oracle/datapump/
+total 220
+-rw-r-----. 1 oracle dba 221184 Sep 29 11:55 hr_sal_emp.dmp
+-rw-r--r--. 1 oracle dba   1299 Sep 29 11:55 hr_sal_emp_exp.log
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 테이블을 잃고 되살린다
+--------------------------------------------------------------------------------
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+SYS@orcl> DROP TABLE hr.sal_emp PURGE;
+
+Table dropped.
+
+SYS@orcl> SELECT COUNT(*) AS parts FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='SAL_EMP';
+
+     PARTS
+----------
+         0
+
+[oracle@oel7v9 ~]$ impdp system/oracle_4U directory=dirpump tables=hr.sal_emp \
+                   dumpfile=hr_sal_emp.dmp logfile=hr_sal_emp_imp.log
+
+Import: Release 19.0.0.0.0 - Production on Tue Sep 29 11:55:37 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle and/or its affiliates.  All rights reserved.
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Master table "SYSTEM"."SYS_IMPORT_TABLE_01" successfully loaded/unloaded
+Starting "SYSTEM"."SYS_IMPORT_TABLE_01":  system/******** directory=dirpump tables=hr.sal_emp dumpfile=hr_sal_emp.dmp logfile=hr_sal_emp_imp.log 
+Processing object type TABLE_EXPORT/TABLE/TABLE
+Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+. . imported "HR"."SAL_EMP":"PART2"                      7.601 KB      55 rows
+. . imported "HR"."SAL_EMP":"PART1"                      7.468 KB      49 rows
+. . imported "HR"."SAL_EMP":"PART3"                      6.531 KB       3 rows
+. . imported "HR"."SAL_EMP":"PMAX"                       6.507 KB       2 rows
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+Job "SYSTEM"."SYS_IMPORT_TABLE_01" successfully completed at Tue Sep 29 11:55:47 2026 elapsed 0 00:00:10
+
+-- impdp 도 파티션마다 한 줄씩 보고한다. 건수가 export 와 정확히 같다.
+-- 두 로그의 건수를 비교하는 것이 가장 간단한 이관 검증이다.
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+SYS@orcl> COL partition_name FORMAT a8
+SYS@orcl> COL high_value FORMAT a10
+SYS@orcl> SELECT partition_position, partition_name, high_value, num_rows, blocks
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='SAL_EMP'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE   NUM_ROWS     BLOCKS
+------------------ -------- ---------- ---------- ----------
+                 1 PART1    5000               49         19
+                 2 PART2    15000              55         19
+                 3 PART3    25000               3         19
+                 4 PMAX     MAXVALUE            2       1006
+
+SYS@orcl> SELECT COUNT(*) AS total FROM hr.sal_emp;
+
+     TOTAL
+----------
+       109
+
+SYS@orcl> SELECT employee_id, last_name, salary FROM hr.sal_emp PARTITION (pmax) ORDER BY employee_id;
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        900 highpay                        40000
+        901 toppay                         52000
+
+SYS@orcl> ALTER TABLE hr.sal_emp DROP PARTITION pmax;
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='SAL_EMP' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE
+------------------ -------- ----------
+                 1 PART1    5000
+                 2 PART2    15000
+                 3 PART3    25000
+
+SYS@orcl> SELECT COUNT(*) AS total FROM hr.sal_emp;
+
+     TOTAL
+----------
+       107
+
+SYS@orcl> SELECT COUNT(*) FROM hr.sal_emp PARTITION (pmax);
+SELECT COUNT(*) FROM hr.sal_emp PARTITION (pmax)
+                                           *
+ERROR at line 1:
+ORA-02149: Specified partition does not exist
+
+-- 파티션 구조·경계·건수가 그대로 복원됐다.
+-- 그리고 통계까지 함께 왔다 (num_rows 가 채워져 있다).
+-- expdp 는 기본으로 통계를 포함한다. 제외하려면 exclude=statistics 를 쓴다.
+--
+-- 이어서 파티션 하나를 지웠다. DROP PARTITION pmax 로 2건이 사라져 107건이 됐다.
+-- 없는 파티션을 지정하면 ORA-02149 다.
+-- 실제 장애 상황을 만들었으니 이제 덤프로 복구한다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 덤프에서 DDL 만 뽑는다
+--------------------------------------------------------------------------------
+[oracle@oel7v9 ~]$ impdp system/oracle_4U directory=dirpump dumpfile=hr_sal_emp.dmp \
+                   sqlfile=sal_emp_ddl.sql logfile=sqlfile.log
+
+Import: Release 19.0.0.0.0 - Production on Tue Sep 29 11:55:50 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle and/or its affiliates.  All rights reserved.
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Master table "SYSTEM"."SYS_SQL_FILE_FULL_01" successfully loaded/unloaded
+Starting "SYSTEM"."SYS_SQL_FILE_FULL_01":  system/******** directory=dirpump dumpfile=hr_sal_emp.dmp sqlfile=sal_emp_ddl.sql logfile=sqlfile.log 
+Processing object type TABLE_EXPORT/TABLE/TABLE
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+Job "SYSTEM"."SYS_SQL_FILE_FULL_01" successfully completed at Tue Sep 29 11:55:52 2026 elapsed 0 00:00:01
+
+-- sqlfile 은 데이터를 건드리지 않고 DDL 만 파일로 뽑는다.
+-- 덤프 안의 구조를 확인하는 가장 안전한 방법이다. DB 에 아무 변화가 없다.
+
+[oracle@oel7v9 ~]$ sed -n '1,30p' /home/oracle/datapump/sal_emp_ddl.sql
+-- CONNECT SYSTEM
+ALTER SESSION SET EVENTS '10150 TRACE NAME CONTEXT FOREVER, LEVEL 1';
+ALTER SESSION SET EVENTS '10904 TRACE NAME CONTEXT FOREVER, LEVEL 1';
+ALTER SESSION SET EVENTS '25475 TRACE NAME CONTEXT FOREVER, LEVEL 1';
+ALTER SESSION SET EVENTS '10407 TRACE NAME CONTEXT FOREVER, LEVEL 1';
+ALTER SESSION SET EVENTS '10851 TRACE NAME CONTEXT FOREVER, LEVEL 1';
+ALTER SESSION SET EVENTS '22830 TRACE NAME CONTEXT FOREVER, LEVEL 192 ';
+-- new object type path: TABLE_EXPORT/TABLE/TABLE
+CREATE TABLE "HR"."SAL_EMP" 
+   (	"EMPLOYEE_ID" NUMBER(6,0), 
+	"LAST_NAME" VARCHAR2(25 BYTE) NOT NULL ENABLE, 
+	"SALARY" NUMBER(8,2), 
+	"DEPARTMENT_ID" NUMBER(4,0)
+   ) PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+  STORAGE(
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "USERS" 
+  PARTITION BY RANGE ("SALARY") 
+ (PARTITION "PART1"  VALUES LESS THAN (5000) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING 
+  STORAGE(INITIAL 8388608 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "USERS"  READ WRITE , 
+ PARTITION "PART2"  VALUES LESS THAN (15000) SEGMENT CREATION IMMEDIATE 
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255 
+ NOCOMPRESS LOGGING 
+  STORAGE(INITIAL 8388608 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+
+-- 추출된 DDL 에서 확인할 것
+--   · PARTITION BY RANGE ("SALARY") 와 각 파티션의 VALUES LESS THAN 이 그대로 있다
+--     -> 잃어버린 파티션의 경계값을 여기서 알아낼 수 있다. 이것이 복구의 출발점이다
+--   · STORAGE(INITIAL 8388608 ...) 이 파티션마다 붙어 있다
+--     8388608 바이트 = 8MB. 실습 02 에서 본 _partition_large_extents 의 결과다
+--     이 DDL 을 그대로 다른 DB 에서 실행하면 같은 크기로 잡힌다
+--   · SEGMENT CREATION IMMEDIATE 도 그대로 온다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+SYS@orcl> ALTER TABLE hr.sal_emp ADD PARTITION pmax VALUES LESS THAN (MAXVALUE) TABLESPACE users;
+
+Table altered.
+
+SYS@orcl> COL partition_name FORMAT a8
+SYS@orcl> COL high_value FORMAT a10
+SYS@orcl> SELECT partition_position, partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='SAL_EMP' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE
+------------------ -------- ----------
+                 1 PART1    5000
+                 2 PART2    15000
+                 3 PART3    25000
+                 4 PMAX     MAXVALUE
+
+SYS@orcl> SELECT COUNT(*) AS pmax_rows FROM hr.sal_emp PARTITION (pmax);
+
+ PMAX_ROWS
+----------
+         0
+
+-- DDL 을 보고 pmax 를 같은 경계(MAXVALUE) 로 다시 만들었다. 아직 0건이다.
+-- 구조는 복구했고 데이터가 남았다.
+
+--------------------------------------------------------------------------------
+[7] 정리 — 파티션 단위 복원과 분리
+--------------------------------------------------------------------------------
+SYS@orcl> EXIT
+[oracle@oel7v9 ~]$ impdp system/oracle_4U directory=dirpump dumpfile=hr_sal_emp.dmp \
+                   tables=hr.sal_emp:pmax partition_options=merge table_exists_action=append \
+                   logfile=pmax_imp.log
+
+Import: Release 19.0.0.0.0 - Production on Tue Sep 29 11:55:55 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle and/or its affiliates.  All rights reserved.
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Master table "SYSTEM"."SYS_IMPORT_TABLE_01" successfully loaded/unloaded
+Starting "SYSTEM"."SYS_IMPORT_TABLE_01":  system/******** directory=dirpump dumpfile=hr_sal_emp.dmp tables=hr.sal_emp:pmax partition_options=merge table_exists_action=append logfile=pmax_imp.log 
+Processing object type TABLE_EXPORT/TABLE/TABLE
+Table "HR"."SAL_EMP" exists. Data will be appended to existing table but all dependent metadata will be skipped due to table_exists_action of append
+Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+. . imported "HR"."SAL_EMP":"PMAX"                       6.507 KB       2 rows
+Job "SYSTEM"."SYS_IMPORT_TABLE_01" successfully completed at Tue Sep 29 11:55:58 2026 elapsed 0 00:00:03
+
+-- 파티션 단위 import 를 읽는 법
+--   tables=hr.sal_emp:pmax        덤프에서 그 파티션 데이터만 고른다
+--   partition_options=merge       파티션 데이터를 대상 테이블에 "합쳐 넣는다"
+--                                 대상의 파티션 구조를 따르므로 경계가 달라도 된다
+--   table_exists_action=append    테이블이 이미 있으므로 추가한다
+--                                 (기본값 skip 이면 아무 일도 하지 않는다)
+--   -> pmax 의 2건만 들어왔다. 다른 파티션은 건드리지 않았다.
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+SYS@orcl> SELECT employee_id, last_name, salary FROM hr.sal_emp PARTITION (pmax) ORDER BY employee_id;
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        900 highpay                        40000
+        901 toppay                         52000
+
+SYS@orcl> SELECT COUNT(*) AS total FROM hr.sal_emp;
+
+     TOTAL
+----------
+       109
+
+SYS@orcl> SELECT COUNT(*) AS part2_rows FROM hr.sal_emp PARTITION (part2);
+
+PART2_ROWS
+----------
+        55
+
+-- 900·901 이 돌아와 109건이 됐다. 파티션 단위 복구 완료다.
+--
+-- 반대 방향도 해 본다. 파티션 하나만 미리 내보내 두는 것이다.
+
+SYS@orcl> EXIT
+[oracle@oel7v9 ~]$ expdp system/oracle_4U directory=dirpump tables=hr.sal_emp:part2 \
+                   dumpfile=hr_sal_emp_part2.dmp logfile=part2_exp.log
+
+Export: Release 19.0.0.0.0 - Production on Tue Sep 29 11:56:01 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle and/or its affiliates.  All rights reserved.
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Starting "SYSTEM"."SYS_EXPORT_TABLE_01":  system/******** directory=dirpump tables=hr.sal_emp:part2 dumpfile=hr_sal_emp_part2.dmp logfile=part2_exp.log 
+Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+Processing object type TABLE_EXPORT/TABLE/TABLE
+. . exported "HR"."SAL_EMP":"PART2"                      7.601 KB      55 rows
+Master table "SYSTEM"."SYS_EXPORT_TABLE_01" successfully loaded/unloaded
+******************************************************************************
+Dump file set for SYSTEM.SYS_EXPORT_TABLE_01 is:
+  /home/oracle/datapump/hr_sal_emp_part2.dmp
+Job "SYSTEM"."SYS_EXPORT_TABLE_01" successfully completed at Tue Sep 29 11:56:10 2026 elapsed 0 00:00:08
+
+[oracle@oel7v9 ~]$ ls -l /home/oracle/datapump/*.dmp
+-rw-r-----. 1 oracle dba 221184 Sep 29 11:55 /home/oracle/datapump/hr_sal_emp.dmp
+-rw-r-----. 1 oracle dba 196608 Sep 29 11:56 /home/oracle/datapump/hr_sal_emp_part2.dmp
+
+-- tables=hr.sal_emp:part2 로 내보내면 그 파티션만 덤프에 들어간다 (55 rows).
+-- 전체 덤프(212,992바이트) 보다 작은 덤프가 만들어진다.
+-- 대용량 이력 테이블을 파티션 단위로 나눠 백업하는 실무 패턴이 이것이다.
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+SYS@orcl> ALTER TABLE hr.sal_emp TRUNCATE PARTITION part2;
+
+Table truncated.
+
+SYS@orcl> SELECT COUNT(*) AS part2_rows FROM hr.sal_emp PARTITION (part2);
+
+PART2_ROWS
+----------
+         0
+
+SYS@orcl> SELECT COUNT(*) AS total FROM hr.sal_emp;
+
+     TOTAL
+----------
+        54
+
+[oracle@oel7v9 ~]$ impdp system/oracle_4U directory=dirpump dumpfile=hr_sal_emp_part2.dmp \
+                   tables=hr.sal_emp:part2 content=data_only logfile=part2_imp.log
+
+Import: Release 19.0.0.0.0 - Production on Tue Sep 29 11:56:13 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle and/or its affiliates.  All rights reserved.
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Master table "SYSTEM"."SYS_IMPORT_TABLE_01" successfully loaded/unloaded
+Starting "SYSTEM"."SYS_IMPORT_TABLE_01":  system/******** directory=dirpump dumpfile=hr_sal_emp_part2.dmp tables=hr.sal_emp:part2 content=data_only logfile=part2_imp.log 
+Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+. . imported "HR"."SAL_EMP":"PART2"                      7.601 KB      55 rows
+Job "SYSTEM"."SYS_IMPORT_TABLE_01" successfully completed at Tue Sep 29 11:56:17 2026 elapsed 0 00:00:03
+
+-- content=data_only 는 DDL 을 건너뛰고 데이터만 넣는다.
+--   테이블이 이미 있고 구조도 맞을 때 쓴다.
+--   TRUNCATE PARTITION 으로 비운 파티션을 되채우는 표준 방법이다.
+--   구조까지 있는 덤프에 이 옵션을 쓰면 "테이블이 이미 있다" 는 경고를 피할 수 있다.
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+SYS@orcl> SELECT COUNT(*) AS part2_rows FROM hr.sal_emp PARTITION (part2);
+
+PART2_ROWS
+----------
+        55
+
+SYS@orcl> SELECT COUNT(*) AS total FROM hr.sal_emp;
+
+     TOTAL
+----------
+       109
+
+-- 55건이 돌아와 109건이 됐다.
+
+-- 마지막으로 파티션을 독립 테이블로 떼어 낸다.
+
+SYS@orcl> EXIT
+[oracle@oel7v9 ~]$ impdp system/oracle_4U directory=dirpump dumpfile=hr_sal_emp.dmp \
+                   tables=hr.sal_emp partition_options=departition \
+                   remap_table=hr.sal_emp:sal_dept logfile=departition.log
+
+Import: Release 19.0.0.0.0 - Production on Tue Sep 29 11:56:19 2026
+Version 19.3.0.0.0
+
+Copyright (c) 1982, 2019, Oracle and/or its affiliates.  All rights reserved.
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Master table "SYSTEM"."SYS_IMPORT_TABLE_01" successfully loaded/unloaded
+Starting "SYSTEM"."SYS_IMPORT_TABLE_01":  system/******** directory=dirpump dumpfile=hr_sal_emp.dmp tables=hr.sal_emp partition_options=departition remap_table=hr.sal_emp:sal_dept logfile=departition.log 
+Processing object type TABLE_EXPORT/TABLE/TABLE
+Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+. . imported "HR"."SAL_EMP_PART2"                        7.601 KB      55 rows
+. . imported "HR"."SAL_EMP_PART1"                        7.468 KB      49 rows
+. . imported "HR"."SAL_EMP_PART3"                        6.531 KB       3 rows
+. . imported "HR"."SAL_EMP_PMAX"                         6.507 KB       2 rows
+Job "SYSTEM"."SYS_IMPORT_TABLE_01" successfully completed at Tue Sep 29 11:56:23 2026 elapsed 0 00:00:03
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+SYS@orcl> COL table_name FORMAT a22
+SYS@orcl> SELECT table_name, partitioned, num_rows FROM dba_tables
+  2  WHERE  owner='HR' AND (table_name LIKE 'SAL_EMP%' OR table_name LIKE 'SAL_DEPT%')
+  3  ORDER  BY table_name;
+
+TABLE_NAME             PAR   NUM_ROWS
+---------------------- --- ----------
+SAL_EMP                YES          5
+SAL_EMP_PART1          NO
+SAL_EMP_PART2          NO
+SAL_EMP_PART3          NO
+SAL_EMP_PMAX           NO
+
+SYS@orcl> SELECT COUNT(*) AS total FROM hr.sal_emp;
+
+     TOTAL
+----------
+       109
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','SAL_EMP',granularity=>'AUTO')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL partition_name FORMAT a8
+SYS@orcl> SELECT partition_position, partition_name, num_rows, blocks FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='SAL_EMP' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO   NUM_ROWS     BLOCKS
+------------------ -------- ---------- ----------
+                 1 PART1            49         19
+                 2 PART2            55         19
+                 3 PART3             3         19
+                 4 PMAX              2         19
+
+-- partition_options=departition 을 읽는 법
+--   · 파티션마다 별개의 비파티션 테이블을 만든다.
+--     이름은 원본테이블_파티션명 이다 (SAL_EMP_PART1 ... SAL_EMP_PMAX).
+--   · remap_table 을 줬지만 이름 규칙은 그대로였다.
+--     departition 의 이름 규칙이 remap_table 보다 우선한다.
+--   · 용도 : 파티션을 독립 테이블로 보관하거나, 파티션 구조가 다른 DB 로 옮길 때 쓴다.
+--     받은 쪽에서 EXCHANGE PARTITION 으로 원하는 파티션에 붙이면 된다 (실습 07).
+--   · 원본 hr.sal_emp 는 그대로 남아 있다 (109건, partitioned=YES).
+--
+-- 실습 환경 정리
+--   DROP TABLE hr.sal_emp PURGE;
+--   DROP TABLE hr.sal_emp_part1 PURGE;
+--   DROP TABLE hr.sal_emp_part2 PURGE;
+--   DROP TABLE hr.sal_emp_part3 PURGE;
+--   DROP TABLE hr.sal_emp_pmax  PURGE;
+--   DROP TABLE hr.exch_emp PURGE;
+--   DROP TABLESPACE part_arch INCLUDING CONTENTS AND DATAFILES;
+--   DROP DIRECTORY dirpump;
+--   [oracle@oel7v9 ~]$ rm -f /home/oracle/datapump/*
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. expdp / impdp 로그는 파티션별 건수 증빙이다.
+--    이관 검증은 "전체 건수 비교" 가 아니라 "파티션별 건수 비교" 로 한다.
+--    파티션 경계가 달라지면 전체 건수는 같아도 분포가 달라질 수 있다.
+--
+-- 2. 파티션 단위 백업은 대용량 이력 테이블의 현실적인 해법이다.
+--    수억 건 테이블을 통째로 export 하면 시간과 공간이 모두 부담이다.
+--    지난 달 파티션만 내보내고 그 파티션을 DROP 하는 절차가 표준이다.
+--      ① expdp tables=T:P202501
+--      ② 덤프 검증 (impdp sqlfile 로 DDL 확인, 로그 건수 확인)
+--      ③ ALTER TABLE T DROP PARTITION P202501 UPDATE INDEXES
+--
+-- 3. sqlfile 은 복구의 시작점이다.
+--    덤프에서 DDL 만 뽑아 경계값·저장 옵션·인덱스 정의를 확인할 수 있고
+--    DB 에는 아무 변화를 주지 않는다. 복구 계획을 세울 때 가장 먼저 쓴다.
+--
+-- 4. partition_options 세 값의 차이를 구분한다.
+--      none         (기본) 파티션 구조를 그대로 재현한다
+--      merge        파티션 데이터를 대상 테이블 구조에 맞춰 합친다
+--      departition  파티션마다 독립 테이블을 만든다
+--    merge 는 파티션 경계를 재설계하며 이관할 때 쓴다.
+--
+-- 5. table_exists_action 을 반드시 지정한다.
+--      skip (기본)  이미 있으면 아무 일도 하지 않는다. 성공한 것처럼 보인다
+--      append       데이터를 추가한다
+--      truncate     비우고 넣는다
+--      replace      테이블을 지우고 다시 만든다
+--    기본값 skip 때문에 "성공했는데 데이터가 없다" 는 상황이 흔하다.
+--
+-- 6. Data Pump 는 논리 백업이다. 물리 복구를 대체하지 않는다.
+--    파티션 하나를 되살리는 데는 Data Pump 가 가장 간편하지만
+--    시점 복구(PITR) 나 전체 복구는 RMAN 의 일이다. 두 가지를 함께 갖춘다.
+================================================================================
+ 실습 11 끝
+================================================================================

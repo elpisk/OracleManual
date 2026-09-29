@@ -1,0 +1,623 @@
+================================================================================
+ 파티셔닝 실습 09 : 로컬(LOCAL) 파티션 인덱스
+ 과정      : Oracle Database 19c 파티셔닝 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 55분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 파티션 테이블의 인덱스는 두 종류다.
+--   LOCAL  : 테이블 파티션 하나에 인덱스 파티션 하나가 1:1 로 붙는다
+--   GLOBAL : 인덱스가 테이블 파티션 구조와 무관하다 (실습 10)
+--
+-- 운영에서 LOCAL 을 기본으로 삼는 이유는 관리 때문이다.
+-- 테이블 파티션을 DROP·TRUNCATE·EXCHANGE 해도 인덱스가 따라 움직이므로
+-- 다른 파티션의 인덱스는 건드리지 않는다.
+--
+-- 목표
+--   (1) LOCAL 인덱스를 만들고 locality · alignment 를 딕셔너리로 확인한다
+--   (2) 접두(PREFIXED) 와 비접두(NON_PREFIXED) 의 계획 차이를 본다
+--   (3) UNIQUE LOCAL 인덱스의 제약(ORA-14039) 을 확인한다
+--   (4) DROP PARTITION 과 MOVE PARTITION 이 인덱스에 미치는 영향을 비교한다
+--   (5) UPDATE INDEXES 절의 효과를 확인한다
+-- 작업 유형 : 인덱스 설계 + 관리
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 07 에서 만든 part_arch 테이블스페이스가 있다
+-- · USERS 에 최소 60MB 여유 (테이블 파티션 6개 + 인덱스)
+-- · 10만 7천 건(107 x 1000) 테이블을 쓴다. employee_id 를 ROWNUM 으로 다시 만들어
+--   1~107000 이 6개 파티션에 고르게 퍼지게 한다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp_local
+  2  PARTITION BY RANGE (employee_id)
+  3  (PARTITION p1 VALUES LESS THAN (20000),
+  4   PARTITION p2 VALUES LESS THAN (40000),
+  5   PARTITION p3 VALUES LESS THAN (80000),
+  6   PARTITION p4 VALUES LESS THAN (100000),
+  7   PARTITION p5 VALUES LESS THAN (120000),
+  8   PARTITION pmax VALUES LESS THAN (MAXVALUE))
+  9  TABLESPACE users
+ 10  AS SELECT ROWNUM AS employee_id, e.last_name, e.first_name, e.hire_date,
+ 11            e.job_id, e.salary, e.manager_id, e.department_id
+ 12     FROM   hr.employees e, (SELECT LEVEL AS id FROM dual CONNECT BY LEVEL <= 1000);
+
+Table created.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_LOCAL',granularity=>'AUTO')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL partition_name FORMAT a8
+SYS@orcl> COL high_value FORMAT a10
+SYS@orcl> SELECT partition_position, partition_name, high_value, num_rows, blocks
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='EMP_LOCAL'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE   NUM_ROWS     BLOCKS
+------------------ -------- ---------- ---------- ----------
+                 1 P1       20000           19999        154
+                 2 P2       40000           20000        157
+                 3 P3       80000           40000        296
+                 4 P4       100000          20000        157
+                 5 P5       120000           7001         67
+                 6 PMAX     MAXVALUE            0          0
+
+6 rows selected.
+
+SYS@orcl> SELECT num_rows, blocks, avg_row_len FROM dba_tables
+  2  WHERE  owner='HR' AND table_name='EMP_LOCAL';
+
+  NUM_ROWS     BLOCKS AVG_ROW_LEN
+---------- ---------- -----------
+    107000        831          45
+
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SET ARRAYSIZE 1000
+
+-- p1 19999 / p2 20000 / p3 40000 / p4 20000 / p5 7001 / pmax 0 건이다.
+-- 전체 107000건 831블록. 파티션별 블록 수도 건수에 비례한다 (154·157·296·157·67).
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_local WHERE employee_id = 1000;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  f6aynfbuq4ycm, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_local WHERE
+employee_id = 1000
+
+Plan hash value: 3556493850
+
+---------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name      | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |           |      1 |        |       |       |      1 |00:00:00.01 |     139 |
+|   1 |  SORT AGGREGATE         |           |      1 |      1 |       |       |      1 |00:00:00.01 |     139 |
+|   2 |   PARTITION RANGE SINGLE|           |      1 |      1 |     1 |     1 |      1 |00:00:00.01 |     139 |
+|*  3 |    TABLE ACCESS FULL    | EMP_LOCAL |      1 |      1 |     1 |     1 |      1 |00:00:00.01 |     139 |
+---------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter("EMPLOYEE_ID"=1000)
+
+
+21 rows selected.
+
+-- 인덱스가 없으면 employee_id = 1000 조회도 그 파티션을 풀 스캔한다.
+-- 프루닝 덕분에 여섯 파티션 중 하나만 읽지만(Buffers 139) 그 파티션은 통째로 훑는다.
+-- 파티셔닝은 인덱스를 대체하지 않는다. 둘은 곱해서 효과를 낸다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — LOCAL 인덱스 생성
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE UNIQUE INDEX hr.emp_local_idx ON hr.emp_local(employee_id) LOCAL TABLESPACE users;
+
+Index created.
+
+SYS@orcl> COL index_name FORMAT a14
+SYS@orcl> SELECT i.index_name, i.uniqueness, p.locality, p.alignment, i.partitioned, p.partition_count
+  2  FROM   dba_indexes i, dba_part_indexes p
+  3  WHERE  i.owner='HR' AND i.table_name='EMP_LOCAL'
+  4  AND    p.owner = i.owner AND p.index_name = i.index_name;
+
+INDEX_NAME     UNIQUENES LOCALI ALIGNMENT    PAR PARTITION_COUNT
+-------------- --------- ------ ------------ --- ---------------
+EMP_LOCAL_IDX  UNIQUE    LOCAL  PREFIXED     YES               6
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, blevel, leaf_blocks, status
+  2  FROM   dba_ind_partitions WHERE index_owner='HR' AND index_name='EMP_LOCAL_IDX'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE     BLEVEL LEAF_BLOCKS STATUS
+------------------ -------- ---------- ---------- ----------- --------
+                 1 P1       20000               1          41 USABLE
+                 2 P2       40000               1          42 USABLE
+                 3 P3       80000               1          84 USABLE
+                 4 P4       100000              1          42 USABLE
+                 5 P5       120000              1          15 USABLE
+                 6 PMAX     MAXVALUE            0           0 USABLE
+
+6 rows selected.
+
+SYS@orcl> SELECT segment_name, COUNT(*) AS segs, SUM(bytes)/1024/1024 AS mb FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name='EMP_LOCAL_IDX' GROUP BY segment_name;
+
+SEGMENT_NAME                                                                                                                           SEGS         MB
+-------------------------------------------------------------------------------------------------------------------------------- ---------- ----------
+EMP_LOCAL_IDX                                                                                                                             5     2.0625
+
+-- 딕셔너리 두 개를 읽는 법
+--   dba_part_indexes    locality(LOCAL/GLOBAL) · alignment(PREFIXED/NON_PREFIXED) · 파티션 수
+--   dba_ind_partitions  인덱스 파티션별 blevel · leaf_blocks · status
+--
+-- 확인된 값
+--   locality  = LOCAL      테이블 파티션과 1:1
+--   alignment = PREFIXED   인덱스 선두 컬럼이 파티션 키와 같다
+--   partition_count = 6    테이블 파티션 수와 같다. 항상 같다
+--
+-- 인덱스 파티션 세그먼트는 8MB 가 아니다.
+-- _index_partition_large_extents 가 FALSE 이기 때문이다(실습 02 참고).
+-- 그래서 인덱스는 실제 크기만큼만 잡는다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_local WHERE employee_id = 1000;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  f6aynfbuq4ycm, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_local WHERE
+employee_id = 1000
+
+Plan hash value: 1647188264
+
+----------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name          | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+----------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |               |      1 |        |       |       |      1 |00:00:00.01 |       2 |      1 |
+|   1 |  SORT AGGREGATE         |               |      1 |      1 |       |       |      1 |00:00:00.01 |       2 |      1 |
+|   2 |   PARTITION RANGE SINGLE|               |      1 |      1 |     1 |     1 |      1 |00:00:00.01 |       2 |      1 |
+|*  3 |    INDEX UNIQUE SCAN    | EMP_LOCAL_IDX |      1 |      1 |     1 |     1 |      1 |00:00:00.01 |       2 |      1 |
+----------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("EMPLOYEE_ID"=1000)
+
+
+21 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_local
+  2  WHERE  employee_id BETWEEN 1000 AND 1100;
+
+  COUNT(*)
+----------
+       101
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  dr0sz88bzrx0x, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_local WHERE
+employee_id BETWEEN 1000 AND 1100
+
+Plan hash value: 1749182647
+
+----------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name          | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+----------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |               |      1 |        |       |       |      1 |00:00:00.01 |       3 |      1 |
+|   1 |  SORT AGGREGATE         |               |      1 |      1 |       |       |      1 |00:00:00.01 |       3 |      1 |
+|   2 |   PARTITION RANGE SINGLE|               |      1 |    102 |     1 |     1 |    101 |00:00:00.01 |       3 |      1 |
+|*  3 |    INDEX RANGE SCAN     | EMP_LOCAL_IDX |      1 |    102 |     1 |     1 |    101 |00:00:00.01 |       3 |      1 |
+----------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("EMPLOYEE_ID">=1000 AND "EMPLOYEE_ID"<=1100)
+
+
+21 rows selected.
+
+-- 같은 조회의 계획이 바뀌었다.
+--   인덱스 전    TABLE ACCESS FULL        Buffers 139
+--   인덱스 후    INDEX UNIQUE SCAN        Buffers 2
+--
+-- 그리고 상위 연산이 PARTITION RANGE SINGLE 이다. 인덱스도 프루닝된다.
+-- 즉 인덱스 파티션 6개 중 1개만 탐색한다. 이것이 LOCAL 인덱스의 이점이다.
+-- GLOBAL 인덱스라면 하나의 큰 인덱스를 탐색한다. 깊이(blevel) 가 더 깊어질 수 있다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 파티션을 넘는 범위와 비접두 인덱스
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_local
+  2  WHERE  employee_id BETWEEN 1000 AND 25000;
+
+  COUNT(*)
+----------
+     24001
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  chsmrdpny2jpq, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_local WHERE
+employee_id BETWEEN 1000 AND 25000
+
+Plan hash value: 2015578686
+
+------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                 | Name          | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT          |               |      1 |        |       |       |      1 |00:00:00.01 |      53 |     49 |
+|   1 |  SORT AGGREGATE           |               |      1 |      1 |       |       |      1 |00:00:00.01 |      53 |     49 |
+|   2 |   PARTITION RANGE ITERATOR|               |      1 |  24002 |     1 |     2 |  24001 |00:00:00.01 |      53 |     49 |
+|*  3 |    INDEX RANGE SCAN       | EMP_LOCAL_IDX |      2 |  24002 |     1 |     2 |  24001 |00:00:00.01 |      53 |     49 |
+------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("EMPLOYEE_ID">=1000 AND "EMPLOYEE_ID"<=25000)
+
+
+21 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics index_rs(e emp_local_idx) */ COUNT(*)
+  2  FROM   hr.emp_local e WHERE employee_id BETWEEN 1000 AND 25000;
+
+  COUNT(*)
+----------
+     24001
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  dpv3x6xtusjg7, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics index_rs(e emp_local_idx) */ COUNT(*)
+FROM   hr.emp_local e WHERE employee_id BETWEEN 1000 AND 25000
+
+Plan hash value: 2015578686
+
+---------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                 | Name          | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT          |               |      1 |        |       |       |      1 |00:00:00.01 |      53 |
+|   1 |  SORT AGGREGATE           |               |      1 |      1 |       |       |      1 |00:00:00.01 |      53 |
+|   2 |   PARTITION RANGE ITERATOR|               |      1 |  24002 |     1 |     2 |  24001 |00:00:00.01 |      53 |
+|*  3 |    INDEX RANGE SCAN       | EMP_LOCAL_IDX |      2 |  24002 |     1 |     2 |  24001 |00:00:00.01 |      53 |
+---------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("EMPLOYEE_ID">=1000 AND "EMPLOYEE_ID"<=25000)
+
+
+21 rows selected.
+
+-- employee_id BETWEEN 1000 AND 25000 은 p1 과 p2 에 걸친다.
+-- PARTITION RANGE ITERATOR / 1-2 / INDEX RANGE SCAN Starts=2.
+-- 인덱스 파티션을 두 번 탐색한다. Buffers 53.
+--
+-- 두 번째 쿼리는 index_rs 힌트를 준 것인데 계획이 같다.
+-- 옵티마이저가 이미 인덱스를 선택했으므로 힌트가 바꿀 것이 없다.
+-- 힌트를 줘도 계획이 같으면 힌트는 불필요하다. 지우는 것이 맞다.
+
+SYS@orcl> CREATE INDEX hr.emp_local_hd ON hr.emp_local(hire_date) LOCAL TABLESPACE users;
+
+Index created.
+
+SYS@orcl> SELECT i.index_name, i.uniqueness, p.locality, p.alignment, p.partition_count
+  2  FROM   dba_indexes i, dba_part_indexes p
+  3  WHERE  i.owner='HR' AND i.table_name='EMP_LOCAL'
+  4  AND    p.owner = i.owner AND p.index_name = i.index_name
+  5  ORDER  BY i.index_name;
+
+INDEX_NAME     UNIQUENES LOCALI ALIGNMENT    PARTITION_COUNT
+-------------- --------- ------ ------------ ---------------
+EMP_LOCAL_HD   NONUNIQUE LOCAL  NON_PREFIXED               6
+EMP_LOCAL_IDX  UNIQUE    LOCAL  PREFIXED                   6
+
+SYS@orcl> EXEC dbms_stats.gather_index_stats('HR','EMP_LOCAL_HD')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics index_rs(e emp_local_hd) */ COUNT(*)
+  2  FROM   hr.emp_local e
+  3  WHERE  hire_date = TO_DATE('2003-06-17','YYYY-MM-DD');
+
+  COUNT(*)
+----------
+      1000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  6snwjpb4d5fcz, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics index_rs(e emp_local_hd) */ COUNT(*)
+FROM   hr.emp_local e WHERE  hire_date =
+TO_DATE('2003-06-17','YYYY-MM-DD')
+
+Plan hash value: 30933239
+
+---------------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name         | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |              |      1 |        |       |       |      1 |00:00:00.01 |      14 |
+|   1 |  SORT AGGREGATE      |              |      1 |      1 |       |       |      1 |00:00:00.01 |      14 |
+|   2 |   PARTITION RANGE ALL|              |      1 |   1092 |     1 |     6 |   1000 |00:00:00.01 |      14 |
+|*  3 |    INDEX RANGE SCAN  | EMP_LOCAL_HD |      6 |   1092 |     1 |     6 |   1000 |00:00:00.01 |      14 |
+---------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("HIRE_DATE"=TO_DATE(' 2003-06-17 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+
+
+22 rows selected.
+
+-- 비접두(NON_PREFIXED) LOCAL 인덱스
+--   인덱스 선두 컬럼(hire_date) 이 파티션 키(employee_id) 와 다르다 -> NON_PREFIXED.
+--   hire_date 조건만 주면 어느 테이블 파티션에 있는지 알 수 없으므로
+--   PARTITION RANGE ALL 로 인덱스 파티션 6개를 전부 탐색한다 (Starts=6).
+--
+--   접두 / 비접두 비교
+--     PREFIXED     파티션 키가 조건에 있으면 인덱스 파티션 하나만 탐색
+--     NON_PREFIXED 파티션 키가 없으면 인덱스 파티션 전부 탐색
+--
+--   비접두가 항상 나쁜 것은 아니다. 이 예에서 Buffers 는 14 로 작다.
+--   인덱스 파티션 6개를 각각 조금씩 읽는 것이 테이블 풀 스캔보다 훨씬 싸다.
+--   다만 파티션이 수백 개면 그 오버헤드가 커진다. 파티션 수가 판단 기준이다.
+
+SYS@orcl> CREATE UNIQUE INDEX hr.emp_local_u2 ON hr.emp_local(hire_date) LOCAL;
+CREATE UNIQUE INDEX hr.emp_local_u2 ON hr.emp_local(hire_date) LOCAL
+                                          *
+ERROR at line 1:
+ORA-14039: partitioning columns must form a subset of key columns of a UNIQUE index
+
+-- ORA-14039: partitioning columns must form a subset of key columns of a UNIQUE index
+--   UNIQUE LOCAL 인덱스는 파티션 키를 반드시 포함해야 한다.
+--   이유는 구조적이다. LOCAL 인덱스는 파티션마다 독립적이므로
+--   파티션을 가로질러 유일성을 보장할 방법이 없다. 키를 포함하면 각 파티션 안에서만
+--   비교하면 되므로 보장할 수 있다.
+--
+--   결과적으로 파티션 테이블의 기본키 설계는 둘 중 하나다.
+--     ① 기본키에 파티션 키를 포함시킨다 -> UNIQUE LOCAL 인덱스 가능 (권장)
+--     ② 기본키를 그대로 두고 GLOBAL 인덱스로 만든다 -> 관리 비용이 늘어난다 (실습 10)
+--   ①을 택하려면 설계 단계에서 결정해야 한다. 나중에 바꾸기 어렵다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 파티션 DDL 과 인덱스 상태
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT partition_name, status FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='EMP_LOCAL_IDX' ORDER BY partition_position;
+
+PARTITIO STATUS
+-------- --------
+P1       USABLE
+P2       USABLE
+P3       USABLE
+P4       USABLE
+P5       USABLE
+PMAX     USABLE
+
+6 rows selected.
+
+SYS@orcl> ALTER TABLE hr.emp_local DROP PARTITION p5;
+
+Table altered.
+
+SYS@orcl> SELECT partition_name, status FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='EMP_LOCAL_IDX' ORDER BY partition_position;
+
+PARTITIO STATUS
+-------- --------
+P1       USABLE
+P2       USABLE
+P3       USABLE
+P4       USABLE
+PMAX     USABLE
+
+SYS@orcl> SELECT COUNT(*) AS rows_left FROM hr.emp_local;
+
+ ROWS_LEFT
+----------
+     99999
+
+-- DROP PARTITION p5 를 했다. 결과를 정확히 읽는다.
+--   · 인덱스 파티션도 함께 사라졌다 (6개 -> 5개). 자동이다.
+--   · 남은 인덱스 파티션은 전부 USABLE 이다. 하나도 못 쓰게 되지 않았다.
+--   · 이것이 LOCAL 인덱스를 기본으로 삼는 가장 큰 이유다.
+--     GLOBAL 인덱스라면 같은 작업에서 인덱스 전체가 UNUSABLE 이 된다 (실습 10).
+
+SYS@orcl> ALTER TABLE hr.emp_local MOVE PARTITION p1 TABLESPACE part_arch;
+
+Table altered.
+
+SYS@orcl> SELECT partition_name, status FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='EMP_LOCAL_IDX' ORDER BY partition_position;
+
+PARTITIO STATUS
+-------- --------
+P1       UNUSABLE
+P2       USABLE
+P3       USABLE
+P4       USABLE
+PMAX     USABLE
+
+SYS@orcl> SELECT /*+ gather_plan_statistics index_rs(e emp_local_idx) */ COUNT(*)
+  2  FROM   hr.emp_local e WHERE employee_id = 1000;
+SELECT /*+ gather_plan_statistics index_rs(e emp_local_idx) */ COUNT(*)
+*
+ERROR at line 1:
+ORA-01502: index 'HR.EMP_LOCAL_IDX' or partition of such index is in unusable state
+
+
+SYS@orcl> ALTER INDEX hr.emp_local_idx REBUILD PARTITION p1;
+
+Index altered.
+
+SYS@orcl> SELECT partition_name, status FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='EMP_LOCAL_IDX' ORDER BY partition_position;
+
+PARTITIO STATUS
+-------- --------
+P1       USABLE
+P2       USABLE
+P3       USABLE
+P4       USABLE
+PMAX     USABLE
+
+-- MOVE PARTITION 은 다르다.
+--   · 데이터를 새 세그먼트에 다시 쓰므로 ROWID 가 전부 바뀐다.
+--   · 인덱스는 ROWID 를 담고 있으므로 그 파티션의 인덱스가 UNUSABLE 이 된다.
+--   · UNUSABLE 인덱스를 쓰려고 하면 ORA-01502 다.
+--     주의 : 옵티마이저는 UNUSABLE 인덱스를 무시하고 풀 스캔으로 우회한다.
+--     힌트로 강제했기 때문에 오류가 났다. 힌트가 없으면 조용히 느려진다.
+--     -> 인덱스 상태 점검 쿼리를 정기적으로 돌려야 한다.
+--   · 복구는 REBUILD PARTITION 이다. 그 파티션만 다시 만들면 된다.
+
+SYS@orcl> ALTER TABLE hr.emp_local MOVE PARTITION p2 TABLESPACE part_arch UPDATE INDEXES;
+
+Table altered.
+
+SYS@orcl> SELECT partition_name, tablespace_name, status FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='EMP_LOCAL_IDX' ORDER BY partition_position;
+
+PARTITIO TABLESPACE_NAME                STATUS
+-------- ------------------------------ --------
+P1       USERS                          USABLE
+P2       USERS                          USABLE
+P3       USERS                          USABLE
+P4       USERS                          USABLE
+PMAX     USERS                          USABLE
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_local WHERE employee_id = 25000;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  1tr02d3vuggbm, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_local WHERE
+employee_id = 25000
+
+Plan hash value: 1647188264
+
+----------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name          | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+----------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |               |      1 |        |       |       |      1 |00:00:00.01 |       2 |      1 |
+|   1 |  SORT AGGREGATE         |               |      1 |      1 |       |       |      1 |00:00:00.01 |       2 |      1 |
+|   2 |   PARTITION RANGE SINGLE|               |      1 |      1 |     2 |     2 |      1 |00:00:00.01 |       2 |      1 |
+|*  3 |    INDEX UNIQUE SCAN    | EMP_LOCAL_IDX |      1 |      1 |     2 |     2 |      1 |00:00:00.01 |       2 |      1 |
+----------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("EMPLOYEE_ID"=25000)
+
+
+21 rows selected.
+
+-- UPDATE INDEXES 절을 붙이면 MOVE 와 인덱스 갱신이 한 문장에서 끝난다.
+--   · 작업 후 status 가 모두 USABLE 이다. 중간에 UNUSABLE 상태가 없다.
+--   · 인덱스 파티션의 tablespace_name 은 USERS 로 그대로다.
+--     테이블만 옮겼고 인덱스는 제자리에서 갱신됐다.
+--     인덱스도 옮기려면 MOVE 뒤에 ALTER INDEX ... REBUILD PARTITION ... TABLESPACE 를 쓴다.
+--   · 비용 : UPDATE INDEXES 는 인덱스 갱신을 포함하므로 작업 시간이 늘어난다.
+--     대신 서비스 중에 UNUSABLE 구간이 생기지 않는다.
+--     야간 창이 충분하면 MOVE 후 REBUILD, 서비스 중이면 UPDATE INDEXES 를 쓴다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- 이 실습의 테이블은 다음 실습에서 쓰지 않는다.
+--   DROP TABLE hr.emp_local PURGE;
+-- part_arch 테이블스페이스는 남겨 둔다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. 특별한 이유가 없으면 LOCAL 인덱스를 쓴다.
+--    파티션 단위 DDL 이 다른 파티션의 인덱스를 건드리지 않는다는 점 하나로 충분하다.
+--    이력 테이블에서 오래된 파티션을 매달 DROP 한다면 GLOBAL 은 사실상 쓸 수 없다.
+--
+-- 2. 가능하면 접두(PREFIXED) 로 만든다.
+--    인덱스 선두 컬럼을 파티션 키로 두면 인덱스 프루닝까지 된다.
+--    비접두는 파티션 수가 적을 때만 허용 범위다. 수백 개면 다시 검토한다.
+--
+-- 3. 기본키에 파티션 키를 포함하는 설계를 먼저 검토한다.
+--    그래야 UNIQUE LOCAL 인덱스가 가능하다 (ORA-14039 회피).
+--    복합 기본키가 부담이라면 GLOBAL UNIQUE 인덱스를 쓰되 관리 비용을 감수한다.
+--
+-- 4. 인덱스를 UNUSABLE 로 만드는 작업을 외운다.
+--      MOVE PARTITION · SPLIT · MERGE · EXCHANGE · TRUNCATE(일부) · 직접 적재
+--    반대로 DROP PARTITION 은 LOCAL 인덱스를 UNUSABLE 로 만들지 않는다.
+--    모든 파티션 DDL 문장에 UPDATE INDEXES 를 붙이는 것을 절차서의 기본으로 삼는다.
+--
+-- 5. 상태 점검 쿼리를 상시 운영한다.
+--      SELECT index_name, partition_name, status FROM dba_ind_partitions
+--      WHERE  status <> 'USABLE';
+--      SELECT index_name, status FROM dba_indexes WHERE status = 'UNUSABLE';
+--    UNUSABLE 인덱스는 오류 없이 성능만 떨어뜨리므로 감시가 유일한 발견 수단이다.
+--
+-- 6. 이 실습에서 본 오류
+--    ORA-14039  파티션 키 없는 UNIQUE LOCAL 인덱스   -> 키에 파티션 컬럼 포함
+--    ORA-01502  UNUSABLE 인덱스 사용                 -> REBUILD PARTITION
+================================================================================
+ 실습 09 끝
+================================================================================

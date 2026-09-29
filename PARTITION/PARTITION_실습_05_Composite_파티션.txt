@@ -1,0 +1,595 @@
+================================================================================
+ 파티셔닝 실습 05 : 복합(Composite) 파티션과 서브파티션 템플릿
+ 과정      : Oracle Database 19c 파티셔닝 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 55분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 조회 조건이 두 개면 파티션도 두 단계로 나눌 수 있다. 이것이 복합 파티션이다.
+--   상위(파티션)  = 주로 이력 관리용 (날짜)
+--   하위(서브파티션) = 주로 조회 분산용 (부서·해시)
+-- 11g 이후 상위는 RANGE·LIST 둘 다, 하위는 RANGE·LIST·HASH 를 쓸 수 있다.
+--
+-- 목표
+--   (1) RANGE-HASH 복합 파티션을 만들고 서브파티션 딕셔너리를 읽는다
+--   (2) 조건이 하나일 때와 두 개일 때 프루닝이 어떻게 달라지는지 계획으로 본다
+--   (3) SUBPARTITION TEMPLATE 로 서브파티션 이름을 예측 가능하게 만든다
+--   (4) 실제 세그먼트는 서브파티션 단위라는 것을 확인한다
+--   (5) 복합 파티션에서 LOGGING 속성이 어디에 저장되는지 확인한다
+-- 작업 유형 : 구조 확인
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 04 의 hr.emp_hash · hr.emp_list 를 지웠다
+-- · USERS 테이블스페이스에 최소 250MB 의 여유가 필요하다
+--   파티션 4 x 서브파티션 4 = 세그먼트 16개, 각 8MB 이므로 테이블 하나가 100MB 를 넘는다
+--   이 실습에서 그런 테이블을 두 개 만든다
+-- · 여유가 부족하면 SUBPARTITIONS 4 를 2 로 줄여도 관찰 결과는 같다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — RANGE-HASH 복합 파티션
+--------------------------------------------------------------------------------
+-- 구문 순서가 중요하다.
+--   PARTITION BY RANGE (상위키)
+--   SUBPARTITION BY HASH (하위키) SUBPARTITIONS n
+--   (PARTITION ... VALUES LESS THAN ...)
+-- SUBPARTITIONS n 을 상위 정의보다 먼저 쓴다.
+
+SYS@orcl> CREATE TABLE hr.emp_comp
+  2  PARTITION BY RANGE (salary)
+  3  SUBPARTITION BY HASH (employee_id) SUBPARTITIONS 4
+  4  (PARTITION p4999  VALUES LESS THAN (5000),
+  5   PARTITION p9999  VALUES LESS THAN (10000),
+  6   PARTITION p19999 VALUES LESS THAN (20000),
+  7   PARTITION pmax   VALUES LESS THAN (MAXVALUE))
+  8  TABLESPACE users
+  9  AS SELECT employee_id, last_name, salary, department_id FROM hr.employees;
+
+Table created.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_COMP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL partition_name FORMAT a8
+SYS@orcl> COL subpartition_name FORMAT a20
+SYS@orcl> COL high_value FORMAT a10
+SYS@orcl> SELECT partition_position, partition_name, high_value, num_rows, blocks
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='EMP_COMP'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE   NUM_ROWS     BLOCKS
+------------------ -------- ---------- ---------- ----------
+                 1 P4999    5000               49         76
+                 2 P9999    10000              39         76
+                 3 P19999   20000              18         76
+                 4 PMAX     MAXVALUE            1         19
+
+SYS@orcl> SELECT partitioning_type, partition_count, subpartitioning_type, def_subpartition_count
+  2  FROM   dba_part_tables WHERE owner='HR' AND table_name='EMP_COMP';
+
+PARTITION PARTITION_COUNT SUBPARTIT DEF_SUBPARTITION_COUNT
+--------- --------------- --------- ----------------------
+RANGE                   4 HASH                           4
+
+SYS@orcl> COL name FORMAT a10
+SYS@orcl> COL column_name FORMAT a14
+SYS@orcl> SELECT name, column_name, column_position FROM dba_part_key_columns
+  2  WHERE  owner='HR' AND name='EMP_COMP';
+
+NAME       COLUMN_NAME    COLUMN_POSITION
+---------- -------------- ---------------
+EMP_COMP   SALARY                       1
+
+SYS@orcl> SELECT name, column_name, column_position FROM dba_subpart_key_columns
+  2  WHERE  owner='HR' AND name='EMP_COMP';
+
+NAME       COLUMN_NAME    COLUMN_POSITION
+---------- -------------- ---------------
+EMP_COMP   EMPLOYEE_ID                  1
+
+-- 관찰
+--   · 상위 파티션은 4개, 서브파티션 방식은 HASH, def_subpartition_count 는 4다.
+--   · 파티션 키는 dba_part_key_columns, 서브파티션 키는 dba_subpart_key_columns 다.
+--     뷰가 다르다. 둘 다 컬럼 이름이 name 이다.
+--   · 상위 파티션의 blocks 가 76 인데 이것은 그 파티션의 서브파티션 합계다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 서브파티션 목록과 세그먼트
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT partition_name, subpartition_name, subpartition_position, num_rows
+  2  FROM   dba_tab_subpartitions WHERE table_owner='HR' AND table_name='EMP_COMP'
+  3  ORDER  BY partition_name, subpartition_position;
+
+PARTITIO SUBPARTITION_NAME    SUBPARTITION_POSITION   NUM_ROWS
+-------- -------------------- --------------------- ----------
+P19999   SYS_SUBP655                              1
+P19999   SYS_SUBP656                              2
+P19999   SYS_SUBP657                              3
+P19999   SYS_SUBP658                              4
+P4999    SYS_SUBP647                              1
+P4999    SYS_SUBP648                              2
+P4999    SYS_SUBP649                              3
+P4999    SYS_SUBP650                              4
+P9999    SYS_SUBP651                              1
+P9999    SYS_SUBP652                              2
+P9999    SYS_SUBP653                              3
+P9999    SYS_SUBP654                              4
+PMAX     SYS_SUBP659                              1
+PMAX     SYS_SUBP660                              2
+PMAX     SYS_SUBP661                              3
+PMAX     SYS_SUBP662                              4
+
+16 rows selected.
+
+SYS@orcl> SELECT COUNT(*) AS seg_cnt, SUM(bytes)/1024/1024 AS total_mb
+  2  FROM   dba_segments WHERE owner='HR' AND segment_name='EMP_COMP';
+
+   SEG_CNT   TOTAL_MB
+---------- ----------
+        13        104
+
+-- 관찰 세 가지
+--   (1) 서브파티션 이름이 SYS_SUBPnnn 으로 자동 생성됐다. 예측할 수 없다.
+--       -> [6] 의 SUBPARTITION TEMPLATE 이 이 문제를 해결한다.
+--   (2) 서브파티션 num_rows 가 비어 있다.
+--       gather_table_stats 의 granularity 기본값(AUTO) 이 이 테이블에서는
+--       서브파티션 통계를 수집하지 않았다.
+--       서브파티션 통계가 꼭 필요하면 granularity=>'ALL' 을 명시한다.
+--   (3) 세그먼트가 16개가 아니라 13개다.
+--       행이 한 건도 없는 서브파티션 3개는 세그먼트를 만들지 않았다
+--       (deferred_segment_creation=TRUE). 그래도 13 x 8MB = 104MB 다.
+--       복합 파티션의 용량은 파티션 수 x 서브파티션 수로 곱해서 계산해야 한다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 두 단계 프루닝
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp
+  2  WHERE  salary < 5000 AND employee_id = 200;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  2scdmz48s1ayw, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp WHERE
+salary < 5000 AND employee_id = 200
+
+Plan hash value: 1240061565
+
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name     | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |          |      1 |        |       |       |      1 |00:00:00.01 |       2 |
+|   1 |  SORT AGGREGATE         |          |      1 |      1 |       |       |      1 |00:00:00.01 |       2 |
+|   2 |   PARTITION RANGE SINGLE|          |      1 |      1 |     1 |     1 |      1 |00:00:00.01 |       2 |
+|   3 |    PARTITION HASH SINGLE|          |      1 |      1 |     1 |     1 |      1 |00:00:00.01 |       2 |
+|*  4 |     TABLE ACCESS FULL   | EMP_COMP |      1 |      1 |     1 |     1 |      1 |00:00:00.01 |       2 |
+--------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - filter("EMPLOYEE_ID"=200)
+
+
+22 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp WHERE salary < 5000;
+
+  COUNT(*)
+----------
+        49
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  4rt4k7zcxquax, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp WHERE
+salary < 5000
+
+Plan hash value: 3478264771
+
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name     | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |          |      1 |        |       |       |      1 |00:00:00.01 |       8 |
+|   1 |  SORT AGGREGATE         |          |      1 |      1 |       |       |      1 |00:00:00.01 |       8 |
+|   2 |   PARTITION RANGE SINGLE|          |      1 |     49 |     1 |     1 |     49 |00:00:00.01 |       8 |
+|   3 |    PARTITION HASH ALL   |          |      1 |     49 |     1 |     4 |     49 |00:00:00.01 |       8 |
+|   4 |     TABLE ACCESS FULL   | EMP_COMP |      4 |     49 |     1 |     4 |     49 |00:00:00.01 |       8 |
+--------------------------------------------------------------------------------------------------------------
+
+
+17 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp WHERE employee_id = 102;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  31cky0zg8qf6r, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp WHERE
+employee_id = 102
+
+Plan hash value: 1219584101
+
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name     | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |          |      1 |        |       |       |      1 |00:00:00.01 |       8 |
+|   1 |  SORT AGGREGATE         |          |      1 |      1 |       |       |      1 |00:00:00.01 |       8 |
+|   2 |   PARTITION RANGE ALL   |          |      1 |      1 |     1 |     4 |      1 |00:00:00.01 |       8 |
+|   3 |    PARTITION HASH SINGLE|          |      4 |      1 |     3 |     3 |      1 |00:00:00.01 |       8 |
+|*  4 |     TABLE ACCESS FULL   | EMP_COMP |      4 |      1 |       |       |      1 |00:00:00.01 |       8 |
+--------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - filter("EMPLOYEE_ID"=102)
+
+
+22 rows selected.
+
+-- 세 계획을 나란히 놓으면 규칙이 보인다.
+--
+--   조건                          | 상위 연산             | 하위 연산             | Buffers
+--   ------------------------------|-----------------------|-----------------------|--------
+--   salary < 5000 AND emp_id=200  | PARTITION RANGE SINGLE| PARTITION HASH SINGLE |    2
+--   salary < 5000                 | PARTITION RANGE SINGLE| PARTITION HASH ALL    |    8
+--   employee_id = 102             | PARTITION RANGE ALL   | PARTITION HASH SINGLE |    8
+--
+-- · 두 키가 모두 조건에 있으면 세그먼트 하나만 읽는다. 이것이 복합 파티션의 목표다.
+-- · 상위 키만 있으면 그 파티션의 서브파티션을 전부 읽는다.
+-- · 하위 키만 있으면 모든 상위 파티션에서 해당 서브파티션 하나씩 읽는다
+--   (Starts=4 : 상위 4개 각각에서 한 번씩).
+-- · 따라서 하위 키만으로 조회하는 패턴이 많다면 복합 파티션의 이득은 작다.
+--   그때는 하위 키를 상위로 올리는 설계를 검토한다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — RANGE-LIST 와 서브파티션 템플릿
+--------------------------------------------------------------------------------
+-- SUBPARTITION TEMPLATE 을 쓰면 모든 상위 파티션에 같은 서브파티션 구성을 적용하고
+-- 이름을 파티션명_서브파티션명 형태로 만들어 준다.
+
+SYS@orcl> CREATE TABLE hr.emp_comp_rl
+  2  PARTITION BY RANGE (hire_date)
+  3  SUBPARTITION BY LIST (department_id)
+  4  SUBPARTITION TEMPLATE
+  5  (SUBPARTITION s_dept_1 VALUES (10,20,30,40),
+  6   SUBPARTITION s_dept_2 VALUES (50),
+  7   SUBPARTITION s_dept_3 VALUES (60,70,80,90,100,110),
+  8   SUBPARTITION s_dept_4 VALUES (DEFAULT))
+  9  (PARTITION p2004 VALUES LESS THAN (TO_DATE('2005-01-01','YYYY-MM-DD')),
+ 10   PARTITION p2005 VALUES LESS THAN (TO_DATE('2006-01-01','YYYY-MM-DD')),
+ 11   PARTITION p2006 VALUES LESS THAN (TO_DATE('2007-01-01','YYYY-MM-DD')),
+ 12   PARTITION pmax  VALUES LESS THAN (MAXVALUE))
+ 13  NOLOGGING
+ 14  TABLESPACE users
+ 15  AS SELECT employee_id, last_name, salary, hire_date, department_id FROM hr.employees;
+
+Table created.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_COMP_RL')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL high_value FORMAT a44
+SYS@orcl> SELECT partition_position, partition_name, high_value, logging, num_rows
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='EMP_COMP_RL'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE                                   LOGGING   NUM_ROWS
+------------------ -------- -------------------------------------------- ------- ----------
+                 1 P2004    TO_DATE(' 2005-01-01 00:00:00', 'SYYYY-MM-DD NONE            24
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 2 P2005    TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD NONE            29
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 3 P2006    TO_DATE(' 2007-01-01 00:00:00', 'SYYYY-MM-DD NONE            24
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 4 PMAX     MAXVALUE                                     NONE            30
+
+-- LOGGING 컬럼이 NONE 으로 나왔다. NO 가 아니다.
+-- 복합 파티션에서 LOGGING 속성은 서브파티션에 저장된다.
+-- 상위 파티션은 자기 서브파티션들이 서로 다를 수 있으므로 NONE(정의 없음) 으로 표시한다.
+
+SYS@orcl> ALTER TABLE hr.emp_comp_rl LOGGING;
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, logging FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_COMP_RL' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO LOGGING
+------------------ -------- -------
+                 1 P2004    YES
+                 2 P2005    YES
+                 3 P2006    YES
+                 4 PMAX     YES
+
+SYS@orcl> SELECT subpartition_name, logging FROM dba_tab_subpartitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_COMP_RL' AND partition_name='P2005'
+  3  ORDER  BY subpartition_position;
+
+SUBPARTITION_NAME    LOG
+-------------------- ---
+P2005_S_DEPT_1       YES
+P2005_S_DEPT_2       YES
+P2005_S_DEPT_3       YES
+P2005_S_DEPT_4       YES
+
+-- ALTER TABLE ... LOGGING 을 하면 상위는 YES 가 되고 서브파티션도 전부 YES 가 된다.
+-- 즉 테이블 수준 변경이 아래로 전파된다.
+
+SYS@orcl> SELECT partition_name, subpartition_name, subpartition_position, num_rows
+  2  FROM   dba_tab_subpartitions WHERE table_owner='HR' AND table_name='EMP_COMP_RL'
+  3  AND    partition_name IN ('P2005','PMAX')
+  4  ORDER  BY partition_name, subpartition_position;
+
+PARTITIO SUBPARTITION_NAME    SUBPARTITION_POSITION   NUM_ROWS
+-------- -------------------- --------------------- ----------
+P2005    P2005_S_DEPT_1                           1          3
+P2005    P2005_S_DEPT_2                           2         12
+P2005    P2005_S_DEPT_3                           3         14
+P2005    P2005_S_DEPT_4                           4          0
+PMAX     PMAX_S_DEPT_1                            1          1
+PMAX     PMAX_S_DEPT_2                            2         13
+PMAX     PMAX_S_DEPT_3                            3         15
+PMAX     PMAX_S_DEPT_4                            4          1
+
+8 rows selected.
+
+SYS@orcl> SELECT COUNT(*) AS subpart_cnt FROM dba_tab_subpartitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_COMP_RL';
+
+SUBPART_CNT
+-----------
+         16
+
+-- 템플릿이 만든 이름이 P2005_S_DEPT_1 ... PMAX_S_DEPT_4 다.
+-- 규칙이 있으므로 운영 스크립트에서 이름을 조립할 수 있다.
+-- 템플릿 없이 만들면 SYS_SUBP 이름이 되어 스크립트를 쓸 수 없다.
+-- 복합 파티션을 만들 때 템플릿은 선택이 아니라 사실상 필수다.
+--
+-- 이 테이블은 서브파티션 통계가 수집됐다(num_rows 가 채워졌다).
+-- 앞의 RANGE-HASH 테이블과 다르다. AUTO 의 판단이 테이블에 따라 다르다는 뜻이므로
+-- 서브파티션 통계가 필요하면 granularity 를 명시하는 습관을 들인다.
+
+SYS@orcl> SELECT COUNT(*) AS one_sub FROM hr.emp_comp_rl SUBPARTITION (p2005_s_dept_2);
+
+   ONE_SUB
+----------
+        12
+
+SYS@orcl> SELECT COUNT(*) AS one_part FROM hr.emp_comp_rl PARTITION (p2005);
+
+  ONE_PART
+----------
+        29
+
+SYS@orcl> SELECT COUNT(*) AS sub_for FROM hr.emp_comp_rl
+  2  SUBPARTITION FOR (TO_DATE('2005-06-01','YYYY-MM-DD'), 50);
+
+   SUB_FOR
+----------
+        12
+
+-- 조회 표기 세 가지
+--   PARTITION (p2005)                    상위 파티션 전체 (29건)
+--   SUBPARTITION (p2005_s_dept_2)        서브파티션 하나 (12건)
+--   SUBPARTITION FOR (상위값, 하위값)     두 키 값으로 찾기 (12건)
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp_rl
+  2  WHERE  hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+  3                       AND TO_DATE('2005-12-31 23:59:59','YYYY-MM-DD HH24:MI:SS');
+
+  COUNT(*)
+----------
+        29
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  5g0396zv49yf3, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp_rl WHERE
+ hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+   AND TO_DATE('2005-12-31 23:59:59','YYYY-MM-DD HH24:MI:SS')
+
+Plan hash value: 2451847218
+
+-----------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name        | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |             |      1 |        |       |       |      1 |00:00:00.01 |       6 |
+|   1 |  SORT AGGREGATE         |             |      1 |      1 |       |       |      1 |00:00:00.01 |       6 |
+|   2 |   PARTITION RANGE SINGLE|             |      1 |     29 |     2 |     2 |     29 |00:00:00.01 |       6 |
+|   3 |    PARTITION LIST ALL   |             |      1 |     29 |     1 |     4 |     29 |00:00:00.01 |       6 |
+|*  4 |     TABLE ACCESS FULL   | EMP_COMP_RL |      4 |     29 |     5 |     8 |     29 |00:00:00.01 |       6 |
+-----------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - filter("HIRE_DATE"<=TO_DATE(' 2005-12-31 23:59:59', 'syyyy-mm-dd hh24:mi:ss'))
+
+
+23 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp_rl
+  2  WHERE  hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+  3                       AND TO_DATE('2005-12-31 23:59:59','YYYY-MM-DD HH24:MI:SS')
+  4  AND    department_id = 50;
+
+  COUNT(*)
+----------
+        12
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  4svurdqas127b, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp_rl WHERE
+ hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+   AND TO_DATE('2005-12-31 23:59:59','YYYY-MM-DD HH24:MI:SS') AND
+department_id = 50
+
+Plan hash value: 2871772883
+
+-----------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name        | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |             |      1 |        |       |       |      1 |00:00:00.01 |       2 |
+|   1 |  SORT AGGREGATE         |             |      1 |      1 |       |       |      1 |00:00:00.01 |       2 |
+|   2 |   PARTITION RANGE SINGLE|             |      1 |     12 |     2 |     2 |     12 |00:00:00.01 |       2 |
+|   3 |    PARTITION LIST SINGLE|             |      1 |     12 |   KEY |   KEY |     12 |00:00:00.01 |       2 |
+|*  4 |     TABLE ACCESS FULL   | EMP_COMP_RL |      1 |     12 |     6 |     6 |     12 |00:00:00.01 |       2 |
+-----------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - filter("HIRE_DATE"<=TO_DATE(' 2005-12-31 23:59:59', 'syyyy-mm-dd hh24:mi:ss'))
+
+
+24 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp_rl WHERE department_id = 50;
+
+  COUNT(*)
+----------
+        45
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  5965ampvmkqj0, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_comp_rl WHERE
+department_id = 50
+
+Plan hash value: 151300889
+
+-----------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name        | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |             |      1 |        |       |       |      1 |00:00:00.01 |       8 |
+|   1 |  SORT AGGREGATE         |             |      1 |      1 |       |       |      1 |00:00:00.01 |       8 |
+|   2 |   PARTITION RANGE ALL   |             |      1 |     10 |     1 |     4 |     45 |00:00:00.01 |       8 |
+|   3 |    PARTITION LIST SINGLE|             |      4 |     10 |   KEY |   KEY |     45 |00:00:00.01 |       8 |
+|   4 |     TABLE ACCESS FULL   | EMP_COMP_RL |      4 |     10 |   KEY |   KEY |     45 |00:00:00.01 |       8 |
+-----------------------------------------------------------------------------------------------------------------
+
+
+17 rows selected.
+
+-- 두 단계 프루닝을 실제 숫자로 확인한다.
+--
+--   조건                      | 상위                  | 하위                  | Buffers
+--   --------------------------|-----------------------|-----------------------|--------
+--   hire_date 범위            | PARTITION RANGE SINGLE| PARTITION LIST ALL    |    6
+--   hire_date + department_id | PARTITION RANGE SINGLE| PARTITION LIST SINGLE |    2
+--   department_id 만          | PARTITION RANGE ALL   | PARTITION LIST SINGLE |    8
+--
+-- 가장 아래 TABLE ACCESS FULL 행의 Pstart/Pstop 을 보면 5-8, 6-6 처럼 나온다.
+-- 이것은 서브파티션의 절대 번호다. 상위 파티션 번호가 아니다.
+-- 1..16 중 어느 서브파티션을 읽었는지를 알려 준다.
+
+SYS@orcl> SELECT COUNT(*) AS seg_cnt, SUM(bytes)/1024/1024 AS total_mb
+  2  FROM   dba_segments WHERE owner='HR' AND segment_name='EMP_COMP_RL';
+
+   SEG_CNT   TOTAL_MB
+---------- ----------
+        13        104
+
+SYS@orcl> SELECT segment_type, COUNT(*) FROM dba_segments
+  2  WHERE  owner='HR' AND segment_name IN ('EMP_COMP','EMP_COMP_RL')
+  3  GROUP  BY segment_type;
+
+SEGMENT_TYPE         COUNT(*)
+------------------ ----------
+TABLE SUBPARTITION         26
+
+-- 마지막 확인 : 복합 파티션의 세그먼트는 서브파티션 단위다.
+-- segment_type 이 TABLE SUBPARTITION 으로 나온다.
+-- 상위 파티션은 논리적 묶음일 뿐이고 실제 데이터는 서브파티션 세그먼트에 있다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- 두 테이블이 200MB 를 차지한다. 다음 실습에서 쓰지 않으므로 지운다.
+--   DROP TABLE hr.emp_comp PURGE;
+--   DROP TABLE hr.emp_comp_rl PURGE;
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. 복합 파티션을 쓸 이유는 하나다. 조회 조건이 항상 두 개이기 때문이다.
+--    조건이 하나뿐이라면 단일 파티션이 더 단순하고 관리 비용도 낮다.
+--    대표적인 조합 : RANGE(날짜) + HASH(고객ID) — 이력 관리 + 조회 분산
+--                    RANGE(날짜) + LIST(지역)   — 이력 관리 + 지역별 관리
+--
+-- 2. SUBPARTITION TEMPLATE 은 반드시 쓴다.
+--    이름이 예측 가능해야 파티션 단위 TRUNCATE·EXCHANGE·통계 수집을 스크립트로 만들 수 있다.
+--
+-- 3. 용량은 곱셈이다.
+--    파티션 12개 x 서브파티션 8개 = 세그먼트 96개 = 최소 768MB (8MB x 96).
+--    복합 파티션은 작은 테이블에 쓰면 손해다. 최소 수억 건 규모에서 검토한다.
+--
+-- 4. 통계 수집은 granularity 를 명시한다.
+--    AUTO 가 서브파티션 통계를 수집할지 여부는 테이블마다 다르게 판단된다.
+--    서브파티션 프루닝이 걸린 SQL 의 카디널리티가 이상하면 이것을 먼저 본다.
+--      granularity=>'ALL'        전체 + 파티션 + 서브파티션
+--      granularity=>'SUBPARTITION'  서브파티션만
+--
+-- 5. 실행계획의 Pstart/Pstop 은 계층마다 의미가 다르다.
+--    상위 연산 행 = 상위 파티션 번호, 테이블 접근 행 = 서브파티션 절대 번호.
+--    이것을 혼동하면 프루닝이 됐는지 안 됐는지를 잘못 읽는다.
+--
+-- 6. 이 실습에서 본 표시
+--    LOGGING = NONE     복합 파티션의 상위 파티션 (속성은 서브파티션에 있다)
+--    세그먼트 13/16      행이 없는 서브파티션은 세그먼트를 만들지 않는다
+================================================================================
+ 실습 05 끝
+================================================================================

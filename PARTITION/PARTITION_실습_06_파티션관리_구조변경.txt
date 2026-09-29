@@ -1,0 +1,513 @@
+================================================================================
+ 파티셔닝 실습 06 : 파티션 관리 (1) 구조 변경 — SPLIT · ADD · DROP · MERGE
+ 과정      : Oracle Database 19c 파티셔닝 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 60분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- 파티션 테이블을 만든 다음부터가 진짜 일이다.
+-- 파티션은 늘려야 하고, 오래된 것은 버려야 하고, 잘못 잡은 경계는 다시 자르거나 합쳐야 한다.
+-- 이 실습은 그 여섯 가지 DDL 을 전부 한 테이블에서 순서대로 수행한다.
+--
+--   SPLIT     하나를 둘로 자른다
+--   ADD       맨 뒤에 붙인다
+--   RENAME    이름만 바꾼다
+--   DROP      데이터까지 버린다
+--   TRUNCATE  데이터만 비운다
+--   MERGE     인접한 둘을 하나로 합친다
+--
+-- 그리고 파티션 테이블에서만 만나는 오류 ORA-14402(파티션 키 UPDATE) 와
+-- 그 해결책인 ROW MOVEMENT 를 확인한다.
+-- 작업 유형 : 구조 변경 (운영 절차와 직결된다)
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 05 의 hr.emp_comp · hr.emp_comp_rl 을 지웠다
+-- · 급여(salary) 로 자르는 테이블을 새로 만든다. 날짜가 아니라 숫자 키로 해 보는 것이다
+--   숫자 키라도 RANGE 파티션의 동작은 완전히 같다
+-- · 이 실습이 만드는 구조는 실습 07 에서 그대로 이어 쓴다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.sal_emp
+  2  PARTITION BY RANGE (salary)
+  3  (PARTITION part1 VALUES LESS THAN (5000),
+  4   PARTITION part2 VALUES LESS THAN (15000),
+  5   PARTITION part3 VALUES LESS THAN (25000))
+  6  TABLESPACE users
+  7  AS SELECT employee_id, last_name, salary, department_id FROM hr.employees;
+
+Table created.
+
+SYS@orcl> COL partition_name FORMAT a8
+SYS@orcl> COL high_value FORMAT a10
+SYS@orcl> COL tablespace_name FORMAT a10
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','SAL_EMP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, tablespace_name, num_rows
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='SAL_EMP'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE TABLESPACE   NUM_ROWS
+------------------ -------- ---------- ---------- ----------
+                 1 PART1    5000       USERS              49
+                 2 PART2    15000      USERS              55
+                 3 PART3    25000      USERS               3
+
+SYS@orcl> SELECT COUNT(*) AS part3 FROM hr.sal_emp PARTITION (part3);
+
+     PART3
+----------
+         3
+
+SYS@orcl> SELECT employee_id, last_name, salary FROM hr.sal_emp PARTITION (part3) ORDER BY salary;
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        101 Kochhar                        17000
+        102 De Haan                        17000
+        100 King                           24000
+
+-- 49 / 55 / 3 으로 나뉘었다. part3 에는 임원 세 명(17000·17000·24000) 만 있다.
+-- MAXVALUE 파티션이 없는 상태로 시작한다. [6] 에서 추가한다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — SPLIT 과 ADD
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLE hr.sal_emp SPLIT PARTITION part3 AT (20000) INTO (PARTITION part3, PARTITION p4);
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, num_rows
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='SAL_EMP'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE   NUM_ROWS
+------------------ -------- ---------- ----------
+                 1 PART1    5000               49
+                 2 PART2    15000              55
+                 3 PART3    20000
+                 4 P4       25000
+
+SYS@orcl> SELECT COUNT(*) AS part3 FROM hr.sal_emp PARTITION (part3);
+
+     PART3
+----------
+         2
+
+SYS@orcl> SELECT COUNT(*) AS p4 FROM hr.sal_emp PARTITION (p4);
+
+        P4
+----------
+         1
+
+-- SPLIT 을 읽는 법
+--   ALTER TABLE ... SPLIT PARTITION part3 AT (20000) INTO (PARTITION part3, PARTITION p4)
+--   · AT (20000) 이 자르는 지점이다. 앞 조각이 20000 미만, 뒤 조각이 원래 상한(25000) 미만이다.
+--   · INTO 에 두 이름을 준다. 앞 이름을 원래 이름으로 두는 것이 관례다.
+--   · 결과 : part3 에 2건(17000 두 건), p4 에 1건(24000).
+--   · 중요 : num_rows 가 비었다. SPLIT 은 통계를 무효화한다.
+--     구조 변경 DDL 뒤에는 반드시 통계를 다시 수집한다. 안 하면 계획이 틀어진다.
+--   · SPLIT 은 데이터를 실제로 두 세그먼트에 다시 쓴다. 큰 파티션에서는 시간이 걸린다.
+--     19c 에서는 ONLINE 절을 붙일 수 있다 (SPLIT PARTITION ... ONLINE).
+
+SYS@orcl> ALTER TABLE hr.sal_emp SPLIT PARTITION part3 AT (40000) INTO (PARTITION part3, PARTITION pzz);
+ALTER TABLE hr.sal_emp SPLIT PARTITION part3 AT (40000) INTO (PARTITION part3, PARTITION pzz)
+                                       *
+ERROR at line 1:
+ORA-14080: partition cannot be split along the specified high bound
+
+-- ORA-14080: partition cannot be split along the specified high bound
+--   자르려는 값이 그 파티션의 범위 안에 있어야 한다. 40000 은 part3(20000 미만) 밖이다.
+--   경계값을 확인하지 않고 스크립트를 돌리면 여기서 멈춘다.
+--   자를 지점은 항상 dba_tab_partitions.high_value 를 먼저 읽어 결정한다.
+
+SYS@orcl> ALTER TABLE hr.sal_emp ADD PARTITION p5_1 VALUES LESS THAN (30000);
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='SAL_EMP' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE
+------------------ -------- ----------
+                 1 PART1    5000
+                 2 PART2    15000
+                 3 PART3    20000
+                 4 P4       25000
+                 5 P5_1     30000
+
+SYS@orcl> ALTER TABLE hr.sal_emp ADD PARTITION p_low VALUES LESS THAN (1000);
+ALTER TABLE hr.sal_emp ADD PARTITION p_low VALUES LESS THAN (1000)
+                                     *
+ERROR at line 1:
+ORA-14074: partition bound must collate higher than that of the last partition
+
+-- ADD 를 읽는 법
+--   · ADD PARTITION 은 항상 "맨 뒤" 에만 붙는다. 중간에 끼울 수 없다.
+--   · 중간을 늘리려면 SPLIT 을 쓴다.
+--   · 마지막 파티션보다 낮은 경계를 주면 ORA-14074 다
+--     (partition bound must collate higher than that of the last partition).
+--   · ADD 는 빈 세그먼트만 만들므로 즉시 끝난다. 데이터 이동이 없다.
+--     -> 미래 파티션은 ADD 로 미리 만들어 두는 것이 안전하다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — RENAME · DROP · TRUNCATE
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLE hr.sal_emp RENAME PARTITION p5_1 TO part5;
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='SAL_EMP' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE
+------------------ -------- ----------
+                 1 PART1    5000
+                 2 PART2    15000
+                 3 PART3    20000
+                 4 P4       25000
+                 5 PART5    30000
+
+SYS@orcl> ALTER TABLE hr.sal_emp DROP PARTITION part5;
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='SAL_EMP' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE
+------------------ -------- ----------
+                 1 PART1    5000
+                 2 PART2    15000
+                 3 PART3    20000
+                 4 P4       25000
+
+-- RENAME 은 딕셔너리만 바꾼다. 즉시 끝나고 데이터에 영향이 없다.
+-- DROP 은 데이터까지 버린다. 되돌릴 수 없다 (휴지통에 들어가지 않는다).
+--   운영에서 오래된 이력을 버리는 표준 방법이 이것이다.
+--   DELETE 로 수백만 건을 지우는 것과 비교하면 REDO·UNDO 가 거의 없고 즉시 끝난다.
+
+SYS@orcl> SELECT COUNT(*) AS before_cnt FROM hr.sal_emp PARTITION (part3);
+
+BEFORE_CNT
+----------
+         2
+
+SYS@orcl> ALTER TABLE hr.sal_emp TRUNCATE PARTITION part3;
+
+Table truncated.
+
+SYS@orcl> SELECT COUNT(*) AS after_cnt FROM hr.sal_emp PARTITION (part3);
+
+ AFTER_CNT
+----------
+         0
+
+SYS@orcl> SELECT COUNT(*) AS table_cnt FROM hr.sal_emp;
+
+ TABLE_CNT
+----------
+       105
+
+SYS@orcl> INSERT INTO hr.sal_emp
+  2  SELECT employee_id, last_name, salary, department_id FROM hr.employees
+  3  WHERE  employee_id IN (101,102);
+
+2 rows created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT employee_id, last_name, salary FROM hr.sal_emp PARTITION (part3);
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        101 Kochhar                        17000
+        102 De Haan                        17000
+
+-- TRUNCATE PARTITION 은 구조를 남기고 데이터만 비운다.
+--   · part3 의 2건이 0건이 됐고 테이블 전체는 107 -> 105 가 됐다.
+--   · 다시 2건을 넣으면 그 파티션에 들어간다.
+--   · DROP 과의 차이 : 파티션이 남으므로 이후 INSERT 가 계속 성공한다.
+--     일별 스테이징 테이블을 매일 비우는 패턴에 쓴다.
+--   · 주의 : TRUNCATE 뒤에 첫 행을 넣으면 세그먼트 전체(8MB) 가 포맷돼
+--     블록 수가 1024 로 보인다. 이 현상은 실습 07 에서 자세히 다룬다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 파티션 키를 바꾸는 UPDATE
+--------------------------------------------------------------------------------
+SYS@orcl> UPDATE hr.sal_emp SET salary = 21000 WHERE employee_id = 101;
+UPDATE hr.sal_emp SET salary = 21000 WHERE employee_id = 101
+          *
+ERROR at line 1:
+ORA-14402: updating partition key column would cause a partition change
+
+
+SYS@orcl> UPDATE hr.sal_emp SET salary = 18000 WHERE employee_id = 101;
+
+1 row updated.
+
+SYS@orcl> ROLLBACK;
+
+Rollback complete.
+
+SYS@orcl> SELECT row_movement FROM dba_tables WHERE owner='HR' AND table_name='SAL_EMP';
+
+ROW_MOVE
+--------
+DISABLED
+
+SYS@orcl> ALTER TABLE hr.sal_emp ENABLE ROW MOVEMENT;
+
+Table altered.
+
+SYS@orcl> UPDATE hr.sal_emp SET salary = 21000 WHERE employee_id = 101;
+
+1 row updated.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT employee_id, last_name, salary FROM hr.sal_emp PARTITION (part3);
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        102 De Haan                        17000
+
+SYS@orcl> SELECT employee_id, last_name, salary FROM hr.sal_emp PARTITION (p4);
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        100 King                           24000
+        101 Kochhar                        21000
+
+SYS@orcl> ALTER TABLE hr.sal_emp DISABLE ROW MOVEMENT;
+
+Table altered.
+
+-- ORA-14402: updating partition key column would cause a partition change
+--   원인 : 101번의 급여를 17000 -> 21000 으로 올리면 part3(20000 미만) 에서
+--          p4(25000 미만) 로 옮겨야 한다. 행이 세그먼트를 넘어가는 이동이다.
+--          기본값은 이것을 금지한다.
+--   해결 : ALTER TABLE ... ENABLE ROW MOVEMENT
+--   같은 파티션 안에서 끝나는 변경(17000 -> 18000) 은 아무 설정 없이도 된다.
+--
+-- ROW MOVEMENT 를 켠 뒤 다시 하면 성공하고, 행이 실제로 p4 로 이동한다.
+--
+-- ROW MOVEMENT 의 비용과 위험
+--   · 내부적으로 DELETE + INSERT 다. 따라서 ROWID 가 바뀐다.
+--     ROWID 를 붙잡아 두는 애플리케이션(SELECT ... FOR UPDATE 후 ROWID 재사용)은 깨진다.
+--   · REDO·UNDO 가 일반 UPDATE 보다 많다.
+--   · 그래서 기본값이 DISABLE 이다. 필요한 테이블에만 켠다.
+--   · SHRINK SPACE 도 ROW MOVEMENT 를 요구한다 (실습 07).
+--   · 설계 원칙 : 파티션 키는 변하지 않는 컬럼으로 잡는다.
+--     날짜 중에서도 등록일·거래일은 변하지 않고, 수정일은 변한다.
+
+--------------------------------------------------------------------------------
+[7] 정리는 하지 않는다 — MAXVALUE 추가와 MERGE
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLE hr.sal_emp ADD PARTITION pmax VALUES LESS THAN (MAXVALUE);
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='SAL_EMP' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE
+------------------ -------- ----------
+                 1 PART1    5000
+                 2 PART2    15000
+                 3 PART3    20000
+                 4 P4       25000
+                 5 PMAX     MAXVALUE
+
+SYS@orcl> ALTER TABLE hr.sal_emp ADD PARTITION p6 VALUES LESS THAN (40000);
+ALTER TABLE hr.sal_emp ADD PARTITION p6 VALUES LESS THAN (40000)
+                                     *
+ERROR at line 1:
+ORA-14074: partition bound must collate higher than that of the last partition
+
+
+SYS@orcl> INSERT INTO hr.sal_emp VALUES (300,'oracle',29000,20);
+
+1 row created.
+
+SYS@orcl> INSERT INTO hr.sal_emp VALUES (400,'itwill',30000,10);
+
+1 row created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT employee_id, last_name, salary FROM hr.sal_emp PARTITION (pmax) ORDER BY salary;
+
+EMPLOYEE_ID LAST_NAME                     SALARY
+----------- ------------------------- ----------
+        300 oracle                         29000
+        400 itwill                         30000
+
+-- MAXVALUE 파티션을 추가한 뒤에는 ADD PARTITION 이 영구히 막힌다(ORA-14074).
+-- MAXVALUE 보다 높은 경계가 있을 수 없기 때문이다.
+-- 그 뒤로 파티션을 늘리는 방법은 SPLIT 하나뿐이다.
+-- -> MAXVALUE 를 두는 순간 운영 절차가 ADD 에서 SPLIT 으로 바뀐다. 절차서에 반영해야 한다.
+
+SYS@orcl> ALTER TABLE hr.sal_emp SPLIT PARTITION pmax AT (30000) INTO (PARTITION p5, PARTITION pmax);
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='SAL_EMP' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE
+------------------ -------- ----------
+                 1 PART1    5000
+                 2 PART2    15000
+                 3 PART3    20000
+                 4 P4       25000
+                 5 P5       30000
+                 6 PMAX     MAXVALUE
+
+6 rows selected.
+
+SYS@orcl> SELECT COUNT(*) AS p5 FROM hr.sal_emp PARTITION (p5);
+
+        P5
+----------
+         1
+
+SYS@orcl> SELECT COUNT(*) AS pmax FROM hr.sal_emp PARTITION (pmax);
+
+      PMAX
+----------
+         1
+
+-- MAXVALUE 파티션 SPLIT 이 이력 테이블 운영의 표준 동작이다.
+--   ALTER TABLE ... SPLIT PARTITION pmax AT (경계) INTO (PARTITION 새이름, PARTITION pmax)
+--   pmax 에 쌓인 데이터가 경계에 따라 두 파티션으로 나뉘고 pmax 는 다시 비워진다.
+--   결과 : p5 에 29000 한 건, pmax 에 30000 한 건.
+
+SYS@orcl> SELECT COUNT(*) AS p4 FROM hr.sal_emp PARTITION (p4);
+
+        P4
+----------
+         2
+
+SYS@orcl> ALTER TABLE hr.sal_emp MERGE PARTITIONS p4, p5 INTO PARTITION p5;
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='SAL_EMP' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE
+------------------ -------- ----------
+                 1 PART1    5000
+                 2 PART2    15000
+                 3 PART3    20000
+                 4 P5       30000
+                 5 PMAX     MAXVALUE
+
+SYS@orcl> SELECT COUNT(*) AS p5 FROM hr.sal_emp PARTITION (p5);
+
+        P5
+----------
+         3
+
+SYS@orcl> ALTER TABLE hr.sal_emp MERGE PARTITIONS part1, p5 INTO PARTITION pjunk;
+ALTER TABLE hr.sal_emp MERGE PARTITIONS part1, p5 INTO PARTITION pjunk
+                                        *
+ERROR at line 1:
+ORA-14274: partitions being merged are not adjacent
+
+-- MERGE 를 읽는 법
+--   · 인접한 두 파티션만 합칠 수 있다. 떨어져 있으면 ORA-14274 다
+--     (partitions being merged are not adjacent).
+--   · 합친 결과의 상한은 둘 중 높은 쪽이다. 이름은 INTO 에 준 것을 쓴다.
+--   · 데이터를 새 세그먼트에 다시 쓴다. SPLIT 과 마찬가지로 비용이 든다.
+--   · 용도 : 잘게 쪼갠 오래된 파티션을 분기·연 단위로 합쳐 파티션 수를 줄인다.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','SAL_EMP',granularity=>'AUTO')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, num_rows, blocks
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='SAL_EMP'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE   NUM_ROWS     BLOCKS
+------------------ -------- ---------- ---------- ----------
+                 1 PART1    5000               49         19
+                 2 PART2    15000              55         19
+                 3 PART3    20000               1       1006
+                 4 P5       30000               3         19
+                 5 PMAX     MAXVALUE            1         19
+
+SYS@orcl> SELECT num_rows, blocks FROM dba_tables WHERE owner='HR' AND table_name='SAL_EMP';
+
+  NUM_ROWS     BLOCKS
+---------- ----------
+       109       1082
+
+-- 마지막으로 통계를 다시 수집한다. 구조 변경 DDL 뒤에는 항상 해야 한다.
+-- 파티션별 합(49+55+1+3+1=109) 과 테이블 통계(109) 가 맞는다.
+--
+-- part3 의 blocks 가 1006 으로 유독 크다. 1건짜리 파티션인데 그렇다.
+-- 이 숫자가 실습 07 의 출발점이다.
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. 여섯 DDL 의 비용을 구분해서 기억한다.
+--      즉시 끝난다 (딕셔너리만)     : ADD · RENAME · DROP · TRUNCATE
+--      데이터를 다시 쓴다 (느리다)   : SPLIT · MERGE · MOVE
+--    야간 작업 창을 잡을 때 이 구분이 기준이 된다.
+--
+-- 2. 구조 변경 DDL 뒤에는 통계를 다시 수집한다.
+--    SPLIT·MERGE 는 num_rows 를 NULL 로 만든다. 그대로 두면 옵티마이저가 기본값으로 추정한다.
+--    운영 절차서에는 DDL 과 gather_table_stats 를 한 단계로 묶어 적는다.
+--
+-- 3. 파티션 단위 DDL 은 인덱스를 못 쓰게 만들 수 있다.
+--    이 실습에는 인덱스가 없어 드러나지 않았다. 실습 09·10 에서 확인한다.
+--    실제 절차서에는 항상 UPDATE INDEXES 절이나 후속 REBUILD 가 함께 들어간다.
+--
+-- 4. 오래된 데이터를 버리는 방법은 세 가지다.
+--      DROP PARTITION            가장 빠르다. 되돌릴 수 없다
+--      TRUNCATE PARTITION        구조를 남긴다
+--      EXCHANGE PARTITION        데이터를 살려 둔 채 떼어 낸다 (실습 07)
+--    보관 요건이 있으면 EXCHANGE 후 그 테이블을 압축·export 하는 절차가 정답이다.
+--
+-- 5. ROW MOVEMENT 는 필요한 테이블에만 켠다.
+--    켜면 ROWID 가 변할 수 있다는 사실을 개발팀에 알려야 한다.
+--    근본적으로는 변하지 않는 컬럼을 파티션 키로 잡는 것이 맞다.
+--
+-- 6. 이 실습에서 본 오류
+--    ORA-14080  범위 밖의 값으로 SPLIT          -> high_value 확인 후 재시도
+--    ORA-14074  마지막 파티션보다 낮은 경계 ADD  -> SPLIT 을 쓴다
+--    ORA-14402  파티션 키 UPDATE                -> ENABLE ROW MOVEMENT
+--    ORA-14274  인접하지 않은 파티션 MERGE       -> 인접한 쌍끼리 순서대로 합친다
+================================================================================
+ 실습 06 끝
+================================================================================

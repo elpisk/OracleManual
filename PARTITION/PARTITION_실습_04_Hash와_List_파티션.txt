@@ -1,0 +1,613 @@
+================================================================================
+ 파티셔닝 실습 04 : HASH 와 LIST 파티션
+ 과정      : Oracle Database 19c 파티셔닝 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 50분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- RANGE 는 순서가 있는 값을 자를 때 쓴다. 남은 두 방식은 목적이 다르다.
+--   HASH : 값을 고르게 흩뿌린다. 경합 분산과 병렬 처리가 목적이다.
+--   LIST : 값의 목록으로 묶는다. 지역·상태코드·부서처럼 열거 가능한 값에 쓴다.
+--
+-- 목표
+--   (1) HASH 파티션의 분포를 실제로 세어 본다 (고르게 나뉘는지)
+--   (2) HASH 는 등치 조건에서만 프루닝된다는 것을 계획으로 확인한다
+--   (3) HASH 파티션 수를 늘리고 줄이는 방법 (ADD / COALESCE) 을 익힌다
+--   (4) LIST 파티션의 DEFAULT 파티션과 값 추가·삭제(ADD/DROP VALUES) 를 익힌다
+--   (5) 19c 의 자동 LIST 파티션(AUTOMATIC) 을 확인한다
+-- 작업 유형 : 구조 확인
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 03 의 hr.emp_yr 을 지웠다 (없어도 실습에는 지장 없다)
+-- · hr.employees 의 부서 분포를 알고 있으면 좋다
+--     10:1  20:2  30:6  40:1  50:45  60:5  70:1  80:34  90:3  100:6  110:2  NULL:1
+-- · USERS 테이블스페이스에 최소 70MB 의 여유 (파티션 8개 + 자동 LIST 11개)
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인 — HASH 파티션 생성
+--------------------------------------------------------------------------------
+-- HASH 는 경계값을 쓰지 않는다. 개수만 준다.
+-- PARTITIONS 4 처럼 개수만 주면 이름은 SYS_Pnnn 으로 자동 생성된다.
+-- 이름을 정하고 싶으면 (PARTITION h1, PARTITION h2, ...) 로 나열한다.
+
+SYS@orcl> CREATE TABLE hr.emp_hash
+  2  PARTITION BY HASH (employee_id) PARTITIONS 4
+  3  TABLESPACE users
+  4  AS SELECT employee_id, last_name, salary, department_id FROM hr.employees;
+
+Table created.
+
+SYS@orcl> COL partition_name FORMAT a10
+SYS@orcl> COL high_value FORMAT a12
+SYS@orcl> COL tablespace_name FORMAT a10
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_HASH')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, tablespace_name, num_rows, blocks
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='EMP_HASH'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITION_ HIGH_VALUE   TABLESPACE   NUM_ROWS     BLOCKS
+------------------ ---------- ------------ ---------- ---------- ----------
+                 1 SYS_P615                USERS              25         19
+                 2 SYS_P616                USERS              32         19
+                 3 SYS_P617                USERS              31         19
+                 4 SYS_P618                USERS              19         19
+
+SYS@orcl> SELECT partitioning_type, partition_count FROM dba_part_tables
+  2  WHERE  owner='HR' AND table_name='EMP_HASH';
+
+PARTITION PARTITION_COUNT
+--------- ---------------
+HASH                    4
+
+SYS@orcl> COL name FORMAT a10
+SYS@orcl> COL column_name FORMAT a14
+SYS@orcl> SELECT name, column_name, column_position FROM dba_part_key_columns
+  2  WHERE  owner='HR' AND name='EMP_HASH';
+
+NAME       COLUMN_NAME    COLUMN_POSITION
+---------- -------------- ---------------
+EMP_HASH   EMPLOYEE_ID                  1
+
+-- 관찰
+--   · high_value 가 비어 있다. HASH 에는 경계값이라는 개념이 없다.
+--   · 분포는 25 / 32 / 31 / 19 다. 107 건을 4개로 나눴으니 이상적으로는 26.75 씩이다.
+--     완전히 고르지는 않다. 해시는 통계적으로 고르게 나누는 것이지 정확히 나누지 않는다.
+--   · 건수가 많아질수록 편차 비율은 줄어든다.
+--   · 파티션 수를 2의 거듭제곱(2·4·8·16) 으로 잡으면 분포가 더 고르다.
+--     2의 거듭제곱이 아니면 일부 파티션이 두 배 크기가 된다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — HASH 파티션 조회와 프루닝
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT 'P1' AS part, COUNT(*) FROM hr.emp_hash PARTITION FOR (1)
+  2  UNION ALL SELECT 'ALL', COUNT(*) FROM hr.emp_hash;
+
+PAR   COUNT(*)
+--- ----------
+P1          19
+ALL        107
+
+SYS@orcl> SELECT COUNT(*) AS p1 FROM hr.emp_hash SUBPARTITION FOR (1);
+SELECT COUNT(*) AS p1 FROM hr.emp_hash SUBPARTITION FOR (1)
+                                                        *
+ERROR at line 1:
+ORA-14173: illegal subpartition-extended table name syntax
+
+-- PARTITION FOR (1) 은 키 값 1 이 들어갈 파티션을 찾아 준다.
+-- HASH 에서는 이것이 유일한 실용적인 지정 방법이다. SYS_P 이름은 예측할 수 없기 때문이다.
+--
+-- SUBPARTITION FOR 은 복합 파티션이 아니면 ORA-14173 이다.
+-- 오류 문구가 illegal subpartition-extended table name syntax 라서
+-- 구문 오류처럼 보이지만 실제 원인은 이 테이블에는 서브파티션이 없다는 것이다.
+
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_hash WHERE employee_id = 115;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  f6txsf233p6gs, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_hash WHERE
+employee_id = 115
+
+Plan hash value: 3574618386
+
+-------------------------------------------------------------------------------------------------------------
+| Id  | Operation              | Name     | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT       |          |      1 |        |       |       |      1 |00:00:00.01 |       2 |
+|   1 |  SORT AGGREGATE        |          |      1 |      1 |       |       |      1 |00:00:00.01 |       2 |
+|   2 |   PARTITION HASH SINGLE|          |      1 |      1 |     2 |     2 |      1 |00:00:00.01 |       2 |
+|*  3 |    TABLE ACCESS FULL   | EMP_HASH |      1 |      1 |     2 |     2 |      1 |00:00:00.01 |       2 |
+-------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter("EMPLOYEE_ID"=115)
+
+
+21 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_hash WHERE employee_id BETWEEN 110 AND 120;
+
+  COUNT(*)
+----------
+        11
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  9pwzjar6aubam, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_hash WHERE
+employee_id BETWEEN 110 AND 120
+
+Plan hash value: 3573117041
+
+----------------------------------------------------------------------------------------------------------
+| Id  | Operation           | Name     | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |          |      1 |        |       |       |      1 |00:00:00.01 |       8 |
+|   1 |  SORT AGGREGATE     |          |      1 |      1 |       |       |      1 |00:00:00.01 |       8 |
+|   2 |   PARTITION HASH ALL|          |      1 |     12 |     1 |     4 |     11 |00:00:00.01 |       8 |
+|*  3 |    TABLE ACCESS FULL| EMP_HASH |      4 |     12 |     1 |     4 |     11 |00:00:00.01 |       8 |
+----------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(("EMPLOYEE_ID"<=120 AND "EMPLOYEE_ID">=110))
+
+
+21 rows selected.
+
+-- 이것이 HASH 의 핵심 제약이다.
+--
+--   조건                        | 연산                  | Pstart/Pstop | Starts | Buffers
+--   ----------------------------|-----------------------|--------------|--------|--------
+--   employee_id = 115           | PARTITION HASH SINGLE | 2 / 2        | 1      | 2
+--   employee_id BETWEEN 110 120 | PARTITION HASH ALL    | 1 / 4        | 4      | 8
+--
+-- 등치(=) 와 IN 은 해시 값을 계산할 수 있으므로 파티션을 특정할 수 있다.
+-- 범위(BETWEEN · > · <) 는 계산할 수 없다. 해시는 순서를 보존하지 않기 때문이다.
+-- -> 범위 조회가 주된 테이블에 HASH 를 쓰면 프루닝 이득이 전혀 없다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — HASH 파티션 수 조정
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER TABLE hr.emp_hash ADD PARTITION;
+
+Table altered.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_HASH')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT partition_position, partition_name, num_rows FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_HASH' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITION_   NUM_ROWS
+------------------ ---------- ----------
+                 1 SYS_P615            7
+                 2 SYS_P616           32
+                 3 SYS_P617           31
+                 4 SYS_P618           19
+                 5 SYS_P619           18
+
+SYS@orcl> ALTER TABLE hr.emp_hash COALESCE PARTITION;
+
+Table altered.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_HASH')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT partition_position, partition_name, num_rows FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_HASH' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITION_   NUM_ROWS
+------------------ ---------- ----------
+                 1 SYS_P615           25
+                 2 SYS_P616           32
+                 3 SYS_P617           31
+                 4 SYS_P618           19
+
+SYS@orcl> ALTER TABLE hr.emp_hash DROP PARTITION SYS_P1;
+ALTER TABLE hr.emp_hash DROP PARTITION SYS_P1
+                                       *
+ERROR at line 1:
+ORA-14255: table is not partitioned by range, list, composite range, or composite list method
+
+-- 관찰
+--   · ADD PARTITION 을 하면 개수가 5가 되고, 기존 한 파티션의 행이 새 파티션으로 재분배된다.
+--     SYS_P615 가 25 -> 7 로 줄고 새 SYS_P619 가 18을 받았다.
+--     즉 ADD 는 하나를 쪼개 두 개로 만드는 동작이다. 전체 재분배가 아니다.
+--     그래서 2의 거듭제곱이 아닌 개수에서는 분포가 고르지 않다.
+--   · COALESCE PARTITION 은 그 반대다. 마지막 파티션을 지우고 행을 다시 흩뿌린다.
+--     25 / 32 / 31 / 19 로 정확히 원래대로 돌아왔다.
+--   · DROP PARTITION 은 HASH 에 쓸 수 없다 (ORA-14255).
+--     HASH 에서 파티션을 하나 지우면 그 행이 갈 곳이 없어지기 때문이다.
+--     줄이려면 COALESCE 를 쓴다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — LIST 파티션
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp_list
+  2  PARTITION BY LIST (department_id)
+  3  (PARTITION p_dept_1 VALUES (10,20,30,40),
+  4   PARTITION p_dept_2 VALUES (50),
+  5   PARTITION p_dept_3 VALUES (60,70,80,90,100,110),
+  6   PARTITION p_dept_4 VALUES (DEFAULT))
+  7  TABLESPACE users
+  8  AS SELECT employee_id, last_name, salary, department_id FROM hr.employees;
+
+Table created.
+
+SYS@orcl> COL high_value FORMAT a34
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_LIST')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, num_rows
+  2  FROM   dba_tab_partitions WHERE table_owner='HR' AND table_name='EMP_LIST'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITION_ HIGH_VALUE                           NUM_ROWS
+------------------ ---------- ---------------------------------- ----------
+                 1 P_DEPT_1   10, 20, 30, 40                             10
+                 2 P_DEPT_2   50                                         45
+                 3 P_DEPT_3   60, 70, 80, 90, 100, 110                   51
+                 4 P_DEPT_4   DEFAULT                                     1
+
+SYS@orcl> SELECT partitioning_type, partition_count FROM dba_part_tables
+  2  WHERE  owner='HR' AND table_name='EMP_LIST';
+
+PARTITION PARTITION_COUNT
+--------- ---------------
+LIST                    4
+
+SYS@orcl> SELECT COUNT(*) AS default_part FROM hr.emp_list PARTITION (p_dept_4);
+
+DEFAULT_PART
+------------
+           1
+
+SYS@orcl> SELECT employee_id, last_name, department_id FROM hr.emp_list PARTITION (p_dept_4);
+
+EMPLOYEE_ID LAST_NAME                 DEPARTMENT_ID
+----------- ------------------------- -------------
+        178 Grant
+
+-- 관찰
+--   · high_value 에 값 목록이 그대로 보인다. RANGE 의 경계값과 달리 읽기 쉽다.
+--   · DEFAULT 파티션이 나머지를 받는다. 여기에는 부서가 NULL 인 Grant 한 건이 들어갔다.
+--     LIST 에서 NULL 은 DEFAULT 로 간다. RANGE 에서 NULL 은 MAXVALUE 쪽으로 간다.
+--     (NULL 을 특정 파티션에 넣고 싶으면 VALUES (NULL) 로 명시할 수 있다)
+--   · 분포는 10 / 45 / 51 / 1 이다. LIST 는 값 묶음을 사람이 정하므로
+--     묶는 방식이 곧 크기를 결정한다. 부서 50 하나가 45건인 것을 감안해 묶어야 한다.
+
+SYS@orcl> ALTER TABLE hr.emp_list ADD PARTITION p_dept_5 VALUES (120,130);
+ALTER TABLE hr.emp_list ADD PARTITION p_dept_5 VALUES (120,130)
+               *
+ERROR at line 1:
+ORA-14323: cannot add partition when DEFAULT partition exists
+
+
+SYS@orcl> ALTER TABLE hr.emp_list MODIFY PARTITION p_dept_2 ADD VALUES (120);
+
+Table altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_LIST' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITION_ HIGH_VALUE
+------------------ ---------- ----------------------------------
+                 1 P_DEPT_1   10, 20, 30, 40
+                 2 P_DEPT_2   50, 120
+                 3 P_DEPT_3   60, 70, 80, 90, 100, 110
+                 4 P_DEPT_4   DEFAULT
+
+SYS@orcl> ALTER TABLE hr.emp_list MODIFY PARTITION p_dept_3 ADD VALUES (120);
+ALTER TABLE hr.emp_list MODIFY PARTITION p_dept_3 ADD VALUES (120)
+*
+ERROR at line 1:
+ORA-14312: Value 120 already exists in partition 2
+
+
+SYS@orcl> ALTER TABLE hr.emp_list MODIFY PARTITION p_dept_2 DROP VALUES (120);
+
+Table altered.
+
+-- LIST 파티션 값 관리에서 만나는 오류 두 개다.
+--   ORA-14323 : cannot add partition when DEFAULT partition exists
+--     DEFAULT 가 이미 모든 값을 받고 있으므로 새 파티션을 붙일 수 없다.
+--     방법 두 가지 - (1) DEFAULT 파티션을 SPLIT 한다
+--                    (2) 기존 파티션에 MODIFY PARTITION ... ADD VALUES 로 값을 더한다
+--     (2)를 해 보면 p_dept_2 가 50, 120 이 된다. ADD VALUES 는 데이터 이동이 없어 빠르다.
+--   ORA-14312 : Value 120 already exists in partition 2
+--     같은 값을 두 파티션에 둘 수 없다. 옮기려면 먼저 DROP VALUES 로 떼어 내야 한다.
+
+SYS@orcl> CREATE TABLE hr.emp_list_nd
+  2  PARTITION BY LIST (department_id)
+  3  (PARTITION p_a VALUES (10,20,30,40),
+  4   PARTITION p_b VALUES (50))
+  5  TABLESPACE users
+  6  AS SELECT employee_id, last_name, salary, department_id FROM hr.employees
+  7  WHERE  department_id IN (10,20,30,40,50);
+
+Table created.
+
+SYS@orcl> SELECT COUNT(*) FROM hr.emp_list_nd;
+
+  COUNT(*)
+----------
+        55
+
+SYS@orcl> INSERT INTO hr.emp_list_nd VALUES (900,'NEWDEPT',3000,60);
+INSERT INTO hr.emp_list_nd VALUES (900,'NEWDEPT',3000,60)
+               *
+ERROR at line 1:
+ORA-14400: inserted partition key does not map to any partition
+
+
+SYS@orcl> DROP TABLE hr.emp_list_nd PURGE;
+
+Table dropped.
+
+-- DEFAULT 파티션이 없으면 RANGE 와 똑같이 ORA-14400 이다.
+-- LIST 파티션에 DEFAULT 를 두는 것은 RANGE 에 MAXVALUE 를 두는 것과 같은 선택이다.
+--   두면   : 안전하지만 예상 못한 값이 조용히 쌓인다 (데이터 품질 문제를 늦게 발견한다)
+--   안 두면 : 새 코드값이 생길 때마다 INSERT 가 실패한다 (즉시 알 수 있다)
+
+-- 19c 에는 세 번째 답이 있다.
+
+SYS@orcl> CREATE TABLE hr.emp_list_auto
+  2  PARTITION BY LIST (department_id) AUTOMATIC
+  3  (PARTITION p_dept_10 VALUES (10))
+  4  TABLESPACE users
+  5  AS SELECT employee_id, last_name, salary, department_id FROM hr.employees
+  6  WHERE  department_id IS NOT NULL;
+
+Table created.
+
+SYS@orcl> SELECT autolist, partition_count FROM dba_part_tables
+  2  WHERE  owner='HR' AND table_name='EMP_LIST_AUTO';
+
+AUT PARTITION_COUNT
+--- ---------------
+YES              11
+
+SYS@orcl> COL high_value FORMAT a12
+SYS@orcl> SELECT partition_position, partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_LIST_AUTO' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITION_ HIGH_VALUE
+------------------ ---------- ------------
+                 1 P_DEPT_10  10
+                 2 SYS_P620   90
+                 3 SYS_P621   60
+                 4 SYS_P622   100
+                 5 SYS_P623   30
+                 6 SYS_P624   50
+                 7 SYS_P625   80
+                 8 SYS_P626   20
+                 9 SYS_P627   40
+                10 SYS_P628   70
+                11 SYS_P629   110
+
+11 rows selected.
+
+SYS@orcl> INSERT INTO hr.emp_list_auto VALUES (901,'BRANDNEW',3000,999);
+
+1 row created.
+
+SYS@orcl> COMMIT;
+
+Commit complete.
+
+SYS@orcl> SELECT COUNT(*) AS parts FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_LIST_AUTO';
+
+     PARTS
+----------
+        12
+
+SYS@orcl> SELECT partition_name, high_value FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_LIST_AUTO' AND high_value = '999';
+SELECT partition_name, high_value FROM dba_tab_partitions
+                                                  *
+ERROR at line 1:
+ORA-00997: illegal use of LONG datatype
+
+
+SYS@orcl> DROP TABLE hr.emp_list_auto PURGE;
+
+Table dropped.
+
+-- AUTOMATIC LIST 파티션
+--   · 정의할 때 값 하나만 줬는데 CTAS 가 나머지 부서값마다 파티션을 만들었다 (11개).
+--   · 부서 999 를 넣으니 12번째 파티션이 자동으로 생겼다.
+--   · autolist 컬럼이 YES 다. DEFAULT 파티션은 쓸 수 없다 (자동 생성과 충돌한다).
+--   · INTERVAL 이 RANGE 에 해 주는 일을 AUTOMATIC 이 LIST 에 해 준다.
+--   · 다만 값의 가짓수가 많으면 파티션이 폭증한다. 값 종류가 제한적일 때만 쓴다.
+--
+-- 참고 : high_value 는 LONG 이라 WHERE 절에 쓸 수 없다 (ORA-00997).
+--        값으로 파티션을 찾으려면 PARTITION FOR (값) 을 쓰거나 PL/SQL 로 비교한다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_list WHERE department_id = 50;
+
+  COUNT(*)
+----------
+        45
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  0v909ubquw5v1, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_list WHERE
+department_id = 50
+
+Plan hash value: 1663036479
+
+-------------------------------------------------------------------------------------------------------------
+| Id  | Operation              | Name     | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT       |          |      1 |        |       |       |      1 |00:00:00.01 |       2 |
+|   1 |  SORT AGGREGATE        |          |      1 |      1 |       |       |      1 |00:00:00.01 |       2 |
+|   2 |   PARTITION LIST SINGLE|          |      1 |     45 |   KEY |   KEY |     45 |00:00:00.01 |       2 |
+|   3 |    TABLE ACCESS FULL   | EMP_LIST |      1 |     45 |     2 |     2 |     45 |00:00:00.01 |       2 |
+-------------------------------------------------------------------------------------------------------------
+
+
+16 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_list WHERE department_id IN (50,80);
+
+  COUNT(*)
+----------
+        79
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  0grv4qcqcjtuk, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_list WHERE
+department_id IN (50,80)
+
+Plan hash value: 2810691189
+
+-------------------------------------------------------------------------------------------------------------
+| Id  | Operation              | Name     | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT       |          |      1 |        |       |       |      1 |00:00:00.01 |       4 |
+|   1 |  SORT AGGREGATE        |          |      1 |      1 |       |       |      1 |00:00:00.01 |       4 |
+|   2 |   PARTITION LIST INLIST|          |      1 |     19 |KEY(I) |KEY(I) |     79 |00:00:00.01 |       4 |
+|*  3 |    TABLE ACCESS FULL   | EMP_LIST |      2 |     19 |KEY(I) |KEY(I) |     79 |00:00:00.01 |       4 |
+-------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(("DEPARTMENT_ID"=50 OR "DEPARTMENT_ID"=80))
+
+
+21 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_list WHERE salary > 10000;
+
+  COUNT(*)
+----------
+        15
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  g8xf8nhh02q8z, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_list WHERE
+salary > 10000
+
+Plan hash value: 2860038073
+
+----------------------------------------------------------------------------------------------------------
+| Id  | Operation           | Name     | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |          |      1 |        |       |       |      1 |00:00:00.01 |       8 |
+|   1 |  SORT AGGREGATE     |          |      1 |      1 |       |       |      1 |00:00:00.01 |       8 |
+|   2 |   PARTITION LIST ALL|          |      1 |     68 |     1 |     4 |     15 |00:00:00.01 |       8 |
+|*  3 |    TABLE ACCESS FULL| EMP_LIST |      4 |     68 |     1 |     4 |     15 |00:00:00.01 |       8 |
+----------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter("SALARY">10000)
+
+
+21 rows selected.
+
+-- LIST 프루닝 연산 이름
+--   department_id = 50        -> PARTITION LIST SINGLE   상위는 KEY, 하위 테이블은 2/2
+--   department_id IN (50,80)  -> PARTITION LIST INLIST   KEY(I), Starts=2
+--   파티션 키가 없는 조건     -> PARTITION LIST ALL      1/4, Starts=4
+--
+-- KEY 는 실행 시점에 결정된다는 뜻이다. LIST SINGLE 에서 상위 연산이 KEY 로 나오는 것은
+-- 값에서 파티션을 찾는 일을 실행 시점에 하기 때문이며, 실제로는 한 파티션만 읽는다(Starts=1).
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- hr.emp_hash 와 hr.emp_list 는 다음 실습에서 쓰지 않는다. 지운다.
+--   DROP TABLE hr.emp_hash PURGE;
+--   DROP TABLE hr.emp_list PURGE;
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. 방식 선택 기준은 한 문장으로 정리된다.
+--      범위로 자를 수 있고 범위로 조회한다        -> RANGE (또는 INTERVAL)
+--      열거 가능한 코드값으로 조회·관리한다        -> LIST
+--      고르게 흩뿌리는 것 자체가 목적이다          -> HASH
+--    무엇으로 조회하는가가 기준이다. 무엇으로 나누고 싶은가가 아니다.
+--
+-- 2. HASH 파티션 수는 2의 거듭제곱으로 잡는다.
+--    그리고 범위 조회에는 프루닝이 없다는 점을 반드시 확인한다.
+--    HASH 의 실제 이득은 파티션 단위 병렬 처리와 파티션 와이즈 조인이다.
+--
+-- 3. HASH 파티션은 DROP 할 수 없고 COALESCE 로 줄인다.
+--    반대로 RANGE·LIST 는 DROP·SPLIT·MERGE 가 전부 된다.
+--    파티션을 주기적으로 버려야 하는 테이블에 HASH 는 맞지 않는다.
+--
+-- 4. DEFAULT / MAXVALUE 파티션 정책을 문서로 정해 둔다.
+--    두는 쪽을 택했다면 그 파티션의 건수를 감시하는 쿼리를 함께 만든다.
+--    예상 못한 코드값이 쌓이는 것을 발견하는 장치가 그것뿐이기 때문이다.
+--
+-- 5. 19c 의 AUTOMATIC LIST 는 코드값이 계속 추가되는 테이블에 유용하다.
+--    단 값 종류가 수천 개로 늘어날 수 있는 컬럼에는 쓰지 않는다.
+--
+-- 6. 이 실습에서 본 오류
+--    ORA-14173  복합 파티션이 아닌데 SUBPARTITION 지정   -> PARTITION 으로 바꾼다
+--    ORA-14255  HASH 파티션에 DROP PARTITION             -> COALESCE PARTITION
+--    ORA-14323  DEFAULT 가 있는데 ADD PARTITION          -> SPLIT 또는 ADD VALUES
+--    ORA-14312  다른 파티션에 이미 있는 값 추가           -> 먼저 DROP VALUES
+--    ORA-14400  DEFAULT 없는 LIST 에 새 값 INSERT        -> DEFAULT 또는 AUTOMATIC
+--    ORA-00997  high_value(LONG) 를 WHERE 에 사용        -> PARTITION FOR (값)
+================================================================================
+ 실습 04 끝
+================================================================================

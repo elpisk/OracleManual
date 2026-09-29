@@ -1,0 +1,643 @@
+================================================================================
+ 파티셔닝 실습 10 : 글로벌(GLOBAL) 파티션 인덱스와 UNUSABLE 복구
+ 과정      : Oracle Database 19c 파티셔닝 실습
+ 환경      : Oracle 19.3.0 / Oracle Linux 7 / non-CDB ORCL / AL32UTF8 / 8K 블록
+ 계정      : SYS (대상 스키마 HR)
+ 소요 시간 : 약 55분
+================================================================================
+--------------------------------------------------------------------------------
+[1] 시나리오 개요
+--------------------------------------------------------------------------------
+-- GLOBAL 인덱스는 테이블 파티션 구조와 무관하게 만든다.
+-- 테이블은 사번으로 자르고 인덱스는 입사일로 자르는 것이 가능하다.
+-- 조회 조건이 파티션 키와 다를 때 유일한 선택지다.
+--
+-- 대가가 있다. 인덱스가 테이블 파티션 하나에 종속되지 않으므로
+-- 파티션 하나를 지우면 인덱스 전체가 무효가 된다. 이 실습은 그 과정을 그대로 재현한다.
+--
+-- 목표
+--   (1) 글로벌 파티션 인덱스는 반드시 접두여야 한다는 제약을 확인한다 (ORA-14038)
+--   (2) 인덱스 파티션 단위 프루닝을 계획으로 본다
+--   (3) DROP PARTITION 이 글로벌 인덱스 전체를 UNUSABLE 로 만드는 것을 확인한다
+--   (4) ORA-14086 / ORA-14078 을 만나고 파티션 단위 복구 방법을 익힌다
+--   (5) UPDATE INDEXES 절과 글로벌 비파티션 인덱스의 차이를 비교한다
+-- 작업 유형 : 인덱스 설계 + 장애 대응
+
+--------------------------------------------------------------------------------
+[2] 사전 조건
+--------------------------------------------------------------------------------
+-- · 실습 09 의 hr.emp_local 을 지웠다 (남아 있어도 무관하다)
+-- · USERS 에 최소 60MB 여유
+-- · 테이블은 employee_id 로 6개 RANGE 파티션, 인덱스는 hire_date 로 4개 RANGE 파티션이다
+--   일부러 서로 다른 키를 쓴다. 그것이 GLOBAL 인덱스의 존재 이유다
+
+[oracle@oel7v9 ~]$ sqlplus / as sysdba
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+
+SYS@orcl> SET LINESIZE 180 PAGESIZE 5000
+SYS@orcl> SET TAB OFF
+
+--------------------------------------------------------------------------------
+[3] 초기 상태 확인
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE TABLE hr.emp_global
+  2  PARTITION BY RANGE (employee_id)
+  3  (PARTITION part1 VALUES LESS THAN (20000),
+  4   PARTITION part2 VALUES LESS THAN (40000),
+  5   PARTITION part3 VALUES LESS THAN (80000),
+  6   PARTITION p4    VALUES LESS THAN (100000),
+  7   PARTITION p5    VALUES LESS THAN (120000),
+  8   PARTITION pmax  VALUES LESS THAN (MAXVALUE))
+  9  TABLESPACE users
+ 10  AS SELECT ROWNUM AS employee_id, e.last_name, e.first_name, e.hire_date,
+ 11            e.job_id, e.salary, e.manager_id, e.department_id
+ 12     FROM   hr.employees e, (SELECT LEVEL AS id FROM dual CONNECT BY LEVEL <= 1000);
+
+Table created.
+
+SYS@orcl> EXEC dbms_stats.gather_table_stats('HR','EMP_GLOBAL',granularity=>'AUTO')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL partition_name FORMAT a8
+SYS@orcl> COL high_value FORMAT a46
+SYS@orcl> SELECT partition_position, partition_name, num_rows, blocks FROM dba_tab_partitions
+  2  WHERE  table_owner='HR' AND table_name='EMP_GLOBAL' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO   NUM_ROWS     BLOCKS
+------------------ -------- ---------- ----------
+                 1 PART1         19999        156
+                 2 PART2         20000        157
+                 3 PART3         40000        296
+                 4 P4            20000        157
+                 5 P5             7001         65
+                 6 PMAX              0          0
+
+6 rows selected.
+
+SYS@orcl> SELECT num_rows, blocks FROM dba_tables WHERE owner='HR' AND table_name='EMP_GLOBAL';
+
+  NUM_ROWS     BLOCKS
+---------- ----------
+    107000        831
+
+-- 107000건, 파티션 6개. 실습 09 와 같은 형태다.
+
+SYS@orcl> CREATE INDEX hr.emp_global_bad ON hr.emp_global(job_id, hire_date) GLOBAL
+  2    PARTITION BY RANGE (hire_date)
+  3    (PARTITION p1 VALUES LESS THAN (TO_DATE('2006-01-01','YYYY-MM-DD')),
+  4     PARTITION pmax VALUES LESS THAN (MAXVALUE)) TABLESPACE users;
+  PARTITION BY RANGE (hire_date)
+                               *
+ERROR at line 2:
+ORA-14038: GLOBAL partitioned index must be prefixed
+
+-- ORA-14038: GLOBAL partitioned index must be prefixed
+--   글로벌 파티션 인덱스는 인덱스의 선두 컬럼이 인덱스 파티션 키와 같아야 한다.
+--   위 시도는 인덱스 컬럼이 (job_id, hire_date) 인데 파티션 키가 hire_date 여서 거부됐다.
+--   (hire_date, job_id) 순서면 통과한다.
+--
+--   왜 강제하는가 : 접두가 아니면 어떤 값이 어느 인덱스 파티션에 있는지 알 수 없어
+--   유일성 보장과 프루닝이 모두 불가능하다. LOCAL 인덱스는 비접두가 허용되지만
+--   GLOBAL 은 허용되지 않는다. 이 차이를 시험에서도 자주 묻는다.
+
+--------------------------------------------------------------------------------
+[4] 작업 수행 — 글로벌 파티션 인덱스 생성
+--------------------------------------------------------------------------------
+SYS@orcl> CREATE INDEX hr.emp_global_idx ON hr.emp_global(hire_date) GLOBAL
+  2    PARTITION BY RANGE (hire_date)
+  3    (PARTITION p2004 VALUES LESS THAN (TO_DATE('2005-01-01','YYYY-MM-DD')),
+  4     PARTITION p2005 VALUES LESS THAN (TO_DATE('2006-01-01','YYYY-MM-DD')),
+  5     PARTITION p2006 VALUES LESS THAN (TO_DATE('2007-01-01','YYYY-MM-DD')),
+  6     PARTITION pmax  VALUES LESS THAN (MAXVALUE))
+  7    TABLESPACE users;
+
+Index created.
+
+SYS@orcl> COL index_name FORMAT a16
+SYS@orcl> SELECT i.index_name, i.uniqueness, p.locality, p.alignment, i.partitioned, p.partition_count
+  2  FROM   dba_indexes i, dba_part_indexes p
+  3  WHERE  i.owner='HR' AND i.table_name='EMP_GLOBAL'
+  4  AND    p.owner = i.owner AND p.index_name = i.index_name;
+
+INDEX_NAME       UNIQUENES LOCALI ALIGNMENT    PAR PARTITION_COUNT
+---------------- --------- ------ ------------ --- ---------------
+EMP_GLOBAL_IDX   NONUNIQUE GLOBAL PREFIXED     YES               4
+
+SYS@orcl> COL high_value FORMAT a44
+SYS@orcl> SELECT partition_position, partition_name, high_value, blevel, leaf_blocks, status
+  2  FROM   dba_ind_partitions WHERE index_owner='HR' AND index_name='EMP_GLOBAL_IDX'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE                                       BLEVEL LEAF_BLOCKS STATUS
+------------------ -------- -------------------------------------------- ---------- ----------- --------
+                 1 P2004    TO_DATE(' 2005-01-01 00:00:00', 'SYYYY-MM-DD          1          77 USABLE
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 2 P2005    TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD          1          93 USABLE
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 3 P2006    TO_DATE(' 2007-01-01 00:00:00', 'SYYYY-MM-DD          1          77 USABLE
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 4 PMAX     MAXVALUE                                              1          97 USABLE
+
+SYS@orcl> ALTER SESSION SET statistics_level = ALL;
+
+Session altered.
+
+SYS@orcl> SET ARRAYSIZE 1000
+
+-- 딕셔너리 확인
+--   locality  = GLOBAL       테이블 파티션과 무관
+--   alignment = PREFIXED     글로벌은 항상 PREFIXED 다 (그 외에는 만들 수 없다)
+--   partition_count = 4      테이블 파티션 수(6) 와 다르다. 이것이 LOCAL 과의 핵심 차이다
+--
+-- 인덱스 파티션마다 blevel 1, leaf_blocks 77 / 93 / 77 / 97 이다.
+-- 인덱스를 네 조각으로 나눴으므로 각 조각의 깊이가 얕다.
+-- 비파티션 인덱스 하나였다면 leaf 가 300개 넘는 하나의 트리였을 것이다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_global WHERE employee_id = 1000;
+
+  COUNT(*)
+----------
+         1
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  fzq9b27q2bvha, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_global WHERE
+employee_id = 1000
+
+Plan hash value: 3662618875
+
+----------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name       | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |            |      1 |        |       |       |      1 |00:00:00.01 |     139 |
+|   1 |  SORT AGGREGATE         |            |      1 |      1 |       |       |      1 |00:00:00.01 |     139 |
+|   2 |   PARTITION RANGE SINGLE|            |      1 |      1 |     1 |     1 |      1 |00:00:00.01 |     139 |
+|*  3 |    TABLE ACCESS FULL    | EMP_GLOBAL |      1 |      1 |     1 |     1 |      1 |00:00:00.01 |     139 |
+----------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter("EMPLOYEE_ID"=1000)
+
+
+21 rows selected.
+
+-- 테이블 파티션 키(employee_id) 로 조회하면 이 인덱스는 쓰이지 않는다.
+-- PARTITION RANGE SINGLE + TABLE ACCESS FULL, Buffers 139.
+-- 당연하다. 인덱스 키가 hire_date 이기 때문이다.
+-- -> GLOBAL 인덱스를 만들 때는 그 인덱스를 타는 SQL 이 실제로 있는지 먼저 확인한다.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics index_rs(e emp_global_idx) */ COUNT(*)
+  2  FROM   hr.emp_global e
+  3  WHERE  hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+  4                       AND TO_DATE('2005-12-31','YYYY-MM-DD');
+
+  COUNT(*)
+----------
+     29000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  ffrszrydqbdx6, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics index_rs(e emp_global_idx) */
+COUNT(*) FROM   hr.emp_global e WHERE  hire_date BETWEEN
+TO_DATE('2005-01-01','YYYY-MM-DD')                      AND
+TO_DATE('2005-12-31','YYYY-MM-DD')
+
+Plan hash value: 1502691026
+
+-----------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name           | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+-----------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |                |      1 |        |       |       |      1 |00:00:00.01 |      94 |     93 |
+|   1 |  SORT AGGREGATE         |                |      1 |      1 |       |       |      1 |00:00:00.01 |      94 |     93 |
+|   2 |   PARTITION RANGE SINGLE|                |      1 |  16853 |     2 |     2 |  29000 |00:00:00.01 |      94 |     93 |
+|*  3 |    INDEX RANGE SCAN     | EMP_GLOBAL_IDX |      1 |  16853 |     2 |     2 |  29000 |00:00:00.01 |      94 |     93 |
+-----------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("HIRE_DATE">=TO_DATE(' 2005-01-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND "HIRE_DATE"<=TO_DATE('
+              2005-12-31 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+
+
+24 rows selected.
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_global
+  2  WHERE  hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+  3                       AND TO_DATE('2005-12-31','YYYY-MM-DD');
+
+  COUNT(*)
+----------
+     29000
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  6y0tdxkkshg4c, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_global WHERE
+hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+  AND TO_DATE('2005-12-31','YYYY-MM-DD')
+
+Plan hash value: 1584155811
+
+--------------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name           | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |                |      1 |        |       |       |      1 |00:00:00.01 |     101 |
+|   1 |  SORT AGGREGATE         |                |      1 |      1 |       |       |      1 |00:00:00.01 |     101 |
+|   2 |   PARTITION RANGE SINGLE|                |      1 |  16853 |     2 |     2 |  29000 |00:00:00.01 |     101 |
+|*  3 |    INDEX FAST FULL SCAN | EMP_GLOBAL_IDX |      1 |  16853 |     2 |     2 |  29000 |00:00:00.01 |     101 |
+--------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter("HIRE_DATE"<=TO_DATE(' 2005-12-31 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+
+
+22 rows selected.
+
+-- 인덱스 키로 조회하면 인덱스 파티션 하나만 읽는다.
+--   PARTITION RANGE SINGLE / Pstart 2 / Pstop 2 / INDEX RANGE SCAN / Buffers 94
+--   여기서 Pstart 2 는 인덱스 파티션 번호다. 테이블 파티션 번호가 아니다.
+--   2005년 데이터는 p2005 인덱스 파티션 하나에만 있으므로 하나만 읽으면 된다.
+--
+-- 두 번째 쿼리는 힌트를 뺀 것이다. 계획이 INDEX FAST FULL SCAN 으로 바뀌었다(Buffers 101).
+-- COUNT(*) 라서 순서가 필요 없으므로 옵티마이저가 멀티블록 읽기를 골랐다.
+-- 두 계획 모두 인덱스 파티션 2번만 읽는다. 프루닝은 그대로다.
+
+--------------------------------------------------------------------------------
+[5] 진행 로그 — 파티션 하나를 지우면 인덱스 전체가 죽는다
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT partition_name, status FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='EMP_GLOBAL_IDX' ORDER BY partition_position;
+
+PARTITIO STATUS
+-------- --------
+P2004    USABLE
+P2005    USABLE
+P2006    USABLE
+PMAX     USABLE
+
+SYS@orcl> ALTER TABLE hr.emp_global DROP PARTITION p4;
+
+Table altered.
+
+SYS@orcl> SELECT partition_name, status FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='EMP_GLOBAL_IDX' ORDER BY partition_position;
+
+PARTITIO STATUS
+-------- --------
+P2004    UNUSABLE
+P2005    UNUSABLE
+P2006    UNUSABLE
+PMAX     UNUSABLE
+
+SYS@orcl> SELECT /*+ gather_plan_statistics index_rs(e emp_global_idx) */ COUNT(*)
+  2  FROM   hr.emp_global e
+  3  WHERE  hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+  4                       AND TO_DATE('2005-12-31','YYYY-MM-DD');
+SELECT /*+ gather_plan_statistics index_rs(e emp_global_idx) */ COUNT(*)
+*
+ERROR at line 1:
+ORA-01502: index 'HR.EMP_GLOBAL_IDX' or partition of such index is in unusable state
+
+
+SYS@orcl> SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_global
+  2  WHERE  hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+  3                       AND TO_DATE('2005-12-31','YYYY-MM-DD');
+
+  COUNT(*)
+----------
+     23579
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  6y0tdxkkshg4c, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics */ COUNT(*) FROM hr.emp_global WHERE
+hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+  AND TO_DATE('2005-12-31','YYYY-MM-DD')
+
+Plan hash value: 4068342047
+
+-------------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name       | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |            |      1 |        |       |       |      1 |00:00:00.01 |     608 |
+|   1 |  SORT AGGREGATE      |            |      1 |      1 |       |       |      1 |00:00:00.01 |     608 |
+|   2 |   PARTITION RANGE ALL|            |      1 |  13669 |     1 |     5 |  23579 |00:00:00.01 |     608 |
+|*  3 |    TABLE ACCESS FULL | EMP_GLOBAL |      5 |  13669 |     1 |     5 |  23579 |00:00:00.01 |     608 |
+-------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(("HIRE_DATE">=TO_DATE(' 2005-01-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND
+              "HIRE_DATE"<=TO_DATE(' 2005-12-31 00:00:00', 'syyyy-mm-dd hh24:mi:ss')))
+
+
+23 rows selected.
+
+-- 이것이 GLOBAL 인덱스의 대가다.
+--   DROP PARTITION p4 하나로 인덱스 파티션 네 개가 전부 UNUSABLE 이 됐다.
+--   이유 : 글로벌 인덱스 엔트리는 테이블 전체에 흩어진 ROWID 를 가리킨다.
+--          지운 파티션의 ROWID 가 어느 인덱스 파티션에 들어 있는지 알 수 없으므로
+--          전부 무효로 표시하는 것이 유일한 안전한 처리다.
+--
+-- 결과
+--   · 힌트로 인덱스를 강제하면 ORA-01502 다.
+--   · 힌트가 없으면 조용히 PARTITION RANGE ALL / TABLE ACCESS FULL 로 우회한다.
+--     Buffers 가 94 에서 608 로 6배 이상 늘었다. 오류가 없으니 아무도 모른다.
+--   · 이것이 "파티션 정리 작업 다음 날 아침에 시스템이 느려지는" 전형적인 원인이다.
+
+SYS@orcl> ALTER INDEX hr.emp_global_idx REBUILD;
+ALTER INDEX hr.emp_global_idx REBUILD
+               *
+ERROR at line 1:
+ORA-14086: a partitioned index may not be rebuilt as a whole
+
+
+SYS@orcl> ALTER INDEX hr.emp_global_idx REBUILD PARTITION p2004;
+
+Index altered.
+
+SYS@orcl> ALTER INDEX hr.emp_global_idx REBUILD PARTITION p2005;
+
+Index altered.
+
+SYS@orcl> ALTER INDEX hr.emp_global_idx REBUILD PARTITION p2006;
+
+Index altered.
+
+SYS@orcl> ALTER INDEX hr.emp_global_idx REBUILD PARTITION pmax;
+
+Index altered.
+
+SYS@orcl> SELECT partition_name, blevel, leaf_blocks, status FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='EMP_GLOBAL_IDX' ORDER BY partition_position;
+
+PARTITIO     BLEVEL LEAF_BLOCKS STATUS
+-------- ---------- ----------- --------
+P2004             1          63 USABLE
+P2005             1          76 USABLE
+P2006             1          63 USABLE
+PMAX              1          79 USABLE
+
+SYS@orcl> SELECT /*+ gather_plan_statistics index_rs(e emp_global_idx) */ COUNT(*)
+  2  FROM   hr.emp_global e
+  3  WHERE  hire_date BETWEEN TO_DATE('2005-01-01','YYYY-MM-DD')
+  4                       AND TO_DATE('2005-12-31','YYYY-MM-DD');
+
+  COUNT(*)
+----------
+     23579
+
+SYS@orcl> SELECT * FROM TABLE(dbms_xplan.display_cursor(NULL,NULL,'ALLSTATS LAST +PARTITION'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  ffrszrydqbdx6, child number 0
+-------------------------------------
+SELECT /*+ gather_plan_statistics index_rs(e emp_global_idx) */
+COUNT(*) FROM   hr.emp_global e WHERE  hire_date BETWEEN
+TO_DATE('2005-01-01','YYYY-MM-DD')                      AND
+TO_DATE('2005-12-31','YYYY-MM-DD')
+
+Plan hash value: 1502691026
+
+-----------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation               | Name           | Starts | E-Rows | Pstart| Pstop | A-Rows |   A-Time   | Buffers | Reads  |
+-----------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |                |      1 |        |       |       |      1 |00:00:00.01 |      77 |     76 |
+|   1 |  SORT AGGREGATE         |                |      1 |      1 |       |       |      1 |00:00:00.01 |      77 |     76 |
+|   2 |   PARTITION RANGE SINGLE|                |      1 |  13669 |     2 |     2 |  23579 |00:00:00.01 |      77 |     76 |
+|*  3 |    INDEX RANGE SCAN     | EMP_GLOBAL_IDX |      1 |  13669 |     2 |     2 |  23579 |00:00:00.01 |      77 |     76 |
+-----------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("HIRE_DATE">=TO_DATE(' 2005-01-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND "HIRE_DATE"<=TO_DATE('
+              2005-12-31 00:00:00', 'syyyy-mm-dd hh24:mi:ss'))
+
+
+24 rows selected.
+
+-- 복구 방법
+--   ORA-14086: a partitioned index may not be rebuilt as a whole
+--     파티션 인덱스는 통째로 REBUILD 할 수 없다. 파티션 단위로만 가능하다.
+--     파티션이 100개면 REBUILD 문장 100개가 필요하다.
+--     실무에서는 dba_ind_partitions 를 읽어 문장을 생성하는 스크립트를 쓴다.
+--
+--   네 파티션을 각각 REBUILD 하면 전부 USABLE 로 돌아온다.
+--   leaf_blocks 가 77/93/77/97 에서 63/76/63/79 로 줄었다.
+--   지운 파티션의 엔트리가 빠졌고 리빌드로 조각이 정리됐기 때문이다.
+--   같은 쿼리의 Buffers 도 608 -> 77 로 돌아왔다.
+
+SYS@orcl> ALTER TABLE hr.emp_global DROP PARTITION p5 UPDATE INDEXES;
+
+Table altered.
+
+SYS@orcl> SELECT partition_name, status FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='EMP_GLOBAL_IDX' ORDER BY partition_position;
+
+PARTITIO STATUS
+-------- --------
+P2004    USABLE
+P2005    USABLE
+P2006    USABLE
+PMAX     USABLE
+
+-- 처음부터 UNUSABLE 을 만들지 않는 방법이 UPDATE INDEXES 다.
+--   ALTER TABLE ... DROP PARTITION p5 UPDATE INDEXES
+--   작업 후 네 인덱스 파티션이 모두 USABLE 이다.
+--   Oracle 이 DROP 과 동시에 해당 엔트리만 인덱스에서 지운다.
+--
+--   비용 : 지우는 파티션의 건수만큼 인덱스 유지 작업이 발생한다. DROP 이 느려진다.
+--          그래도 UNUSABLE 구간이 없다는 이점이 대부분의 경우 더 크다.
+--   글로벌 인덱스가 있는 테이블의 파티션 DDL 에는 UPDATE INDEXES 를 기본으로 붙인다.
+
+--------------------------------------------------------------------------------
+[6] 검증 — 인덱스 파티션 자체를 관리한다
+--------------------------------------------------------------------------------
+SYS@orcl> ALTER INDEX hr.emp_global_idx SPLIT PARTITION pmax
+  2    AT (TO_DATE('2008-01-01','YYYY-MM-DD')) INTO (PARTITION part2007, PARTITION pmax);
+
+Index altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, blevel, leaf_blocks, status
+  2  FROM   dba_ind_partitions WHERE index_owner='HR' AND index_name='EMP_GLOBAL_IDX'
+  3  ORDER  BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE                                       BLEVEL LEAF_BLOCKS STATUS
+------------------ -------- -------------------------------------------- ---------- ----------- --------
+                 1 P2004    TO_DATE(' 2005-01-01 00:00:00', 'SYYYY-MM-DD          1          63 USABLE
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 2 P2005    TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD          1          76 USABLE
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 3 P2006    TO_DATE(' 2007-01-01 00:00:00', 'SYYYY-MM-DD          1          63 USABLE
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 4 PART2007 TO_DATE(' 2008-01-01 00:00:00', 'SYYYY-MM-DD                        USABLE
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 5 PMAX     MAXVALUE                                                            USABLE
+
+SYS@orcl> ALTER INDEX hr.emp_global_idx DROP PARTITION part2007;
+
+Index altered.
+
+SYS@orcl> SELECT partition_position, partition_name, high_value, status FROM dba_ind_partitions
+  2  WHERE  index_owner='HR' AND index_name='EMP_GLOBAL_IDX' ORDER BY partition_position;
+
+PARTITION_POSITION PARTITIO HIGH_VALUE                                   STATUS
+------------------ -------- -------------------------------------------- --------
+                 1 P2004    TO_DATE(' 2005-01-01 00:00:00', 'SYYYY-MM-DD USABLE
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 2 P2005    TO_DATE(' 2006-01-01 00:00:00', 'SYYYY-MM-DD USABLE
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 3 P2006    TO_DATE(' 2007-01-01 00:00:00', 'SYYYY-MM-DD USABLE
+                             HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')
+
+                 4 PMAX     MAXVALUE                                     UNUSABLE
+
+SYS@orcl> ALTER INDEX hr.emp_global_idx REBUILD PARTITION pmax;
+
+Index altered.
+
+SYS@orcl> ALTER INDEX hr.emp_global_idx DROP PARTITION pmax;
+ALTER INDEX hr.emp_global_idx DROP PARTITION pmax
+                                             *
+ERROR at line 1:
+ORA-14078: you may not drop the highest partition of a GLOBAL index
+
+-- 인덱스 파티션도 테이블 파티션처럼 SPLIT · DROP 할 수 있다.
+--   · SPLIT 직후 새로 생긴 두 파티션(part2007 · pmax) 의 blevel·leaf_blocks 가 비었다.
+--     통계가 무효화됐다는 뜻이다. status 는 USABLE 이다.
+--   · DROP PARTITION part2007 을 하면 그 다음 파티션(pmax) 이 UNUSABLE 이 된다.
+--     지운 파티션이 담당했던 값의 범위를 pmax 가 흡수하는데
+--     그 엔트리가 실제로는 없으므로 무효 표시가 된다. REBUILD 해야 한다.
+--   · 마지막 파티션은 지울 수 없다 (ORA-14078).
+--     지우면 그 범위의 값을 담을 곳이 없어지므로 인덱스가 불완전해진다.
+--     LOCAL 인덱스에는 이 제약이 없다. 테이블 파티션이 지워질 때 같이 지워지기 때문이다.
+
+SYS@orcl> CREATE INDEX hr.emp_global_np ON hr.emp_global(salary) TABLESPACE users;
+
+Index created.
+
+SYS@orcl> SELECT index_name, partitioned, status FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_GLOBAL' ORDER BY index_name;
+
+INDEX_NAME       PAR STATUS
+---------------- --- --------
+EMP_GLOBAL_IDX   YES N/A
+EMP_GLOBAL_NP    NO  VALID
+
+SYS@orcl> ALTER TABLE hr.emp_global DROP PARTITION part3;
+
+Table altered.
+
+SYS@orcl> SELECT index_name, partitioned, status FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_GLOBAL' ORDER BY index_name;
+
+INDEX_NAME       PAR STATUS
+---------------- --- --------
+EMP_GLOBAL_IDX   YES N/A
+EMP_GLOBAL_NP    NO  UNUSABLE
+
+SYS@orcl> ALTER INDEX hr.emp_global_np REBUILD;
+
+Index altered.
+
+SYS@orcl> SELECT index_name, partitioned, status FROM dba_indexes
+  2  WHERE  owner='HR' AND table_name='EMP_GLOBAL' ORDER BY index_name;
+
+INDEX_NAME       PAR STATUS
+---------------- --- --------
+EMP_GLOBAL_IDX   YES N/A
+EMP_GLOBAL_NP    NO  VALID
+
+-- 글로벌 비파티션 인덱스와 비교한다.
+--   · dba_indexes.status 는 파티션 인덱스에서 N/A 다. 상태는 dba_ind_partitions 에 있다.
+--     비파티션 인덱스는 dba_indexes.status 에 VALID / UNUSABLE 이 나온다.
+--     -> 점검 쿼리를 두 개 만들어야 한다. 하나만 보면 절반을 놓친다.
+--   · DROP PARTITION part3 로 비파티션 글로벌 인덱스도 UNUSABLE 이 됐다.
+--     글로벌이면 파티션이든 아니든 결과가 같다.
+--   · 비파티션이면 ALTER INDEX ... REBUILD 한 문장으로 복구된다.
+--     ORA-14086 이 없다. 파티션 인덱스보다 복구 절차가 단순하다.
+--
+-- 정리 : GLOBAL 인덱스를 파티션할 이유는 크기 분산과 경합 완화다.
+--        복구 절차가 복잡해지므로 이득이 분명할 때만 파티션한다.
+
+--------------------------------------------------------------------------------
+[7] 정리
+--------------------------------------------------------------------------------
+-- 이 실습의 테이블은 다음 실습에서 쓰지 않는다.
+--   DROP TABLE hr.emp_global PURGE;
+
+--------------------------------------------------------------------------------
+[8] 실무 포인트
+--------------------------------------------------------------------------------
+-- 1. LOCAL 과 GLOBAL 선택 기준
+--      조회 조건 = 파티션 키                  -> LOCAL (기본 선택)
+--      조회 조건 <> 파티션 키                 -> GLOBAL
+--      파티션 키를 포함하지 않는 유일성 필요   -> GLOBAL UNIQUE
+--      파티션을 주기적으로 DROP·EXCHANGE      -> LOCAL 로 몰아넣는 설계를 재검토
+--    한 테이블에 둘을 섞어 쓰는 것은 정상이다. 인덱스마다 판단한다.
+--
+-- 2. 글로벌 파티션 인덱스는 반드시 접두다 (ORA-14038).
+--    인덱스 선두 컬럼과 인덱스 파티션 키가 같아야 한다.
+--
+-- 3. 글로벌 인덱스가 있으면 모든 파티션 DDL 에 UPDATE INDEXES 를 붙인다.
+--    붙이지 않으면 인덱스 전체가 UNUSABLE 이 되고, 오류 없이 성능만 나빠진다.
+--    절차서에 문장 템플릿을 박아 두는 것이 가장 확실한 예방책이다.
+--
+-- 4. 상태 점검 쿼리는 두 개다.
+--      SELECT index_name, partition_name FROM dba_ind_partitions WHERE status <> 'USABLE';
+--      SELECT index_name FROM dba_indexes WHERE status = 'UNUSABLE';
+--    파티션 인덱스는 dba_indexes.status 가 N/A 이므로 첫 번째 쿼리가 없으면 못 찾는다.
+--
+-- 5. 복구는 파티션 단위다 (ORA-14086).
+--    복구 스크립트를 미리 만들어 둔다.
+--      SELECT 'ALTER INDEX '||index_owner||'.'||index_name||
+--             ' REBUILD PARTITION '||partition_name||' ONLINE;'
+--      FROM   dba_ind_partitions WHERE status <> 'USABLE';
+--    ONLINE 을 붙이면 서비스 중에도 리빌드할 수 있다.
+--
+-- 6. 이 실습에서 본 오류
+--    ORA-14038  비접두 글로벌 파티션 인덱스 생성   -> 선두 컬럼을 파티션 키로
+--    ORA-01502  UNUSABLE 인덱스 사용               -> REBUILD PARTITION
+--    ORA-14086  파티션 인덱스 전체 REBUILD         -> 파티션 단위로 반복
+--    ORA-14078  글로벌 인덱스 마지막 파티션 DROP    -> SPLIT/MERGE 로 구조 조정
+================================================================================
+ 실습 10 끝
+================================================================================
