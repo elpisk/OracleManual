@@ -84,7 +84,7 @@ SQLT 교안은 모든 챕터가 같은 10절 구조다: 01 Why / 02 Concept / 03
 | 2 | SQLT Ch02 | SQL 은 어떻게 실행되는가? | 1 | 2 | Parse/Bind/Execute/Fetch, 리터럴 값별 실행계획, SQL_ID 로 파싱 재사용 확인 | **TUN 2장의 파싱 설명을 여기서 흡수** |
 | 3 | SQLT Ch03 | 실행계획 기초 | 1 | 2 | 컬럼별 판독 기준, 카디널리티 추정 오류 사례, 주요 Operation 6종 | — |
 | 4 | SQLT Ch14 | SQL 성능 측정 | 1 | 2 | Buffers vs Reads, 콜드/웜 캐시, Buffers 만 보고 튜닝했을 때의 함정 | **Ch13 뒤에서 Day 1 로 앞당김** — 이후 모든 실습의 측정 도구 |
-| 5 | SQLT Ch04 | Full Scan vs Index Scan | 2 | 2 | 작은 표 vs 큰 표 Full Scan, 선택도에 따른 접근 방식 전환 | — |
+| 5 | SQLT Ch04 | Full Scan vs Index Scan | 2 | 2 | 작은 테이블 vs 큰 테이블 Full Scan, 선택도에 따른 접근 방식 전환 | — |
 | 6 | SQLT Ch05 | 인덱스 설계 | 2 | 2 | (HOSP_ID, RECEIPT_DATE) 복합 인덱스 실측, 컬럼 순서 반전 | — |
 | 7 | SQLT Ch06 | SARGable SQL | 2 | 2 | BIRTH_DATE 조건절 3종, 묵시적 형변환 방향, DATE 컬럼 재현 | — |
 | 8 | SQLT Ch13 | Optimizer 와 통계정보 | 2 | 2 | HOSP_ID 스큐 히스토그램 유무별 E-Rows, 히스토그램 제거·복원 | **Ch12 뒤에서 Day 2 마지막으로 이동** — TUN 7장의 전제 |

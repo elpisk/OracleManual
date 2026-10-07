@@ -32,7 +32,7 @@
 
 ### ch05 — SQLT Ch04 · Full Scan vs Index Scan
 - **교안** (`ch05_FullScan_vs_IndexScan/`): `ch05_교안.md` · `ch05_교안.pptx`
-- **트랜스크립트** (`ch05_FullScan_vs_IndexScan/`): `ch05_실습_01_FullScan비용은_표크기가_정한다.txt` · `ch05_실습_02_선택도에따른_인덱스_FullScan전환.txt` · `ch05_실습_03_IndexOnly_표를읽지않으면_49퍼센트도_인덱스.txt`
+- **트랜스크립트** (`ch05_FullScan_vs_IndexScan/`): `ch05_실습_01_FullScan비용은_테이블크기가_정한다.txt` · `ch05_실습_02_선택도에따른_인덱스_FullScan전환.txt` · `ch05_실습_03_IndexOnly_테이블을읽지않으면_49퍼센트도_인덱스.txt`
 - **문제해설** (`ch05_FullScan_vs_IndexScan/`): `ch05_문제.md` · `ch05_해설.md`
 
 ### ch06 — SQLT Ch05 · 인덱스 설계
@@ -57,7 +57,7 @@
 
 ### ch10 — SQLT Ch08 · Subquery / EXISTS / IN
 - **교안** (`ch10_Subquery_EXISTS_IN/`): `ch10_교안.md` · `ch10_교안.pptx`
-- **트랜스크립트** (`ch10_Subquery_EXISTS_IN/`): `ch10_실습_01_스칼라서브쿼리_캐싱_vs_JOIN.txt` · `ch10_실습_02_상관서브쿼리_변환이_표를_두번읽는다.txt` · `ch10_실습_03_인라인뷰WHERE_vs_HAVING_뷰병합.txt`
+- **트랜스크립트** (`ch10_Subquery_EXISTS_IN/`): `ch10_실습_01_스칼라서브쿼리_캐싱_vs_JOIN.txt` · `ch10_실습_02_상관서브쿼리_변환이_테이블을_두번읽는다.txt` · `ch10_실습_03_인라인뷰WHERE_vs_HAVING_뷰병합.txt`
 - **문제해설** (`ch10_Subquery_EXISTS_IN/`): `ch10_문제.md` · `ch10_해설.md`
 
 ### ch11 — SQLT Ch09 · UNION / UNION ALL / DISTINCT
