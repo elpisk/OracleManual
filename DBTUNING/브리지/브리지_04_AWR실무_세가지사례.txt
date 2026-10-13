@@ -1,0 +1,1014 @@
+================================================================================
+ 브리지 04 — AWR 로 사건을 다루는 세 가지 방식 (ch20~ch25 최종 정리)
+ 목표: ch20~ch25 에서 따로 배운 도구(AWR 스냅샷·보고서·Compare Periods·ADDM·ASH)를
+       하나의 사건 처리 흐름으로 묶는다. 신고가 들어오는 방식은 세 가지뿐이다 —
+       "어제 느렸다"(과거) / "지난주보다 느리다"(비교) / "지금 느리다"(현재).
+       셋은 1차 도구가 다르고, 각 도구에는 사각지대가 있다. 세 사례를 실제로
+       만들어 각 도구가 무엇을 보여 주고 무엇을 숨기는지 수치로 확인한다.
+ 환경: non-CDB=orcl 19.3.0.0, SYS AS SYSDBA + SQLT. 4 CPU / 7.49GB.
+       🔒 AWR·ADDM·ASH 는 Diagnostics Pack. control_management_pack_access =
+       DIAGNOSTIC+TUNING 확인 후 진행했다. 미보유 환경은 절차서의 V$ 대안을 따른다.
+ 전제: 스냅샷 1시간 주기 / 8일 보존 / SM/AWR 414MB. 진료비청구심사 스키마 7개 표.
+       보고서는 awrrpt.sql 대화형 대신 DBMS_WORKLOAD_REPOSITORY 프로그램 호출로
+       만든다(ch22 실습 01 이 대화형을 다루므로 여기서는 운영에서 쓰는 쪽을 쓴다).
+ 주의: 개인 실습 환경 전용. 조회와 수동 스냅샷만 한다. 사례 2 에서 인덱스를 하나
+       만들었다 지우며, 원본 7개 표의 데이터는 바꾸지 않는다.
+       2026-10-13 실측. 스냅샷 1112~1120 을 이 실습이 만들었다(8일 뒤 자동 소멸).
+================================================================================
+
+--------------------------------------------------------------------------------
+-- [0] 들어가며 — 신고의 형태가 1차 도구를 정한다
+--------------------------------------------------------------------------------
+-- 세 사례를 먼저 표로 놓고 시작한다. 이 표가 이 문서의 결론이다.
+--
+--   ┌──────────────────┬──────────────┬──────────────┬────────────────────────┐
+--   │ 신고             │ 1차 도구     │ 2차 도구     │ 하면 안 되는 것        │
+--   ├──────────────────┼──────────────┼──────────────┼────────────────────────┤
+--   │ 어제 느렸다      │ AWR 보고서   │ ASH(분 단위) │ 구간 평균만 보고 판정  │
+--   │ 지난주보다 느리다│ Compare Per. │ SQLSTAT 정규화│ 절대값 비교           │
+--   │ 지금 느리다      │ V$SESSION/ASH│ 사후 AWR     │ AWR 부터 열기          │
+--   └──────────────────┴──────────────┴──────────────┴────────────────────────┘
+--
+-- 셋 다 "누적값을 두 시점의 차이로 읽는다" 는 ch19 의 원칙 위에 서 있다.
+
+SYS@orcl> SELECT name, value FROM v$parameter
+  2        WHERE name IN ('control_management_pack_access','statistics_level');
+
+NAME                               VALUE
+---------------------------------- ------------------------
+statistics_level                   TYPICAL
+control_management_pack_access     DIAGNOSTIC+TUNING
+
+SYS@orcl> SELECT snap_interval, retention FROM dba_hist_wr_control;
+
+SNAP_INTERVAL                  RETENTION
+------------------------------ ------------------------------
++00000 01:00:00.0              +00008 00:00:00.0
+
+-- 해석: 라이선스 접근이 DIAGNOSTIC+TUNING 이므로 AWR·ADDM·ASH 를 쓸 수 있다.
+--   단 이 파라미터가 계약을 보장하지는 않는다 — 계약서 확인은 별도다(ch15 실습 03).
+--   1시간 주기 / 8일 보존. "어제 오후" 는 보존 안에 있다. 이것이 사례 1 의 전제다.
+
+
+================================================================================
+ 사례 1 — "어제 오후에 느렸다" (과거 구간, 사후 진단)
+================================================================================
+-- 신고: "어제 오후에 화면이 느렸다." SQL 도 시각도 세션도 주어지지 않았다.
+-- 재현을 위해 같은 모양의 구간을 지금 만든다 — 넓은 구간 안에 짧은 스파이크.
+
+--------------------------------------------------------------------------------
+-- [1-1] 구간 만들기 (재현 절차)
+--------------------------------------------------------------------------------
+-- [터미널 1 : SYS]   EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+-- [터미널 2 : SQLT]  평시 조회 120초  (HOSPITALS COUNT + 0.4초 간격)
+--                    스파이크  60초  (CLAIM_DETAILS 전체 스캔 + 리터럴 SQL, 간격 없음)
+--                    평시 조회 120초
+-- [터미널 1 : SYS]   EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+SYS@orcl> EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> SELECT MAX(snap_id) AS start_snap,
+  2               TO_CHAR(SYSTIMESTAMP,'YYYY-MM-DD HH24:MI:SS') AS t0 FROM dba_hist_snapshot;
+
+START_SNAP T0
+---------- -------------------
+      1112 2026-10-13 08:59:46
+
+SQLT@orcl> -- 스파이크 구획 (60초)
+SQLT@orcl> DECLARE
+  2          v NUMBER; t0 NUMBER := DBMS_UTILITY.GET_TIME; i PLS_INTEGER := 0;
+  3        BEGIN
+  4          WHILE (DBMS_UTILITY.GET_TIME - t0) < 6000 LOOP
+  5            i := i + 1;
+  6            SELECT /*+ C1_SPIKE_SCAN */ COUNT(*) INTO v FROM claim_details WHERE amt > 150000;
+  7            EXECUTE IMMEDIATE
+  8              'SELECT /* C1_SPIKE_LIT */ COUNT(*) FROM medical_claims WHERE hosp_id = '
+  9              || TO_CHAR(MOD(i,1000)+1) INTO v;
+ 10          END LOOP;
+ 11          DBMS_OUTPUT.PUT_LINE('스파이크 끝 반복 '||i||'회');
+ 12        END;
+ 13        /
+스파이크 끝 반복 1868회, 60초
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> SELECT MAX(snap_id) AS end_snap,
+  2               TO_CHAR(SYSTIMESTAMP,'YYYY-MM-DD HH24:MI:SS') AS t1 FROM dba_hist_snapshot;
+
+  END_SNAP T1
+---------- -------------------
+      1113 2026-10-13 09:04:51
+
+-- 해석: 구간 1112→1113 은 5분 5초이고 그 안의 60초만 바빴다. 희석비 5배.
+--   운영에서는 "1시간 자동 스냅샷 구간 안의 5분 장애" 가 흔하다 — 희석비 12배다.
+
+
+--------------------------------------------------------------------------------
+-- [1-2] AWR 텍스트 보고서 생성 — 운영에서 쓰는 프로그램 호출
+--------------------------------------------------------------------------------
+SYS@orcl> SET LINESIZE 200 PAGESIZE 2000 HEADING OFF
+SYS@orcl> SPOOL /tmp/awr/awr_1112_1113.txt
+SYS@orcl> SELECT output FROM TABLE(DBMS_WORKLOAD_REPOSITORY.AWR_REPORT_TEXT(
+  2               (SELECT dbid FROM v$database), 1, 1112, 1113));
+SYS@orcl> SPOOL OFF
+SYS@orcl> HOST wc -l /tmp/awr/awr_1112_1113.txt
+3372 /tmp/awr/awr_1112_1113.txt
+
+-- 해석: awrrpt.sql 은 형식·일수·스냅ID 를 되묻는 대화형이라 자동화에 쓸 수 없다.
+--   AWR_REPORT_TEXT(dbid, inst, bid, eid) 는 테이블 함수라 그대로 SPOOL 할 수 있고
+--   dbid·inst 를 질의로 채우면 환경에 안 묶인다. HTML 은 AWR_REPORT_HTML 이다.
+--   3,372 줄이다 — 전부 읽는 것이 아니라 섹션을 찍어 본다.
+
+
+--------------------------------------------------------------------------------
+-- [1-3] (조회 → 1차 판정) 머리 요약과 Load Profile
+--------------------------------------------------------------------------------
+SYS@orcl> HOST sed -n '/Snap Id/,/DB Time:/p' /tmp/awr/awr_1112_1113.txt
+
+              Snap Id      Snap Time      Sessions Curs/Sess
+            --------- ------------------- -------- ---------
+Begin Snap:      1112 13-10월-26 08:59:45       55       4.6
+  End Snap:      1113 13-10월-26 09:04:50       55       4.7
+   Elapsed:                5.09 (mins)
+   DB Time:                1.04 (mins)
+
+SYS@orcl> HOST sed -n '/^Load Profile/,/^Instance Efficiency/p' /tmp/awr/awr_1112_1113.txt
+
+Load Profile                    Per Second   Per Transaction  Per Exec  Per Call
+~~~~~~~~~~~~~~~            ---------------   --------------- --------- ---------
+             DB Time(s):               0.2               4.5      0.01      0.75
+              DB CPU(s):               0.2               4.3      0.01      0.72
+      Background CPU(s):               0.0               0.2      0.00      0.00
+      Redo size (bytes):          18,604.8         405,644.6
+  Logical read (blocks):          59,584.2       1,299,127.4
+          Block changes:              60.5           1,319.6
+ Physical read (blocks):              10.6             231.7
+Physical write (blocks):               3.3              71.0
+       Read IO requests:               0.7              15.4
+      Write IO requests:               1.4              30.9
+
+-- 해석: ★ 여기서 멈추면 틀린다. ★
+--   Elapsed 5.09분 / DB Time 1.04분 → DB Time 이 구간의 20% 다.
+--   DB Time(s) = 0.2 /초 = 평균 활성 세션(AAS) 0.2. 4 CPU 환경에서 AAS 0.2 는
+--   "한가하다" 는 뜻이다. 보고서만 보면 "문제 없는 구간" 으로 결론 내리게 된다.
+--   그런데 Logical read 가 초당 59,584 블록이다 — 한가한 DB 의 숫자가 아니다.
+--   이 두 숫자의 어긋남이 "평균이 무언가를 숨기고 있다" 는 첫 신호다.
+
+
+--------------------------------------------------------------------------------
+-- [1-4] Top 10 Foreground Events — 대기인가 CPU 인가
+--------------------------------------------------------------------------------
+SYS@orcl> HOST sed -n '/^Top 10 Foreground Events/,/^Wait Classes by Total/p' /tmp/awr/awr_1112_1113.txt
+
+Top 10 Foreground Events by Total Wait Time
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                                           Total Wait       Avg   % DB Wait
+Event                                Waits Time (sec)      Wait   time Class
+------------------------------ ----------- ---------- --------- ------ --------
+DB CPU                                           60.1             96.6
+db file scattered read                  66         .9   13.84ms    1.5 User I/O
+db file sequential read                103         .9    8.75ms    1.4 User I/O
+direct path read                        12         .1    7.16ms     .1 User I/O
+direct path write                       23          0    1.18ms     .0 User I/O
+undo segment extension                   2          0    5.43ms     .0 Configur
+log file sync                            1          0    2.33ms     .0 Commit
+PGA memory operation                   184          0    7.84us     .0 Other
+Disk file operations I/O                25          0   38.68us     .0 User I/O
+control file sequential read           152          0    2.41us     .0 System I
+
+-- 해석: DB CPU 가 DB Time 의 96.6% 다. 대기는 전부 1.5% 이하다.
+--   → 이 사건은 대기 사건이 아니라 CPU 사건이다. 대기 이벤트를 파도 답이 없다.
+--   AWR 은 "무엇이 아닌지" 를 먼저 확실히 알려 준다. 이것만으로도 보고서를 연 값을 한다.
+
+
+--------------------------------------------------------------------------------
+-- [1-5] Time Model — CPU 안에서 어디로 갔나
+--------------------------------------------------------------------------------
+SYS@orcl> HOST sed -n '/^Time Model Statistics/,+22p' /tmp/awr/awr_1112_1113.txt
+
+Time Model Statistics                     DB/Inst: ORCL/orcl  Snaps: 1112-1113
+-> Ordered by % of DB time in descending order, followed by Statistic Name
+
+                                                                % of  % of Total
+Statistic Name                                       Time (s) DB Time   CPU Time
+------------------------------------------ ------------------ ------- ----------
+sql execute elapsed time                                 62.1    99.7
+DB CPU                                                   60.1    96.6       95.6
+parse time elapsed                                        1.9     3.0
+hard parse elapsed time                                   1.4     2.3
+hard parse (sharing criteria) elapsed time                0.5      .9
+PL/SQL execution elapsed time                             0.3      .5
+PL/SQL compilation elapsed time                           0.1      .2
+failed parse elapsed time                                 0.1      .2
+connection management call elapsed time                   0.1      .1
+DB time                                                  62.3
+background elapsed time                                   5.0
+background cpu time                                       2.8                4.4
+
+-- 해석: sql execute 99.7%, 파싱 3.0%. 즉 "SQL 실행 자체가 CPU 를 썼다".
+--   파싱이 3% 뿐이라 리터럴 문제는 이 구간의 주된 원인이 아니다 — 라고 읽게 된다.
+--   (뒤의 [1-11] 에서 이 판단이 절반만 맞았다는 것이 드러난다)
+
+
+--------------------------------------------------------------------------------
+-- [1-6] (이상 징후 → 원인) SQL 섹션 1위가 PL/SQL 블록이다
+--------------------------------------------------------------------------------
+SYS@orcl> HOST sed -n '/^SQL ordered by Elapsed Time/,+22p' /tmp/awr/awr_1112_1113.txt
+
+SQL ordered by Elapsed Time               DB/Inst: ORCL/orcl  Snaps: 1112-1113
+-> Resources reported for PL/SQL code includes the resources used by all SQL
+   statements called by the code.
+-> Captured SQL account for   73.9% of Total DB Time (s):              62
+-> Captured PL/SQL account for  100.2% of Total DB Time (s):              62
+
+        Elapsed                  Elapsed Time
+        Time (s)    Executions  per Exec (s)  %Total   %CPU    %IO    SQL Id
+---------------- -------------- ------------- ------ ------ ------ -------------
+            60.0              1         60.04   96.4   98.0    1.6 8s4jwfsyr9tb6
+Module: SQL*Plus
+DECLARE v NUMBER; t0 NUMBER := DBMS_UTILITY.GET_TIME; i PLS_INTEGER := 0; BEGI
+N WHILE (DBMS_UTILITY.GET_TIME - t0) < 6000 LOOP i := i + 1; SELECT /*
++ C1_SPIKE_SCAN */ COUNT(*) INTO v FROM claim_details WHERE amt > 150000; EX
+ECUTE IMMEDIATE 'SELECT /* C1_SPIKE_LIT */ COUNT(*) FROM medical_claims WH
+
+-- 이상 징후: 1위가 DB Time 의 96.4% 를 쓴 "SQL" 인데, 내용이 익명 PL/SQL 블록이다.
+-- 원인 파악: 머리말 두 줄이 답을 말해 준다.
+--   "Resources reported for PL/SQL code includes the resources used by all SQL
+--    statements called by the code"
+--   → 블록은 자기가 호출한 모든 SQL 의 자원을 합산한다. 그래서
+--     Captured SQL 73.9% + Captured PL/SQL 100.2% = 174% 가 된다. 중복 계산이다.
+-- 조치: 1위가 PL/SQL 블록이면 그것은 "원인" 이 아니라 "봉투" 다. 봉투를 열어
+--   안에서 실제로 비용을 쓴 SQL 을 찾아야 한다. 2위부터 보는 것이 아니라,
+--   블록의 소비량과 캡처된 SQL 들의 합을 맞춰 보는 것이 정석이다([1-11]).
+
+
+--------------------------------------------------------------------------------
+-- [1-7] (이상 징후) ADDM 에 물어보면 — "문제 없음"
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN
+  2          DBMS_ADDM.ANALYZE_DB('BR04_ADDM_1112_1113', 1112, 1113);
+  3        END;
+  4        /
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> SET PAGESIZE 0 HEADING OFF LONG 2000000 LONGCHUNKSIZE 200000
+SYS@orcl> SELECT DBMS_ADDM.GET_REPORT('BR04_ADDM_1112_1113') FROM dual;
+
+          'BR04_ADDM_1112_1113' 작업에 대한 ADDM 보고서
+          -------------------------------------
+분석 기간
+-----
+AWR 스냅샷 범위는 1112 - 1113입니다.
+26/10/13 08:59:45에서 기간이 시작됩니다.
+26/10/13 09:04:50에서 기간이 끝납니다.
+분석 기간 중 작업
+----------
+총 데이터베이스 시간은 62초입니다.
+평균 활성 세션 수는 .2입니다.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+보고할 검색 결과가 없습니다.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+          추가 정보
+          -----
+기타 정보
+-----
+ADDM 실행을 위한 데이터베이스 작업이 부족합니다.
+
+-- 해석: ★ 실무에서 반드시 알아야 하는 사실 ★
+--   ADDM 은 구간 평균 활성 세션이 일정 수준을 넘지 않으면 아예 분석하지 않는다.
+--   "보고할 검색 결과가 없습니다 / 작업이 부족합니다" 는 "문제가 없다" 가 아니라
+--   "판단할 만큼 바쁘지 않았다" 는 뜻이다. AAS 0.2 짜리 구간에 60초 스파이크가
+--   들어 있어도 ADDM 은 침묵한다.
+--   → ADDM 을 1차 도구로 쓰면 짧은 사건은 전부 놓친다.
+--   (사례 3 에서 AAS 2.03 구간에도 같은 답이 나온다 — ch24 실습 05 의 "권고 맹신 경계")
+-- 참고: SET LONG 을 올리지 않으면 GET_REPORT 가 80자에서 잘려 제목만 나온다.
+--   처음 실행했을 때 보고서가 비어 보인 것이 이 때문이었다.
+
+
+--------------------------------------------------------------------------------
+-- [1-8] (조치) ASH 로 구간을 분 단위로 쪼갠다 — 평균이 숨긴 것
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT TO_CHAR(sample_time,'HH24:MI') mi,
+  2               COUNT(*)                                   AS "활성샘플",
+  3               ROUND(COUNT(*) / 60 * 100)                 AS "활성세션_퍼센트",
+  4               COUNT(DISTINCT session_id)                 AS "세션수",
+  5               SUM(CASE WHEN session_state='ON CPU' THEN 1 ELSE 0 END) AS "ON_CPU",
+  6               SUM(CASE WHEN session_state='WAITING' THEN 1 ELSE 0 END) AS "WAITING"
+  7          FROM v$active_session_history
+  8         WHERE sample_time BETWEEN TIMESTAMP '2026-10-13 08:59:40'
+  9                               AND TIMESTAMP '2026-10-13 09:05:00'
+ 10         GROUP BY TO_CHAR(sample_time,'HH24:MI')
+ 11         ORDER BY 1;
+
+MI         활성샘플 활성세션_퍼센트     세션수     ON_CPU    WAITING
+-------- ---------- --------------- ---------- ---------- ----------
+08:59            12              20          5         12          0
+09:00            16              27          5         16          0
+09:01            37              62         11         32          5
+09:02            53              88          3         53          0
+09:03            13              22          3         13          0
+09:04            17              28          4         16          1
+
+-- 재확인: 구간 평균은 AAS 0.2(=20%) 였는데, 09:02 한 분만 보면 88% 다.
+--   09:01 62% / 09:02 88% 두 분에 사건이 들어 있다(스파이크는 09:01:47~09:02:47).
+--   희석비 88/20 = 4.4배. AWR 이 "한가하다" 고 말한 구간에서 ASH 는 분 단위로
+--   정확히 사건을 집어낸다. ASH 샘플링 주기가 1초라 60초 = 60샘플이 기준이 된다.
+-- ★ 이것이 사례 1 의 핵심이다: AWR 은 "무엇이 아닌지" 를, ASH 는 "언제" 를 말한다.
+
+
+--------------------------------------------------------------------------------
+-- [1-9] (조치) 그 분에 무엇이 돌았나 — ASH × SQL
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT TO_CHAR(h.sample_time,'HH24:MI') mi, h.sql_id,
+  2               COUNT(*) AS "샘플", SUBSTR(s.sql_text,1,54) txt
+  3          FROM v$active_session_history h
+  4               LEFT JOIN v$sql s ON s.sql_id = h.sql_id
+  5         WHERE h.sample_time BETWEEN TIMESTAMP '2026-10-13 08:59:40'
+  6                                 AND TIMESTAMP '2026-10-13 09:05:00'
+  7           AND h.sql_id IS NOT NULL
+  8         GROUP BY TO_CHAR(h.sample_time,'HH24:MI'), h.sql_id, SUBSTR(s.sql_text,1,54)
+  9        HAVING COUNT(*) >= 3
+ 10         ORDER BY 1, 3 DESC;
+
+MI       SQL_ID               샘플 TXT
+-------- -------------- ---------- ------------------------------------------------------
+08:59    a0kvb7p9bf45v           3 insert into  wrh$_shared_server_summary  (dbid, per_pd
+08:59    gghdxmkfp2vkt           3 SELECT DECODE(VALUE, 'UNUSED', NULL, TO_NUMBER(VALUE))
+09:01    acmvv4fhdc9zh          11 select obj#,type#,ctime,mtime,stime, status, dataobj#,
+09:01    6p8yjz956nnk5           5 SELECT /*+ C1_SPIKE_SCAN */ COUNT(*) FROM CLAIM_DETAIL
+09:02    6p8yjz956nnk5          34 SELECT /*+ C1_SPIKE_SCAN */ COUNT(*) FROM CLAIM_DETAIL
+09:04    bjck50zs3nc95           3 insert into  WRH$_SYSSTAT  (dbid, per_pdb, con_dbid, s
+
+-- 해석: 09:02 의 53 샘플 중 34 가 6p8yjz956nnk5(C1_SPIKE_SCAN) 다. 원인 SQL 확정.
+--   09:01 의 acmvv4fhdc9zh(obj$ 조회) 11 샘플은 리터럴 SQL 을 매번 하드 파싱하면서
+--   딕셔너리를 읽은 재귀 SQL 이다 — 리터럴의 흔적이 여기에 남았다.
+--   08:59·09:04 의 wrh$ INSERT 는 스냅샷을 뜬 비용이다. 내가 만든 것이니 제외한다.
+
+
+--------------------------------------------------------------------------------
+-- [1-10] (근거 고정) DBA_HIST_SQLSTAT 델타 — 구간 안의 실제 소비
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT st.sql_id, st.executions_delta AS "실행",
+  2               ROUND(st.elapsed_time_delta/1e6, 2) AS "경과초",
+  3               st.buffer_gets_delta AS "논리읽기",
+  4               ROUND(st.buffer_gets_delta
+  5                     / DECODE(st.executions_delta,0,1,st.executions_delta)) AS "실행당",
+  6               SUBSTR(t.sql_text,1,52) AS sql_text
+  7          FROM dba_hist_sqlstat st
+  8               LEFT JOIN dba_hist_sqltext t ON t.sql_id = st.sql_id AND t.dbid = st.dbid
+  9         WHERE st.snap_id = 1113
+ 10         ORDER BY st.elapsed_time_delta DESC FETCH FIRST 5 ROWS ONLY;
+
+SQL_ID               실행     경과초   논리읽기     실행당 SQL_TEXT
+-------------- ---------- ---------- ---------- ---------- ----------------------------------------------------
+8s4jwfsyr9tb6           1      60.04   18140158   18140158 DECLARE
+                                                             v NUMBER; t0 NUMBER := DBMS_UTILITY.GET_TIME;
+6p8yjz956nnk5        1868      41.87   12368034       6621 SELECT /*+ C1_SPIKE_SCAN */ COUNT(*) FROM CLAIM_DET
+5mgzhcmtumbm9           2       1.03       6183       3092 SELECT /* C1_SPIKE_LIT */ COUNT(*) FROM medical_clai
+fhf8upax5cxsz           1        .88       6938       6938 BEGIN sys.dbms_auto_report_internal.i_save_report (:
+491wcfyfd6wc1           1        .85      15802      15802 BEGIN DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT; END;
+
+-- 해석: 원인 SQL 6p8yjz956nnk5 은 1,868회 실행 / 실행당 6,621 블록이다.
+--   CLAIM_DETAILS 가 6,670 블록이므로 매번 전체를 읽었다(ch05). amt 에 인덱스가 없다.
+--   AWR 보고서의 SQL 섹션보다 이 질의가 낫다 — 실행 횟수·실행당 비용을 바로 준다.
+
+
+--------------------------------------------------------------------------------
+-- [1-11] (이상 징후 → 원인 → 조치) 봉투와 내용물의 차이 32% 를 찾는다
+--------------------------------------------------------------------------------
+SYS@orcl> -- 익명 블록(봉투) 18,140,158 블록 vs 원인 SQL 12,368,034 블록.
+SYS@orcl> -- 차이 5,772,124 블록은 어디로 갔나. 캡처된 SQL 목록에는 없다.
+SYS@orcl> SELECT force_matching_signature AS sig, COUNT(DISTINCT sql_id) AS "커서수",
+  2               SUM(executions_delta) AS "실행", SUM(buffer_gets_delta) AS "논리읽기",
+  3               ROUND(SUM(elapsed_time_delta)/1e6, 2) AS "경과초"
+  4          FROM dba_hist_sqlstat
+  5         WHERE snap_id = 1113 AND force_matching_signature <> 0
+  6         GROUP BY force_matching_signature
+  7         ORDER BY SUM(buffer_gets_delta) DESC FETCH FIRST 3 ROWS ONLY;
+
+       SIG     커서수       실행   논리읽기     경과초
+---------- ---------- ---------- ---------- ----------
+8.6423E+17          1       1868   12368034      41.87
+5.4640E+18         13         26      80343       1.42
+6.0387E+18          1        590       8856        .08
+
+-- 원인 파악: 리터럴 SQL(C1_SPIKE_LIT)은 hosp_id 값마다 문장이 달라 커서 1,868개로
+--   쪼개졌다. AWR 은 구간 상위 N개 SQL 만 보관하므로(TOPNSQL) 그중 13개·26실행만
+--   남았다. 1,868회 중 26회다. 서명으로 묶어도 80,343 블록밖에 안 보인다.
+--   실제로는 1,868 × 3,090 = 약 577만 블록(전체의 32%)을 썼다 — 봉투와의 차이가 그것이다.
+-- 조치: "익명 블록의 소비량과 캡처된 SQL 합의 차이" 를 항상 확인한다. 차이가 크면
+--   리터럴로 쪼개진 커서를 의심하고, 사건이 진행 중일 때 V$SQL 을 서명으로 묶어 본다.
+--   AWR 은 사후에 그것을 복원해 주지 못한다 — 이것이 AWR 의 구조적 사각지대다.
+
+-- ── 사례 1 정리 ────────────────────────────────────────────────────────────
+-- 1) AWR 머리 요약 : Elapsed 5.09분 / DB Time 1.04분 / AAS 0.2 → "한가해 보인다"
+-- 2) Top 10        : DB CPU 96.6% → 대기 사건이 아니다 (이건 맞다)
+-- 3) ADDM          : "보고할 검색 결과가 없습니다" → 작업량 미달로 분석 자체를 거부
+-- 4) ASH 분 단위   : 09:02 에 88% → 평균 대비 4.4배. 사건 시각 확정
+-- 5) SQLSTAT 델타  : 6p8yjz956nnk5, 1,868회, 실행당 6,621 블록 → 원인 SQL 확정
+-- 6) 서명 묶기     : 리터럴 32% 는 AWR 에 남지 않았다 → 사후 복원 불가
+-- 결론: 사건 시각을 아는 과거 사건은 AWR 로 성격(CPU/대기)을 가리고,
+--       ASH 로 시각과 주체를 확정한다. ADDM 은 이 규모에서 도움이 안 된다.
+
+
+================================================================================
+ 사례 2 — "지난주보다 느려졌다" (비교)
+================================================================================
+-- 신고: "같은 보고서가 지난주엔 빨랐는데 이번 주는 느리다."
+-- 이 신고의 본질은 "부하가 늘었나, 성능이 나빠졌나" 다. 둘은 조치가 정반대다.
+-- 세 구간을 만들어 둘을 구분하는 절차를 세운다.
+--   구간 A (평시)    : 인덱스 있음, 100ms 간격
+--   구간 C (부하 2배): 인덱스 있음,  50ms 간격
+--   구간 B (성능 저하): 인덱스 없음, 100ms 간격   ← 누가 인덱스를 지웠다
+
+--------------------------------------------------------------------------------
+-- [2-1] 구간 만들기
+--------------------------------------------------------------------------------
+SQLT@orcl> CREATE INDEX br04_ix_dt ON medical_claims(receipt_date);
+
+인덱스가 생성되었습니다.
+
+SQLT@orcl> SELECT index_name, blevel, leaf_blocks, clustering_factor
+  2          FROM user_indexes WHERE index_name = 'BR04_IX_DT';
+
+INDEX_NAME     BLEVEL LEAF_BLOCKS CLUSTERING_FACTOR
+---------- ---------- ----------- -----------------
+BR04_IX_DT          2         796            263835
+
+SYS@orcl>  EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;   -- SNAP=1114 09:07:34
+SQLT@orcl> -- 구간 A : 60초, 100ms 간격
+SQLT@orcl> DECLARE
+  2          v NUMBER; n PLS_INTEGER := 0; t0 NUMBER := DBMS_UTILITY.GET_TIME;
+  3        BEGIN
+  4          WHILE (DBMS_UTILITY.GET_TIME - t0) < 6000 LOOP
+  5            n := n + 1;
+  6            SELECT /*+ C2_REPORT */ COUNT(*) INTO v FROM medical_claims
+  7             WHERE receipt_date >= DATE '2024-06-01' AND receipt_date < DATE '2024-07-01';
+  8            DBMS_SESSION.SLEEP(0.1);
+  9          END LOOP;
+ 10          DBMS_OUTPUT.PUT_LINE('구간A 실행 '||n||'회');
+ 11        END;
+ 12        /
+구간A 실행 577회, 60초
+
+SYS@orcl>  EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;   -- SNAP=1115 09:08:35
+SQLT@orcl> -- 구간 C : 같은 SQL, SLEEP(0.05) 로 호출 빈도만 2배
+구간C 실행 1169회, 60초
+SYS@orcl>  EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;   -- SNAP=1116 09:09:37
+
+SQLT@orcl> DROP INDEX br04_ix_dt;
+
+인덱스가 삭제되었습니다.
+
+SYS@orcl>  EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;   -- SNAP=1117 09:09:39
+SQLT@orcl> -- 구간 B : 같은 SQL, 같은 간격(100ms), 인덱스만 없다
+구간B 실행 528회, 60초
+SYS@orcl>  EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;   -- SNAP=1118 09:10:41
+
+-- 해석: 세 구간 모두 61~62초다. 구간 길이를 맞춰야 비교가 성립한다.
+--   구간 B 의 실행 횟수가 528 로 A(577)보다 적다 — 한 번이 느려서 덜 돌았다.
+
+
+--------------------------------------------------------------------------------
+-- [2-2] (1차 근거) 구간별 DB Time
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT DECODE(s.snap_id, 1115,'A 평시', 1116,'C 부하2배', 1118,'B 저하') AS "구간",
+  2               ROUND(MAX(DECODE(t.stat_name,'DB time', t.value_d))/1e6, 2) AS "DB_time_초",
+  3               ROUND(MAX(DECODE(t.stat_name,'DB CPU',  t.value_d))/1e6, 2) AS "DB_CPU_초"
+  4          FROM dba_hist_snapshot s,
+  5               (SELECT snap_id, stat_name,
+  6                       value - LAG(value) OVER (PARTITION BY stat_name ORDER BY snap_id) AS value_d
+  7                  FROM dba_hist_sys_time_model
+  8                 WHERE stat_name IN ('DB time','DB CPU')) t
+  9         WHERE t.snap_id = s.snap_id AND s.snap_id IN (1115, 1116, 1118)
+ 10         GROUP BY s.snap_id ORDER BY s.snap_id;
+
+구간       DB_time_초  DB_CPU_초
+---------- ---------- ----------
+A 평시            1.4       1.02
+C 부하2배         1.6        1.4
+B 저하           6.41       6.19
+
+-- 해석: B 의 DB Time 이 A 의 4.6배다. C 는 1.14배뿐이다.
+--   ★ 여기서 "B 가 문제" 라고 결론 내리면 절반만 맞다. ★
+--   DB Time 이 늘어난 이유가 "일을 더 많이 해서(부하)" 인지 "같은 일이 비싸져서
+--   (성능)" 인지 아직 모른다. 다음 단계가 그것을 가린다.
+
+
+--------------------------------------------------------------------------------
+-- [2-3] Compare Periods 보고서 — 머리 요약이 먼저 말해 주는 것
+--------------------------------------------------------------------------------
+SYS@orcl> SPOOL /tmp/awr/awrdd_A_B.txt
+SYS@orcl> SELECT output FROM TABLE(DBMS_WORKLOAD_REPOSITORY.AWR_DIFF_REPORT_TEXT(
+  2               (SELECT dbid FROM v$database), 1, 1114, 1115,
+  3               (SELECT dbid FROM v$database), 1, 1117, 1118));
+SYS@orcl> SPOOL OFF
+SYS@orcl> HOST sed -n '/Avg Active Users/,/%Diff/p' /tmp/awr/awrdd_A_B.txt
+
+Snapshot Set  Begin Snap Id ... Avg Active Users  Elapsed Time (min)  DB time (min)
+------------ -------------- ... ----------------- ------------------- --------------
+1st                    1114 ...              0.0                 1.0            0.0
+2nd                    1117 ...              0.1                 1.0            0.1
+                                ~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~~~~~~~~~ ~~~~~~~~~~~~~~
+                         %Diff:         400.0%              -1.0%         358.6%
+
+-- 해석: 머리 요약 세 줄이 비교의 뼈대다.
+--   Elapsed -1.0% (같은 길이) / DB time +358.6% / AAS +400%.
+--   "같은 시간에 DB Time 이 4.6배" → 부하 증가로 설명하려면 일의 양도 4.6배여야 한다.
+--   그것을 확인하는 것이 다음 단계다.
+-- 참고: awrddrpt 의 본문은 1st/2nd 를 좌우로 붙여 한 줄이 200자를 넘는다.
+--   텍스트로는 읽기 어렵다 — 본문은 HTML(AWR_DIFF_REPORT_HTML)로 보고,
+--   판정은 아래 [2-4] 처럼 DBA_HIST_SQLSTAT 를 직접 정규화해서 하는 편이 빠르다.
+
+
+--------------------------------------------------------------------------------
+-- [2-4] (판정) DBA_HIST_SQLSTAT 정규화 — 실행당으로 바꿔 놓으면 답이 나온다
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT DECODE(snap_id, 1115,'A 평시', 1116,'C 부하2배', 1118,'B 저하') AS "구간",
+  2               sql_id, plan_hash_value AS "계획", executions_delta AS "실행",
+  3               ROUND(elapsed_time_delta/1e6, 3) AS "경과초",
+  4               ROUND(elapsed_time_delta
+  5                     /DECODE(executions_delta,0,1,executions_delta)/1000, 2) AS "실행당_ms",
+  6               buffer_gets_delta AS "논리읽기",
+  7               ROUND(buffer_gets_delta
+  8                     /DECODE(executions_delta,0,1,executions_delta)) AS "실행당_블록"
+  9          FROM dba_hist_sqlstat
+ 10         WHERE snap_id IN (1115, 1116, 1118)
+ 11           AND sql_id IN (SELECT sql_id FROM dba_hist_sqltext
+ 12                           WHERE sql_text LIKE '%C2_REPORT%'
+ 13                             AND sql_text NOT LIKE '%sqltext%')
+ 14         ORDER BY snap_id;
+
+구간       SQL_ID              계획       실행     경과초  실행당_ms   논리읽기 실행당_블록
+---------- ------------- ---------- ---------- ---------- ---------- ---------- -----------
+A 평시     0d6bnv7u13ns1 1922395333        577       .431        .75      39236          68
+C 부하2배  0d6bnv7u13ns1 1922395333       1169       .895        .77      79492          68
+B 저하     0d6bnv7u13ns1 2119550289        528      5.877      11.13    1631564        3090
+
+-- ★ 판정 ★
+--   A → C : 실행 577 → 1,169 (2.03배) / 실행당 0.75 → 0.77ms (같다)
+--           실행당 블록 68 → 68 (같다) / 계획 1922395333 (같다)
+--           → 부하 증가다. 한 번의 비용은 그대로이고 호출이 늘었다.
+--             조치는 DB 가 아니라 호출하는 쪽(애플리케이션·배치 스케줄)이다.
+--
+--   A → B : 실행 577 → 528 (줄었다!) / 실행당 0.75 → 11.13ms (14.8배)
+--           실행당 블록 68 → 3,090 (45배) / 계획 1922395333 → 2119550289 (바뀜)
+--           → 성능 저하다. 일을 덜 했는데 더 오래 걸렸다.
+--             조치는 DB 쪽이다 — 계획이 왜 바뀌었는지부터 찾는다.
+--
+-- 해석: "실행 횟수가 줄었는데 DB Time 이 늘었다" 는 부하 증가로 설명할 수 없다.
+--   이 한 문장이 판정을 끝낸다. 절대값(DB Time 1.4 → 6.41초)만 보면 A→C 와 A→B 를
+--   구분할 수 없다 — C 도 DB Time 이 늘었기 때문이다.
+--   정규화 기준은 두 가지다: 실행당 시간(실행당_ms)과 실행당 작업량(실행당_블록).
+--   둘 중 작업량이 더 믿을 만하다 — 시간은 캐시 상태와 장비 부하에 흔들린다.
+--   실제로 블록은 45배인데 시간은 14.8배다(블록이 캐시에 있었다).
+
+
+--------------------------------------------------------------------------------
+-- [2-5] (결정적 증거) 계획 해시가 바뀌었다
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sql_id, plan_hash_value AS "계획", snap_id, executions_delta AS "실행",
+  2               ROUND(buffer_gets_delta
+  3                     /DECODE(executions_delta,0,1,executions_delta)) AS "실행당_블록"
+  4          FROM dba_hist_sqlstat
+  5         WHERE sql_id = '0d6bnv7u13ns1' AND snap_id BETWEEN 1114 AND 1118
+  6         ORDER BY snap_id;
+
+SQL_ID              계획    SNAP_ID       실행 실행당_블록
+------------- ---------- ---------- ---------- -----------
+0d6bnv7u13ns1 1922395333       1115        577          68
+0d6bnv7u13ns1 1922395333       1116       1169          68
+0d6bnv7u13ns1 2119550289       1118        528        3090
+
+-- 해석: 같은 SQL_ID 의 plan_hash_value 가 구간 사이에 바뀌었다. 이것이 회귀의
+--   결정적 증거다. DBA_HIST_SQLSTAT 에 계획별로 행이 남으므로, 사후에도
+--   "언제부터 계획이 바뀌었는지" 를 스냅샷 단위로 특정할 수 있다.
+--   계획 2119550289 은 MEDICAL_CLAIMS 전체 스캔이다 — ch01 실습 01 의
+--   Full Scan 베이스라인과 같은 해시다. 즉 "인덱스를 쓰다가 안 쓰게 됐다".
+--   원인 후보: 인덱스 삭제 / 인덱스 UNUSABLE / 통계 변화 / 바인드 값 변화 / SPD.
+--   이 사례의 원인은 인덱스 삭제였다(DBA_OBJECTS 에서 사라진 것으로 확인).
+
+-- ── 사례 2 정리 ────────────────────────────────────────────────────────────
+-- 판정 절차 3단계. 순서를 지키면 틀리지 않는다.
+--   1) 구간 길이를 맞춘다. Elapsed 가 다르면 비교 자체가 성립하지 않는다.
+--   2) DB Time 변화를 본다 — 여기까지는 "뭔가 달라졌다" 까지만 알 수 있다.
+--   3) 실행 횟수와 "실행당" 을 본다.
+--        실행 ↑ · 실행당 = → 부하 증가 (조치: 호출하는 쪽)
+--        실행 = · 실행당 ↑ → 성능 저하 (조치: DB 쪽)
+--        실행 ↓ · 실행당 ↑ → 성능 저하 확정 (가장 분명한 신호)
+--        실행 ↑ · 실행당 ↑ → 둘 다. 보통 부하가 성능을 끌어내린 경우다
+--   4) 성능 저하면 plan_hash_value 변화를 확인한다. 바뀌었으면 계획 문제,
+--      그대로면 데이터량·경합·장비를 본다.
+
+
+================================================================================
+ 사례 3 — "지금 느리다" (진행 중)
+================================================================================
+-- 신고: "지금 화면이 안 넘어간다."
+-- 이 사건에는 AWR 스냅샷이 아직 없다. 가장 가까운 자동 스냅샷은 최대 1시간 전이다.
+-- AWR 부터 열면 아무것도 안 나온다 — 순서가 반대다.
+
+--------------------------------------------------------------------------------
+-- [3-1] (1차 도구) 지금 활성 세션 — 가장 먼저 보는 것
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT s.sid, s.serial#, s.username, SUBSTR(s.program,1,12) prog, s.sql_id,
+  2               s.event, s.state, s.seconds_in_wait AS wait_s,
+  3               s.blocking_session AS blocker
+  4          FROM v$session s
+  5         WHERE s.status = 'ACTIVE' AND s.type = 'USER' AND s.username IS NOT NULL
+  6         ORDER BY s.sid;
+
+       SID    SERIAL# USERNAME   PROG         SQL_ID         EVENT                      STATE       WAIT_S  BLOCKER
+---------- ---------- ---------- ------------ -------------- -------------------------- --------- -------- --------
+        20      17325 SQLT       sqlplus@oel7 9068nx8p9zz9c  latch: cache buffers chains WAITED KNOWN TIME  6
+       406      29017 SQLT       sqlplus@oel7 9068nx8p9zz9c  latch: cache buffers chains WAITED SHORT TIME  6
+       596       3793 SYS        sqlplus@oel7 20xs4hx6ag19q  SQL*Net message to client   WAITED SHORT TIME  0
+
+-- 해석: SQLT 두 세션이 같은 SQL(9068nx8p9zz9c)을 돌리고 있고, 둘 다
+--   latch: cache buffers chains 를 기다렸다. blocking_session 은 비어 있다 —
+--   래치 경합은 행 잠금이 아니므로 블로커가 특정되지 않는다(ch27).
+-- ★ 그러나 여기서 "래치 경합이 원인" 이라고 단정하면 안 된다. ★
+--   V$SESSION 은 "그 순간" 의 한 장이다. STATE 가 WAITED ... TIME 인 것은
+--   "지금 기다리는 중" 이 아니라 "직전에 기다렸고 지금은 CPU 를 쓰는 중" 이라는 뜻이다.
+--   비중을 알려면 구간 집계가 필요하다 — 다음 단계.
+
+
+--------------------------------------------------------------------------------
+-- [3-2] (2차) 최근 60초 ASH — 비중으로 확인한다
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT session_id, sql_id, session_state,
+  2               COUNT(*) AS "샘플", ROUND(COUNT(*)/60*100) AS "활성_퍼센트"
+  3          FROM v$active_session_history
+  4         WHERE sample_time > SYSTIMESTAMP - INTERVAL '60' SECOND
+  5           AND session_type = 'FOREGROUND'
+  6         GROUP BY session_id, sql_id, session_state
+  7         ORDER BY 4 DESC FETCH FIRST 6 ROWS ONLY;
+
+SESSION_ID SQL_ID         SESSION       샘플 활성_퍼센트
+---------- -------------- ------- ---------- -----------
+       406 9068nx8p9zz9c  ON CPU          26          43
+        20 9068nx8p9zz9c  ON CPU          26          43
+       596 8yy5q06wvrpga  ON CPU           2           3
+        20 fakbs2c9373kh  ON CPU           2           3
+       596 7kktk0uzwp9ju  ON CPU           1           2
+       596 cyutg2uh00mk2  ON CPU           1           2
+
+SYS@orcl> SELECT NVL(event,'[ON CPU]') AS event, wait_class,
+  2               COUNT(*) AS "샘플",
+  3               ROUND(COUNT(*)*100/SUM(COUNT(*)) OVER (),1) AS "퍼센트"
+  4          FROM v$active_session_history
+  5         WHERE sample_time > SYSTIMESTAMP - INTERVAL '60' SECOND
+  6           AND session_type = 'FOREGROUND'
+  7         GROUP BY NVL(event,'[ON CPU]'), wait_class
+  8         ORDER BY 3 DESC FETCH FIRST 5 ROWS ONLY;
+
+EVENT                        WAIT_CLASS             샘플     퍼센트
+---------------------------- ---------------- ---------- ----------
+[ON CPU]                                              72       94.7
+db file sequential read      User I/O                   3        3.9
+Disk file operations I/O     User I/O                   1        1.3
+
+-- 재확인: 최근 60초의 94.7% 가 ON CPU 다. latch: cache buffers chains 는
+--   ASH 상위에 아예 들어오지 못했다.
+-- ★ V$SESSION 이 보여 준 래치 이벤트는 "그 순간" 의 모습일 뿐 비중이 없었다. ★
+--   사건의 실체는 두 세션이 각각 43% 활성으로 같은 SQL 을 CPU 로 돌리는 것이다.
+--   사례 1 과 정확히 반대 방향의 함정이다 —
+--     사례 1: 구간 평균이 짧은 사건을 숨긴다
+--     사례 3: 순간 한 장이 비중 없는 이벤트를 과장한다
+--   둘 다 "집계 구간을 의식해서 읽어라" 는 같은 교훈이다.
+
+
+--------------------------------------------------------------------------------
+-- [3-3] 지금 돌고 있는 SQL 의 실시간 상태 (V$SQL_MONITOR)
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT sid, sql_id, status, ROUND(elapsed_time/1e6,1) AS "경과초",
+  2               buffer_gets, ROUND(cpu_time/1e6,1) AS "CPU초",
+  3               SUBSTR(sql_text,1,40) sql_text
+  4          FROM v$sql_monitor
+  5         WHERE status = 'EXECUTING' AND username = 'SQLT'
+  6         ORDER BY elapsed_time DESC FETCH FIRST 4 ROWS ONLY;
+
+       SID SQL_ID         STATUS          경과초 BUFFER_GETS      CPU초 SQL_TEXT
+---------- -------------- ----------- ---------- ----------- ---------- ----------------------------------------
+        20 b9x4v5kzum2aq  EXECUTING         25.6     6114211       25.2 DECLARE
+       406 b9x4v5kzum2aq  EXECUTING         25.6     6067345       25.0 DECLARE
+
+SYS@orcl> SELECT sql_id, executions, buffer_gets,
+  2               ROUND(buffer_gets/DECODE(executions,0,1,executions)) AS "실행당",
+  3               SUBSTR(sql_text,1,46) sql_text
+  4          FROM v$sql WHERE sql_text LIKE '%C3_LIVE%' AND sql_text NOT LIKE '%v$sql%';
+
+SQL_ID         EXECUTIONS BUFFER_GETS     실행당 SQL_TEXT
+-------------- ---------- ----------- ---------- ----------------------------------------------
+b9x4v5kzum2aq           0    12181578   12181578 DECLARE   v NUMBER; i PLS_INTEGER := 0; t0 NUM
+9068nx8p9zz9c        1280    12537033       9795 SELECT /*+ C3_LIVE */ COUNT(*) FROM CLAIM_DETA
+
+-- 해석: V$SQL_MONITOR 는 "지금 실행 중" 만 보여 주므로 진행 중 사건에 가장 직접적이다.
+--   두 세션이 같은 익명 블록을 25.6초째 돌리며 각각 610만 블록을 읽었다.
+--   V$SQL 에서 실행당으로 보면 원인 SQL 9068nx8p9zz9c 은 실행당 9,795 블록이다.
+--   익명 블록(executions=0, 아직 안 끝났다)의 1,218만은 봉투 값이다 — 사례 1 과 같다.
+-- 🔒 V$SQL_MONITOR 는 Tuning Pack 이다. 미보유면 V$SESSION_LONGOPS 와
+--   ASH 의 sql_exec_id 로 대신한다.
+
+
+--------------------------------------------------------------------------------
+-- [3-4] ★ 지금 스냅샷을 떠 둔다 — 이것을 안 하면 나중에 비교할 기준이 없다
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> SELECT MAX(snap_id) AS mid_snap, TO_CHAR(SYSTIMESTAMP,'HH24:MI:SS') now
+  2          FROM dba_hist_snapshot;
+
+  MID_SNAP NOW
+---------- --------
+      1119 09:15:19
+
+-- 해석: 진행 중 사건에서 가장 중요한 한 줄이다. 이 스냅샷이 있으면 사건 구간의
+--   AWR 보고서를 만들 수 있고, 없으면 자동 스냅샷 경계까지 희석된 구간밖에 없다.
+--   사건을 인지한 순간 떠야 한다 — 조치하기 전에.
+--   (사건이 길 것 같으면 5~10분 간격으로 몇 개 더 뜬다. 1분 미만 간격은 비용이 크다)
+
+
+--------------------------------------------------------------------------------
+-- [3-5] (사후 검증) 부하가 끝난 뒤 AWR 로 실시간 판단을 확인한다
+--------------------------------------------------------------------------------
+SQLT@orcl> -- (부하 종료) 반복 3759회 / 3728회
+SYS@orcl>  EXEC DBMS_WORKLOAD_REPOSITORY.CREATE_SNAPSHOT;   -- SNAP=1120 09:17:21
+
+SYS@orcl> HOST sed -n '/Snap Id/,/DB Time:/p' /tmp/awr/awr_1119_1120.txt
+
+              Snap Id      Snap Time      Sessions Curs/Sess
+            --------- ------------------- -------- ---------
+Begin Snap:      1119 13-10월-26 09:15:16       61       4.5
+  End Snap:      1120 13-10월-26 09:17:21       57       4.7
+   Elapsed:                2.08 (mins)
+   DB Time:                4.19 (mins)
+
+SYS@orcl> HOST sed -n '/^Top 10 Foreground Events/,+12p' /tmp/awr/awr_1119_1120.txt
+
+Top 10 Foreground Events by Total Wait Time
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+                                           Total Wait       Avg   % DB Wait
+Event                                Waits Time (sec)      Wait   time Class
+------------------------------ ----------- ---------- --------- ------ --------
+DB CPU                                          246.6             98.0
+db file sequential read                351          1    2.77ms     .4 User I/O
+direct path write                      129         .7    5.30ms     .3 User I/O
+Disk file operations I/O                19          0  929.16us     .0 User I/O
+db file scattered read                   3          0    2.98ms     .0 User I/O
+cursor: mutex S                          2          0    1.40ms     .0 Concurre
+PGA memory operation                   132          0    8.64us     .0 Other
+cursor: pin S                            1          0    1.10ms     .0 Concurre
+control file sequential read           152          0    2.64us     .0 System I
+latch: cache buffers chains              2          0  116.00us     .0 Concurre
+
+-- 재확인: Elapsed 2.08분 / DB Time 4.19분 → AAS 2.0. 두 세션이 쉬지 않았다.
+--   DB CPU 가 98.0%. 실시간 ASH 가 본 94.7% ON CPU 와 일치한다.
+--   그리고 V$SESSION 이 보여 줬던 latch: cache buffers chains 는
+--   ★ 2회 / 0초 / 0.0% ★ 로 사실상 사라졌다. [3-2] 의 판단이 옳았다는 증거다.
+
+SYS@orcl> HOST sed -n '/^SQL ordered by Gets/,+16p' /tmp/awr/awr_1119_1120.txt | cut -c1-100
+
+SQL ordered by Gets                       DB/Inst: ORCL/orcl  Snaps: 1119-1120
+-> Total Buffer Gets:      60,021,365
+-> Captured SQL account for   97.6% of Total
+
+     Buffer                 Gets              Elapsed
+      Gets   Executions   per Exec   %Total   Time (s)  %CPU   %IO    SQL Id
+----------- ----------- ------------ ------ ---------- ----- ----- -------------
+ 58,580,628       5,963      9,824.0   97.6      239.5  98.9     0 9068nx8p9zz9c
+Module: SQL*Plus
+SELECT /*+ C3_LIVE */ COUNT(*) FROM CLAIM_DETAILS D, MEDICAL_CLAIMS C WHERE D.CL
+AIM_ID = C.CLAIM_ID AND C.CLAIM_TYPE = '입원' AND D.AMT > 180000
+ 58,065,146           2 2.903257E+07   96.7      228.8 100.4     0 b9x4v5kzum2aq
+
+-- 해석: 원인 SQL 9068nx8p9zz9c 이 전체 논리읽기의 97.6% 다. 실행당 9,824 블록 —
+--   실시간에 V$SQL 에서 본 9,795 와 같다. 사후 AWR 이 실시간 판단을 확인해 준다.
+--   익명 블록 b9x4v5kzum2aq 가 96.7% 로 또 중복 집계된다(97.6 + 96.7 = 194%).
+
+
+--------------------------------------------------------------------------------
+-- [3-6] ADDM 은 이 구간에도 침묵한다
+--------------------------------------------------------------------------------
+SYS@orcl> BEGIN DBMS_ADDM.ANALYZE_DB('BR04_ADDM_1119_1120', 1119, 1120); END;
+  2        /
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> SELECT DBMS_ADDM.GET_REPORT('BR04_ADDM_1119_1120') FROM dual;
+
+분석 기간 중 작업
+----------
+총 데이터베이스 시간은 252초입니다.
+평균 활성 세션 수는 2.03입니다.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+보고할 검색 결과가 없습니다.
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+기타 정보
+-----
+ADDM 실행을 위한 데이터베이스 작업이 부족합니다.
+
+-- 해석: AAS 2.03 / DB Time 252초 인데도 "작업이 부족하다" 고 한다.
+--   ADDM 의 기준은 절대 DB Time 이 아니라 CPU 수 대비 평균 활성 세션이다.
+--   이 장비는 4 CPU 이므로 AAS 2.03 은 절반 수준이고, 그 아래에서는 의견을 내지 않는다.
+--   → 실습·개발 환경에서 ADDM 은 거의 항상 침묵한다. 운영 수준 부하에서 1차 선별
+--     도구로 쓰고, 그 아래에서는 AWR SQL 섹션 + ASH 가 실질 도구다.
+--     ADDM 이 "문제 없음" 이라고 해서 문제가 없는 것이 아니다(ch24 실습 05).
+
+-- ── 사례 3 정리 ────────────────────────────────────────────────────────────
+-- 1) V$SESSION    : 활성 세션·SQL_ID·이벤트를 1초 안에 안다. 단 "순간 한 장" 이다
+-- 2) ASH 60초     : 94.7% ON CPU → 래치는 비중 없음. 순간의 인상을 교정한다
+-- 3) V$SQL_MONITOR: 지금 실행 중인 문장의 경과·블록·CPU. 진행 중 사건의 직접 증거
+-- 4) V$SQL 실행당 : 누적 함정을 피하는 정규화
+-- 5) 수동 스냅샷  : ★ 조치 전에 뜬다. 이것이 사후 AWR 구간을 만든다 ★
+-- 6) 사후 AWR     : AAS 2.0 / DB CPU 98% / 원인 SQL 97.6% → 실시간 판단 확인
+-- 7) ADDM         : AAS 2.03 에서도 침묵
+
+
+================================================================================
+ [4] 세 사례를 겹쳐 본다 — 도구별 사각지대 (이 문서의 요약)
+================================================================================
+--   ┌───────────────┬──────────────────────────┬────────────────────────────────┐
+--   │ 도구          │ 잘 보여 주는 것          │ 사각지대 (실측 근거)           │
+--   ├───────────────┼──────────────────────────┼────────────────────────────────┤
+--   │ AWR 보고서    │ 구간의 성격(CPU/대기),   │ 구간 평균이 짧은 사건을 희석.  │
+--   │               │ 상위 SQL, Load Profile   │ AAS 0.2 로 보인 구간에 88% 분  │
+--   │               │                          │ 이 있었다 (사례 1, 4.4배)      │
+--   │               │                          │ 리터럴로 쪼개진 커서는 TOPNSQL │
+--   │               │                          │ 밖이라 32% 가 남지 않았다      │
+--   │               │                          │ PL/SQL 블록이 자원을 중복 집계 │
+--   │               │                          │ (73.9% + 100.2% = 174%)        │
+--   ├───────────────┼──────────────────────────┼────────────────────────────────┤
+--   │ Compare       │ 두 구간의 차이를 %Diff   │ 텍스트 본문이 200자를 넘어     │
+--   │ Periods       │ 로 요약. 머리 세 줄이    │ 읽기 어렵다. 판정은 결국       │
+--   │               │ 판정의 뼈대              │ SQLSTAT 정규화로 해야 한다     │
+--   ├───────────────┼──────────────────────────┼────────────────────────────────┤
+--   │ ADDM          │ 운영 부하에서 1차 선별   │ CPU 수 대비 AAS 가 낮으면 분석 │
+--   │               │                          │ 자체를 거부. AAS 0.2 와 2.03   │
+--   │               │                          │ 모두 "작업 부족" (사례 1·3)    │
+--   ├───────────────┼──────────────────────────┼────────────────────────────────┤
+--   │ ASH           │ 분·초 단위의 "언제·누가· │ 보존이 짧다(V$ 는 메모리,      │
+--   │               │ 무엇을". 평균의 희석을   │ DBA_HIST_ACTIVE_SESS_HISTORY   │
+--   │               │ 뚫는 유일한 도구         │ 는 10분의 1 표본)              │
+--   ├───────────────┼──────────────────────────┼────────────────────────────────┤
+--   │ V$SESSION     │ 지금 누가 무엇을 (1초)   │ 순간 한 장. 비중 없는 이벤트를 │
+--   │               │                          │ 원인으로 보이게 한다 — 래치가  │
+--   │               │                          │ 구간 집계에선 2회/0초 (사례 3) │
+--   ├───────────────┼──────────────────────────┼────────────────────────────────┤
+--   │ DBA_HIST_     │ 실행 횟수·실행당 비용·   │ 상위 N개만 보관. 캡처되지 않은 │
+--   │ SQLSTAT       │ 계획 해시 변화. 회귀     │ SQL 은 사후에 복원할 수 없다   │
+--   │               │ 판정의 결정적 근거       │                                │
+--   └───────────────┴──────────────────────────┴────────────────────────────────┘
+
+
+================================================================================
+ [5] 실무 체크리스트 — 신고를 받으면 이 순서로
+================================================================================
+-- (공통 0) 신고의 형태를 먼저 분류한다. 과거 / 비교 / 현재. 도구가 달라진다.
+--
+-- A. "어제 ~시경 느렸다"
+--   1) DBA_HIST_SNAPSHOT 으로 그 시각을 덮는 스냅샷 쌍을 찾는다.
+--      보존(기본 8일) 밖이면 여기서 끝이다 — 그 사실을 보고하고 스냅샷 보존을 늘린다.
+--   2) AWR 보고서로 성격을 가린다 : DB CPU 비중 / Top 10 / Time Model.
+--   3) ASH 로 구간을 분 단위로 쪼갠다. 구간 평균과 최대 분을 함께 적는다.
+--      (사건이 희석됐는지 여기서 드러난다)
+--   4) 그 분의 상위 SQL_ID 를 ASH 에서 뽑고, DBA_HIST_SQLSTAT 로 실행당 비용을 확정.
+--   5) 익명 블록이 1위면 봉투다. 봉투와 캡처 SQL 합의 차이를 확인한다.
+--   6) ADDM 은 돌려 보되 "검색 결과 없음" 을 "문제 없음" 으로 읽지 않는다.
+--
+-- B. "지난주보다 느리다"
+--   1) 두 구간의 Elapsed 를 맞춘다. 요일·시간대를 같게 잡는다.
+--   2) Compare Periods 머리 요약 세 줄(Elapsed / DB time / AAS %Diff)을 적는다.
+--   3) DBA_HIST_SQLSTAT 를 실행 횟수와 실행당으로 정규화해 판정한다.
+--        실행 ↑ 실행당 = → 부하 증가 → 호출하는 쪽으로
+--        실행 = 또는 ↓ , 실행당 ↑ → 성능 저하 → DB 쪽으로
+--   4) 성능 저하면 plan_hash_value 변화를 확인한다.
+--   5) 베이스라인(SYSTEM_MOVING_WINDOW 또는 수동 생성)이 있으면 평시 기준으로 쓴다.
+--
+-- C. "지금 느리다"
+--   1) V$SESSION 활성 목록 — SID·SQL_ID·EVENT·BLOCKING_SESSION.
+--   2) 최근 60초 ASH 로 비중을 교정한다. 순간의 이벤트에 끌려가지 않는다.
+--   3) V$SQL_MONITOR 로 지금 실행 중인 문장을 확정. V$SQL 은 실행당으로 정렬.
+--   4) ★ 조치하기 전에 수동 스냅샷을 뜬다. ★ 조치 후에도 한 번 더.
+--   5) 급하면 세션 차단(ch17), 아니면 원인 SQL 을 고친다.
+--   6) 끝난 뒤 그 스냅샷 쌍으로 AWR 을 만들어 실시간 판단을 검증하고 기록으로 남긴다.
+--
+-- (공통 끝) 근거 보존 — 1~6 전부를 SPOOL 한 파일 하나로 남긴다.
+--   "무엇을 바꿨더니 어느 지표가 얼마에서 얼마로 바뀌었다" 한 문장을 맨 끝에 쓴다.
+
+
+================================================================================
+ [6] 이 랩에서 확인한 운영상 사실 두 가지
+================================================================================
+SYS@orcl> SELECT occupant_name, ROUND(space_usage_kbytes/1024) mb
+  2          FROM v$sysaux_occupants
+  3         WHERE occupant_name IN ('SM/AWR','SM/ADVISOR','SM/OPTSTAT') ORDER BY 2 DESC;
+
+OCCUPANT_NAME                    MB
+------------------------------ ----
+SM/AWR                          414
+SM/OPTSTAT                      318
+SM/ADVISOR                      175
+
+-- 1) AWR 이 SYSAUX 를 414MB 쓰고 있다. 8일 보존·1시간 주기, 측정 시점 스냅샷 212개다.
+--    보존을 늘리거나 주기를 짧게 하면 선형으로 늘어난다. 늘리기 전에 SYSAUX
+--    여유를 확인한다(ch20 실습 05). ADDM 태스크 703개가 SM/ADVISOR 175MB 다 —
+--    자동 ADDM 이 스냅샷마다 태스크를 만들기 때문이다.
+
+SYS@orcl> SELECT TO_CHAR(window_start_time,'MM-DD HH24:MI') ws, job_status
+  2          FROM (SELECT * FROM dba_autotask_job_history
+  3                 WHERE client_name LIKE '%stat%' ORDER BY window_start_time DESC)
+  4         WHERE ROWNUM <= 2;
+
+WS          JOB_STATUS
+----------- ------------------------------
+10-12 22:00 SUCCEEDED
+10-11 06:00 SUCCEEDED
+
+SYS@orcl> SELECT table_name, column_name, histogram,
+  2               TO_CHAR(last_analyzed,'MM-DD HH24:MI:SS') la
+  3          FROM dba_tab_col_statistics
+  4         WHERE owner='SQLT' AND histogram <> 'NONE'
+  5           AND table_name = 'MEDICAL_CLAIMS' ORDER BY 2;
+
+TABLE_NAME       COLUMN_NAME     HISTOGRAM       LA
+---------------- --------------- --------------- --------------
+MEDICAL_CLAIMS   CLAIM_ID        HYBRID          10-12 22:07:54
+MEDICAL_CLAIMS   CLAIM_TYPE      FREQUENCY       10-12 22:07:54
+MEDICAL_CLAIMS   DEPT_CODE       FREQUENCY       10-12 22:07:54
+MEDICAL_CLAIMS   HOSP_ID         HYBRID          10-12 22:07:54
+MEDICAL_CLAIMS   RECEIPT_DATE    HYBRID          10-12 22:07:54
+...
+
+-- 2) ★ 이 과정의 기준 상태(히스토그램은 MEDICAL_CLAIMS.HOSP_ID 하나)는
+--    자동 통계 수집 작업을 넘기지 못한다. ★
+--    10-12 22:00 유지관리 창에서 auto optimizer stats collection 이 돌았고,
+--    22:07:54 에 히스토그램이 여러 컬럼에 다시 생겼다. 손으로 Day 0 명령을
+--    돌려 기준 상태로 맞춰도 다음 밤에 또 벌어진다.
+--    원인: METHOD_OPT 기본값이 FOR ALL COLUMNS SIZE AUTO 이고, 실습에서 WHERE 에
+--    쓴 컬럼이 컬럼 사용 이력에 남아 AUTO 가 그 컬럼에 히스토그램을 만든다.
+--    고정하려면 테이블 수준 환경설정을 걸어야 한다(ch21 실습 06).
+--
+--      EXEC DBMS_STATS.SET_TABLE_PREFS('SQLT','MEDICAL_CLAIMS','METHOD_OPT', -
+--             'FOR ALL COLUMNS SIZE 1 FOR COLUMNS SIZE 254 HOSP_ID')
+--      -- 나머지 6개 표
+--      EXEC DBMS_STATS.SET_TABLE_PREFS('SQLT','<표>','METHOD_OPT','FOR ALL COLUMNS SIZE 1')
+--
+--    또는 통계를 잠근다 :  EXEC DBMS_STATS.LOCK_TABLE_STATS('SQLT','<표>')
+--    환경설정을 걸지 않는 한, ch01~ch20 의 E-Rows 는 밤마다 조금씩 달라진다.
+
+
+--------------------------------------------------------------------------------
+-- [정리] 되돌리기
+--------------------------------------------------------------------------------
+SQLT@orcl> -- 사례 2 의 인덱스는 사례 2 안에서 지웠다. 확인한다.
+SYS@orcl> SELECT index_name, table_name FROM dba_indexes
+  2         WHERE owner='SQLT' AND table_name IN ('HOSPITALS','PATIENTS','DRUG_MASTER',
+  3               'MEDICAL_CLAIMS','CLAIM_DETAILS','DISEASES','REVIEW_LOG') ORDER BY 2;
+
+INDEX_NAME             TABLE_NAME
+---------------------- ----------------
+PK_CLAIM_DETAILS       CLAIM_DETAILS
+PK_DISEASES            DISEASES
+PK_DRUG_MASTER         DRUG_MASTER
+PK_HOSPITALS           HOSPITALS
+PK_MEDICAL_CLAIMS      MEDICAL_CLAIMS
+PK_PATIENTS            PATIENTS
+PK_REVIEW_LOG          REVIEW_LOG
+
+7 행이 선택되었습니다.
+
+SYS@orcl> -- 내가 만든 ADDM 태스크 두 개를 지운다
+SYS@orcl> BEGIN
+  2          FOR r IN (SELECT task_name FROM dba_advisor_tasks
+  3                     WHERE task_name LIKE 'BR04\_%' ESCAPE '\') LOOP
+  4            DBMS_ADVISOR.DELETE_TASK(r.task_name);
+  5          END LOOP;
+  6        END;
+  7        /
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> SELECT COUNT(*) AS "남은_BR04_태스크" FROM dba_advisor_tasks
+  2         WHERE task_name LIKE 'BR04%';
+
+남은_BR04_태스크
+----------------
+               0
+
+-- 1) 수동 스냅샷 1112~1120 (9개)는 지우지 않는다. AWR 이력이고 8일 뒤 보존 정책에
+--    따라 자동으로 사라진다. 꼭 지워야 하면 DBMS_WORKLOAD_REPOSITORY.DROP_SNAPSHOT_RANGE
+--    를 쓰되, 그 구간을 쓰는 베이스라인이 있으면 거부된다(ch20 실습 04).
+-- 2) 원본 7개 표의 데이터는 바꾼 적이 없다. 인덱스도 PK 7개로 돌아왔다.
+-- 3) 보고서 파일(/tmp/awr/*.txt)은 근거이므로 사건 기록과 함께 보관한 뒤 지운다.
+
+================================================================================
