@@ -1,0 +1,763 @@
+================================================================================
+ ch34 실습 08 — 리소스 관리자: CPU 할당과 활성 세션 풀 (PTW_RSRC_MGR 교재 실측)
+ 목표: 소비자 그룹 → 리소스 플랜 → 플랜 지시어 → 사용자 매핑 순으로 리소스 관리자를
+       구성하고, EMPHASIS 와 RATIO 두 CPU 할당 방식의 차이를 확인한다. 그리고
+       교재가 다루지 않는 마지막 한 걸음 — "플랜을 켜서 실제로 작동시키는 것" 까지
+       해서, 활성 세션 풀이 세션을 큐에 넣고 타임아웃으로 끊는 것을 눈으로 본다.
+ 환경: non-CDB=orcl 19.3.0.0, SYS AS SYSDBA + SQLT. CPU 4개.
+       리소스 관리자는 Enterprise Edition 기본 기능이다(별도 팩 라이선스 불필요).
+ 전제: 교재 `PTW_RSRC_MGR.pdf` 의 세 절(기본 설정 / RATIO 방식 / 활성 세션 풀)을
+       그대로 실행해 보고, 19c 에서 실제로 어떻게 되는지 확인한다.
+       교재 명령 중 이 버전에서 그대로 통하지 않는 것이 네 군데 있다 — 아래에서
+       오류 원문과 함께 다룬다.
+ 주의: ★ 개인 실습 환경 전용 ★  RESOURCE_MANAGER_PLAN 은 인스턴스 전체에 걸린다.
+       플랜을 켜면 그 순간부터 모든 세션의 CPU 와 동시 세션 수가 제한된다.
+       시작 전 현재 값을 반드시 적어 두고, 끝나면 [9] 로 원복한다.
+       2026-10-13 실측. 모든 출력은 그날 세션의 것이다.
+================================================================================
+
+--------------------------------------------------------------------------------
+-- [1] (조치 전 상태) 지금 리소스 관리자는 어떻게 되어 있나
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT name, value, isdefault FROM v$parameter WHERE name='resource_manager_plan';
+
+NAME                           VALUE      ISDEFAULT
+------------------------------ ---------- ---------
+resource_manager_plan                     TRUE
+
+SYS@orcl> SELECT name AS "활성플랜", cpu_managed, instance_caging FROM v$rsrc_plan;
+
+활성플랜                         CPU INS
+-------------------------------- --- ---
+INTERNAL_PLAN                    OFF OFF
+
+-- 해석: ★ 원복 기준이다. 반드시 적어 둔다. ★
+--   RESOURCE_MANAGER_PLAN 이 비어 있고(ISDEFAULT=TRUE), V$RSRC_PLAN 은
+--   INTERNAL_PLAN 에 CPU_MANAGED=OFF 다. 즉 "리소스 관리자가 꺼져 있다".
+--   INTERNAL_PLAN 은 플랜이 없을 때 Oracle 이 내부적으로 거는 자리표시자다.
+--   파라미터가 비었다고 V$RSRC_PLAN 이 비는 것이 아니다 — 둘을 함께 봐야 한다.
+
+SYS@orcl> SELECT plan, num_plan_directives, mandatory FROM dba_rsrc_plans
+  2        ORDER BY mandatory DESC, plan;
+
+PLAN                     NUM_PLAN_DIRECTIVES MAN
+------------------------ ------------------- ---
+APPQOS_PLAN                                7 YES
+DEFAULT_MAINTENANCE_PLAN                   3 YES
+DEFAULT_PLAN                               3 YES
+INTERNAL_PLAN                              3 YES
+INTERNAL_QUIESCE                           2 YES
+ORA$AUTOTASK_PLAN                          1 YES
+ORA$QOS_PLAN                               7 YES
+ORA$ROOT_PLAN                              2 YES
+DSS_PLAN                                   7 NO
+ETL_CRITICAL_PLAN                          7 NO
+MIXED_WORKLOAD_PLAN                        5 NO
+
+11 행이 선택되었습니다.
+
+SYS@orcl> SELECT consumer_group, mandatory FROM dba_rsrc_consumer_groups
+  2        WHERE mandatory = 'NO' ORDER BY 1;
+
+CONSUMER_GROUP                 MAN
+------------------------------ ---
+BATCH_GROUP                    NO
+DSS_CRITICAL_GROUP             NO
+DSS_GROUP                      NO
+ETL_GROUP                      NO
+INTERACTIVE_GROUP              NO
+LOW_GROUP                      NO
+
+6 행이 선택되었습니다.
+
+-- 해석: 빈 DB 가 아니다. Oracle 이 **샘플 플랜 3개와 샘플 소비자 그룹 6개**를
+--   미리 만들어 둔다. MANDATORY='NO' 라 지울 수는 있지만, 이름이 겹치면
+--   새로 만들 수 없다. 교재의 BATCH_GROUP 이 바로 그 경우다 — [2] 에서 걸린다.
+
+
+--------------------------------------------------------------------------------
+-- [2] (이상 징후 → 원인 → 조치 → 재확인) 소비자 그룹 만들기
+--     교재 Step 1 을 그대로 실행한다
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CLEAR_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+-- 모든 변경은 Pending Area 에서 하고 SUBMIT 으로 확정한다. 교재가 맨 앞에
+-- CLEAR → CREATE 를 두는 이유는, 앞 작업이 남긴 미결 변경이 있으면 섞이기 때문이다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP( -
+  2          CONSUMER_GROUP => 'OLTP_GROUP', -
+  3          COMMENT        => 'OLTP 온라인 사용자 그룹');
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP( -
+  2          CONSUMER_GROUP => 'BATCH_GROUP', -
+  3          COMMENT        => '배치 작업 그룹');
+BEGIN DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP(CONSUMER_GROUP => 'BATCH_GROUP', COMMENT => '배치 작업 그룹'); END;
+*
+1행에 오류:
+ORA-29357: BATCH_GROUP 객체는 이미 존재합니다
+ORA-06512: "SYS.DBMS_RMIN_SYS", 1503행
+ORA-06512: "SYS.DBMS_SYS_ERROR", 86행
+ORA-06512: "SYS.DBMS_RMIN_SYS", 393행
+ORA-06512: "SYS.DBMS_RMIN_SYS", 1477행
+ORA-06512: "SYS.DBMS_RESOURCE_MANAGER", 175행
+ORA-06512: 1행
+
+-- 이상 징후: 교재 그대로 실행했는데 두 번째 그룹에서 멈춘다.
+-- 원인 파악: [1] 에서 본 대로 BATCH_GROUP 은 Oracle 이 미리 만들어 둔 샘플 그룹이다.
+SYS@orcl> SELECT consumer_group, mandatory, comments FROM dba_rsrc_consumer_groups
+  2        WHERE consumer_group = 'BATCH_GROUP';
+
+CONSUMER_GROUP   MAN COMMENTS
+---------------- --- ------------------------------------------
+BATCH_GROUP      NO  Consumer group for batch operations
+
+-- 조치: 둘 중 하나다.
+--   (a) 기존 BATCH_GROUP 을 그대로 쓴다 — 샘플 플랜(DSS_PLAN 등)이 참조하므로 권장하지 않는다
+--   (b) 이름을 바꿔 내 것을 만든다 ← 이쪽을 택한다
+--   실무에서는 조직 약어를 접두로 붙여 Oracle 공급 객체와 섞이지 않게 한다.
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP( -
+  2          CONSUMER_GROUP => 'PTW_BATCH_GROUP', -
+  3          COMMENT        => '배치 작업 그룹');
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+-- 재확인
+SYS@orcl> SELECT consumer_group, mandatory, comments FROM dba_rsrc_consumer_groups
+  2        WHERE consumer_group IN ('OLTP_GROUP','PTW_BATCH_GROUP') ORDER BY 1;
+
+CONSUMER_GROUP           MAN COMMENTS
+------------------------ --- ------------------------------------------
+OLTP_GROUP               NO  OLTP 온라인 사용자 그룹
+PTW_BATCH_GROUP          NO  배치 작업 그룹
+
+2 행이 선택되었습니다.
+
+
+--------------------------------------------------------------------------------
+-- [3] (이상 징후 → 원인 → 조치 → 재확인) 플랜과 지시어 (EMPHASIS)
+--     교재 Step 2. OTHER_GROUPS 를 일부러 빼고 SUBMIT 해 본다
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN( -
+  2          PLAN    => 'MY_WORK_PLAN', -
+  3          COMMENT => '업무 시간 리소스 플랜');
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE( -
+  2          PLAN             => 'MY_WORK_PLAN', -
+  3          GROUP_OR_SUBPLAN => 'OLTP_GROUP', -
+  4          COMMENT          => 'OLTP 그룹: Level1에 70% CPU 할당', -
+  5          MGMT_P1          => 70);
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE( -
+  2          PLAN             => 'MY_WORK_PLAN', -
+  3          GROUP_OR_SUBPLAN => 'PTW_BATCH_GROUP', -
+  4          COMMENT          => '배치 그룹: Level1에 20% CPU 할당', -
+  5          MGMT_P1          => 20);
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> -- 교재는 여기서 OTHER_GROUPS 지시어를 "반드시 포함해야 함" 이라고 적었다.
+SYS@orcl> -- 왜 반드시인지 확인하려고 일부러 빼고 SUBMIT 해 본다.
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+BEGIN DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA(); END;
+*
+1행에 오류:
+ORA-29377: OTHER_GROUPS 수요자 그룹은 MY_WORK_PLAN 상단 계획에 일부가 아닙니다
+ORA-06512: "SYS.DBMS_RMIN_SYS", 3743행
+ORA-06512: "SYS.DBMS_SYS_ERROR", 95행
+ORA-06512: "SYS.DBMS_RMIN_SYS", 3733행
+ORA-06512: "SYS.DBMS_RMIN_SYS", 3794행
+ORA-06512: "SYS.DBMS_RMIN_SYS", 3806행
+ORA-06512: "SYS.DBMS_RMIN_SYS", 4451행
+ORA-06512: "SYS.DBMS_RESOURCE_MANAGER", 674행
+ORA-06512: 1행
+
+-- 이상 징후: 지시어를 다 만들었는데 SUBMIT 에서 거부된다.
+-- 원인 파악: 어느 그룹에도 매핑되지 않은 세션은 OTHER_GROUPS 로 간다. 그 그룹에
+--   할당이 없으면 그 세션들이 받을 CPU 가 정의되지 않는다. 그래서 최상위 플랜에는
+--   OTHER_GROUPS 지시어가 **필수**다. 검증은 SUBMIT 시점에 일어난다 —
+--   CREATE_PLAN_DIRECTIVE 하나하나는 통과했다는 점에 주의한다.
+-- 조치: OTHER_GROUPS 를 넣고 VALIDATE 로 먼저 확인한 뒤 SUBMIT 한다.
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE( -
+  2          PLAN => 'MY_WORK_PLAN', GROUP_OR_SUBPLAN => 'OTHER_GROUPS', MGMT_P1 => 10);
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+-- 재확인: 교재의 확인 쿼리 세 개
+SYS@orcl> SELECT plan, num_plan_directives, status, mandatory
+  2          FROM dba_rsrc_plans WHERE plan = 'MY_WORK_PLAN';
+
+PLAN                     NUM_PLAN_DIRECTIVES STATUS MAN
+------------------------ ------------------- ------ ---
+MY_WORK_PLAN                               3        NO
+
+SYS@orcl> SELECT plan, group_or_subplan, mgmt_p1
+  2          FROM dba_rsrc_plan_directives WHERE plan = 'MY_WORK_PLAN' ORDER BY mgmt_p1 DESC;
+
+PLAN                     GROUP_OR_SUBPLAN            MGMT_P1
+------------------------ ------------------------ ----------
+MY_WORK_PLAN             OLTP_GROUP                       70
+MY_WORK_PLAN             PTW_BATCH_GROUP                  20
+MY_WORK_PLAN             OTHER_GROUPS                     10
+
+3 행이 선택되었습니다.
+
+-- 해석: STATUS 가 비어 있으면 "확정된(활성) 정의" 다. Pending Area 에 들어 있는
+--   동안에는 STATUS='PENDING' 으로 보인다. 확인 쿼리를 SUBMIT 전에 돌리면
+--   같은 이름의 행이 두 번 나오는 것(확정본 + 미결본)도 이 때문이다.
+
+
+--------------------------------------------------------------------------------
+-- [4] (조치) 사용자 매핑 — 교재 Step 3 과 현행 방식
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER_PRIVS.GRANT_SWITCH_CONSUMER_GROUP( -
+  2          GRANTEE_NAME     => 'HR', -
+  3          CONSUMER_GROUP   => 'OLTP_GROUP', -
+  4          GRANT_OPTION     => FALSE);
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> -- SET_INITIAL_CONSUMER_GROUP 은 11g 부터 비권장(deprecated)이다. 되는지 본다.
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SET_INITIAL_CONSUMER_GROUP( -
+  2          USER => 'HR', CONSUMER_GROUP => 'OLTP_GROUP');
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> SELECT grantee, granted_group, grant_option, initial_group
+  2          FROM dba_rsrc_consumer_group_privs WHERE grantee = 'HR';
+
+GRANTEE      GRANTED_GROUP        GRA INI
+------------ -------------------- --- ---
+HR           OLTP_GROUP           NO  YES
+
+-- 해석: 19c 에서도 동작한다. 다만 비권장이고, 현행 방식은 **매핑 규칙**이다.
+--   매핑은 사용자뿐 아니라 서비스·모듈·클라이언트 프로그램·세션 속성으로도 걸 수 있어
+--   같은 계정이 쓰는 배치와 온라인을 갈라 놓을 수 있다. [6] 에서 그쪽을 쓴다.
+--
+--     DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP_MAPPING(
+--       DBMS_RESOURCE_MANAGER.ORACLE_USER, 'HR', 'OLTP_GROUP');
+--     -- 그 밖의 속성: SERVICE_NAME · MODULE_NAME · CLIENT_PROGRAM · ORACLE_FUNCTION 등
+--
+--   GRANT_SWITCH_CONSUMER_GROUP 은 어느 방식이든 **먼저** 필요하다.
+--   권한 없이 매핑만 하면 세션이 그 그룹으로 옮겨가지 않는다.
+
+
+--------------------------------------------------------------------------------
+-- [5] (조회) RATIO 방식 — 같은 MGMT_P1 이 다른 뜻이다
+--     교재 2절
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CLEAR_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP('OLTP_USERS','온라인 사용자');
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP('DSS_USERS','DSS 분석 사용자');
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP('BATCH_USERS','배치 작업');
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN( -
+  2          PLAN => 'RATIO_PLAN', MGMT_MTH => 'RATIO', -
+  3          COMMENT => 'RATIO 방식 CPU 할당 테스트 플랜');
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE(PLAN=>'RATIO_PLAN', GROUP_OR_SUBPLAN=>'OLTP_USERS',   MGMT_P1=>4);
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE(PLAN=>'RATIO_PLAN', GROUP_OR_SUBPLAN=>'DSS_USERS',    MGMT_P1=>3);
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE(PLAN=>'RATIO_PLAN', GROUP_OR_SUBPLAN=>'BATCH_USERS',  MGMT_P1=>2);
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE(PLAN=>'RATIO_PLAN', GROUP_OR_SUBPLAN=>'OTHER_GROUPS', MGMT_P1=>1);
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> SELECT group_or_subplan, mgmt_p1,
+  2               ROUND(mgmt_p1 / SUM(mgmt_p1) OVER () * 100, 1) AS pct_cpu
+  3          FROM dba_rsrc_plan_directives WHERE plan = 'RATIO_PLAN' ORDER BY mgmt_p1 DESC;
+
+GROUP_OR_SUBPLAN        MGMT_P1    PCT_CPU
+-------------------- ---------- ----------
+OLTP_USERS                    4         40
+DSS_USERS                     3         30
+BATCH_USERS                   2         20
+OTHER_GROUPS                  1         10
+
+4 행이 선택되었습니다.
+
+-- 해석: RATIO 는 **합계 제한이 없고 상대 비율로 계산된다**. 4:3:2:1 → 40/30/20/10%.
+--   8:6:4:2 로 적어도 결과는 같다. 그룹을 하나 더 붙이면 나머지 비율이 자동으로
+--   다시 나뉘므로, 그룹이 자주 늘고 주는 환경에서 손이 덜 간다.
+--   EMPHASIS 는 반대로 "레벨별 백분율" 이라 합이 100 을 넘을 수 없다 — [5-1] 에서 본다.
+
+
+--------------------------------------------------------------------------------
+-- [5-1] (이상 징후 → 원인) 교재의 확인 쿼리에 MGMT_MTH 를 쓰면
+--------------------------------------------------------------------------------
+SYS@orcl> SELECT plan, mgmt_mth, num_plan_directives FROM dba_rsrc_plans
+  2        WHERE plan = 'RATIO_PLAN';
+SELECT plan, mgmt_mth, num_plan_directives FROM dba_rsrc_plans
+             *
+1행에 오류:
+ORA-00904: "MGMT_MTH": 부적합한 식별자
+
+-- 이상 징후: CREATE_PLAN 에 쓴 이름 그대로 조회했는데 컬럼이 없다.
+-- 원인 파악: MGMT_MTH 는 **프로시저 파라미터 이름**이고, 뷰의 컬럼 이름은 다르다.
+SYS@orcl> SELECT column_name FROM dba_tab_columns
+  2          WHERE table_name = 'DBA_RSRC_PLANS' AND owner = 'SYS' ORDER BY column_id;
+
+COLUMN_NAME
+--------------------------
+PLAN_ID
+PLAN
+NUM_PLAN_DIRECTIVES
+CPU_METHOD
+MGMT_METHOD
+ACTIVE_SESS_POOL_MTH
+PARALLEL_DEGREE_LIMIT_MTH
+QUEUEING_MTH
+SUB_PLAN
+COMMENTS
+STATUS
+MANDATORY
+
+12 행이 선택되었습니다.
+
+-- 조치: MGMT_METHOD 로 조회한다. CPU_METHOD 는 구버전 호환용이다.
+SYS@orcl> SELECT plan, mgmt_method, num_plan_directives, mandatory
+  2          FROM dba_rsrc_plans
+  3         WHERE plan IN ('MY_WORK_PLAN','RATIO_PLAN','DEFAULT_PLAN') ORDER BY plan;
+
+PLAN                     MGMT_METHOD  NUM_PLAN_DIRECTIVES MAN
+------------------------ ------------ ------------------- ---
+DEFAULT_PLAN             EMPHASIS                       3 YES
+MY_WORK_PLAN             EMPHASIS                       3 NO
+RATIO_PLAN               RATIO                          4 NO
+
+3 행이 선택되었습니다.
+
+-- 해석: MGMT_MTH 를 생략하면 기본값이 EMPHASIS 다. Oracle 공급 DEFAULT_PLAN 도 EMPHASIS.
+
+
+--------------------------------------------------------------------------------
+-- [5-2] (이상 징후 → 원인 → 재확인) EMPHASIS 는 레벨당 합 100 이 상한이다
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CLEAR_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+SYS@orcl> -- OLTP_GROUP 을 70 -> 90 으로 올려 본다 (합 120)
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE( -
+  2          PLAN => 'MY_WORK_PLAN', GROUP_OR_SUBPLAN => 'OLTP_GROUP', NEW_MGMT_P1 => 90);
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+BEGIN DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA(); END;
+*
+1행에 오류:
+ORA-29382: 미결 영역의 검증이 실패되었습니다
+ORA-29375: 값 합계 120(1 레벨, MY_WORK_PLAN 계획)이(가) 100을(를) 초과함
+ORA-06512: "SYS.DBMS_RMIN_SYS", 3699행
+ORA-06512: "SYS.DBMS_RMIN_SYS", 3809행
+ORA-06512: "SYS.DBMS_RESOURCE_MANAGER", 664행
+ORA-06512: 1행
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CLEAR_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+-- 해석: ★ EMPHASIS 와 RATIO 의 결정적 차이다. ★
+--   EMPHASIS : MGMT_Pn 은 백분율. **레벨마다 합이 100 이하**여야 한다.
+--              남은 CPU 는 다음 레벨(P2, P3 …)로 내려간다.
+--   RATIO    : MGMT_P1 은 가중치. 합계 제한이 없고 상대 비율로 계산한다. 레벨 1 만 쓴다.
+--   같은 MGMT_P1 컬럼인데 플랜의 MGMT_METHOD 에 따라 뜻이 달라진다 —
+--   남이 만든 플랜을 읽을 때 MGMT_METHOD 를 먼저 확인해야 하는 이유다.
+--   VALIDATE_PENDING_AREA 를 습관처럼 넣어 두면 SUBMIT 전에 걸러진다.
+
+
+--------------------------------------------------------------------------------
+-- [6] (이상 징후 → 원인 → 조치) 활성 세션 풀 — 교재 3절
+--     교재는 DEFAULT_PLAN 에 지시어를 추가하라고 한다. 그대로 해 본다.
+--------------------------------------------------------------------------------
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_CONSUMER_GROUP( -
+  2          CONSUMER_GROUP => 'APPUSER_GROUP', COMMENT => '애플리케이션 사용자 그룹');
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE( -
+  2          PLAN                  => 'DEFAULT_PLAN', -
+  3          GROUP_OR_SUBPLAN      => 'APPUSER_GROUP', -
+  4          COMMENT               => '앱 사용자 세션 및 유휴 제한', -
+  5          MGMT_P2               => 30, -
+  6          ACTIVE_SESS_POOL_P1   => 20, -
+  7          QUEUEING_P1           => 60, -
+  8          MAX_IDLE_TIME         => 300, -
+  9          MAX_IDLE_BLOCKER_TIME => 120);
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+-- 이상 징후: ★ 성공했다. ★ 그런데 이것이 문제다.
+SYS@orcl> SELECT plan, group_or_subplan, mgmt_p1, mgmt_p2, active_sess_pool_p1, max_idle_time
+  2          FROM dba_rsrc_plan_directives WHERE plan = 'DEFAULT_PLAN' ORDER BY group_or_subplan;
+
+PLAN                     GROUP_OR_SUBPLAN          MGMT_P1    MGMT_P2 ACTIVE_SESS_POOL_P1 MAX_IDLE_TIME
+------------------------ ---------------------- ---------- ---------- ------------------- -------------
+DEFAULT_PLAN             APPUSER_GROUP                   0         30                  20           300
+DEFAULT_PLAN             ORA$AUTOTASK                    1          0
+DEFAULT_PLAN             OTHER_GROUPS                    9          0
+DEFAULT_PLAN             SYS_GROUP                      90          0
+
+4 행이 선택되었습니다.
+
+-- 원인 파악: MANDATORY='YES' 는 **"삭제할 수 없다"** 는 뜻이지 "수정할 수 없다" 가
+--   아니다. 그래서 Oracle 공급 DEFAULT_PLAN 에 내 지시어가 그대로 들어간다.
+--   DEFAULT_PLAN 은 원래 SYS_GROUP 90 / OTHER_GROUPS 9 / ORA$AUTOTASK 1 세 줄이고,
+--   다른 플랜이 없을 때 돌아가는 기본 플랜이자 여러 기능이 전제하는 정의다.
+--   여기를 건드리면 (a) 원복 대상인 줄 모르고 남고 (b) 다른 DBA 가 영문을 모르고
+--   (c) 업그레이드·패치 때 충돌 소지가 된다.
+-- 조치: 내 플랜에 건다. DEFAULT_PLAN 은 읽기만 한다.
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CLEAR_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE( -
+  2          PLAN                  => 'MY_WORK_PLAN', -
+  3          GROUP_OR_SUBPLAN      => 'APPUSER_GROUP', -
+  4          COMMENT               => '앱 사용자 세션 및 유휴 제한', -
+  5          MGMT_P2               => 30, -
+  6          ACTIVE_SESS_POOL_P1   => 20, -
+  7          QUEUEING_P1           => 60, -
+  8          MAX_IDLE_TIME         => 300, -
+  9          MAX_IDLE_BLOCKER_TIME => 120);
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+-- 재확인: 교재의 확인 쿼리
+SYS@orcl> SELECT plan, group_or_subplan, mgmt_p1, mgmt_p2,
+  2               active_sess_pool_p1, queueing_p1, max_idle_time, max_idle_blocker_time
+  3          FROM dba_rsrc_plan_directives WHERE plan='MY_WORK_PLAN' ORDER BY group_or_subplan;
+
+PLAN                   GROUP_OR_SUBPLAN        MGMT_P1    MGMT_P2 ACTIVE_SESS_POOL_P1 QUEUEING_P1 MAX_IDLE_TIME MAX_IDLE_BLOCKER_TIME
+---------------------- -------------------- ---------- ---------- ------------------- ----------- ------------- ---------------------
+MY_WORK_PLAN           APPUSER_GROUP                 0         30                  20          60           300                   120
+MY_WORK_PLAN           OLTP_GROUP                   70          0
+MY_WORK_PLAN           OTHER_GROUPS                 10          0
+MY_WORK_PLAN           PTW_BATCH_GROUP              20          0
+
+4 행이 선택되었습니다.
+
+-- 해석: 네 가지 제한이 한 지시어에 함께 들어간다.
+--   ACTIVE_SESS_POOL_P1 = 20   동시에 "실행 중" 일 수 있는 세션 수. 접속 수가 아니다
+--   QUEUEING_P1         = 60   풀이 찼을 때 큐에서 기다릴 최대 초. 넘으면 ORA-07454
+--   MAX_IDLE_TIME       = 300  유휴 5분이면 세션을 끊는다
+--   MAX_IDLE_BLOCKER_TIME = 120  다른 세션을 막고 있는 유휴 세션은 2분이면 끊는다
+--   APPUSER_GROUP 은 MGMT_P2=30 이라 레벨 1 에서는 CPU 를 못 받고, 레벨 1 이
+--   다 쓰고 남은 것을 레벨 2 에서 30% 받는다. MGMT_P1 이 0 인 것이 그 표시다.
+
+
+--------------------------------------------------------------------------------
+-- [7] ★ 교재에 없는 마지막 한 걸음 — 플랜을 켜야 아무 일이든 일어난다 ★
+--------------------------------------------------------------------------------
+-- 여기까지는 "정의" 만 만들었다. RESOURCE_MANAGER_PLAN 에 걸지 않으면
+-- 지시어는 한 줄도 동작하지 않는다. 교재는 이 단계를 다루지 않는다.
+--
+-- 효과를 눈에 보이게 하려고 활성 세션 풀을 20 -> 1 로 조이고,
+-- 큐 대기도 60 -> 30 초로 줄인다. SYS 가 OTHER_GROUPS(10%)로 떨어지지 않도록
+-- SYS_GROUP 자리도 만들어 둔다(레벨 1 합이 100 을 넘지 않게 OLTP 를 60 으로 내린다).
+
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CLEAR_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(PLAN=>'MY_WORK_PLAN', -
+  2          GROUP_OR_SUBPLAN=>'PTW_BATCH_GROUP', NEW_ACTIVE_SESS_POOL_P1=>1, NEW_QUEUEING_P1=>30);
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.UPDATE_PLAN_DIRECTIVE(PLAN=>'MY_WORK_PLAN', -
+  2          GROUP_OR_SUBPLAN=>'OLTP_GROUP', NEW_MGMT_P1=>60);
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PLAN_DIRECTIVE(PLAN=>'MY_WORK_PLAN', -
+  2          GROUP_OR_SUBPLAN=>'SYS_GROUP', MGMT_P1=>10);
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.VALIDATE_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> -- SQLT 를 PTW_BATCH_GROUP 으로 보낸다. 권한이 먼저, 매핑이 나중이다.
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER_PRIVS.GRANT_SWITCH_CONSUMER_GROUP( -
+  2          GRANTEE_NAME=>'SQLT', CONSUMER_GROUP=>'PTW_BATCH_GROUP', GRANT_OPTION=>FALSE);
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP_MAPPING( -
+  2          DBMS_RESOURCE_MANAGER.ORACLE_USER, 'SQLT', 'PTW_BATCH_GROUP');
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+SYS@orcl> SELECT attribute, value, consumer_group, status
+  2          FROM dba_rsrc_group_mappings WHERE value IN ('SQLT','HR');
+
+ATTRIBUTE        VALUE        CONSUMER_GROUP
+---------------- ------------ --------------------
+ORACLE_USER      SQLT         PTW_BATCH_GROUP
+
+SYS@orcl> -- ★ 켠다 ★  SCOPE=MEMORY 로 걸면 재기동하면 사라진다(실습에 적합).
+SYS@orcl> ALTER SYSTEM SET resource_manager_plan = 'MY_WORK_PLAN' SCOPE=MEMORY;
+
+시스템이 변경되었습니다.
+
+SYS@orcl> SELECT name AS "활성플랜", cpu_managed, instance_caging FROM v$rsrc_plan;
+
+활성플랜                         CPU INS
+-------------------------------- --- ---
+MY_WORK_PLAN                     ON  OFF
+
+-- 재확인: [1] 의 INTERNAL_PLAN / OFF 가 MY_WORK_PLAN / ON 으로 바뀌었다.
+--   ★ CPU_MANAGED 가 ON 이 된 순간부터 지시어가 효력을 가진다. ★
+--   운영에 걸 때는 SCOPE=BOTH 를 쓰거나, 스케줄러 윈도우에 플랜을 지정한다
+--   (유지관리 창은 DEFAULT_MAINTENANCE_PLAN 을 자동으로 건다 — ch30 실습 02).
+
+
+--------------------------------------------------------------------------------
+-- [8] (실측) 활성 세션 풀이 세션을 큐에 넣는다
+--------------------------------------------------------------------------------
+-- [터미널 2, 3 : SQLT] 같은 조회를 동시에 띄운다. 풀이 1 이므로 하나는 큐로 간다.
+SQLT@orcl> SELECT TO_CHAR(SYSTIMESTAMP,'HH24:MI:SS')||'  접속 '||USER
+  2               ||'  그룹='||(SELECT resource_consumer_group FROM v$session
+  3                             WHERE sid=SYS_CONTEXT('USERENV','SID')) AS t FROM dual;
+
+T
+--------------------------------------------------------------------------------
+10:41:31  접속 SQLT  그룹=PTW_BATCH_GROUP
+
+SQLT@orcl> DECLARE
+  2          v NUMBER; t0 NUMBER := DBMS_UTILITY.GET_TIME;
+  3        BEGIN
+  4          WHILE (DBMS_UTILITY.GET_TIME - t0) < 4000 LOOP
+  5            SELECT /*+ RM_WORK */ COUNT(*) INTO v FROM claim_details WHERE amt > 170000;
+  6          END LOOP;
+  7        END;
+  8        /
+
+-- [터미널 1 : SYS] 부하가 도는 동안 큐를 본다
+SYS@orcl> SELECT name, active_sessions, queue_length, consumed_cpu_time, cpu_waits
+  2          FROM v$rsrc_consumer_group ORDER BY name;
+
+NAME                   ACTIVE_SESSIONS QUEUE_LENGTH CONSUMED_CPU_TIME  CPU_WAITS
+---------------------- --------------- ------------ ----------------- ----------
+APPUSER_GROUP                        0            0                 0          0
+OLTP_GROUP                           0            0                 0          0
+OTHER_GROUPS                         0            0                 0          0
+PTW_BATCH_GROUP                      1            1             11885          2
+SYS_GROUP                            2            0               147          0
+_ORACLE_BACKGROUND_GROUP_           45            0                 0          0
+
+6 행이 선택되었습니다.
+
+-- 해석: ★ PTW_BATCH_GROUP 의 ACTIVE_SESSIONS 1 / QUEUE_LENGTH 1. ★
+--   풀이 1 이라 한 세션만 실행되고 나머지 하나는 큐에 들어갔다.
+--   SYS_GROUP 2 는 내 진단 세션들이다 — SYS 는 자동으로 SYS_GROUP 으로 간다.
+
+SYS@orcl> SELECT s.sid, s.username, s.resource_consumer_group rcg, s.status,
+  2               s.event, s.current_queue_duration
+  3          FROM v$session s WHERE s.username = 'SQLT' ORDER BY s.sid;
+
+       SID USERNAME RCG                  STATUS   EVENT                          CURRENT_QUEUE_DURATION
+---------- -------- -------------------- -------- ------------------------------ ----------------------
+        20 SQLT     PTW_BATCH_GROUP      INACTIVE SQL*Net message from client                         0
+        21 SQLT     PTW_BATCH_GROUP      INACTIVE SQL*Net message from client                         0
+       401 SQLT     PTW_BATCH_GROUP      INACTIVE SQL*Net message from client                         0
+       404 SQLT     PTW_BATCH_GROUP      ACTIVE   latch: shared pool                                  0
+       596 SQLT     PTW_BATCH_GROUP      INACTIVE SQL*Net message from client                         0
+       603 SQLT     PTW_BATCH_GROUP      ACTIVE   resmgr:become active                               11
+
+6 행이 선택되었습니다.
+
+-- 해석: ★ SID 603 의 EVENT 가 resmgr:become active 다. ★
+--   이것이 "리소스 관리자가 세션을 큐에 세워 두고 있다" 는 대기 이벤트다.
+--   CURRENT_QUEUE_DURATION 11 — 11초째 기다리는 중이다.
+--   운영에서 이 이벤트가 상위에 보이면 대개 활성 세션 풀이 너무 작은 것이다.
+--   RESOURCE_CONSUMER_GROUP 컬럼으로 세션이 실제로 어느 그룹에 들어갔는지 확인한다 —
+--   매핑을 걸어도 권한이 없으면 OTHER_GROUPS 에 남는다.
+
+-- [터미널 3] 큐에서 30초를 넘긴 세션의 최후
+SQLT@orcl> DECLARE
+...
+  8        /
+DECLARE
+*
+1행에 오류:
+ORA-07454: 대기열 시간 초과. 30초 초과됨
+
+-- [터미널 2] 풀을 차지했던 세션은 정상 종료
+10:42:11  작업 끝
+
+-- 재확인: 끝난 뒤 누적 통계
+SYS@orcl> SELECT name, active_sessions, queue_length,
+  2               active_session_limit_hit AS "풀초과_횟수",
+  3               queued_time AS "누적큐_ms", queue_time_outs AS "큐타임아웃",
+  4               ROUND(consumed_cpu_time/1000,1) AS "소비CPU초"
+  5          FROM v$rsrc_consumer_group
+  6         WHERE name IN ('PTW_BATCH_GROUP','OLTP_GROUP','OTHER_GROUPS','SYS_GROUP')
+  7         ORDER BY name;
+
+NAME                   ACTIVE_SESSIONS QUEUE_LENGTH 풀초과_횟수  누적큐_ms 큐타임아웃  소비CPU초
+---------------------- --------------- ------------ ----------- ---------- ---------- ----------
+OLTP_GROUP                           0            0           0          0          0          0
+OTHER_GROUPS                         0            0           0          0          0          0
+PTW_BATCH_GROUP                      0            0           4      39977          1       39.6
+SYS_GROUP                            2            0           0          0          0         .3
+
+4 행이 선택되었습니다.
+
+-- 해석: 사건 전체가 숫자로 남는다.
+--   ACTIVE_SESSION_LIMIT_HIT 4  풀이 꽉 차서 거절한 횟수
+--   QUEUED_TIME 39,977 ms       큐에서 보낸 누적 시간 ≈ 40초
+--   QUEUE_TIME_OUTS 1           QUEUEING_P1(30초)을 넘겨 ORA-07454 로 끝난 세션 수
+--   CONSUMED_CPU_TIME 39.6초    풀을 통과한 세션이 실제로 쓴 CPU
+--   ★ 이 네 값이 "활성 세션 풀을 얼마로 잡아야 하는가" 의 근거다. ★
+--   QUEUE_TIME_OUTS 가 0 이 아니면 업무가 실패하고 있다는 뜻이다 — 풀을 키우거나
+--   QUEUEING_P1 을 늘리거나, 애초에 그 그룹의 동시 요청을 줄여야 한다.
+
+
+--------------------------------------------------------------------------------
+-- [9] (원복) ★ 반드시 수행한다 ★
+--------------------------------------------------------------------------------
+SYS@orcl> -- 1) 플랜을 먼저 끈다. 활성 플랜은 삭제할 수 없다.
+SYS@orcl> ALTER SYSTEM SET resource_manager_plan = '' SCOPE=MEMORY;
+
+시스템이 변경되었습니다.
+
+SYS@orcl> -- 2) 사용자 쪽 : 초기 그룹 -> 권한 -> 매핑 순으로 되돌린다
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SET_INITIAL_CONSUMER_GROUP('HR','DEFAULT_CONSUMER_GROUP');
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER_PRIVS.REVOKE_SWITCH_CONSUMER_GROUP('HR','OLTP_GROUP');
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER_PRIVS.REVOKE_SWITCH_CONSUMER_GROUP('SQLT','PTW_BATCH_GROUP');
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP_MAPPING( -
+  2          DBMS_RESOURCE_MANAGER.ORACLE_USER, 'SQLT', NULL);
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+
+SYS@orcl> -- 3) ★ [6] 에서 DEFAULT_PLAN 에 넣은 지시어를 반드시 뺀다 ★
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.DELETE_PLAN_DIRECTIVE('DEFAULT_PLAN','APPUSER_GROUP');
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+
+SYS@orcl> -- 4) 내가 만든 플랜과 그룹을 지운다. CASCADE 는 플랜이 쓰던 그룹까지 지운다
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.CREATE_PENDING_AREA();
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.DELETE_PLAN_CASCADE('MY_WORK_PLAN');
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.DELETE_PLAN_CASCADE('RATIO_PLAN');
+SYS@orcl> EXEC DBMS_RESOURCE_MANAGER.SUBMIT_PENDING_AREA();
+
+PL/SQL 처리가 정상적으로 완료되었습니다.
+
+-- 재확인 : [1] 의 상태로 돌아왔는가
+SYS@orcl> SELECT name AS "활성플랜", cpu_managed, instance_caging FROM v$rsrc_plan;
+
+활성플랜                         CPU INS
+-------------------------------- --- ---
+INTERNAL_PLAN                    OFF OFF
+
+SYS@orcl> SELECT name, value, isdefault FROM v$parameter WHERE name='resource_manager_plan';
+
+NAME                           VALUE      ISDEFAULT
+------------------------------ ---------- ---------
+resource_manager_plan                     TRUE
+
+SYS@orcl> SELECT plan, num_plan_directives, mandatory FROM dba_rsrc_plans
+  2        ORDER BY mandatory DESC, plan;
+
+PLAN                     NUM_PLAN_DIRECTIVES MAN
+------------------------ ------------------- ---
+APPQOS_PLAN                                7 YES
+DEFAULT_MAINTENANCE_PLAN                   3 YES
+DEFAULT_PLAN                               3 YES
+INTERNAL_PLAN                              3 YES
+INTERNAL_QUIESCE                           2 YES
+ORA$AUTOTASK_PLAN                          1 YES
+ORA$QOS_PLAN                               7 YES
+ORA$ROOT_PLAN                              2 YES
+DSS_PLAN                                   7 NO
+ETL_CRITICAL_PLAN                          7 NO
+MIXED_WORKLOAD_PLAN                        5 NO
+
+11 행이 선택되었습니다.
+
+SYS@orcl> SELECT consumer_group FROM dba_rsrc_consumer_groups
+  2        WHERE consumer_group IN ('OLTP_GROUP','PTW_BATCH_GROUP','APPUSER_GROUP',
+  3                                 'OLTP_USERS','DSS_USERS','BATCH_USERS');
+
+선택된 레코드가 없습니다.
+
+SYS@orcl> SELECT plan, group_or_subplan FROM dba_rsrc_plan_directives
+  2        WHERE plan='DEFAULT_PLAN' ORDER BY 2;
+
+PLAN                     GROUP_OR_SUBPLAN
+------------------------ ----------------------
+DEFAULT_PLAN             ORA$AUTOTASK
+DEFAULT_PLAN             OTHER_GROUPS
+DEFAULT_PLAN             SYS_GROUP
+
+3 행이 선택되었습니다.
+
+SYS@orcl> SELECT grantee, granted_group FROM dba_rsrc_consumer_group_privs
+  2        WHERE grantee IN ('HR','SQLT');
+
+선택된 레코드가 없습니다.
+
+-- 재확인 완료: 활성 플랜 INTERNAL_PLAN / CPU OFF, 파라미터 ISDEFAULT=TRUE,
+--   플랜 11개(mandatory 8 + Oracle 샘플 3), DEFAULT_PLAN 지시어 3개,
+--   내가 만든 그룹 6개 전부 삭제, 권한·매핑 없음. [1] 과 같다.
+
+
+--------------------------------------------------------------------------------
+-- [정리] 이 실습에서 확인한 것
+--------------------------------------------------------------------------------
+-- 1) 구성 순서는 **소비자 그룹 → 플랜 → 지시어 → 권한 → 매핑 → 플랜 활성화** 다.
+--    마지막 한 단계(ALTER SYSTEM SET resource_manager_plan)를 빼면 아무 일도
+--    일어나지 않는다. V$RSRC_PLAN.CPU_MANAGED 가 ON 인지로 확인한다.
+--
+-- 2) 모든 변경은 Pending Area 를 거친다. 개별 호출은 통과해도 **SUBMIT 에서 검증**된다.
+--    VALIDATE_PENDING_AREA 를 SUBMIT 앞에 습관처럼 둔다.
+--      ORA-29377  최상위 플랜에 OTHER_GROUPS 지시어가 없다
+--      ORA-29375  EMPHASIS 에서 레벨 합이 100 을 넘었다
+--
+-- 3) EMPHASIS 와 RATIO 는 같은 MGMT_P1 컬럼을 다르게 해석한다.
+--      EMPHASIS  레벨별 백분율, 레벨마다 합 100 이하, 남은 몫은 다음 레벨로
+--      RATIO     상대 가중치, 합계 제한 없음, 레벨 1 만 사용 (4:3:2:1 → 40/30/20/10%)
+--    남의 플랜을 읽을 때 DBA_RSRC_PLANS.MGMT_METHOD 를 먼저 본다.
+--    (MGMT_MTH 는 프로시저 파라미터 이름이고 뷰 컬럼이 아니다 — ORA-00904)
+--
+-- 4) Oracle 공급 객체와 이름이 겹치면 못 만든다(ORA-29357). BATCH_GROUP·DSS_GROUP·
+--    LOW_GROUP·INTERACTIVE_GROUP·ETL_GROUP·DSS_CRITICAL_GROUP 은 이미 있다.
+--    조직 약어를 접두로 붙인다.
+--
+-- 5) MANDATORY='YES' 는 "삭제 불가" 일 뿐 "수정 불가" 가 아니다. DEFAULT_PLAN 에
+--    지시어를 추가하는 것이 **된다** — 그래서 더 위험하다. 교재 3절을 그대로 따르면
+--    Oracle 공급 플랜이 조용히 바뀐 채 남는다. 항상 자기 플랜에 건다.
+--
+-- 6) 활성 세션 풀은 "접속 수" 가 아니라 "동시에 실행 중인 세션 수" 제한이다.
+--    넘치면 큐에 들어가고 대기 이벤트는 resmgr:become active,
+--    V$SESSION.CURRENT_QUEUE_DURATION 으로 얼마나 기다리는지 보인다.
+--    QUEUEING_P1 을 넘기면 ORA-07454 로 **업무가 실패한다**.
+--    사이징 근거는 V$RSRC_CONSUMER_GROUP 의 네 값이다 —
+--    ACTIVE_SESSION_LIMIT_HIT / QUEUED_TIME / QUEUE_TIME_OUTS / CONSUMED_CPU_TIME.
+--
+-- 7) SET_INITIAL_CONSUMER_GROUP 은 19c 에서도 동작하지만 비권장이다.
+--    현행은 SET_CONSUMER_GROUP_MAPPING 이고, 사용자 말고도 서비스·모듈·프로그램으로
+--    매핑할 수 있어 같은 계정의 배치와 온라인을 갈라 놓을 수 있다.
+--    어느 쪽이든 GRANT_SWITCH_CONSUMER_GROUP 이 먼저다.
+--
+-- 8) 원복은 **플랜 끄기 → 사용자 권한·매핑 → DEFAULT_PLAN 지시어 → 플랜/그룹 삭제**
+--    순서다. 활성 플랜은 삭제되지 않으므로 끄는 것이 맨 앞이다.
+
+================================================================================
