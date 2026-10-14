@@ -1,11 +1,12 @@
-# Oracle Database 19c Active Data Guard 교안 — 실습 트랜스크립트 주제 목록 (v1 초안)
+# Oracle Database 19c Active Data Guard 교안 — 실습 트랜스크립트 주제 목록
 
 **작성일**: 2026-08-26
-**상태**: 확인 대기
+**최종 갱신**: 2026-10-14
+**상태**: 완료. 16장 전부 실측 트랜스크립트 작성 완료(계획 99개 → 실제 111개). 실제 파일 목록은 맨 끝 부록 참고
 
 - **형식**: SQL\*Plus / DGMGRL / 셸 세션 트랜스크립트. 프롬프트는 노드를 구분한다 — `SYS@chicago>`, `SYS@boston>`, `DGMGRL>`, `[oracle@chicago-srv ~]$`, `[oracle@boston-srv ~]$`
 - **파일명**: `{N}장_실습_{NN}_{주제}.txt`
-- **총 16장 / 99개**
+- **총 16장 / 계획 99개 → 실제 111개** (장별 증감은 각 장 제목 옆 표기)
 - 각 파일 최소 1곳에 **"오류·이상 징후 발생 → 원인 파악 → 조치 → 재확인"** 흐름을 넣는다
 - **★** = 두 노드가 동시에 살아 있어야 성립하는 실습 (전체의 대부분)
 - **🔒** = Active Data Guard 옵션 라이선스가 필요한 실습. 미보유 환경 대안 경로를 트랜스크립트 후반에 함께 넣는다
@@ -53,7 +54,7 @@
 6. 생성 결과 검증 — 데이터 파일 목록·SRL·컨트롤 파일 유형(`V$DATABASE.CONTROLFILE_TYPE`) 확인, DBID가 primary와 같음을 확인
 7. `DBMS_DBCOMP.DBCOMP`로 primary·standby 블록 비교 수행과 결과 판독
 
-## 6장. Physical Standby 생성 ② OMF 방식 ★ (6개)
+## 6장. Physical Standby 생성 ② OMF 방식 ★ (계획 6개 → 실제 7개)
 1. OMF 파라미터 이해와 설정 — `DB_CREATE_FILE_DEST`, `DB_CREATE_ONLINE_LOG_DEST_n`, `DB_RECOVERY_FILE_DEST`
 2. OMF를 켠 상태로 DBCA silent CDB 생성 — 자동 생성된 경로 구조 확인(`/u03/app/oracle/oradata/CHICAGO/`)
 3. OMF 방식 standby 초기 pfile 작성 — convert 파라미터가 없는 최소 구성
@@ -70,7 +71,7 @@
 6. MRP를 중지한 채 리두를 쌓았다가 재기동해 따라잡는 과정 확인 — 갭 해소(FAL) 동작
 7. **아카이브 로그를 의도적으로 삭제해 갭을 만들고 복구** — `V$ARCHIVE_GAP` 조회, FAL로 자동 해소되지 않는 경우의 수동 조치
 
-## 8장. Primary 구조 변경의 Standby 반영 ★ (6개)
+## 8장. Primary 구조 변경의 Standby 반영 ★ (계획 6개 → 실제 7개)
 1. 테이블스페이스 추가 시 standby 자동 반영 확인 (`STANDBY_FILE_MANAGEMENT=AUTO`)
 2. 데이터 파일 추가·크기 변경의 반영 확인
 3. **수동 개입이 필요한 변경 재현** — 온라인 리두 로그 그룹 추가·삭제 후 standby에서 별도 조치가 필요한 것 확인
@@ -78,7 +79,7 @@
 5. 파라미터 변경의 전파 여부 확인 — spfile 변경이 standby에 자동 반영되지 않는 것과 broker 사용 시의 차이
 6. 데이터 파일을 standby에서 잃어버린 상황 재현 → primary에서 해당 파일만 RMAN으로 복구해 standby에 적용
 
-## 9장. Active Data Guard ① 실시간 조회와 DML 리다이렉션 ★🔒 (7개)
+## 9장. Active Data Guard ① 실시간 조회와 DML 리다이렉션 ★🔒 (계획 7개 → 실제 8개)
 1. standby를 OPEN READ ONLY로 열고 MRP를 함께 돌리는 구성 — Real-Time Query 활성화
 2. 읽기 전용 상태에서 조회 수행과 primary 결과 대조 — 일관성 확인
 3. **읽기 전용 standby에서 DML을 시도해 오류 재현** (`ORA-16000`) → `ADG_REDIRECT_DML` 설정 후 성공 확인
@@ -87,21 +88,21 @@
 6. PL/SQL 리다이렉션 설정과 동작 확인
 7. **대안 경로(옵션 미보유)** — standby를 MOUNT로 두고 primary에서 `V$DATAGUARD_STATS`·`V$ARCHIVED_LOG`로 동기화를 확인하는 방법
 
-## 10장. Active Data Guard ② Far Sync와 Real-Time Cascading ★🔒 (5개)
+## 10장. Active Data Guard ② Far Sync와 Real-Time Cascading ★🔒 (계획 5개 → 실제 7개)
 1. Far Sync 인스턴스의 구조 이해 — 컨트롤 파일과 SRL만 있고 데이터 파일이 없음을 확인
 2. RMAN으로 far sync 인스턴스 생성
 3. SQL로 far sync 인스턴스 생성 (대안 절차)
 4. far sync를 경유한 zero data loss 구성 검증 — primary → far sync(SYNC) → standby(ASYNC) 경로 확인
 5. **대안 경로(옵션 미보유)** — Real-Time Cascading만으로 다단 구성하기. 캐스케이딩 standby 설정과 제약 확인
 
-## 11장. Snapshot Standby ★ (5개)
+## 11장. Snapshot Standby ★ (계획 5개 → 실제 7개)
 1. physical standby를 snapshot standby로 전환 — `CONVERT TO SNAPSHOT STANDBY`와 전제 조건(Flashback, FRA)
 2. snapshot 상태에서 갱신 작업 수행 — 테스트 데이터 적재와 DDL
 3. 전환 중에도 리두가 계속 수신되는 것 확인 — 수신은 되지만 적용되지 않음을 `V$ARCHIVED_LOG`로 확인
 4. physical standby로 복귀 — `CONVERT TO PHYSICAL STANDBY`, 갱신분이 사라지는 것 확인
 5. **FRA 공간 부족 상태에서 전환을 시도해 실패 재현** → 공간 확보 후 재시도. 복귀까지 마쳐 원상 복구
 
-## 12장. Logical Standby와 SQL Apply ★ (6개)
+## 12장. Logical Standby와 SQL Apply ★ (계획 6개 → 실제 7개)
 1. logical standby가 필요한 상황 판별 — physical과의 차이를 표로 정리
 2. 지원되지 않는 데이터 유형 사전 점검 — `DBA_LOGSTDBY_UNSUPPORTED` 조회
 3. physical standby로부터 logical standby 생성 절차 수행
@@ -109,7 +110,7 @@
 5. SQL Apply 필터링 — `DBMS_LOGSTDBY.SKIP`으로 특정 스키마·테이블 제외
 6. **지원되지 않는 유형의 테이블을 갱신해 SQL Apply가 멈추는 상황 재현** → `DBA_LOGSTDBY_EVENTS`로 원인 확인 → SKIP 등록 후 재기동
 
-## 13장. Data Guard Broker 개요와 구성 생성 ★ (6개)
+## 13장. Data Guard Broker 개요와 구성 생성 ★ (계획 6개 → 실제 7개)
 1. broker 활성화 — `DG_BROKER_START=TRUE`, 구성 파일 경로 지정과 파일 생성 확인
 2. DGMGRL 접속과 구성 생성 — `CREATE CONFIGURATION`, `ADD DATABASE`
 3. 구성 활성화 — `ENABLE CONFIGURATION`과 상태 확인
@@ -117,7 +118,7 @@
 5. 데이터베이스 속성 조회와 변경 — `EDIT DATABASE ... SET PROPERTY`
 6. broker 구성 파일 이중화와 손상 시 복구 절차
 
-## 14장. Broker 모니터링과 검증 명령 ★ (6개)
+## 14장. Broker 모니터링과 검증 명령 ★ (계획 6개 → 실제 9개)
 1. `SHOW CONFIGURATION` 판독 — 구성 상태와 각 DB의 역할·전송 지연
 2. `SHOW DATABASE VERBOSE` 판독 — 속성 목록과 상태 보고
 3. `VALIDATE DATABASE` 수행 — 역할 전환 준비 상태 점검 항목 해석
@@ -163,3 +164,26 @@
 ★(2노드 필요) 15개 챕터 / 🔒(ADG 옵션 필요) 2개 챕터 12개 실습 — 옵션이 필요한 실습에는 전부 대안 경로를 함께 싣는다.
 
 **1장 5개를 제외한 94개가 두 노드를 요구한다.** 챕터 목록 4-1절의 환경 선택지(A/B/C)가 정해지기 전에는 트랜스크립트 작성에 착수할 수 없다.
+
+---
+
+## 부록. 실제 산출 트랜스크립트 (2026-10-14 기준, 111개)
+
+계획 목록과 번호·제목이 다를 수 있다. 실측 중 주제를 나누거나 합친 결과이며, 내용의 기준은 아래 실제 파일이다.
+
+- **1장** (5개) — 01_현재구성파악 · 02_DataGuard프로세스식별 · 03_라이선스확인 · 04_Standby유형별상태확인 · 05_구성전점검표
+- **2장** (5개) — 01_보호모드확인 · 02_LOG_ARCHIVE_DEST속성해부 · 03_보호모드전환 · 04_모드별Primary동작 · 05_MODE와LEVEL어긋남
+- **3장** (6개) — 01_tnsnames구성과검증 · 02_listener정적등록 · 03_정적등록제거와복원 · 04_DG_CONFIG설정과누락 · 05_패스워드파일불일치 · 06_포트차단과해소
+- **4장** (6개) — 01_DBCA로CDB생성 · 02_ARCHIVELOG확인과전환 · 03_FORCE_LOGGING실증 · 04_SRL산정과생성 · 05_SRL없이실시간적용 · 06_19c_STANDBY_NOLOGGING
+- **5장** (7개) — 01_Primary파라미터확인 · 02_Standby초기pfile · 03_NOMOUNT기동과접속확인 · 04_DUPLICATE실행 · 05_실패재현과진단 · 06_결과검증과ADG전환 · 07_DBMS_DBCOMP블록비교
+- **6장** (7개) — 01_OMF파라미터와기준상태 · 02_없는디렉터리실패재현 · 03_파라미터누락실패재현 · 04_OMF_DUPLICATE실행 · 05_OMF구조해부 · 06_컨트롤파일교정 · 07_두방식비교와ADG검증
+- **7장** (7개) — 01_적용프로세스관찰 · 02_적용제어와오류 · 03_BAD_PARAM진단과교정 · 04_실시간적용판별 · 05_갭만들기와해소 · 06_지연읽기 · 07_SRL과적용
+- **8장** (7개) — 01_자동반영확인 · 02_파일추가와크기변경 · 03_MANUAL과UNNAMED파일 · 04_UNNAMED파일복구 · 05_PDB추가와삭제 · 06_반영되지않는것 · 07_사고분석_CURRENT리두삭제
+- **9장** (8개) — 01_ADG상태확인 · 02_읽기일관성검증 · 03_되는것과안되는것 · 04_DML리다이렉션 · 05_리다이렉션의제약 · 06_지연한도 · 07_지연히스토그램 · 08_옵션없는대안경로
+- **10장** (7개) — 01_FarSync노드준비 · 02_인스턴스기동과역할확인 · 03_SRL실체화 · 04_OracleNet구성 · 05_리두경로전환 · 06_보호모드상향 · 07_Cascading과원복
+- **11장** (7개) — 01_전제조건확인 · 02_전환실패와성공 · 03_복원지점읽기 · 04_열고쓰기 · 05_전환중의관찰 · 06_되돌리기 · 07_검증과정리
+- **12장** (7개) — 01_전제조건점검 · 02_LogMiner딕셔너리 · 03_전환 · 04_SQLApply기동과복제확인 · 05_골라서복제하기와조정 · 06_데이터베이스가드와SYS사고 · 07_되살리기와원복
+- **13장** (7개) — 01_전제조건점검 · 02_Broker켜기 · 03_구성만들기와ORA-16698 · 04_활성화와인수확인 · 05_상태제어와속성 · 06_SQL로바꾸면 · 07_재기동검증과스냅샷
+- **14장** (9개) — 01_VALIDATE읽기 · 02_SHOW와VALIDATE의차이 · 03_모니터링전용속성 · 04_지연과임계값 · 05_V뷰로교차확인 · 06_구성내보내기 · 07_FastStartFailover · 08_VALIDATE의나머지형태 · 09_Broker로그판독
+- **15장** (7개) — 01_로그파일과SRL · 02_아카이브목적지 · 03_전송중단재현과진단 · 04_적용의진행과APPLIED · 05_LOG_ARCHIVE_TRACE · 06_상시점검스크립트 · 07_LogicalStandby모니터링
+- **16장** (9개) — 01_전환사전점검 · 02_Switchover실행 · 03_전환후확인과되돌리기 · 04_전환거부재현 · 05_SQL전환사고와복구 · 06_플래시백준비 · 07_Failover와Reinstate · 08_관측자와FSFO실제발동 · 09_Standby백업활용
