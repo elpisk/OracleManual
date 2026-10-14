@@ -25,7 +25,7 @@
 --              버퍼 캐시가 식어 있으면 1~2분까지 걸린다)
 --
 -- 관찰 지표  : PF_ 객체 잔존 여부 · 확장 통계 수 · 히스토그램 목록
---              7개 표의 건수 · 활성 리소스 관리자 플랜
+--              PF_ 스케줄러 작업 · 7개 표의 건수 · 활성 리소스 관리자 플랜
 --
 -- 되돌리기   : 이 스크립트가 되돌리기 그 자체다.
 --
@@ -73,6 +73,11 @@ SELECT 'ADVISOR TASK' AS item, task_name AS found, '지운다' AS note
   FROM dba_advisor_tasks
  WHERE owner = 'SYS' AND SUBSTR(task_name, 1, 8) = 'PF_ADDM_'
  ORDER BY task_name;
+
+SELECT 'SCHEDULER JOB' AS item, job_name AS found, '지운다' AS note
+  FROM dba_scheduler_jobs
+ WHERE SUBSTR(job_name, 1, 3) = 'PF_'
+ ORDER BY job_name;
 
 
 PROMPT
@@ -140,6 +145,20 @@ BEGIN
         EXCEPTION WHEN OTHERS THEN
             v_failed := v_failed + 1;
             say('[실패] ADDM 작업 ' || r.task_name || ' : ' || SQLERRM);
+        END;
+    END LOOP;
+
+    -- (5) 스케줄러 작업 (카드 F 의 방해자). AUTO_DROP 이 켜져 있어도
+    --     60초가 지나기 전에 원복을 돌리면 아직 살아 있다. FORCE 로 끊는다.
+    FOR r IN (SELECT owner, job_name, state FROM dba_scheduler_jobs
+               WHERE SUBSTR(job_name, 1, 3) = 'PF_') LOOP
+        BEGIN
+            DBMS_SCHEDULER.DROP_JOB(r.owner || '.' || r.job_name, FORCE => TRUE);
+            v_dropped := v_dropped + 1;
+            say('[제거] 스케줄러 작업 ' || r.job_name || ' (상태 ' || r.state || ')');
+        EXCEPTION WHEN OTHERS THEN
+            v_failed := v_failed + 1;
+            say('[실패] 스케줄러 작업 ' || r.job_name || ' : ' || SQLERRM);
         END;
     END LOOP;
 
@@ -254,10 +273,10 @@ END;
 
 PROMPT
 PROMPT -- PF 가 만든 플랜·소비자 그룹 정의가 남아 있는지만 알려 준다 (지우지 않는다)
-SELECT 'PLAN' AS item, plan AS found, '수동확인 - 카드의 원복 절차를 따른다' AS note
+SELECT 'PLAN' AS item, plan AS found, '★ @PF_10_시나리오주입.sql H UNDO 로 지운다' AS note
   FROM dba_rsrc_plans WHERE SUBSTR(plan, 1, 3) = 'PF_'
 UNION ALL
-SELECT 'CONSUMER GROUP', consumer_group, '수동확인 - 카드의 원복 절차를 따른다'
+SELECT 'CONSUMER GROUP', consumer_group, '★ @PF_10_시나리오주입.sql H UNDO 로 지운다'
   FROM dba_rsrc_consumer_groups WHERE SUBSTR(consumer_group, 1, 3) = 'PF_';
 
 
