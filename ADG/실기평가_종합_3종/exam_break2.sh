@@ -2,7 +2,7 @@
 #===============================================================================
 # exam_break2.sh — 시나리오 2 [최상] 전환 · 재해 · 재구축 — 장애 주입
 #
-#   사용법 :  ./exam_break2.sh 1|2|3
+#   사용법 :  sudo -u examadm /home/examadm/exam/exam_break2.sh 1|2|3
 #
 #     1 : 계획 전환(boston 으로) 전에 숨은 장애물 두 개
 #         → Broker 전송 차단 + boston 정적 등록 오타 (14장 · 16장)
@@ -23,7 +23,7 @@ case "$STEP" in
   need_ok chicago chicago
   echo "=== [2-1] 지난주 점검 작업의 흔적 (기록은 남지 않았다) ==="
   dg chicago "edit database 'boston' set property 'LogShipping'='OFF';" >/dev/null
-  bo_ssh "$BO_ENV; sed -i 's/boston_DGMGRL/boston_DGMRGL/' \$ORACLE_HOME/network/admin/listener.ora && lsnrctl reload >/dev/null" \
+  bo_ssh "$ENV_BO; sed -i 's/boston_DGMGRL/boston_DGMRGL/' \$ORACLE_HOME/network/admin/listener.ora && lsnrctl reload >/dev/null" \
     && echo "  (작업 완료)"
   mark 'S2-1a' '전환 계획 공지 직전 입력'
   echo
@@ -53,7 +53,7 @@ case "$STEP" in
   echo "  boston SHUTDOWN ABORT"
   echo
   echo "Primary(boston)가 내려갔다. 업무를 가장 빨리, 그리고 정확한 손실 보고와 함께 재개하라."
-  echo "업무팀의 입력 기록은 $EX/business.log 에 있다."
+  echo "업무팀의 입력 기록은 $PUB/business.log 에 있다."
   ;;
 
 3)

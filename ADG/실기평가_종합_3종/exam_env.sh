@@ -2,54 +2,60 @@
 #===============================================================================
 # exam_env.sh — ADG 종합 실기평가 공통 함수 (직접 실행하지 않는다)
 #
-#   모든 스크립트는 chicago-srv 의 oracle 계정에서 실행한다.
-#   boston-srv 의 OS 작업은 oracle 계정 SSH(암호 없는 키)로 한다.
-#   데이터베이스 접속은 SYS 비밀번호로 TNS(chicago / boston)를 거친다.
+#   모든 스크립트는 chicago-srv 의 감독관 계정 examadm 으로 돈다.
+#   응시자(oracle)는 sudo -u examadm 으로 장애 주입 스크립트를 실행만 할 수 있고,
+#   /home/examadm 은 700 이라 스크립트 내용과 감독관 기록을 읽지 못한다.
+#   데이터베이스·OS 작업은 모두 oracle 계정 SSH(암호 없는 키)로 양쪽 서버에서 한다.
 #
-#   바꿀 수 있는 값 (환경변수)
-#     EXAM_SYS_PW      SYS 비밀번호 (필수)
-#     EXAM_DIR         스크립트·기록 디렉터리   기본 /home/oracle/exam
-#     EXAM_BOSTON_HOST Standby 호스트           기본 boston-srv
+#   설정 파일 $EX/exam.conf (examadm 만 읽는다, 600)
+#     EXAM_SYS_PW=<SYS 비밀번호>      (필수)
+#     ORACLE_HOME=...                 기본 /u01/app/oracle/product/19.3.0/dbhome_1
+#     CHICAGO_HOST=...                기본 chicago-srv
+#     BOSTON_HOST=...                 기본 boston-srv
 #===============================================================================
-export ORACLE_HOME=${ORACLE_HOME:-/u01/app/oracle/product/19.3.0/dbhome_1}
-export PATH=$ORACLE_HOME/bin:$PATH
-EX=${EXAM_DIR:-/home/oracle/exam}
-BOSTON_HOST=${EXAM_BOSTON_HOST:-boston-srv}
+EX=${EXAM_DIR:-/home/examadm/exam}   # 스크립트·감독관 기록 (examadm 전용). sudo 가 환경을 지우므로 응시자는 바꿀 수 없다
+PUB=${EXAM_PUB:-/exam/pub}           # 응시자가 읽는 기록 (business.log, baseline.txt, ticket_*)
+if [ "$(id -un)" != "examadm" ]; then
+  echo "중단: examadm 계정으로 실행해야 한다 (응시자는 sudo -u examadm <스크립트>)." ; exit 1
+fi
+[ -r "$EX/exam.conf" ] && . "$EX/exam.conf"
+OH=${ORACLE_HOME:-/u01/app/oracle/product/19.3.0/dbhome_1}
+CHICAGO_HOST=${CHICAGO_HOST:-chicago-srv}
+BOSTON_HOST=${BOSTON_HOST:-boston-srv}
 if [ -z "${EXAM_SYS_PW:-}" ]; then
-  echo "중단: EXAM_SYS_PW (SYS 비밀번호) 를 export 한 뒤 실행할 것." ; exit 1
+  echo "중단: $EX/exam.conf 에 EXAM_SYS_PW 가 없다 (운영가이드 1-4)." ; exit 1
 fi
 PW=$EXAM_SYS_PW
-mkdir -p "$EX"
+umask 022
+mkdir -p "$EX/state" "$EX/proctor" || exit 1
+[ -d "$PUB" ] && [ -w "$PUB" ] || { echo "중단: $PUB 가 없거나 쓸 수 없다 (운영가이드 1-3)." ; exit 1; }
 
-# q <db> "<sql>"   값만 돌려준다 (머리글·피드백 없음)
+ENV_CH="export ORACLE_HOME=$OH ORACLE_SID=chicago PATH=$OH/bin:\$PATH"
+ENV_BO="export ORACLE_HOME=$OH ORACLE_SID=boston PATH=$OH/bin:\$PATH"
+SSHOPT="-o BatchMode=yes -o ConnectTimeout=5"
+ch_ssh() { ssh $SSHOPT oracle@"${CHICAGO_HOST}" "$@"; }
+bo_ssh() { ssh $SSHOPT oracle@"${BOSTON_HOST}" "$@"; }
+
+# q <db> "<sql>"   chicago-srv 의 oracle 로 TNS 접속, 값만 돌려준다 (머리글·피드백 없음)
 q() {
-  sqlplus -s -L "sys/${PW}@$1 as sysdba" <<EOS
+  ch_ssh "$ENV_CH; sqlplus -s -L 'sys/${PW}@$1 as sysdba'" <<EOS
 set head off feed off pages 0 lines 300 trimspool on verify off
 whenever sqlerror continue
 $2
 exit
 EOS
 }
-# run <db> "<sql>"  출력을 그대로 보여 준다
-run() {
-  sqlplus -s -L "sys/${PW}@$1 as sysdba" <<EOS
-set feed on lines 200 pages 100 trimspool on
-$2
-exit
-EOS
-}
-dg()     { dgmgrl -silent "sys/${PW}@$1" "$2"; }
-bo_ssh() { ssh -o BatchMode=yes -o ConnectTimeout=5 oracle@"${BOSTON_HOST}" "$@"; }
+# dg <db> "<명령>"  DGMGRL 한 줄 (명령 안에는 작은따옴표만 쓴다)
+dg() { ch_ssh "$ENV_CH; dgmgrl -silent 'sys/${PW}@$1' \"$2\""; }
 # bo_sql "<sql>"  boston 에서 OS 인증으로 (인스턴스가 내려가 있어도 쓸 수 있다)
-BO_ENV='export ORACLE_HOME=/u01/app/oracle/product/19.3.0/dbhome_1 ORACLE_SID=boston; export PATH=$ORACLE_HOME/bin:$PATH'
-bo_sql() { bo_ssh "$BO_ENV; sqlplus -s / as sysdba" <<EOS
+bo_sql() { bo_ssh "$ENV_BO; sqlplus -s / as sysdba" <<EOS
 set feed on lines 200 pages 100
 $1
 exit
 EOS
 }
-# ch_sql "<sql>"  chicago 에서 OS 인증으로 (스크립트가 chicago-srv 에서 돈다)
-ch_sql() { ORACLE_SID=chicago sqlplus -s / as sysdba <<EOS
+# ch_sql "<sql>"  chicago 에서 OS 인증으로
+ch_sql() { ch_ssh "$ENV_CH; sqlplus -s / as sysdba" <<EOS
 set feed on lines 200 pages 100
 $1
 exit
@@ -69,7 +75,7 @@ mark() {
   q "$p" "insert into system.exam_log(step,memo,reg_time,scn)
           select '$1','$2',sysdate,current_scn from v\$database;
           commit;" >/dev/null
-  echo "$(date '+%F %T')  $1  $2  (on $p)" >> "$EX/business.log"
+  echo "$(date '+%F %T')  $1  $2  (on $p)" >> "$PUB/business.log"
   echo "  [업무] $(date '+%T')  $1  $2"
 }
 

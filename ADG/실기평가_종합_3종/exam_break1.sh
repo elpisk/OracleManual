@@ -2,7 +2,7 @@
 #===============================================================================
 # exam_break1.sh — 시나리오 1 [최상] 멈춘 Standby 되살리기 — 장애 주입
 #
-#   사용법 :  ./exam_break1.sh 1|2|3
+#   사용법 :  sudo -u examadm /home/examadm/exam/exam_break1.sh 1|2|3
 #
 #     1 : Standby 의 파일 관리가 MANUAL 로 바뀐 채 Primary 에 테이블스페이스 추가
 #         → UNNAMED 파일, Redo Apply 정지 (8장 · 13장)
@@ -43,7 +43,7 @@ commit;" >/dev/null
 2)
   need_ok chicago chicago
   echo "=== [1-2] 운영자가 boston 의 비밀번호 파일을 '정리' 했다 ==="
-  bo_ssh "$BO_ENV; cd \$ORACLE_HOME/dbs && orapwd file=orapwboston password='Exam#Wrong1' format=12.2 force=y" \
+  bo_ssh "$ENV_BO; cd \$ORACLE_HOME/dbs && orapwd file=orapwboston password='Exam#Wrong1' format=12.2 force=y" \
     && echo "  orapwboston 이 다른 비밀번호로 다시 만들어졌다"
   echo "=== 정기 점검으로 boston 인스턴스를 재기동했다 ==="
   bo_sql "shutdown immediate
@@ -77,9 +77,9 @@ startup" >/dev/null
   for s in $N0 $((N0+1)); do
     F=$(q chicago "select name from v\$archived_log where dest_id=1 and thread#=1 and sequence#=$s
                    and resetlogs_change#=(select resetlogs_change# from v\$database) and rownum=1;" | tr -d '[:space:]')
-    [ -n "$F" ] && rm -f "$F" && echo "  삭제: $F"
+    [ -n "$F" ] && ch_ssh "rm -f '$F'" && echo "  삭제: $F"
   done
-  echo "$N0 $((N0+1))" > "$EX/.s13_deleted"          # 감독자 확인용 (채점 시 대조)
+  echo "$N0 $((N0+1))" > "$EX/state/s13_deleted"     # 감독관 확인용 (채점 시 대조)
   echo "  온라인 리두에 남아 있는지 :"
   q chicago "select '    group '||group#||' seq '||sequence#||' '||status from v\$log order by group#;"
   echo "=== boston 호스트 복구 — 인스턴스를 다시 올린다 ==="

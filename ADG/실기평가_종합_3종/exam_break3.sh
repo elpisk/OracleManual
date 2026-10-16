@@ -2,7 +2,7 @@
 #===============================================================================
 # exam_break3.sh — 시나리오 3 [상] Active Data Guard 운영 지원 — 장애 주입
 #
-#   사용법 :  ./exam_break3.sh 1|2|3
+#   사용법 :  sudo -u examadm /home/examadm/exam/exam_break3.sh 1|2|3
 #
 #     1 : 리포트팀 문의 — 방금 넣은 주문이 Standby 에 안 보이고 ORA-03172
 #         → Broker DelayMins (9장 · 14장)
@@ -23,25 +23,25 @@ case "$STEP" in
   sleep 5
   mark 'S3-1a' '주문 접수 — 리포트에 나와야 한다'
   switch_n 1
-  cat > "$EX/ticket_S3-1.txt" <<TXT
+  cat > "$PUB/ticket_S3-1.txt" <<TXT
 [리포트팀 문의 $(date '+%F %T')]
 방금 접수된 주문(exam_log 의 S3-1a)이 boston 리포트 화면에 나오지 않습니다.
 리포트 세션은 신선도 보장을 위해 접속 직후
   ALTER SESSION SET STANDBY_MAX_DATA_DELAY=60;
 을 실행하는데, 오늘 오후부터 조회할 때마다 오류가 납니다. 리포트 계정은 SYSTEM 입니다.
 TXT
-  echo "  리포트팀 문의가 $EX/ticket_S3-1.txt 로 도착했다."
-  cat "$EX/ticket_S3-1.txt"
+  echo "  리포트팀 문의가 $PUB/ticket_S3-1.txt 로 도착했다."
+  cat "$PUB/ticket_S3-1.txt"
   ;;
 
 2)
   need_ok chicago chicago
-  bo_ssh "$BO_ENV; lsnrctl stop >/dev/null" && echo "=== [3-2] (아무도 모르게) boston 리스너가 내려갔다 ==="
+  bo_ssh "$ENV_BO; lsnrctl stop >/dev/null" && echo "=== [3-2] (아무도 모르게) boston 리스너가 내려갔다 ==="
   mark 'S3-2a' '야간 배치 1'
   switch_n 2
   mark 'S3-2b' '야간 배치 2'
   echo "  60초 기다린다 ..."; sleep 60
-  echo "[야간 점검표 $(date '+%T')] 상태: 경고 — 원인 미상" | tee "$EX/ticket_S3-2.txt"
+  echo "[야간 점검표 $(date '+%T')] 상태: 경고 — 원인 미상" | tee "$PUB/ticket_S3-2.txt"
   echo
   echo "점검표가 경고를 냈다. 원인을 층별로 좁혀 고치고, 보호가 없던 구간을 보고하라."
   ;;
