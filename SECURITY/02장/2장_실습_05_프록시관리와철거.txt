@@ -1,0 +1,235 @@
+================================================================================
+ 제2장 실습 05 — 프록시 관리와 철거
+ 대상    : oel7v9 orcl
+ 목표    : DBA_PROXIES·PROXY_USERS·V$SESSION_CONNECT_INFO 로 프록시 관계와 세션을 점검하고,
+          프록시 계정 잠금과 REVOKE 의 효과를 확인한 뒤 이 장의 객체를 모두 철거한다
+ 소요    : 약 20분
+ 변경    : 이 장에서 만든 사용자·역할·감사 정책 전부 철거
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 현재 프록시 관계
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL proxy FOR a10
+SYS@orcl> COL client FOR a10
+SYS@orcl> COL role FOR a10
+SYS@orcl> SELECT proxy, client, authentication, authorization_constraint, role FROM dba_proxies WHERE proxy = 'PRX_APP' ORDER BY client;
+
+PROXY      CLIENT     AUT AUTHORIZATION_CONSTRAINT            ROLE
+---------- ---------- --- ----------------------------------- ----------
+PRX_APP    PRX_USER1  NO  PROXY MAY ACTIVATE ALL CLIENT ROLES
+PRX_APP    PRX_USER2  NO  NO CLIENT ROLES MAY BE ACTIVATED
+PRX_APP    PRX_USER3  NO  PROXY MAY ACTIVATE ALL CLIENT ROLES
+
+3 rows selected.
+
+SYS@orcl> COL flags FOR a28
+SYS@orcl> SELECT proxy, client, authentication, flags FROM proxy_users WHERE proxy = 'PRX_APP' ORDER BY client;
+
+PROXY      CLIENT     AUT FLAGS
+---------- ---------- --- ----------------------------
+PRX_APP    PRX_USER1  NO  PROXY MAY ACTIVATE ALL CLIEN
+                          T ROLES
+
+PRX_APP    PRX_USER2  NO  NO CLIENT ROLES MAY BE ACTIV
+                          ATED
+
+PRX_APP    PRX_USER3  NO  PROXY MAY ACTIVATE ALL CLIEN
+                          T ROLES
+
+
+3 rows selected.
+
+-- ★ DBA_PROXIES 는 역할 제한까지(ROLE 열) 보여 준다. PROXY_USERS 는 같은 관계를 FLAGS 로 요약한다.
+--    prx_user3 은 03 에서 조건 없이 다시 GRANT 해 AUT=NO 다.
+
+--------------------------------------------------------------------------------
+ [2] 프록시 세션 식별
+--------------------------------------------------------------------------------
+
+-- 프록시 세션을 하나 띄워 둔 채 다른 세션에서 조회해야 하므로 셸에서 백그라운드 세션을 연다.
+
+[oracle@oel7v9 ~]$ echo 'EXEC DBMS_SESSION.SLEEP(20)' | sqlplus -s 'prx_app[prx_user1]/prx_app' > /dev/null &
+[oracle@oel7v9 ~]$ sleep 3
+[oracle@oel7v9 ~]$ echo "SELECT s.sid, s.username, i.authentication_type, i.osuser FROM v\$session s JOIN v\$session_connect_info i ON s.sid = i.sid WHERE s.username = 'PRX_USER1' AND ROWNUM = 1;" > /tmp/prx_q.sql
+[oracle@oel7v9 ~]$ sqlplus -s / as sysdba @/tmp/prx_q.sql < /dev/null
+
+       SID
+----------
+USERNAME
+--------------------------------------------------------------------------------
+AUTHENTICATION_TYPE
+--------------------------
+OSUSER
+--------------------------------------------------------------------------------
+       223
+PRX_USER1
+PROXY
+oracle
+
+
+[oracle@oel7v9 ~]$ rm -f /tmp/prx_q.sql
+[oracle@oel7v9 ~]$ wait
+
+-- ★ V$SESSION_CONNECT_INFO.AUTHENTICATION_TYPE 이 PROXY 로 나온다.
+--    V$SESSION.USERNAME 은 대상 사용자 PRX_USER1 이다. 운영 중 프록시 세션을 골라낼 때 이 열을 쓴다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — 프록시 계정 잠금
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> ALTER USER prx_app ACCOUNT LOCK;
+
+User altered.
+
+SYS@orcl> CONNECT prx_app[prx_user1]/prx_app
+ERROR:
+ORA-28000: The account is locked.
+
+
+Warning: You are no longer connected to ORACLE.
+SYS@orcl> CONNECT prx_user1/prx_user1
+Connected.
+PRX_USER1@orcl> SHOW USER
+USER is "PRX_USER1"
+PRX_USER1@orcl> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> ALTER USER prx_app ACCOUNT UNLOCK;
+
+User altered.
+
+-- ★ 프록시 계정이 잠기면 그 계정을 거치는 모든 대상 사용자 접속이 ORA-28000 으로 막힌다.
+--    prx_user1 의 직접 접속에는 영향이 없다. 애플리케이션 서버 계정 하나를 잠그면 그 서버만 차단된다.
+--    UNLOCK 으로 되돌렸다.
+
+--------------------------------------------------------------------------------
+ [4] REVOKE CONNECT THROUGH
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> ALTER USER prx_user1 REVOKE CONNECT THROUGH prx_app;
+
+User altered.
+
+SYS@orcl> CONNECT prx_app[prx_user1]/prx_app
+ERROR:
+ORA-01017: invalid username/password; logon denied
+
+
+Warning: You are no longer connected to ORACLE.
+SYS@orcl> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> SELECT proxy, client FROM dba_proxies WHERE proxy = 'PRX_APP' ORDER BY client;
+
+PROXY
+------------------------------------------------------------------------------------------------------------------------
+CLIENT
+------------------------------------------------------------------------------------------------------------------------
+PRX_APP
+PRX_USER2
+
+PRX_APP
+PRX_USER3
+
+
+2 rows selected.
+
+-- ★ 허용을 회수하면 다시 ORA-01017 이 난다. 원본 자료에서도 같은 오류가 나온다.
+--    DBA_PROXIES 에서 prx_user1 행이 사라졌다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — 원복 중 감사 정책 삭제
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> NOAUDIT POLICY prx_dml_pol;
+
+Noaudit succeeded.
+
+SYS@orcl> DROP AUDIT POLICY prx_dml_pol;
+DROP AUDIT POLICY prx_dml_pol
+*
+ERROR at line 1:
+ORA-46361: Audit policy cannot be dropped as it is currently enabled.
+
+
+SYS@orcl> COL policy_name FOR a12
+SYS@orcl> COL entity_name FOR a10
+SYS@orcl> SELECT policy_name, enabled_option, entity_name FROM audit_unified_enabled_policies WHERE policy_name = 'PRX_DML_POL';
+
+POLICY_NAME  ENABLED_OPTION  ENTITY_NAM
+------------ --------------- ----------
+PRX_DML_POL  BY USER         PRX_APP
+
+1 row selected.
+
+SYS@orcl> NOAUDIT POLICY prx_dml_pol BY prx_app;
+
+Noaudit succeeded.
+
+SYS@orcl> DROP AUDIT POLICY prx_dml_pol;
+
+Audit Policy dropped.
+
+SYS@orcl> DROP USER prx_user1 CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP USER prx_user2 CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP USER prx_user3 CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP USER prx_app CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP ROLE prx_role;
+
+Role dropped.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_users WHERE username LIKE 'PRX%';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_roles WHERE role = 'PRX_ROLE';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+SYS@orcl> SELECT COUNT(*) FROM audit_unified_policies WHERE policy_name = 'PRX_DML_POL';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+-- ★ NOAUDIT POLICY prx_dml_pol 만으로는 BY prx_app 으로 켠 상태가 풀리지 않아 DROP 이 ORA-46361 로 거부됐다.
+--    AUDIT_UNIFIED_ENABLED_POLICIES 에서 켜진 대상을 확인하고 NOAUDIT ... BY prx_app 으로 끈 뒤 삭제했다.
+--    사용자 0, 역할 0, 정책 0. 실습 전 상태와 같다. 감사 기록 자체는 감사 기록 관리(13장) 몫이라 남겨 둔다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - 점검: DBA_PROXIES(역할 제한 포함), PROXY_USERS, V$SESSION_CONNECT_INFO(AUTHENTICATION_TYPE=PROXY).
+-- - 프록시 계정 잠금은 그 계정을 거치는 모든 접속을 ORA-28000 으로 막는다.
+-- - BY 사용자로 켠 통합 감사 정책은 NOAUDIT ... BY 사용자로 꺼야 삭제할 수 있다(ORA-46361).

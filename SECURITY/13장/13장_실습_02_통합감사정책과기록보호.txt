@@ -1,0 +1,199 @@
+================================================================================
+ 제13장 실습 02 — 통합 감사 정책과 기록 보호
+ 대상    : oel7v9 orcl
+ 목표    : 통합 감사 정책을 만들고 켜서 기록을 확인하고, 켜진 정책 삭제와
+          감사 기록 테이블 직접 삭제가 어떻게 막히는지 확인한다
+ 소요    : 약 15분
+ 변경    : 정책 SEC13_EMP_POL 생성 후 삭제
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 정책 만들고 켜기
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> CREATE AUDIT POLICY sec13_emp_pol ACTIONS SELECT ON scott.emp, DELETE ON scott.emp;
+
+Audit policy created.
+
+SYS@orcl> AUDIT POLICY sec13_emp_pol BY scott;
+
+Audit succeeded.
+
+SYS@orcl> COL policy_name FOR a14
+SYS@orcl> COL entity_name FOR a8
+SYS@orcl> SELECT policy_name, entity_name, enabled_option FROM audit_unified_enabled_policies WHERE policy_name = 'SEC13_EMP_POL';
+
+POLICY_NAME    ENTITY_N ENABLED_OPTION
+-------------- -------- ---------------
+SEC13_EMP_POL  SCOTT    BY USER
+
+1 row selected.
+
+-- ★ SCOTT.EMP 에 대한 SELECT·DELETE 를 SCOTT 사용자에 한해 기록한다.
+
+--------------------------------------------------------------------------------
+ [2] SCOTT 의 작업
+--------------------------------------------------------------------------------
+
+-- 정책은 AUDIT POLICY 이후 새로 연결한 세션부터 적용된다. CONNECT 로 새 세션을 연다.
+
+SQL> CONNECT scott/tiger
+Connected.
+SCOTT@orcl> SELECT COUNT(*) FROM emp;
+
+  COUNT(*)
+----------
+        14
+
+1 row selected.
+
+SCOTT@orcl> DELETE FROM emp WHERE empno = 9999;
+
+0 rows deleted.
+
+SCOTT@orcl> ROLLBACK;
+
+Rollback complete.
+
+SCOTT@orcl> SELECT COUNT(*) FROM dept;
+
+  COUNT(*)
+----------
+         4
+
+1 row selected.
+
+-- ★ 0건 DELETE 와 ROLLBACK 도 실행됐다. DEPT 조회는 정책 대상이 아니다.
+
+--------------------------------------------------------------------------------
+ [3] 정책 기록 조회
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL ts FOR a19
+SYS@orcl> COL action_name FOR a8
+SYS@orcl> COL object_name FOR a6
+SYS@orcl> COL sql_text FOR a42
+SYS@orcl> SELECT TO_CHAR(event_timestamp, 'HH24:MI:SS') ts, action_name, object_name, return_code, sql_text
+  2    FROM unified_audit_trail
+  3   WHERE unified_audit_policies LIKE '%SEC13_EMP_POL%'
+  4   ORDER BY event_timestamp;
+
+TS                  ACTION_N OBJECT RETURN_CODE SQL_TEXT
+------------------- -------- ------ ----------- ------------------------------------------
+20:15:17            SELECT   EMP              0 SELECT COUNT(*) FROM emp
+20:15:17            DELETE   EMP              0 DELETE FROM emp WHERE empno = 9999
+
+2 rows selected.
+
+-- ★ EMP 에 대한 SELECT 와 DELETE 두 건이 SQL_TEXT 와 함께 기록됐다. DEPT 조회는 없다.
+--    지운 행이 0건이고 ROLLBACK 했어도 DELETE 문 실행 자체가 기록됐다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 켜진 정책 지우기
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> DROP AUDIT POLICY sec13_emp_pol;
+DROP AUDIT POLICY sec13_emp_pol
+*
+ERROR at line 1:
+ORA-46361: Audit policy cannot be dropped as it is currently enabled.
+
+
+SYS@orcl> NOAUDIT POLICY sec13_emp_pol BY scott;
+
+Noaudit succeeded.
+
+SYS@orcl> DROP AUDIT POLICY sec13_emp_pol;
+
+Audit Policy dropped.
+
+SYS@orcl> SELECT COUNT(*) FROM audit_unified_policies WHERE policy_name = 'SEC13_EMP_POL';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+-- ★ ORA-46361: 켜져 있는 정책은 DROP 할 수 없다. NOAUDIT 로 끈 뒤 DROP 하니 지워졌다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — 감사 기록 테이블 직접 지우기
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> DELETE FROM audsys.aud$unified WHERE ROWNUM = 1;
+DELETE FROM audsys.aud$unified WHERE ROWNUM = 1
+                   *
+ERROR at line 1:
+ORA-46385: DML and DDL operations are not allowed on table "AUDSYS"."AUD$UNIFIED".
+
+
+SYS@orcl> TRUNCATE TABLE audsys.aud$unified;
+TRUNCATE TABLE audsys.aud$unified
+                      *
+ERROR at line 1:
+ORA-46385: DML and DDL operations are not allowed on table "AUDSYS"."AUD$UNIFIED".
+
+
+SYS@orcl> COL action_name FOR a14
+SYS@orcl> COL object_name FOR a12
+SYS@orcl> SELECT TO_CHAR(event_timestamp, 'HH24:MI:SS') ts, action_name, object_schema, object_name, return_code
+  2    FROM unified_audit_trail
+  3   WHERE object_name = 'AUD$UNIFIED' AND event_timestamp > SYSTIMESTAMP - INTERVAL '5' MINUTE;
+
+TS       ACTION_NAME
+-------- --------------
+OBJECT_SCHEMA
+------------------------------------------------------------------------------------------------------------------------
+OBJECT_NAME  RETURN_CODE
+------------ -----------
+20:15:20 DELETE
+AUDSYS
+AUD$UNIFIED        46385
+
+20:15:20 TRUNCATE TABLE
+AUDSYS
+AUD$UNIFIED        46385
+
+
+2 rows selected.
+
+-- ★ SYS 라도 AUD$UNIFIED 에 DELETE·TRUNCATE 를 할 수 없다(ORA-46385).
+--    더 중요한 것은 그 시도 자체가 RETURN_CODE 46385 인 감사 기록으로 남았다는 점이다.
+--    감사 기록 정리는 DBMS_AUDIT_MGMT 로만 한다(실습 03).
+
+--------------------------------------------------------------------------------
+ [6] 감사 관리 역할 보유자
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL grantee FOR a22
+SYS@orcl> COL granted_role FOR a14
+SYS@orcl> SELECT grantee, granted_role FROM dba_role_privs WHERE granted_role IN ('AUDIT_ADMIN', 'AUDIT_VIEWER') ORDER BY 2, 1;
+
+GRANTEE                GRANTED_ROLE
+---------------------- --------------
+SYS                    AUDIT_ADMIN
+SYS                    AUDIT_VIEWER
+
+2 rows selected.
+
+-- ★ AUDIT_ADMIN, AUDIT_VIEWER 를 받은 것은 SYS 뿐이다. 감사 관리 계정을 따로 만들 때 이 역할을 준다.
+--    업무 DBA 에게 AUDIT_ADMIN 을 주면 자기 작업의 기록을 정리할 수 있게 된다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - CREATE AUDIT POLICY → AUDIT POLICY ... BY. 적용은 새 세션부터.
+-- - 켜진 정책 DROP 은 ORA-46361. NOAUDIT 후 DROP.
+-- - AUD$UNIFIED 직접 DML·DDL 은 ORA-46385 이고, 시도도 감사 기록으로 남는다.

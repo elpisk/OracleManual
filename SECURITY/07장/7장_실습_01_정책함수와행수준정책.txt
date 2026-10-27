@@ -1,0 +1,274 @@
+================================================================================
+ 제7장 실습 01 — 정책 함수와 행 수준 정책
+ 대상    : oel7v9 orcl (non-CDB, 19.3)
+ 목표    : 정책 관리자 계정을 따로 두고 SCOTT.EMP 에 SELECT 정책을 건다.
+          정책 함수가 돌려준 술어에 오류가 있을 때 어떤 오류가 나고 원인을 어디서 찾는지 확인한다
+ 소요    : 약 25분
+ 변경    : sysadmin_vpd 사용자 생성, SCOTT.EMP 에 정책 1개 (05 에서 철거)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 기준 상태
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> SELECT COUNT(*) FROM dba_policies WHERE object_owner = 'SCOTT';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+SYS@orcl> SELECT deptno, COUNT(*) FROM scott.emp GROUP BY deptno ORDER BY deptno;
+
+    DEPTNO   COUNT(*)
+---------- ----------
+        10          3
+        20          5
+        30          6
+
+3 rows selected.
+
+-- ★ SCOTT 스키마에 걸린 정책은 없다. EMP 는 10번 3명, 20번 5명, 30번 6명이다.
+--    이 분포가 뒤에서 정책이 걸렸는지 판단하는 기준이 된다.
+
+--------------------------------------------------------------------------------
+ [2] 정책 관리자 계정 만들기
+--------------------------------------------------------------------------------
+
+-- 정책 함수와 컨텍스트 패키지를 데이터 소유자(SCOTT)나 SYS 에 두지 않는다.
+-- 매뉴얼 튜토리얼과 같은 이름의 전용 계정 sysadmin_vpd 를 쓴다.
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> CREATE USER sysadmin_vpd IDENTIFIED BY oracle;
+
+User created.
+
+SYS@orcl> GRANT CREATE SESSION, CREATE PROCEDURE, CREATE ANY CONTEXT TO sysadmin_vpd;
+
+Grant succeeded.
+
+SYS@orcl> GRANT EXECUTE ON DBMS_RLS TO sysadmin_vpd;
+
+Grant succeeded.
+
+SYS@orcl> GRANT EXECUTE ON DBMS_SESSION TO sysadmin_vpd;
+
+Grant succeeded.
+
+-- ★ DBMS_RLS 실행 권한이 곧 정책을 걸고 뗄 수 있는 권한이다. 아무에게나 주지 않는다.
+--    CREATE ANY CONTEXT 는 02 에서 컨텍스트를 만들 때 쓴다.
+
+--------------------------------------------------------------------------------
+ [3] 정책 함수 작성과 정책 등록 (술어에 오타가 있다)
+--------------------------------------------------------------------------------
+
+-- 정책 함수는 (스키마, 객체) 두 인자를 받아 WHERE 절에 붙을 문자열을 돌려준다.
+-- 일부러 컬럼 이름을 dept_no 로 잘못 썼다. EMP 의 컬럼은 deptno 다.
+
+SQL> CONNECT sysadmin_vpd/oracle
+Connected.
+SYSADMIN_VPD@orcl> CREATE OR REPLACE FUNCTION rls_dept (
+  2    p_schema IN VARCHAR2,
+  3    p_object IN VARCHAR2)
+  4  RETURN VARCHAR2
+  5  AS
+  6    v_dept NUMBER;
+  7  BEGIN
+  8    v_dept := SYS_CONTEXT('HR_CONTEXT', 'DEPT');
+  9    IF v_dept IS NULL THEN
+ 10      RETURN '1=2';
+ 11    END IF;
+ 12    RETURN 'dept_no = ' || v_dept;
+ 13  END;
+ 14  /
+
+Function created.
+
+SYSADMIN_VPD@orcl> SHOW ERRORS
+No errors.
+SYSADMIN_VPD@orcl> BEGIN
+  2    DBMS_RLS.ADD_POLICY(
+  3      object_schema   => 'SCOTT',
+  4      object_name     => 'EMP',
+  5      policy_name     => 'EMP_DEPT_POLICY',
+  6      function_schema => 'SYSADMIN_VPD',
+  7      policy_function => 'RLS_DEPT',
+  8      statement_types => 'SELECT');
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+-- ★ 함수는 문자열을 만들 뿐이라 컴파일 오류가 없다. ADD_POLICY 도 술어를 검사하지 않고 성공한다.
+--    술어가 틀렸다는 사실은 SCOTT 가 EMP 를 조회하는 순간에야 드러난다.
+
+--------------------------------------------------------------------------------
+ [4] 컨텍스트가 비어 있을 때 SCOTT 의 조회
+--------------------------------------------------------------------------------
+
+SQL> CONNECT scott/tiger
+Connected.
+SCOTT@orcl> COL dept FOR a6
+SCOTT@orcl> SELECT SYS_CONTEXT('HR_CONTEXT', 'DEPT') AS dept FROM dual;
+
+DEPT
+------
+
+
+1 row selected.
+
+SCOTT@orcl> SELECT empno, ename, deptno FROM emp;
+
+no rows selected
+
+-- ★ HR_CONTEXT 는 아직 만들지도 않았다. SYS_CONTEXT 는 오류 없이 NULL 을 돌려준다.
+--    함수는 '1=2' 를 돌려주고, 오타가 있는 deptno 분기는 타지 않는다. 그래서 오류 없이 0건이다.
+--    값이 없으면 아무것도 보여 주지 않는 쪽으로 닫아 두는 것이 정책 함수의 기본 설계다.
+
+--------------------------------------------------------------------------------
+ [5] SYS 로 같은 테이블을 보면
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> SELECT COUNT(*) FROM scott.emp;
+
+  COUNT(*)
+----------
+        14
+
+1 row selected.
+
+-- ★ SYS 로 접속한 세션에는 VPD 정책이 적용되지 않는다. 14건 모두 보인다.
+--    정책을 시험할 때 SYS 로 확인하면 정책이 안 걸린 것처럼 보이는 함정이 여기서 생긴다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — 오타 난 술어가 실제로 붙으면
+--------------------------------------------------------------------------------
+
+-- 같은 오타를 항상 돌려주는 시험용 함수로 두 번째 정책을 붙인다.
+-- 한 객체에 정책이 여러 개면 술어가 AND 로 모두 붙는다.
+
+SQL> CONNECT sysadmin_vpd/oracle
+Connected.
+SYSADMIN_VPD@orcl> CREATE OR REPLACE FUNCTION rls_dept_test (
+  2    p_schema IN VARCHAR2,
+  3    p_object IN VARCHAR2)
+  4  RETURN VARCHAR2
+  5  AS
+  6  BEGIN
+  7    RETURN 'dept_no = 20';
+  8  END;
+  9  /
+
+Function created.
+
+SYSADMIN_VPD@orcl> BEGIN
+  2    DBMS_RLS.ADD_POLICY(
+  3      object_schema   => 'SCOTT',
+  4      object_name     => 'EMP',
+  5      policy_name     => 'EMP_TEST_POLICY',
+  6      function_schema => 'SYSADMIN_VPD',
+  7      policy_function => 'RLS_DEPT_TEST',
+  8      statement_types => 'SELECT');
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+SYSADMIN_VPD@orcl> CONNECT scott/tiger
+Connected.
+SCOTT@orcl> SELECT empno, ename, deptno FROM emp;
+SELECT empno, ename, deptno FROM emp
+                                 *
+ERROR at line 1:
+ORA-28113: policy predicate has error
+
+-- ★ ORA-28113: policy predicate has error.
+--    메시지만으로는 어느 정책의 어떤 술어가 틀렸는지 알 수 없다. 서버 트레이스 파일을 본다.
+
+--------------------------------------------------------------------------------
+ [7] 원인 확인 — 세션 트레이스 파일
+--------------------------------------------------------------------------------
+
+[oracle@oel7v9 ~]$ grep -l 'dept_no' $(ls -t $ORACLE_BASE/diag/rdbms/orcl/orcl/trace/orcl_ora_*.trc | head -5) \
+      | head -1 | xargs -r grep -A3 -i 'policy\|predicate' | head -12
+VPD Policy name    : EMP_TEST_POLICY
+Policy function: SYSADMIN_VPD.RLS_DEPT_TEST
+RLS view  :
+SELECT  "EMPNO","ENAME","JOB","MGR","HIREDATE","SAL","COMM","DEPTNO" FROM "SCOTT"."EMP"   "EMP" WHERE (dept_no = 20) 
+ORA-00904: "DEPT_NO": invalid identifier
+--
+Parent policy predicate:
+Table/View     : SCOTT.EMP
+VPD Policy name    : EMP_DEPT_POLICY
+Policy function: SYSADMIN_VPD.RLS_DEPT
+RLS predicate  :
+1=2
+
+-- ★ 트레이스에 정책 이름, 정책 함수, 술어가 붙은 최종 문장과 ORA-00904 가 남는다.
+--    두 정책의 술어 (dept_no = 20) 와 1=2 가 함께 붙었다는 것도 보인다.
+
+--------------------------------------------------------------------------------
+ [8] 조치 — 시험용 정책 제거, 함수 수정
+--------------------------------------------------------------------------------
+
+SQL> CONNECT sysadmin_vpd/oracle
+Connected.
+SYSADMIN_VPD@orcl> BEGIN
+  2    DBMS_RLS.DROP_POLICY('SCOTT', 'EMP', 'EMP_TEST_POLICY');
+  3  END;
+  4  /
+
+PL/SQL procedure successfully completed.
+
+SYSADMIN_VPD@orcl> DROP FUNCTION rls_dept_test;
+
+Function dropped.
+
+SYSADMIN_VPD@orcl> CREATE OR REPLACE FUNCTION rls_dept (
+  2    p_schema IN VARCHAR2,
+  3    p_object IN VARCHAR2)
+  4  RETURN VARCHAR2
+  5  AS
+  6    v_dept NUMBER;
+  7  BEGIN
+  8    v_dept := SYS_CONTEXT('HR_CONTEXT', 'DEPT');
+  9    IF v_dept IS NULL THEN
+ 10      RETURN '1=2';
+ 11    END IF;
+ 12    RETURN 'deptno = ' || v_dept;
+ 13  END;
+ 14  /
+
+Function created.
+
+SYSADMIN_VPD@orcl> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL object_name FOR a10
+SYS@orcl> COL policy_name FOR a16
+SYS@orcl> COL function FOR a10
+SYS@orcl> SELECT object_name, policy_name, function, sel, ins, upd, del, enable
+  2    FROM dba_policies WHERE object_owner = 'SCOTT';
+
+OBJECT_NAM POLICY_NAME      FUNCTION   SEL INS UPD DEL ENA
+---------- ---------------- ---------- --- --- --- --- ---
+EMP        EMP_DEPT_POLICY  RLS_DEPT   YES NO  NO  NO  YES
+
+1 row selected.
+
+-- ★ 정책 함수만 고치면 정책은 다시 등록할 필요가 없다. 정책은 함수 이름을 참조할 뿐이다.
+--    SEL=YES 만 켜져 있다. statement_types 에 'SELECT' 만 줬기 때문이다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - 정책 = (대상 객체, 정책 함수, 적용 문장 유형). 함수가 돌려준 문자열이 WHERE 절에 붙는다.
+-- - 술어 오류는 등록 시점이 아니라 조회 시점에 ORA-28113 으로 드러나고, 원인은 트레이스에 남는다.
+-- - SYS 세션은 정책을 우회한다. 정책 검증은 실제 업무 계정으로 한다.
+-- - 정책 EMP_DEPT_POLICY 와 sysadmin_vpd 는 02~04 에서 계속 쓴다.

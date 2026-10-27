@@ -1,0 +1,186 @@
+================================================================================
+ 제4장 실습 05 — 점검과 원복
+ 대상    : oel7v9 orcl
+ 목표    : 주체·호스트·포트·권한을 한 번에 보는 점검 조회를 만들고,
+          잘못된 제거 시도의 오류를 확인한 뒤 이 장에서 만든 것을 모두 철거한다
+ 소요    : 약 15분
+ 변경    : 이 장에서 만든 ACE·ACL·사용자·역할·HTTP 서버 전부 철거
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 한눈에 보는 점검 조회
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL host FOR a14
+SYS@orcl> COL principal FOR a12
+SYS@orcl> COL privilege FOR a9
+SYS@orcl> COL ports FOR a11
+SYS@orcl> COL grant_type FOR a5
+SYS@orcl> SELECT host, NVL(TO_CHAR(lower_port), '-') || '~' || NVL(TO_CHAR(upper_port), '-') AS ports,
+  2         principal, privilege, grant_type
+  3    FROM dba_host_aces
+  4   WHERE principal LIKE 'ACL%'
+  5   ORDER BY principal, host;
+
+HOST           PORTS       PRINCIPAL    PRIVILEGE GRANT
+-------------- ----------- ------------ --------- -----
+172.16.225.50  8090~8090   ACL_U1       CONNECT   GRANT
+172.16.225.50  8090~8090   ACL_U1       HTTP      GRANT
+oel7v9         -~-         ACL_U1       RESOLVE   GRANT
+172.16.225.*   -~-         ACL_U2       HTTP      GRANT
+oel7v9         8090~8090   ACL_U3       CONNECT   GRANT
+172.16.225.50  8090~8090   ACL_WEB_ROLE HTTP      GRANT
+
+6 rows selected.
+
+-- ★ 실습 계정에 걸린 ACE 6개가 주체별로 정리된다. 운영에서는 WHERE 절만 빼고 정기 점검에 쓴다.
+--    ACL_WEB_ROLE 처럼 역할 이름도 주체로 나온다. 그 역할을 누가 가졌는지는 DBA_ROLE_PRIVS 로 이어서 본다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 없는 항목 제거
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> BEGIN
+  2    DBMS_NETWORK_ACL_ADMIN.REMOVE_HOST_ACE(
+  3      host => 'no-such-host',
+  4      ace  => xs$ace_type(privilege_list => xs$name_list('http'),
+  5                          principal_name => 'ACL_U1',
+  6                          principal_type => xs_acl.ptype_db));
+  7  END;
+  8  /
+BEGIN
+*
+ERROR at line 1:
+ORA-01927: cannot REVOKE privileges you did not grant
+ORA-06512: at "SYS.DBMS_NETWORK_ACL_ADMIN", line 1222
+ORA-06512: at line 2
+
+
+SYS@orcl> BEGIN
+  2    DBMS_NETWORK_ACL_ADMIN.DROP_ACL('acl_legasy.xml');
+  3  END;
+  4  /
+BEGIN
+*
+ERROR at line 1:
+ORA-46114: ACL name /sys/acls/acl_legasy.xml not found.
+ORA-06512: at "SYS.DBMS_NETWORK_ACL_ADMIN", line 752
+ORA-06512: at "SYS.DBMS_SYS_ERROR", line 86
+ORA-06512: at "SYS.DBMS_NETWORK_ACL_ADMIN", line 268
+ORA-06512: at "SYS.DBMS_NETWORK_ACL_ADMIN", line 731
+ORA-06512: at line 2
+
+-- ★ 등록하지 않은 호스트의 ACE 를 지우려 하면 ORA-01927: cannot REVOKE privileges you did not grant.
+--    구버전 DROP_ACL 에 오타 난 이름을 주면 ORA-46114: ACL name ... not found.
+--    제거 전에는 DBA_HOST_ACES 에서 호스트·포트·권한·GRANT/DENY 를 그대로 옮겨 쓴다.
+
+--------------------------------------------------------------------------------
+ [3] 조치 — 철거
+--------------------------------------------------------------------------------
+
+-- 구버전 ACL 은 DROP_ACL 로 먼저 지우고, 남은 ACE 는 DBA_HOST_ACES 를 읽어 그대로 REMOVE_HOST_ACE 한다.
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> EXEC DBMS_NETWORK_ACL_ADMIN.DROP_ACL('acl_legacy.xml')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> BEGIN
+  2    FOR r IN (SELECT host, lower_port, upper_port, principal, privilege, grant_type
+  3                FROM dba_host_aces WHERE principal LIKE 'ACL%') LOOP
+  4      DBMS_NETWORK_ACL_ADMIN.REMOVE_HOST_ACE(
+  5        host             => r.host,
+  6        lower_port       => r.lower_port,
+  7        upper_port       => r.upper_port,
+  8        ace              => xs$ace_type(privilege_list => xs$name_list(r.privilege),
+  9                                        principal_name => r.principal,
+ 10                                        principal_type => xs_acl.ptype_db,
+ 11                                        granted        => (r.grant_type = 'GRANT')),
+ 12        remove_empty_acl => TRUE);
+ 13    END LOOP;
+ 14  END;
+ 15  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> DROP USER acl_u1 CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP USER acl_u2 CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP USER acl_u3 CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP ROLE acl_web_role;
+
+Role dropped.
+
+-- ★ remove_empty_acl => TRUE 라 ACE 가 빠진 ACL 도 함께 지워진다. 사용자·역할도 삭제했다.
+
+--------------------------------------------------------------------------------
+ [4] 시험용 HTTP 서버 종료 (root)
+--------------------------------------------------------------------------------
+
+[root@oel7v9 ~]# pkill -f 'SimpleHTTPServer 8090'
+[root@oel7v9 ~]# rm -rf /tmp/acl_www /tmp/acl_http.log
+[root@oel7v9 ~]# ss -ltn | grep -c 8090
+0
+
+-- ★ 8090 포트를 쓰는 프로세스가 없다.
+
+--------------------------------------------------------------------------------
+ [5] 재확인 — 원복
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL host FOR a12
+SYS@orcl> COL principal FOR a18
+SYS@orcl> COL privilege FOR a9
+SYS@orcl> SELECT host, ace_order, principal, privilege FROM dba_host_aces ORDER BY host, ace_order;
+
+HOST          ACE_ORDER PRINCIPAL          PRIVILEGE
+------------ ---------- ------------------ ---------
+*                     1 GSMADMIN_INTERNAL  RESOLVE
+*                     2 GGSYS              RESOLVE
+localhost             1 ORACLE_OCM         RESOLVE
+
+3 rows selected.
+
+SYS@orcl> COL acl FOR a48
+SYS@orcl> SELECT host, acl FROM dba_host_acls ORDER BY host;
+
+HOST         ACL
+------------ ------------------------------------------------
+*            NETWORK_ACL_86B64B66DF95012EE053F706E80A06B7
+localhost    /sys/acls/oracle-sysman-ocm-Resolve-Access.xml
+
+2 rows selected.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_users WHERE username LIKE 'ACL%';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+-- ★ ACE 3개(*: GSMADMIN_INTERNAL·GGSYS, localhost: ORACLE_OCM), ACL 2개. 실습 전과 같다.
+--    이 세 ACE 는 설치 때부터 있던 것이니 지우지 않는다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - 점검: DBA_HOST_ACES(주체·권한·포트·GRANT/DENY), DBA_HOST_ACLS(호스트별 ACL), USER_HOST_ACES(본인 판정).
+-- - 제거는 추가할 때와 같은 호스트·포트·권한·granted 로 한다(아니면 ORA-01927).
+-- - 설치 시 생성된 시스템 ACE 는 건드리지 않는다.

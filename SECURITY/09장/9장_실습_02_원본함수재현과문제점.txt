@@ -1,0 +1,193 @@
+================================================================================
+ 제9장 실습 02 — 원본 함수 재현과 문제점
+ 대상    : oel7v9 orcl
+ 목표    : 과정 원본 자료의 encrypt_value/decrypt_value 함수(DES3, VARCHAR2 저장, 소스 내 고정 키)를
+          그대로 만들어 동작은 하지만 어떤 위험이 있는지 확인한다
+ 소요    : 약 25분
+ 변경    : cr_owner.cr_emp 테이블(HR.EMPLOYEES 복사본), 함수 2개
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 오류 재현 — 실습 테이블 만들기
+--------------------------------------------------------------------------------
+
+SQL> CONNECT cr_owner/oracle
+Connected.
+CR_OWNER@orcl> CREATE TABLE cr_emp AS
+  2    SELECT employee_id, last_name, email, salary FROM hr.employees;
+  SELECT employee_id, last_name, email, salary FROM hr.employees
+                                                       *
+ERROR at line 2:
+ORA-00942: table or view does not exist
+
+
+CR_OWNER@orcl> 
+
+-- ★ cr_owner 는 HR.EMPLOYEES 를 읽을 권한이 없다. 원본은 SYS 로 작업해 이 문제가 드러나지 않았다.
+
+--------------------------------------------------------------------------------
+ [2] 조치 — 권한을 받고 원본 함수 만들기
+--------------------------------------------------------------------------------
+
+-- 원본 코드를 문법만 정리해 그대로 옮겼다. 키는 16진수처럼 보이는 48글자 문자열을
+-- STRING_TO_RAW 로 바꾼 것이고, 암호문은 CAST_TO_VARCHAR2 로 문자열 컬럼에 넣는다.
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> GRANT SELECT ON hr.employees TO cr_owner;
+
+Grant succeeded.
+
+SYS@orcl> CONNECT cr_owner/oracle
+Connected.
+CR_OWNER@orcl> CREATE TABLE cr_emp AS
+  2    SELECT employee_id, last_name, email, salary FROM hr.employees;
+
+Table created.
+
+CR_OWNER@orcl> CREATE OR REPLACE FUNCTION encrypt_value (input_string IN VARCHAR2)
+  2  RETURN VARCHAR2 IS
+  3    raw_key     RAW(128) := UTL_I18N.STRING_TO_RAW('0DEEFB5B6967D85F614E038E771F9DCC7AE48C85B08D9F7E', 'AL32UTF8');
+  4    l_encrypted RAW(512);
+  5    l_type      NUMBER := DBMS_CRYPTO.DES3_CBC_PKCS5;
+  6  BEGIN
+  7    l_encrypted := DBMS_CRYPTO.ENCRYPT(UTL_RAW.CAST_TO_RAW(input_string), l_type, raw_key);
+  8    RETURN UTL_RAW.CAST_TO_VARCHAR2(l_encrypted);
+  9  END;
+ 10  /
+
+Function created.
+
+CR_OWNER@orcl> CREATE OR REPLACE FUNCTION decrypt_value (input_string IN VARCHAR2)
+  2  RETURN VARCHAR2 IS
+  3    raw_key     RAW(128) := UTL_I18N.STRING_TO_RAW('0DEEFB5B6967D85F614E038E771F9DCC7AE48C85B08D9F7E', 'AL32UTF8');
+  4    l_decrypted RAW(512);
+  5    l_type      NUMBER := DBMS_CRYPTO.DES3_CBC_PKCS5;
+  6  BEGIN
+  7    l_decrypted := DBMS_CRYPTO.DECRYPT(UTL_RAW.CAST_TO_RAW(input_string), l_type, raw_key);
+  8    RETURN UTL_RAW.CAST_TO_VARCHAR2(l_decrypted);
+  9  END;
+ 10  /
+
+Function created.
+
+CR_OWNER@orcl> ALTER TABLE cr_emp ADD (encrypt_name VARCHAR2(100));
+
+Table altered.
+
+CR_OWNER@orcl> UPDATE cr_emp SET encrypt_name = encrypt_value(last_name);
+
+107 rows updated.
+
+CR_OWNER@orcl> COMMIT;
+
+Commit complete.
+
+-- ★ 107행 모두 암호화됐다. 오류는 없다. 원본이 쓴 DES3_CBC_PKCS5 는 이전 호환용 스위트이고
+--    새로 만드는 코드는 AES 를 쓴다(03).
+
+--------------------------------------------------------------------------------
+ [3] 암호문이 VARCHAR2 에 들어간 모습
+--------------------------------------------------------------------------------
+
+SQL> CONNECT cr_owner/oracle
+Connected.
+CR_OWNER@orcl> COL last_name FOR a12
+CR_OWNER@orcl> COL hex FOR a50
+CR_OWNER@orcl> SELECT employee_id, last_name, LENGTH(encrypt_name) AS chars, LENGTHB(encrypt_name) AS bytes,
+  2         RAWTOHEX(UTL_RAW.CAST_TO_RAW(encrypt_name)) AS hex
+  3    FROM cr_emp WHERE employee_id BETWEEN 100 AND 104 ORDER BY employee_id;
+
+EMPLOYEE_ID LAST_NAME         CHARS      BYTES HEX
+----------- ------------ ---------- ---------- --------------------------------------------------
+        100 King                  8          8 2D27A4FE964BA058
+        101 Kochhar               5          8 095C15E5B968DB54
+        102 De Haan               4          8 CC4A55F48415BC1C
+        103 Hunold                6          8 1614E7A410C05F95
+        104 Ernst                 7          8 197DA36F959466E1
+
+5 rows selected.
+
+CR_OWNER@orcl> SELECT COUNT(*) AS total,
+  2         SUM(CASE WHEN decrypt_value(encrypt_name) = last_name THEN 1 ELSE 0 END) AS ok
+  3    FROM cr_emp;
+
+     TOTAL         OK
+---------- ----------
+       107        107
+
+1 row selected.
+
+-- ★ 바이트 수는 모두 8(DES3 블록 크기)인데 LENGTH 가 5, 4, 6 처럼 들쭉날쭉하다.
+--    임의의 바이트를 AL32UTF8 문자로 해석하면서 여러 바이트가 한 글자로 묶였다.
+--    같은 DB 안에서는 바이트가 그대로 보존돼 107건 모두 복호화된다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 문자 집합 변환에 노출
+--------------------------------------------------------------------------------
+
+-- 다른 문자 집합의 클라이언트나 DB 로 옮겨지는 상황을 CONVERT 로 흉내 낸다.
+
+SQL> CONNECT cr_owner/oracle
+Connected.
+CR_OWNER@orcl> COL dump_head FOR a60
+CR_OWNER@orcl> SELECT employee_id, DUMP(encrypt_name, 16) AS dump_head FROM cr_emp WHERE employee_id = 100;
+
+EMPLOYEE_ID DUMP_HEAD
+----------- ------------------------------------------------------------
+        100 Typ=1 Len=8: 2d,27,a4,fe,96,4b,a0,58
+
+1 row selected.
+
+CR_OWNER@orcl> SELECT CONVERT(encrypt_name, 'KO16MSWIN949', 'AL32UTF8') FROM cr_emp WHERE employee_id = 100;
+
+CONVERT(ENCRYPT_NAME,'KO16MSWIN949','AL32UTF8')
+------------------------------------------------------------------------------------------------------------------------
+-'???K?X
+
+1 row selected.
+
+CR_OWNER@orcl> SELECT decrypt_value(CONVERT(CONVERT(encrypt_name, 'KO16MSWIN949', 'AL32UTF8'), 'AL32UTF8', 'KO16MSWIN949')) AS after_conv
+  2    FROM cr_emp WHERE employee_id BETWEEN 100 AND 104;
+SELECT decrypt_value(CONVERT(CONVERT(encrypt_name, 'KO16MSWIN949', 'AL32UTF8'), 'AL32UTF8', 'KO16MSWIN949')) AS after_conv
+       *
+ERROR at line 1:
+ORA-28817: PL/SQL function returned an error.
+ORA-06512: at "SYS.DBMS_CRYPTO_FFI", line 67
+ORA-06512: at "SYS.DBMS_CRYPTO", line 44
+ORA-06512: at "CR_OWNER.DECRYPT_VALUE", line 7
+
+-- ★ 변환을 한 번 왕복하자 바이트가 '?' 로 바뀌었고 복호화는 ORA-28817 로 실패했다.
+--    문자 컬럼의 값은 내보내기·가져오기, DB 링크, 클라이언트 NLS_LANG 에 따라 변환 대상이 된다.
+--    암호문은 RAW 로 두거나, 문자로 둬야 하면 RAWTOHEX·BASE64 로 바꿔 저장한다(ARPLS 권고).
+
+--------------------------------------------------------------------------------
+ [5] 키가 소스에 그대로 남는다
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL text FOR a100
+SYS@orcl> SELECT line, text FROM dba_source
+  2   WHERE owner = 'CR_OWNER' AND name = 'ENCRYPT_VALUE' AND text LIKE '%STRING_TO_RAW%';
+
+      LINE TEXT
+---------- ----------------------------------------------------------------------------------------------------
+         3   raw_key     RAW(128) := UTL_I18N.STRING_TO_RAW('0DEEFB5B6967D85F614E038E771F9DCC7AE48C85B08D9F7E',
+            'AL32UTF8');
+
+
+1 row selected.
+
+-- ★ 함수 소스에 키 문자열이 그대로 있다. DBA_SOURCE 를 읽을 수 있는 사람, 소스 백업,
+--    Data Pump 덤프를 가진 사람은 모두 키를 가진 셈이다. 04 에서 키를 분리한다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - 원본 함수는 같은 DB 안에서는 동작하지만 세 가지 위험이 있다.
+--   (1) 암호문을 VARCHAR2 에 저장: 문자 집합 변환에서 손상(ORA-28817).
+--   (2) 키를 소스에 고정: DBA_SOURCE 로 노출.
+--   (3) DES3 스위트: 이전 호환용. 새 코드는 AES256 + CBC + PKCS5.
+-- - cr_emp 와 두 함수는 05 에서 사용자와 함께 철거한다.

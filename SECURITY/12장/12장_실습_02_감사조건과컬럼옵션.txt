@@ -1,0 +1,291 @@
+================================================================================
+ 제12장 실습 02 — 감사 조건과 컬럼 옵션
+ 대상    : oel7v9 orcl
+ 목표    : audit_condition 으로 행 조건을 걸고 문장당 기록 건수를 확인한다.
+          감사 조건이 감사 대상 테이블을 다시 읽으면 생기는 오류를 재현하고, ALL_COLUMNS 를 확인한다
+ 소요    : 약 25분
+ 변경    : 정책 교체(EMP_HIGH_SAL → EMP_NAME_SAL). 시험 정책은 단계 안에서 삭제
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 조건 있는 정책으로 교체
+--------------------------------------------------------------------------------
+
+-- SALARY 를 참조하고, 처리된 행 중 SALARY > 9999 인 행이 있을 때만 기록한다.
+
+SQL> CONNECT secadm/oracle
+Connected.
+SECADM@orcl> EXEC DBMS_FGA.DROP_POLICY('HR', 'EMPLOYEES', 'EMP_SAL_ACCESS')
+
+PL/SQL procedure successfully completed.
+
+SECADM@orcl> BEGIN
+  2    DBMS_FGA.ADD_POLICY(
+  3      object_schema   => 'HR',
+  4      object_name     => 'EMPLOYEES',
+  5      policy_name     => 'EMP_HIGH_SAL',
+  6      audit_condition => 'SALARY > 9999',
+  7      audit_column    => 'SALARY');
+  8  END;
+  9  /
+
+PL/SQL procedure successfully completed.
+
+--------------------------------------------------------------------------------
+ [2] HR 의 조회 네 가지
+--------------------------------------------------------------------------------
+
+SQL> CONNECT hr/hr
+Connected.
+HR@orcl> COL last_name FOR a12
+HR@orcl> SELECT last_name, salary FROM employees WHERE employee_id = 102;
+
+LAST_NAME        SALARY
+------------ ----------
+De Haan           17000
+
+1 row selected.
+
+HR@orcl> SELECT last_name, salary FROM employees WHERE employee_id = 105;
+
+LAST_NAME        SALARY
+------------ ----------
+Austin             4800
+
+1 row selected.
+
+HR@orcl> SELECT COUNT(*), MAX(salary) FROM employees WHERE department_id = 60;
+
+  COUNT(*) MAX(SALARY)
+---------- -----------
+         5        9000
+
+1 row selected.
+
+HR@orcl> SELECT last_name, salary FROM employees WHERE department_id = 90;
+
+LAST_NAME        SALARY
+------------ ----------
+King              24000
+Kochhar           17000
+De Haan           17000
+
+3 rows selected.
+
+-- ★ 102번은 17000, 105번은 4800 이다. 60번 부서 5명은 최고 9000 이라 조건을 만족하는 행이 없다.
+--    90번 부서는 세 명 모두 조건을 만족한다.
+
+--------------------------------------------------------------------------------
+ [3] 어떤 문장이 기록됐나
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL db_user FOR a8
+SYS@orcl> COL policy_name FOR a14
+SYS@orcl> COL ts FOR a19
+SYS@orcl> COL sql_text FOR a60
+SYS@orcl> SELECT db_user, policy_name, TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') ts, sql_text
+  2    FROM dba_fga_audit_trail WHERE policy_name = 'EMP_HIGH_SAL' ORDER BY timestamp;
+
+DB_USER  POLICY_NAME    TS                  SQL_TEXT
+-------- -------------- ------------------- ------------------------------------------------------------
+HR       EMP_HIGH_SAL   2026-10-27 20:13:50 SELECT last_name, salary FROM employees WHERE department_id
+                                            = 90
+
+HR       EMP_HIGH_SAL   2026-10-27 20:13:50 SELECT last_name, salary FROM employees WHERE employee_id =
+                                            102
+
+
+2 rows selected.
+
+-- ★ 102번 조회와 90번 부서 조회 두 건만 남았다.
+--    90번 부서 조회는 조건을 만족한 행이 3개였지만 기록은 1건이다. 기록 단위는 문장이다.
+--    105번과 60번 부서 조회는 SALARY 를 읽었어도 조건을 만족한 행이 없어 기록되지 않았다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 조건이 감사 대상 테이블을 다시 읽으면
+--------------------------------------------------------------------------------
+
+-- '평균보다 많이 받는 사원' 을 조건으로 쓰려고 같은 테이블을 읽는 서브쿼리를 넣었다.
+
+SQL> CONNECT secadm/oracle
+Connected.
+SECADM@orcl> BEGIN
+  2    DBMS_FGA.ADD_POLICY(
+  3      object_schema   => 'HR',
+  4      object_name     => 'EMPLOYEES',
+  5      policy_name     => 'EMP_TEST_SUB',
+  6      audit_condition => 'SALARY > (SELECT AVG(salary) FROM hr.employees)',
+  7      audit_column    => 'SALARY');
+  8  END;
+  9  /
+
+PL/SQL procedure successfully completed.
+
+SECADM@orcl> CONNECT hr/hr
+Connected.
+HR@orcl> SELECT last_name, salary FROM employees WHERE employee_id = 105;
+SELECT last_name, salary FROM employees WHERE employee_id = 105
+                                                              *
+ERROR at line 1:
+ORA-28112: failed to execute policy function
+
+-- ★ ADD_POLICY 는 성공했지만 HR 의 조회가 ORA-28112: failed to execute policy function 으로 실패한다.
+--    감사 조건 하나 때문에 업무 조회가 막혔다.
+
+--------------------------------------------------------------------------------
+ [5] 원인 확인 — 세션 트레이스
+--------------------------------------------------------------------------------
+
+[oracle@oel7v9 ~]$ grep -h 'FGA: Query parsing returned' $(ls -t $ORACLE_BASE/diag/rdbms/orcl/orcl/trace/orcl_ora_*.trc | head -3) | tail -2
+FGA: Query parsing returned with error# 28112
+FGA: Query parsing returned with error# 28112
+[oracle@oel7v9 ~]$ grep -h -o "WHERE SYS_AUDIT((CASE WHEN(SALARY > (SELECT AVG(salary) FROM hr.employees))" $(ls -t $ORACLE_BASE/diag/rdbms/orcl/orcl/trace/orcl_ora_*.trc | head -3) | tail -1
+WHERE SYS_AUDIT((CASE WHEN(SALARY > (SELECT AVG(salary) FROM hr.employees))
+
+-- ★ FGA 는 조건을 SYS_AUDIT(CASE WHEN 조건 THEN 1 ...) 형태로 바꿔 내부 질의를 만든다.
+--    그 안의 서브쿼리가 다시 HR.EMPLOYEES 를 읽고, 그 읽기에 또 FGA 정책이 걸리는 재귀가 생겨 파싱이 실패했다.
+--    매뉴얼은 감사 대상 테이블을 다시 읽는 조건이나 서브쿼리를 쓰지 말라고 적고 있다.
+--    19.3 은 등록 시점에 이를 막지 않는다.
+
+--------------------------------------------------------------------------------
+ [6] 조치 — 시험 정책 삭제, AND 조건 확인
+--------------------------------------------------------------------------------
+
+SQL> CONNECT secadm/oracle
+Connected.
+SECADM@orcl> EXEC DBMS_FGA.DROP_POLICY('HR', 'EMPLOYEES', 'EMP_TEST_SUB')
+
+PL/SQL procedure successfully completed.
+
+SECADM@orcl> BEGIN
+  2    DBMS_FGA.ADD_POLICY(
+  3      object_schema   => 'HR',
+  4      object_name     => 'EMPLOYEES',
+  5      policy_name     => 'EMP_TEST_AND',
+  6      audit_condition => 'SALARY > 9999 AND DEPARTMENT_ID = 80',
+  7      audit_column    => 'SALARY');
+  8  END;
+  9  /
+
+PL/SQL procedure successfully completed.
+
+SECADM@orcl> CONNECT hr/hr
+Connected.
+HR@orcl> SELECT last_name, salary FROM employees WHERE employee_id = 105;
+
+LAST_NAME                     SALARY
+------------------------- ----------
+Austin                          4800
+
+1 row selected.
+
+HR@orcl> SELECT COUNT(*) FROM employees WHERE department_id = 80 AND salary > 9999;
+
+  COUNT(*)
+----------
+        11
+
+1 row selected.
+
+HR@orcl> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL db_user FOR a8
+SYS@orcl> COL policy_name FOR a14
+SYS@orcl> COL ts FOR a19
+SYS@orcl> COL sql_text FOR a60
+SYS@orcl> SELECT db_user, policy_name, TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') ts, sql_text
+  2    FROM dba_fga_audit_trail WHERE policy_name = 'EMP_TEST_AND' ORDER BY timestamp;
+
+DB_USER  POLICY_NAME    TS                  SQL_TEXT
+-------- -------------- ------------------- ------------------------------------------------------------
+HR       EMP_TEST_AND   2026-10-27 20:13:54 SELECT COUNT(*) FROM employees WHERE department_id = 80 AND
+                                            salary > 9999
+
+
+1 row selected.
+
+SYS@orcl> CONNECT secadm/oracle
+Connected.
+SECADM@orcl> EXEC DBMS_FGA.DROP_POLICY('HR', 'EMPLOYEES', 'EMP_TEST_AND')
+
+PL/SQL procedure successfully completed.
+
+-- ★ 정책을 지우자 같은 조회가 정상으로 돌아왔다.
+--    AND 로 두 조건을 묶은 정책은 19.3 에서 오류 없이 동작했다. 80번 부서 고액 연봉자 조회 1건만 기록됐다.
+--    다만 매뉴얼은 audit_condition 에서 AND·OR 결합을 쓰지 말라고 적고 있으므로 지원 범위 밖으로 보고,
+--    운영 정책에는 단일 조건을 쓰거나 결합 조건을 충분히 시험한 뒤 쓴다.
+
+--------------------------------------------------------------------------------
+ [7] ALL_COLUMNS
+--------------------------------------------------------------------------------
+
+SQL> CONNECT secadm/oracle
+Connected.
+SECADM@orcl> BEGIN
+  2    DBMS_FGA.DROP_POLICY('HR', 'EMPLOYEES', 'EMP_HIGH_SAL');
+  3    DBMS_FGA.ADD_POLICY(
+  4      object_schema     => 'HR',
+  5      object_name       => 'EMPLOYEES',
+  6      policy_name       => 'EMP_NAME_SAL',
+  7      audit_column      => 'LAST_NAME,SALARY',
+  8      audit_column_opts => DBMS_FGA.ALL_COLUMNS);
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+SECADM@orcl> CONNECT hr/hr
+Connected.
+HR@orcl> SELECT last_name FROM employees WHERE employee_id = 101;
+
+LAST_NAME
+-------------------------
+Kochhar
+
+1 row selected.
+
+HR@orcl> SELECT salary FROM employees WHERE employee_id = 101;
+
+    SALARY
+----------
+     17000
+
+1 row selected.
+
+HR@orcl> SELECT last_name, salary FROM employees WHERE employee_id = 101;
+
+LAST_NAME                     SALARY
+------------------------- ----------
+Kochhar                        17000
+
+1 row selected.
+
+HR@orcl> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL db_user FOR a8
+SYS@orcl> COL policy_name FOR a14
+SYS@orcl> COL ts FOR a19
+SYS@orcl> COL sql_text FOR a60
+SYS@orcl> SELECT db_user, policy_name, TO_CHAR(timestamp, 'YYYY-MM-DD HH24:MI:SS') ts, sql_text
+  2    FROM dba_fga_audit_trail WHERE policy_name = 'EMP_NAME_SAL' ORDER BY timestamp;
+
+DB_USER  POLICY_NAME    TS                  SQL_TEXT
+-------- -------------- ------------------- ------------------------------------------------------------
+HR       EMP_NAME_SAL   2026-10-27 20:13:55 SELECT last_name, salary FROM employees WHERE employee_id =
+                                            101
+
+
+1 row selected.
+
+-- ★ LAST_NAME 과 SALARY 를 ALL_COLUMNS 로 묶었다. 이름만, 급여만 읽은 조회는 기록되지 않았다.
+--    둘을 함께 읽은 마지막 조회 1건만 남았다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - 기록은 문장 하나당 정책 하나에 1건. 조건을 만족한 행이 처리돼야 기록된다.
+-- - 감사 대상 테이블을 다시 읽는 조건은 등록은 되지만 조회 시 ORA-28112 로 업무 문장을 실패시킨다.
+-- - ANY_COLUMNS 는 하나라도, ALL_COLUMNS 는 모두 참조할 때 기록한다.

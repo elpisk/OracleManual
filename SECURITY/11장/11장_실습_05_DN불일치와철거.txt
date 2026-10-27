@@ -1,0 +1,165 @@
+================================================================================
+ 제11장 실습 05 — DN 불일치, CA 없는 지갑, 철거
+ 대상    : oel7v9 orcl, oracle OS 사용자
+ 목표    : DB 사용자의 DN 이 인증서와 다를 때, 클라이언트 지갑에 인증서가 없을 때의 오류를 재현한 뒤
+          TCPS 리스너·지갑·사용자를 모두 철거하고 공용 설정이 그대로인지 확인한다
+ 소요    : 약 20분
+ 변경    : 이 장에서 만든 것 전부 철거
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] DB 사용자의 DN 을 틀리게 바꾸기
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> ALTER USER tls_client IDENTIFIED EXTERNALLY AS 'CN=tls_client,O=itwill,C=US';
+
+User altered.
+
+SYS@orcl> COL external_name FOR a32
+SYS@orcl> SELECT username, external_name FROM dba_users WHERE username = 'TLS_CLIENT';
+
+USERNAME
+------------------------------------------------------------------------------------------------------------------------
+EXTERNAL_NAME
+--------------------------------
+TLS_CLIENT
+cn=tls_client,o=itwill,c=US
+
+
+1 row selected.
+
+-- ★ C=KR 을 C=US 로 바꿨다. 인증서는 그대로다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 인증서와 DN 이 다르다
+--------------------------------------------------------------------------------
+
+[oracle@oel7v9 ~]$ export TNS_ADMIN=/home/oracle/tls/client_tns
+[oracle@oel7v9 ~]$ echo "SELECT SUBSTR(SYS_CONTEXT('USERENV','SESSION_USER'),1,12) usr, SUBSTR(SYS_CONTEXT('USERENV','NETWORK_PROTOCOL'),1,6) proto, SUBSTR(SYS_CONTEXT('USERENV','AUTHENTICATION_METHOD'),1,10) auth FROM dual;" | sqlplus -s -L /@orcl_tls
+ERROR:
+ORA-01017: invalid username/password; logon denied
+
+
+SP2-0751: Unable to connect to Oracle.  Exiting SQL*Plus
+
+-- ★ ORA-01017. TLS 핸드셰이크는 통과했지만 인증서 DN 과 일치하는 DB 사용자가 없어 로그인이 거부됐다.
+--    TLS 오류(ORA-28xxx, ORA-29024)가 아니라 일반 인증 오류로 보인다는 점이 진단의 단서다.
+
+--------------------------------------------------------------------------------
+ [3] 조치 — DN 바로잡기
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> ALTER USER tls_client IDENTIFIED EXTERNALLY AS 'CN=tls_client,O=itwill,C=KR';
+
+User altered.
+
+-- ★ ALTER USER ... IDENTIFIED EXTERNALLY AS 로 DN 을 고쳤다. 사용자를 지우고 다시 만들 필요가 없다.
+
+--------------------------------------------------------------------------------
+ [4] 다시 접속
+--------------------------------------------------------------------------------
+
+[oracle@oel7v9 ~]$ export TNS_ADMIN=/home/oracle/tls/client_tns
+[oracle@oel7v9 ~]$ echo "SELECT SUBSTR(SYS_CONTEXT('USERENV','SESSION_USER'),1,12) usr, SUBSTR(SYS_CONTEXT('USERENV','NETWORK_PROTOCOL'),1,6) proto, SUBSTR(SYS_CONTEXT('USERENV','AUTHENTICATION_METHOD'),1,10) auth FROM dual;" | sqlplus -s -L /@orcl_tls
+
+USR						 PROTO
+------------------------------------------------ ------------------------
+AUTH
+----------------------------------------
+TLS_CLIENT					 tcps
+SSL
+
+-- ★ TLS_CLIENT 로 tcps 접속이 복구됐다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — 인증서가 하나도 없는 클라이언트 지갑
+--------------------------------------------------------------------------------
+
+-- 빈 auto-login 지갑을 하나 더 만들어 클라이언트 sqlnet.ora 가 그것을 가리키게 한다. 비밀번호 사용자로 접속한다.
+
+[oracle@oel7v9 ~]$ mkdir -p /home/oracle/tls/client_wallet2
+[oracle@oel7v9 ~]$ orapki wallet create -wallet /home/oracle/tls/client_wallet2 -pwd 'Client#2026' -auto_login
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+[oracle@oel7v9 ~]$ cd /home/oracle/tls/client_tns
+[oracle@oel7v9 client_tns]$ sed -i 's#client_wallet)#client_wallet2)#' sqlnet.ora
+[oracle@oel7v9 client_tns]$ grep DIRECTORY sqlnet.ora
+WALLET_LOCATION = (SOURCE = (METHOD = FILE)(METHOD_DATA = (DIRECTORY = /home/oracle/tls/client_wallet2)))
+[oracle@oel7v9 client_tns]$ export TNS_ADMIN=/home/oracle/tls/client_tns
+[oracle@oel7v9 client_tns]$ echo "SELECT SUBSTR(SYS_CONTEXT('USERENV','SESSION_USER'),1,12) usr, SUBSTR(SYS_CONTEXT('USERENV','NETWORK_PROTOCOL'),1,6) proto, SUBSTR(SYS_CONTEXT('USERENV','AUTHENTICATION_METHOD'),1,10) auth FROM dual;" | sqlplus -s -L scott/tiger@orcl_tls
+ERROR:
+ORA-28845: No certificate
+
+
+SP2-0751: Unable to connect to Oracle.  Exiting SQL*Plus
+[oracle@oel7v9 client_tns]$ sed -i 's#client_wallet2)#client_wallet)#' sqlnet.ora
+[oracle@oel7v9 client_tns]$ echo "SELECT SUBSTR(SYS_CONTEXT('USERENV','SESSION_USER'),1,12) usr, SUBSTR(SYS_CONTEXT('USERENV','NETWORK_PROTOCOL'),1,6) proto, SUBSTR(SYS_CONTEXT('USERENV','AUTHENTICATION_METHOD'),1,10) auth FROM dual;" | sqlplus -s -L scott/tiger@orcl_tls
+
+USR						 PROTO
+------------------------------------------------ ------------------------
+AUTH
+----------------------------------------
+SCOTT						 tcps
+PASSWORD
+
+-- ★ ORA-28845: No certificate. 지갑에 CA 인증서도 사용자 인증서도 없다.
+--    클라이언트가 SSL_CLIENT_AUTHENTICATION = TRUE 라서 비밀번호 사용자로 접속해도 인증서가 필요하다.
+--    원래 지갑으로 되돌리자 SCOTT 이 tcps/PASSWORD 로 다시 접속됐다.
+
+--------------------------------------------------------------------------------
+ [6] 철거 — 리스너와 파일
+--------------------------------------------------------------------------------
+
+[oracle@oel7v9 ~]$ export TNS_ADMIN=/home/oracle/tls/server_tns
+[oracle@oel7v9 ~]$ lsnrctl stop LISTENER_TLS | tail -2
+Connecting to (DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=oel7v9)(PORT=2484)))
+The command completed successfully
+[oracle@oel7v9 ~]$ rm -rf /home/oracle/tls
+[oracle@oel7v9 ~]$ ls -d /home/oracle/tls
+ls: cannot access /home/oracle/tls: No such file or directory
+[oracle@oel7v9 ~]$ md5sum $ORACLE_HOME/network/admin/*.ora
+10d7442986929ce050326f853ae81d8a  /u01/app/oracle/product/19.3.0/dbhome_1/network/admin/listener.ora
+4842bc60cd301476deead5025d27f03e  /u01/app/oracle/product/19.3.0/dbhome_1/network/admin/sqlnet.ora
+14f51ab7a8f0f31b6329300054a4fd18  /u01/app/oracle/product/19.3.0/dbhome_1/network/admin/tnsnames.ora
+[oracle@oel7v9 ~]$ unset TNS_ADMIN
+[oracle@oel7v9 ~]$ lsnrctl status | grep -i 'Listening\|Alias'
+Alias                     LISTENER
+Listening Endpoints Summary...
+
+-- ★ LISTENER_TLS 를 내리고 /home/oracle/tls 를 지웠다. 공용 listener.ora·sqlnet.ora·tnsnames.ora md5 가 01 의 값과 같다.
+--    기존 리스너 LISTENER 만 남았다.
+
+--------------------------------------------------------------------------------
+ [7] 철거 — DB 사용자
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> DROP USER tls_client CASCADE;
+
+User dropped.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_users WHERE username = 'TLS_CLIENT';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+-- ★ TLS_CLIENT 0. OS_AUTHENT_PREFIX, REMOTE_OS_AUTHENT 는 처음부터 바꾸지 않았다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - DN 불일치는 ORA-01017, 지갑에 인증서가 없으면 ORA-28845, 지갑을 못 열면 ORA-28759, 인증서가 섞이면 ORA-29024.
+-- - DN 은 ALTER USER ... IDENTIFIED EXTERNALLY AS 로 고친다.
+-- - 이 장은 공용 Oracle Net 설정과 DB 파라미터를 바꾸지 않았다.

@@ -1,0 +1,185 @@
+================================================================================
+ 제9장 실습 04 — 키 분리와 암호화 패키지
+ 대상    : oel7v9 orcl
+ 목표    : 키를 키 관리 계정의 테이블로 옮기고, 정의자 권한 패키지만 키를 읽게 한다.
+          업무 계정은 패키지로 암호화·복호화만 하고 키는 볼 수 없는지 확인한다
+ 소요    : 약 25분
+ 변경    : cr_keymgr 사용자, cr_keys 테이블, cr_pkg 패키지, cr_emp.email_enc 컬럼
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 키 관리 계정과 키 테이블
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> CREATE USER cr_keymgr IDENTIFIED BY oracle QUOTA 1M ON users;
+
+User created.
+
+SYS@orcl> GRANT CREATE SESSION, CREATE TABLE, CREATE PROCEDURE TO cr_keymgr;
+
+Grant succeeded.
+
+SYS@orcl> GRANT EXECUTE ON DBMS_CRYPTO TO cr_keymgr;
+
+Grant succeeded.
+
+SYS@orcl> CONNECT cr_keymgr/oracle
+Connected.
+CR_KEYMGR@orcl> CREATE TABLE cr_keys (key_id NUMBER PRIMARY KEY, key_val RAW(32) NOT NULL, created DATE DEFAULT SYSDATE);
+
+Table created.
+
+CR_KEYMGR@orcl> INSERT INTO cr_keys (key_id, key_val) VALUES (1, DBMS_CRYPTO.RANDOMBYTES(32));
+
+1 row created.
+
+CR_KEYMGR@orcl> COMMIT;
+
+Commit complete.
+
+-- ★ 키는 DB 안 테이블에 있지만 업무 데이터와 다른 스키마에 있다.
+--    매뉴얼은 키 저장 위치로 DB 안, OS 파일, 사용자 보관 세 가지를 들고 각각의 위험을 설명한다.
+
+--------------------------------------------------------------------------------
+ [2] 암호화 패키지 (IV 를 암호문 앞에 붙임)
+--------------------------------------------------------------------------------
+
+SQL> CONNECT cr_keymgr/oracle
+Connected.
+CR_KEYMGR@orcl> CREATE OR REPLACE PACKAGE cr_pkg AS
+  2    FUNCTION enc (p_text IN VARCHAR2) RETURN RAW;
+  3    FUNCTION dec (p_data IN RAW) RETURN VARCHAR2;
+  4  END;
+  5  /
+
+Package created.
+
+CR_KEYMGR@orcl> CREATE OR REPLACE PACKAGE BODY cr_pkg AS
+  2    c_typ CONSTANT PLS_INTEGER := DBMS_CRYPTO.ENCRYPT_AES256 + DBMS_CRYPTO.CHAIN_CBC + DBMS_CRYPTO.PAD_PKCS5;
+  3    FUNCTION get_key RETURN RAW IS
+  4      v_key RAW(32);
+  5    BEGIN
+  6      SELECT key_val INTO v_key FROM cr_keys WHERE key_id = 1;
+  7      RETURN v_key;
+  8    END;
+  9    FUNCTION enc (p_text IN VARCHAR2) RETURN RAW IS
+ 10      v_iv RAW(16) := DBMS_CRYPTO.RANDOMBYTES(16);
+ 11    BEGIN
+ 12      RETURN UTL_RAW.CONCAT(v_iv,
+ 13             DBMS_CRYPTO.ENCRYPT(UTL_I18N.STRING_TO_RAW(p_text, 'AL32UTF8'), c_typ, get_key, v_iv));
+ 14    END;
+ 15    FUNCTION dec (p_data IN RAW) RETURN VARCHAR2 IS
+ 16    BEGIN
+ 17      RETURN UTL_I18N.RAW_TO_CHAR(
+ 18               DBMS_CRYPTO.DECRYPT(UTL_RAW.SUBSTR(p_data, 17), c_typ, get_key, UTL_RAW.SUBSTR(p_data, 1, 16)),
+ 19               'AL32UTF8');
+ 20    END;
+ 21  END;
+ 22  /
+
+Package body created.
+
+CR_KEYMGR@orcl> GRANT EXECUTE ON cr_pkg TO cr_owner;
+
+Grant succeeded.
+
+-- ★ enc 는 16바이트 IV 와 암호문을 이어 붙인 RAW 하나를 돌려준다. dec 는 앞 16바이트를 IV 로 떼어 쓴다.
+--    패키지는 정의자 권한이라 cr_keymgr 권한으로 cr_keys 를 읽는다. 업무 계정에는 EXECUTE 만 준다.
+
+--------------------------------------------------------------------------------
+ [3] 확인 — 업무 계정에서 키 테이블 직접 읽기
+--------------------------------------------------------------------------------
+
+SQL> CONNECT cr_owner/oracle
+Connected.
+CR_OWNER@orcl> SELECT key_val FROM cr_keymgr.cr_keys;
+SELECT key_val FROM cr_keymgr.cr_keys
+                              *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+-- ★ ORA-00942. cr_owner 는 키 테이블을 볼 수 없다. 이 오류가 기대한 결과다.
+
+--------------------------------------------------------------------------------
+ [4] 패키지로 암호화·복호화
+--------------------------------------------------------------------------------
+
+SQL> CONNECT cr_owner/oracle
+Connected.
+CR_OWNER@orcl> ALTER TABLE cr_emp ADD (email_enc RAW(128));
+
+Table altered.
+
+CR_OWNER@orcl> UPDATE cr_emp SET email_enc = cr_keymgr.cr_pkg.enc(email);
+
+107 rows updated.
+
+CR_OWNER@orcl> COMMIT;
+
+Commit complete.
+
+CR_OWNER@orcl> COL email FOR a10
+CR_OWNER@orcl> COL email_enc FOR a40
+CR_OWNER@orcl> COL dec FOR a10
+CR_OWNER@orcl> SELECT employee_id, email, SUBSTR(RAWTOHEX(email_enc), 1, 40) AS email_enc, cr_keymgr.cr_pkg.dec(email_enc) AS dec
+  2    FROM cr_emp WHERE employee_id IN (100, 101, 102) ORDER BY 1;
+
+EMPLOYEE_ID EMAIL      EMAIL_ENC                                DEC
+----------- ---------- ---------------------------------------- ----------
+        100 SKING      E427F863C2A46316147836BFFF2516871BD7D96D SKING
+        101 NKOCHHAR   43764AA5A3580EB22B5E695C1977973C9DFEAC0E NKOCHHAR
+        102 LDEHAAN    AEF3B3086D9F458243904198CAF9B0D2AFF119BD LDEHAAN
+
+3 rows selected.
+
+CR_OWNER@orcl> SELECT COUNT(*) total, SUM(CASE WHEN cr_keymgr.cr_pkg.dec(email_enc) = email THEN 1 ELSE 0 END) ok FROM cr_emp;
+
+     TOTAL         OK
+---------- ----------
+       107        107
+
+1 row selected.
+
+-- ★ 107건 모두 복호화 결과가 원래 이메일과 같다. 업무 계정은 키를 모른 채 암호화 기능만 쓴다.
+--    다만 패키지 실행 권한이 있는 사람은 dec 로 모든 값을 복호화할 수 있다.
+--    권한 분리는 키 노출을 막을 뿐, 복호화 권한 관리는 별도로 남는다.
+
+--------------------------------------------------------------------------------
+ [5] 업무 계정에서 보이는 소스
+--------------------------------------------------------------------------------
+
+SQL> CONNECT cr_owner/oracle
+Connected.
+CR_OWNER@orcl> COL text FOR a100
+CR_OWNER@orcl> SELECT COUNT(*) FROM all_source WHERE owner = 'CR_KEYMGR' AND name = 'CR_PKG' AND type = 'PACKAGE BODY';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+CR_OWNER@orcl> SELECT text FROM all_source WHERE owner = 'CR_KEYMGR' AND name = 'CR_PKG' AND type = 'PACKAGE';
+
+TEXT
+----------------------------------------------------------------------------------------------------
+PACKAGE cr_pkg AS
+  FUNCTION enc (p_text IN VARCHAR2) RETURN RAW;
+  FUNCTION dec (p_data IN RAW) RETURN VARCHAR2;
+END;
+
+4 rows selected.
+
+-- ★ 실행 권한만으로는 패키지 명세만 보이고 본문(BODY)은 보이지 않는다.
+--    키를 소스에 두지 않았으니 본문이 보여도 키는 드러나지 않는다. 02 의 함수와 대비된다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - 키 테이블은 별도 계정에, 접근은 정의자 권한 패키지로만.
+-- - IV 를 암호문 앞에 붙여 하나의 RAW 로 저장하면 컬럼 관리가 쉽다.
+-- - 복호화 함수의 실행 권한이 곧 평문 접근 권한이다. 부여 대상을 최소로.
+-- - SYS 와 키 관리 계정은 여전히 키를 읽을 수 있다. 이 한계 때문에 저장 데이터 보호는 TDE(10장)를 우선 검토한다.

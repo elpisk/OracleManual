@@ -1,0 +1,177 @@
+================================================================================
+ 제5장 실습 02 — 정의자 권한 프로시저로 원격 DML 위임
+ 대상    : oel7v9 orcl → sales
+ 목표    : 링크를 소유한 계정의 프로시저·뷰로 원격 작업을 다른 사용자에게 위임하고,
+          원격 객체에는 직접 권한을 줄 수 없다는 것(ORA-02021)을 확인한다
+ 소요    : 약 20분
+ 변경    : orcl: 프로시저·뷰·역할 sec05_r1, HR 동의어 rmt_emp / sales: 원격 emp 의 급여 2건 변경
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 원격 테이블을 고치는 프로시저
+--------------------------------------------------------------------------------
+
+SQL> CONNECT sec05_own/sec05_own
+Connected.
+SEC05_OWN@orcl> CREATE OR REPLACE PROCEDURE update_rmt_sal (
+  2    p_empno IN NUMBER,
+  3    p_sal   IN NUMBER)
+  4  IS
+  5  BEGIN
+  6    UPDATE emp@sales_lnk SET sal = p_sal WHERE empno = p_empno;
+  7  END;
+  8  /
+
+Procedure created.
+
+SEC05_OWN@orcl> SELECT empno, ename, sal FROM emp@sales_lnk WHERE empno = 201;
+
+     EMPNO ENAME                            SAL
+---------- ------------------------- ----------
+       201 Hartstein                      13000
+
+1 row selected.
+
+SEC05_OWN@orcl> EXEC update_rmt_sal(201, 13500)
+
+PL/SQL procedure successfully completed.
+
+SEC05_OWN@orcl> COMMIT;
+
+Commit complete.
+
+SEC05_OWN@orcl> SELECT empno, ename, sal FROM emp@sales_lnk WHERE empno = 201;
+
+     EMPNO ENAME                            SAL
+---------- ------------------------- ----------
+       201 Hartstein                      13500
+
+1 row selected.
+
+-- ★ 원본 실습의 update_scott_sal 과 같은 구조다. 링크 소유자 sec05_own 의 프로시저 안에서만 링크가 쓰인다.
+--    원격 UPDATE 는 분산 트랜잭션이 되며, 로컬 세션의 COMMIT 으로 원격까지 확정된다.
+
+--------------------------------------------------------------------------------
+ [2] 역할로 실행 권한 넘기기
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> CREATE ROLE sec05_r1;
+
+Role created.
+
+SYS@orcl> GRANT sec05_r1 TO hr;
+
+Grant succeeded.
+
+SYS@orcl> CONNECT sec05_own/sec05_own
+Connected.
+SEC05_OWN@orcl> GRANT EXECUTE ON update_rmt_sal TO sec05_r1;
+
+Grant succeeded.
+
+-- ★ 프로시저 실행 권한을 역할에 주고 역할을 HR 에 부여했다. 프로시저는 정의자 권한으로 돈다.
+
+--------------------------------------------------------------------------------
+ [3] HR 에서 실행, 오류 재현 — 남의 링크를 직접 쓰기
+--------------------------------------------------------------------------------
+
+SQL> CONNECT hr/hr
+Connected.
+HR@orcl> EXEC sec05_own.update_rmt_sal(202, 6500)
+
+PL/SQL procedure successfully completed.
+
+HR@orcl> COMMIT;
+
+Commit complete.
+
+HR@orcl> SELECT empno, sal FROM sec05_rmt.emp@sales_lnk WHERE empno = 202;
+SELECT empno, sal FROM sec05_rmt.emp@sales_lnk WHERE empno = 202
+                                     *
+ERROR at line 1:
+ORA-02019: connection description for remote database not found
+
+-- ★ HR 은 프로시저로 원격 급여를 바꿀 수 있다. 원격 비밀번호를 몰라도 된다.
+--    같은 링크를 HR 이 직접 쓰면 ORA-02019. 사설 링크는 소유자만 이름으로 참조할 수 있다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 원격 객체에 직접 GRANT
+--------------------------------------------------------------------------------
+
+SQL> CONNECT sec05_own/sec05_own
+Connected.
+SEC05_OWN@orcl> GRANT SELECT ON emp@sales_lnk TO hr;
+GRANT SELECT ON emp@sales_lnk TO hr
+                    *
+ERROR at line 1:
+ORA-02021: DDL operations are not allowed on a remote database
+
+-- ★ ORA-02021: DDL operations are not allowed on a remote database.
+--    GRANT 는 DDL 이고 원격 객체에 대한 DDL 은 링크로 실행할 수 없다. 원본 자료의 '안되네' 지점이다.
+
+--------------------------------------------------------------------------------
+ [5] 조치 — 로컬 뷰를 만들어 넘기기
+--------------------------------------------------------------------------------
+
+SQL> CONNECT sec05_own/sec05_own
+Connected.
+SEC05_OWN@orcl> CREATE VIEW emp_rmt_vw AS
+  2    SELECT empno, ename, sal, deptno FROM emp@sales_lnk;
+
+View created.
+
+SEC05_OWN@orcl> GRANT SELECT ON emp_rmt_vw TO hr;
+
+Grant succeeded.
+
+SEC05_OWN@orcl> CONNECT hr/hr
+Connected.
+HR@orcl> SELECT empno, ename, sal FROM sec05_own.emp_rmt_vw WHERE empno = 202;
+
+     EMPNO ENAME                            SAL
+---------- ------------------------- ----------
+       202 Fay                             6500
+
+1 row selected.
+
+HR@orcl> CREATE SYNONYM rmt_emp FOR sec05_own.emp_rmt_vw;
+
+Synonym created.
+
+HR@orcl> SELECT deptno, COUNT(*) FROM rmt_emp GROUP BY deptno ORDER BY deptno;
+
+    DEPTNO   COUNT(*)
+---------- ----------
+        10          1
+        20          2
+        30          6
+
+3 rows selected.
+
+-- ★ 원격 테이블을 감싼 로컬 뷰에 SELECT 권한을 주면 HR 이 조회할 수 있다.
+--    원본은 HR 의 기존 EMP 테이블을 지우고 같은 이름의 동의어를 만들었다. 여기서는 rmt_emp 라는 새 이름을 썼다.
+--    HR 이 원격 데이터를 보는 길은 뷰의 열(empno, ename, sal, deptno)로 한정된다.
+
+--------------------------------------------------------------------------------
+ [6] HR 이 뷰로 고치려 하면
+--------------------------------------------------------------------------------
+
+SQL> CONNECT hr/hr
+Connected.
+HR@orcl> UPDATE rmt_emp SET sal = 1 WHERE empno = 202;
+UPDATE rmt_emp SET sal = 1 WHERE empno = 202
+       *
+ERROR at line 1:
+ORA-01031: insufficient privileges
+
+-- ★ 뷰에는 SELECT 만 줬으므로 ORA-01031. 변경은 프로시저가 허용한 형태(급여 갱신)로만 가능하다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - 링크는 원격 계정의 권한을 로컬에 옮겨 놓는 통로다. 링크 소유자의 프로시저·뷰가 위임의 경계가 된다.
+-- - 원격 객체에 GRANT 는 불가(ORA-02021). 로컬 뷰·프로시저를 만들어 그 객체에 권한을 준다.
+-- - 사설 링크는 소유자만 이름으로 참조한다(ORA-02019).

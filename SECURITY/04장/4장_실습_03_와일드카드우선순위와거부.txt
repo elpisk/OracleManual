@@ -1,0 +1,185 @@
+================================================================================
+ 제4장 실습 03 — 와일드카드·우선순위·거부 항목
+ 대상    : oel7v9 orcl
+ 목표    : 서브넷 와일드카드로 권한을 주고, 더 구체적인 호스트의 거부 ACE 가 우선하는 것을 확인한다.
+          사용자 자신이 USER_HOST_ACES 로 판정 결과를 보는 방법을 익힌다
+ 소요    : 약 20분
+ 변경    : acl_u2 에 172.16.225.* http 허용, 172.16.225.50 거부 ACE 추가 후 제거
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 서브넷 단위로 허용
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> BEGIN
+  2    DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+  3      host => '172.16.225.*',
+  4      ace  => xs$ace_type(privilege_list => xs$name_list('http'),
+  5                          principal_name => 'ACL_U2',
+  6                          principal_type => xs_acl.ptype_db));
+  7  END;
+  8  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> CONNECT acl_u2/oracle
+Connected.
+ACL_U2@orcl> SELECT SUBSTR(UTL_HTTP.REQUEST('http://172.16.225.50:8090/'), 1, 40) AS page FROM dual;
+
+PAGE
+------------------------------------------------------------------------------------------------------------------------
+<html><body>ACL test page on oel7v9</bod
+
+1 row selected.
+
+-- ★ 172.16.225.* 에 대한 http 허용만으로 acl_u2 가 172.16.225.50 페이지를 읽는다.
+
+--------------------------------------------------------------------------------
+ [2] 호스트 검색 순서 — DBMS_NETWORK_ACL_UTILITY.DOMAINS
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> SELECT column_value AS domain FROM TABLE(DBMS_NETWORK_ACL_UTILITY.DOMAINS('172.16.225.50'));
+
+DOMAIN
+------------------------------------------------------------------------------------------------------------------------
+172.16.225.50
+172.16.225.*
+172.16.*
+172.*
+*
+
+5 rows selected.
+
+-- ★ 172.16.225.50 → 172.16.225.* → 172.16.* → 172.* → * 순서다.
+--    가장 구체적인 항목부터 찾고, 같은 호스트라면 포트 범위가 있는 ACL 이 먼저다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — 더 구체적인 호스트에 거부 ACE
+--------------------------------------------------------------------------------
+
+-- granted => FALSE 로 172.16.225.50 에 대한 acl_u2 의 http 를 거부한다.
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> BEGIN
+  2    DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+  3      host => '172.16.225.50',
+  4      ace  => xs$ace_type(privilege_list => xs$name_list('http'),
+  5                          principal_name => 'ACL_U2',
+  6                          principal_type => xs_acl.ptype_db,
+  7                          granted        => FALSE));
+  8  END;
+  9  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL host FOR a16
+SYS@orcl> COL principal FOR a10
+SYS@orcl> COL privilege FOR a9
+SYS@orcl> SELECT host, lower_port lo, upper_port hi, ace_order ord, principal, privilege, grant_type
+  2    FROM dba_host_aces WHERE principal LIKE 'ACL%' ORDER BY host, lo, ord;
+
+HOST                     LO         HI        ORD PRINCIPAL  PRIVILEGE GRANT
+---------------- ---------- ---------- ---------- ---------- --------- -----
+172.16.225.*                                    1 ACL_U2     HTTP      GRANT
+172.16.225.50          8090       8090          1 ACL_U1     HTTP      GRANT
+172.16.225.50          8090       8090          2 ACL_U1     CONNECT   GRANT
+172.16.225.50                                   1 ACL_U2     HTTP      DENY
+oel7v9                                          1 ACL_U1     RESOLVE   GRANT
+
+5 rows selected.
+
+SYS@orcl> CONNECT acl_u2/oracle
+Connected.
+ACL_U2@orcl> SELECT SUBSTR(UTL_HTTP.REQUEST('http://172.16.225.50:8090/'), 1, 40) AS page FROM dual;
+SELECT SUBSTR(UTL_HTTP.REQUEST('http://172.16.225.50:8090/'), 1, 40) AS page FROM dual
+              *
+ERROR at line 1:
+ORA-29273: HTTP request failed
+ORA-06512: at "SYS.UTL_HTTP", line 1530
+ORA-24247: network access denied by access control list (ACL)
+ORA-06512: at "SYS.UTL_HTTP", line 380
+ORA-06512: at "SYS.UTL_HTTP", line 1470
+ORA-06512: at line 1
+
+-- ★ GRANT_TYPE 이 DENY 인 ACE 가 생겼고 acl_u2 는 다시 ORA-24247 이다.
+--    서브넷 허용보다 호스트 단위 거부가 더 구체적이라 먼저 판정됐다.
+--    "이 서버만 빼고" 같은 요구는 이렇게 표현한다.
+
+--------------------------------------------------------------------------------
+ [4] 원인 확인 — 사용자 관점의 판정 (USER_HOST_ACES)
+--------------------------------------------------------------------------------
+
+SQL> CONNECT acl_u2/oracle
+Connected.
+ACL_U2@orcl> COL host FOR a16
+ACL_U2@orcl> COL privilege FOR a9
+ACL_U2@orcl> SELECT host, lower_port lo, upper_port hi, privilege, status FROM user_host_aces ORDER BY host;
+
+HOST                     LO         HI PRIVILEGE STATUS
+---------------- ---------- ---------- --------- -------
+172.16.225.*                           HTTP      GRANTED
+172.16.225.50                          HTTP      DENIED
+
+2 rows selected.
+
+ACL_U2@orcl> CONNECT acl_u1/oracle
+Connected.
+ACL_U1@orcl> SELECT host, lower_port lo, upper_port hi, privilege, status FROM user_host_aces ORDER BY host;
+
+HOST                     LO         HI PRIVILEGE STATUS
+---------------- ---------- ---------- --------- -------
+172.16.225.50          8090       8090 CONNECT   GRANTED
+172.16.225.50          8090       8090 HTTP      GRANTED
+oel7v9                                 RESOLVE   GRANTED
+
+3 rows selected.
+
+-- ★ acl_u2 는 172.16.225.* GRANTED, 172.16.225.50 DENIED 두 줄을 본다.
+--    USER_HOST_ACES 는 PUBLIC 에 열려 있어 일반 사용자가 스스로 ORA-24247 원인을 찾을 수 있다.
+--    DBA_HOST_ACES 는 SELECT_CATALOG_ROLE 이 있어야 볼 수 있다.
+
+--------------------------------------------------------------------------------
+ [5] 조치 — 거부 항목 제거
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> BEGIN
+  2    DBMS_NETWORK_ACL_ADMIN.REMOVE_HOST_ACE(
+  3      host => '172.16.225.50',
+  4      ace  => xs$ace_type(privilege_list => xs$name_list('http'),
+  5                          principal_name => 'ACL_U2',
+  6                          principal_type => xs_acl.ptype_db,
+  7                          granted        => FALSE),
+  8      remove_empty_acl => TRUE);
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> CONNECT acl_u2/oracle
+Connected.
+ACL_U2@orcl> SELECT SUBSTR(UTL_HTTP.REQUEST('http://172.16.225.50:8090/'), 1, 40) AS page FROM dual;
+
+PAGE
+------------------------------------------------------------------------------------------------------------------------
+<html><body>ACL test page on oel7v9</bod
+
+1 row selected.
+
+-- ★ REMOVE_HOST_ACE 에 granted => FALSE 까지 같게 줘야 그 거부 ACE 가 지워진다.
+--    remove_empty_acl => TRUE 라 비게 된 ACL 도 함께 사라졌고, 서브넷 허용이 다시 적용되어 페이지를 읽는다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - 와일드카드는 도메인(*.example.com)과 IP 서브넷(172.16.225.*) 모두에 쓸 수 있다.
+-- - 판정은 가장 구체적인 호스트(그 안에서는 포트 범위가 있는 ACL)부터 한다.
+-- - granted => FALSE 로 거부 ACE 를 만든다. 제거할 때도 같은 granted 값을 준다.
+-- - 일반 사용자는 USER_HOST_ACES 로 자기 판정 결과를 본다.

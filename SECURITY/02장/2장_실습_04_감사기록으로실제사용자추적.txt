@@ -1,0 +1,220 @@
+================================================================================
+ 제2장 실습 04 — 감사 기록으로 실제 사용자 추적
+ 대상    : oel7v9 orcl (mixed 감사 모드, Unified Audit 정책 사용 가능)
+ 목표    : 통합 감사 정책으로 프록시 세션의 작업을 기록하고 DBPROXY_USERNAME 으로
+          프록시 경유 작업과 직접 접속 작업을 구분한다. 정책 대상을 누구로 잡아야 하는지 확인한다
+ 소요    : 약 25분
+ 변경    : 통합 감사 정책 prx_dml_pol (05 에서 철거). 감사 기록은 남는다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 통합 감사 정책 만들기
+--------------------------------------------------------------------------------
+
+-- 원본 자료는 AUDIT ... BY appsuser ON BEHALF OF user1 같은 전통 감사 문법을 쓴다.
+-- 19c 에서는 통합 감사(Unified Auditing) 정책으로 같은 목적을 이룬다.
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> CREATE AUDIT POLICY prx_dml_pol
+  2    ACTIONS CREATE TABLE, INSERT, UPDATE, DELETE, SELECT ON scott.dept;
+
+Audit policy created.
+
+SYS@orcl> AUDIT POLICY prx_dml_pol BY prx_user1;
+
+Audit succeeded.
+
+SYS@orcl> COL policy_name FOR a12
+SYS@orcl> COL entity_name FOR a10
+SYS@orcl> SELECT policy_name, enabled_option, entity_name FROM audit_unified_enabled_policies WHERE policy_name = 'PRX_DML_POL';
+
+POLICY_NAME  ENABLED_OPTION  ENTITY_NAM
+------------ --------------- ----------
+PRX_DML_POL  BY USER         PRX_USER1
+
+1 row selected.
+
+-- ★ 정책은 CREATE AUDIT POLICY 로 정의하고 AUDIT POLICY ... BY 사용자 로 켠다.
+--    SCOTT.DEPT 조회 권한은 아직 주지 않았다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 권한 없는 조회, 조치 후 재확인
+--------------------------------------------------------------------------------
+
+SQL> CONNECT prx_app[prx_user1]/prx_app
+Connected.
+PRX_USER1@orcl> CREATE TABLE prx_test (id NUMBER);
+
+Table created.
+
+PRX_USER1@orcl> INSERT INTO prx_test VALUES (1);
+
+1 row created.
+
+PRX_USER1@orcl> COMMIT;
+
+Commit complete.
+
+PRX_USER1@orcl> SELECT COUNT(*) FROM scott.dept;
+SELECT COUNT(*) FROM scott.dept
+                           *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+
+PRX_USER1@orcl> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> GRANT SELECT ON scott.dept TO prx_user1;
+
+Grant succeeded.
+
+SYS@orcl> CONNECT prx_app[prx_user1]/prx_app
+Connected.
+PRX_USER1@orcl> SELECT COUNT(*) FROM scott.dept;
+
+  COUNT(*)
+----------
+         4
+
+1 row selected.
+
+PRX_USER1@orcl> CONNECT prx_user1/prx_user1
+Connected.
+PRX_USER1@orcl> INSERT INTO prx_test VALUES (2);
+
+1 row created.
+
+PRX_USER1@orcl> COMMIT;
+
+Commit complete.
+
+-- ★ 프록시 세션에서 SCOTT.DEPT 를 조회하자 ORA-00942. PRX_USER1 에게 SELECT 권한이 없었다.
+--    권한은 프록시 계정이 아니라 대상 사용자 PRX_USER1 에게 준다. 다시 프록시로 접속해 4건을 확인했다.
+--    마지막으로 PRX_USER1 이 직접 접속해 INSERT 를 한 번 했다.
+
+--------------------------------------------------------------------------------
+ [3] 감사 기록 조회
+--------------------------------------------------------------------------------
+
+-- 통합 감사 기록은 큐를 거쳐 기록되므로 FLUSH 후 조회한다.
+-- 시간 조건은 이번 실습에서 prx_app 을 만든 시각 이후로 잡았다. 앞서 같은 이름으로 실행한 기록을 빼기 위해서다.
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> EXEC DBMS_AUDIT_MGMT.FLUSH_UNIFIED_AUDIT_TRAIL
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL dbusername FOR a10
+SYS@orcl> COL dbproxy_username FOR a10
+SYS@orcl> COL action_name FOR a13
+SYS@orcl> COL object_name FOR a10
+SYS@orcl> SELECT dbusername, dbproxy_username, action_name, object_name, return_code
+  2    FROM unified_audit_trail
+  3   WHERE dbusername = 'PRX_USER1' AND unified_audit_policies = 'PRX_DML_POL'
+  4     AND event_timestamp >= (SELECT created FROM dba_users WHERE username = 'PRX_APP')
+  5   ORDER BY event_timestamp;
+
+DBUSERNAME DBPROXY_US ACTION_NAME   OBJECT_NAM RETURN_CODE
+---------- ---------- ------------- ---------- -----------
+PRX_USER1  PRX_APP    CREATE TABLE  PRX_TEST             0
+PRX_USER1  PRX_APP    INSERT        PRX_TEST             0
+PRX_USER1  PRX_APP    SELECT        DEPT              2004
+PRX_USER1  PRX_APP    SELECT        DEPT                 0
+PRX_USER1             INSERT        PRX_TEST             0
+
+5 rows selected.
+
+-- ★ DBUSERNAME 은 모두 PRX_USER1 이다. 프록시 경유 작업에만 DBPROXY_USERNAME=PRX_APP 이 붙는다.
+--    마지막 행(직접 접속 INSERT)은 DBPROXY_USERNAME 이 비어 있다.
+--    실패한 SELECT 는 RETURN_CODE 2004 로 남았다. 사용자 화면에는 ORA-00942(존재하지 않음)를 보여 주고
+--    감사 기록에는 실제 사유인 ORA-02004(security violation)를 남긴다.
+
+--------------------------------------------------------------------------------
+ [4] 확인 — 정책 대상을 프록시 계정으로 잡으면
+--------------------------------------------------------------------------------
+
+-- 정책 대상을 prx_user1 에서 prx_app 으로 옮기고, 프록시 세션에서 INSERT 를 한 번 더 한다.
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> NOAUDIT POLICY prx_dml_pol BY prx_user1;
+
+Noaudit succeeded.
+
+SYS@orcl> AUDIT POLICY prx_dml_pol BY prx_app;
+
+Audit succeeded.
+
+SYS@orcl> SELECT COUNT(*) FROM unified_audit_trail
+  2   WHERE unified_audit_policies = 'PRX_DML_POL' AND event_timestamp >= (SELECT created FROM dba_users WHERE username = 'PRX_APP');
+
+  COUNT(*)
+----------
+         5
+
+1 row selected.
+
+SYS@orcl> CONNECT prx_app[prx_user1]/prx_app
+Connected.
+PRX_USER1@orcl> INSERT INTO prx_test VALUES (3);
+
+1 row created.
+
+PRX_USER1@orcl> COMMIT;
+
+Commit complete.
+
+PRX_USER1@orcl> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> EXEC DBMS_AUDIT_MGMT.FLUSH_UNIFIED_AUDIT_TRAIL
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> SELECT COUNT(*) FROM unified_audit_trail
+  2   WHERE unified_audit_policies = 'PRX_DML_POL' AND event_timestamp >= (SELECT created FROM dba_users WHERE username = 'PRX_APP');
+
+  COUNT(*)
+----------
+         5
+
+1 row selected.
+
+-- ★ 실행 전후 모두 5건이다. 새 INSERT 는 기록되지 않았다.
+--    프록시 세션의 사용자는 PRX_USER1 이므로 BY prx_app 정책에 걸리지 않는다.
+--    프록시 경유 작업을 감사하려면 정책을 대상 사용자에 건다.
+
+--------------------------------------------------------------------------------
+ [5] 로그온 실패 기록의 프록시 정보
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL dbusername FOR a10
+SYS@orcl> COL dbproxy_username FOR a10
+SYS@orcl> SELECT dbusername, dbproxy_username, action_name, return_code
+  2    FROM unified_audit_trail
+  3   WHERE dbusername IN ('PRX_USER1', 'PRX_USER2', 'PRX_USER3')
+  4     AND action_name = 'LOGON' AND event_timestamp >= (SELECT created FROM dba_users WHERE username = 'PRX_APP')
+  5   ORDER BY event_timestamp;
+
+DBUSERNAME DBPROXY_US ACTION_NAME                                                      RETURN_CODE
+---------- ---------- ---------------------------------------------------------------- -----------
+PRX_USER1  PRX_APP    LOGON                                                                   1017
+PRX_USER2  PRX_APP    LOGON                                                                   1045
+PRX_USER3  PRX_APP    LOGON                                                                  28150
+
+3 rows selected.
+
+-- ★ 기본 정책 ORA_LOGON_FAILURES 가 01~03 의 실패한 프록시 접속을 남겼다.
+--    RETURN_CODE 1017(허용 없음), 1045(CREATE SESSION 없음), 28150(인증 요구)과 함께
+--    DBPROXY_USERNAME=PRX_APP 이 기록돼 어느 애플리케이션 서버에서 온 시도인지 알 수 있다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - UNIFIED_AUDIT_TRAIL 의 DBPROXY_USERNAME 으로 프록시 경유 작업을 구분한다.
+-- - 감사 정책은 프록시 계정이 아니라 대상 사용자에 건다(BY prx_app 은 프록시 세션 작업을 잡지 않았다).
+-- - 실패한 프록시 로그인도 ORA_LOGON_FAILURES 기록에 프록시 계정과 함께 남는다.

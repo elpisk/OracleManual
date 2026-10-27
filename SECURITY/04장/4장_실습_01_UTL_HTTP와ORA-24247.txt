@@ -1,0 +1,170 @@
+================================================================================
+ 제4장 실습 01 — UTL_HTTP와 ORA-24247
+ 대상    : oel7v9 orcl (non-CDB, 19.3), 같은 서버의 시험용 HTTP 서버(8090)
+ 목표    : 패키지 실행 권한이 있어도 ACL 이 없으면 외부 호출이 막히는 것을 확인하고,
+          APPEND_HOST_ACE 로 사용자 한 명에게 한 호스트·한 포트의 http 권한을 준다
+ 소요    : 약 20분
+ 변경    : 사용자 acl_u1, acl_u2 생성, 호스트 ACE 추가 (05 에서 철거)
+          /tmp/acl_www 에 시험용 HTTP 서버 기동 (05 에서 종료)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 시험용 HTTP 서버 준비 (root)
+--------------------------------------------------------------------------------
+
+-- 원본 실습은 httpd 를 설치했다. 여기서는 OS 에 들어 있는 python 내장 서버로 대신한다.
+-- 패키지를 설치하지 않으므로 실습 뒤 정리가 간단하다.
+
+[root@oel7v9 ~]# mkdir -p /tmp/acl_www
+[root@oel7v9 ~]# echo '<html><body>ACL test page on oel7v9</body></html>' > /tmp/acl_www/index.html
+[root@oel7v9 ~]# cd /tmp/acl_www
+[root@oel7v9 acl_www]# setsid nohup python -m SimpleHTTPServer 8090 > /tmp/acl_http.log 2>&1 < /dev/null &
+[root@oel7v9 acl_www]# cd ~
+[root@oel7v9 ~]# sleep 2
+[root@oel7v9 ~]# curl -s http://172.16.225.50:8090/
+<html><body>ACL test page on oel7v9</body></html>
+[root@oel7v9 ~]# ss -ltn | grep 8090
+LISTEN     0      5            *:8090                     *:*
+
+-- ★ 172.16.225.50:8090 에서 시험 페이지가 응답한다. DB 서버 자신이 HTTP 서버를 겸한다.
+
+--------------------------------------------------------------------------------
+ [2] UTL_ 패키지 실행 권한 확인, 시험 계정 생성
+--------------------------------------------------------------------------------
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL grantee FOR a10
+SYS@orcl> COL table_name FOR a12
+SYS@orcl> SELECT grantee, table_name, privilege FROM dba_tab_privs
+  2   WHERE table_name IN ('UTL_HTTP', 'UTL_TCP', 'UTL_SMTP', 'UTL_INADDR') AND grantee = 'PUBLIC';
+
+GRANTEE    TABLE_NAME   PRIVILEGE
+---------- ------------ ----------------------------------------
+PUBLIC     UTL_TCP      EXECUTE
+PUBLIC     UTL_HTTP     EXECUTE
+PUBLIC     UTL_INADDR   EXECUTE
+PUBLIC     UTL_SMTP     EXECUTE
+
+4 rows selected.
+
+SYS@orcl> CREATE USER acl_u1 IDENTIFIED BY oracle;
+
+User created.
+
+SYS@orcl> CREATE USER acl_u2 IDENTIFIED BY oracle;
+
+User created.
+
+SYS@orcl> GRANT CREATE SESSION TO acl_u1, acl_u2;
+
+Grant succeeded.
+
+-- ★ UTL_HTTP, UTL_TCP, UTL_SMTP, UTL_INADDR 의 EXECUTE 는 기본으로 PUBLIC 에 있다.
+--    누구나 패키지를 부를 수는 있다. 실제로 어디에 접속할 수 있는지는 ACL 이 정한다.
+--    acl_u1, acl_u2 에는 CREATE SESSION 만 줬다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — ACL 없이 HTTP 호출
+--------------------------------------------------------------------------------
+
+SQL> CONNECT acl_u1/oracle
+Connected.
+ACL_U1@orcl> SELECT SUBSTR(UTL_HTTP.REQUEST('http://172.16.225.50:8090/'), 1, 40) AS page FROM dual;
+SELECT SUBSTR(UTL_HTTP.REQUEST('http://172.16.225.50:8090/'), 1, 40) AS page FROM dual
+              *
+ERROR at line 1:
+ORA-29273: HTTP request failed
+ORA-06512: at "SYS.UTL_HTTP", line 1530
+ORA-24247: network access denied by access control list (ACL)
+ORA-06512: at "SYS.UTL_HTTP", line 380
+ORA-06512: at "SYS.UTL_HTTP", line 1470
+ORA-06512: at line 1
+
+-- ★ ORA-29273 아래에 ORA-24247: network access denied by access control list (ACL).
+--    11g 부터 네트워크 접근은 기본 거부다. 업그레이드한 DB 에서 이 오류가 갑자기 늘어나는 이유이기도 하다.
+
+--------------------------------------------------------------------------------
+ [4] 조치 — APPEND_HOST_ACE
+--------------------------------------------------------------------------------
+
+-- 호스트 172.16.225.50, 포트 8090 하나에 http 권한을 acl_u1 에게 준다.
+-- principal_type 은 xs_acl.ptype_db 를 명시한다. 기본값 PTYPE_XS 는 RAS 애플리케이션 사용자용이다.
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> BEGIN
+  2    DBMS_NETWORK_ACL_ADMIN.APPEND_HOST_ACE(
+  3      host       => '172.16.225.50',
+  4      lower_port => 8090,
+  5      upper_port => 8090,
+  6      ace        => xs$ace_type(privilege_list => xs$name_list('http'),
+  7                                principal_name => 'ACL_U1',
+  8                                principal_type => xs_acl.ptype_db));
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL host FOR a16
+SYS@orcl> COL principal FOR a10
+SYS@orcl> COL privilege FOR a9
+SYS@orcl> SELECT host, lower_port lo, upper_port hi, ace_order ord, principal, privilege, grant_type
+  2    FROM dba_host_aces WHERE principal LIKE 'ACL%' ORDER BY host, lo, ord;
+
+HOST                     LO         HI        ORD PRINCIPAL  PRIVILEGE GRANT
+---------------- ---------- ---------- ---------- ---------- --------- -----
+172.16.225.50          8090       8090          1 ACL_U1     HTTP      GRANT
+
+1 row selected.
+
+SYS@orcl> COL acl FOR a45
+SYS@orcl> SELECT host, lower_port lo, upper_port hi, acl FROM dba_host_acls WHERE host = '172.16.225.50';
+
+HOST                     LO         HI ACL
+---------------- ---------- ---------- ---------------------------------------------
+172.16.225.50          8090       8090 NETWORK_ACL_5ED177E7059E120FE06332E110AC502C
+
+1 row selected.
+
+-- ★ DBA_HOST_ACES 에 ACE 가 한 줄, DBA_HOST_ACLS 에 ACL 이 하나 생겼다.
+--    ACL 이름은 NETWORK_ACL_ 로 시작하는 시스템 생성 이름이다. ACL 을 따로 만들지 않아도
+--    첫 ACE 를 넣는 순간 호스트·포트 조합마다 자동으로 만들어진다.
+
+--------------------------------------------------------------------------------
+ [5] 재확인 — 다시 호출
+--------------------------------------------------------------------------------
+
+SQL> CONNECT acl_u1/oracle
+Connected.
+ACL_U1@orcl> SELECT SUBSTR(UTL_HTTP.REQUEST('http://172.16.225.50:8090/'), 1, 40) AS page FROM dual;
+
+PAGE
+------------------------------------------------------------------------------------------------------------------------
+<html><body>ACL test page on oel7v9</bod
+
+1 row selected.
+
+ACL_U1@orcl> CONNECT acl_u2/oracle
+Connected.
+ACL_U2@orcl> SELECT SUBSTR(UTL_HTTP.REQUEST('http://172.16.225.50:8090/'), 1, 40) AS page FROM dual;
+SELECT SUBSTR(UTL_HTTP.REQUEST('http://172.16.225.50:8090/'), 1, 40) AS page FROM dual
+              *
+ERROR at line 1:
+ORA-29273: HTTP request failed
+ORA-06512: at "SYS.UTL_HTTP", line 1530
+ORA-24247: network access denied by access control list (ACL)
+ORA-06512: at "SYS.UTL_HTTP", line 380
+ORA-06512: at "SYS.UTL_HTTP", line 1470
+ORA-06512: at line 1
+
+-- ★ acl_u1 은 페이지 앞부분을 받아 온다. ACE 가 없는 acl_u2 는 여전히 ORA-24247 이다.
+--    ACL 은 사용자(또는 역할) 단위로 판정된다.
+
+================================================================================
+ 정리
+================================================================================
+
+-- - UTL_HTTP 등 네트워크 패키지는 PUBLIC 실행 권한이 있어도 ACL 이 허용해야 접속할 수 있다.
+-- - 19c 에서는 APPEND_HOST_ACE 하나로 ACL 생성·권한 부여·호스트 지정이 끝난다.
+-- - principal_type => xs_acl.ptype_db 를 빠뜨리지 않는다.
