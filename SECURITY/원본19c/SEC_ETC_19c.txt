@@ -1,0 +1,2429 @@
+
+■ SECURITY
+
+KEY WORDS
+- SSL, Secure external password store, Proxy Authentication
+- Secure Application Role, Application contexts, Data Masking, DBMS_CRYTO, TDE
+
+
+■ SSL
+
+- 네트워크 통신을 암호화하고 인증하는 표준 기술
+- 도청/스니핑(Eavesdropping/Sniffing) 방지
+- 중간자 공격(Man-in-the-Middle Attack) 방지
+- 구성요소 : 오라클 지갑 (Oracle Wallet): 보안 자격 증명(Security Credentials)을 저장하는 컨테이너.
+  ✓ 공개 키/개인 키 쌍 (Private Key/Public Key Pair): 암호화에 사용되는 핵심 키
+  ✓ 인증서 (Certificate): 서버나 클라이언트의 신원을 증명. 보통 신뢰할 수 있는 제 3 의 기관(CA)에 의해 서명된 서버 인증서와, 통신 상대방의 인증서를 신뢰할 수 있도록 등록한 신뢰 인증서(Trusted Certificates)가 포함.
+--  19c 문서는 SSL 대신 TLS라는 이름을 쓴다(19.3에서 쓸 수 있는 최고 버전은 TLS 1.2). sqlnet.ora 파라미터는 SSL_* 이름이 그대로 동작한다.
+- 구성 파일
+
+| 구성 요소       | 역할                                                           | 핵심 파일                       |
+|-----------------|----------------------------------------------------------------|---------------------------------|
+| Oracle Wallet   | 인증서와 개인 키를 저장하는 금고 역할                          | cwallet.sso (지갑 파일)         |
+| 서버 설정       | 데이터베이스 리스너가 암호화된 연결(TCPS)을 수신하도록 설정    | listener.ora, sqlnet.ora        |
+| 클라이언트 설정 | 서버의 인증서를 신뢰하고 TCPS 프로토콜을 사용하도록 설정       | tnsnames.ora, sqlnet.ora        |
+| TCPS            | TCP 위에 SSL/TLS 암호화 계층을 추가하여 통신하는 프로토콜       | 포트 번호 (일반적으로 2484)     |
+
+<< Oracle Database SSL 인증 >>
+
+--  원본은 서버(orcl)와 클라이언트(prod) 두 서버로 진행한다. 실측은 OEL7V9 한 대에서 했으므로 scp 대신 cp로 파일을 옮긴다.
+--  공용 listener.ora·sqlnet.ora를 건드리지 않도록 서버용 /u01/app/oracle/server_tns, 클라이언트용 /u01/app/oracle/client_tns 디렉터리를 따로 두고 TNS_ADMIN으로 지정한다.
+
+1) 서버 지갑 생성 및 구성(orcl DB)
+
+-빈 서버 지갑 생성:
+[oracle@oel7v9 ~]$ mkdir /u01/app/oracle/server_wallet
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/server_wallet
+[oracle@oel7v9 server_wallet]$ orapki wallet create -wallet /u01/app/oracle/server_wallet -auto_login -pwd welcome1
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+[oracle@oel7v9 server_wallet]$ ls -la /u01/app/oracle/server_wallet
+total 12
+drwxr-xr-x.  2 oracle dba   90 Oct 28 09:27 .
+drwxrwxr-x. 12 oracle dba 4096 Oct 28 09:27 ..
+-rw-------.  1 oracle dba  194 Oct 28 09:27 cwallet.sso
+-rw-------.  1 oracle dba    0 Oct 28 09:27 cwallet.sso.lck
+-rw-------.  1 oracle dba  149 Oct 28 09:27 ewallet.p12
+-rw-------.  1 oracle dba    0 Oct 28 09:27 ewallet.p12.lck
+
+-서버 자체 서명 인증서 생성:
+--  -keysize 512 → 2048, -sign_alg sha256 추가. orapki는 512비트도 막지 않지만(11장 실측) 보안 권고에 맞춰 2048비트 이상 키와 SHA-2 서명을 쓴다.
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/server_wallet
+[oracle@oel7v9 server_wallet]$ orapki wallet add -wallet /u01/app/oracle/server_wallet -dn "CN=server" -keysize 2048 -self_signed -validity 365 -sign_alg sha256 -pwd welcome1
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+
+2) 클라이언트 지갑 생성 및 구성(prod DB)
+
+-클라이언트를 위한 빈 지갑 생성 (새 디렉터리에):
+[oracle@oel7v9 ~]$ mkdir /u01/app/oracle/client_wallet
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/client_wallet
+[oracle@oel7v9 client_wallet]$ orapki wallet create -wallet /u01/app/oracle/client_wallet -auto_login -pwd welcome2
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+
+참고: -auto_login 옵션을 사용하여 cwallet.sso 파일을 다른 머신으로 이동.
+클라이언트가 서버와 동일한 머신에서 실행되는 경우 -auto_login_local을 사용.
+
+-다음 단계는 인증서 요청을 생성.
+--  -keysize 1024 → 2048.
+-- 원본의 export 명령은 클라이언트 지갑 비밀번호를 welcome1로 잘못 적었다. 실측해 보면 auto-login 지갑이라 -pwd를 무시하고 성공한다("Option -pwd is not recognized and ignored."). 올바른 비밀번호로 다시 실행한 결과도 함께 둔다.
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/client_wallet
+[oracle@oel7v9 client_wallet]$ orapki wallet add -wallet . -dn "CN=client,O=oracle,C=ro" -keysize 2048 -pwd "welcome2"
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+[oracle@oel7v9 client_wallet]$ orapki wallet export -wallet . -dn "CN=client,O=oracle,C=ro" -request ./certificate_request.txt -pwd "welcome1"
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Found Auto Login (AL) wallet.
+Option -pwd is not recognized and ignored.
+Operation is successfully completed.
+[oracle@oel7v9 client_wallet]$ orapki wallet export -wallet . -dn "CN=client,O=oracle,C=ro" -request ./certificate_request.txt -pwd "welcome2"
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+[oracle@oel7v9 client_wallet]$ ls -l certificate_request.txt
+-rw-------. 1 oracle dba 935 Oct 28 09:27 certificate_request.txt
+
+"client" 디렉터리에서 "server" 디렉터리로 인증서 요청 복사:
+-- [19c 랩] 한 서버에서 실측했으므로 scp 대신 cp.
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/client_wallet
+[oracle@oel7v9 client_wallet]$ cp certificate_request.txt /u01/app/oracle/server_wallet/
+
+*클라이언트 인증서에 서명하고 서버의 CA 인증서 내보내기(orcl DB에서 )
+-- orapki cert create에 -sign_alg sha256 추가.
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/server_wallet
+[oracle@oel7v9 server_wallet]$ orapki cert create -wallet . -request ./certificate_request.txt -cert ./signed_certificate.cert -validity 365 -sign_alg sha256 -pwd "welcome1"
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+[oracle@oel7v9 server_wallet]$ orapki wallet export -wallet /u01/app/oracle/server_wallet -dn "CN=server" -cert server_ca.cert
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+참고: 서버의 자동 로그인 지갑은 인증 기관(CA)으로 사용.
+이 방법을 사용하면 클라이언트 인증서에 서명하기 위해 실제 CA를 사용하는 것을 피할 수 있음.
+
+*서명된 인증서(signed_certificate.cert)와 서버의 루트 인증서(server_ca.cert)를 클라이언트 지갑 디렉터리로 복사.
+(orcl DB에서 )
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/server_wallet
+[oracle@oel7v9 server_wallet]$ cp signed_certificate.cert /u01/app/oracle/client_wallet/
+[oracle@oel7v9 server_wallet]$ cp server_ca.cert /u01/app/oracle/client_wallet/
+
+*prod DB에서  클라이언트 지갑으로 가져오기
+--  가져온 결과를 확인하도록 orapki wallet display를 덧붙였다.
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/client_wallet
+[oracle@oel7v9 client_wallet]$ orapki wallet add -wallet . -trusted_cert -cert ./server_ca.cert -pwd "welcome2"
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+[oracle@oel7v9 client_wallet]$ orapki wallet add -wallet . -user_cert -cert ./signed_certificate.cert -pwd "welcome2"
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+[oracle@oel7v9 client_wallet]$ orapki wallet display -wallet .
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Requested Certificates:
+User Certificates:
+Subject:        CN=client,O=oracle,C=ro
+Trusted Certificates:
+Subject:        CN=server
+
+3) 데이터베이스 내 사용자 생성
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> create user client identified externally as 'CN=client,O=oracle,C=ro';
+
+User created.
+
+SYS@orcl> grant create session to client;
+
+Grant succeeded.
+
+참고: 데이터베이스 내 사용자는 해당 인증서의 고유 이름(DN)을 지정하여 생성.
+이전에 생성된 사용자 인증서는 DN 'CN=client,O=oracle,C=ro'를 가졌으므로,
+데이터베이스에서 사용자를 생성할 때 동일한 문자열을 사용.
+
+위의 모든 단계를 수행한 후, 데이터베이스 서버 머신의 server_wallet 및 client_wallet 디렉터리에
+서버와 클라이언트 모두에 필요한 모든 인증서가 준비 완료.
+
+4) 서버 측 리스너 구성(orcl DB에서 )
+
+-TCPS 리스너 주소 구성:
+
+Net Manager를 사용하여 새 TCPS 리스너를 생성하거나 기존 리스너에 새 TCPS 주소를 및  지갑 위치를 추가.
+-- [19c 랩] 기본 LISTENER를 재기동하지 않도록 TCPS 전용 리스너 LISTENER_SSL(포트 1522)을 server_tns에 따로 만든다.
+-- [19c 랩] 정적 등록(SID_DESC)의 ENVS로 TNS_ADMIN을 넘겨야 이 리스너가 띄운 서버 프로세스가 server_tns/sqlnet.ora(서버 지갑)를 읽는다.
+[oracle@oel7v9 ~]$ mkdir /u01/app/oracle/server_tns
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/server_tns
+[oracle@oel7v9 server_tns]$ printf '%s\n' 'LISTENER_SSL =' '   (DESCRIPTION_LIST =' '      (DESCRIPTION =' '         (ADDRESS = (PROTOCOL = TCPS)(HOST = oel7v9)(PORT = 1522))' '      )' '   )' 'SID_LIST_LISTENER_SSL =' '   (SID_LIST =' '      (SID_DESC =' '         (GLOBAL_DBNAME = orcl)' '         (ORACLE_HOME = /u01/app/oracle/product/19.3.0/dbhome_1)' '         (SID_NAME = orcl)' '         (ENVS = "TNS_ADMIN=/u01/app/oracle/server_tns")' '      )' '   )' 'WALLET_LOCATION =' '   (SOURCE=' '     (METHOD=File)' '      (METHOD_DATA=' '        (DIRECTORY=/u01/app/oracle/server_wallet)))' > listener.ora
+[oracle@oel7v9 server_tns]$ cat listener.ora
+LISTENER_SSL =
+   (DESCRIPTION_LIST =
+      (DESCRIPTION =
+         (ADDRESS = (PROTOCOL = TCPS)(HOST = oel7v9)(PORT = 1522))
+      )
+   )
+SID_LIST_LISTENER_SSL =
+   (SID_LIST =
+      (SID_DESC =
+         (GLOBAL_DBNAME = orcl)
+         (ORACLE_HOME = /u01/app/oracle/product/19.3.0/dbhome_1)
+         (SID_NAME = orcl)
+         (ENVS = "TNS_ADMIN=/u01/app/oracle/server_tns")
+      )
+   )
+WALLET_LOCATION =
+   (SOURCE=
+     (METHOD=File)
+      (METHOD_DATA=
+        (DIRECTORY=/u01/app/oracle/server_wallet)))
+
+5) 서버 측 sqlnet.ora 구성( orcl DB에서 )
+
+-- [19c] SSL_VERSION = 0은 19.3에서 오류 없이 받아들여졌고 접속도 됐다(아래 9)). 문서에 적힌 값은 undetermined, 1.0, 1.1, 1.2 등이므로 실무에서는 SSL_VERSION = 1.2(또는 TLS_VERSION)로 적는다.
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/server_tns
+[oracle@oel7v9 server_tns]$ printf '%s\n' 'SQLNET.AUTHENTICATION_SERVICES= (BEQ, TCPS)' 'SSL_VERSION = 0' 'SSL_CLIENT_AUTHENTICATION = TRUE' 'WALLET_LOCATION =' '   (SOURCE =' '     (METHOD = FILE)' '      (METHOD_DATA =' '        (DIRECTORY = /u01/app/oracle/server_wallet)' '      )' '     )' > sqlnet.ora
+[oracle@oel7v9 server_tns]$ cat sqlnet.ora
+SQLNET.AUTHENTICATION_SERVICES= (BEQ, TCPS)
+SSL_VERSION = 0
+SSL_CLIENT_AUTHENTICATION = TRUE
+WALLET_LOCATION =
+   (SOURCE =
+     (METHOD = FILE)
+      (METHOD_DATA =
+        (DIRECTORY = /u01/app/oracle/server_wallet)
+      )
+     )
+
+6) 클라이언트 측 sqlnet.ora 구성(prod DB 에서 )
+
+클라이언트 sqlnet.ora에서 TCPS를 인증 방법으로 설정하고 지갑 위치를 설정.
+[oracle@oel7v9 ~]$ mkdir /u01/app/oracle/client_tns
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/client_tns
+[oracle@oel7v9 client_tns]$ printf '%s\n' 'SQLNET.AUTHENTICATION_SERVICES= (BEQ, TCPS)' 'SSL_VERSION = 0' 'SSL_CLIENT_AUTHENTICATION = TRUE' 'WALLET_LOCATION =' '   (SOURCE =' '     (METHOD = FILE)' '      (METHOD_DATA =' '      (DIRECTORY = /u01/app/oracle/client_wallet)' '      )' '   )' > sqlnet.ora
+[oracle@oel7v9 client_tns]$ cat sqlnet.ora
+SQLNET.AUTHENTICATION_SERVICES= (BEQ, TCPS)
+SSL_VERSION = 0
+SSL_CLIENT_AUTHENTICATION = TRUE
+WALLET_LOCATION =
+   (SOURCE =
+     (METHOD = FILE)
+      (METHOD_DATA =
+      (DIRECTORY = /u01/app/oracle/client_wallet)
+      )
+   )
+
+7) 클라이언트 측 tnsnames.ora 구성
+
+Net Manager 또는 Net Configuration Assistant를 사용하여
+TCPS를 사용하는 서비스 이름을 생성.
+-- [19c 랩] HOST는 실측 서버 이름 oel7v9로 바꿨다.
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/client_tns
+[oracle@oel7v9 client_tns]$ printf '%s\n' 'ORCLSSL =' '   (DESCRIPTION =' '      (ADDRESS_LIST =' '         (ADDRESS = (PROTOCOL = TCPS)(HOST = oel7v9)(PORT = 1522))' '      )' '      (CONNECT_DATA =' '         (SERVICE_NAME = orcl)' '      )' '     )' > tnsnames.ora
+[oracle@oel7v9 client_tns]$ cat tnsnames.ora
+ORCLSSL =
+   (DESCRIPTION =
+      (ADDRESS_LIST =
+         (ADDRESS = (PROTOCOL = TCPS)(HOST = oel7v9)(PORT = 1522))
+      )
+      (CONNECT_DATA =
+         (SERVICE_NAME = orcl)
+      )
+     )
+
+8) 데이터베이스 구성
+
+-- [19c] 원본의 다음 작업은 하지 않는다.
+--   alter system set remote_os_authent=FALSE scope=spfile
+--   alter system set os_authent_prefix='' scope=spfile;
+--   shut immediate / startup
+-- [19c] REMOTE_OS_AUTHENT는 11g부터 디프리케이트이고 기본값이 FALSE다. 인증서 사용자는 IDENTIFIED EXTERNALLY AS 'DN'으로 DN과 직접 연결되므로 OS_AUTHENT_PREFIX(기본 ops$)와 관계가 없다.
+-- [19c] 값을 그대로 둔 채 9)에서 인증서 로그인이 되는 것으로 확인한다(11장 실측과 같음). DB 재기동도 필요 없다.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> show parameter remote_os_authent
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+remote_os_authent                    boolean     FALSE
+SYS@orcl> show parameter os_authent_prefix
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+os_authent_prefix                    string      ops$
+
+9) 구성 테스트　　orcl db에서 리스너 재 가동
+-- 기본 리스너 재가동 대신 LISTENER_SSL을 기동한다.
+[oracle@oel7v9 ~]$ export TNS_ADMIN=/u01/app/oracle/server_tns
+[oracle@oel7v9 ~]$ lsnrctl start LISTENER_SSL
+
+LSNRCTL for Linux: Version 19.0.0.0.0 - Production on 28-OCT-2026 09:27:42
+
+Copyright (c) 1991, 2019, Oracle.  All rights reserved.
+
+Starting /u01/app/oracle/product/19.3.0/dbhome_1/bin/tnslsnr: please wait...
+
+TNSLSNR for Linux: Version 19.0.0.0.0 - Production
+System parameter file is /u01/app/oracle/server_tns/listener.ora
+Log messages written to /u01/app/oracle/diag/tnslsnr/oel7v9/listener_ssl/alert/log.xml
+Listening on: (DESCRIPTION=(ADDRESS=(PROTOCOL=tcps)(HOST=oel7v9)(PORT=1522)))
+
+Connecting to (DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=oel7v9)(PORT=1522)))
+STATUS of the LISTENER
+------------------------
+Alias                     LISTENER_SSL
+Version                   TNSLSNR for Linux: Version 19.0.0.0.0 - Production
+Start Date                28-OCT-2026 09:27:42
+Uptime                    0 days 0 hr. 0 min. 0 sec
+Trace Level               off
+Security                  ON: Local OS Authentication
+SNMP                      OFF
+Listener Parameter File   /u01/app/oracle/server_tns/listener.ora
+Listener Log File         /u01/app/oracle/diag/tnslsnr/oel7v9/listener_ssl/alert/log.xml
+Listening Endpoints Summary...
+  (DESCRIPTION=(ADDRESS=(PROTOCOL=tcps)(HOST=oel7v9)(PORT=1522)))
+Services Summary...
+Service "orcl" has 1 instance(s).
+  Instance "orcl", status UNKNOWN, has 1 handler(s) for this service...
+The command completed successfully
+
+- 클라이언트가 TCPS 리스너의 별칭으로 tnsping을 할 수 있는지 확인.
+[oracle@oel7v9 ~]$ export TNS_ADMIN=/u01/app/oracle/client_tns
+[oracle@oel7v9 ~]$ tnsping ORCLSSL
+
+TNS Ping Utility for Linux: Version 19.0.0.0.0 - Production on 28-OCT-2026 09:27:42
+
+Copyright (c) 1997, 2019, Oracle.  All rights reserved.
+
+Used parameter files:
+/u01/app/oracle/client_tns/sqlnet.ora
+
+
+Used TNSNAMES adapter to resolve the alias
+Attempting to contact (DESCRIPTION = (ADDRESS_LIST = (ADDRESS = (PROTOCOL = TCPS)(HOST = oel7v9)(PORT = 1522))) (CONNECT_DATA = (SERVICE_NAME = orcl)))
+OK (60 msec)
+
+- 두 번째 테스트는 지갑에 저장된 인증서와 연결된 사용자로 연결.
+-- [19c] 접속이 TCPS·인증서(SSL)로 이루어졌는지 USERENV로 함께 확인한다.
+SQL> CONNECT /@ORCLSSL
+Connected.
+CLIENT@ORCLSSL> select user from dual;
+
+USER
+------------------------------------------------------------------------------------------------------------------------
+CLIENT
+
+1 row selected.
+
+CLIENT@ORCLSSL> select sys_context('userenv','network_protocol') proto, sys_context('userenv','authentication_method') auth from dual;
+
+PROTO
+------------------------------------------------------------------------------------------------------------------------
+AUTH
+------------------------------------------------------------------------------------------------------------------------
+tcps
+SSL
+
+
+1 row selected.
+
+-- 이 절에서 만든 리스너, 지갑, 네트워크 디렉터리, 사용자를 지운다.
+[oracle@oel7v9 ~]$ export TNS_ADMIN=/u01/app/oracle/server_tns
+[oracle@oel7v9 ~]$ lsnrctl stop LISTENER_SSL | tail -1
+The command completed successfully
+[oracle@oel7v9 ~]$ unset TNS_ADMIN
+[oracle@oel7v9 ~]$ rm -rf /u01/app/oracle/server_wallet /u01/app/oracle/client_wallet /u01/app/oracle/server_tns /u01/app/oracle/client_tns
+[oracle@oel7v9 ~]$ ls -d /u01/app/oracle/server_wallet /u01/app/oracle/client_wallet /u01/app/oracle/server_tns /u01/app/oracle/client_tns
+ls: cannot access /u01/app/oracle/server_wallet: No such file or directory
+ls: cannot access /u01/app/oracle/client_wallet: No such file or directory
+ls: cannot access /u01/app/oracle/server_tns: No such file or directory
+ls: cannot access /u01/app/oracle/client_tns: No such file or directory
+[oracle@oel7v9 ~]$ netstat -lnt | grep -c ':1522 '
+0
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> drop user client cascade;
+
+User dropped.
+
+
+■ SECURE EXTERNAL PASSWORD STORE
+
+- 오라클 데이터베이스 클라이언트가 데이터베이스에 접속하기 위한 비밀번호를 파일 시스템의 안전한 위치에 암호화하여 저장하고, 접속 시 해당 비밀번호를 자동으로 로드하여 사용하는 메커니즘
+
+- 목표: 비밀번호를 애플리케이션 코드, 접속 문자열, 또는 평문 파일(Plain Text File)에 직접 노출하는 위험을 제거.
+- 작동 방식: 오라클 클라이언트(예: SQL*Plus)는 접속할 때 사용자 이름만 제공하고, 비밀번호는 로컬 시스템에 저장된 SEPS 파일(보통 오라클 지갑/Wallet 파일)에서 가져 옴.
+-- 실제로는 사용자 이름도 주지 않는다. "/@접속문자열" 형식으로 접속하면 접속 문자열과 같은 이름으로 저장된 사용자 이름·비밀번호를 지갑에서 꺼낸다.
+
+- 구성 요소
+
+| 구성 요소            | 설명                                                              |
+|----------------------|-------------------------------------------------------------------|
+| Oracle Wallet (지갑) | 비밀번호가 암호화되어 저장되는 컨테이너. 비밀번호 저장소 역할     |
+| MKSTORE 유틸리티     | 비밀번호를 생성, 수정 및 지갑에 저장하는 데 사용되는 오라클 cmd    |
+| sqlnet.ora 파일      | 클라이언트가 지갑의 위치와 사용 방법을 알 수 있도록 설정하는 파일 |
+
+--  사용자 test1·test2는 SEC_ACL 자료와 이름이 겹쳐 seps1·seps2로 바꿨다(비밀번호도 같은 이름). 접속 문자열 tt1·tt2·tt_proxy는 원본 그대로다.
+--  처음 실행하면 DROP USER는 ORA-01918로 실패한다. 원본은 사용자가 이미 있던 상태의 출력이다.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> drop user seps1 cascade;
+drop user seps1 cascade
+          *
+ERROR at line 1:
+ORA-01918: user 'SEPS1' does not exist
+
+
+SYS@orcl> drop user seps2 cascade;
+drop user seps2 cascade
+          *
+ERROR at line 1:
+ORA-01918: user 'SEPS2' does not exist
+
+
+SYS@orcl> create user seps1 identified by seps1;
+
+User created.
+
+SYS@orcl> create user seps2 identified by seps2;
+
+User created.
+
+SYS@orcl> grant create session to seps1,seps2;
+
+Grant succeeded.
+
+SYS@orcl> alter user seps2 grant connect through seps1;
+
+User altered.
+
+--  mkstore의 지갑 비밀번호는 원본의 here document(<<EOF … EOF) 대신 echo 파이프로 넣었다. 동작은 같다.
+--  원본은 앞부분을 SQL*Plus의 ! 명령으로 실행하지만 실측은 셸에서 바로 실행했다.
+[oracle@oel7v9 ~]$ mkdir -p ${HOME}/wallet
+[oracle@oel7v9 ~]$ mkdir -p ${HOME}/tns
+[oracle@oel7v9 ~]$ orapki wallet create -wallet "${HOME}/wallet" -pwd "MyPassword1" -auto_login_local
+Oracle PKI Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Operation is successfully completed.
+[oracle@oel7v9 ~]$ echo MyPassword1 | mkstore -wrl "${HOME}/wallet" -createCredential tt1 seps1 seps1
+Oracle Secret Store Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Enter wallet password:   
+[oracle@oel7v9 ~]$ echo MyPassword1 | mkstore -wrl "${HOME}/wallet" -createCredential tt2 seps2 seps2
+Oracle Secret Store Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Enter wallet password:
+[oracle@oel7v9 ~]$ echo MyPassword1 | mkstore -wrl "${HOME}/wallet" -createCredential tt_proxy "seps1[seps2]" seps1
+Oracle Secret Store Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Enter wallet password:
+
+-- 원본은 sqlnet.ora·tnsnames.ora의 내용만 보여 준다. 실측에서는 printf로 파일을 만든 뒤 cat으로 확인했다. HOST는 oel7v9로 바꿨다.
+-- SSL_CLIENT_AUTHENTICATION·SSL_VERSION은 TCP 접속에는 쓰이지 않는다. 원본 그대로 두었다.
+-- 원본의 export TNS_ADMIIN은 오타라 TNS_ADMIN이 비어 있다(아래 첫 echo). 원본 출력의 /home/oracle/tns는 이 오타로는 나올 수 없다. 올바른 이름으로 다시 export했다.
+[oracle@oel7v9 ~]$ ls ${HOME}/wallet
+cwallet.sso
+cwallet.sso.lck
+ewallet.p12
+ewallet.p12.lck
+[oracle@oel7v9 ~]$ echo MyPassword1 | mkstore -wrl "${HOME}/wallet" -listCredential
+Oracle Secret Store Tool Release 19.0.0.0.0 - Production
+Version 19.3.0.0.0
+Copyright (c) 2004, 2019, Oracle and/or its affiliates. All rights reserved.
+
+Enter wallet password:
+List credential (index: connect_string username)
+3: tt_proxy seps1[seps2]
+2: tt2 seps2
+1: tt1 seps1
+[oracle@oel7v9 ~]$ printf '%s\n' 'WALLET_LOCATION =' '  (SOURCE =' '   (METHOD = FILE)' '   (METHOD_DATA =' '     (DIRECTORY = /home/oracle/wallet)' '   )' '  )' 'SQLNET.WALLET_OVERRIDE = TRUE' 'SSL_CLIENT_AUTHENTICATION = FALSE' 'SSL_VERSION = 0' > ${HOME}/tns/sqlnet.ora
+[oracle@oel7v9 ~]$ printf '%s\n' 'TT2 =' '   (DESCRIPTION =' '      (ADDRESS_LIST =' '         (ADDRESS = (PROTOCOL = TCP)(HOST = oel7v9)(PORT = 1521))' '      )' '      (CONNECT_DATA =' '         (SERVER = DEDICATED)' '         (SERVICE_NAME = orcl)' '      )' '   )' 'TT1 =' '   (DESCRIPTION =' '      (ADDRESS_LIST =' '         (ADDRESS = (PROTOCOL = TCP)(HOST = oel7v9)(PORT = 1521))' '      )' '      (CONNECT_DATA =' '         (SERVER = DEDICATED)' '         (SERVICE_NAME = orcl)' '      )' '   )' 'TT_PROXY =' '   (DESCRIPTION =' '      (ADDRESS_LIST =' '         (ADDRESS = (PROTOCOL = TCP)(HOST = oel7v9)(PORT = 1521))' '      )' '      (CONNECT_DATA =' '         (SERVER = DEDICATED)' '         (SERVICE_NAME = orcl)' '      )' '   )' > ${HOME}/tns/tnsnames.ora
+[oracle@oel7v9 ~]$ cat ${HOME}/tns/sqlnet.ora
+WALLET_LOCATION =
+  (SOURCE =
+   (METHOD = FILE)
+   (METHOD_DATA =
+     (DIRECTORY = /home/oracle/wallet)
+   )
+  )
+SQLNET.WALLET_OVERRIDE = TRUE
+SSL_CLIENT_AUTHENTICATION = FALSE
+SSL_VERSION = 0
+[oracle@oel7v9 ~]$ cat ${HOME}/tns/tnsnames.ora
+TT2 =
+   (DESCRIPTION =
+      (ADDRESS_LIST =
+         (ADDRESS = (PROTOCOL = TCP)(HOST = oel7v9)(PORT = 1521))
+      )
+      (CONNECT_DATA =
+         (SERVER = DEDICATED)
+         (SERVICE_NAME = orcl)
+      )
+   )
+TT1 =
+   (DESCRIPTION =
+      (ADDRESS_LIST =
+         (ADDRESS = (PROTOCOL = TCP)(HOST = oel7v9)(PORT = 1521))
+      )
+      (CONNECT_DATA =
+         (SERVER = DEDICATED)
+         (SERVICE_NAME = orcl)
+      )
+   )
+TT_PROXY =
+   (DESCRIPTION =
+      (ADDRESS_LIST =
+         (ADDRESS = (PROTOCOL = TCP)(HOST = oel7v9)(PORT = 1521))
+      )
+      (CONNECT_DATA =
+         (SERVER = DEDICATED)
+         (SERVICE_NAME = orcl)
+      )
+   )
+[oracle@oel7v9 ~]$ export TNS_ADMIIN=${HOME}/tns
+[oracle@oel7v9 ~]$ echo $TNS_ADMIN
+
+[oracle@oel7v9 ~]$ export TNS_ADMIN=${HOME}/tns
+[oracle@oel7v9 ~]$ echo $TNS_ADMIN
+/home/oracle/tns
+
+-- 원본에 없던 DIRPUMP 디렉터리를 만든다. 실측 DB에는 DIRPUMP가 없어서다.
+-- 프록시 별칭 tt_proxy로 붙은 세션의 실제 접속 계정을 PROXY_USER로 함께 확인했다.
+-- expdp가 "Password:"를 띄우지만 입력 없이 지갑 자격 증명으로 접속된다
+SQL> CONNECT /@tt1
+Connected.
+SEPS1@tt1> show user
+USER is "SEPS1"
+SEPS1@tt1> conn /@tt2
+Connected.
+SEPS2@tt2> show user
+USER is "SEPS2"
+SEPS2@tt2> conn /@tt_proxy
+Connected.
+SEPS2@tt_proxy> show user
+USER is "SEPS2"
+SEPS2@tt_proxy> select sys_context('userenv','proxy_user') proxy_user from dual;
+
+PROXY_USER
+------------------------------------------------------------------------------------------------------------------------
+SEPS1
+
+1 row selected.
+
+SEPS2@tt_proxy> conn /as sysdba
+Connected.
+SYS@orcl> desc dba_directories
+ Name                                                              Null?    Type
+ ----------------------------------------------------------------- -------- --------------------------------------------
+ OWNER                                                             NOT NULL VARCHAR2(128)
+ DIRECTORY_NAME                                                    NOT NULL VARCHAR2(128)
+ DIRECTORY_PATH                                                             VARCHAR2(4000)
+ ORIGIN_CON_ID                                                              NUMBER
+
+SYS@orcl> col directory_name for a25
+SYS@orcl> col directory_path for a60
+SYS@orcl> select DIRECTORY_NAME,DIRECTORY_PATH from dba_directories;
+
+DIRECTORY_NAME            DIRECTORY_PATH
+------------------------- ------------------------------------------------------------
+DP_NONE                   /u03/no_such_path
+DP_BAD                    /u03/dpdump_bad
+TSPITR_DIROBJ_DPDIR       /arch/aux_drill
+DP_DIR                    /u03/dpdump
+LOG_FILE_DIR              /home/oracle/logs
+DATA_FILE_DIR             /home/oracle/db-sample-schemas-19c/sales_history/
+MEDIA_DIR                 /home/oracle/db-sample-schemas-19c/product_media/
+SUBDIR                    /home/oracle/db-sample-schemas-19c/order_entry//2002/Sep
+SS_OE_XMLDIR              /home/oracle/db-sample-schemas-19c/order_entry/
+SDO_DIR_WORK
+SDO_DIR_ADMIN             /u01/app/oracle/product/19.3.0/dbhome_1/md/admin
+XMLDIR                    /u01/app/oracle/product/19.3.0/dbhome_1/rdbms/xml
+XSDDIR                    /u01/app/oracle/product/19.3.0/dbhome_1/rdbms/xml/schema
+OPATCH_INST_DIR           /u01/app/oracle/product/19.3.0/dbhome_1/OPatch
+ORACLE_OCM_CONFIG_DIR2    /u01/app/oracle/product/19.3.0/dbhome_1/ccr/state
+ORACLE_BASE               /u01/app/oracle
+ORACLE_HOME               /u01/app/oracle/product/19.3.0/dbhome_1
+ORACLE_OCM_CONFIG_DIR     /u01/app/oracle/product/19.3.0/dbhome_1/ccr/state
+DATA_PUMP_DIR             /u01/app/oracle/admin/orcl/dpdump/
+OPATCH_SCRIPT_DIR         /u01/app/oracle/product/19.3.0/dbhome_1/QOpatch
+OPATCH_LOG_DIR            /u01/app/oracle/product/19.3.0/dbhome_1/rdbms/log
+JAVA$JOX$CUJS$DIRECTORY$  /u01/app/oracle/product/19.3.0/dbhome_1/javavm/admin/
+
+22 rows selected.
+
+SYS@orcl> !mkdir -p /home/oracle/datapump
+
+SYS@orcl> create directory dirpump as '/home/oracle/datapump';
+
+Directory created.
+
+SYS@orcl> select DIRECTORY_NAME,DIRECTORY_PATH from dba_directories where directory_name='DIRPUMP';
+
+DIRECTORY_NAME            DIRECTORY_PATH
+------------------------- ------------------------------------------------------------
+DIRPUMP                   /home/oracle/datapump
+
+1 row selected.
+
+SYS@orcl> grant create table to seps1;
+
+Grant succeeded.
+
+SYS@orcl> grant read,write on directory dirpump to seps1;
+
+Grant succeeded.
+
+SYS@orcl> alter user seps1
+  2  default tablespace users
+  3  quota 10m on users;
+
+User altered.
+
+SYS@orcl> conn /@tt1
+Connected.
+SEPS1@tt1> create table tab1(id number);
+
+Table created.
+
+SEPS1@tt1> insert into tab1 values(1);
+
+1 row created.
+
+SEPS1@tt1> commit;
+
+Commit complete.
+
+SEPS1@tt1> !expdp /@tt1 tables=tab1 directory=dirpump dumpfile=tt1_tab1.dmp
+
+Export: Release 19.0.0.0.0 - Production on Wed Oct 28 09:28:59 2026
+
+Password:
+
+Connected to: Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Starting "SEPS1"."SYS_EXPORT_TABLE_01":  /********@tt1 tables=tab1 directory=dirpump dumpfile=tt1_tab1.dmp
+Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+Processing object type TABLE_EXPORT/TABLE/TABLE
+. . exported "SEPS1"."TAB1"                              5.046 KB       1 rows
+Master table "SEPS1"."SYS_EXPORT_TABLE_01" successfully loaded/unloaded
+******************************************************************************
+Dump file set for SEPS1.SYS_EXPORT_TABLE_01 is:
+  /home/oracle/datapump/tt1_tab1.dmp
+Job "SEPS1"."SYS_EXPORT_TABLE_01" successfully completed at Wed Oct 28 09:29:05 2026 elapsed 0 00:00:06
+
+--  이 절에서 만든 사용자, 디렉터리, 지갑, 네트워크 파일을 지운다.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> drop user seps1 cascade;
+
+User dropped.
+
+SYS@orcl> drop user seps2 cascade;
+
+User dropped.
+
+SYS@orcl> drop directory dirpump;
+
+Directory dropped.
+[oracle@oel7v9 ~]$ rm -rf ${HOME}/wallet ${HOME}/tns /home/oracle/datapump
+[oracle@oel7v9 ~]$ ls -d ${HOME}/wallet ${HOME}/tns /home/oracle/datapump
+ls: cannot access /home/oracle/wallet: No such file or directory
+ls: cannot access /home/oracle/tns: No such file or directory
+ls: cannot access /home/oracle/datapump: No such file or directory
+
+
+■ Proxy Authentication
+
+- 프록시 인증은 중간 계층(Middle Tier)에 있는 하나의 공통 사용자 계정(프록시 사용자)이 최종 사용자(End User)를 대신하여 데이터베이스에 접속하는 방식. 애플리케이션 서버(프록시)가 데이터베이스에 연결할 때, "나는 애플리케이션 서버(프록시)지만, 지금 이 연결은 '실제 사용자 A'를 위한 거야"라고 알리는 것.
+- 프록시 사용자 (Proxy User): 애플리케이션 서버가 데이터베이스에 접속하는 데 사용하는 실제 DB 계정. 이 계정은 비밀번호 없이 최종 사용자를 대신하여 연결할 수 있는 권한을 부여받음
+- 클라이언트 사용자 (Client User/Target User): 애플리케이션을 사용하는 최종 사용자. 데이터베이스 세션은 이 사용자의 권한으로 실행
+- 프록시 인증의 작동 방식 (두 가지 유형)
+  1. 비밀번호 기반 프록시 인증 (Password-Based Proxy):
+     o 프록시 사용자 (APPSERVER)가 최종 사용자(USER_A)의 비밀번호를 받아서 접속.
+     o CONNECT APPSERVER[USER_A] IDENTIFIED BY user_a_password; 형태로 연결.
+  2. 비밀번호 없는 프록시 인증 (No-Password Proxy):
+     o 프록시 사용자 (APPSERVER)가 자신의 비밀번호를 사용하여 접속하고, 최종 사용자(USER_A)의 비밀번호 없이도 대신 연결.
+     o 이 경우, 프록시 사용자는 최종 사용자를 대신할 수 있는 권한만 있으면 됨. (CONNECT APPSERVER[USER_A];) 이 방식이 가장 일반적.
+-- 19c의 RESOURCE 역할에는 SODA_APP 역할이 들어 있어 USER1의 SESSION_ROLES에 SODA_APP이 함께 보인다(원본 출력과 같음).
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> create role proxyrole;
+
+Role created.
+
+SYS@orcl> Grant create table to proxyrole;
+
+Grant succeeded.
+
+SYS@orcl> CREATE USER appsuser IDENTIFIED BY appsuser;
+
+User created.
+
+SYS@orcl> GRANT connect to appsuser;
+
+Grant succeeded.
+
+SYS@orcl> CREATE USER user1 IDENTIFIED BY user1;
+
+User created.
+
+SYS@orcl> CREATE USER user2 IDENTIFIED BY user2;
+
+User created.
+
+SYS@orcl> GRANT connect,proxyrole,RESOURCE to user1;
+
+Grant succeeded.
+
+SYS@orcl> GRANT connect,proxyrole to user2;
+
+Grant succeeded.
+
+SYS@orcl> alter user user1 quota 10m on users;
+
+User altered.
+
+SYS@orcl> ALTER USER user1 GRANT CONNECT THROUGH appsuser;
+
+User altered.
+
+SYS@orcl> ALTER USER user2 GRANT CONNECT THROUGH appsuser WITH ROLE proxyrole,connect;
+
+User altered.
+
+SYS@orcl> conn appsuser[user1]/appsuser
+Connected.
+USER1@orcl> show user
+USER is "USER1"
+USER1@orcl> select user from dual;
+
+USER
+------------------------------------------------------------------------------------------------------------------------
+USER1
+
+1 row selected.
+
+USER1@orcl> col "SYS_CONTEXT('USERENV','CURRENT_USER')" for a40
+USER1@orcl> col "SYS_CONTEXT('USERENV','PROXY_USER')" for a40
+USER1@orcl> col role for a30
+USER1@orcl> select sys_context('userenv','current_user') from dual;
+
+SYS_CONTEXT('USERENV','CURRENT_USER')
+----------------------------------------
+USER1
+
+1 row selected.
+
+USER1@orcl> select sys_context('userenv','proxy_user') from dual;
+
+SYS_CONTEXT('USERENV','PROXY_USER')
+----------------------------------------
+APPSUSER
+
+1 row selected.
+
+USER1@orcl> select role from session_roles;
+
+ROLE
+------------------------------
+CONNECT
+RESOURCE
+SODA_APP
+PROXYROLE
+
+4 rows selected.
+
+USER1@orcl> conn appsuser[user2]/appsuser
+Connected.
+USER2@orcl> show user
+USER is "USER2"
+USER2@orcl> select user from dual;
+
+USER
+------------------------------------------------------------------------------------------------------------------------
+USER2
+
+1 row selected.
+
+USER2@orcl> select sys_context('userenv','current_user') from dual;
+
+SYS_CONTEXT('USERENV','CURRENT_USER')
+----------------------------------------
+USER2
+
+1 row selected.
+
+USER2@orcl> select sys_context('userenv','proxy_user') from dual;
+
+SYS_CONTEXT('USERENV','PROXY_USER')
+----------------------------------------
+APPSUSER
+
+1 row selected.
+
+USER2@orcl> select role from session_roles;
+
+ROLE
+------------------------------
+CONNECT
+PROXYROLE
+
+2 rows selected.
+
+--  1번 형식(CONNECT APPSERVER[USER_A] IDENTIFIED BY ...)은 SQL*Plus CONNECT 문법이 아니어서 SP2-0306이 난다. 대상 사용자 비밀번호를 요구하려면 ALTER USER ... GRANT CONNECT THROUGH ... AUTHENTICATION REQUIRED로 지정한다. 이때 PROXY_USERS.AUTHENTICATION이 YES가 되고, 프록시 비밀번호만으로 접속하면 ORA-28150이 난다. 비밀번호는 OCI·JDBC 프록시 세션 API로 넘긴다(문서 기준).
+--  아래 authentication 목록의 AUTHENTICATED USING PASSWORD는 19.3에서도 오류 없이 받아들여졌다. 확인 뒤 user1은 원래 상태(AUTHENTICATION NO)로 되돌렸다.
+.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> conn appsuser[user1] identified by user1
+SP2-0306: Invalid option.
+Usage: CONN[ECT] [{logon|/|proxy} [AS {SYSDBA|SYSOPER|SYSASM|SYSBACKUP|SYSDG|SYSKM|SYSRAC}] [edition=value]]
+where <logon> ::= <username>[/<password>][@<connect_identifier>]
+      <proxy> ::= <proxyuser>[<username>][/<password>][@<connect_identifier>]
+SYS@orcl> conn /as sysdba
+Connected.
+SYS@orcl> ALTER USER user1 GRANT CONNECT THROUGH appsuser AUTHENTICATED USING PASSWORD;
+
+User altered.
+
+SYS@orcl> ALTER USER user1 GRANT CONNECT THROUGH appsuser AUTHENTICATION REQUIRED;
+
+User altered.
+
+SYS@orcl> col proxy for a10
+SYS@orcl> col client for a10
+SYS@orcl> select proxy, client, authentication from proxy_users where client = 'USER1';
+
+PROXY      CLIENT     AUT
+---------- ---------- ---
+APPSUSER   USER1      YES
+
+1 row selected.
+
+SYS@orcl> conn appsuser[user1]/appsuser
+ERROR:
+ORA-28150: proxy not authorized to connect as client
+
+
+Warning: You are no longer connected to ORACLE.
+SYS@orcl> conn /as sysdba
+Connected.
+SYS@orcl> ALTER USER user1 GRANT CONNECT THROUGH appsuser;
+
+User altered.
+
+SYS@orcl> select proxy, client, authentication from proxy_users where client = 'USER1';
+
+PROXY      CLIENT     AUT
+---------- ---------- ---
+APPSUSER   USER1      NO
+
+1 row selected.
+
+- proxy_options:
+     CONNECT THROUGH proxy [WITH ROLE role_name,...] [authentication]
+     CONNECT THROUGH proxy [WITH ROLE ALL EXCEPT role_name,...] [authentication]
+     CONNECT THROUGH proxy [WITH NO ROLES] [authentication]
+- authentication:
+     AUTHENTICATED USING PASSWORD
+     AUTHENTICATED USING DISTINGUISHED NAME
+     AUTHENTICATED USING CERTIFICATE [TYPE 'type'] [VERSION 'version']
+-- [19c] AUTHENTICATED USING 절은 디프리케이트되었다(19c SQL Reference ALTER USER). AUTHENTICATED USING PASSWORD는 AUTHENTICATION REQUIRED로 바뀌어 저장되고, CERTIFICATE·DISTINGUISHED NAME은 AUTHENTICATION REQUIRED를 생략한 것과 같다. 19c에서는 [WITH ROLE ...] [AUTHENTICATION REQUIRED]로 쓴다.
+
+Revoking Proxy Authentication
+===============================
+--  원본의 conn appsuser[user]/appsuser는 오타라 user1로 고쳤다. 권한을 거둔 뒤에는 ORA-28150이 아니라 ORA-01017이 난다
+--  v$session_connect_info는 컬럼이 많아 건수만 셌다. 이 시점에는 열린 프록시 세션이 없어 0건이다.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> ALTER USER user1 REVOKE CONNECT THROUGH appsuser;
+
+User altered.
+
+SYS@orcl> conn appsuser[user1]/appsuser
+ERROR:
+ORA-01017: invalid username/password; logon denied
+
+
+Warning: You are no longer connected to ORACLE.
+SYS@orcl> conn /as sysdba
+Connected.
+SYS@orcl> desc dba_proxies
+ Name                                                              Null?    Type
+ ----------------------------------------------------------------- -------- --------------------------------------------
+ PROXY                                                                      VARCHAR2(128)
+ CLIENT                                                            NOT NULL VARCHAR2(128)
+ AUTHENTICATION                                                             VARCHAR2(3)
+ AUTHORIZATION_CONSTRAINT                                                   VARCHAR2(35)
+ ROLE                                                                       VARCHAR2(128)
+ PROXY_AUTHORITY                                                            VARCHAR2(9)
+
+SYS@orcl> set linesize 200
+SYS@orcl> col proxy for a15
+SYS@orcl> col client for a15
+SYS@orcl> col role for a15
+SYS@orcl> select * from dba_proxies;
+
+PROXY           CLIENT          AUT AUTHORIZATION_CONSTRAINT            ROLE            PROXY_AUT
+--------------- --------------- --- ----------------------------------- --------------- ---------
+APPSUSER        USER2           NO  PROXY MAY ACTIVATE ROLE             PROXYROLE       DATABASE
+APPSUSER        USER2           NO  PROXY MAY ACTIVATE ROLE             CONNECT         DATABASE
+
+2 rows selected.
+
+SYS@orcl> desc proxy_users
+ Name                                                                                                              Null?    Type
+ ----------------------------------------------------------------------------------------------------------------- -------- ----------------------------------------------------------------------------
+ PROXY                                                                                                             NOT NULL VARCHAR2(128)
+ CLIENT                                                                                                            NOT NULL VARCHAR2(128)
+ AUTHENTICATION                                                                                                             VARCHAR2(3)
+ FLAGS                                                                                                                      VARCHAR2(35)
+
+SYS@orcl> select * from proxy_users;
+
+PROXY           CLIENT          AUT FLAGS
+--------------- --------------- --- -----------------------------------
+APPSUSER        USER2           NO  PROXY MAY ACTIVATE ROLE
+
+1 row selected.
+
+SYS@orcl> select count(*) from v$session_connect_info where AUTHENTICATION_TYPE='PROXY';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+-- 프록시 사용자가 수행한 작업을 감사하고, 해당 작업이 어떤 프록시 사용자를 통해 이루어졌는지 확인하려면:
+-- 아래 AUDIT 문은 전통 감사다. 실측 DB는 혼합 감사 모드(audit_trail=DB)라 그대로 동작한다. 전통 감사는 21c부터 디프리케이트되었으므로 19c에서는 바로 다음의 통합 감사 방식을 함께 익힌다.
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> ALTER USER user1 GRANT CONNECT THROUGH appsuser;
+
+User altered.
+
+SYS@orcl> AUDIT SESSION;
+
+Audit succeeded.
+
+SYS@orcl> AUDIT SELECT TABLE, UPDATE TABLE, INSERT TABLE, DELETE TABLE BY appsuser ON BEHALF OF user1;
+
+Audit succeeded.
+
+SYS@orcl> AUDIT SELECT TABLE, UPDATE TABLE, INSERT TABLE, DELETE TABLE BY user1;
+
+Audit succeeded.
+
+SYS@orcl> conn appsuser[user1]/appsuser
+Connected.
+USER1@orcl> col "SYS_CONTEXT('USERENV','PROXY_USER')" for a40
+USER1@orcl> select sys_context('userenv','proxy_user') from dual;
+
+SYS_CONTEXT('USERENV','PROXY_USER')
+----------------------------------------
+APPSUSER
+
+1 row selected.
+
+USER1@orcl> select user from dual;
+
+USER
+------------------------------------------------------------------------------------------------------------------------
+USER1
+
+1 row selected.
+
+USER1@orcl> CREATE TABLE test (id NUMBER);
+
+Table created.
+
+USER1@orcl> INSERT INTO test VALUES(1);
+
+1 row created.
+
+USER1@orcl> commit;
+
+Commit complete.
+
+USER1@orcl> conn /as sysdba
+Connected.
+SYS@orcl> set linesize 150
+SYS@orcl> COLUMN PROXY FORMAT A10
+SYS@orcl> COLUMN USERNAME FORMAT A10
+SYS@orcl> COLUMN EXTENDED_TIMESTAMP FORMAT A36
+SYS@orcl> COLUMN OWNER FORMAT A6
+SYS@orcl> COLUMN OBJ_NAME FORMAT A10
+SYS@orcl> COLUMN ACTION_NAME FORMAT A15
+SYS@orcl> SELECT
+  2  tr2.username PROXY,
+  3  tr1.username USERNAME,
+  4  tr1.extended_timestamp,
+  5  tr1.owner,
+  6  tr1.obj_name,
+  7  tr1.action_name,
+  8  tr1.returncode ,
+  9  tr1.SESSIONID,
+ 10  tr1.PROXY_SESSIONID
+ 11  FROM dba_audit_trail tr1,
+ 12  dba_audit_trail tr2
+ 13  WHERE tr1.obj_name not in ( 'DUAL','SQLPLUS_PRODUCT_PROFILE','PRODUCT_PRIVS')
+ 14  AND tr1.proxy_sessionid=tr2.sessionid
+ 15  AND tr2.action_name='PROXY AUTHENTICATION ONLY'
+ 16  ORDER BY tr1.timestamp;
+
+PROXY      USERNAME   EXTENDED_TIMESTAMP                   OWNER  OBJ_NAME   ACTION_NAME     RETURNCODE  SESSIONID PROXY_SESSIONID
+---------- ---------- ------------------------------------ ------ ---------- --------------- ---------- ---------- ---------------
+APPSUSER   USER1      28-OCT-26 09.29.45.863654 AM +09:00  USER1  TEST       INSERT                   0    3062298         3062297
+APPSUSER   USER1      28-OCT-26 09.29.47.023799 AM +09:00  USER1  TEST       INSERT                   0    3062300         3062299
+APPSUSER   USER1      28-OCT-26 09.32.40.628695 AM +09:00  USER1  TEST       INSERT                   0    3062346         3062345
+
+3 rows selected.
+
+SYS@orcl> col ACTION_NAME for a28
+SYS@orcl> col COMMENT_TEXT for a70
+SYS@orcl> col USERNAME for a10
+SYS@orcl> col OBJ_NAME for a10
+SYS@orcl> Select USERNAME,OBJ_NAME,ACTION_NAME,COMMENT_TEXT from DBA_AUDIT_TRAIL where USERNAME='APPSUSER';
+
+USERNAME   OBJ_NAME   ACTION_NAME                  COMMENT_TEXT
+---------- ---------- ---------------------------- ----------------------------------------------------------------------
+APPSUSER              PROXY AUTHENTICATION ONLY    Authenticated by: DATABASE;AUTHENTICATED IDENTITY: APPSUSER
+APPSUSER              PROXY AUTHENTICATION ONLY    Authenticated by: DATABASE;AUTHENTICATED IDENTITY: APPSUSER
+APPSUSER              PROXY AUTHENTICATION ONLY    Authenticated by: DATABASE;AUTHENTICATED IDENTITY: APPSUSER
+
+3 rows selected.
+
+-- 통합 감사로 같은 추적: 정책을 대상 사용자(USER1)에 걸면 UNIFIED_AUDIT_TRAIL의 DBPROXY_USERNAME에 프록시 계정이 남는다. 
+두 행을 SESSIONID로 조인할 필요가 없다.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> CREATE AUDIT POLICY prx_ua_pol ACTIONS INSERT, UPDATE, DELETE, SELECT;
+
+Audit policy created.
+
+SYS@orcl> AUDIT POLICY prx_ua_pol BY user1;
+
+Audit succeeded.
+
+SYS@orcl> conn appsuser[user1]/appsuser
+Connected.
+USER1@orcl> INSERT INTO test VALUES(2);
+
+1 row created.
+
+USER1@orcl> commit;
+
+Commit complete.
+
+USER1@orcl> conn /as sysdba
+Connected.
+SYS@orcl> col dbusername for a10
+SYS@orcl> col dbproxy_username for a16
+SYS@orcl> col action_name for a12
+SYS@orcl> col object_name for a10
+SYS@orcl> SELECT dbusername, dbproxy_username, action_name, object_name, return_code
+  2    FROM unified_audit_trail
+  3   WHERE dbusername = 'USER1' AND object_name = 'TEST'
+  4   ORDER BY event_timestamp;
+
+DBUSERNAME DBPROXY_USERNAME ACTION_NAME  OBJECT_NAM RETURN_CODE
+---------- ---------------- ------------ ---------- -----------
+USER1      APPSUSER         INSERT       TEST                 0
+USER1      APPSUSER         INSERT       TEST                 0
+
+2 rows selected.
+
+-- 전통 감사 옵션을 NOAUDIT으로 모두 끄고(AUDIT SESSION은 DB 전체에 걸리므로 반드시 끈다), 통합 감사 정책과 사용자·역할을 지운다.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> NOAUDIT SESSION;
+
+Noaudit succeeded.
+
+SYS@orcl> NOAUDIT SELECT TABLE, UPDATE TABLE, INSERT TABLE, DELETE TABLE BY appsuser ON BEHALF OF user1;
+
+Noaudit succeeded.
+
+SYS@orcl> NOAUDIT SELECT TABLE, UPDATE TABLE, INSERT TABLE, DELETE TABLE BY user1;
+
+Noaudit succeeded.
+
+SYS@orcl> NOAUDIT POLICY prx_ua_pol BY user1;
+
+Noaudit succeeded.
+
+SYS@orcl> DROP AUDIT POLICY prx_ua_pol;
+
+Audit Policy dropped.
+
+SYS@orcl> drop user user1 cascade;
+
+User dropped.
+
+SYS@orcl> drop user user2 cascade;
+
+User dropped.
+
+SYS@orcl> drop user appsuser cascade;
+
+User dropped.
+
+SYS@orcl> drop role proxyrole;
+
+Role dropped.
+
+SYS@orcl> select count(*) from dba_stmt_audit_opts;
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+SYS@orcl> select count(*) from audit_unified_policies where policy_name = 'PRX_UA_POL';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+
+■ Secure Application Role
+
+- 특정 애플리케이션이나 세션 조건이 충족될 때만 권한을 활성화
+- 구성 요소
+  ✓ Application Role: CREATE ROLE ... IDENTIFIED GLOBALLY 또는 IDENTIFIED USING <package> 구문으로 생성
+  ✓ Activation Procedure: 롤을 활성화하기 위한 로직을 포함하는 저장 프로시저
+  ✓ Verification Logic: 프로시저 내에서 현재 세션 정보(예: IP 주소, OS 사용자, 특정 애플리케이션 변수)를 확인하여 권한 부여의 적합성을 판단
+-- IDENTIFIED GLOBALLY는 엔터프라이즈 사용자(디렉터리)용 전역 역할이다. Secure Application Role은 IDENTIFIED USING [schema.]package|procedure로만 만든다.
+
+- DBA Role을 가진 User
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> col grantee for a10
+SYSTEM@orcl> col granted_role for a28
+SYSTEM@orcl> select * from dba_role_privs where granted_role='DBA';
+
+GRANTEE    GRANTED_ROLE                 ADM DEL DEF COM INH
+---------- ---------------------------- --- --- --- --- ---
+SARAH      DBA                          NO  NO  YES NO  NO
+SYS        DBA                          YES NO  YES YES YES
+SYSTEM     DBA                          NO  NO  YES YES YES
+
+3 rows selected.
+
+- USER Privileges
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> col grantee for a20
+SYSTEM@orcl> col privilege for a40
+SYSTEM@orcl> SELECT grantee, privilege FROM dba_sys_privs
+  2  WHERE grantee = 'HR'
+  3  ORDER BY privilege;
+
+GRANTEE              PRIVILEGE
+-------------------- ----------------------------------------
+HR                   ALTER SESSION
+HR                   CREATE DATABASE LINK
+HR                   CREATE SEQUENCE
+HR                   CREATE SESSION
+HR                   CREATE SYNONYM
+HR                   CREATE VIEW
+HR                   UNLIMITED TABLESPACE
+
+7 rows selected.
+
+- find user with system privilege UNLIMITED TABLESPACE
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> col grantee for a20
+SYSTEM@orcl> col privilege for a22
+SYSTEM@orcl> SELECT * FROM dba_sys_privs WHERE privilege = 'UNLIMITED TABLESPACE';
+
+GRANTEE              PRIVILEGE              ADM COM INH
+-------------------- ---------------------- --- --- ---
+SQLT                 UNLIMITED TABLESPACE   NO  NO  NO
+BI                   UNLIMITED TABLESPACE   NO  NO  NO
+SARAH                UNLIMITED TABLESPACE   NO  NO  NO
+HR                   UNLIMITED TABLESPACE   NO  NO  NO
+PM                   UNLIMITED TABLESPACE   NO  NO  NO
+OE                   UNLIMITED TABLESPACE   NO  NO  NO
+IX                   UNLIMITED TABLESPACE   NO  NO  NO
+SH                   UNLIMITED TABLESPACE   NO  NO  NO
+SYSTEM               UNLIMITED TABLESPACE   NO  YES YES
+SYS                  UNLIMITED TABLESPACE   NO  YES YES
+DBSNMP               UNLIMITED TABLESPACE   NO  YES YES
+SYSBACKUP            UNLIMITED TABLESPACE   NO  YES YES
+GGSYS                UNLIMITED TABLESPACE   NO  YES YES
+CTXSYS               UNLIMITED TABLESPACE   NO  YES YES
+OJVMSYS              UNLIMITED TABLESPACE   NO  YES YES
+DVSYS                UNLIMITED TABLESPACE   NO  YES YES
+GSMADMIN_INTERNAL    UNLIMITED TABLESPACE   NO  YES YES
+ORDDATA              UNLIMITED TABLESPACE   NO  YES YES
+XDB                  UNLIMITED TABLESPACE   NO  YES YES
+WMSYS                UNLIMITED TABLESPACE   NO  YES YES
+ORDSYS               UNLIMITED TABLESPACE   NO  YES YES
+
+21 rows selected.
+
+- Role에 포함된 권한 및 롤
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> col grantee for a10
+SYSTEM@orcl> col privilege for a40
+SYSTEM@orcl> SELECT grantee, privilege FROM dba_sys_privs WHERE grantee = 'CONNECT' ORDER BY privilege;
+
+GRANTEE    PRIVILEGE
+---------- ----------------------------------------
+CONNECT    CREATE SESSION
+CONNECT    SET CONTAINER
+
+2 rows selected.
+
+- Table Privileges
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> col grantee for a8
+SYSTEM@orcl> col owner for a6
+SYSTEM@orcl> col table_name for a12
+SYSTEM@orcl> col grantor for a8
+SYSTEM@orcl> col privilege for a10
+SYSTEM@orcl> col type for a9
+SYSTEM@orcl> select * from dba_tab_privs where grantee = 'HR';
+
+GRANTEE  OWNER  TABLE_NAME   GRANTOR  PRIVILEGE  GRA HIE COM TYPE      INH
+-------- ------ ------------ -------- ---------- --- --- --- --------- ---
+HR       SYS    DP_DIR       SYS      READ       NO  NO  NO  DIRECTORY NO
+HR       SYS    DP_BAD       SYS      READ       NO  NO  NO  DIRECTORY NO
+HR       SYS    DP_NONE      SYS      READ       NO  NO  NO  DIRECTORY NO
+HR       SYS    DP_DIR       SYS      WRITE      NO  NO  NO  DIRECTORY NO
+HR       SYS    DP_BAD       SYS      WRITE      NO  NO  NO  DIRECTORY NO
+HR       SYS    DP_NONE      SYS      WRITE      NO  NO  NO  DIRECTORY NO
+
+6 rows selected.
+
+- Role Privileges
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> col grantee for a8
+SYSTEM@orcl> col granted_role for a28
+SYSTEM@orcl> select * from dba_role_privs where grantee='DBA';
+
+GRANTEE  GRANTED_ROLE                 ADM DEL DEF COM INH
+-------- ---------------------------- --- --- --- --- ---
+DBA      PLUSTRACE                    YES NO  YES NO  NO
+DBA      EXECUTE_CATALOG_ROLE         NO  NO  YES YES YES
+DBA      DATAPUMP_IMP_FULL_DATABASE   NO  NO  YES YES YES
+DBA      SCHEDULER_ADMIN              NO  NO  YES YES YES
+DBA      XDBADMIN                     NO  NO  YES YES YES
+DBA      OLAP_DBA                     NO  NO  YES YES YES
+DBA      CAPTURE_ADMIN                NO  NO  YES YES YES
+DBA      SELECT_CATALOG_ROLE          NO  NO  YES YES YES
+DBA      DATAPUMP_EXP_FULL_DATABASE   NO  NO  YES YES YES
+DBA      GATHER_SYSTEM_STATISTICS     NO  NO  YES YES YES
+DBA      WM_ADMIN_ROLE                NO  NO  YES YES YES
+DBA      EXP_FULL_DATABASE            NO  NO  YES YES YES
+DBA      OPTIMIZER_PROCESSING_RATE    NO  NO  YES YES YES
+DBA      EM_EXPRESS_ALL               NO  NO  YES YES YES
+DBA      IMP_FULL_DATABASE            NO  NO  YES YES YES
+DBA      XDB_SET_INVOKER              NO  NO  YES YES YES
+DBA      JAVA_ADMIN                   NO  NO  YES YES YES
+DBA      OLAP_XS_ADMIN                NO  NO  YES YES YES
+
+18 rows selected.
+
+- SYSTEM Privileges
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> col grantee for a4
+SYSTEM@orcl> col privilege for a40
+SYSTEM@orcl> select * from dba_sys_privs where grantee='HR';
+
+GRAN PRIVILEGE                                ADM COM INH
+---- ---------------------------------------- --- --- ---
+HR   CREATE DATABASE LINK                     NO  NO  NO
+HR   ALTER SESSION                            NO  NO  NO
+HR   CREATE VIEW                              NO  NO  NO
+HR   UNLIMITED TABLESPACE                     NO  NO  NO
+HR   CREATE SESSION                           NO  NO  NO
+HR   CREATE SEQUENCE                          NO  NO  NO
+HR   CREATE SYNONYM                           NO  NO  NO
+
+7 rows selected.
+
+- Step 1
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> create user blake identified by blake;
+
+User created.
+
+SYSTEM@orcl> create user james identified by james;
+
+User created.
+
+SYSTEM@orcl> grant connect to blake,james;
+
+Grant succeeded.
+
+SYSTEM@orcl> grant create view to scott;
+
+Grant succeeded.
+
+SYSTEM@orcl> conn scott/tiger
+Connected.
+SCOTT@orcl> create view emp_job as (select ename, job from emp);
+
+View created.
+
+SCOTT@orcl> grant select on emp_job to blake;
+
+Grant succeeded.
+
+SCOTT@orcl> grant select on emp_job to james;
+
+Grant succeeded.
+
+SCOTT@orcl> conn blake/blake
+Connected.
+BLAKE@orcl> select count(*) from scott.emp_job;
+
+  COUNT(*)
+----------
+        14
+
+1 row selected.
+
+BLAKE@orcl> select * from scott.emp;
+select * from scott.emp
+                    *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+- Step 2
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> create role manager_role identified using access_control_policy;
+
+Role created.
+
+SYSTEM@orcl> grant select on scott.emp to manager_role;
+
+Grant succeeded.
+
+SYSTEM@orcl> set role manager_role;
+set role manager_role
+*
+ERROR at line 1:
+ORA-28201: invalid command to enable secure application role 'MANAGER_ROLE'
+
+- Step 3
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> create or replace PROCEDURE access_control_policy
+  2  authid current_user
+  3  AS
+  4  v_user varchar2(50);
+  5  v_job varchar2(50);
+  6  BEGIN
+  7  -- get the user from the context
+  8  v_user := lower( (sys_context ('userenv','session_user')));
+  9  -- get the job description
+ 10  select job
+ 11  into v_job
+ 12  from scott.emp_job
+ 13  where lower(ename) = v_user;
+ 14  -- if we're a manager then set the role
+ 15  if
+ 16  v_job = 'MANAGER'
+ 17  then
+ 18  DBMS_SESSION.SET_ROLE('manager_role');
+ 19  else null;
+ 20  end if;
+ 21  END access_control_policy;
+ 22  /
+
+Procedure created.
+
+- Step 4
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> grant execute on access_control_policy to blake;
+
+Grant succeeded.
+
+SYSTEM@orcl> grant execute on access_control_policy to james;
+
+Grant succeeded.
+
+- Step 5
+-- DBMS_SESSION.SET_ROLE은 세션의 역할을 통째로 바꾼다. BLAKE의 SESSION_ROLES에 CONNECT가 사라지고 MANAGER_ROLE만 남는 이유다.
+SQL> CONNECT scott/tiger
+Connected.
+SCOTT@orcl> select * from emp_job;
+
+ENAME      JOB
+---------- ---------
+SMITH      CLERK
+ALLEN      SALESMAN
+WARD       SALESMAN
+JONES      MANAGER
+MARTIN     SALESMAN
+BLAKE      MANAGER
+CLARK      MANAGER
+SCOTT      ANALYST
+KING       PRESIDENT
+TURNER     SALESMAN
+ADAMS      CLERK
+JAMES      CLERK
+FORD       ANALYST
+MILLER     CLERK
+
+14 rows selected.
+
+SCOTT@orcl> conn blake/blake
+Connected.
+BLAKE@orcl> exec system.access_control_policy;
+
+PL/SQL procedure successfully completed.
+
+BLAKE@orcl> select * from session_roles;
+
+ROLE
+------------------------------------------------------------------------------------------------------------------------
+MANAGER_ROLE
+
+1 row selected.
+
+BLAKE@orcl> select max(sal) from scott.emp;
+
+  MAX(SAL)
+----------
+      5000
+
+1 row selected.
+
+BLAKE@orcl> conn james/james
+Connected.
+JAMES@orcl> exec system.access_control_policy;
+
+PL/SQL procedure successfully completed.
+
+JAMES@orcl> select * from session_roles;
+
+ROLE
+------------------------------------------------------------------------------------------------------------------------
+CONNECT
+
+1 row selected.
+
+JAMES@orcl> select max(sal) from scott.emp;
+select max(sal) from scott.emp
+                           *
+ERROR at line 1:
+ORA-00942: table or view does not exist
+
+
+JAMES@orcl> conn system/oracle
+Connected.
+SYSTEM@orcl> col role for a14
+SYSTEM@orcl> col schema for a8
+SYSTEM@orcl> col package for a24
+SYSTEM@orcl> select * from dba_application_roles;
+
+ROLE           SCHEMA   PACKAGE
+-------------- -------- ------------------------
+MANAGER_ROLE   SYSTEM   ACCESS_CONTROL_POLICY
+
+1 row selected.
+
+-- 이 절에서 만든 사용자, 역할, 프로시저, 뷰를 지우고 SCOTT의 CREATE VIEW를 회수한다.
+SQL> CONNECT system/oracle
+Connected.
+SYSTEM@orcl> drop user blake cascade;
+
+User dropped.
+
+SYSTEM@orcl> drop user james cascade;
+
+User dropped.
+
+SYSTEM@orcl> drop role manager_role;
+
+Role dropped.
+
+SYSTEM@orcl> drop procedure access_control_policy;
+
+Procedure dropped.
+
+SYSTEM@orcl> drop view scott.emp_job;
+
+View dropped.
+
+SYSTEM@orcl> revoke create view from scott;
+
+Revoke succeeded.
+
+SYSTEM@orcl> select count(*) from dba_application_roles where role = 'MANAGER_ROLE';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+
+
+■ Application contexts
+
+- 모든 사용자가 데이터베이스에 로그인할 때마다 트리거에 의해 자동으로 설정
+- 세션용 개인 명찰(Name Tag)
+- 사용자가 데이터베이스에 로그인하면, 오라클은 그 사용자만을 위한 보이지 않는 명찰을 하나 발급
+  이 명찰에는 '부서=영업팀', '직급=과장', '접속IP=192.168.10.5'와 같은 정보를 이름=값 형태로 여러 개 기록해 둘 수 있다.
+- 사용자가 쿼리를 실행할 때, 오라클은 이 명찰의 내용을 확인하여 "영업팀 소속이니 영업 관련 데이터만 보여주자"와 같은 동적이고 세밀한 접근 제어를 수행. 이 명찰 정보는 다른 세션과 공유되지 않으며, 로그 아웃하면 사라진다
+- 구성 요소:
+  - Context Namespace: 명찰 자체를 정의. (CREATE CONTEXT)
+  - Trusted Package: 명찰에 내용을 기록할 수 있는 유일한 허가된 주체(PL/SQL 패키지).
+  - SYS_CONTEXT 함수: 명찰의 내용을 읽어오는 함수.
+
+- Step 1. 테스트 계정 및 Context Namespace 생성(SYS)
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> create user sking identified by sking;
+
+User created.
+
+SYS@orcl> create user ahunold identified by ahunold;
+
+User created.
+
+SYS@orcl> grant create session to  sking, ahunold;
+
+Grant succeeded.
+
+SYS@orcl> CREATE OR REPLACE CONTEXT emp_ctx USING hr.emp_ctx_pkg;
+
+Context created.
+
+- Step 2. 신뢰할 수 있는(Trusted) 패키지 생성(HR)
+SQL> conn hr/hr
+Connected.
+HR@orcl> CREATE OR REPLACE PACKAGE emp_ctx_pkg AS
+  2   PROCEDURE set_department;
+  3  END emp_ctx_pkg;
+  4  /
+
+Package created.
+
+HR@orcl> CREATE OR REPLACE PACKAGE BODY emp_ctx_pkg AS
+  2   PROCEDURE set_department IS
+  3      v_dept_id employees.department_id%TYPE;
+  4   BEGIN
+  5      -- 현재 접속한 사용자의 이메일(로그인 ID라고 가정)을 기반으로 부서 ID를 조회
+  6      -- 'USERENV', 'SESSION_USER'는 현재 접속한 사용자 이름을 반환하는 내장 컨텍스트
+  7      SELECT department_id
+  8        INTO v_dept_id
+  9        FROM hr.employees
+ 10       WHERE email = UPPER(SYS_CONTEXT('USERENV', 'SESSION_USER'));
+ 11      -- DBMS_SESSION.SET_CONTEXT 프로시저를 사용하여 컨텍스트 값을 설정
+ 12      -- 'emp_ctx' 라는 컨텍스트에 'dept_id' 라는 이름으로 조회된 부서 ID를 설정
+ 13      DBMS_SESSION.SET_CONTEXT('emp_ctx', 'dept_id', v_dept_id);
+ 14   EXCEPTION
+ 15      -- 해당 사용자가 employees 테이블에 없으면 아무 작업도 하지 않음
+ 16      WHEN NO_DATA_FOUND THEN
+ 17         NULL;
+ 18   END set_department;
+ 19  END emp_ctx_pkg;
+ 20  /
+
+Package body created.
+
+- STEP 3. LOGON 트리거 생성 (Context 자동 설정)(SYS)
+-- AFTER LOGON ON DATABASE 트리거는 모든 사용자의 로그온마다 실행됨. 패키지가 무효이거나 NO_DATA_FOUND 밖의 예외가 나면
+--       ADMINISTER DATABASE TRIGGER 권한이 없는 사용자는 로그온이 막힘(ORA-04088). 실습이 끝나면 바로 삭제함.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> CREATE OR REPLACE TRIGGER set_dept_on_logon
+  2   AFTER LOGON ON DATABASE
+  3  BEGIN
+  4    hr.emp_ctx_pkg.set_department;
+  5  END;
+  6  /
+
+Trigger created.
+
+- Step 4.Application Context 사용 (데이터 조회)(HR)
+  - 보안 뷰 생성
+SQL> conn hr/hr
+Connected.
+HR@orcl> CREATE OR REPLACE VIEW secure_employees AS
+  2   SELECT
+  3      employee_id,
+  4      first_name,
+  5      last_name,
+  6      email,
+  7      phone_number,
+  8      hire_date,
+  9      job_id,
+ 10      salary,
+ 11      department_id
+ 12   FROM
+ 13      hr.employees
+ 14   WHERE
+ 15      -- 현재 세션의 'emp_ctx' 컨텍스트에서 'dept_id' 속성 값을 읽어와 비교
+ 16      department_id = SYS_CONTEXT('emp_ctx', 'dept_id');
+
+View created.
+
+  - 다른 사용자에게 뷰 조회 권한 부여
+
+HR@orcl> GRANT SELECT ON secure_employees TO PUBLIC;
+
+Grant succeeded.
+
+- Step 5. 결과 확인
+SQL> conn sking/sking
+Connected.
+SKING@orcl> select employee_id, first_name, department_id FROM hr.secure_employees;
+
+EMPLOYEE_ID FIRST_NAME           DEPARTMENT_ID
+----------- -------------------- -------------
+        100 Steven                          90
+        101 Neena                           90
+        102 Lex                             90
+
+3 rows selected.
+
+SKING@orcl> conn ahunold/ahunold
+Connected.
+AHUNOLD@orcl> select employee_id, first_name, department_id FROM hr.secure_employees;
+
+EMPLOYEE_ID FIRST_NAME           DEPARTMENT_ID
+----------- -------------------- -------------
+        103 Alexander                       60
+        104 Bruce                           60
+        105 David                           60
+        106 Valli                           60
+        107 Diana                           60
+
+5 rows selected.
+
+==  Local context ==
+
+- 어플리케이션이 필요에 따라 특정 세션에 명시적으로 컨텍스트를 설정
+
+- Step 1. Context Namespace 생성
+
+-- 12c부터 RESOURCE 역할에 UNLIMITED TABLESPACE가 포함되지 않음. 원본처럼 QUOTA를 따로 주어야 테이블을 만들 수 있음.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> create user ateam identified by ateam
+  2  default tablespace users quota 10m on users;
+
+User created.
+
+SYS@orcl> grant connect, resource, create view  to ateam;
+
+Grant succeeded.
+
+SYS@orcl> CREATE OR REPLACE CONTEXT app_user_ctx USING ateam.app_ctx_pkg;
+
+Context created.
+
+- Step 2. 패키지 생성
+
+SQL> conn ateam/ateam
+Connected.
+ATEAM@orcl> CREATE TABLE app_tasks (
+  2   task_id        NUMBER PRIMARY KEY,
+  3   assigned_user VARCHAR2(30),
+  4   task_details  VARCHAR2(200) );
+
+Table created.
+
+ATEAM@orcl> INSERT INTO app_tasks VALUES (1, 'USER_A', '월간 보고서 작성');
+
+1 row created.
+
+ATEAM@orcl> INSERT INTO app_tasks VALUES (2, 'USER_B', '서버 패치 계획 수립');
+
+1 row created.
+
+ATEAM@orcl> INSERT INTO app_tasks VALUES (3, 'USER_A', '신규 입사자 교육 준비');
+
+1 row created.
+
+ATEAM@orcl> commit;
+
+Commit complete.
+
+ATEAM@orcl> CREATE OR REPLACE PACKAGE app_ctx_pkg AS
+  2   PROCEDURE set_app_user(p_user_id VARCHAR2);
+  3   PROCEDURE clear_context;
+  4  END app_ctx_pkg;
+  5  /
+
+Package created.
+
+ATEAM@orcl> CREATE OR REPLACE PACKAGE BODY app_ctx_pkg AS
+  2   PROCEDURE set_app_user(p_user_id VARCHAR2) IS
+  3   BEGIN
+  4      -- 'app_user_ctx' 컨텍스트에 'app_user'라는 이름으로 파라미터 값을 설정
+  5      DBMS_SESSION.SET_CONTEXT('app_user_ctx', 'app_user', p_user_id);
+  6   END set_app_user;
+  7   PROCEDURE clear_context IS
+  8   BEGIN
+  9      -- 컨텍스트 값을 초기화 (커넥션 풀링 환경에서 중요)
+ 10      DBMS_SESSION.CLEAR_CONTEXT('app_user_ctx', 'app_user');
+ 11   END clear_context;
+ 12  END app_ctx_pkg;
+ 13  /
+
+Package body created.
+
+- Step 3. Application Context를 사용하는 보안 뷰 생성
+
+SQL> conn ateam/ateam
+Connected.
+ATEAM@orcl> CREATE OR REPLACE VIEW secure_app_tasks AS
+  2   SELECT
+  3      task_id,
+  4      assigned_user,
+  5      task_details
+  6   FROM
+  7      app_tasks
+  8   WHERE
+  9      -- 현재 세션의 'app_user_ctx' 컨텍스트에서 'app_user' 속성 값을 읽어와 비교
+ 10      assigned_user = SYS_CONTEXT('app_user_ctx', 'app_user');
+
+View created.
+
+ATEAM@orcl> GRANT SELECT ON secure_app_tasks TO hr;
+
+Grant succeeded.
+
+ATEAM@orcl> GRANT EXECUTE ON app_ctx_pkg TO hr;
+
+Grant succeeded.
+
+- Step 4. 결과 확인
+
+
+--. 신뢰 패키지 밖에서 DBMS_SESSION.SET_CONTEXT를 직접 부르면 ORA-01031로 거부되고,
+--       컨텍스트 값은 USER_B 그대로 남음.
+SQL> conn hr/hr
+Connected.
+HR@orcl> COL assigned_user FOR a13
+HR@orcl> COL task_details FOR a30
+HR@orcl> BEGIN
+  2   ateam.app_ctx_pkg.set_app_user('USER_A');
+  3  END;
+  4  /
+
+PL/SQL procedure successfully completed.
+
+HR@orcl> SELECT * FROM ateam.secure_app_tasks;
+
+   TASK_ID ASSIGNED_USER TASK_DETAILS
+---------- ------------- ------------------------------
+         1 USER_A        월간 보고서 작성
+         3 USER_A        신규 입사자 교육 준비
+
+2 rows selected.
+
+HR@orcl> BEGIN
+  2   ateam.app_ctx_pkg.set_app_user('USER_B');
+  3  END;
+  4  /
+
+PL/SQL procedure successfully completed.
+
+HR@orcl> SELECT * FROM ateam.secure_app_tasks;
+
+   TASK_ID ASSIGNED_USER TASK_DETAILS
+---------- ------------- ------------------------------
+         2 USER_B        서버 패치 계획 수립
+
+1 row selected.
+
+HR@orcl> exec DBMS_SESSION.SET_CONTEXT('app_user_ctx', 'app_user', 'USER_A')
+BEGIN DBMS_SESSION.SET_CONTEXT('app_user_ctx', 'app_user', 'USER_A'); END;
+
+*
+ERROR at line 1:
+ORA-01031: insufficient privileges
+ORA-06512: at "SYS.DBMS_SESSION", line 141
+ORA-06512: at line 1
+
+
+HR@orcl> SELECT * FROM ateam.secure_app_tasks;
+
+   TASK_ID ASSIGNED_USER TASK_DETAILS
+---------- ------------- ------------------------------
+         2 USER_B        서버 패치 계획 수립
+
+1 row selected.
+
+== the Application Context Accessed Globally Using dbms_session ==
+
+- Step 1. Context
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> CREATE OR REPLACE CONTEXT hrapp_ctx
+  2    USING hr.hr_context_pkg
+  3    ACCESSED GLOBALLY;
+
+Context created.
+
+- Step 2. Package
+
+SQL> conn hr/hr
+Connected.
+HR@orcl> CREATE OR REPLACE PACKAGE hr_context_pkg AS
+  2    PROCEDURE set_department;
+  3  END hr_context_pkg;
+  4  /
+
+Package created.
+
+HR@orcl> CREATE OR REPLACE PACKAGE BODY hr_context_pkg AS
+  2   PROCEDURE set_department IS
+  3     v_dept_id employees.department_id%TYPE;
+  4   BEGIN
+  5      -- 현재 접속한 사용자의 이메일(로그인 ID라고 가정)을 기반으로 부서 ID를 조회
+  6      SELECT department_id
+  7        INTO v_dept_id
+  8        FROM hr.employees
+  9       WHERE email = UPPER(SYS_CONTEXT('USERENV', 'SESSION_USER'));
+ 10  
+ 11      -- DBMS_SESSION.SET_CONTEXT 프로시저를 사용하여 컨텍스트 값을 설정
+ 12      DBMS_SESSION.SET_CONTEXT('hrapp_ctx', 'department_id', v_dept_id);
+ 13  
+ 14   EXCEPTION
+ 15      WHEN NO_DATA_FOUND THEN NULL;
+ 16   END set_department;
+ 17  END hr_context_pkg;
+ 18  /
+
+Package body created.
+
+- Step 3. Trigger(LDAP으로 가능)
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> CREATE OR REPLACE TRIGGER set_hrapp_ctx_on_logon
+  2   AFTER LOGON ON DATABASE
+  3  BEGIN
+  4   -- 사용자가 로그인하면 hr.hr_context_pkg의 set_department 프로시저를 호출
+  5   hr.hr_context_pkg.set_department;
+  6  END;
+  7  /
+
+Trigger created.
+
+- Step 4. 보안 뷰
+
+SQL> conn hr/hr
+Connected.
+HR@orcl> CREATE OR REPLACE VIEW secure_employees_view AS
+  2   SELECT employee_id, first_name, last_name, email, department_id
+  3   FROM hr.employees
+  4   WHERE department_id = SYS_CONTEXT('hrapp_ctx', 'department_id');
+
+View created.
+
+HR@orcl> GRANT SELECT ON secure_employees_view TO PUBLIC;
+
+Grant succeeded.
+
+- 결과 조회
+
+--       SET_CONTEXT에 username·client_id 인자를 주지 않으면 전역 컨텍스트 값 하나를 인스턴스의 모든 세션이 함께 봄.
+--       마지막에 로그온한 AHUNOLD가 넣은 60이 남아, employees에 없는 HR도 60번 부서를 봄(GLOBAL_CONTEXT의 USERNAME·CLIENT_IDENTIFIER가 비어 있음).
+--       사용자마다 값을 나누려면 SET_CONTEXT의 username 또는 client_id 인자를 쓰고, 세션에서 DBMS_SESSION.SET_IDENTIFIER로 맞춤.
+SQL> conn sking/sking
+Connected.
+SKING@orcl> SELECT first_name, department_id FROM hr.secure_employees_view;
+
+FIRST_NAME           DEPARTMENT_ID
+-------------------- -------------
+Steven                          90
+Neena                           90
+Lex                             90
+
+3 rows selected.
+
+SKING@orcl> conn ahunold/ahunold
+Connected.
+AHUNOLD@orcl> SELECT first_name, department_id FROM hr.secure_employees_view;
+
+FIRST_NAME           DEPARTMENT_ID
+-------------------- -------------
+Alexander                       60
+Bruce                           60
+David                           60
+Valli                           60
+Diana                           60
+
+5 rows selected.
+
+AHUNOLD@orcl> conn hr/hr
+Connected.
+HR@orcl> SELECT first_name, department_id FROM hr.secure_employees_view;
+
+FIRST_NAME           DEPARTMENT_ID
+-------------------- -------------
+Alexander                       60
+Bruce                           60
+David                           60
+Valli                           60
+Diana                           60
+
+5 rows selected.
+
+HR@orcl> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> COL namespace FOR a10
+SYS@orcl> COL attribute FOR a14
+SYS@orcl> COL value FOR a6
+SYS@orcl> COL username FOR a8
+SYS@orcl> COL client_identifier FOR a17
+SYS@orcl> SELECT namespace, attribute, value, username, client_identifier FROM global_context;
+
+NAMESPACE  ATTRIBUTE      VALUE  USERNAME CLIENT_IDENTIFIER
+---------- -------------- ------ -------- -----------------
+HRAPP_CTX  DEPARTMENT_ID  60
+
+1 row selected.
+
+
+■ DBMS_CRYPTO
+
+- 표준 암호화(Encryption) 및 복호화(Decryption) 기능을 수행할 수 있도록 제공되는 PL/SQL 내장 패키지
+
+-- DBMS_CRYPTO는 PUBLIC에 실행 권한이 없음. 권한 없이 부르면 ORA-00904가 나고, SYS가 EXECUTE를 준 뒤 진행함.
+SQL> conn hr/hr
+Connected.
+HR@orcl> SELECT dbms_crypto.randombytes(24) FROM DUAL;
+SELECT dbms_crypto.randombytes(24) FROM DUAL
+       *
+ERROR at line 1:
+ORA-00904: "DBMS_CRYPTO"."RANDOMBYTES": invalid identifier
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@orcl> GRANT EXECUTE ON DBMS_CRYPTO TO hr;
+
+Grant succeeded.
+
+SQL> conn hr/hr
+Connected.
+HR@orcl> SELECT dbms_crypto.randombytes(24) FROM DUAL;
+
+DBMS_CRYPTO.RANDOMBYTES(24)
+------------------------------------------------------------------------------------------------------------------------
+7CB09B4FAC28F9C516E94A4B1C62067402AFF9A457DD9D0E
+
+1 row selected.
+
+HR@orcl> -- Encryption
+HR@orcl> create or replace function encrypt_value (input_string in varchar2)
+  2  return varchar2 is
+  3  raw_key RAW(128) := UTL_I18N.STRING_TO_RAW('0DEEFB5B6967D85F614E038E771F9DCC7AE48C85B08D9F7E','AL32UTF8');
+  4  l_encrypted raw(512);
+  5  l_type number := DBMS_CRYPTO.DES3_CBC_PKCS5;
+  6  begin
+  7  l_encrypted :=DBMS_CRYPTO.ENCRYPT(UTL_RAW.CAST_TO_RAW(input_string),l_type,raw_key);
+  8  return UTL_RAW.CAST_TO_VARCHAR2(l_encrypted);
+  9  end;
+ 10  /
+
+Function created.
+
+HR@orcl> -- Decryption
+HR@orcl> create or replace function decrypt_value (input_string in varchar2)
+  2  return varchar2 is
+  3  raw_key RAW(128) := UTL_I18N.STRING_TO_RAW('0DEEFB5B6967D85F614E038E771F9DCC7AE48C85B08D9F7E','AL32UTF8');
+  4  l_decrypted raw(512);
+  5  l_type number := DBMS_CRYPTO.DES3_CBC_PKCS5;
+  6  begin
+  7  l_decrypted :=DBMS_CRYPTO.DECRYPT(UTL_RAW.CAST_TO_RAW(input_string),l_type,raw_key);
+  8  return UTL_RAW.CAST_TO_VARCHAR2(l_decrypted);
+  9  end;
+ 10  /
+
+Function created.
+
+HR@orcl> create table test as select * from hr.employees;
+
+Table created.
+
+HR@orcl> alter table test add (encrypt_name varchar2(100));
+
+Table altered.
+
+HR@orcl> update test t1 set encrypt_name=encrypt_value(last_name) where t1.employee_id=t1.employee_id;
+
+107 rows updated.
+
+HR@orcl> commit;
+
+Commit complete.
+
+-- 암호문 RAW를 VARCHAR2로 바꿔 저장·출력하면 클라이언트 문자셋(AL32UTF8)으로 풀 수 없는 바이트가 생겨 SP2-0784가 섞여 나옴.
+--       아래 출력은 제어 문자와 깨진 문자를 ? 로 바꾸고 중간을 줄였음.
+SQL> conn hr/hr
+Connected.
+HR@orcl> select encrypt_value(last_name) from test;
+
+ENCRYPT_VALUE(LAST_NAME)
+------------------------------------------------------------------------------------------------------------------------
+-'???K?X
+	\??h?T
+?JU????
+?????_?
+?}?o??f
+
+
+?S?????
+?_?q??I(??`????E
+???Y?Gg?
+??????Rn????E?-
+?J???#?
+T$/????T
+SP2-0784: Invalid or incomplete character beginning 0xE9 returned
+?l???D
+???CX?
+-- (중략: 98행)
+???'??n?U?KuE5.4
+?<}y݂??
+
+107 rows selected.
+
+SQL> conn hr/hr
+Connected.
+HR@orcl> select decrypt_value(encrypt_name) from test;
+
+DECRYPT_VALUE(ENCRYPT_NAME)
+------------------------------------------------------------------------------------------------------------------------
+King
+Kochhar
+De Haan
+Hunold
+Ernst
+Austin
+Pataballa
+Lorentz
+Greenberg
+Faviet
+-- (중략: 98행)
+Dellinger
+Jones
+
+107 rows selected.
+
+-- 확인 단계.
+--       - 키는 RANDOMBYTES 값이 아니라 16진 문자열 48자를 문자 그대로 바이트로 바꾼 48바이트임.
+--       - IV를 주지 않은 DES3_CBC_PKCS5는 같은 평문이 늘 같은 암호문이 됨. 107행 중 암호문은 102종이고, 같은 성(King, Smith 등)이 같은 값임.
+--       - 19c 문서는 새 개발에 AES(ENCRYPT_AES256 + CHAIN_CBC + PAD_PKCS5)를 쓰고, 암호문은 RAW 컬럼에, 키는 HEXTORAW(RANDOMBYTES 결과)로 두도록 안내함.
+--         DES·3DES는 하위 호환용으로 남아 있음.
+SQL> conn hr/hr
+Connected.
+HR@orcl> SELECT UTL_RAW.LENGTH(UTL_I18N.STRING_TO_RAW('0DEEFB5B6967D85F614E038E771F9DCC7AE48C85B08D9F7E','AL32UTF8')) key_bytes FROM dual;
+
+ KEY_BYTES
+----------
+        48
+
+1 row selected.
+
+HR@orcl> SELECT COUNT(*) total, COUNT(DISTINCT encrypt_name) distinct_enc, SUM(CASE WHEN decrypt_value(encrypt_name) = last_name THEN 1 ELSE 0 END) roundtrip_ok FROM test;
+
+     TOTAL DISTINCT_ENC ROUNDTRIP_OK
+---------- ------------ ------------
+       107          102          107
+
+1 row selected.
+
+HR@orcl> SELECT last_name, RAWTOHEX(UTL_RAW.CAST_TO_RAW(encrypt_name)) enc_hex FROM test WHERE employee_id IN (198, 199);
+
+LAST_NAME
+-------------------------
+ENC_HEX
+------------------------------------------------------------------------------------------------------------------------
+OConnell
+A62E88CE96404E69B51BD83C51428B69
+
+Grant
+348FFC3E8DEF68B0
+
+
+2 rows selected.
+
+
+■ TDE
+
+- 데이터베이스 사용자나 애플리케이션에게는 투명하게(Transparent) 작동.
+  - Transparent : 데이터를 저장하거나 검색할 때, 암호화/복호화 과정이 애플리케이션 코드의 수정 없이 데이터베이스 내부에서 자동으로 처리. 개발자는 데이터가 암호화되었는지조차 알 필요가 없다.
+  - Data Encryption : 디스크에 저장되는 데이터(Data at Rest)를 암호화하여, 데이터 파일 자체가 유출되더라도 내용을 읽을 수 없도록 보호한다
+
+--  이 절은 키스토어를 한 번도 만든 적 없는 DB가 필요해서 DBCA로 만든 임시 DB SECTDE(19.3 non-CDB)에서 실측함.
+--       경로는 /u01/app/oracle/admin/orcl/wallet 대신 /u01/app/oracle/admin/sectde/wallet,
+--       데이터 파일은 /u01/app/oracle/oradata/ORCL 대신 /u01/app/oracle/sectdedata/SECTDE를 씀.
+-- WALLET_ROOT(18c부터)는 정적 파라미터라 SCOPE=SPFILE 후 재기동이 필요함. TDE_CONFIGURATION은 그 뒤에 SCOPE=BOTH로 설정함.
+--       TDE_CONFIGURATION 설정만으로는 ewallet.p12가 생기지 않음(원본의 '-> ewallet.p12 생성'을 고침). 파일은 CREATE KEYSTORE에서 생김.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@sectde> show parameter wallet
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+ssl_wallet                           string
+wallet_root                          string
+SYS@sectde> !mkdir -p /u01/app/oracle/admin/sectde/wallet/tde
+
+SYS@sectde> alter system set wallet_root='/u01/app/oracle/admin/sectde/wallet' scope=spfile;
+
+System altered.
+
+SYS@sectde> shu immediate
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+SYS@sectde> startup
+ORACLE instance started.
+
+Total System Global Area  943716976 bytes
+Fixed Size                  8903280 bytes
+Variable Size             247463936 bytes
+Database Buffers          679477248 bytes
+Redo Buffers                7872512 bytes
+Database mounted.
+Database opened.
+SYS@sectde> alter system set tde_configuration='KEYSTORE_CONFIGURATION=FILE' scope=both;
+
+System altered.
+
+SYS@sectde> !ls -l /u01/app/oracle/admin/sectde/wallet/tde
+total 0
+
+--  원본 명령처럼 경로를 적어도 그 경로가 WALLET_ROOT/tde와 같으면 19.3에서 그대로 동작함.
+--       WALLET_ROOT를 쓰는 19c의 표준 형식은 경로를 빼는 것. 아래 두 번째 명령은 이미 키스토어가 있는 상태에서 실행해 ORA-46630이 남.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@sectde> administer key management
+  2  create keystore '/u01/app/oracle/admin/sectde/wallet/tde' identified by oracle;
+
+keystore altered.
+
+SYS@sectde> administer key management
+  2  create keystore identified by oracle;
+administer key management
+*
+ERROR at line 1:
+ORA-46630: keystore cannot be created at the specified location
+
+
+SYS@sectde> !ls -l /u01/app/oracle/admin/sectde/wallet/tde
+total 4
+-rw-------. 1 oracle dba 2555 Oct 28 09:30 ewallet.p12
+
+SYS@sectde> administer key management
+  2  set keystore open identified by oracle;
+
+keystore altered.
+
+--  desc v$database는 19c에서 컬럼이 100개가 넘어 중간을 줄임.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@sectde> desc v$encryption_keys
+ Name                                                              Null?    Type
+ ----------------------------------------------------------------- -------- --------------------------------------------
+ KEY_ID                                                                     VARCHAR2(78)
+ TAG                                                                        VARCHAR2(4000)
+ CREATION_TIME                                                              TIMESTAMP(6) WITH TIME ZONE
+ ACTIVATION_TIME                                                            TIMESTAMP(6) WITH TIME ZONE
+ CREATOR                                                                    VARCHAR2(128)
+ CREATOR_ID                                                                 NUMBER
+ USER                                                                       VARCHAR2(128)
+ USER_ID                                                                    NUMBER
+ KEY_USE                                                                    VARCHAR2(10)
+ KEYSTORE_TYPE                                                              VARCHAR2(17)
+ ORIGIN                                                                     VARCHAR2(41)
+ BACKED_UP                                                                  VARCHAR2(9)
+ CREATOR_DBNAME                                                             VARCHAR2(128)
+ CREATOR_DBID                                                               NUMBER
+ CREATOR_INSTANCE_NAME                                                      VARCHAR2(30)
+ CREATOR_INSTANCE_NUMBER                                                    NUMBER
+ CREATOR_INSTANCE_SERIAL                                                    NUMBER
+ CREATOR_PDBNAME                                                            VARCHAR2(128)
+ CREATOR_PDBID                                                              NUMBER
+ CREATOR_PDBUID                                                             NUMBER
+ CREATOR_PDBGUID                                                            RAW(16)
+ ACTIVATING_DBNAME                                                          VARCHAR2(128)
+ ACTIVATING_DBID                                                            NUMBER
+ ACTIVATING_INSTANCE_NAME                                                   VARCHAR2(30)
+ ACTIVATING_INSTANCE_NUMBER                                                 NUMBER
+ ACTIVATING_INSTANCE_SERIAL                                                 NUMBER
+ ACTIVATING_PDBNAME                                                         VARCHAR2(128)
+ ACTIVATING_PDBID                                                           NUMBER
+ ACTIVATING_PDBUID                                                          NUMBER
+ ACTIVATING_PDBGUID                                                         RAW(16)
+ CON_ID                                                                     NUMBER
+
+SYS@sectde> desc v$database
+ Name                                                              Null?    Type
+ ----------------------------------------------------------------- -------- --------------------------------------------
+ DBID                                                                       NUMBER
+ NAME                                                                       VARCHAR2(9)
+ CREATED                                                                    DATE
+-- (중략: 53행)
+ CON_DBID                                                                   NUMBER
+ FORCE_FULL_DB_CACHING                                                      VARCHAR2(3)
+ SUPPLEMENTAL_LOG_DATA_SR                                                   VARCHAR2(3)
+
+SYS@sectde> desc v$encryption_wallet
+ Name                                                              Null?    Type
+ ----------------------------------------------------------------- -------- --------------------------------------------
+ WRL_TYPE                                                                   VARCHAR2(20)
+ WRL_PARAMETER                                                              VARCHAR2(4000)
+ STATUS                                                                     VARCHAR2(30)
+ WALLET_TYPE                                                                VARCHAR2(20)
+ WALLET_ORDER                                                               VARCHAR2(9)
+ KEYSTORE_MODE                                                              VARCHAR2(8)
+ FULLY_BACKED_UP                                                            VARCHAR2(9)
+ CON_ID                                                                     NUMBER
+
+SYS@sectde> select p.con_id, p.name, p.open_mode,
+  2       ew.wrl_type,ew.wallet_type,ew.status
+  3  from v$database p, v$encryption_wallet ew
+  4  where p.con_id=ew.con_id
+  5  order by 1;
+
+    CON_ID NAME      OPEN_MODE            WRL_TYPE             WALLET_TYPE          STATUS
+---------- --------- -------------------- -------------------- -------------------- ------------------------------
+         0 SECTDE    READ WRITE           FILE                 PASSWORD             OPEN_NO_MASTER_KEY
+
+1 row selected.
+→ 열린 지갑 안에 아직 데이터베이스를 암호화하는 데 필요한 마스터 암호화 키(Master Encryption Key, MEK)가 생성되어 있지 않음
+
+-- WITH BACKUP은 키를 만들기 전 키스토어를 ewallet_<시각>.p12로 백업함. 백업 이름의 시각은 UTC임.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@sectde> select p.con_id, p.name, p.open_mode,ek.key_id
+  2  from v$database p, v$encryption_keys ek
+  3  where p.con_id=ek.con_id(+)
+  4  order by 1;
+
+    CON_ID NAME      OPEN_MODE            KEY_ID
+---------- --------- -------------------- ------------------------------------------------------------------------------
+         0 SECTDE    READ WRITE
+
+1 row selected.
+
+SYS@sectde> administer key management set key
+  2  identified by oracle with backup;
+
+keystore altered.
+
+SYS@sectde> select p.con_id, p.name, p.open_mode,ek.key_id
+  2  from v$database p, v$encryption_keys ek
+  3  where p.con_id=ek.con_id(+)
+  4  order by 1;
+
+    CON_ID NAME      OPEN_MODE            KEY_ID
+---------- --------- -------------------- ------------------------------------------------------------------------------
+         0 SECTDE    READ WRITE           ASW+a5Xmlk+VvwBrzaOHZ80AAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+
+1 row selected.
+
+SYS@sectde> !ls -l /u01/app/oracle/admin/sectde/wallet/tde
+total 8
+-rw-------. 1 oracle dba 3995 Oct 28 09:30 ewallet.p12
+-rw-------. 1 oracle dba 2555 Oct 28 09:30 ewallet_2026102800301174.p12
+
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@sectde> create tablespace wall_tbs
+  2  datafile '/u01/app/oracle/sectdedata/SECTDE/wall_tbs01.dbf' size 50m
+  3  encryption using 'AES128' default storage(encrypt);
+
+Tablespace created.
+
+SYS@sectde> select t.name, e.encryptedts, e.encryptionalg
+  2  from v$encrypted_tablespaces e , v$tablespace t
+  3  where e.ts#=t.ts#
+  4  order by 1;
+
+NAME                           ENC ENCRYPT
+------------------------------ --- -------
+WALL_TBS                       YES AES128
+
+1 row selected.
+
+SYS@sectde> create table wall_t (id number) tablespace wall_tbs;
+
+Table created.
+
+SYS@sectde> insert into wall_t values(100);
+
+1 row created.
+
+SYS@sectde> commit;
+
+Commit complete.
+
+SYS@sectde> select * from wall_t;
+
+        ID
+----------
+       100
+
+1 row selected.
+
+--  재기동 직후 비밀번호 키스토어는 WALLET_TYPE UNKNOWN, STATUS CLOSED로 나옴.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@sectde> shu immediate
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+SYS@sectde> startup
+ORACLE instance started.
+
+Total System Global Area  943716976 bytes
+Fixed Size                  8903280 bytes
+Variable Size             247463936 bytes
+Database Buffers          679477248 bytes
+Redo Buffers                7872512 bytes
+Database mounted.
+Database opened.
+SYS@sectde> select * from wall_t;
+select * from wall_t
+              *
+ERROR at line 1:
+ORA-28365: wallet is not open
+
+
+SYS@sectde> select p.con_id, p.name, p.open_mode,
+  2       ew.wrl_type,ew.wallet_type,ew.status
+  3  from v$database p, v$encryption_wallet ew
+  4  where p.con_id=ew.con_id
+  5  order by 1;
+
+    CON_ID NAME      OPEN_MODE            WRL_TYPE             WALLET_TYPE          STATUS
+---------- --------- -------------------- -------------------- -------------------- ------------------------------
+         0 SECTDE    READ WRITE           FILE                 UNKNOWN              CLOSED
+
+1 row selected.
+
+SYS@sectde> administer key management
+  2  set keystore open identified by oracle;
+
+keystore altered.
+
+SYS@sectde> select p.con_id, p.name, p.open_mode,
+  2       ew.wrl_type,ew.wallet_type,ew.status
+  3  from v$database p, v$encryption_wallet ew
+  4  order by 1;
+
+    CON_ID NAME      OPEN_MODE            WRL_TYPE             WALLET_TYPE          STATUS
+---------- --------- -------------------- -------------------- -------------------- ------------------------------
+         0 SECTDE    READ WRITE           FILE                 PASSWORD             OPEN
+
+1 row selected.
+
+SYS@sectde> select * from wall_t;
+
+        ID
+----------
+       100
+
+1 row selected.
+
+--  auto-login 키스토어(cwallet.sso)를 만든 직후에는 여전히 PASSWORD 키스토어가 열려 있음.
+--       비밀번호 키스토어를 닫으면 cwallet.sso가 자동으로 열려 AUTOLOGIN OPEN이 됨.
+--       같은 서버에서만 열리게 하려면 CREATE LOCAL AUTO_LOGIN KEYSTORE를 씀.
+SQL> CONNECT / AS SYSDBA
+Connected.
+SYS@sectde> administer key management create auto_login keystore
+  2  from keystore '/u01/app/oracle/admin/sectde/wallet/tde'
+  3  identified by oracle;
+
+keystore altered.
+
+SYS@sectde> select p.con_id, p.name, p.open_mode,
+  2       ew.wrl_type,ew.wallet_type,ew.status
+  3  from v$database p, v$encryption_wallet ew
+  4  order by 1;
+
+    CON_ID NAME      OPEN_MODE            WRL_TYPE             WALLET_TYPE          STATUS
+---------- --------- -------------------- -------------------- -------------------- ------------------------------
+         0 SECTDE    READ WRITE           FILE                 PASSWORD             OPEN
+
+1 row selected.
+
+SYS@sectde> !ls -l /u01/app/oracle/admin/sectde/wallet/tde
+total 12
+-rw-------. 1 oracle dba 4040 Oct 28 09:31 cwallet.sso
+-rw-------. 1 oracle dba 3995 Oct 28 09:30 ewallet.p12
+-rw-------. 1 oracle dba 2555 Oct 28 09:30 ewallet_2026102800301174.p12
+
+SYS@sectde> administer key management
+  2  set keystore close identified by oracle;
+
+keystore altered.
+
+SYS@sectde> select p.con_id, p.name, p.open_mode,
+  2       ew.wrl_type,ew.wallet_type,ew.status
+  3  from v$database p, v$encryption_wallet ew
+  4  order by 1;
+
+    CON_ID NAME      OPEN_MODE            WRL_TYPE             WALLET_TYPE          STATUS
+---------- --------- -------------------- -------------------- -------------------- ------------------------------
+         0 SECTDE    READ WRITE           FILE                 AUTOLOGIN            OPEN
+
+1 row selected.

@@ -1,0 +1,1438 @@
+■ SECURITY
+
+KEY WORDS
+- FGAC 심화 : 전역 컨텍스트, 정책 유형과 커서 공유, update_check, 열 마스킹, 정책 그룹, 드라이빙 컨텍스트, VPD 오류 진단
+
+<<실습 개요>>
+- 난이도 : 상. SEC_FGAC 실습(로컬 컨텍스트, ADD_POLICY, update_check 기본형)을 마친 뒤 진행함
+- 상황 : DB 계정 하나(FGX_APP)로 접속을 풀링하는 다중 테넌트 주문 애플리케이션. 실제 사용자는 CLIENT_IDENTIFIER 로 구분함
+- 계정
+    FGX_OWN  주문 테이블 ORDERS 소유자
+    FGX_SEC  보안 관리 스키마. 컨텍스트 패키지와 정책 함수를 소유하고 DBMS_RLS 를 실행함
+    FGX_APP  애플리케이션 풀 계정
+    FGX_AUD  감사 담당 조회 계정
+- 앱 사용자(FGX_SEC.APP_USERS) : ALICE 10번 테넌트 MANAGER, CAROL 10번 테넌트 CLERK, BOB 20번 테넌트 MANAGER
+- 순서 : 1 준비 → 2 전역 컨텍스트 → 3 STATIC 정책의 함정 → 4 CONTEXT_SENSITIVE → 5 SYS_CONTEXT 술어 → 6 DML 통제 → 7 열 마스킹 → 8 오류 진단 → 9 정책 그룹 → 10 정책 면제 → 11 정리
+- 구간끼리 이어지므로 순서대로 진행함. 앞 구간이 남긴 정책이 다음 구간의 결과에 영향을 줌
+- 정책 함수가 몇 번 실행됐는지는 패키지 변수 POL_PKG.G_CALLS 로 셈. 패키지 상태는 세션 단위라 FGX_APP 세션 안에서 조회함
+
+<<1. 준비 — 계정, 테이블, 컨텍스트>>
+- 컨텍스트 두 개를 ACCESSED GLOBALLY 로 만듦. FGX_CTX 는 테넌트와 역할, FGX_DRV 는 9구간에서 정책 그룹을 고르는 드라이빙 컨텍스트
+- CTX_PKG.LOGIN 은 APP_USERS 에 있는 사용자만 받아들이고, 값을 (DB 사용자 = USER, 클라이언트 식별자 = 앱 사용자) 조합에 묶어 넣음
+- CTX_PKG.LOGOUT 은 현재 식별자의 값을 CLEAR_CONTEXT 로 지움. 전역 컨텍스트 값은 세션이 끝나도 SGA 에 남으므로 지우는 절차가 따로 필요함
+
+SQL> conn / as sysdba
+Connected.
+SYS@orcl> CREATE USER fgx_own IDENTIFIED BY fgx_own QUOTA 10M ON users;
+
+User created.
+
+SYS@orcl> CREATE USER fgx_sec IDENTIFIED BY fgx_sec QUOTA 10M ON users;
+
+User created.
+
+SYS@orcl> CREATE USER fgx_app IDENTIFIED BY fgx_app;
+
+User created.
+
+SYS@orcl> CREATE USER fgx_aud IDENTIFIED BY fgx_aud;
+
+User created.
+
+SYS@orcl> GRANT CREATE SESSION, CREATE TABLE TO fgx_own;
+
+Grant succeeded.
+
+SYS@orcl> GRANT CREATE SESSION, CREATE TABLE, CREATE PROCEDURE TO fgx_sec;
+
+Grant succeeded.
+
+SYS@orcl> GRANT EXECUTE ON dbms_rls TO fgx_sec;
+
+Grant succeeded.
+
+SYS@orcl> GRANT CREATE SESSION TO fgx_app, fgx_aud;
+
+Grant succeeded.
+
+SYS@orcl> CREATE CONTEXT fgx_ctx USING fgx_sec.ctx_pkg ACCESSED GLOBALLY;
+
+Context created.
+
+SYS@orcl> CREATE CONTEXT fgx_drv USING fgx_sec.ctx_pkg ACCESSED GLOBALLY;
+
+Context created.
+
+SYS@orcl> conn fgx_own/fgx_own
+Connected.
+FGX_OWN@orcl> CREATE TABLE orders (
+  2    order_id  NUMBER PRIMARY KEY,
+  3    tenant_id NUMBER NOT NULL,
+  4    item      VARCHAR2(20),
+  5    amount    NUMBER,
+  6    card_no   VARCHAR2(19));
+
+Table created.
+
+FGX_OWN@orcl> INSERT INTO orders VALUES (101, 10, 'SSD',      320, '4512-1111-2222-0101');
+
+1 row created.
+
+FGX_OWN@orcl> INSERT INTO orders VALUES (102, 10, 'RAM',      150, '4512-1111-2222-0102');
+
+1 row created.
+
+FGX_OWN@orcl> INSERT INTO orders VALUES (103, 10, 'GPU',     1900, '4512-1111-2222-0103');
+
+1 row created.
+
+FGX_OWN@orcl> INSERT INTO orders VALUES (201, 20, 'MONITOR',  410, '5310-3333-4444-0201');
+
+1 row created.
+
+FGX_OWN@orcl> INSERT INTO orders VALUES (202, 20, 'MOUSE',     30, '5310-3333-4444-0202');
+
+1 row created.
+
+FGX_OWN@orcl> INSERT INTO orders VALUES (301, 30, 'SERVER',  8800, '3760-5555-6666-0301');
+
+1 row created.
+
+FGX_OWN@orcl> COMMIT;
+
+Commit complete.
+
+FGX_OWN@orcl> GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO fgx_app;
+
+Grant succeeded.
+
+FGX_OWN@orcl> GRANT SELECT ON orders TO fgx_aud;
+
+Grant succeeded.
+
+FGX_OWN@orcl> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> CREATE TABLE app_users (
+  2    app_user  VARCHAR2(30) PRIMARY KEY,
+  3    tenant_id NUMBER NOT NULL,
+  4    app_role  VARCHAR2(10) NOT NULL);
+
+Table created.
+
+FGX_SEC@orcl> INSERT INTO app_users VALUES ('ALICE', 10, 'MANAGER');
+
+1 row created.
+
+FGX_SEC@orcl> INSERT INTO app_users VALUES ('CAROL', 10, 'CLERK');
+
+1 row created.
+
+FGX_SEC@orcl> INSERT INTO app_users VALUES ('BOB',   20, 'MANAGER');
+
+1 row created.
+
+FGX_SEC@orcl> COMMIT;
+
+Commit complete.
+
+FGX_SEC@orcl> CREATE OR REPLACE PACKAGE ctx_pkg AS
+  2    PROCEDURE login(p_user IN VARCHAR2, p_app IN VARCHAR2 DEFAULT 'ORDER_APP');
+  3    PROCEDURE logout;
+  4  END;
+  5  /
+
+Package created.
+
+FGX_SEC@orcl> CREATE OR REPLACE PACKAGE BODY ctx_pkg AS
+  2    PROCEDURE login(p_user IN VARCHAR2, p_app IN VARCHAR2 DEFAULT 'ORDER_APP') IS
+  3      v_tid  app_users.tenant_id%TYPE;
+  4      v_role app_users.app_role%TYPE;
+  5    BEGIN
+  6      SELECT tenant_id, app_role INTO v_tid, v_role
+  7        FROM app_users WHERE app_user = UPPER(p_user);
+  8      DBMS_SESSION.SET_IDENTIFIER(UPPER(p_user));
+  9      DBMS_SESSION.SET_CONTEXT('FGX_CTX', 'TENANT', v_tid,  USER, UPPER(p_user));
+ 10      DBMS_SESSION.SET_CONTEXT('FGX_CTX', 'ROLE',   v_role, USER, UPPER(p_user));
+ 11      DBMS_SESSION.SET_CONTEXT('FGX_DRV', 'APP',    p_app,  USER, UPPER(p_user));
+ 12    EXCEPTION
+ 13      WHEN NO_DATA_FOUND THEN
+ 14        DBMS_SESSION.CLEAR_IDENTIFIER;
+ 15        RAISE_APPLICATION_ERROR(-20001, 'unknown application user: ' || p_user);
+ 16    END;
+ 17    PROCEDURE logout IS
+ 18      v_cid VARCHAR2(64) := SYS_CONTEXT('USERENV', 'CLIENT_IDENTIFIER');
+ 19    BEGIN
+ 20      DBMS_SESSION.CLEAR_CONTEXT('FGX_CTX', v_cid);
+ 21      DBMS_SESSION.CLEAR_CONTEXT('FGX_DRV', v_cid);
+ 22      DBMS_SESSION.CLEAR_IDENTIFIER;
+ 23    END;
+ 24  END;
+ 25  /
+
+Package body created.
+
+FGX_SEC@orcl> GRANT EXECUTE ON ctx_pkg TO fgx_app;
+
+Grant succeeded.
+
+FGX_SEC@orcl> conn / as sysdba
+Connected.
+SYS@orcl> COL namespace FOR A8
+SYS@orcl> COL schema FOR A8
+SYS@orcl> COL package FOR A8
+SYS@orcl> SELECT namespace, schema, package, type FROM dba_context WHERE namespace LIKE 'FGX%';
+
+NAMESPAC SCHEMA   PACKAGE  TYPE
+-------- -------- -------- ----------------------
+FGX_CTX  FGX_SEC  CTX_PKG  ACCESSED GLOBALLY
+FGX_DRV  FGX_SEC  CTX_PKG  ACCESSED GLOBALLY
+
+2 rows selected.
+
+--  TYPE 이 ACCESSED GLOBALLY. 값을 넣을 수 있는 것은 USING 절의 FGX_SEC.CTX_PKG 뿐임
+
+<<2. 전역 컨텍스트와 클라이언트 식별자>>
+- 풀 계정 하나를 여러 사용자가 번갈아 쓰면 세션 단위 로컬 컨텍스트로는 사용자가 바뀔 때마다 값을 다시 넣어야 함
+- 전역 컨텍스트는 값을 클라이언트 식별자별로 SGA 에 둠. 세션은 식별자만 바꾸면 그 식별자의 값을 바로 봄
+- 식별자는 누구나 DBMS_SESSION.SET_IDENTIFIER 로 바꿀 수 있음. 이 구간에서 편리함과 위험을 함께 확인함
+
+SQL> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> COL tenant FOR A8
+FGX_APP@orcl> COL role   FOR A8
+FGX_APP@orcl> COL client FOR A8
+FGX_APP@orcl> EXEC DBMS_SESSION.SET_CONTEXT('FGX_CTX', 'TENANT', '30')
+BEGIN DBMS_SESSION.SET_CONTEXT('FGX_CTX', 'TENANT', '30'); END;
+
+*
+ERROR at line 1:
+ORA-01031: insufficient privileges
+ORA-06512: at "SYS.DBMS_SESSION", line 141
+ORA-06512: at line 1
+
+--  컨텍스트 값은 USING 절의 패키지 안에서만 넣을 수 있어 직접 호출은 ORA-01031
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('MALLORY')
+BEGIN fgx_sec.ctx_pkg.login('MALLORY'); END;
+
+*
+ERROR at line 1:
+ORA-20001: unknown application user: MALLORY
+ORA-06512: at "FGX_SEC.CTX_PKG", line 15
+ORA-06512: at line 1
+
+--  신뢰 패키지가 APP_USERS 에 없는 사용자를 거부함
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') client,
+  2         SYS_CONTEXT('FGX_CTX','TENANT') tenant,
+  3         SYS_CONTEXT('FGX_CTX','ROLE')   role FROM dual;
+
+CLIENT   TENANT   ROLE
+-------- -------- --------
+ALICE    10       MANAGER
+
+1 row selected.
+
+FGX_APP@orcl> EXEC DBMS_SESSION.SET_IDENTIFIER('BOB')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') client,
+  2         SYS_CONTEXT('FGX_CTX','TENANT') tenant FROM dual;
+
+CLIENT   TENANT
+-------- --------
+BOB
+
+1 row selected.
+
+--  BOB 은 아직 LOGIN 하지 않아 식별자만 바뀌고 값은 비어 있음
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('BOB')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> EXEC DBMS_SESSION.SET_IDENTIFIER('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') client,
+  2         SYS_CONTEXT('FGX_CTX','TENANT') tenant FROM dual;
+
+CLIENT   TENANT
+-------- --------
+ALICE    10
+
+1 row selected.
+
+--  LOGIN 없이 식별자만 ALICE 로 바꿨는데 10번 테넌트 값이 보임. 앞서 넣은 ALICE 의 값이 SGA 에 남아 있기 때문
+
+FGX_APP@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC DBMS_SESSION.SET_IDENTIFIER('BOB')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') client,
+  2         SYS_CONTEXT('FGX_CTX','TENANT') tenant FROM dual;
+
+CLIENT   TENANT
+-------- --------
+BOB      20
+
+1 row selected.
+
+--  새 세션에서도 BOB 의 값이 그대로 보임. 전역 컨텍스트 값의 수명은 세션과 무관함
+
+FGX_APP@orcl> conn fgx_aud/fgx_aud
+Connected.
+FGX_AUD@orcl> EXEC DBMS_SESSION.SET_IDENTIFIER('BOB')
+
+PL/SQL procedure successfully completed.
+
+FGX_AUD@orcl> SELECT SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') client,
+  2         SYS_CONTEXT('FGX_CTX','TENANT') tenant FROM dual;
+
+CLIENT   TENANT
+-------- --------
+BOB
+
+1 row selected.
+
+--  다른 DB 계정 FGX_AUD 는 같은 식별자를 써도 값을 보지 못함. SET_CONTEXT 의 username 인자를 USER(FGX_APP)로 줬기 때문
+--  username 을 NULL 로 주면 식별자만 맞추면 어느 계정에서나 값이 보임
+
+FGX_AUD@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC DBMS_SESSION.SET_IDENTIFIER('BOB')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.logout
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> EXEC DBMS_SESSION.SET_IDENTIFIER('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.logout
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> EXEC DBMS_SESSION.SET_IDENTIFIER('BOB')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT SYS_CONTEXT('USERENV','CLIENT_IDENTIFIER') client,
+  2         SYS_CONTEXT('FGX_CTX','TENANT') tenant FROM dual;
+
+CLIENT   TENANT
+-------- --------
+BOB
+
+1 row selected.
+
+--  LOGOUT 이 식별자별 값을 지운 뒤에는 식별자를 BOB 으로 바꿔도 값이 없음
+--  풀 반납 시점에 LOGOUT 을 빠뜨리면 다음 사용자가 식별자만 바꿔 남의 테넌트 값을 쓸 수 있음
+--  FGX_APP 계정 자체가 탈취되면 식별자 위장은 막지 못함. 실무에서는 식별자에 추측하기 어려운 세션 토큰을 쓰기도 함
+
+<<3. STATIC 정책의 함정>>
+- STATIC 정책은 정책 함수를 한 번만 실행하고 그 술어를 SGA 에 캐시해 모든 세션이 재사용함
+- 함수가 컨텍스트 값을 술어 문자열에 리터럴로 이어 붙이면, 처음 실행한 사용자의 값이 이후 모든 사용자에게 적용됨
+
+SQL> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> CREATE OR REPLACE PACKAGE pol_pkg AS
+  2    g_calls NUMBER := 0;
+  3    FUNCTION tenant_pred(p_schema IN VARCHAR2, p_obj IN VARCHAR2) RETURN VARCHAR2;
+  4    FUNCTION calls RETURN NUMBER;
+  5  END;
+  6  /
+
+Package created.
+
+FGX_SEC@orcl> CREATE OR REPLACE PACKAGE BODY pol_pkg AS
+  2    FUNCTION tenant_pred(p_schema IN VARCHAR2, p_obj IN VARCHAR2) RETURN VARCHAR2 IS
+  3    BEGIN
+  4      g_calls := g_calls + 1;
+  5      IF SYS_CONTEXT('FGX_CTX', 'TENANT') IS NULL THEN
+  6        RETURN '1=0';
+  7      END IF;
+  8      RETURN 'tenant_id = ' || SYS_CONTEXT('FGX_CTX', 'TENANT');
+  9    END;
+ 10    FUNCTION calls RETURN NUMBER IS BEGIN RETURN g_calls; END;
+ 11  END;
+ 12  /
+
+Package body created.
+
+FGX_SEC@orcl> GRANT EXECUTE ON pol_pkg TO fgx_app;
+
+Grant succeeded.
+
+FGX_SEC@orcl> BEGIN
+  2    DBMS_RLS.ADD_POLICY(
+  3      object_schema   => 'FGX_OWN',
+  4      object_name     => 'ORDERS',
+  5      policy_name     => 'ORD_TENANT',
+  6      function_schema => 'FGX_SEC',
+  7      policy_function => 'POL_PKG.TENANT_PRED',
+  8      policy_type     => DBMS_RLS.STATIC);
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+FGX_SEC@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM
+---------- ---------- --------------------
+       101         10 SSD
+       102         10 RAM
+       103         10 GPU
+
+3 rows selected.
+
+FGX_APP@orcl> SELECT fgx_sec.pol_pkg.calls FROM dual;
+
+     CALLS
+----------
+         1
+
+1 row selected.
+
+--  ALICE(10번 테넌트)로 첫 실행. 함수 호출 1회
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('BOB')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM
+---------- ---------- --------------------
+       101         10 SSD
+       102         10 RAM
+       103         10 GPU
+
+3 rows selected.
+
+FGX_APP@orcl> SELECT fgx_sec.pol_pkg.calls FROM dual;
+
+     CALLS
+----------
+         1
+
+1 row selected.
+
+--  BOB(20번 테넌트)에게 10번 테넌트 주문이 보임. 테넌트 간 데이터 노출
+--  호출 횟수가 1 그대로라 BOB 의 조회 때는 함수가 실행되지 않았음
+
+FGX_APP@orcl> conn / as sysdba
+Connected.
+SYS@orcl> COL object_name FOR A8
+SYS@orcl> COL policy FOR A10
+SYS@orcl> COL predicate FOR A20
+SYS@orcl> SELECT v.sql_id, v.child_number, v.policy, v.predicate
+  2    FROM v$vpd_policy v JOIN v$sql s ON s.sql_id = v.sql_id AND s.child_number = v.child_number
+  3   WHERE v.object_owner = 'FGX_OWN' AND s.sql_text LIKE 'SELECT order_id, tenant_id, item%';
+
+SQL_ID        CHILD_NUMBER POLICY     PREDICATE
+------------- ------------ ---------- --------------------
+9xr3v53qmtf08            0 ORD_TENANT tenant_id = 10
+
+1 row selected.
+
+--  캐시된 술어가 리터럴 'tenant_id = 10'. 실제로 붙은 술어는 V$VPD_POLICY 로 커서별로 확인함
+
+<<4. CONTEXT_SENSITIVE 정책>>
+- CONTEXT_SENSITIVE 는 세션의 컨텍스트가 바뀌면 정책 함수를 다시 실행함
+- 12.2부터 ADD_POLICY 의 namespace·attribute 인자로 특정 속성이 바뀔 때만 다시 실행하도록 묶을 수 있음
+- 정책을 교체할 때 DROP 과 ADD 를 한 블록에 넣으면 어떻게 되는지도 함께 봄
+
+SQL> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> BEGIN
+  2    DBMS_RLS.DROP_POLICY('FGX_OWN', 'ORDERS', 'ORD_TENANT');
+  3    DBMS_RLS.ADD_POLICY(
+  4      object_schema   => 'FGX_OWN',
+  5      object_name     => 'ORDERS',
+  6      policy_name     => 'ORD_TENANT',
+  7      function_schema => 'FGX_SEC',
+  8      policy_function => 'POL_PKG.TENANT_PRED',
+  9      policy_type     => DBMS_RLS.CONTEXT_SENSITIVE,
+ 10      namespace       => 'FGX_CTX',
+ 11      attribute       => 'TENANT');
+ 12  END;
+ 13  /
+BEGIN
+*
+ERROR at line 1:
+ORA-28126: Attribute association failed for policy "ORD_TENANT".
+ORA-06512: at "SYS.DBMS_RLS_INT", line 23
+ORA-06512: at "SYS.DBMS_RLS", line 54
+ORA-06512: at line 3
+
+--  전역 컨텍스트 FGX_CTX 에는 속성 연결을 할 수 없어 ORA-28126
+--  같은 호출에 로컬 컨텍스트(ACCESSED GLOBALLY 없이 만든 것)를 주면 성공함(19.3 실측)
+
+FGX_SEC@orcl> SELECT COUNT(*) FROM all_policies WHERE object_owner = 'FGX_OWN' AND policy_name = 'ORD_TENANT';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+--  블록 앞부분의 DROP_POLICY 는 이미 반영돼 ORD_TENANT 가 없어짐. 뒤의 오류가 DROP 을 되돌리지 못함
+
+FGX_SEC@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('BOB')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT COUNT(*) FROM fgx_own.orders;
+
+  COUNT(*)
+----------
+         6
+
+1 row selected.
+
+--  정책이 빠진 사이 BOB 에게 모든 테넌트의 주문 6건이 보임
+--  정책 교체는 새 이름으로 ADD 를 먼저 하고 옛 정책을 지우는 순서가 안전함
+
+FGX_APP@orcl> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> BEGIN
+  2    DBMS_RLS.ADD_POLICY(
+  3      object_schema   => 'FGX_OWN',
+  4      object_name     => 'ORDERS',
+  5      policy_name     => 'ORD_TENANT',
+  6      function_schema => 'FGX_SEC',
+  7      policy_function => 'POL_PKG.TENANT_PRED',
+  8      policy_type     => DBMS_RLS.CONTEXT_SENSITIVE);
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+FGX_SEC@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM
+---------- ---------- --------------------
+       101         10 SSD
+       102         10 RAM
+       103         10 GPU
+
+3 rows selected.
+
+FGX_APP@orcl> SELECT fgx_sec.pol_pkg.calls FROM dual;
+
+     CALLS
+----------
+         1
+
+1 row selected.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM
+---------- ---------- --------------------
+       101         10 SSD
+       102         10 RAM
+       103         10 GPU
+
+3 rows selected.
+
+FGX_APP@orcl> SELECT fgx_sec.pol_pkg.calls FROM dual;
+
+     CALLS
+----------
+         2
+
+1 row selected.
+
+--  컨텍스트 값이 그대로인데도 두 번째 실행에서 함수가 다시 실행됨(호출 2). 전역 컨텍스트에서는 실행할 때마다 함수를 부름(19.3 실측)
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('CAROL')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM
+---------- ---------- --------------------
+       101         10 SSD
+       102         10 RAM
+       103         10 GPU
+
+3 rows selected.
+
+FGX_APP@orcl> SELECT fgx_sec.pol_pkg.calls FROM dual;
+
+     CALLS
+----------
+         3
+
+1 row selected.
+
+--  CAROL 도 10번 테넌트라 결과는 같음
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('BOB')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM
+---------- ---------- --------------------
+       201         20 MONITOR
+       202         20 MOUSE
+
+2 rows selected.
+
+FGX_APP@orcl> SELECT fgx_sec.pol_pkg.calls FROM dual;
+
+     CALLS
+----------
+         4
+
+1 row selected.
+
+--  BOB 에게 20번 테넌트만 보임. 노출 문제는 사라짐
+
+FGX_APP@orcl> conn / as sysdba
+Connected.
+SYS@orcl> COL sql_text FOR A60
+SYS@orcl> SELECT sql_id, child_number, executions, SUBSTR(sql_text, 1, 60) sql_text
+  2    FROM v$sql
+  3   WHERE sql_text LIKE 'SELECT order_id, tenant_id, item FROM fgx_own.orders%'
+  4   ORDER BY child_number;
+
+SQL_ID        CHILD_NUMBER EXECUTIONS SQL_TEXT
+------------- ------------ ---------- ------------------------------------------------------------
+9xr3v53qmtf08            0          3 SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER B
+9xr3v53qmtf08            1          1 SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER B
+
+2 rows selected.
+
+SYS@orcl> COL predicate FOR A20
+SYS@orcl> SELECT v.sql_id, v.child_number, v.predicate
+  2    FROM v$vpd_policy v JOIN v$sql s ON s.sql_id = v.sql_id AND s.child_number = v.child_number
+  3   WHERE v.object_owner = 'FGX_OWN' AND s.sql_text LIKE 'SELECT order_id, tenant_id, item%'
+  4   ORDER BY v.child_number;
+
+SQL_ID        CHILD_NUMBER PREDICATE
+------------- ------------ --------------------
+9xr3v53qmtf08            0 tenant_id = 10
+9xr3v53qmtf08            1 tenant_id = 20
+
+2 rows selected.
+
+--  같은 SQL 에 자식 커서가 술어별로 생김(child 0 = 10번, child 1 = 20번). ALICE·CAROL 은 child 0 을 같이 씀
+--  리터럴 술어는 테넌트 수만큼 하드 파스와 자식 커서를 늘림. 테넌트가 수천 개면 공유 풀 부담이 커짐
+
+<<5. 술어에 SYS_CONTEXT 를 남기는 방식>>
+- 술어 문자열 안에 SYS_CONTEXT 호출을 그대로 두면 값은 실행할 때 바인드 변수처럼 평가됨
+- 술어 문자열이 사용자와 무관하므로 STATIC 으로 둬도 안전하고, 모든 테넌트가 커서 하나를 공유함
+- 앞 구간의 커서를 지워 비교를 쉽게 하려고 공유 풀을 비움. 운영 DB에서는 하지 않음
+
+SQL> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> CREATE OR REPLACE PACKAGE BODY pol_pkg AS
+  2    FUNCTION tenant_pred(p_schema IN VARCHAR2, p_obj IN VARCHAR2) RETURN VARCHAR2 IS
+  3    BEGIN
+  4      g_calls := g_calls + 1;
+  5      RETURN 'tenant_id = TO_NUMBER(SYS_CONTEXT(''FGX_CTX'', ''TENANT''))';
+  6    END;
+  7    FUNCTION calls RETURN NUMBER IS BEGIN RETURN g_calls; END;
+  8  END;
+  9  /
+
+Package body created.
+
+FGX_SEC@orcl> BEGIN
+  2    DBMS_RLS.DROP_POLICY('FGX_OWN', 'ORDERS', 'ORD_TENANT');
+  3    DBMS_RLS.ADD_POLICY(
+  4      object_schema   => 'FGX_OWN',
+  5      object_name     => 'ORDERS',
+  6      policy_name     => 'ORD_TENANT',
+  7      function_schema => 'FGX_SEC',
+  8      policy_function => 'POL_PKG.TENANT_PRED',
+  9      policy_type     => DBMS_RLS.STATIC);
+ 10  END;
+ 11  /
+
+PL/SQL procedure successfully completed.
+
+FGX_SEC@orcl> conn / as sysdba
+Connected.
+SYS@orcl> ALTER SYSTEM FLUSH SHARED_POOL;
+
+System altered.
+
+SYS@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM
+---------- ---------- --------------------
+       101         10 SSD
+       102         10 RAM
+       103         10 GPU
+
+3 rows selected.
+
+FGX_APP@orcl> SELECT fgx_sec.pol_pkg.calls FROM dual;
+
+     CALLS
+----------
+         1
+
+1 row selected.
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('BOB')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM
+---------- ---------- --------------------
+       201         20 MONITOR
+       202         20 MOUSE
+
+2 rows selected.
+
+FGX_APP@orcl> SELECT fgx_sec.pol_pkg.calls FROM dual;
+
+     CALLS
+----------
+         1
+
+1 row selected.
+
+--  함수 호출은 1회 그대로인데 BOB 에게는 20번 테넌트가 보임
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.logout
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER BY order_id;
+
+no rows selected
+
+FGX_APP@orcl> SELECT fgx_sec.pol_pkg.calls FROM dual;
+
+     CALLS
+----------
+         1
+
+1 row selected.
+
+--  컨텍스트가 비면 TO_NUMBER(NULL) 비교가 참이 아니라 0건. 함수에 '1=0' 분기를 따로 둘 필요가 없음
+
+FGX_APP@orcl> conn / as sysdba
+Connected.
+SYS@orcl> COL sql_text FOR A60
+SYS@orcl> SELECT sql_id, child_number, executions, SUBSTR(sql_text, 1, 60) sql_text
+  2    FROM v$sql
+  3   WHERE sql_text LIKE 'SELECT order_id, tenant_id, item FROM fgx_own.orders%';
+
+SQL_ID        CHILD_NUMBER EXECUTIONS SQL_TEXT
+------------- ------------ ---------- ------------------------------------------------------------
+9xr3v53qmtf08            0          3 SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER B
+
+1 row selected.
+
+--  자식 커서 하나를 세 번 실행함. 다중 테넌트 VPD 에서 기본으로 삼는 형태
+
+<<6. DML 통제와 update_check>>
+- SELECT 정책과 DML 정책을 나누면 조회 범위와 변경 범위를 따로 정할 수 있음
+- 술어는 변경할 대상 행을 고를 뿐 변경 후의 값은 검사하지 않음. 변경 후 값 검사는 update_check => TRUE 일 때만 함
+- 5구간의 ORD_TENANT(STATIC, 기본 statement_types = SELECT·UPDATE·DELETE)는 그대로 남아 있음
+
+SQL> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> BEGIN
+  2    DBMS_RLS.ADD_POLICY(
+  3      object_schema   => 'FGX_OWN',
+  4      object_name     => 'ORDERS',
+  5      policy_name     => 'ORD_TENANT_DML',
+  6      function_schema => 'FGX_SEC',
+  7      policy_function => 'POL_PKG.TENANT_PRED',
+  8      statement_types => 'INSERT,UPDATE,DELETE');
+  9  END;
+ 10  /
+BEGIN
+*
+ERROR at line 1:
+ORA-28104: input value for statement_types is not valid
+ORA-06512: at "SYS.DBMS_RLS_INT", line 23
+ORA-06512: at "SYS.DBMS_RLS", line 54
+ORA-06512: at line 2
+
+--  statement_types 에 INSERT 를 넣으려면 update_check => TRUE 가 함께 있어야 해서 ORA-28104
+--  INSERT 를 빼고 다시 만듦
+
+FGX_SEC@orcl> BEGIN
+  2    DBMS_RLS.ADD_POLICY(
+  3      object_schema   => 'FGX_OWN',
+  4      object_name     => 'ORDERS',
+  5      policy_name     => 'ORD_TENANT_DML',
+  6      function_schema => 'FGX_SEC',
+  7      policy_function => 'POL_PKG.TENANT_PRED',
+  8      statement_types => 'UPDATE,DELETE');
+  9  END;
+ 10  /
+
+PL/SQL procedure successfully completed.
+
+FGX_SEC@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> UPDATE fgx_own.orders SET tenant_id = 20 WHERE order_id = 103;
+
+1 row updated.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM
+---------- ---------- --------------------
+       101         10 SSD
+       102         10 RAM
+
+2 rows selected.
+
+--  ALICE 가 자기 주문 103 의 테넌트를 20 으로 바꿨고, 바꾼 행은 ALICE 의 조회에서 사라짐. 데이터를 다른 테넌트로 밀어 넣는 경로
+
+FGX_APP@orcl> ROLLBACK;
+
+Rollback complete.
+
+FGX_APP@orcl> INSERT INTO fgx_own.orders VALUES (299, 20, 'FAKE', 1, NULL);
+
+1 row created.
+
+FGX_APP@orcl> ROLLBACK;
+
+Rollback complete.
+
+--  INSERT 정책이 없어 20번 테넌트 행도 들어감
+
+FGX_APP@orcl> UPDATE fgx_own.orders SET amount = 0 WHERE order_id = 201;
+
+0 rows updated.
+
+--  다른 테넌트의 행은 UPDATE 대상에서 빠져 0건. 오류가 나지 않아 애플리케이션은 권한 문제인지 데이터가 없는 것인지 구분하지 못함
+
+FGX_APP@orcl> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> BEGIN
+  2    DBMS_RLS.DROP_POLICY('FGX_OWN', 'ORDERS', 'ORD_TENANT_DML');
+  3    DBMS_RLS.ADD_POLICY(
+  4      object_schema   => 'FGX_OWN',
+  5      object_name     => 'ORDERS',
+  6      policy_name     => 'ORD_TENANT_DML',
+  7      function_schema => 'FGX_SEC',
+  8      policy_function => 'POL_PKG.TENANT_PRED',
+  9      statement_types => 'INSERT,UPDATE,DELETE',
+ 10      update_check    => TRUE);
+ 11  END;
+ 12  /
+
+PL/SQL procedure successfully completed.
+
+FGX_SEC@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> UPDATE fgx_own.orders SET tenant_id = 20 WHERE order_id = 103;
+UPDATE fgx_own.orders SET tenant_id = 20 WHERE order_id = 103
+               *
+ERROR at line 1:
+ORA-28115: policy with check option violation
+
+FGX_APP@orcl> INSERT INTO fgx_own.orders VALUES (299, 20, 'FAKE', 1, NULL);
+INSERT INTO fgx_own.orders VALUES (299, 20, 'FAKE', 1, NULL)
+                    *
+ERROR at line 1:
+ORA-28115: policy with check option violation
+
+FGX_APP@orcl> INSERT INTO fgx_own.orders VALUES (104, 10, 'CABLE', 12, NULL);
+
+1 row created.
+
+FGX_APP@orcl> ROLLBACK;
+
+Rollback complete.
+
+--  변경 후의 값을 술어로 다시 검사해 테넌트를 바꾸는 UPDATE 와 남의 테넌트 INSERT 가 ORA-28115
+--  자기 테넌트 행 INSERT 는 통과함
+
+FGX_APP@orcl> conn / as sysdba
+Connected.
+SYS@orcl> COL policy_name FOR A16
+SYS@orcl> COL sel FOR A3
+SYS@orcl> COL ins FOR A3
+SYS@orcl> COL upd FOR A3
+SYS@orcl> COL del FOR A3
+SYS@orcl> COL chk_option FOR A3
+SYS@orcl> SELECT policy_name, sel, ins, upd, del, chk_option, policy_type
+  2    FROM dba_policies WHERE object_owner = 'FGX_OWN' ORDER BY policy_name;
+
+POLICY_NAME      SEL INS UPD DEL CHK POLICY_TYPE
+---------------- --- --- --- --- --- ------------------------
+ORD_TENANT       YES NO  YES YES NO  STATIC
+ORD_TENANT_DML   NO  YES YES YES YES DYNAMIC
+
+2 rows selected.
+
+--  ORD_TENANT_DML 의 CHK_OPTION 이 YES. POLICY_TYPE 을 주지 않은 정책은 DYNAMIC 으로 실행마다 함수를 부름
+
+<<7. 열 마스킹 — sec_relevant_cols_opt => ALL_ROWS>>
+- 열 수준 VPD 는 지정한 열을 참조하는 질의에만 정책을 붙임. 기본 동작은 행을 거르고, ALL_ROWS 를 주면 행은 그대로 두고 열 값만 NULL 로 바꿈
+- ALL_ROWS 는 SELECT 에만 쓸 수 있음. statement_types 에 DML 을 넣으면 ORA-28104
+- 술어 문자열이 사용자와 무관해서 SHARED_STATIC 으로 둠
+
+SQL> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> CREATE OR REPLACE FUNCTION card_pred(p_schema IN VARCHAR2, p_obj IN VARCHAR2)
+  2    RETURN VARCHAR2 IS
+  3  BEGIN
+  4    RETURN 'SYS_CONTEXT(''FGX_CTX'', ''ROLE'') = ''MANAGER''';
+  5  END;
+  6  /
+
+Function created.
+
+FGX_SEC@orcl> BEGIN
+  2    DBMS_RLS.ADD_POLICY(
+  3      object_schema         => 'FGX_OWN',
+  4      object_name           => 'ORDERS',
+  5      policy_name           => 'ORD_CARD',
+  6      function_schema       => 'FGX_SEC',
+  7      policy_function       => 'CARD_PRED',
+  8      statement_types       => 'SELECT',
+  9      sec_relevant_cols     => 'CARD_NO',
+ 10      sec_relevant_cols_opt => DBMS_RLS.ALL_ROWS,
+ 11      policy_type           => DBMS_RLS.SHARED_STATIC);
+ 12  END;
+ 13  /
+
+PL/SQL procedure successfully completed.
+
+FGX_SEC@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> COL card_no FOR A19
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, item, amount, card_no FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID ITEM                     AMOUNT CARD_NO
+---------- -------------------- ---------- -------------------
+       101 SSD                         320 4512-1111-2222-0101
+       102 RAM                         150 4512-1111-2222-0102
+       103 GPU                        1900 4512-1111-2222-0103
+
+3 rows selected.
+
+--  MANAGER 인 ALICE 는 카드 번호가 보임. 행은 ORD_TENANT 때문에 10번 테넌트만 나옴
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('CAROL')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, item, amount, card_no FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID ITEM                     AMOUNT CARD_NO
+---------- -------------------- ---------- -------------------
+       101 SSD                         320
+       102 RAM                         150
+       103 GPU                        1900
+
+3 rows selected.
+
+--  CLERK 인 CAROL 은 행 3건이 그대로 나오고 카드 번호만 NULL
+
+FGX_APP@orcl> SELECT COUNT(*), COUNT(card_no) FROM fgx_own.orders;
+
+  COUNT(*) COUNT(CARD_NO)
+---------- --------------
+         3              0
+
+1 row selected.
+
+--  집계에도 마스킹이 반영돼 COUNT(card_no) 가 0
+
+FGX_APP@orcl> SELECT order_id FROM fgx_own.orders WHERE card_no LIKE '4512%';
+
+no rows selected
+
+--  WHERE 절의 card_no 도 NULL 로 평가돼 0건. 원래 값으로 검색되는 Data Redaction 과 다른 점
+
+<<8. 정책 오류 진단 — ORA-28113, ORA-28112>>
+- 술어 문법이 틀리면 ORA-28113, 정책 함수가 예외를 내면 ORA-28112. 사용자 화면에는 원인이 나오지 않음
+- 두 오류 모두 서버 프로세스 트레이스에 정책 이름과 함수가 남음. ORA-28113 은 술어가 붙은 최종 질의(RLS view)와 원래 오류까지 남음
+- 정책 함수의 오류는 그 테이블을 읽는 모든 질의를 막음. 정책 배포는 애플리케이션 장애와 같은 무게로 다룸
+
+SQL> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> CREATE OR REPLACE FUNCTION bad_pred(p_schema IN VARCHAR2, p_obj IN VARCHAR2)
+  2    RETURN VARCHAR2 IS
+  3  BEGIN
+  4    RETURN 'tenant_idd = 10';
+  5  END;
+  6  /
+
+Function created.
+
+FGX_SEC@orcl> CREATE OR REPLACE FUNCTION boom_pred(p_schema IN VARCHAR2, p_obj IN VARCHAR2)
+  2    RETURN VARCHAR2 IS
+  3    v NUMBER;
+  4  BEGIN
+  5    SELECT tenant_id INTO v FROM app_users WHERE app_user = 'NOBODY';
+  6    RETURN 'tenant_id = ' || v;
+  7  END;
+  8  /
+
+Function created.
+
+FGX_SEC@orcl> EXEC DBMS_RLS.ADD_POLICY('FGX_OWN', 'ORDERS', 'ORD_BAD', 'FGX_SEC', 'BAD_PRED', 'SELECT')
+
+PL/SQL procedure successfully completed.
+
+FGX_SEC@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT COUNT(*) FROM fgx_own.orders;
+SELECT COUNT(*) FROM fgx_own.orders
+                             *
+ERROR at line 1:
+ORA-28113: policy predicate has error
+
+--  정책 이름도 원인도 보이지 않는 ORA-28113
+
+FGX_APP@orcl> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> EXEC DBMS_RLS.DROP_POLICY('FGX_OWN', 'ORDERS', 'ORD_BAD')
+
+PL/SQL procedure successfully completed.
+
+FGX_SEC@orcl> EXEC DBMS_RLS.ADD_POLICY('FGX_OWN', 'ORDERS', 'ORD_BOOM', 'FGX_SEC', 'BOOM_PRED', 'SELECT')
+
+PL/SQL procedure successfully completed.
+
+FGX_SEC@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT COUNT(*) FROM fgx_own.orders;
+SELECT COUNT(*) FROM fgx_own.orders
+                             *
+ERROR at line 1:
+ORA-28112: failed to execute policy function
+
+--  BOOM_PRED 안의 SELECT INTO 가 NO_DATA_FOUND 를 내서 ORA-28112
+
+FGX_APP@orcl> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> EXEC DBMS_RLS.DROP_POLICY('FGX_OWN', 'ORDERS', 'ORD_BOOM')
+
+PL/SQL procedure successfully completed.
+
+--  서버 트레이스 확인. 위 두 세션의 트레이스 파일에 기록이 남음
+[oracle@oel7v9 ~]$ cd /u01/app/oracle/diag/rdbms/orcl/orcl/trace
+[oracle@oel7v9 trace]$ T1=$(grep -l 'Error information for ORA-28113' $(ls -t *.trc | head -30) | head -1); echo $T1
+orcl_ora_559.trc
+[oracle@oel7v9 trace]$ sed -n '/Error information for ORA-28113/,/^-----/p' $T1
+Error information for ORA-28113:
+Logon user     : FGX_APP
+Table/View     : FGX_OWN.ORDERS
+VPD Policy name    : ORD_BAD
+Policy function: FGX_SEC.BAD_PRED
+RLS view  :
+SELECT  "ORDER_ID","TENANT_ID","ITEM","AMOUNT","CARD_NO" FROM "FGX_OWN"."ORDERS"   "ORDERS" WHERE (tenant_idd = 10) 
+ORA-00904: "TENANT_IDD": invalid identifier
+-------------------------------------------------------------
+--  RLS view 줄에 술어가 붙은 최종 질의와 원래 오류 ORA-00904 가 남음
+
+[oracle@oel7v9 trace]$ T2=$(grep -l 'ORA-28112' $(ls -t *.trc | head -30) | head -1); echo $T2
+orcl_ora_561.trc
+[oracle@oel7v9 trace]$ grep -B8 -A3 'ORA-28112' $T2
+*** CLIENT DRIVER:(SQL*PLUS) 2026-10-28T13:01:51.062250+09:00
+ 
+----------------------------------------------------------
+Policy function execution error:
+Logon user     : FGX_APP
+Table/View     : FGX_OWN.ORDERS
+VPD Policy name    : ORD_BOOM
+Policy function: FGX_SEC.BOOM_PRED
+ORA-28112: failed to execute policy function
+
+--  ORA-28112 는 정책과 함수 이름만 남고 함수 안의 예외(NO_DATA_FOUND)는 기록되지 않음
+--  정책 함수 안에서 예외를 잡아 로그 테이블에 남기고 '1=0' 을 돌려주게 짜 두면 원인 추적과 장애 범위 모두 줄일 수 있음
+
+<<9. 정책 그룹과 드라이빙 컨텍스트>>
+- 같은 테이블을 여러 애플리케이션이 쓸 때 앱마다 다른 정책 묶음을 적용함
+- 드라이빙 컨텍스트(FGX_DRV.APP) 값이 적용할 그룹 이름임. ADD_POLICY 로 만든 정책은 SYS_DEFAULT 그룹에 들어가 어느 앱에서나 항상 적용됨
+- ORD_TENANT 는 ORDER_APP 그룹으로 옮기고, 감사 앱용 AUDIT_APP 그룹에는 고액 주문만 보이는 정책을 둠
+
+SQL> conn fgx_sec/fgx_sec
+Connected.
+FGX_SEC@orcl> CREATE OR REPLACE FUNCTION audit_pred(p_schema IN VARCHAR2, p_obj IN VARCHAR2)
+  2    RETURN VARCHAR2 IS
+  3  BEGIN
+  4    RETURN 'amount >= 1000';
+  5  END;
+  6  /
+
+Function created.
+
+FGX_SEC@orcl> BEGIN
+  2    DBMS_RLS.CREATE_POLICY_GROUP('FGX_OWN', 'ORDERS', 'ORDER_APP');
+  3    DBMS_RLS.CREATE_POLICY_GROUP('FGX_OWN', 'ORDERS', 'AUDIT_APP');
+  4    DBMS_RLS.ADD_POLICY_CONTEXT('FGX_OWN', 'ORDERS', 'FGX_DRV', 'APP');
+  5    DBMS_RLS.DROP_POLICY('FGX_OWN', 'ORDERS', 'ORD_TENANT');
+  6    DBMS_RLS.ADD_GROUPED_POLICY(
+  7      object_schema   => 'FGX_OWN',
+  8      object_name     => 'ORDERS',
+  9      policy_group    => 'ORDER_APP',
+ 10      policy_name     => 'ORD_TENANT',
+ 11      function_schema => 'FGX_SEC',
+ 12      policy_function => 'POL_PKG.TENANT_PRED',
+ 13      statement_types => 'SELECT',
+ 14      policy_type     => DBMS_RLS.STATIC);
+ 15    DBMS_RLS.ADD_GROUPED_POLICY(
+ 16      object_schema   => 'FGX_OWN',
+ 17      object_name     => 'ORDERS',
+ 18      policy_group    => 'AUDIT_APP',
+ 19      policy_name     => 'ORD_LARGE',
+ 20      function_schema => 'FGX_SEC',
+ 21      policy_function => 'AUDIT_PRED',
+ 22      statement_types => 'SELECT',
+ 23      policy_type     => DBMS_RLS.STATIC);
+ 24  END;
+ 25  /
+
+PL/SQL procedure successfully completed.
+
+FGX_SEC@orcl> conn / as sysdba
+Connected.
+SYS@orcl> COL policy_group FOR A12
+SYS@orcl> COL policy_name FOR A16
+SYS@orcl> COL pf_owner FOR A8
+SYS@orcl> COL function FOR A20
+SYS@orcl> SELECT policy_group, policy_name, pf_owner, function, sel, ins, upd, del
+  2    FROM dba_policies WHERE object_owner = 'FGX_OWN' ORDER BY policy_group, policy_name;
+
+POLICY_GROUP POLICY_NAME      PF_OWNER FUNCTION             SEL INS UPD DEL
+------------ ---------------- -------- -------------------- --- --- --- ---
+AUDIT_APP    ORD_LARGE        FGX_SEC  AUDIT_PRED           YES NO  NO  NO
+ORDER_APP    ORD_TENANT       FGX_SEC  TENANT_PRED          YES NO  NO  NO
+SYS_DEFAULT  ORD_CARD         FGX_SEC  CARD_PRED            YES NO  NO  NO
+SYS_DEFAULT  ORD_TENANT_DML   FGX_SEC  TENANT_PRED          NO  YES YES YES
+
+4 rows selected.
+
+--  ORD_CARD 와 ORD_TENANT_DML 은 SYS_DEFAULT 에 남아 두 앱 모두에 적용됨
+
+SYS@orcl> COL namespace FOR A10
+SYS@orcl> COL attribute FOR A10
+SYS@orcl> SELECT namespace, attribute FROM dba_policy_contexts WHERE object_owner = 'FGX_OWN';
+
+NAMESPACE  ATTRIBUTE
+---------- ----------
+FGX_DRV    APP
+
+1 row selected.
+
+SYS@orcl> conn fgx_app/fgx_app
+Connected.
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE', 'ORDER_APP')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item, amount FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM                     AMOUNT
+---------- ---------- -------------------- ----------
+       101         10 SSD                         320
+       102         10 RAM                         150
+       103         10 GPU                        1900
+
+3 rows selected.
+
+--  ORDER_APP 에서는 테넌트 정책만 적용돼 10번 테넌트 3건
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE', 'AUDIT_APP')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item, amount FROM fgx_own.orders ORDER BY order_id;
+
+  ORDER_ID  TENANT_ID ITEM                     AMOUNT
+---------- ---------- -------------------- ----------
+       103         10 GPU                        1900
+       301         30 SERVER                     8800
+
+2 rows selected.
+
+--  AUDIT_APP 에서는 테넌트 제한 없이 1000 이상 주문만 나옴. 30번 테넌트의 301 도 보임
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.login('ALICE', 'REPORT_APP')
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item, amount FROM fgx_own.orders ORDER BY order_id;
+SELECT order_id, tenant_id, item, amount FROM fgx_own.orders ORDER BY order_id
+                                                      *
+ERROR at line 1:
+ORA-28123: Driving context 'FGX_DRV,APP' contains invalid group 'REPORT_APP'
+
+--  없는 그룹 이름이면 조회 자체가 ORA-28123 으로 실패함
+
+FGX_APP@orcl> EXEC fgx_sec.ctx_pkg.logout
+
+PL/SQL procedure successfully completed.
+
+FGX_APP@orcl> SELECT order_id, tenant_id, item, amount FROM fgx_own.orders ORDER BY order_id;
+
+no rows selected
+
+--  드라이빙 컨텍스트가 비면 0건
+
+FGX_APP@orcl> conn / as sysdba
+Connected.
+SYS@orcl> COL policy FOR A14
+SYS@orcl> COL policy_group FOR A12
+SYS@orcl> COL predicate FOR A60
+SYS@orcl> SELECT v.child_number, v.policy_group, v.policy, v.predicate
+  2    FROM v$vpd_policy v JOIN v$sql s ON s.sql_id = v.sql_id AND s.child_number = v.child_number
+  3   WHERE v.object_owner = 'FGX_OWN' AND s.sql_text LIKE 'SELECT order_id, tenant_id, item, amount%'
+  4   ORDER BY v.child_number, v.policy;
+
+CHILD_NUMBER POLICY_GROUP POLICY         PREDICATE
+------------ ------------ -------------- ------------------------------------------------------------
+           0 SYS_DEFAULT  ORD_CARD       SYS_CONTEXT('FGX_CTX', 'ROLE') = 'MANAGER'
+           0 ORDER_APP    ORD_TENANT     tenant_id = TO_NUMBER(SYS_CONTEXT('FGX_CTX', 'TENANT'))
+           1 SYS_DEFAULT  ORD_CARD       SYS_CONTEXT('FGX_CTX', 'ROLE') = 'MANAGER'
+           1 AUDIT_APP    ORD_LARGE      amount >= 1000
+           2 SYS_DEFAULT  ORD_CARD       SYS_CONTEXT('FGX_CTX', 'ROLE') = 'MANAGER'
+           2 AUDIT_APP    ORD_LARGE      amount >= 1000
+           2 ORDER_APP    ORD_TENANT     tenant_id = TO_NUMBER(SYS_CONTEXT('FGX_CTX', 'TENANT'))
+
+7 rows selected.
+
+--  child 0 은 ORDER_APP, child 1 은 AUDIT_APP 정책만 붙음. 컨텍스트가 빈 child 2 에는 두 그룹 정책이 모두 붙어 테넌트 술어 때문에 0건이 됨
+--  SYS_DEFAULT 의 ORD_CARD 는 세 커서 모두에 붙음
+
+<<10. 정책 면제 — EXEMPT ACCESS POLICY>>
+- VPD 정책은 테이블 소유자에게도 적용됨. 정책을 받지 않는 것은 SYS 접속과 EXEMPT ACCESS POLICY 권한을 가진 사용자뿐
+- 이 권한은 객체 단위로 줄 수 없어서 모든 스키마의 VPD 정책을 한꺼번에 우회함
+- 기본 통합 감사 정책 ORA_SECURECONFIG 에 EXEMPT ACCESS POLICY 사용 감사가 들어 있음
+
+SQL> conn fgx_own/fgx_own
+Connected.
+FGX_OWN@orcl> SELECT COUNT(*) FROM orders;
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+--  소유자 FGX_OWN 도 0건. 컨텍스트가 비어 모든 그룹 정책이 적용됨
+
+FGX_OWN@orcl> conn fgx_aud/fgx_aud
+Connected.
+FGX_AUD@orcl> SELECT COUNT(*) FROM fgx_own.orders;
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+--  FGX_AUD 도 정책 대상이라 0건
+
+FGX_AUD@orcl> conn / as sysdba
+Connected.
+SYS@orcl> GRANT EXEMPT ACCESS POLICY TO fgx_aud;
+
+Grant succeeded.
+
+SYS@orcl> conn fgx_aud/fgx_aud
+Connected.
+FGX_AUD@orcl> SELECT COUNT(*), COUNT(card_no) FROM fgx_own.orders;
+
+  COUNT(*) COUNT(CARD_NO)
+---------- --------------
+         6              6
+
+1 row selected.
+
+FGX_AUD@orcl> conn / as sysdba
+Connected.
+--  권한을 받자 6건과 카드 번호 6개가 모두 보임. 열 마스킹도 함께 우회됨
+
+SYS@orcl> COL grantee FOR A12
+SYS@orcl> COL privilege FOR A22
+SYS@orcl> SELECT grantee, privilege, admin_option FROM dba_sys_privs
+  2   WHERE privilege = 'EXEMPT ACCESS POLICY' ORDER BY grantee;
+
+GRANTEE      PRIVILEGE              ADM
+------------ ---------------------- ---
+FGX_AUD      EXEMPT ACCESS POLICY   NO
+GSMUSER_ROLE EXEMPT ACCESS POLICY   NO
+MDSYS        EXEMPT ACCESS POLICY   NO
+
+3 rows selected.
+
+--  GSMUSER_ROLE 과 MDSYS 는 설치 때 받은 것. 이 목록은 정기 점검 대상
+
+SYS@orcl> EXEC DBMS_AUDIT_MGMT.FLUSH_UNIFIED_AUDIT_TRAIL
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> COL dbusername FOR A8
+SYS@orcl> COL action_name FOR A8
+SYS@orcl> COL obj FOR A14
+SYS@orcl> COL system_privilege_used FOR A40
+SYS@orcl> SELECT dbusername, action_name, object_schema || '.' || object_name obj, system_privilege_used
+  2    FROM unified_audit_trail
+  3   WHERE dbusername = 'FGX_AUD' AND event_timestamp > SYSTIMESTAMP - INTERVAL '10' MINUTE
+  4   ORDER BY event_timestamp;
+
+DBUSERNA ACTION_N OBJ            SYSTEM_PRIVILEGE_USED
+-------- -------- -------------- ----------------------------------------
+FGX_AUD  SELECT   FGX_OWN.ORDERS EXEMPT ACCESS POLICY
+FGX_AUD  SELECT   FGX_OWN.ORDERS EXEMPT ACCESS POLICY
+FGX_AUD  SELECT   FGX_OWN.ORDERS EXEMPT ACCESS POLICY
+
+3 rows selected.
+
+--  ORA_SECURECONFIG 가 권한 사용을 SYSTEM_PRIVILEGE_USED 로 남김. SELECT 한 번에 기록이 3건 생김(19.3 실측)
+
+SYS@orcl> REVOKE EXEMPT ACCESS POLICY FROM fgx_aud;
+
+Revoke succeeded.
+
+<<11. 정리>>
+- 그룹 안의 정책, 드라이빙 컨텍스트, 정책 그룹 순으로 지운 뒤 계정과 컨텍스트를 지움
+- 남은 것이 없는지 확인함. GLOBAL_CONTEXT 에 남은 값도 0 이어야 함
+
+SQL> conn / as sysdba
+Connected.
+SYS@orcl> EXEC DBMS_RLS.DROP_GROUPED_POLICY('FGX_OWN', 'ORDERS', 'ORDER_APP', 'ORD_TENANT')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC DBMS_RLS.DROP_GROUPED_POLICY('FGX_OWN', 'ORDERS', 'AUDIT_APP', 'ORD_LARGE')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC DBMS_RLS.DROP_POLICY_CONTEXT('FGX_OWN', 'ORDERS', 'FGX_DRV', 'APP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC DBMS_RLS.DELETE_POLICY_GROUP('FGX_OWN', 'ORDERS', 'ORDER_APP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> EXEC DBMS_RLS.DELETE_POLICY_GROUP('FGX_OWN', 'ORDERS', 'AUDIT_APP')
+
+PL/SQL procedure successfully completed.
+
+SYS@orcl> DROP USER fgx_app CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP USER fgx_aud CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP USER fgx_own CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP USER fgx_sec CASCADE;
+
+User dropped.
+
+SYS@orcl> DROP CONTEXT fgx_ctx;
+
+Context dropped.
+
+SYS@orcl> DROP CONTEXT fgx_drv;
+
+Context dropped.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_users WHERE username LIKE 'FGX%';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_context WHERE namespace LIKE 'FGX%';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+SYS@orcl> SELECT COUNT(*) FROM dba_policies WHERE object_owner = 'FGX_OWN';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+SYS@orcl> SELECT COUNT(*) FROM global_context WHERE namespace LIKE 'FGX%';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+--  The End ---
