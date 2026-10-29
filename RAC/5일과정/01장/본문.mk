@@ -276,7 +276,7 @@ Grid 홈 (grid) | /u01/app/19.3.0/grid, ORACLE_BASE /u01/app/grid
 DB 홈 (oracle) | /u01/app/oracle/product/19.3.0/dbhome_rac, ORACLE_BASE /u01/app/oracle
 데이터베이스 | racdb, PDB racpdb1, 관리자 관리형, Management policy AUTOMATIC
 OS | Oracle Linux 7.9, SELinux permissive, 시간 동기화 CTSS
-실습용 추가 디스크 | /dev/asmdisk/test1~6 (4GB × 6). ASM 실습(4~7장) 전용 후보 디스크
+실습용 추가 디스크 | /dev/asmdisk/test1~6 (4GB × 6). ASM 실습(4~7장) 전용 후보 디스크, 설치 가이드 v2 부록 E로 추가
 기준 스냅샷 | rac-base (두 노드 정지 후 함께 뜸, 공유 디스크는 D:\RAC\SHARED 사본)
 @END
 

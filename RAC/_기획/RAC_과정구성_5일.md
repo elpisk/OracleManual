@@ -142,7 +142,7 @@
 | 항목 | 값 |
 |---|---|
 | 구성 | 설치 가이드 v2 그대로. rac1·rac2, racdb1·racdb2, +ASM1·+ASM2, +CRS·+DATA·+FRA, rac-scan 172.16.225.120 |
-| 실습용 추가 디스크 | /dev/asmdisk/test1~6 (4GB × 6). 4~7장 ASM 실습 전용. 설치 가이드 2장·4장 방식으로 D:\RAC\SHARED 에 추가 |
+| 실습용 추가 디스크 | /dev/asmdisk/test1~6 (4GB × 6). 4~7장 ASM 실습 전용. 설치 가이드 v2 부록 E 와 `host/04_add_test_disks.ps1`, `node/15_udev_testdisks.sh` 로 추가 |
 | 수강생 PC | VM 2대 × 9216MB → 호스트 메모리 32GB 권장, 디스크 여유 250GB 이상 (OS 디스크 2 × 100GB, 공유 96GB + test 24GB, 사본 별도) |
 | 사전 구축 | 과정 전에 `RAC/scripts/run_all.py` 로 구축하고 `90_snapshot.ps1 -Name rac-base -BackupShared` 로 기준점을 만든다 |
 

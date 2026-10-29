@@ -13,6 +13,7 @@ scripts/
     01_create_shared_disks.ps1   공유 vmdk 8개 생성 (96GB)
     02_clone_vms.ps1             기준 이미지에서 링크드 클론 2대
     03_patch_vmx.ps1             사설 NIC + 공유 SCSI 버스 설정
+    04_add_test_disks.ps1        ASM 실습용 test 디스크 6개 (설치 후, 가이드 부록 E)
     90_snapshot.ps1              기준 스냅샷 (-BackupShared 로 공유 디스크도 백업)
   node/                 노드에서 실행 (Oracle Linux)
     10_os_setup.sh               호스트명·IP·hosts·그룹·커널·limits·디렉터리
@@ -26,6 +27,7 @@ scripts/
     40_diskgroups.sh             +DATA / +FRA 생성·마운트
     41_dbca.sh                   RAC 데이터베이스 생성, PDB 상태 저장
     50_postcheck.sh              최종 구성 체크리스트 자동 검사
+    15_udev_testdisks.sh         test 디스크 udev 규칙 덧붙임 (rac1 → rac2 복사, 부록 E)
   templates/
     gridsetup.rsp.tmpl           GI 응답 파일 (변수 치환)
     db.rsp.tmpl                  DB 응답 파일
@@ -89,6 +91,24 @@ bash node/10_os_setup.sh 1
 # 데이터베이스·CRS 정지 후 전원을 내린 다음
 powershell -ExecutionPolicy Bypass -File host\90_snapshot.ps1 -Name rac-base
 ```
+
+### 5) ASM 실습용 test 디스크 — 설치 후
+
+RAC 5일 과정 4~7장 실습에 쓰는 4GB 디스크 6개(`/dev/asmdisk/test1~6`)를 붙인다.
+가이드 부록 E 와 같다. 4)의 정지 상태에서 시작한다.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File host\04_add_test_disks.ps1
+# 두 VM 기동 후 rac1 에서 root 로
+bash node/15_udev_testdisks.sh
+# 다시 정지한 뒤 이전 rac-base 를 지우고 기준 스냅샷을 새로 뜬다 (공유 디스크 120GB)
+& "C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe" deleteSnapshot D:\RAC\RAC1\RAC1.vmx rac-base
+& "C:\Program Files (x86)\VMware\VMware Workstation\vmrun.exe" deleteSnapshot D:\RAC\RAC2\RAC2.vmx rac-base
+powershell -ExecutionPolicy Bypass -File host\90_snapshot.ps1 -Name rac-base -BackupShared
+```
+
+test 디스크는 crs 디스크와 크기가 같아서 `12_udev_asmdisk.sh` 를 다시 돌리면
+crs4~crs9 로 잡힌다. 규칙은 `15_udev_testdisks.sh` 로만 덧붙인다.
 
 ## 알아 둘 것
 
