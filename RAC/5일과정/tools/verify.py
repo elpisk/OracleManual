@@ -9,7 +9,7 @@ BAN_ALL = ["**", "실측", "우리 환경", "여러분", "Day ", "Day1", "Day2",
 BAN_PPT = ["`"]
 OLD_ENV = ["19.0.0/grid", "dbhome_1", "oracleasm", "ORCL:", "oel7rac", "OEL7V9", "+ASM3",
            "racstby", "racsby"]
-INSTALL = ["gridSetup.sh -silent", "runInstaller", "-createDatabase", "runcluvfy",
+INSTALL = ["gridSetup.sh -silent", "INSTALL_DB_SWONLY", "-createDatabase", "runcluvfy",
            "stage -pre crsinst", "udevadm"]
 TIC = ["것이 핵심이다", "라는 뜻이다"]
 NO_NOTE = ("학습 목표", "Agenda", "요약", "퀴즈", "Quiz", "실습 개요")
