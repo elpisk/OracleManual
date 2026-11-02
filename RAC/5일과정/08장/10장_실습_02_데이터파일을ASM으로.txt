@@ -1,0 +1,327 @@
+================================================================================
+ 제10장 실습 02 — 데이터파일 하나를 ASM 으로 옮기기
+ 대상   : rac1 (검증은 rac2 포함)
+ 목표   : 파일 시스템 데이터파일을 만들어 rac2 에서 접근이 안 되는 것을 확인하고,
+          RMAN 으로 ASM 에 옮긴 뒤 rac2 에서 정상 동작하는 것을 확인한다
+ 소요   : 약 30분
+ 선행   : 실습 01 완료, racdb 양 노드 OPEN
+ 계정   : root, oracle
+ 주의   : 여기서 만든 ts_mig 는 실습 06 끝에서 삭제한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 옮길 대상 만들기 — rac1 로컬 파일 시스템
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# mkdir -p /u01/app/oracle/oradata
+[root@rac1 ~]# chown oracle:oinstall /u01/app/oracle/oradata
+[root@rac1 ~]# ls -ld /u01/app/oracle/oradata
+drwxr-xr-x. 2 oracle oinstall 6 Sep  3 19:32 /u01/app/oracle/oradata
+
+[root@rac2 ~]# ls -ld /u01/app/oracle/oradata
+ls: cannot access /u01/app/oracle/oradata: No such file or directory
+
+-- rac1 에만 만들었으므로 rac2 에는 없다. 이것이 의도된 설정이다.
+-- 실무에서 절대 하면 안 되는 일을 재현하는 것이다.
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> create tablespace ts_mig
+  2    datafile '/u01/app/oracle/oradata/ts_mig01.dbf' size 100M autoextend off;
+
+Tablespace created.                                            (4.1초 소요)
+
+SQL> col name for a52
+SQL> select file#, name, status from v$datafile where name like '/u01%';
+
+     FILE# NAME                                       STATUS
+---------- ------------------------------------------ -------
+        23 /u01/app/oracle/oradata/ts_mig01.dbf       ONLINE
+
+1 row selected.
+
+-- 파일 번호 23 을 받았다.
+-- 오류 없이 만들어졌다는 점에 주목한다. 오라클은 이 경로가 공유 스토리지인지
+-- 검사하지 않는다. RAC 이라고 해서 막아 주지 않는다.
+
+--------------------------------------------------------------------------------
+ [2] 데이터 넣기 — rac1 에서는 완벽히 정상
+--------------------------------------------------------------------------------
+
+SQL> create table sys.mig_t (a number, b varchar2(100)) tablespace ts_mig;
+
+Table created.
+
+SQL> insert into sys.mig_t select level, lpad('m',100,'m')
+  2    from dual connect by level<=20000;
+
+20000 rows created.
+
+SQL> commit;
+
+Commit complete.
+
+SQL> select count(*) from sys.mig_t;
+
+  COUNT(*)
+----------
+     20000
+
+1 row selected.
+
+-- 테이블 생성, 2 만 건 입력, 조회가 모두 정상이다.
+-- rac1 에서만 보면 아무 문제가 없다.
+--
+-- 여기서 잠시 멈추고 생각해 보자. rac2 에서는 어떻게 될 것인가.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — rac2 에서 같은 조회
+--------------------------------------------------------------------------------
+
+[oracle@rac2 ~]$ sqlplus -s / as sysdba
+
+SQL> select count(*) from sys.mig_t;
+select count(*) from sys.mig_t
+                         *
+ERROR at line 1:
+ORA-01157: cannot identify/lock data file 23 - see DBWR trace file
+ORA-01110: data file 23: '/u01/app/oracle/oradata/ts_mig01.dbf'
+
+-- 오류 : ORA-01157, ORA-01110
+--
+-- ORA-01110 이 어느 파일인지 정확히 알려 준다. 진단에 큰 도움이 된다.
+
+--------------------------------------------------------------------------------
+ [4] 원인 파악 — 계층을 나눠 확인
+--------------------------------------------------------------------------------
+
+-- 먼저 데이터베이스 계층을 본다.
+
+SQL> col name for a52
+SQL> select file#, name, status from v$datafile where file#=23;
+
+     FILE# NAME                                       STATUS
+---------- ------------------------------------------ -------
+        23 /u01/app/oracle/oradata/ts_mig01.dbf       ONLINE
+
+1 row selected.
+
+SQL> col error for a24
+SQL> select file#, error, online_status from v$recover_file;
+
+no rows selected
+
+-- 딕셔너리는 정상이라고 말한다.
+--   STATUS 가 ONLINE 이다.
+--   V$RECOVER_FILE 이 0 행이다 — 복구가 필요한 상태가 아니다.
+--
+-- 즉 데이터베이스 관점에서는 아무 이상이 없다.
+-- 그렇다면 문제는 아래 계층에 있다.
+
+[oracle@rac2 ~]$ ls -l /u01/app/oracle/oradata/
+ls: cannot access /u01/app/oracle/oradata/: No such file or directory
+
+-- 원인 파악 : 디렉터리 자체가 없다.
+--             rac1 의 로컬 디스크에 만든 것이므로 rac2 에는 존재하지 않는다.
+--             딕셔너리는 파일 이름을 기록할 뿐, 그 경로에 실제로 파일이
+--             있는지는 접근할 때 확인된다.
+-- 조치     : 그 데이터파일을 공유 스토리지로 옮긴다. 다른 방법이 없다.
+--             권한 조정이나 재기동으로는 해결되지 않는다.
+-- 재확인   : 옮긴 뒤 rac2 에서 같은 조회를 실행해 정상 결과가 나오는지 본다.
+--             [8] 에서 확인한다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 2 — NOARCHIVELOG 에서 온라인 복사
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ rman target /
+
+Recovery Manager: Release 19.0.0.0.0 - Production
+connected to target database: RACDB (DBID=1240378513)
+
+RMAN> backup as copy datafile 23 format '+DATA';
+
+Starting backup at 03-SEP-26
+using target database control file instead of recovery catalog
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=151 instance=racdb1 device type=DISK
+channel ORA_DISK_1: starting datafile copy
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03009: failure of backup command on ORA_DISK_1 channel at 09/03/2026 19:32:53
+ORA-19602: cannot backup or copy active file in NOARCHIVELOG mode
+
+-- 오류 : ORA-19602
+--
+-- 원인 파악 : 실습 01 [7] 에서 확인한 NOARCHIVELOG 모드 때문이다.
+--             복사 중에 변경이 일어나면 그 사본이 어느 시점의 것인지
+--             맞출 방법이 없어 오라클이 금지한다.
+--             메시지가 원인을 정확히 말해 주는 드문 경우다.
+-- 조치     : 선택지가 둘이다.
+--             (1) ARCHIVELOG 모드로 전환한다 — 온라인 복사 가능, 재기동 필요
+--             (2) 대상 테이블스페이스를 OFFLINE 으로 내린다 — 여기서는 이 길
+-- 재확인   : OFFLINE 후 같은 명령을 다시 실행한다. [6] 에서 수행한다.
+
+--------------------------------------------------------------------------------
+ [6] OFFLINE 후 복사
+--------------------------------------------------------------------------------
+
+SQL> alter tablespace ts_mig offline;
+
+Tablespace altered.                                            (1.2초 소요)
+
+SQL> select file#, status from v$datafile where file#=23;
+
+     FILE# STATUS
+---------- -------
+        23 OFFLINE
+
+1 row selected.
+
+RMAN> backup as copy datafile 23 format '+DATA';
+
+Starting backup at 03-SEP-26
+using target database control file instead of recovery catalog
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=151 instance=racdb1 device type=DISK
+channel ORA_DISK_1: starting datafile copy
+input datafile file number=00023 name=/u01/app/oracle/oradata/ts_mig01.dbf
+output file name=+DATA/RACDB/DATAFILE/ts_mig.279.1243020779
+   tag=TAG20260903T193257 RECID=4 STAMP=1243020778
+channel ORA_DISK_1: datafile copy complete, elapsed time: 00:00:01
+Finished backup at 03-SEP-26
+
+Starting Control File and SPFILE Autobackup at 03-SEP-26
+piece handle=+FRA/RACDB/AUTOBACKUP/2026_09_03/s_1243020779.261.1243020781
+   comment=NONE
+Finished Control File and SPFILE Autobackup at 03-SEP-26
+Recovery Manager complete.
+                                                               (7.0초 소요)
+
+-- 100MB 복사에 7.0 초다. 이 단계가 시간이 드는 유일한 곳이다.
+--
+-- 출력 파일 이름을 눈여겨본다.
+--   +DATA/RACDB/DATAFILE/ts_mig.279.1243020779
+-- 사람이 지정하지 않았는데 ASM 이 OMF 규칙으로 만들었다.
+-- 279 가 파일 번호, 뒤가 인카네이션이다 (7장 명명 규칙).
+--
+-- 마지막 두 줄도 중요하다. 컨트롤파일 자동 백업이 함께 일어났다.
+-- RMAN 이 데이터베이스 구조를 바꾸는 작업 뒤에 자동으로 수행한다.
+-- 이 장에서 SWITCH 를 세 번 하므로 자동 백업 조각도 셋이 생긴다.
+
+RMAN> list copy of datafile 23;
+
+List of Datafile Copies
+=======================
+Key     File S Completion Time Ckp SCN    Ckp Time        Sparse
+------- ---- - --------------- ---------- --------------- ------
+4       23   A 03-SEP-26       3993524    03-SEP-26       NO
+        Name: +DATA/RACDB/DATAFILE/ts_mig.279.1243020779
+
+-- 사본이 RMAN 저장소에 등록되었다.
+-- Ckp SCN 3993524 는 이 사본이 어느 시점의 것인지 나타낸다.
+-- 실습 03 에서 이 숫자가 중요해진다.
+
+--------------------------------------------------------------------------------
+ [7] SWITCH — 데이터베이스가 바라보는 곳 바꾸기
+--------------------------------------------------------------------------------
+
+RMAN> switch datafile 23 to copy;
+
+datafile 23 switched to datafile copy "+DATA/RACDB/DATAFILE/ts_mig.279.1243020779"
+                                                               (2.3초 소요)
+
+SQL> col name for a54
+SQL> select file#, name, status from v$datafile where file#=23;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+        23 +DATA/RACDB/DATAFILE/ts_mig.279.1243020779    OFFLINE
+
+1 row selected.
+
+-- 2.3 초다. 복사는 7.0 초였는데 SWITCH 는 그 3 분의 1 이다.
+--
+-- 이유 : SWITCH 는 파일을 옮기는 것이 아니라 컨트롤파일에 적힌 경로를
+--        바꾸는 것이다. 그래서 100MB 든 1TB 든 이 시간은 같다.
+--        시간이 드는 것은 앞 단계의 복사다.
+--
+-- 이 구분이 서비스 중단 시간 산정의 핵심이다.
+
+SQL> alter tablespace ts_mig online;
+
+Tablespace altered.
+
+SQL> select file#, status from v$datafile where file#=23;
+
+     FILE# STATUS
+---------- -------
+        23 ONLINE
+
+1 row selected.
+
+-- 복구 없이 바로 ONLINE 이 되었다.
+-- 복사 시점과 SWITCH 시점 사이에 이 파일에 대한 변경이 없었기 때문이다.
+-- 실습 03 에서는 이 조건이 깨져 ORA-01113 을 만난다.
+
+--------------------------------------------------------------------------------
+ [8] 재확인 — rac2 에서 이제 읽히는가
+--------------------------------------------------------------------------------
+
+SQL> select count(*) from sys.mig_t;        -- rac1
+
+  COUNT(*)
+----------
+     20000
+
+1 row selected.
+
+[oracle@rac2 ~]$ sqlplus -s / as sysdba
+
+SQL> select count(*) from sys.mig_t;
+
+  COUNT(*)
+----------
+     20000
+
+1 row selected.
+
+SQL> col name for a54
+SQL> select file#, name, status from v$datafile where file#=23;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+        23 +DATA/RACDB/DATAFILE/ts_mig.279.1243020779    ONLINE
+
+1 row selected.
+
+-- [3] 에서 ORA-01157 을 내던 바로 그 조회다.
+-- rac2 에서는 아무 작업도 하지 않았다. 재기동도 하지 않았다.
+-- 파일이 공유 스토리지 위로 옮겨졌다는 사실만으로 정상 동작하게 되었다.
+--
+-- 이것이 RAC 에서 ASM 마이그레이션이 선택이 아니라 필수인 이유다.
+
+--------------------------------------------------------------------------------
+ [9] 옛 파일은 남아 있다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ ls -l /u01/app/oracle/oradata/
+total 102408
+-rw-r-----. 1 oracle asmadmin 104865792 Sep  3 19:32 ts_mig01.dbf
+
+-- SWITCH 는 컨트롤파일의 경로만 바꾼다. 원본은 그대로 남는다.
+-- 104,865,792 바이트, 정확히 100MB 다.
+--
+-- 이것은 버그가 아니라 의도된 설계다. SWITCH 직후 문제가 생기면
+-- 반대 방향으로 SWITCH 해서 되돌릴 수 있어야 하기 때문이다.
+--
+-- 다만 검증이 끝나면 반드시 지워야 한다. 이 장에서는 실습 06 마지막에
+-- RMAN 의 DELETE COPY 로 정리한다. OS 의 rm 을 쓰면 RMAN 저장소에
+-- 기록이 남아 나중에 crosscheck 에서 EXPIRED 로 잡힌다.
+
+SQL> exit
+
+================================================================================
+ 실습 02 종료 — ts_mig 가 +DATA 에 있는 상태로 실습 03 에 인계
+================================================================================

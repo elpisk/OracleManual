@@ -1,0 +1,298 @@
+================================================================================
+ 제10장 실습 06 — 되돌리기 : ASM 에서 파일 시스템으로
+ 대상   : rac1 (검증은 rac2 포함)
+ 목표   : 역방향 마이그레이션의 절차가 대칭임을 확인하고, RAC 에서 그 결과가
+          왜 선택지가 되지 못하는지 직접 확인한 뒤 랩을 기준선으로 되돌린다
+ 소요   : 약 25분
+ 선행   : 실습 03 완료 (ts_mig 의 file 23 이 +FRA 에 ONLINE)
+ 계정   : oracle
+ 주의   : 이 실습 마지막에 ts_mig 를 삭제해 기준선으로 복귀한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 현재 위치 확인
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> col name for a52
+SQL> select file#, name, status from v$datafile where file#=23;
+
+     FILE# NAME                                       STATUS
+---------- ------------------------------------------ -------
+        23 +FRA/RACDB/DATAFILE/ts_mig.262.1243020835  ONLINE
+
+1 row selected.
+
+-- 실습 02 에서 파일 시스템 → +DATA, 실습 03 에서 +DATA → +FRA 로 옮겼다.
+-- 이제 파일 시스템으로 되돌린다.
+
+--------------------------------------------------------------------------------
+ [2] 역방향 — 명령은 같고 FORMAT 만 다르다
+--------------------------------------------------------------------------------
+
+SQL> alter tablespace ts_mig offline;
+
+Tablespace altered.
+
+[oracle@rac1 ~]$ rman target /
+
+RMAN> backup as copy datafile 23 format '/u01/app/oracle/oradata/ts_mig_back.dbf';
+RMAN> switch datafile 23 to copy;
+RMAN> recover datafile 23;
+
+Starting backup at 03-SEP-26
+using target database control file instead of recovery catalog
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=278 instance=racdb1 device type=DISK
+channel ORA_DISK_1: starting datafile copy
+input datafile file number=00023 name=+FRA/RACDB/DATAFILE/ts_mig.262.1243020835
+output file name=/u01/app/oracle/oradata/ts_mig_back.dbf
+   tag=TAG20260903T193553 RECID=8 STAMP=1243020954
+channel ORA_DISK_1: datafile copy complete, elapsed time: 00:00:01
+Finished backup at 03-SEP-26
+
+Starting Control File and SPFILE Autobackup at 03-SEP-26
+piece handle=+FRA/RACDB/AUTOBACKUP/2026_09_03/s_1243020954.264.1243020955
+Finished Control File and SPFILE Autobackup at 03-SEP-26
+
+datafile 23 switched to datafile copy "/u01/app/oracle/oradata/ts_mig_back.dbf"
+
+Starting recover at 03-SEP-26
+using channel ORA_DISK_1
+starting media recovery
+media recovery complete, elapsed time: 00:00:00
+Finished recover at 03-SEP-26
+                                                               (5.4초 소요)
+
+-- FORMAT 에 디스크그룹 대신 경로를 줬을 뿐 명령은 같다.
+-- RMAN 은 대상이 ASM 인지 파일 시스템인지 신경 쓰지 않는다.
+--
+-- 복구가 0 초다. 실습 04 와 마찬가지로 OFFLINE 을 유지한 채 세 명령을
+-- 한 번에 실행했으므로 SCN 이 벌어질 틈이 없었다.
+--
+-- 달라진 것이 하나 있다. 파일 이름을 사람이 지정해야 했다.
+-- 대상이 파일 시스템이므로 OMF 가 작동하지 않는다.
+-- ASM 의 이점 하나가 여기서 사라진다.
+
+SQL> alter tablespace ts_mig online;
+
+Tablespace altered.
+
+SQL> col name for a52
+SQL> select file#, name, status from v$datafile where file#=23;
+
+     FILE# NAME                                       STATUS
+---------- ------------------------------------------ -------
+        23 /u01/app/oracle/oradata/ts_mig_back.dbf    ONLINE
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [3] rac1 에서는 정상
+--------------------------------------------------------------------------------
+
+SQL> select count(*) from sys.mig_t;
+
+  COUNT(*)
+----------
+     20000
+
+1 row selected.
+
+-- 데이터가 온전하다. 여기까지만 보면 성공한 작업이다.
+
+--------------------------------------------------------------------------------
+ [4] 제약이 다시 나타난다
+--------------------------------------------------------------------------------
+
+[oracle@rac2 ~]$ sqlplus -s / as sysdba
+
+SQL> select count(*) from sys.mig_t;
+select count(*) from sys.mig_t
+                         *
+ERROR at line 1:
+ORA-01157: cannot identify/lock data file 23 - see DBWR trace file
+ORA-01110: data file 23: '/u01/app/oracle/oradata/ts_mig_back.dbf'
+
+-- 오류 : ORA-01157, ORA-01110
+--
+-- 원인 파악 : 실습 02 [3] 과 똑같은 오류다. 파일 이름만 바뀌었다.
+--             파일이 rac1 의 로컬 디스크로 돌아갔으므로 rac2 는 접근할 수 없다.
+--             절차는 성공했지만 결과는 RAC 을 깨뜨렸다.
+-- 조치     : 이 상태로 두면 안 된다. 다시 ASM 으로 옮기거나 이 실습처럼
+--             테이블스페이스 자체를 제거해야 한다.
+-- 재확인   : [6] 에서 테이블스페이스를 지운 뒤 rac2 에서 오류가 사라졌는지
+--             확인한다.
+
+--------------------------------------------------------------------------------
+ [5] 이 장의 결론 — 위치에 따른 결과 정리
+--------------------------------------------------------------------------------
+
+--  데이터파일 위치              rac1        rac2          RAC 에서 쓸 수 있나
+--  --------------------------  ----------  ------------  -------------------
+--  로컬 파일 시스템 (실습 02)   20000 행    ORA-01157     불가
+--  +DATA (실습 02)              20000 행    20000 행      가능
+--  +FRA (실습 03)               20000 행    20000 행      가능
+--  로컬 파일 시스템 (되돌림)     20000 행    ORA-01157     불가
+--
+-- 같은 데이터, 같은 테이블, 같은 조회다.
+-- 파일이 어디 있느냐에 따라 두 번째 노드의 결과가 갈린다.
+--
+-- +DATA 냐 +FRA 냐는 RAC 관점에서 아무 차이를 만들지 않는다.
+-- 공유냐 아니냐만이 결과를 가른다.
+--
+-- 그러므로 RAC 에서 "ASM 에서 파일 시스템으로 되돌리기" 는
+-- 절차상 가능하지만 실질적으로는 선택지가 아니다.
+-- 그렇게 하는 순간 한 노드에서만 동작하는 데이터베이스가 되고,
+-- 그것은 더 이상 RAC 이 아니다.
+--
+-- 예외 : NFS·ACFS 같은 공유 파일 시스템이면 ORA-01157 이 나지 않는다.
+--        다만 ASM 을 안 쓸 거라면 처음부터 그렇게 구성했을 것이므로
+--        현실적으로 그런 선택을 할 이유가 거의 없다.
+--
+-- 역방향이 실제로 필요해지는 경우는 RAC 을 단일 인스턴스로 되돌릴 때다.
+-- 그때는 클러스터를 해체하는 것이 목적이므로 이 제약이 문제가 되지 않는다.
+
+--------------------------------------------------------------------------------
+ [6] 정리 1 — 테이블스페이스와 사본 삭제
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> drop table sys.mig_t purge;
+
+Table dropped.
+
+SQL> drop tablespace ts_mig including contents and datafiles;
+
+Tablespace dropped.
+
+RMAN> crosscheck copy;
+RMAN> delete noprompt copy;
+
+deleted datafile copy
+datafile copy file name=+FRA/RACDB/DATAFILE/ts_mig.262.1243020835 RECID=9
+deleted datafile copy
+datafile copy file name=+DATA/RACDB/DATAFILE/ts_mig.279.1243020779 RECID=7
+deleted datafile copy
+datafile copy file name=/u01/app/oracle/oradata/ts_mig01.dbf RECID=5
+Deleted 3 objects
+
+-- 사본이 정확히 셋이다.
+--   +FRA 것            — 실습 03 에서 만든 것
+--   +DATA 것           — 실습 02 에서 만든 것
+--   파일 시스템 것      — 실습 02 시작 시의 원본
+--
+-- DROP TABLESPACE 로 지워진 것은 현재 사용 중이던 ts_mig_back.dbf 하나뿐이다.
+-- 나머지 셋은 RMAN 저장소에만 남아 있어 별도로 지워야 한다.
+--
+-- OS 의 rm 을 쓰지 않는 이유가 여기 있다. rm 으로 지우면 저장소에 기록이
+-- 남아 나중에 crosscheck 에서 EXPIRED 로 잡히고 저장소를 신뢰할 수 없게 된다.
+
+RMAN> delete noprompt backup device type disk;
+
+deleted backup piece
+backup piece handle=+FRA/RACDB/AUTOBACKUP/2026_09_03/s_1243020779.261.1243020781
+deleted backup piece
+backup piece handle=+FRA/RACDB/AUTOBACKUP/2026_09_03/s_1243020836.263.1243020837
+deleted backup piece
+backup piece handle=+FRA/RACDB/AUTOBACKUP/2026_09_03/s_1243020954.264.1243020955
+Deleted 3 objects
+
+-- 자동 백업 조각도 셋이다. 실습 02·03·06 에서 SWITCH 를 세 번 했고
+-- 그때마다 컨트롤파일 자동 백업이 일어났다.
+
+--------------------------------------------------------------------------------
+ [7] 정리 2 — 파일 시스템 잔여물
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# ls -l /u01/app/oracle/oradata/
+total 0
+
+[root@rac1 ~]# rmdir /u01/app/oracle/oradata
+[root@rac1 ~]# ls -ld /u01/app/oracle/oradata
+ls: cannot access /u01/app/oracle/oradata: No such file or directory
+
+-- DELETE COPY 가 파일 시스템의 사본까지 실제로 지웠으므로 디렉터리가 비었다.
+-- 실습 02 에서 만든 디렉터리도 제거해 원래 상태로 되돌린다.
+
+--------------------------------------------------------------------------------
+ [8] 기준선 복귀 확인
+--------------------------------------------------------------------------------
+
+SQL> select count(*) df from v$datafile;
+
+        DF
+----------
+        13
+
+1 row selected.
+
+SQL> col name for a58
+SQL> select name from v$datafile where name not like '+DATA%';
+
+no rows selected
+
+-- 이 두 조회가 완료 판정 기준이다.
+-- 데이터파일 13 개로 돌아왔고 +DATA 밖에 있는 것은 하나도 없다.
+--
+-- 두 번째 조회는 실습 01 [2] 에서 소개한 바로 그 한 줄이다.
+-- RAC 전환 작업의 마지막에 실행해 0 행이 나오는지 확인하는 것이 원칙이다.
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select header_status, count(*) from v$asm_disk group by header_status order by 1;
+
+HEADER_STATU   COUNT(*)
+------------ ----------
+FORMER                6
+MEMBER                8
+
+2 rows selected.
+
+SQL> select name, total_mb, free_mb from v$asm_diskgroup order by group_number;
+
+NAME       TOTAL_MB    FREE_MB
+-------- ---------- ----------
+CRS           12288      11324
+DATA          61440      56906
+FRA           24576      23636
+
+3 rows selected.
+
+[grid@rac1 ~]$ crsctl check cluster -all | grep -c "is online"
+6
+
+[oracle@rac1 ~]$ srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+
+[oracle@rac2 ~]$ sqlplus -s / as sysdba
+
+SQL> select count(*) from dba_tablespaces where tablespace_name in ('TS_MIG','TS_DG');
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+-- 확인 항목과 기대값
+--   1. 데이터파일 개수          → 13                      ✓
+--   2. ASM 밖의 파일            → 0 행                    ✓
+--   3. 디스크 헤더 상태         → FORMER 6 / MEMBER 8     ✓
+--   4. +FRA 여유                → 23636MB                 ✓
+--   5. 파일 시스템 잔여물       → 디렉터리 없음           ✓
+--   6. 클러스터                 → online 6줄              ✓
+--   7. 데이터베이스             → 두 인스턴스 running     ✓
+--   8. 실습용 테이블스페이스    → 0 개                    ✓
+--
+-- 4 번이 특히 중요하다. 자동 백업 조각이 남아 있으면 이 값이 줄어 있다.
+-- 23636 이 나오면 RMAN 정리까지 완전히 끝났다는 뜻이다.
+
+SQL> exit
+
+================================================================================
+ 실습 06 종료 — 랩이 기준선으로 완전히 복귀함
+================================================================================

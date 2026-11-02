@@ -1,0 +1,288 @@
+================================================================================
+ 제6장 실습 06 — 마운트와 언마운트
+ 대상   : rac1, rac2
+ 목표   : 사용 중인 디스크그룹의 언마운트가 어떻게 막히는지 확인하고,
+          FORCE 를 썼을 때 데이터베이스가 어떤 상태에 놓이는지 관찰한다
+ 소요   : 약 30분
+ 선행   : 실습 04 의 TEST 디스크그룹과 TS_TEST 테이블스페이스
+ 계정   : grid, oracle
+ 주의   : FORCE 옵션은 데이터베이스가 모르는 사이에 저장소를 걷어 낸다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 사용 중 상태 확인
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> select tablespace_name, status from dba_tablespaces where tablespace_name='TS_TEST';
+
+TABLESPACE_NAME                STATUS
+------------------------------ ---------
+TS_TEST                        ONLINE
+
+SQL> select file#, name, status from v$datafile where name like '%TEST%';
+
+     FILE# NAME                                              STATUS
+---------- ------------------------------------------------- -------
+        16 +TEST/RACDB/DATAFILE/ts_test.256.1242847583       ONLINE
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 사용 중 언마운트
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> alter diskgroup TEST dismount;
+alter diskgroup TEST dismount
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-15027: active use of diskgroup "TEST" precludes its dismount
+
+-- 오류 : ORA-15032, ORA-15027
+-- 원인 파악 : active use of diskgroup precludes its dismount. 데이터베이스가
+--             그 안의 파일을 열어 두고 있으므로 ASM 이 언마운트를 거부한다.
+--             정상적인 보호 동작이다.
+--             ORA-15032 는 5장에서도 본 포괄 메시지다. 실제 원인은 그 아래에
+--             있다.
+-- 조치     : 정상 순서는 데이터베이스 쪽을 먼저 정리하는 것이다.
+--             테이블스페이스를 오프라인으로 내리거나 삭제한 뒤 언마운트한다.
+--             그러면 이 오류 자체가 나지 않으므로 FORCE 가 필요 없다.
+-- 재확인   : 상태가 그대로인지 확인한다.
+
+SQL> select name, state from v$asm_diskgroup where name='TEST';
+
+NAME       STATE
+---------- -----------
+TEST       MOUNTED
+
+--------------------------------------------------------------------------------
+ [3] FORCE 를 붙이면 (실습 환경에서만)
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup TEST dismount force;
+
+Diskgroup altered.
+
+SQL> select name, state from v$asm_diskgroup where name='TEST';
+
+NAME       STATE
+---------- -----------
+TEST       DISMOUNTED
+
+-- 언마운트되었다. 이제 데이터베이스가 어떤 상태인지 본다.
+
+--------------------------------------------------------------------------------
+ [4] 데이터베이스는 아직 모른다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> select tablespace_name, status from dba_tablespaces where tablespace_name='TS_TEST';
+
+TABLESPACE_NAME                STATUS
+------------------------------ ---------
+TS_TEST                        ONLINE
+
+SQL> select name, status from v$datafile where name like '%TEST%';
+
+NAME                                              STATUS
+------------------------------------------------- -------
++TEST/RACDB/DATAFILE/ts_test.256.1242847583       ONLINE
+
+-- 여전히 ONLINE 이라고 답한다. 실제로는 접근할 수 없는데도 그렇다.
+-- 이 불일치가 FORCE 의 위험이다. 데이터 딕셔너리는 파일이 정상이라고
+-- 알고 있으므로, 그 테이블스페이스를 건드리는 첫 쿼리부터 오류가 번진다.
+--
+-- 감시 도구도 속는다. dba_tablespaces 를 조회하는 점검 스크립트는
+-- 아무 문제가 없다고 보고한다.
+
+--------------------------------------------------------------------------------
+ [5] 데이터베이스가 스스로 복구를 시도한다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ tail -12 /u01/app/oracle/diag/rdbms/racdb/racdb1/trace/alert_racdb1.log
+Starting background process AMB1
+AMB1 started with pid=113, OS id=466
+NOTE: AMB1 (index:1) registering with ASM instance as Flex client 0xffffffffffffffff
+NOTE: AMB1 (index:1) (466) connected to ASM instance +ASM2, osid: 21950 (Flex mode)
+NOTE: AMB1 (466) rebuilding ASM server state for all pending groups
+NOTE: AMB1 (466) rebuilding ASM server state for group 4 (TEST)
+NOTE: AMB1 (466) rebuilt 1 (of 1) groups
+NOTE: AMB1 (466) rebuilt 1 (of 27) allocated files
+NOTE: (466) fetching new locked extents from server
+NOTE: AMB1 (466) 0 locks established; 0 pending writes sent to server
+SUCCESS: AMB1 (466) reconnected & completed ASM server state for disk group 4
+
+-- 주목할 줄은 이것이다.
+--   connected to ASM instance +ASM2
+--
+-- rac1 의 데이터베이스가 rac1 의 ASM 이 아니라 rac2 의 +ASM2 에 붙었다.
+-- Flex ASM 의 동작이다. 12c 부터 데이터베이스 인스턴스는 자기 노드의 ASM
+-- 인스턴스에 고정되지 않는다. 한쪽에서 디스크그룹이 사라지면 다른 노드의
+-- ASM 인스턴스로 옮겨 붙어 서비스를 이어 간다.
+--
+-- 이 실습에서는 우연히 관찰한 것이지만, 원래 Flex ASM 은 ASM 인스턴스 장애가
+-- 데이터베이스 장애로 번지지 않게 하는 기능이다.
+
+--------------------------------------------------------------------------------
+ [6] 되돌린다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> alter diskgroup TEST mount;
+
+Diskgroup altered.
+
+SQL> select name, state from v$asm_diskgroup where name='TEST';
+
+NAME       STATE
+---------- -----------
+TEST       MOUNTED
+
+-- 데이터파일 상태를 확인한다.
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> select file#, name, status from v$datafile where name like '%TEST%';
+
+     FILE# NAME                                              STATUS
+---------- ------------------------------------------------- -------
+        16 +TEST/RACDB/DATAFILE/ts_test.256.1242847583       ONLINE
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 — 잘못된 경로로 온라인 시도
+--------------------------------------------------------------------------------
+
+-- 데이터파일을 명시적으로 온라인시켜야 하는 상황이라면 경로를 정확히 써야 한다.
+
+SQL> alter database datafile '+TEST/RACDB/DATAFILE/ts_test.256.1242920001' online;
+alter database datafile '+TEST/RACDB/DATAFILE/ts_test.256.1242920001' online
+*
+ERROR at line 1:
+ORA-01516: nonexistent log file, data file, or temporary file
+           "+TEST/RACDB/DATAFILE/ts_test.256.1242920001" in the current container
+
+-- 오류 : ORA-01516
+-- 원인 파악 : 파일 이름 끝의 incarnation 번호가 틀렸다. ASM 파일 이름은
+--             이름.파일번호.incarnation 형식이고 마지막 숫자는 파일을
+--             만들 때 부여된다. 손으로 입력하다 틀리기 쉽다.
+-- 조치     : v$datafile 의 NAME 을 그대로 복사해 쓴다. 파일 번호로
+--             지정하는 방법이 더 안전하다.
+-- 재확인   : 파일 번호로 실행한다.
+
+SQL> alter database datafile 16 online;
+
+Database altered.
+
+--------------------------------------------------------------------------------
+ [8] 오류 재현 — 파일이 있는 디스크그룹 삭제
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> drop diskgroup TEST;
+drop diskgroup TEST
+*
+ERROR at line 1:
+ORA-15039: diskgroup not dropped
+ORA-15053: diskgroup "TEST" contains existing files
+
+-- 오류 : ORA-15039, ORA-15053
+-- 원인 파악 : 디스크그룹 안에 파일이 남아 있다. ORA-15039 는 결과,
+--             ORA-15053 이 원인이다. 생성 때의 ORA-15018 과 같은 구조다.
+-- 조치     : 데이터베이스 쪽에서 파일을 정리한다.
+-- 재확인   : 정리한 뒤 다시 시도한다.
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+SQL> drop tablespace ts_test including contents and datafiles;
+
+Tablespace dropped.
+
+--------------------------------------------------------------------------------
+ [9] 오류 재현 — 다른 인스턴스가 마운트 중
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> drop diskgroup TEST;
+drop diskgroup TEST
+*
+ERROR at line 1:
+ORA-15039: diskgroup not dropped
+ORA-15073: diskgroup TEST is mounted by another ASM instance
+
+-- 오류 : ORA-15039, ORA-15073
+-- 원인 파악 : 실습 04 에서 rac2 에도 마운트했다. 디스크그룹을 삭제하려면
+--             삭제하는 인스턴스 하나만 마운트한 상태여야 한다.
+--             같은 ORA-15039 인데 원인이 바뀌었다. 둘째 줄을 읽어야 한다.
+-- 조치     : 다른 모든 노드에서 언마운트한다.
+-- 재확인   : rac2 를 언마운트한 뒤 다시 시도한다.
+
+[grid@rac2 ~]$ sqlplus -s / as sysasm
+SQL> alter diskgroup TEST dismount;
+
+Diskgroup altered.
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+SQL> drop diskgroup TEST;
+
+Diskgroup dropped.
+
+SQL> select name, state, type from v$asm_diskgroup order by name;
+
+NAME       STATE       TYPE
+---------- ----------- ------
+CRS        MOUNTED     NORMAL
+DATA       MOUNTED     EXTERN
+FRA        MOUNTED     EXTERN
+
+--------------------------------------------------------------------------------
+ [10] 리소스도 함께 정리되었는가
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ srvctl status diskgroup -g TEST
+PRCA-1000 : ASM Disk Group TEST does not exist
+PRCR-1001 : Resource ora.TEST.dg does not exist
+
+[root@rac1 ~]# crsctl status resource -t 2>&1 | grep -c TEST
+0
+
+-- 리소스까지 깨끗이 사라졌다.
+--
+-- 여기서 이 장의 중요한 비대칭이 확인된다.
+--   만들기·지우기  ASM 과 Clusterware 가 연동된다
+--   올리기·내리기  연동되지 않는다 (실습 04 에서 확인)
+--
+-- 그래서 운영에서는 조작을 srvctl 로 통일하고, 진단할 때는 두 계층을
+-- 모두 조회해 어긋나지 않았는지 확인한다.
+
+--------------------------------------------------------------------------------
+ [11] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류
+--   ORA-15032 / ORA-15027   사용 중 언마운트
+--   ORA-01516               잘못된 파일 이름으로 온라인 시도
+--   ORA-15039 / ORA-15053   파일이 있는 디스크그룹 삭제
+--   ORA-15039 / ORA-15073   다른 인스턴스가 마운트 중
+--   PRCA-1000 / PRCR-1001   삭제 후 리소스 조회 (정상 확인용)
+--
+-- 확인한 것
+--   1) 사용 중 언마운트는 ORA-15027 로 막힌다. 정상적인 보호다
+--   2) FORCE 는 성공하지만 DB 는 여전히 ONLINE 이라고 인식한다
+--   3) DB 가 Flex ASM 으로 다른 노드의 +ASM2 에 옮겨 붙었다
+--   4) ASM 파일 이름의 incarnation 은 손으로 입력하면 틀리기 쉽다
+--   5) 삭제는 두 단계로 막힌다. 파일 정리와 타 노드 언마운트
+--   6) 삭제하면 Clusterware 리소스도 함께 사라진다
+--
+-- 실무 순서 (안전한 디스크그룹 제거)
+--   1) 사용처 조회 — dba_data_files, v$datafile, v$logfile, v$controlfile
+--   2) DB 쪽 정리 — drop tablespace ... including contents and datafiles
+--   3) 타 노드 언마운트 — srvctl stop diskgroup 또는 각 노드에서 dismount
+--   4) 삭제 — drop diskgroup
+--   5) 확인 — HEADER_STATUS 가 FORMER 인지, 리소스가 사라졌는지
+================================================================================
+ 실습 06 종료
+================================================================================

@@ -1,0 +1,249 @@
+================================================================================
+ 제8장 실습 01 — 현재 디스크 배치 확인
+ 대상   : rac1
+ 목표   : 실습용 Normal 디스크그룹을 만들고 데이터를 채운 뒤, 익스텐트가
+          디스크에 어떻게 분포하는지 x$kffxp 로 확인한다
+ 소요   : 약 30분
+ 선행   : 7장 종료 후 test1~test6 이 FORMER 상태일 것
+ 계정   : grid, oracle
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 오류 재현 — CREATE 에 disk_repair_time 을 넣으면
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> create diskgroup TESTN normal redundancy
+  2    failgroup fgA disk '/dev/asmdisk/test2' name d_a
+  3    failgroup fgB disk '/dev/asmdisk/test3' name d_b
+  4    attribute 'compatible.asm'='19.0.0.0.0','compatible.rdbms'='19.0.0.0.0',
+  5              'disk_repair_time'='3m';
+create diskgroup TESTN normal redundancy
+*
+ERROR at line 1:
+ORA-15018: diskgroup cannot be created
+ORA-15237: invalid attribute disk_repair_time to CREATE DISKGROUP command
+
+-- 오류 : ORA-15018, ORA-15237
+-- 원인 파악 : 속성이라고 다 같은 속성이 아니다.
+--             CREATE 에 쓸 수 있는 것은 생성 시점에 고정되어 나중에 바꿀 수
+--             없는 속성뿐이다. compatible 계열, au_size, sector_size 가
+--             여기 해당한다.
+--             disk_repair_time 은 운영 중에 조정하는 정책 값이므로 ALTER
+--             전용이다.
+-- 조치     : 생성과 속성 설정을 두 단계로 나눈다.
+-- 재확인   : 나눠서 실행하면 성공한다.
+
+SQL> create diskgroup TESTN normal redundancy
+  2    failgroup fgA disk '/dev/asmdisk/test2' name d_a
+  3    failgroup fgB disk '/dev/asmdisk/test3' name d_b
+  4    attribute 'compatible.asm'='19.0.0.0.0','compatible.rdbms'='19.0.0.0.0';
+
+Diskgroup created.
+
+SQL> alter diskgroup TESTN set attribute 'disk_repair_time'='3m';
+
+Diskgroup altered.
+
+SQL> select name, value from v$asm_attribute
+  2   where group_number=(select group_number from v$asm_diskgroup where name='TESTN')
+  3     and name like '%repair%';
+
+NAME                    VALUE
+----------------------- ------
+disk_repair_time        3m
+failgroup_repair_time   24.0h
+
+-- 기본값 3.6시간을 3분으로 줄였다. 실습 06 에서 타이머 만료를 관찰하기
+-- 위해서다. 운영 환경에서는 기본값을 그대로 두는 것이 안전하다.
+
+--------------------------------------------------------------------------------
+ [2] rac2 에서도 마운트한다
+--------------------------------------------------------------------------------
+
+[grid@rac2 ~]$ sqlplus -s / as sysasm
+
+SQL> alter diskgroup TESTN mount;
+
+Diskgroup altered.
+
+-- 6장에서 배운 대로 마운트는 인스턴스별 동작이다. 이 단계를 빠뜨리면
+-- rac2 에서 그 디스크그룹의 파일에 접근할 수 없다.
+
+--------------------------------------------------------------------------------
+ [3] 빈 디스크그룹의 지표
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select name, type, total_mb, free_mb, required_mirror_free_mb, usable_file_mb
+  2    from v$asm_diskgroup where name='TESTN';
+
+NAME     TYPE     TOTAL_MB    FREE_MB REQUIRED_MIRROR_FREE_MB USABLE_FILE_MB
+-------- ------ ---------- ---------- ----------------------- --------------
+TESTN    NORMAL       8192       8076                       0           4038
+
+-- REQUIRED_MIRROR_FREE_MB 가 0이다. 6장에서 본 것과 같다.
+-- 계산하면 (8076 - 0) / 2 = 4038 로 USABLE_FILE_MB 와 맞는다.
+--
+-- 이 0이 왜 나오는지가 중요하다. 디스크가 2장뿐인 Normal 구성에서 한 장을
+-- 잃으면 남은 한 장에 원본과 미러를 함께 둘 수 없다. 복구 자체가 불가능하므로
+-- 예약할 공간을 계산하지 않는다.
+-- 실습 02 에서 디스크를 3장으로 만들면 이 값이 실제로 잡힌다.
+
+--------------------------------------------------------------------------------
+ [4] 데이터를 채운다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> set timing on
+SQL> create tablespace ts_reb datafile '+TESTN' size 2500M;
+
+Tablespace created.
+
+Elapsed: 00:04:32.30
+
+-- 272초가 걸렸다. 2500MB 를 두 벌 쓰므로 실제로는 5GB 를 기록한다.
+-- 실습 환경의 가상 디스크 성능이 이 정도다.
+--
+-- 왜 데이터를 채우는가. 빈 디스크그룹에 디스크를 추가하면 옮길 것이 없어
+-- 리밸런스가 1초 만에 끝난다. 관찰할 것이 없다.
+
+SQL> select tablespace_name, bytes/1024/1024 mb from dba_data_files
+  2   where tablespace_name='TS_REB';
+
+TABLESPACE_NAME                MB
+------------------------------ ----
+TS_REB                         2500
+
+--------------------------------------------------------------------------------
+ [5] 디스크별 사용량
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select d.name, d.path, d.failgroup, d.total_mb, d.free_mb,
+  2         d.total_mb-d.free_mb used_mb
+  3    from v$asm_disk d, v$asm_diskgroup g
+  4   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME     PATH                 FAILGR   TOTAL_MB    FREE_MB    USED_MB
+-------- -------------------- ------ ---------- ---------- ----------
+D_A      /dev/asmdisk/test2   FGA          4096       1486       2610
+D_B      /dev/asmdisk/test3   FGB          4096       1486       2610
+
+-- 두 디스크가 각각 2610MB 를 썼다. 합계 5220MB 다.
+-- 2500MB 의 두 배는 5000MB 이므로 220MB 가 더 붙었다. 파일 헤더와
+-- 디스크그룹 메타데이터다.
+--
+-- 두 디스크의 사용량이 정확히 같다는 점도 눈여겨보라. ASM 은 처음 쓸 때부터
+-- 고르게 분배한다.
+
+SQL> select name, total_mb, free_mb, required_mirror_free_mb, usable_file_mb
+  2    from v$asm_diskgroup where name='TESTN';
+
+NAME       TOTAL_MB    FREE_MB REQUIRED_MIRROR_FREE_MB USABLE_FILE_MB
+-------- ---------- ---------- ----------------------- --------------
+TESTN          8192       2972                       0           1486
+
+-- FREE_MB 가 8076 에서 2972 로 줄었다. USABLE_FILE_MB 는 1486 이다.
+-- (2972 - 0) / 2 = 1486 으로 계산이 맞는다.
+
+--------------------------------------------------------------------------------
+ [6] 익스텐트는 어디에 있는가 — x$kffxp
+--------------------------------------------------------------------------------
+
+SQL> select x.disk_kffxp disk, x.lxn_kffxp side, count(*) extents
+  2    from x$kffxp x, v$asm_diskgroup g
+  3   where x.group_kffxp=g.group_number and g.name='TESTN'
+  4   group by x.disk_kffxp, x.lxn_kffxp order by 1,2;
+
+      DISK       SIDE    EXTENTS
+---------- ---------- ----------
+         0          0       1302
+         0          1       1305
+         1          0       1305
+         1          1       1302
+     65534          2        106
+
+-- 컬럼 읽는 법
+--   DISK_KFFXP  디스크 번호. 0이 D_A, 1이 D_B
+--   LXN_KFFXP   미러 사본 번호. 0이 원본, 1이 미러
+--   65534       아직 할당되지 않은 가상 디스크를 뜻하는 특수값
+--
+-- 표를 읽으면 이렇다.
+--   디스크 0 — 원본 1302개, 미러 1305개
+--   디스크 1 — 원본 1305개, 미러 1302개
+--
+-- 여기서 ASM 미러링을 오해하기 쉬운 지점이 드러난다.
+-- RAID 1 처럼 한쪽은 원본 전용, 다른 쪽은 미러 전용일 것이라고 생각하는데
+-- 그렇지 않다. 원본과 미러가 두 디스크에 고르게 섞여 있다.
+--
+-- 이유는 읽기 성능이다. 미러 전용 디스크를 두면 그 디스크는 평소에 읽기
+-- 요청을 처리하지 않고 논다. 섞어 두면 두 디스크가 모두 읽기를 나눠 맡는다.
+
+--------------------------------------------------------------------------------
+ [7] 규칙은 무엇인가
+--------------------------------------------------------------------------------
+
+-- 섞는다고 아무렇게나 놓는 것은 아니다. 규칙이 하나 있다.
+--   같은 익스텐트의 원본과 미러는 반드시 서로 다른 장애 그룹에 놓인다.
+--
+-- 이 규칙 덕분에 장애 그룹 하나가 통째로 사라져도 모든 익스텐트의 사본이
+-- 남는다. 실습 05 에서 이 규칙이 실제로 지켜지는지 조회로 검증한다.
+--
+-- 지금은 디스크가 2장뿐이므로 검증이 자명하다. 원본이 디스크 0에 있으면
+-- 미러는 디스크 1에 있을 수밖에 없다.
+
+--------------------------------------------------------------------------------
+ [8] x$kffxp 를 쓸 때의 주의
+--------------------------------------------------------------------------------
+
+-- x$ 로 시작하는 것은 오라클 내부 고정 테이블이다.
+--   문서화되어 있지 않다
+--   버전에 따라 컬럼이 바뀔 수 있다
+--   SYS 또는 SYSASM 으로만 조회할 수 있다
+--
+-- 따라서 운영 스크립트에 넣는 것은 권장하지 않는다.
+-- 다만 미러 배치를 눈으로 확인해야 하는 상황, 예를 들어 장애 그룹 설계를
+-- 검증할 때는 이만한 도구가 없다.
+--
+-- 실무에서 쓸 일이 있다면 조회 결과를 파일로 남겨 두고, 정기 점검
+-- 스크립트는 v$asm_disk 의 집계로 대신하는 것이 안전하다.
+
+-- 일반 사용자로 조회하면 어떻게 되는지 확인한다.
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+SQL> select count(*) from x$kffxp;
+
+  COUNT(*)
+----------
+         0
+
+-- 오류가 나지는 않지만 0건이 나온다. RDBMS 인스턴스에는 ASM 익스텐트
+-- 정보가 없기 때문이다. 반드시 ASM 인스턴스에서 조회해야 한다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류
+--   ORA-15018 / ORA-15237   CREATE 에 disk_repair_time 지정
+--
+-- 확인한 것
+--   1) CREATE 에는 생성 시점 고정 속성만 쓸 수 있다
+--   2) 빈 Normal 디스크그룹의 REQUIRED_MIRROR_FREE_MB 는 0이다
+--   3) 2500MB 테이블스페이스가 5220MB 를 썼다 (두 벌 + 메타데이터)
+--   4) 두 디스크의 사용량이 정확히 같다
+--   5) 원본과 미러가 두 디스크에 고르게 섞여 있다
+--   6) DISK_KFFXP 65534 는 미할당 가상 디스크다
+--   7) x$kffxp 는 ASM 인스턴스에서만 의미 있는 값을 준다
+--
+-- 기억할 기준값 (실습 02 에서 비교한다)
+--   TOTAL_MB 8192, FREE_MB 2972, USABLE_FILE_MB 1486
+--   D_A 2610MB, D_B 2610MB
+--   익스텐트 디스크당 약 2607개
+================================================================================
+ 실습 01 종료
+================================================================================

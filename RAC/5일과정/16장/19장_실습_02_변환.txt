@@ -1,0 +1,123 @@
+================================================================================
+ 제19장 실습 02 — RAC 를 RAC One Node 로 변환  [주의]
+ 대상   : rac1, rac2
+ 목표   : srvctl convert database -dbtype RACONENODE 의 전제 조건 두 가지를
+          오류로 확인하고, 조건을 맞춘 뒤 변환한다
+ 소요   : 약 20분
+ 선행   : 실습 01 완료 (OCR 수동 백업)
+ 계정   : oracle
+ 주의   : racdb2 를 내리고 등록을 해제한다. 실습 05 에서 다시 등록한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 그대로 변환해 본다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl convert database -db racdb -dbtype RACONENODE -instance racdb
+PRCD-1214 : Administrator-managed RAC database racdb has more than one instance
+
+-- 1.2초. 첫 번째 조건에 걸렸다.
+--
+-- 원인 파악 : 실습 01 의 사용법에 "RAC database having one instance" 라고 되어 있었다.
+--             관리자 관리형 RAC 는 인스턴스가 하나여야 변환된다.
+--             RAC One Node 는 한 번에 인스턴스 하나만 돌리는 구성이므로
+--             인스턴스 둘을 어떻게 하나로 합칠지를 srvctl 이 대신 정하지 않는다.
+-- 조치     : 남길 인스턴스를 관리자가 고른다. racdb1 을 남기고 racdb2 를 뺀다.
+
+--------------------------------------------------------------------------------
+ [2] racdb2 를 내리고 등록 해제
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl stop instance -db racdb -instance racdb2
+[oracle@rac1 ~]$ srvctl remove instance -db racdb -instance racdb2 -noprompt
+
+-- 정지 47.5초, 등록 해제 4.9초.
+
+[oracle@rac1 ~]$ srvctl config database -db racdb | grep -E "Type|instances|nodes"
+Type: RAC
+Database instances: racdb1
+Configured nodes: rac1
+
+-- 18장의 dbca -deleteInstance 와 무엇이 다른가.
+--
+--   dbca -deleteInstance    CRS 등록 해제 + 스레드 2·리두·UNDOTBS2 삭제
+--   srvctl remove instance  CRS 등록 해제만. 데이터베이스 안은 그대로
+--
+-- 여기서는 srvctl 을 쓴다. 스레드 2 와 UNDOTBS2 는 남겨 둔다.
+-- 실습 03 에서 다른 노드로 옮길 때 그 인스턴스가 쓸 자리다.
+
+--------------------------------------------------------------------------------
+ [3] 다시 변환 — 두 번째 조건
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl convert database -db racdb -dbtype RACONENODE -instance racdb
+PRCD-1242 : Unable to convert RAC database racdb to RAC One Node database because the database had no service added
+
+-- 1.2초. 이번에는 서비스가 없다고 한다.
+--
+-- 원인 파악 : RAC One Node 는 서비스를 통해 접속하는 것을 전제로 한다.
+--             온라인 재배치는 새 노드에 인스턴스를 띄운 뒤 서비스를 그쪽으로 옮기고,
+--             옛 인스턴스를 내리는 순서로 진행된다(실습 03).
+--             옮길 서비스가 없으면 재배치의 의미가 없으므로 변환 단계에서 막는다.
+--             실습 01 [3] 의 "Services:" 가 비어 있던 것이 이것이다.
+-- 조치     : 서비스를 하나 만든다. 선호 인스턴스는 남은 racdb1, 대상 PDB 는 racpdb1.
+
+[oracle@rac1 ~]$ srvctl add service -db racdb -service ronsvc -preferred racdb1 -pdb racpdb1
+[oracle@rac1 ~]$ srvctl start service -db racdb -service ronsvc
+[oracle@rac1 ~]$ srvctl status service -db racdb
+Service ronsvc is running on instance(s) racdb1
+
+-- 추가 4.9초, 기동 2.5초.
+
+--------------------------------------------------------------------------------
+ [4] 변환
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl convert database -db racdb -dbtype RACONENODE -instance racdb -timeout 30
+
+-- 6.2초. 출력은 없다. rc=0 으로 끝났다.
+-- 데이터베이스는 멈추지 않았다. 바뀐 것은 OCR 의 자원 정의뿐이다.
+
+-- 재확인
+
+[oracle@rac1 ~]$ srvctl config database -db racdb
+...
+Services: ronsvc
+Type: RACOneNode
+Online relocation timeout: 30
+Instance name prefix: racdb
+Candidate servers: rac1
+...
+Database instances: racdb_1
+...
+
+[oracle@rac1 ~]$ srvctl status database -db racdb -v
+Instance racdb1 is running on node rac1 with online services ronsvc. Instance status: Open.
+Online relocation: INACTIVE
+
+-- 새로 생긴 줄이 셋이다.
+--
+--   Online relocation timeout: 30    -timeout 으로 준 값 (분)
+--   Instance name prefix: racdb      -instance 로 준 접두어
+--   Candidate servers: rac1          옮겨 갈 수 있는 노드. 지금은 rac1 하나
+--
+-- 그런데 이상한 곳이 있다.
+--   config  →  Database instances: racdb_1
+--   status  →  Instance racdb1 is running
+--
+-- 구성에는 racdb_1 로 등록됐는데 실제로 도는 인스턴스는 racdb1 이다.
+-- RAC One Node 는 인스턴스 이름을 "접두어_번호" 로 짓는다. 변환은 구성만 바꾸고
+-- 돌고 있는 인스턴스를 다시 띄우지는 않았으므로 이름이 어긋난 채로 남았다.
+
+SQL> select inst_id, instance_name, host_name, thread#, status from gv$instance;
+
+   INST_ID INSTANCE_NAM HOST_NAME             THREAD# STATUS
+---------- ------------ ------------------ ---------- ------------
+         1 racdb1       rac1.localdomain            1 OPEN
+
+-- 실제 인스턴스는 racdb1 그대로다.
+-- 이 어긋남이 실습 03 의 재배치에서 어떻게 해소되는지 본다.
+
+================================================================================
+ 실습 02 종료 — Type RACOneNode, 접두어 racdb, 후보 서버 rac1, 서비스 ronsvc
+================================================================================

@@ -1,0 +1,328 @@
+================================================================================
+ 제8장 실습 06 — 디스크 강제 손실  (파괴적 ⚠)
+ 대상   : rac1
+ 목표   : 디스크를 오프라인으로 만들고 DISK_REPAIR_TIME 이 만료될 때까지
+          기다려 ASM 이 스스로 무엇을 하는지 관찰한다
+ 소요   : 약 30분 (타이머 3분 + 리밸런스 대기)
+ 선행   : 실습 05 로 TESTN 에 디스크 4장이 있을 것
+ 계정   : grid
+ 주의   : 이 실습은 디스크를 실제로 잃는다. 데이터베이스에는 영향이 없지만
+          복구에 리밸런스가 필요하다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 타이머 설정을 확인한다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select name, value from v$asm_attribute
+  2   where group_number=(select group_number from v$asm_diskgroup where name='TESTN')
+  3     and name like '%repair%';
+
+NAME                    VALUE
+----------------------- ------
+disk_repair_time        3m
+failgroup_repair_time   24.0h
+
+-- 실습 01 에서 3분으로 줄여 두었다. 기본값은 3.6시간이다.
+-- failgroup_repair_time 은 장애 그룹 전체가 사라졌을 때의 대기 시간이며
+-- 기본값 24시간이다. 사이트 하나가 통째로 끊기는 상황을 상정한 값이다.
+
+--------------------------------------------------------------------------------
+ [2] 오프라인 직전 상태를 기록한다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ date '+%H:%M:%S'
+20:09:55
+
+SQL> select d.name, d.path, d.failgroup, d.mode_status, d.state, d.repair_timer
+  2    from v$asm_disk d, v$asm_diskgroup g
+  3   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME     PATH                 FAILGR MODE_ST STATE    REPAIR_TIMER
+-------- -------------------- ------ ------- -------- ------------
+D_A      /dev/asmdisk/test2   FGA    ONLINE  NORMAL              0
+D_B      /dev/asmdisk/test3   FGB    ONLINE  NORMAL              0
+D_C      /dev/asmdisk/test6   FGC    ONLINE  NORMAL              0
+D_D      /dev/asmdisk/test5   FGD    ONLINE  NORMAL              0
+
+SQL> select name, offline_disks, free_mb, required_mirror_free_mb, usable_file_mb
+  2    from v$asm_diskgroup where name='TESTN';
+
+NAME       OFFLINE_DISKS    FREE_MB REQUIRED_MIRROR_FREE_MB USABLE_FILE_MB
+-------- ------------- ---------- ----------------------- --------------
+TESTN                0      11046                    4096           3475
+
+--------------------------------------------------------------------------------
+ [3] 디스크를 내린다
+--------------------------------------------------------------------------------
+
+SQL> alter diskgroup TESTN offline disk d_c;
+
+Diskgroup altered.
+
+-- 10초 뒤 상태를 본다.
+
+[grid@rac1 ~]$ date '+%H:%M:%S'
+20:10:07
+
+SQL> select d.name, d.path, d.failgroup, d.mode_status, d.state, d.repair_timer
+  2    from v$asm_disk d, v$asm_diskgroup g
+  3   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME     PATH                 FAILGR MODE_ST STATE    REPAIR_TIMER
+-------- -------------------- ------ ------- -------- ------------
+D_A      /dev/asmdisk/test2   FGA    ONLINE  NORMAL              0
+D_B      /dev/asmdisk/test3   FGB    ONLINE  NORMAL              0
+D_C                           FGC    OFFLINE NORMAL            180
+D_D      /dev/asmdisk/test5   FGD    ONLINE  NORMAL              0
+
+SQL> select name, offline_disks, free_mb, required_mirror_free_mb, usable_file_mb
+  2    from v$asm_diskgroup where name='TESTN';
+
+NAME       OFFLINE_DISKS    FREE_MB REQUIRED_MIRROR_FREE_MB USABLE_FILE_MB
+-------- ------------- ---------- ----------------------- --------------
+TESTN                1      11046                    4096           3475
+
+-- 네 가지를 읽는다.
+--
+--   MODE_STATUS    ONLINE -> OFFLINE
+--   PATH           비었다. ASM 이 열지 않는다
+--   REPAIR_TIMER   0 -> 180. disk_repair_time 3m 을 초로 환산한 값
+--   STATE          NORMAL 그대로
+--
+-- STATE 가 NORMAL 인 점이 중요하다. 실습 04 의 제거 때는 DROPPING 이었다.
+-- 오프라인은 제거가 아니라 일시적 접근 불가 표시다. 그래서 데이터를
+-- 옮기지 않고 리밸런스도 일어나지 않는다.
+--
+-- FREE_MB 와 USABLE_FILE_MB 도 변하지 않았다. 아직 아무것도 옮기지 않았다.
+
+--------------------------------------------------------------------------------
+ [4] 5장과 비교한다
+--------------------------------------------------------------------------------
+
+-- 5장에서 +CRS 의 디스크를 내렸을 때는 REPAIR_TIMER 가 0이었다.
+-- 1분을 기다려도 움직이지 않아 의아했다.
+--
+-- 이유는 alert.log 의 표현에 있었다.
+--   op = clear mandatory
+--
+-- Voting File 을 담은 디스크는 mandatory 속성을 갖는다. 그 속성이 해제되면
+-- 통상적인 repair timer 관리 대상에서 빠진다. Voting File 은 이미 재배치로
+-- 처리되었으므로 타이머로 관리할 이유가 없었다.
+--
+-- TESTN 에는 Voting File 이 없다. 그래서 정상적으로 180초가 잡혔다.
+
+SQL> select name, voting_files from v$asm_diskgroup where name in ('CRS','TESTN');
+
+NAME     V
+-------- -
+CRS      Y
+TESTN    N
+
+--------------------------------------------------------------------------------
+ [5] 데이터는 남아 있다
+--------------------------------------------------------------------------------
+
+SQL> select d.name, d.mode_status, d.total_mb-d.free_mb used_mb
+  2    from v$asm_disk d, v$asm_diskgroup g
+  3   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME     MODE_ST    USED_MB
+-------- ------- ----------
+D_A      ONLINE        1337
+D_B      ONLINE        1336
+D_C      OFFLINE       1328
+D_D      ONLINE        1337
+
+-- D_C 의 USED_MB 가 1328 로 그대로다.
+-- 오프라인은 데이터를 지우지 않는다. 이것이 실습 07 의 빠른 복구를
+-- 가능하게 하는 전제다.
+
+--------------------------------------------------------------------------------
+ [6] 3분을 기다린다 — 25초 간격 관찰
+--------------------------------------------------------------------------------
+
+20:10:34  D_C mode=OFFLINE state=NORMAL repair=180
+20:11:00  D_C mode=OFFLINE state=NORMAL repair=180
+20:11:26  D_C mode=OFFLINE state=NORMAL repair=180
+20:11:52  D_C mode=OFFLINE state=NORMAL repair=180
+20:12:18  D_C mode=OFFLINE state=NORMAL repair=180
+20:12:44  D_C mode=OFFLINE state=NORMAL repair=180
+
+-- REPAIR_TIMER 가 180 에서 줄지 않는다.
+-- 이 컬럼은 남은 시간을 카운트다운하는 것이 아니라 설정된 총 시간을
+-- 보여 준다. 실제 경과는 ASM 이 내부적으로 관리한다.
+-- 남은 시간을 알고 싶다면 오프라인 시각을 따로 기록해 두고 계산해야 한다.
+
+--------------------------------------------------------------------------------
+ [7] 만료 — ASM 이 스스로 제거한다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ tail -30 /u01/app/grid/diag/asm/+asm/+ASM1/trace/alert_+ASM1.log
+WARNING: PST-initiated drop of 1 disk(s) in group 5(.2622516521))
+2026-09-01T20:13:06.329411+09:00
+SQL> alter diskgroup TESTN drop disk D_C force /* ASM SERVER */
+2026-09-01T20:13:06.472946+09:00
+NOTE: cache closing disk 2 of grp 5: (not open) D_C
+NOTE: GroupBlock outside rolling migration privileged region
+NOTE: requesting all-instance membership refresh for group=5
+GMON updating for reconfiguration, group 5 at 178 for pid 38, osid 17013
+NOTE: cache closing disk 2 of grp 5: (not open) D_C
+NOTE: group 5 PST updated.
+NOTE: membership refresh pending for group 5/0x9c506d29 (TESTN)
+NOTE: cache closing disk 2 of grp 5: (not open) _DROPPED_0002_TESTN
+GMON querying group 5 at 179 for pid 26, osid 7948
+SUCCESS: refreshed membership for 5/0x9c506d29 (TESTN)
+SUCCESS: alter diskgroup TESTN drop disk D_C force /* ASM SERVER */
+SUCCESS: PST-initiated drop disk in group 5(2622516521))
+NOTE: starting rebalance of group 5/0x9c506d29 (TESTN) at power 1
+
+-- 세 가지를 읽는다.
+--
+-- 첫째, 시각이다. 20:10:07 오프라인, 20:13:06 강제 제거. 정확히 3분 뒤다.
+--
+-- 둘째, 명령이다. ASM 이 스스로 이 SQL 을 실행했다.
+--   alter diskgroup TESTN drop disk D_C force /* ASM SERVER */
+-- 끝의 /* ASM SERVER */ 주석이 사람이 아니라 ASM 이 낸 명령임을 알려 준다.
+-- alert.log 에서 자동 동작과 수동 작업을 구분하는 결정적 단서다.
+--
+-- 셋째, FORCE 가 붙었다. 실습 04 에서 본 대로 FORCE 는 헤더를 정리하지
+-- 않는다. 그 결과가 어떻게 되는지는 [9] 에서 확인한다.
+--
+-- 그리고 마지막 줄에서 리밸런스가 시작되었다. 파워는 asm_power_limit
+-- 기본값인 1이다.
+
+--------------------------------------------------------------------------------
+ [8] 제거 직후 상태
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ date '+%H:%M:%S'
+20:14:20
+
+SQL> select d.name, d.path, d.failgroup, d.mode_status, d.state, d.repair_timer
+  2    from v$asm_disk d, v$asm_diskgroup g
+  3   where d.group_number=g.group_number and g.name='TESTN' order by d.disk_number;
+
+NAME                  PATH                 FAILGR MODE_ST STATE    REPAIR_TIMER
+--------------------- -------------------- ------ ------- -------- ------------
+D_A                   /dev/asmdisk/test2   FGA    ONLINE  NORMAL              0
+D_B                   /dev/asmdisk/test3   FGB    ONLINE  NORMAL              0
+_DROPPED_0002_TESTN                        FGC    OFFLINE FORCING           180
+D_D                   /dev/asmdisk/test5   FGD    ONLINE  NORMAL              0
+
+SQL> select name, offline_disks, free_mb, required_mirror_free_mb, usable_file_mb
+  2    from v$asm_diskgroup where name='TESTN';
+
+NAME       OFFLINE_DISKS    FREE_MB REQUIRED_MIRROR_FREE_MB USABLE_FILE_MB
+-------- ------------- ---------- ----------------------- --------------
+TESTN                1       7134                    4096           1519
+
+-- 이름이 _DROPPED_0002_TESTN 으로 바뀌고 STATE 가 FORCING 이 되었다.
+-- 실습 04 에서 수동으로 drop disk force 를 했을 때와 같은 모습이다.
+--
+-- USABLE_FILE_MB 가 3475 에서 1519 로 줄었다. 디스크 한 장이 빠지면서
+-- 여유가 줄어든 결과다.
+
+SQL> select operation, state, sofar, est_work from v$asm_operation;
+
+OPERA STAT      SOFAR   EST_WORK
+----- ---- ---------- ----------
+REBAL WAIT          0          0
+REBAL WAIT          0          0
+REBAL RUN        1363       1414
+REBAL DONE          0          0
+
+-- 리밸런스가 진행 중이다. WAIT, RUN, DONE 여러 행이 보이는 것은 단계별로
+-- 나뉘어 있기 때문이다.
+
+--------------------------------------------------------------------------------
+ [9] 데이터베이스는 무사한가
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> select tablespace_name, status from dba_tablespaces where tablespace_name='TS_REB';
+
+TABLESPACE_NAME                STATUS
+------------------------------ ---------
+TS_REB                         ONLINE
+
+SQL> select count(*) from dba_data_files where tablespace_name='TS_REB';
+
+  COUNT(*)
+----------
+         1
+
+-- 아무 영향이 없었다.
+-- Normal 중복도에서 장애 그룹 4개 중 하나를 잃었을 뿐이고, 모든 익스텐트의
+-- 사본이 다른 장애 그룹에 남아 있었다. 실습 05 에서 검증한 그 규칙 덕분이다.
+
+--------------------------------------------------------------------------------
+ [10] 헤더는 정리되지 않았다
+--------------------------------------------------------------------------------
+
+-- 리밸런스가 끝난 뒤 확인한다.
+
+SQL> select path, name, header_status, mount_status, group_number, total_mb, os_mb
+  2    from v$asm_disk where path like '%test6%';
+
+PATH                 NAME  HEADER_STATU MOUNT_S GROUP_NUMBER   TOTAL_MB      OS_MB
+-------------------- ----- ------------ ------- ------------ ---------- ----------
+/dev/asmdisk/test6         MEMBER       CLOSED             0          0       4096
+
+-- HEADER_STATUS 가 FORMER 가 아니라 MEMBER 다.
+-- ASM 이 FORCE 로 제거했기 때문이다. 실습 04 의 수동 FORCE 제거와 같다.
+--
+-- 그래서 이 디스크를 다시 넣으려면 ORA-15033 을 만난다.
+
+SQL> alter diskgroup TESTN add failgroup fgC disk '/dev/asmdisk/test6' name d_c;
+alter diskgroup TESTN add failgroup fgC disk '/dev/asmdisk/test6' name d_c
+*
+ERROR at line 1:
+ORA-15032: not all alterations performed
+ORA-15033: disk '/dev/asmdisk/test6' belongs to diskgroup "TESTN"
+
+-- 오류 : ORA-15032, ORA-15033
+-- 원인 파악 : 타이머 만료로 ASM 이 FORCE 제거했으므로 헤더가 MEMBER 로
+--             남았다. 사람이 실수한 것이 아니라 자동 동작의 결과다.
+--             DISK_REPAIR_TIME 을 짧게 두면 계획하지 않은 상황에서 이런
+--             일이 생긴다.
+-- 조치     : add 에도 FORCE 를 붙인다. GROUP_NUMBER 가 0인지 먼저 확인한다.
+-- 재확인   : 실습 07 에서 복구한다.
+
+--------------------------------------------------------------------------------
+ [11] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류
+--   ORA-15032 / ORA-15033   자동 FORCE 제거 후 재사용 시도
+--
+-- 시각 기록
+--   20:09:55  오프라인 직전
+--   20:10:07  오프라인 완료. REPAIR_TIMER 180
+--   20:13:06  ASM 이 스스로 drop disk force 실행 (정확히 3분 뒤)
+--   20:14:20  _DROPPED_0002_TESTN / FORCING, 리밸런스 진행 중
+--
+-- 확인한 것
+--   1) 오프라인 시 REPAIR_TIMER 에 disk_repair_time 이 초로 잡힌다
+--   2) STATE 는 NORMAL 이다. 제거(DROPPING)와 다르다
+--   3) USED_MB 가 유지된다. 데이터를 지우지 않는다
+--   4) REPAIR_TIMER 는 카운트다운하지 않고 설정값을 그대로 보여 준다
+--   5) 5장에서 0이었던 것은 Voting File 디스크의 mandatory 속성 때문
+--   6) 만료 시 ASM 이 drop disk force 를 스스로 실행한다
+--   7) alert.log 의 /* ASM SERVER */ 주석이 자동 동작의 단서다
+--   8) 데이터베이스는 아무 영향을 받지 않았다
+--   9) 헤더가 MEMBER 로 남아 재사용이 막힌다
+--
+-- 실무 교훈
+--   DISK_REPAIR_TIME 을 임의로 줄이면 안 된다. 기본값 3.6시간은 대부분의
+--   일시적 장애를 흡수한다. 실습을 위해 줄였다면 반드시 되돌린다.
+================================================================================
+ 실습 06 종료
+================================================================================

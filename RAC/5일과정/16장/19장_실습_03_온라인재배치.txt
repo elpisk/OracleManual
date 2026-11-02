@@ -1,0 +1,233 @@
+================================================================================
+ 제19장 실습 03 — 온라인 재배치와 소요 시간
+ 대상   : rac1, rac2
+ 목표   : 데이터베이스를 rac2 로 옮기면서 5초 간격으로 상태를 관찰하고,
+          두 인스턴스가 겹쳐 도는 구간과 전체 소요 시간을 잰다
+ 소요   : 약 20분 (재배치 자체 99.5초)
+ 선행   : 실습 02 완료
+ 계정   : oracle
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 후보 서버에 rac2 를 넣는다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl modify database -db racdb -node rac1,rac2
+PRKF-1125 : multiple values specified for the single value option "node": rac1,rac2
+
+-- 0.6초. 거부됐다.
+--
+-- 원인 파악 : 이 버전의 srvctl 에서 modify database 의 -node 는 값 하나만 받는다.
+--             후보 서버 목록을 통째로 넣는 옵션이 아니다.
+--             목록을 넣으려는 생각은 Candidate servers 줄이 쉼표 목록이라
+--             자연스럽게 나오지만, 명령은 그렇게 동작하지 않는다.
+-- 조치     : 재배치 대상 노드를 relocate 의 -node 로 직접 준다.
+--             관리자 관리형 RAC One Node 는 후보에 없는 노드로 재배치하면
+--             그 노드를 후보에 추가한다. [2] 의 첫 줄에서 확인한다.
+
+[oracle@rac1 ~]$ srvctl config database -db racdb | grep -E "Candidate|instances|Type"
+Type: RACOneNode
+Candidate servers: rac1
+Database instances: racdb_1
+
+--------------------------------------------------------------------------------
+ [2] 재배치 — 5초 간격 관찰
+--------------------------------------------------------------------------------
+
+-- 한쪽 세션에서 relocate 를 걸고, 다른 세션에서 srvctl status 를 반복했다.
+
+[oracle@rac1 ~]$ srvctl relocate database -db racdb -node rac2 -verbose
+
+[관찰  4.3초]
+Instance racdb1 is running on node rac1 with online services ronsvc. Instance status: Open.
+Online relocation: INACTIVE
+[관찰 11.4초]
+Instance racdb1 is running on node rac1 with online services ronsvc. Instance status: Open.
+Online relocation: ACTIVE
+Source instance: racdb1 on rac1
+Destination instance: racdb_2 on rac2
+[관찰 26.2초]
+(같음)
+[관찰 34.2초]
+Instance racdb1 is running on node rac1 with online services ronsvc. Instance status: Open.
+Instance racdb_2 is running on node rac2. Instance status: Open.
+Online relocation: ACTIVE
+Source instance: racdb1 on rac1
+Destination instance: racdb_2 on rac2
+[관찰 42.1초]
+Instance racdb_2 is running on node rac2 with online services ronsvc. Instance status: Open.
+Online relocation: ACTIVE
+...
+[관찰 96.7초]
+Instance racdb_2 is running on node rac2 with online services ronsvc. Instance status: Open.
+Online relocation: ACTIVE
+
+Added target node rac2
+Configuration updated to two instances
+Instance racdb_2 started
+Services relocated
+Waiting for up to 30 minutes for instance racdb1 to stop ...
+Instance racdb1 stopped
+Configuration updated to one instance
+
+-- 99.5초 걸렸다. -verbose 출력이 단계를 그대로 보여 준다.
+--
+--   Added target node rac2              후보 서버에 rac2 를 넣었다 ([1] 의 답)
+--   Configuration updated to two instances   잠시 인스턴스 둘인 구성
+--   Instance racdb_2 started            rac2 에 새 인스턴스. 이름은 접두어_2
+--   Services relocated                  ronsvc 를 racdb_2 로 옮겼다
+--   Waiting ... racdb1 to stop          옛 인스턴스가 내려가기를 기다린다 (최대 30분)
+--   Instance racdb1 stopped
+--   Configuration updated to one instance
+--
+-- 관찰 시각으로 다시 정리하면 이렇다.
+--
+--   0 ~ 11초     재배치 시작. 아직 racdb1 만 있다
+--   ~ 34초       racdb_2 가 Open. 두 인스턴스가 함께 Open 이다
+--   ~ 42초       서비스가 racdb_2 로 넘어갔다. racdb1 은 서비스 없이 남았다
+--   ~ 99.5초     racdb1 이 내려가고 끝났다
+--
+-- 34초 근처에서 두 인스턴스가 함께 Open 이다. 이 짧은 구간 동안은 RAC 다.
+-- 그래서 RAC One Node 도 RAC 옵션의 Cache Fusion 과 스레드 구조를 그대로 쓴다.
+--
+-- 서비스가 넘어간 뒤 racdb1 이 내려가기까지 50초 넘게 걸렸다.
+-- 옛 인스턴스를 정리하는 구간이다. 붙어 있는 세션이 있으면 끝나기를 기다리며
+-- -timeout 30 이 그 상한이다. 이번에는 사용자 세션이 없었다.
+
+--------------------------------------------------------------------------------
+ [2-1] 같은 구간을 알럿 로그로
+--------------------------------------------------------------------------------
+
+-- 두 노드의 알럿 로그에서 해당 줄을 바로 앞의 시각과 묶어 옮겼다.
+
+[rac2] /u01/app/oracle/diag/rdbms/racdb/racdb_2/trace/alert_racdb_2.log
+2026-10-28T18:13:21.069830+09:00  Starting ORACLE instance (normal) (OS id: 22206)
+2026-10-28T18:13:34.175356+09:00  Thread 2 opened at log sequence 44
+2026-10-28T18:13:39.172591+09:00  Completed: ALTER DATABASE OPEN /* db agent */
+2026-10-28T18:13:44.144242+09:00  Pluggable database RACPDB1 opened read write
+
+[rac1] /u01/app/oracle/diag/rdbms/racdb/racdb1/trace/alert_racdb1.log
+2026-10-28T18:13:25.048350+09:00
+Reconfiguration started (old inc 6, new inc 8)
+List of instances (total 2) :
+2026-10-28T18:13:46.604484+09:00
+Shutting down ORACLE instance (transactional local) (OS id: 21600)
+ALTER SYSTEM SET _shutdown_completion_timeout_mins=30 SCOPE=MEMORY;
+2026-10-28T18:14:13.373559+09:00
+Pluggable database RACPDB1 closed
+2026-10-28T18:14:48.371248+09:00
+Instance shutdown complete (OS id: 21600)
+
+-- 시각 순으로 맞추면 이렇다.
+--
+--   18:13:21  rac2  racdb_2 기동 시작
+--   18:13:25  rac1  재구성, 인스턴스 2 개
+--   18:13:34  rac2  스레드 2 오픈
+--   18:13:39  rac2  CDB OPEN
+--   18:13:44  rac2  RACPDB1 READ WRITE
+--   18:13:46  rac1  racdb1 정지 시작 (transactional local)
+--   18:14:48  rac1  racdb1 정지 완료
+--
+-- 새 인스턴스를 여는 데 23초, 옛 인스턴스를 내리는 데 62초가 걸렸다.
+-- 재배치 99.5초의 대부분이 정지 쪽이다.
+--
+-- 18:13:25 의 Reconfiguration 은 17장 실습 05 의 인스턴스 복구 때와 같은 메시지다.
+-- 그때는 인스턴스가 죽어 줄었고, 지금은 새 인스턴스가 들어와 늘었다.
+--
+-- 정지 방식은 transactional local 이다. 진행 중인 트랜잭션을 기다린 뒤 이 인스턴스만 내린다.
+-- 그 상한이 _shutdown_completion_timeout_mins=30 이다. 변환 때 준 -timeout 30 이
+-- 이 숨은 파라미터로 들어갔다. 실습 04 에서 이 값이 바뀌는 것을 본다.
+
+--------------------------------------------------------------------------------
+ [3] 재배치 후 구성
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl status database -db racdb -v
+Instance racdb_2 is running on node rac2 with online services ronsvc. Instance status: Open.
+Online relocation: INACTIVE
+
+[oracle@rac1 ~]$ srvctl config database -db racdb | grep -E "Candidate|instances"
+Candidate servers: rac1,rac2
+Database instances: racdb_2
+
+-- 후보 서버가 rac1,rac2 가 됐다. 구성과 실제 인스턴스 이름이 이제 일치한다.
+-- 실습 02 에서 어긋났던 racdb_1 / racdb1 은 racdb1 이 내려가면서 해소됐다.
+
+--------------------------------------------------------------------------------
+ [3-1] 흔한 오류 — rac2 에서 sqlplus 로 붙으면
+--------------------------------------------------------------------------------
+
+[oracle@rac2 ~]$ sqlplus / as sysdba
+SQL> select inst_id, instance_name, host_name, thread#, status from gv$instance;
+select inst_id, instance_name, host_name, thread#, status from gv$instance
+*
+ERROR at line 1:
+ORA-01034: ORACLE not available
+Process ID: 0
+Session ID: 0 Serial number: 0
+
+-- 데이터베이스는 rac2 에서 Open 인데 ORA-01034 가 났다.
+--
+-- 원인 파악 : 접속한 인스턴스 이름이 다르다.
+
+[oracle@rac2 ~]$ ps -ef | grep [o]ra_pmon
+oracle   22653     1  0 18:13 ?        00:00:00 ora_pmon_racdb_2
+[oracle@rac2 ~]$ echo $ORACLE_SID
+racdb2
+
+--             oracle 계정의 프로필은 ORACLE_SID=racdb2 로 되어 있다.
+--             실제 인스턴스는 racdb_2 다. 로컬 접속(/ as sysdba)은 ORACLE_SID 로
+--             인스턴스를 찾으므로 없는 인스턴스 racdb2 에 붙으려 했다.
+--             RAC One Node 의 인스턴스 이름은 재배치할 때마다 접두어_1, 접두어_2 로
+--             바뀐다. 고정된 ORACLE_SID 와 맞지 않는 것이 정상이다.
+-- 조치     : 이번 접속에서만 SID 를 바꾼다.
+
+[oracle@rac2 ~]$ export ORACLE_SID=racdb_2
+[oracle@rac2 ~]$ sqlplus / as sysdba
+
+SQL> select inst_id, instance_name, host_name, thread#, status from gv$instance;
+
+   INST_ID INSTANCE_NAM HOST_NAME             THREAD# STATUS
+---------- ------------ ------------------ ---------- ------------
+         2 racdb_2      rac2.localdomain            2 OPEN
+
+SQL> select value from v$parameter where name='undo_tablespace';
+
+VALUE
+------------
+UNDOTBS2
+
+SQL> select name, open_mode from v$pdbs where name='RACPDB1';
+
+NAME             OPEN_MODE
+---------------- ----------
+RACPDB1          READ WRITE
+
+-- 재확인 : racdb_2 는 스레드 2 와 UNDOTBS2 를 쓰고 있다.
+--
+-- SPFILE 을 다시 보면 racdb_2 전용 항목은 없다.
+
+SQL> select sid, name, value from v$spparameter
+  2   where name in ('instance_number','thread','undo_tablespace') and value is not null
+  3   order by sid, name;
+
+SID      NAME             VALUE
+-------- ---------------- ------------
+racdb1   instance_number  1
+racdb1   thread           1
+racdb1   undo_tablespace  UNDOTBS1
+racdb2   instance_number  2
+racdb2   thread           2
+racdb2   undo_tablespace  UNDOTBS2
+
+-- 인스턴스 racdb_2 에 지정된 thread, undo_tablespace 가 없는데도
+-- 열려 있는 스레드 2 와 쓰이지 않던 UNDOTBS2 를 잡았다.
+-- 실습 02 에서 srvctl remove instance 로 등록만 해제하고 스레드와 UNDO 를
+-- 남겨 둔 것이 여기서 쓰였다.
+--
+-- 운영에서는 ORACLE_SID 에 기대지 말고 서비스(ronsvc)로 접속한다.
+-- 어느 노드의 어느 인스턴스로 가든 서비스 이름은 그대로다.
+
+================================================================================
+ 실습 03 종료 — racdb_2 on rac2, 후보 서버 rac1,rac2, 재배치 99.5초
+================================================================================

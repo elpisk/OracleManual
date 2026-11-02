@@ -1,0 +1,322 @@
+================================================================================
+ 제12장 실습 07 — PDB 를 노드별로 열고 닫기
+ 대상   : rac1, rac2
+ 목표   : PDB 의 열림 상태가 인스턴스별로 관리된다는 것을 확인하고, 상태가
+          어긋났을 때의 증상과 진단 방법을 익힌다
+ 소요   : 약 25분
+ 선행   : racdb 양 노드 OPEN, RACPDB1 이 양 노드 READ WRITE
+ 계정   : oracle
+ 주의   : PDB 를 한 노드에서 닫는다. [6] 에서 반드시 다시 연다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 시작 상태
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> col name for a12
+SQL> select inst_id, con_id, name, open_mode from gv$pdbs order by 1,2;
+
+   INST_ID     CON_ID NAME         OPEN_MODE
+---------- ---------- ------------ ----------
+         1          2 PDB$SEED     READ ONLY
+         1          3 RACPDB1      READ WRITE
+         2          2 PDB$SEED     READ ONLY
+         2          3 RACPDB1      READ WRITE
+
+4 rows selected.
+
+-- 4 행이다. PDB 둘 × 인스턴스 둘이다.
+--
+-- 여기서 이해해야 할 것은 열림 상태가 인스턴스별로 관리된다는 점이다.
+-- 데이터파일은 공유되지만 그것을 어떤 모드로 여는지는 인스턴스마다 독립적이다.
+-- 단일 인스턴스에는 없는 개념이다.
+--
+-- PDB$SEED 가 READ ONLY 인 것은 정상이다. 새 PDB 를 만들 때 원본이 되는
+-- 템플릿이므로 변경되면 안 된다.
+
+--------------------------------------------------------------------------------
+ [2] PDB 안에 테이블 준비
+--------------------------------------------------------------------------------
+
+SQL> alter session set container=racpdb1;
+
+Session altered.
+
+SQL> create table system.pdb_t (a number) tablespace system;
+
+Table created.
+
+SQL> insert into system.pdb_t values (1);
+
+1 row created.
+
+SQL> commit;
+
+Commit complete.
+
+SQL> select count(*) from system.pdb_t;
+
+  COUNT(*)
+----------
+         1
+
+1 row selected.
+
+-- 조회 대상을 하나 만들어 둔다.
+-- [4] 에서 이 테이블을 두 노드에서 각각 조회해 결과를 비교한다.
+
+--------------------------------------------------------------------------------
+ [3] rac1 에서만 PDB 닫기
+--------------------------------------------------------------------------------
+
+SQL> alter pluggable database racpdb1 close;
+
+Pluggable database altered.
+
+SQL> col name for a12
+SQL> select inst_id, name, open_mode from gv$pdbs where name='RACPDB1' order by 1;
+
+   INST_ID NAME         OPEN_MODE
+---------- ------------ ----------
+         1 RACPDB1      MOUNTED
+         2 RACPDB1      READ WRITE
+
+2 rows selected.
+
+-- INST_ID 1 만 MOUNTED 가 되고 2 는 READ WRITE 그대로다.
+--
+-- 인스턴스 지정을 생략하면 명령을 실행한 노드에만 적용된다.
+-- 단일 인스턴스 습관대로 CLOSE 를 실행하면 의도치 않게 이 상태가 만들어진다.
+--
+-- rac2 에서 같은 조회를 해도 결과는 같다. GV$ 이므로 어느 노드에서 봐도
+-- 클러스터 전체의 상태가 나온다.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 같은 SQL, 다른 결과
+--------------------------------------------------------------------------------
+
+-- rac1 (PDB 가 MOUNTED 인 노드)
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> alter session set container=racpdb1;
+
+Session altered.
+
+SQL> select count(*) from system.pdb_t;
+select count(*) from system.pdb_t
+                            *
+ERROR at line 1:
+ORA-01219: database or pluggable database not open:
+           queries allowed on fixed tables or views only
+
+-- rac2 (PDB 가 READ WRITE 인 노드)
+
+[oracle@rac2 ~]$ sqlplus -s / as sysdba
+
+SQL> alter session set container=racpdb1;
+
+Session altered.
+
+SQL> select count(*) from system.pdb_t;
+
+  COUNT(*)
+----------
+         1
+
+1 row selected.
+
+-- 오류 : ORA-01219 (rac1 에서만)
+--
+-- 원인 파악 : PDB 가 rac1 에서만 MOUNTED 이기 때문이다.
+--             주목할 점이 둘 있다.
+--             하나, alter session set container 자체는 양쪽 다 성공했다.
+--                   Session altered 가 나온다. 컨테이너로 전환하는 것과
+--                   그 안의 데이터를 읽는 것은 별개다.
+--                   전환 단계에서 걸리지 않으므로 원인을 놓치기 쉽다.
+--             둘, 메시지 뒷부분이 정확하다.
+--                   "queries allowed on fixed tables or views only"
+--                   MOUNTED 상태에서도 고정 뷰는 조회할 수 있다.
+--                   그래서 GV$PDBS 로 상태를 확인하는 것은 가능하다.
+-- 조치     : 모든 인스턴스에서 열어야 한다. [6] 에서 수행한다.
+-- 재확인   : 두 노드에서 같은 조회를 실행해 결과가 같은지 본다.
+
+--------------------------------------------------------------------------------
+ [5] DML 은 오류 번호가 다르다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> alter session set container=racpdb1;
+
+Session altered.
+
+SQL> insert into system.pdb_t values (2);
+insert into system.pdb_t values (2)
+*
+ERROR at line 1:
+ORA-01109: database not open
+
+-- 오류 : ORA-01109
+--
+-- 조회는 ORA-01219, 변경은 ORA-01109 다. 원인은 같지만 번호가 다르다.
+-- 두 번호를 구분해 두면 사용자 문의를 받았을 때 무엇을 시도했는지 짐작할 수 있다.
+
+--------------------------------------------------------------------------------
+ [6] 실무에서 이 상황이 나타나는 방식
+--------------------------------------------------------------------------------
+
+-- 사용자는 SCAN 을 통해 접속한다. 어느 노드에 붙을지 모른다.
+-- PDB 가 한 노드에서만 닫혀 있으면 접속이 그 노드로 갈 때만 실패한다.
+--
+-- 증상
+--   간헐적으로 오류가 난다
+--   재시도하면 다른 노드로 붙어 성공하기도 한다
+--   "어제는 됐는데 오늘 안 된다" 는 문의로 올라온다
+--   재현이 안 된다는 보고가 함께 온다
+--
+-- 진단
+--   select inst_id, name, open_mode from gv$pdbs 한 줄이면 된다
+--   INST_ID 별 OPEN_MODE 가 갈려 있으면 원인이 확정된다
+--
+-- 이 점검을 일상 항목에 넣어 두는 것이 좋다.
+-- 9장의 GV$ 대칭 점검과 같은 성격이다.
+-- RAC 에서는 "두 노드가 같은가" 가 반복되는 질문이다.
+
+--------------------------------------------------------------------------------
+ [7] 조치 — 모든 인스턴스에서 열기
+--------------------------------------------------------------------------------
+
+SQL> alter pluggable database racpdb1 open instances=all;
+
+Pluggable database altered.
+
+SQL> col name for a12
+SQL> select inst_id, name, open_mode from gv$pdbs where name='RACPDB1' order by 1;
+
+   INST_ID NAME         OPEN_MODE
+---------- ------------ ----------
+         1 RACPDB1      READ WRITE
+         2 RACPDB1      READ WRITE
+
+2 rows selected.
+
+SQL> alter session set container=racpdb1;
+
+Session altered.
+
+SQL> select count(*) from system.pdb_t;
+
+  COUNT(*)
+----------
+         1
+
+1 row selected.
+
+-- 재확인 : 조금 전 ORA-01219 를 내던 같은 조회가 이제 정상이다.
+--
+-- instances=all 을 붙이면 모든 인스턴스에서 열린다.
+-- 한 노드에서 한 번 실행하면 된다.
+-- 특정 인스턴스만 지정하려면 instances=('racdb1') 형태로 쓴다.
+--
+-- 실무 습관 : 열 때는 항상 instances=all 을 붙인다.
+--             생략하면 실행한 노드에서만 열려 [4] 의 증상이 생긴다.
+
+--------------------------------------------------------------------------------
+ [8] 재기동 후에도 유지되게 하려면
+--------------------------------------------------------------------------------
+
+SQL> select con_name, instance_name, state from dba_pdb_saved_states;
+
+CON_NAME   INSTANCE_NAME   STATE
+---------- --------------- --------
+RACPDB1    racdb1          OPEN
+RACPDB1    racdb2          OPEN
+
+2 rows selected.
+
+-- PDB 의 열림 상태는 기본적으로 인스턴스 재기동 후 유지되지 않는다.
+-- CDB 가 열려도 PDB 는 MOUNTED 로 남는다.
+-- 상태를 저장해 두면 자동으로 열린다.
+--
+-- 이 랩에는 이미 저장되어 있고, 인스턴스마다 한 행씩이다.
+-- 저장 자체도 인스턴스별로 이뤄진다는 뜻이다.
+--
+-- 한 노드에서만 alter pluggable database ... save state 를 하면
+-- 그 노드에서만 자동으로 열린다. 다른 노드는 재기동 후 MOUNTED 로 남아
+-- [4] 의 증상이 재기동 후에 다시 나타난다.
+--
+-- 저장할 때도 instances=all 을 붙여야 두 노드 모두에 기록된다.
+--   alter pluggable database racpdb1 save state instances=all;
+
+--------------------------------------------------------------------------------
+ [9] 노드별로 다르게 여는 정당한 용도
+--------------------------------------------------------------------------------
+
+-- 지금까지는 상태가 어긋난 것을 문제로 다뤘지만 의도적으로 그렇게 하는
+-- 경우도 있다.
+--
+--  작업 격리
+--    특정 PDB 에 무거운 배치를 돌려야 할 때 그 PDB 를 한 노드에서만
+--    열어 두면 배치 부하가 그 노드에 갇힌다.
+--
+--  점검
+--    PDB 를 한 노드에서 닫고 그 노드에서 유지보수를 하는 동안
+--    다른 노드가 서비스를 계속한다.
+--
+-- 어느 쪽이든 조건이 붙는다.
+--   의도적이어야 하고 기록으로 남겨야 한다.
+--   운영 문서에 "RACPDB1 은 rac2 에서만 연다" 와 그 이유를 적어 둔다.
+--   기록되지 않은 의도는 사고와 구별되지 않는다.
+--   다음 사람은 그것을 장애로 판단해 instances=all 로 열어 버릴 것이고,
+--   격리하려던 배치 부하가 다시 두 노드로 퍼진다.
+
+--------------------------------------------------------------------------------
+ [10] 정리
+--------------------------------------------------------------------------------
+
+SQL> alter session set container=racpdb1;
+
+Session altered.
+
+SQL> drop table system.pdb_t purge;
+
+Table dropped.
+
+SQL> select count(*) from dba_tables where owner='SYSTEM' and table_name='PDB_T';
+
+  COUNT(*)
+----------
+         0
+
+1 row selected.
+
+SQL> alter session set container=cdb$root;
+
+Session altered.
+
+SQL> col name for a12
+SQL> select inst_id, con_id, name, open_mode from gv$pdbs order by 1,2;
+
+   INST_ID     CON_ID NAME         OPEN_MODE
+---------- ---------- ------------ ----------
+         1          2 PDB$SEED     READ ONLY
+         1          3 RACPDB1      READ WRITE
+         2          2 PDB$SEED     READ ONLY
+         2          3 RACPDB1      READ WRITE
+
+4 rows selected.
+
+-- 확인 항목과 기대값
+--   1. 실습용 테이블      → 0 개                     ✓
+--   2. GV$PDBS            → 4 행                     ✓
+--   3. RACPDB1            → 양 노드 READ WRITE       ✓
+--   4. PDB$SEED           → 양 노드 READ ONLY        ✓
+
+SQL> exit
+
+================================================================================
+ 실습 07 종료 — PDB 가 양 노드 READ WRITE 기준선으로 복귀함
+================================================================================

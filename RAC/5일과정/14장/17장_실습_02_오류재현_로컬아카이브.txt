@@ -1,0 +1,271 @@
+================================================================================
+ 제17장 실습 02 — 오류 재현, 아카이브를 로컬 경로에 두면
+ 대상   : rac1, rac2
+ 목표   : 아카이브를 공유 스토리지에 두어야 하는 이유를 직접 확인하고,
+          되돌릴 때 만나는 ORA-16014 를 다룬다
+ 소요   : 약 30분
+ 선행   : 실습 01 완료 (ARCHIVELOG 모드)
+ 계정   : oracle, root
+ 주의   : scope=memory 로만 바꾸고 반드시 되돌린다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 한 노드에만 있는 경로를 만든다
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# mkdir -p /u01/app/oracle/arch_local
+[root@rac1 ~]# chown oracle:oinstall /u01/app/oracle/arch_local
+
+[root@rac2 ~]# ls -ld /u01/app/oracle/arch_local
+ls: cannot access /u01/app/oracle/arch_local: No such file or directory
+
+-- rac1 에만 만들었다. 로컬 파일시스템이므로 rac2 에는 없다.
+
+--------------------------------------------------------------------------------
+ [2] 한 인스턴스만 그 경로로 아카이브하게 바꾼다
+--------------------------------------------------------------------------------
+
+SQL> alter system set log_archive_dest_1='LOCATION=/u01/app/oracle/arch_local'
+  2    sid='racdb1' scope=memory;
+
+System altered.
+
+SQL> select inst_id, value from gv$parameter where name='log_archive_dest_1' order by inst_id;
+
+   INST_ID VALUE
+---------- --------------------------------------
+         1 LOCATION=/u01/app/oracle/arch_local
+         2
+
+-- sid='racdb1' 로 한 인스턴스만 바꿨다.
+-- scope=memory 이므로 SPFILE 에는 남지 않는다.
+-- 실습에서 위험한 설정을 시험할 때의 원칙이며 12장에서 세운 그대로다.
+--
+-- 오라클은 이 변경을 막지 않는다. 12장에서 cluster_database 를
+-- 한쪽만 FALSE 로 바꾼 것이 통과했던 것과 같은 종류다.
+
+--------------------------------------------------------------------------------
+ [3] 아카이브를 만들어 본다
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter system archive log current;   -- 몇 번 반복
+
+SQL> select thread#, sequence#, name from v$archived_log
+  2   where deleted='NO' and completion_time > sysdate - 5/1440
+  3   order by thread#, sequence#;
+
+   THREAD#  SEQUENCE# NAME
+---------- ---------- --------------------------------------------------
+         1         22 +FRA/RACDB/ARCHIVELOG/2026_09_04/thread_1_seq_22...
+         1         23 /u01/app/oracle/arch_local/1_23_1242761748.dbf
+         1         24 /u01/app/oracle/arch_local/1_24_1242761748.dbf
+         1         25 /u01/app/oracle/arch_local/1_25_1242761748.dbf
+         2         19 +FRA/RACDB/ARCHIVELOG/2026_09_04/thread_2_seq_19...
+         2         20 +FRA/RACDB/ARCHIVELOG/2026_09_04/thread_2_seq_20...
+
+-- 경계가 선명하다.
+--   시퀀스 22 까지는 +FRA
+--   23 부터는 로컬 경로
+--   스레드 2 는 그대로 +FRA (인스턴스 2 는 안 바꿨으므로)
+--
+-- 파일 이름도 달라졌다.
+--   ASM        thread_1_seq_23.<파일번호>.<타임스탬프>
+--   파일시스템 1_23_1242761748.dbf
+--
+-- 뒤의 것이 log_archive_format 의 %t_%s_%r.dbf 그대로다.
+-- 스레드 1, 시퀀스 23, 리셋로그 ID 1242761748 이다.
+-- ASM 은 자체 규칙으로 이름을 지으므로 format 이 적용되지 않는다.
+
+--------------------------------------------------------------------------------
+ [4] 다른 노드에서 무엇이 보이는가
+--------------------------------------------------------------------------------
+
+[rac1]$ ls /u01/app/oracle/arch_local/
+1_23_1242761748.dbf  1_24_1242761748.dbf  1_25_1242761748.dbf
+
+[rac2]$ ls /u01/app/oracle/arch_local/
+ls: cannot access /u01/app/oracle/arch_local/: No such file or directory
+
+-- 파일은 rac1 에만 있다. 여기까지는 당연하다.
+
+[rac2] SQL> select thread#, sequence#, name from v$archived_log
+  2   where name like '/u01%' and deleted='NO' order by sequence#;
+
+   THREAD#  SEQUENCE# NAME
+---------- ---------- ----------------------------------------------
+         1         23 /u01/app/oracle/arch_local/1_23_1242761748.dbf
+         1         24 /u01/app/oracle/arch_local/1_24_1242761748.dbf
+         1         25 /u01/app/oracle/arch_local/1_25_1242761748.dbf
+
+-- 여기가 핵심이다. rac2 의 딕셔너리에는 세 파일이 다 보인다.
+--
+-- 컨트롤파일은 공유되므로 "이런 아카이브가 있다" 는 기록은
+-- 양 노드가 똑같이 안다. 그런데 rac2 에는 그 파일이 없다.
+--
+-- 딕셔너리에 이름은 있는데 파일이 없는 상황이다.
+-- 10장에서 데이터파일을 로컬에 만들었을 때 rac2 가 ORA-01157 을
+-- 냈던 것과 정확히 같은 구조다. 계층만 다를 뿐 같은 함정이 반복된다.
+
+--------------------------------------------------------------------------------
+ [5] rac2 에서 RMAN 으로 검증하면
+--------------------------------------------------------------------------------
+
+[rac2] RMAN> crosscheck archivelog all;
+
+validation succeeded for archived log
+archived log file name=+FRA/RACDB/ARCHIVELOG/2026_09_04/thread_1_seq_22.270... RECID=42
+validation failed for archived log
+archived log file name=/u01/app/oracle/arch_local/1_23_1242761748.dbf RECID=44
+validation failed for archived log
+archived log file name=/u01/app/oracle/arch_local/1_24_1242761748.dbf RECID=46
+validation failed for archived log
+archived log file name=/u01/app/oracle/arch_local/1_25_1242761748.dbf RECID=47
+   ( 나머지 +FRA 아카이브는 모두 succeeded )
+Crosschecked 16 objects
+
+-- validation failed 가 정확히 세 줄이다.
+-- +FRA 의 아카이브는 모두 성공했고 로컬 경로의 셋만 실패했다.
+--
+-- RMAN 은 이 셋을 EXPIRED 로 표시한다.
+-- "카탈로그에는 있는데 실제로는 없다" 는 뜻이다.
+--
+-- 이것이 뜻하는 바가 심각하다.
+-- rac2 에서 백업을 돌리면 스레드 1 의 그 구간이 백업되지 않는다.
+-- 복구가 필요할 때 그 구간의 리두가 없으므로
+-- 그 시점을 넘어 복구할 수 없다.
+
+-- 실무에서 이 구성이 만드는 문제는 셋이다.
+--
+--   1. 백업을 그 노드에서만 돌려야 한다.
+--      백업 서버나 스케줄러가 노드를 고르지 못하고 특정 노드에 묶인다.
+--
+--   2. 그 노드가 죽으면 그 노드의 아카이브를 못 읽는다.
+--      노드 장애와 미디어 장애가 겹치면 그 구간의 리두가 영영 사라진다.
+--
+--   3. 복구할 때 모든 스레드의 아카이브가 한곳에 모여 있어야 하는데
+--      그렇지 않다. 수동으로 복사해 와야 하며 잊으면 복구가 중간에 멈춘다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — 되돌리려다 더 큰 문제를 만든다
+--------------------------------------------------------------------------------
+
+SQL> alter system set log_archive_dest_1='' sid='racdb1' scope=memory;
+
+System altered.
+
+SQL> alter system archive log current;
+alter system archive log current
+*
+ERROR at line 1:
+ORA-16014: log 2 sequence# 26 not archived, no available destinations
+ORA-00312: online log 2 thread 1: '+DATA/RACDB/ONLINELOG/group_2.263.1242761749'
+ORA-00312: online log 2 thread 1: '+FRA/RACDB/ONLINELOG/group_2.257.1242761759'
+
+-- 원인 파악 : 빈 문자열은 "기본값으로 되돌린다" 가 아니라
+--             "이 대상을 비활성화한다" 는 뜻이다.
+--             상태를 직접 확인한다.
+--               select inst_id, dest_id, dest_name, status, destination
+--                 from gv$archive_dest where dest_id=1 and inst_id=1;
+--             STATUS 가 INACTIVE 로 나온다.
+--             처음에 이 파라미터가 비어 있었을 때는 "지정된 적이 없는"
+--             상태였고 그때는 db_recovery_file_dest 가 암묵적으로 쓰였다.
+--             한 번 지정한 뒤 빈 값으로 바꾸면 그 암묵적 동작이 돌아오지 않는다.
+--             지정되지 않은 상태와 빈 값으로 지정된 상태는 다르다.
+--             함께 나온 ORA-00312 두 줄은 아카이브하지 못한 그룹의
+--             멤버 경로이며 멤버가 둘이라 두 줄이다.
+-- 조치     : 명시적으로 FRA 를 지정한다.
+--               alter system set log_archive_dest_1='LOCATION=USE_DB_RECOVERY_FILE_DEST'
+--                 sid='racdb1' scope=memory;
+--             scope=spfile 이나 both 로 바꿨다면 RESET 으로 항목을 지운다.
+--               alter system reset log_archive_dest_1 sid='racdb1' scope=spfile;
+--             scope=memory 는 RESET 이 통하지 않으므로 재설정하거나 재기동한다.
+-- 재확인   : STATUS 가 VALID 로 바뀌었는지 보고
+--             alter system archive log current 로 실제로 아카이브가
+--             만들어지는지 즉시 확인한다.
+
+SQL> select inst_id, dest_id, dest_name, status, destination
+  2    from gv$archive_dest where dest_id=1 and inst_id=1;
+
+   INST_ID    DEST_ID DEST_NAME           STATUS    DESTINATION
+---------- ---------- ------------------- --------- ------------
+         1          1 LOG_ARCHIVE_DEST_1  INACTIVE
+
+SQL> alter system set log_archive_dest_1='LOCATION=USE_DB_RECOVERY_FILE_DEST'
+  2    sid='racdb1' scope=memory;
+
+System altered.
+
+SQL> alter system archive log current;
+
+System altered.
+
+SQL> select inst_id, dest_id, dest_name, status, destination
+  2    from gv$archive_dest where dest_id=1 order by inst_id;
+
+   INST_ID    DEST_ID DEST_NAME           STATUS  DESTINATION
+---------- ---------- ------------------- ------- --------------------------
+         1          1 LOG_ARCHIVE_DEST_1  VALID   USE_DB_RECOVERY_FILE_DEST
+         2          1 LOG_ARCHIVE_DEST_1  VALID   USE_DB_RECOVERY_FILE_DEST
+
+-- 인스턴스 2 를 눈여겨본다. 파라미터 값은 여전히 비어 있는데
+-- DESTINATION 은 USE_DB_RECOVERY_FILE_DEST 다.
+-- 지정한 적이 없으므로 암묵적 기본값이 그대로 살아 있다.
+--
+-- 두 인스턴스가 같은 곳으로 아카이브하지만 도달한 경로가 다르다.
+-- 하나는 명시, 하나는 암묵이다.
+--
+-- 이 상태를 방치하면 위험하다. 리두 그룹이 다 차는 순간 인스턴스가 멈춘다.
+-- 그래서 아카이브 대상을 건드린 뒤에는 반드시 즉시 검증해야 한다.
+
+--------------------------------------------------------------------------------
+ [7] 정리
+--------------------------------------------------------------------------------
+
+[rac1]$ rm -f /u01/app/oracle/arch_local/*.dbf
+
+RMAN> crosscheck archivelog all;
+RMAN> delete noprompt expired archivelog all;
+
+Key     Thrd Seq     S Low Time
+------- ---- ------- - ---------
+44      1    23      X 04-SEP-26
+46      1    24      X 04-SEP-26
+47      1    25      X 04-SEP-26
+Deleted 3 EXPIRED objects
+
+-- 순서가 중요하다. 파일을 먼저 지우고 crosscheck 로 카탈로그를 갱신한 뒤
+-- EXPIRED 만 지운다.
+--
+-- crosscheck 를 rac1 에서 실행하면 그 노드에 파일이 있으므로 VALID 로
+-- 남는다. 그래서 파일을 먼저 지웠다.
+--
+-- delete expired 는 실제 파일을 지우는 것이 아니라 카탈로그에서
+-- 항목을 제거한다. 파일이 이미 없기 때문이다.
+
+SQL> select count(*) local_left from v$archived_log
+  2   where name like '/u01%' and deleted='NO';
+
+LOCAL_LEFT
+----------
+         0
+
+[rac1]$ rmdir /u01/app/oracle/arch_local
+[rac1]$ ls -d /u01/app/oracle/arch_local
+ls: cannot access /u01/app/oracle/arch_local: No such file or directory
+
+-- 카탈로그와 파일시스템 양쪽 모두 정리되었다.
+
+SQL> select thread#, max(sequence#) mx, count(*) cnt from v$archived_log
+  2   where deleted='NO' and name like '+FRA%ARCHIVELOG%'
+  3   group by thread# order by thread#;
+
+   THREAD#         MX        CNT
+---------- ---------- ----------
+         1         28          8
+         2         23         11
+
+-- 양 스레드 모두 정상적으로 +FRA 에 아카이브하고 있다.
+
+================================================================================
+ 실습 02 종료 — 로컬 아카이브 정리, 양 스레드 정상 아카이브 확인
+================================================================================

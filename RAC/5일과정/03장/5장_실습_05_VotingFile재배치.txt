@@ -1,0 +1,324 @@
+================================================================================
+ 제5장 실습 05 — Voting File 재배치
+ 대상   : rac1, rac2
+ 목표   : 개별 조작이 막혀 있음을 확인하고, replace 로 디스크그룹 단위 이동을
+          수행한다. 실패 시 롤백 보증과 FUID 변화의 의미를 읽는다
+ 소요   : 약 30분
+ 선행   : 실습 04 로 OCR 이 +CRS 한 벌 상태로 복귀했을 것
+ 계정   : root, grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 작업 전 FUID 기록
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl query css votedisk
+##  STATE    File Universal Id                File Name Disk group
+--  -----    -----------------                --------- ---------
+ 1. ONLINE   838fca0461384f6cbfe0440187190bd9 (/dev/asmdisk/crs1) [CRS]
+ 2. ONLINE   4c38f09d6d7b4f1fbfc0e6b7055c8515 (/dev/asmdisk/crs2) [CRS]
+ 3. ONLINE   370e2d1c1e604f6ebfd6c8aa3b8c0d35 (/dev/asmdisk/crs3) [CRS]
+Located 3 voting disk(s).
+
+-- FUID(File Universal Id)는 Voting File 마다 붙는 고유 식별자다.
+-- 이 실습이 끝나면 세 값이 모두 바뀐다. 바뀌는 것이 정상이며, 지금 기록해
+-- 두는 이유는 무엇이 바뀌고 무엇이 그대로인지를 구분하기 위해서다.
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select name, type, voting_files from v$asm_diskgroup order by 1;
+
+NAME       TYPE   V
+---------- ------ -
+CRS        NORMAL Y
+DATA       EXTERN N
+FRA        EXTERN N
+
+-- CRS 만 Y 다. Normal 중복도라 3개를 담고 있다.
+-- DATA 와 FRA 는 External 이며 지금은 Voting File 을 담고 있지 않다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 개별 추가와 삭제
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl add css votedisk /dev/asmdisk/crs1
+CRS-4258: Addition and deletion of voting files are not allowed because the
+          voting files are on ASM
+
+[root@rac1 ~]# crsctl delete css votedisk 838fca0461384f6cbfe0440187190bd9
+CRS-4258: Addition and deletion of voting files are not allowed because the
+          voting files are on ASM
+
+-- 권한 문제인지 확인하려고 grid 로도 실행해 본다.
+[grid@rac1 ~]$ crsctl add css votedisk /dev/asmdisk/crs1
+CRS-4258: Addition and deletion of voting files are not allowed because the
+          voting files are on ASM
+
+-- 오류 : CRS-4258
+-- 원인 파악 : root 와 grid 가 같은 메시지를 받는다. 권한 문제가 아니다.
+--             Voting File 이 ASM 에 있으면 개수와 배치는 전적으로 디스크그룹의
+--             중복도가 결정한다. 사람이 하나만 더 넣으면 개수가 짝수가 되어
+--             과반수 규칙이 깨지고, 하나만 빼면 중복도가 보장하는 손실 허용치와
+--             어긋난다. 그래서 개별 조작을 아예 막는다.
+-- 조치     : 남은 수단은 crsctl replace votedisk 하나다. 디스크그룹 단위로
+--             통째로 교체한다.
+-- 재확인   : 구성이 그대로인지 본다.
+
+[root@rac1 ~]# crsctl query css votedisk | tail -1
+Located 3 voting disk(s).
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — 같은 디스크그룹으로 replace
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl replace votedisk +CRS
+CRS-4261: Diskgroup +CRS is already configured with voting files
+CRS-4000: Command Replace failed, or completed with errors.
+
+-- 오류 : CRS-4261, CRS-4000
+-- 원인 파악 : replace 는 다른 디스크그룹으로의 이동을 위한 명령이다.
+--             같은 디스크그룹을 지정하면 옮길 곳이 없다. CRS-4261 이 판정이고
+--             CRS-4000 은 명령 실패 통보다.
+--             "같은 디스크그룹 안에서 Voting File 만 새로 만들고 싶다" 는
+--             요구는 이 명령으로 충족되지 않는다. 그 경우 디스크를 내렸다
+--             올리는 방법(실습 06)을 쓴다.
+-- 조치     : 다른 디스크그룹을 지정한다.
+-- 재확인   : Located 3 voting disk(s) 로 변화 없음.
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 — 없는 디스크그룹, 그리고 롤백
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl replace votedisk +NOSUCHDG
+CRS-4648: Failed to create voting files on disk group NOSUCHDG.
+CLSU-00107: operating system function: kgfnStmtExecute; failed with error data: 0;
+            at location: kgfdvfCR20
+CLSU-00101: operating system error message: Error 0
+CLSU-00104: additional error information: ORA-15001: diskgroup "NOSUCHDG" does not
+            exist or is not mounted
+CLSU-00104: additional error information: ORA-06512: at line 4
+CLSU-00104: additional error information: ORA-06512: at "SYS.X$DBMS_DISKGROUP", line 818
+CLSU-00104: additional error information: ORA-06512: at line 2
+CRS-4646: Disk group NOSUCHDG does not exist or is not mounted.
+CRS-4628: Change to configuration failed, but was successfully rolled back.
+CRS-4000: Command Replace failed, or completed with errors.
+
+-- 오류 : CRS-4648 / CLSU-00107 / ORA-15001 / CRS-4646 / CRS-4628 / CRS-4000
+-- 원인 파악 : 세 계층이 겹쳐 있다.
+--
+--     CRS  계층   CRS-4648, CRS-4646, CRS-4628, CRS-4000
+--     CLSU 계층   CLSU-00107, CLSU-00101, CLSU-00104
+--     ASM  계층   ORA-15001, ORA-06512
+--
+--             실제 원인은 맨 아래의 ORA-15001 이다. 디스크그룹이 없거나
+--             마운트되지 않았다. 오류 스택은 위에서부터가 아니라 아래에서부터
+--             읽어야 한다.
+--             ORA-06512 at SYS.X$DBMS_DISKGROUP 은 crsctl 이 ASM 에게 요청을
+--             보낼 때 내부 패키지를 PL/SQL 로 호출한다는 사실을 보여 준다.
+-- 조치     : 존재하고 마운트된 디스크그룹을 지정한다.
+-- 재확인   : CRS-4628 이 있는지 확인한다. 이 줄이 가장 중요하다.
+--             "Change to configuration failed, but was successfully rolled back"
+--             실패했지만 롤백에 성공했다는 뜻이며, 구성이 중간 상태로 남지
+--             않았다는 보증이다.
+--             이 줄이 없는 실패는 위험하다. 그때는 아래 명령으로 현재 상태를
+--             직접 확인해야 한다.
+
+[root@rac1 ~]# crsctl query css votedisk
+ 1. ONLINE   838fca0461384f6cbfe0440187190bd9 (/dev/asmdisk/crs1) [CRS]
+ 2. ONLINE   4c38f09d6d7b4f1fbfc0e6b7055c8515 (/dev/asmdisk/crs2) [CRS]
+ 3. ONLINE   370e2d1c1e604f6ebfd6c8aa3b8c0d35 (/dev/asmdisk/crs3) [CRS]
+Located 3 voting disk(s).
+
+-- FUID 세 개가 그대로다. 롤백이 실제로 이루어졌다.
+
+--------------------------------------------------------------------------------
+ [5] +DATA 로 옮긴다 — External 중복도의 결과
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl replace votedisk +DATA
+Successful addition of voting disk 9e65129747454fcbbfe39f012596a4a3.
+Successful deletion of voting disk 838fca0461384f6cbfe0440187190bd9.
+Successful deletion of voting disk 4c38f09d6d7b4f1fbfc0e6b7055c8515.
+Successful deletion of voting disk 370e2d1c1e604f6ebfd6c8aa3b8c0d35.
+Successfully replaced voting disk group with +DATA.
+CRS-4266: Voting file(s) successfully replaced
+
+-- 출력 순서가 핵심이다.
+--   1) Successful addition   새 위치에 먼저 만든다
+--   2) Successful deletion   그다음 옛 위치를 지운다 (3개)
+--
+-- 이 순서 덕분에 어느 순간에도 Voting File 이 0개가 되지 않는다.
+-- 그래서 클러스터를 내리지 않고 옮길 수 있다.
+-- CRS-4266 은 성공 메시지다.
+
+[root@rac1 ~]# crsctl query css votedisk
+##  STATE    File Universal Id                File Name Disk group
+--  -----    -----------------                --------- ---------
+ 1. ONLINE   9e65129747454fcbbfe39f012596a4a3 (/dev/asmdisk/data1) [DATA]
+Located 1 voting disk(s).
+
+-- 3개가 1개가 되었다. +DATA 가 External 중복도이기 때문이다.
+-- 개수를 우리가 정한 것이 아니라 디스크그룹의 중복도가 정했다.
+
+-- 지금 상태는 위험하다. Voting File 이 1개뿐이므로 data1 디스크 하나가
+-- 죽으면 클러스터 전체가 내려간다. 손실 허용치가 0이다.
+-- 실습 목적을 달성했으므로 곧바로 되돌린다.
+
+--------------------------------------------------------------------------------
+ [6] +CRS 로 되돌린다
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl replace votedisk +CRS
+Successful addition of voting disk e6a57fb460704f3abfbb19eac915bad6.
+Successful addition of voting disk be1b37d29fa34fcdbf72f6a2c7bd59b7.
+Successful addition of voting disk 038ff9924acb4f74bf7373f4a62bdeb3.
+Successful deletion of voting disk 9e65129747454fcbbfe39f012596a4a3.
+Successfully replaced voting disk group with +CRS.
+CRS-4266: Voting file(s) successfully replaced
+
+-- 이번에는 addition 이 3개다. Normal 중복도로 돌아왔기 때문이다.
+-- 여기서도 addition 이 먼저, deletion 이 나중이다.
+
+[root@rac1 ~]# crsctl query css votedisk
+##  STATE    File Universal Id                File Name Disk group
+--  -----    -----------------                --------- ---------
+ 1. ONLINE   e6a57fb460704f3abfbb19eac915bad6 (/dev/asmdisk/crs1) [CRS]
+ 2. ONLINE   be1b37d29fa34fcdbf72f6a2c7bd59b7 (/dev/asmdisk/crs2) [CRS]
+ 3. ONLINE   038ff9924acb4f74bf7373f4a62bdeb3 (/dev/asmdisk/crs3) [CRS]
+Located 3 voting disk(s).
+
+-- 개수와 장치 경로는 작업 전과 같지만 FUID 는 전부 다르다.
+--
+--   작업 전                            작업 후
+--   838fca0461384f6cbfe0440187190bd9   e6a57fb460704f3abfbb19eac915bad6
+--   4c38f09d6d7b4f1fbfc0e6b7055c8515   be1b37d29fa34fcdbf72f6a2c7bd59b7
+--   370e2d1c1e604f6ebfd6c8aa3b8c0d35   038ff9924acb4f74bf7373f4a62bdeb3
+--
+-- 지웠다 새로 만들었으므로 새 FUID 가 부여되었다. 정상이다.
+-- 이제부터의 대조 기준은 새 값이다.
+
+--------------------------------------------------------------------------------
+ [7] 무중단이었는지 확인
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl check cluster -all
+**************************************************************
+rac1:
+CRS-4537: Cluster Ready Services is online
+CRS-4529: Cluster Synchronization Services is online
+CRS-4533: Event Manager is online
+**************************************************************
+rac2:
+CRS-4537: Cluster Ready Services is online
+CRS-4529: Cluster Synchronization Services is online
+CRS-4533: Event Manager is online
+**************************************************************
+
+[root@rac1 ~]# srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+
+[root@rac1 ~]# ocrcheck | head -8
+Status of Oracle Cluster Registry is as follows :
+         Version                  :          4
+         Total space (kbytes)     :     491684
+         Used space (kbytes)      :      84240
+         Available space (kbytes) :     407444
+         ID                       :  665666554
+         Device/File Name         :       +CRS
+                                    Device/File integrity check succeeded
+
+-- 클러스터도 데이터베이스도 OCR 도 그대로다. 두 번의 replace 가 서비스에
+-- 아무 영향을 주지 않았다.
+
+[root@rac2 ~]# crsctl query css votedisk
+ 1. ONLINE   e6a57fb460704f3abfbb19eac915bad6 (/dev/asmdisk/crs1) [CRS]
+ 2. ONLINE   be1b37d29fa34fcdbf72f6a2c7bd59b7 (/dev/asmdisk/crs2) [CRS]
+ 3. ONLINE   038ff9924acb4f74bf7373f4a62bdeb3 (/dev/asmdisk/crs3) [CRS]
+Located 3 voting disk(s).
+
+-- rac2 도 새 FUID 를 보고 있다. 두 노드의 인식이 일치한다.
+
+--------------------------------------------------------------------------------
+ [8] ASM alert.log 에 남은 기록
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ tail -30 /u01/app/grid/diag/asm/+asm/+ASM1/trace/alert_+ASM1.log
+2026-09-01T16:11:37.197287+09:00
+NOTE: Deleting voting files in diskgroup CRS
+NOTE: Voting File refresh pending for group 1/0x2cc04b53 (CRS)
+2026-09-01T16:11:38.714535+09:00
+NOTE: updated gpnp profile ASM diskstring: /dev/asmdisk/*
+2026-09-01T16:11:39.792682+09:00
+NOTE: Creating voting files in diskgroup: CRS
+NOTE: Attempting voting file creation in diskgroup CRS
+NOTE: voting file allocation (replicated) on grp 1 disk CRS_0000
+NOTE: voting file allocation on grp 1 disk CRS_0000
+NOTE: voting file allocation (replicated) on grp 1 disk CRS_0001
+NOTE: voting file allocation on grp 1 disk CRS_0001
+NOTE: voting file allocation (replicated) on grp 1 disk CRS_0002
+NOTE: voting file allocation on grp 1 disk CRS_0002
+2026-09-01T16:11:44.084884+09:00
+NOTE: Deleting voting files in diskgroup DATA
+NOTE: Voting File refresh pending for group 2/0x2d304b54 (DATA)
+2026-09-01T16:11:46.028903+09:00
+NOTE: Attempting voting file refresh on diskgroup CRS
+NOTE: Refresh completed on diskgroup CRS. Found 3 voting file(s).
+NOTE: Attempting voting file refresh on diskgroup DATA
+NOTE: Refresh completed on diskgroup DATA. No voting file found.
+NOTE: Voting file relocation is required in diskgroup DATA
+NOTE: Attempting voting file relocation on diskgroup DATA
+NOTE: voting file deletion (replicated) on grp 2 disk DATA_0000
+NOTE: voting file deletion on grp 2 disk DATA_0000
+NOTE: No voting file found on diskgroup DATA
+
+-- 읽는 순서
+--   1) CRS 에 새로 만든다. 디스크 3개에 각각 allocation
+--   2) DATA 에서 지운다
+--   3) 양쪽에 refresh 를 돌려 개수를 확인한다
+--      CRS  -> Found 3 voting file(s)
+--      DATA -> No voting file found
+--
+-- (replicated) 가 붙은 줄과 붙지 않은 줄이 쌍으로 나오는 것은 Normal
+-- 중복도의 미러 쌍을 각각 기록하기 때문이다.
+--
+-- gpnp profile ASM diskstring 갱신 기록도 보인다. Voting File 위치가 바뀌면
+-- GPnP 프로파일도 함께 갱신된다.
+
+[grid@rac2 ~]$ tail -5 /u01/app/grid/diag/asm/+asm/+ASM2/trace/alert_+ASM2.log
+2026-09-01T16:11:46.183586+09:00
+NOTE: Attempting voting file refresh on diskgroup CRS
+NOTE: Refresh completed on diskgroup CRS. Found 3 voting file(s).
+NOTE: Attempting voting file refresh on diskgroup DATA
+NOTE: Refresh completed on diskgroup DATA. No voting file found.
+
+-- rac2 의 ASM 인스턴스도 같은 시각에 refresh 를 수행했다.
+-- Voting File 구성 변경은 모든 ASM 인스턴스가 알아야 하는 사건이다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류
+--   CRS-4258   개별 add/delete 금지. root 와 grid 모두 같은 메시지
+--   CRS-4261   같은 디스크그룹으로 replace
+--   CRS-4648 외 롤백을 동반한 실패. CRS-4628 이 보증한다
+--
+-- 확인한 것
+--   1) Voting File 개수는 중복도가 정한다. Normal 3개, External 1개
+--   2) replace 는 addition 이 먼저, deletion 이 나중이다. 그래서 무중단
+--   3) FUID 는 새로 만들 때마다 새로 부여된다
+--   4) 오류 스택은 맨 아래부터 읽는다. 실제 원인은 ORA-15001 이었다
+--   5) CRS-4628 이 있으면 중간 상태로 남지 않았다는 보증이다
+--   6) ASM alert.log 에 allocation, deletion, refresh 가 순서대로 남는다
+--   7) 두 노드의 ASM 인스턴스가 함께 refresh 한다
+--
+-- 갱신된 대조 기준
+--   Voting FUID   e6a57fb4 / be1b37d2 / 038ff992
+--   Voting 개수   3
+--   OCR ID        665666554 (변화 없음)
+--
+-- 실습 06 에서 이 중 세 번째 FUID 가 다시 바뀐다.
+================================================================================
+ 실습 05 종료
+================================================================================

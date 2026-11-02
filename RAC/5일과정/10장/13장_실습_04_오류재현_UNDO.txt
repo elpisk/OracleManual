@@ -1,0 +1,149 @@
+================================================================================
+ 제13장 실습 04 — 오류 재현, 다른 인스턴스의 UNDO 를 쓰려 하면
+ 대상   : rac1
+ 목표   : ORA-30013 과 ORA-30012 를 직접 재현하고 두 오류를 구분한다.
+          12장에서 막히지 않았던 변경과 대비해 오라클이 무엇을 검증하는지 안다
+ 소요   : 약 20분
+ 선행   : 실습 03 완료
+ 계정   : oracle
+ 주의   : scope=memory 로만 시도한다. SPFILE 에 남기지 않기 위해서다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 시도 전 상태
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, value from gv$parameter where name='undo_tablespace' order by inst_id;
+
+   INST_ID VALUE
+---------- ------------
+         1 UNDOTBS1
+         2 UNDOTBS2
+
+2 rows selected.
+
+-- rac1 의 racdb1 이 UNDOTBS1 을, racdb2 가 UNDOTBS2 를 쓰고 있다.
+-- 이 상태에서 racdb1 에게 UNDOTBS2 를 쓰라고 해 본다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 ① — 다른 인스턴스가 쓰는 UNDO 를 지정
+--------------------------------------------------------------------------------
+
+SQL> alter system set undo_tablespace='UNDOTBS2' scope=memory;
+alter system set undo_tablespace='UNDOTBS2' scope=memory
+*
+ERROR at line 1:
+ORA-02097: parameter cannot be modified because specified value is invalid
+ORA-30013: undo tablespace 'UNDOTBS2' is currently in use
+
+-- 원인 파악 : UNDOTBS2 는 지금 racdb2 가 쓰고 있다. UNDO 테이블스페이스는
+--             한 인스턴스가 배타적으로 쓰며 두 인스턴스가 공유할 수 없다.
+--             앞의 ORA-02097 은 "파라미터를 바꿀 수 없다" 는 일반 메시지라
+--             정보가 없다. 진짜 원인은 마지막 줄에 있다.
+--             어느 인스턴스가 쓰고 있는지는
+--             select inst_id, value from gv$parameter where name='undo_tablespace'
+--             로 확인한다.
+-- 조치     : racdb1 에게 다른 UNDO 를 주려는 것이 목적이라면 새로 만든다.
+--               create undo tablespace UNDOTBS3 datafile '+DATA' size 100M;
+--               alter system set undo_tablespace=UNDOTBS3 sid='racdb1' scope=both;
+--             UNDOTBS1 이 작아서 키우려는 것이 목적이었다면 파라미터를
+--             바꿀 일이 아니라 resize 나 add datafile 로 해결한다.
+-- 재확인   : GV$PARAMETER 를 다시 조회해 두 인스턴스가 서로 다른 값을
+--             갖는지 본다. 같은 값이 되는 일은 애초에 생기지 않는다.
+
+SQL> select inst_id, value from gv$parameter where name='undo_tablespace' order by inst_id;
+
+   INST_ID VALUE
+---------- ------------
+         1 UNDOTBS1
+         2 UNDOTBS2
+
+2 rows selected.
+
+-- 아무것도 바뀌지 않았다. 거부되었으므로 원래 값 그대로다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 ② — 존재하지 않는 UNDO 를 지정
+--------------------------------------------------------------------------------
+
+SQL> alter system set undo_tablespace='UNDOTBS9' scope=memory;
+alter system set undo_tablespace='UNDOTBS9' scope=memory
+*
+ERROR at line 1:
+ORA-02097: parameter cannot be modified because specified value is invalid
+ORA-30012: undo tablespace 'UNDOTBS9' does not exist or of wrong type
+
+-- 원인 파악 : UNDOTBS9 라는 테이블스페이스가 없다.
+--             "or of wrong type" 이 붙은 것은 이름은 있는데 UNDO 가
+--             아닌 경우도 같은 오류로 처리하기 때문이다.
+--             실제로 존재하는 것은 다음으로 확인한다.
+--               select tablespace_name, contents from dba_tablespaces
+--                where contents='UNDO';
+-- 조치     : 이름 오타라면 바로잡는다. 아직 만들지 않았다면 먼저 만든다.
+--               create undo tablespace UNDOTBS9 datafile '+DATA' size 100M;
+--             노드를 추가하면서 UNDO 를 만들지 않고 SPFILE 에 이름만
+--             지정했을 때 이 오류를 만난다.
+-- 재확인   : DBA_TABLESPACES 에 생겼는지 보고 파라미터 지정이
+--             반영되었는지 GV$PARAMETER 로 확인한다.
+
+--------------------------------------------------------------------------------
+ [4] 두 오류의 구분
+--------------------------------------------------------------------------------
+
+--   ORA-30013 : 있긴 한데 남이 쓰고 있다.  → 새로 만들어 준다
+--   ORA-30012 : 아예 없다.                  → 먼저 만든다
+--
+-- 노드를 추가할 때 이 둘을 순서대로 만나기 쉽다.
+-- 먼저 기존 UNDO 를 그대로 쓰려다 ORA-30013 을 만나고,
+-- 그래서 새 이름을 지정했는데 만들지 않아 ORA-30012 를 만난다.
+--
+-- 두 경우 모두 앞에 ORA-02097 이 함께 나온다.
+-- 오라클 오류는 이렇게 겹쳐 나오는 경우가 많으므로 마지막 줄을 읽는다.
+
+--------------------------------------------------------------------------------
+ [5] 12장과 대비 — 왜 여기서는 막아 주는가
+--------------------------------------------------------------------------------
+
+-- 12장에서는 이런 일이 있었다.
+--
+--   SQL> alter system set cluster_database=FALSE sid='racdb1' scope=spfile;
+--   System altered.
+--
+-- RAC 데이터베이스의 한 인스턴스만 비클러스터로 만드는 위험한 변경인데
+-- 아무 경고 없이 통과했고 SPFILE 에 실제로 저장되었다.
+--
+-- 반면 여기서는 막혔다. 차이는 검증 가능성이다.
+--
+--   UNDO 가 지금 다른 인스턴스에 물려 있는가
+--     → 실행 시점에 확인 가능한 사실이다. 그래서 오라클이 검사하고 거부한다.
+--
+--   cluster_database=FALSE 가 지금 이 상황에서 틀린 값인가
+--     → 도구가 판단할 수 없다. 단일 인스턴스로 열어 유지보수하려는
+--       정당한 경우도 있기 때문이다. 그래서 값을 그대로 받는다.
+--
+-- 얻을 원칙은 오라클이 막아 주는 것과 막아 주지 않는 것이 있고,
+-- 막아 주지 않는 쪽이 더 위험하다는 점이다.
+-- 12장에서 SPFILE 항목 수를 세는 점검을 만든 이유가 이것이다.
+
+--------------------------------------------------------------------------------
+ [6] 상태 확인 — 남은 것이 없는지
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, value from gv$parameter where name='undo_tablespace' order by inst_id;
+
+   INST_ID VALUE
+---------- ------------
+         1 UNDOTBS1
+         2 UNDOTBS2
+
+2 rows selected.
+
+-- 두 시도 모두 거부되었고 scope=memory 였으므로 SPFILE 에도 흔적이 없다.
+-- 12장에서 배운 대로 SPFILE 항목 수도 함께 확인해 두면 확실하다.
+--
+--   [oracle@rac1 ~]$ strings <spfile경로> | grep -c undo_tablespace
+--   2
+
+================================================================================
+ 실습 04 종료 — 두 오류를 재현했고 설정은 원래대로
+================================================================================
