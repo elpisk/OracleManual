@@ -1,0 +1,248 @@
+================================================================================
+ 제17장 실습 06 — 미디어 복구, 데이터파일 손실과 복구
+ 대상   : rac1, rac2
+ 목표   : 데이터파일을 잃은 상황을 만들고 restore 와 recover 로 복구한다.
+          공유 스토리지에서 장애가 어떻게 나타나는지 확인한다
+ 소요   : 약 30분
+ 선행   : 실습 05 완료
+ 계정   : oracle, grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 실습용 테이블스페이스 준비
+--------------------------------------------------------------------------------
+
+-- SYSTEM 이나 SYSAUX 로 하면 위험하므로 전용 테이블스페이스를 만든다.
+
+SQL> create tablespace ts_ch17 datafile '+DATA' size 50M;
+SQL> create table sys.ch17_t (n number, v varchar2(30)) tablespace ts_ch17;
+SQL> insert into sys.ch17_t select level, 'row '||level from dual connect by level<=500;
+SQL> commit;
+
+   FILE_ID FILE_NAME                                              MB
+---------- ---------------------------------------------- ----------
+        27 +DATA/RACDB/DATAFILE/ts_ch17.279.1243091315            50
+
+SQL> select count(*) from sys.ch17_t;   →  500
+
+-- 파일 번호 27, 50MB, 500 행이다.
+-- 파일 이름의 끝 숫자 1243091315 를 기억해 둔다. 복구 후에 바뀐다.
+
+--------------------------------------------------------------------------------
+ [2] 백업한다
+--------------------------------------------------------------------------------
+
+RMAN> run {
+  allocate channel ch1 device type disk connect 'sys/<암호>@rac1-vip:1521/racdb';
+  allocate channel ch2 device type disk connect 'sys/<암호>@rac2-vip:1521/racdb';
+  backup as compressed backupset tablespace ts_ch17 format '+FRA';
+  release channel ch1;
+  release channel ch2;
+}
+
+-- 백업이 없으면 복구할 수 없다.
+-- 미디어 복구 실습의 첫 단계는 항상 백업이다.
+--
+-- 실습 04 의 교훈이 여기서 적용된다.
+-- 새 테이블스페이스를 만들면 그것이 백업 대상에 들어갔는지 확인해야 한다.
+
+RMAN> list backup of tablespace ts_ch17 summary;
+   ( 백업이 하나 나온다 )
+
+--------------------------------------------------------------------------------
+ [3] 장애를 만든다
+--------------------------------------------------------------------------------
+
+SQL> alter database datafile 27 offline;
+
+Database altered.
+
+SQL> select file#, status from v$datafile where file#=27;
+
+     FILE# STATUS
+---------- -------
+        27 RECOVER
+
+SQL> select file#, status, error from v$datafile_header where file#=27;
+
+     FILE# STATUS  ERROR
+---------- ------- ------
+        27 OFFLINE
+
+-- 두 뷰가 다른 값을 보여 준다.
+--   V$DATAFILE          RECOVER
+--   V$DATAFILE_HEADER   OFFLINE
+--
+-- 앞은 컨트롤파일이 아는 상태이고 뒤는 파일 헤더가 아는 상태다.
+-- "복구가 필요하다" 는 판단은 컨트롤파일이 한다.
+-- 어느 것이 맞느냐가 아니라 각각 무엇을 아는지가 다르다.
+
+[grid@rac1 ~]$ asmcmd ls -l +DATA/RACDB/DATAFILE/ | grep -i ts_ch17
+DATAFILE  UNPROT  COARSE   SEP 04 15:00:00  Y    TS_CH17.279.1243091315
+
+[grid@rac1 ~]$ asmcmd rm -f +DATA/RACDB/DATAFILE/ts_ch17.279.1243091315
+[grid@rac1 ~]$ asmcmd ls +DATA/RACDB/DATAFILE/ | grep -i ts_ch17
+   (없음)
+
+-- 파일을 지웠다. 미디어 장애를 모사한 것이다.
+--
+-- 오프라인으로 만든 뒤에 지웠다는 점이 중요하다.
+-- 온라인 상태의 데이터파일은 ASM 이 사용 중으로 보아 삭제를 막을 수 있다.
+-- 순서를 바꾸면 삭제가 실패하거나 예기치 않은 오류를 만난다.
+
+--------------------------------------------------------------------------------
+ [4] 양 노드에서 같은 오류
+--------------------------------------------------------------------------------
+
+[rac2] SQL> select count(*) from sys.ch17_t;
+select count(*) from sys.ch17_t
+                         *
+ERROR at line 1:
+ORA-00376: file 27 cannot be read at this time
+ORA-01110: data file 27: '+DATA/RACDB/DATAFILE/ts_ch17.279.1243091315'
+
+-- 원인 파악 : 그 데이터파일이 오프라인이고 실제 파일도 없다.
+--             ORA-00376 은 "지금 읽을 수 없다" 는 뜻이고
+--             ORA-01110 이 어느 파일인지 알려 준다.
+--             13장에서 오류가 겹쳐 나올 때 아래 줄이 사실이라고 한 그대로다.
+--             확인은 두 가지로 한다.
+--               select file#, name, status from v$datafile where file#=27;
+--               asmcmd ls +DATA/RACDB/DATAFILE/ | grep ts_ch17
+--             양 노드에서 같은 오류가 나는 것은 공유 스토리지이므로
+--             장애도 공유되기 때문이다.
+-- 조치     : 백업에서 복원하고 리두를 적용한다. [5] 를 참고한다.
+--             백업이 없다면 그 테이블스페이스의 데이터를 잃는다.
+-- 재확인   : 복구 후 양 노드에서 같은 조회가 되는지 본다.
+
+-- 데이터베이스 전체는 멀쩡하다는 점을 확인해 둔다.
+
+SQL> select inst_id, instance_name, status from gv$instance order by inst_id;
+   ( 둘 다 OPEN )
+
+SQL> select count(*) from dba_tables where tablespace_name='USERS';
+   ( 정상 조회된다 )
+
+-- 장애 범위가 그 데이터파일에 한정된다.
+-- 다른 테이블스페이스는 정상이고 두 인스턴스 모두 OPEN 을 유지한다.
+-- 데이터베이스를 내리지 않고 복구할 수 있다는 뜻이다.
+
+--------------------------------------------------------------------------------
+ [5] 복구
+--------------------------------------------------------------------------------
+
+RMAN> run {
+  allocate channel ch1 device type disk;
+  restore datafile 27;
+  recover datafile 27;
+  release channel ch1;
+}
+
+allocated channel: ch1
+channel ch1: SID=28 instance=racdb1 device type=DISK
+
+Starting restore at 04-SEP-26
+channel ch1: restoring datafile 00027 to +DATA/RACDB/DATAFILE/ts_ch17.279...
+channel ch1: reading from backup piece +FRA/RACDB/BACKUPSET/2026_09_04/nnndf0_tag...
+channel ch1: restored backup piece 1
+channel ch1: restore complete, elapsed time: 00:00:01
+
+Starting recover at 04-SEP-26
+starting media recovery
+media recovery complete, elapsed time: 00:00:01
+Finished recover at 04-SEP-26
+
+>>> 전체 5.3초
+
+-- 두 단계가 나뉘어 있다.
+--   restore  백업에서 파일을 되살린다.
+--   recover  백업 이후의 리두를 적용한다.
+--
+-- 백업 시점과 장애 시점 사이의 변경이 리두에 있으므로 둘 다 필요하다.
+--
+-- recover 가 1초 만에 끝난 것은 백업 직후에 장애를 냈기 때문이다.
+-- 적용할 리두가 거의 없다. 운영에서는 이 단계가 훨씬 오래 걸린다.
+--
+-- 이 실습에서는 채널 하나만 썼다. 파일 하나를 복구하는 것이므로
+-- 채널을 나눠도 이득이 없다.
+
+--------------------------------------------------------------------------------
+ [6] 온라인으로 되돌리고 확인
+--------------------------------------------------------------------------------
+
+SQL> alter database datafile 27 online;
+
+     FILE# NAME                                              STATUS
+---------- ------------------------------------------------- -------
+        27 +DATA/RACDB/DATAFILE/ts_ch17.279.1243091377       ONLINE
+
+SQL> select count(*) from sys.ch17_t;   →  500
+
+-- 500 행이 그대로 있다.
+--
+-- 파일 이름을 잘 보면 끝의 숫자가 바뀌었다.
+--   장애 전  ts_ch17.279.1243091315
+--   복구 후  ts_ch17.279.1243091377
+--
+-- 앞의 279 는 ASM 파일 번호이고 뒤의 숫자는 타임스탬프다.
+-- 같은 논리 파일이지만 ASM 안에서는 새로 만들어진 것이므로
+-- 타임스탬프가 갱신되었다.
+--
+-- 이것이 ASM 을 쓸 때의 특징이다.
+-- 파일시스템이라면 같은 경로에 같은 이름으로 덮어쓰지만
+-- ASM 은 새 파일을 만들고 컨트롤파일의 참조를 갱신한다.
+-- 복구 후 이름이 달라져 있어도 놀라지 않는다.
+
+--------------------------------------------------------------------------------
+ [7] 다른 노드에서도 확인
+--------------------------------------------------------------------------------
+
+[rac2] SQL> select count(*) from sys.ch17_t;                        →  500
+[rac2] SQL> select file#, status from v$datafile where file#=27;    →  ONLINE
+
+-- rac2 에서도 정상이다. 복구는 rac1 에서 했지만 결과는 공유된다.
+--
+-- 복구 후 반드시 다른 노드에서도 확인한다.
+-- 10장과 실습 02 에서 본 것처럼 한 노드에서만 되는 상황이 있을 수 있다.
+-- 그 확인을 건너뛰면 문제를 나중에 발견하게 된다.
+
+--------------------------------------------------------------------------------
+ [8] 복구 절차 정리
+--------------------------------------------------------------------------------
+
+-- 데이터파일을 잃었을 때의 절차를 정리하면 이렇다.
+--
+--   1. 범위 확인
+--      select file#, name, status from v$datafile
+--       where status not in ('ONLINE','SYSTEM');
+--      다른 파일은 정상인지 본다. 범위가 한정되어 있으면
+--      데이터베이스를 내리지 않고 복구할 수 있다.
+--
+--   2. 오프라인
+--      alter database datafile <번호> offline;
+--      V$DATAFILE 의 STATUS 가 RECOVER 로 바뀌는지 확인한다.
+--
+--   3. 백업 확인
+--      RMAN> list backup of datafile <번호>;
+--      백업이 없으면 여기서 멈추고 다른 방법을 찾아야 한다.
+--
+--   4. 복원과 복구
+--      RMAN> restore datafile <번호>;
+--      RMAN> recover datafile <번호>;
+--      recover 는 아카이브가 모두 있어야 성공한다.
+--
+--   5. 온라인
+--      alter database datafile <번호> online;
+--
+--   6. 데이터 검증
+--      그 테이블스페이스의 테이블을 조회한다.
+--
+--   7. 다른 노드 확인
+--      rac2 에서도 같은 조회가 되는지 본다.
+--
+-- SYSTEM 이나 UNDO 테이블스페이스라면 3~5 단계가 달라진다.
+-- 그 파일들은 오프라인으로 만들 수 없으므로 데이터베이스를 MOUNT 로
+-- 내린 뒤 복구해야 한다. RAC 에서는 모든 인스턴스를 내려야 한다.
+
+================================================================================
+ 실습 06 종료 — 데이터파일 27 복구 완료, 양 노드에서 500행 확인
+================================================================================

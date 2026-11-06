@@ -1,0 +1,335 @@
+================================================================================
+ 제17장 실습 05 — 인스턴스 복구 관찰  [주의]
+ 대상   : rac1, rac2
+ 목표   : 인스턴스 하나를 강제 종료하고 다른 인스턴스가 그 스레드를
+          복구하는 과정을 알럿 로그로 관찰한다
+ 소요   : 약 30분
+ 선행   : 실습 04 완료. 부하 4 이하일 때 진행한다
+ 계정   : oracle, root
+ 주의   : 인스턴스를 강제로 죽인다. 다른 실습과 겹치지 않게 한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 인스턴스 복구란 무엇인가
+--------------------------------------------------------------------------------
+
+-- 13장에서 리두 스레드를 다루며 이렇게 말했다.
+-- "인스턴스 하나가 죽으면 살아남은 인스턴스가 죽은 인스턴스의
+--  스레드를 읽어 복구한다."
+--
+-- 그 과정을 여기서 실제로 관찰한다.
+--
+-- 미디어 복구와 다른 점은 데이터파일이 멀쩡하다는 것이다.
+-- 잃은 것은 메모리(버퍼 캐시)에 있던 커밋된 변경이며,
+-- 그것이 리두에 있으므로 리두를 읽어 데이터파일에 반영하면 된다.
+--
+--   인스턴스 복구  데이터파일 정상. 자동으로 일어난다.
+--   미디어 복구    데이터파일 자체를 잃었다. 관리자가 명령을 내린다.
+
+--------------------------------------------------------------------------------
+ [2] 복구 예측치를 미리 본다
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, recovery_estimated_ios, actual_redo_blks, target_redo_blks,
+  2         estimated_mttr, target_mttr
+  3    from gv$instance_recovery order by inst_id;
+
+   INST_ID RECOVERY_ESTIMATED_IOS ACTUAL_REDO_BLKS TARGET_REDO_BLKS ESTIMATED_MTTR TARGET_MTTR
+---------- ---------------------- ---------------- ---------------- -------------- -----------
+         1                   1161             9651           331776              1           0
+         2                   1018             7507           331776              1           0
+
+-- 읽는 법.
+--
+--   ESTIMATED_MTTR = 1
+--     지금 인스턴스가 죽으면 약 1초 만에 복구된다는 예측이다.
+--     뒤에서 실측과 비교한다.
+--
+--   ACTUAL_REDO_BLKS = 9651, TARGET_REDO_BLKS = 331776
+--     지금 복구해야 할 리두 블록 수와 상한이다.
+--     실제가 상한의 3% 도 안 되므로 여유가 크다.
+--
+--   TARGET_MTTR = 0
+--     fast_start_mttr_target 을 설정하지 않았다는 뜻이다.
+--     목표를 정하지 않았으므로 오라클이 알아서 한다.
+--
+-- 이 값을 미리 기록해 두면 실측과 비교할 수 있다.
+
+--------------------------------------------------------------------------------
+ [3] 알럿 로그의 관찰 시작점을 기록한다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ ls -d /u01/app/oracle/diag/rdbms/racdb/racdb1/trace/alert_racdb1.log
+/u01/app/oracle/diag/rdbms/racdb/racdb1/trace/alert_racdb1.log
+
+[oracle@rac1 ~]$ wc -l < /u01/app/oracle/diag/rdbms/racdb/racdb1/trace/alert_racdb1.log
+14721
+
+-- 줄 수를 기록해 둔다. 나중에 이 지점부터만 읽을 수 있다.
+--   tail -n +14721 alert_racdb1.log
+--
+-- 알럿 로그는 계속 쌓이므로 이 요령이 없으면 관련 없는 내용을
+-- 잔뜩 뒤져야 한다.
+--
+-- 죽일 대상은 rac2 이므로 관찰은 rac1 의 알럿 로그에서 한다.
+-- 살아남는 쪽이 복구를 수행하기 때문이다.
+
+--------------------------------------------------------------------------------
+ [4] 인스턴스를 죽인다
+--------------------------------------------------------------------------------
+
+[root@rac2 ~]# ps -ef | grep ora_pmon_racdb2 | grep -v grep
+oracle   11443     1  0 14:59 ?        00:00:00 ora_pmon_racdb2
+
+[root@rac2 ~]# date '+%T'; pkill -9 -f ora_pmon_racdb2
+15:10:09
+
+-- 15:10:09 에 죽였다. pmon 을 죽이면 인스턴스 전체가 비정상 종료된다.
+-- 12장과 15장에서 쓴 것과 같은 방법이다.
+
+--------------------------------------------------------------------------------
+ [5] 상태 관찰
+--------------------------------------------------------------------------------
+
+[rac1] 경과 15초 (15:10:24)
+Instance racdb1 is running on node rac1. Instance status: Open.
+Instance racdb2 is not running on node rac2
+
+[rac1] 경과 34초 (15:10:43)
+Instance racdb1 is running on node rac1. Instance status: Open.
+Instance racdb2 is not running on node rac2
+
+[rac1] 경과 57초 (15:11:06)
+Instance racdb1 is running on node rac1. Instance status: Open.
+Instance racdb2 is running on node rac2. Instance status: Open.
+
+-- racdb2 가 57초 만에 CRS 에 의해 되살아났다.
+-- 12장에서 61초, 15장에서 47초로 쟀던 그 자동 복구다.
+--
+-- 그런데 이 57초는 인스턴스 재기동 시간이지 인스턴스 복구 시간이 아니다.
+-- 둘은 다른 값이며 알럿 로그를 봐야 구분된다.
+
+--------------------------------------------------------------------------------
+ [6] 재구성 단계
+--------------------------------------------------------------------------------
+
+[rac1]$ tail -n +14721 /u01/app/oracle/diag/rdbms/racdb/racdb1/trace/alert_racdb1.log
+
+2026-09-04T15:10:14.229334+09:00
+Reconfiguration started (old inc 4, new inc 6)
+List of instances (total 1) :
+ 1
+Dead instances (total 1) :
+ 2
+My inst 1
+publish big name space -  dead or down/up instance detected, invalidate domain 0
+ Global Resource Directory frozen
+* dead instance detected - domain 0 invalid = TRUE
+* dead instance detected - domain 2 invalid = TRUE, need cdb-level instance recovery
+* dead instance detected - domain 3 invalid = TRUE, need cdb-level instance recovery
+ Communication channels reestablished
+ Master broadcasted resource hash value bitmaps
+ Non-local Process blocks cleaned out
+2026-09-04T15:10:14.265281+09:00
+ LMS 0: 0 GCS shadows cancelled, 0 closed, 0 Xw survived, skipped 0
+2026-09-04T15:10:14.283141+09:00
+ LMS 1: 0 GCS shadows cancelled, 0 closed, 0 Xw survived, skipped 0
+ Set master node info
+ Dwn-cvts replayed, VALBLKs dubious
+ All grantable enqueues granted
+ Post SMON to start 1st pass IR
+Reconfiguration complete (total time 0.1 secs)
+
+-- 15:10:14 에 rac1 이 알아차렸다. 죽인 지 약 5초다.
+--
+-- 읽는 순서.
+--
+--   Reconfiguration started (old inc 4, new inc 6)
+--     클러스터 재구성 시작. incarnation 번호가 4 에서 6 으로 올라간다.
+--     이것이 사건의 시작 시각이다.
+--
+--   Dead instances (total 1) : 2
+--     죽은 인스턴스를 식별했다.
+--
+--   Global Resource Directory frozen
+--     캐시 퓨전의 자원 목록을 잠시 얼린다.
+--     이 동안 블록을 주고받을 수 없으므로 짧은 정지가 생긴다.
+--
+--   dead instance detected - domain N invalid
+--     어느 컨테이너가 복구를 필요로 하는지 알려 준다.
+--     CDB 환경이므로 PDB 단위로 나온다.
+--
+--   LMS 0 / LMS 1: GCS shadows cancelled
+--     LMS 는 캐시 퓨전을 담당하는 프로세스다.
+--     죽은 인스턴스가 잡고 있던 자원을 정리했다.
+--
+--   Post SMON to start 1st pass IR
+--     SMON 에게 인스턴스 복구를 시작하라고 알린다.
+--
+--   Reconfiguration complete (total time 0.1 secs)
+--     재구성 자체는 0.1초다.
+
+--------------------------------------------------------------------------------
+ [7] 복구 단계
+--------------------------------------------------------------------------------
+
+2026-09-04T15:10:14.505663+09:00
+CDB IR excluding pdb 2 which was cleanly closed.
+Instance recovery: looking for dead threads
+Beginning instance recovery of 1 threads
+ parallel recovery started with 3 processes
+ Thread 2: Recovery starting at checkpoint rba (logseq 25 block 8), scn 0
+2026-09-04T15:10:14.650172+09:00
+Started redo scan
+2026-09-04T15:10:14.756333+09:00
+Completed redo scan
+ read 3754 KB redo, 1011 data blocks need recovery
+2026-09-04T15:10:15.050261+09:00
+Started redo application at
+ Thread 2: logseq 25, block 8, offset 0
+Recovery of Online Redo Log: Thread 2 Group 3 Seq 25 Reading mem 0
+  Mem# 0: +DATA/RACDB/ONLINELOG/group_3.270.1242762459
+  Mem# 1: +FRA/RACDB/ONLINELOG/group_3.259.1242762467
+2026-09-04T15:10:15.134001+09:00
+Completed redo application of 3.34MB
+2026-09-04T15:10:15.155990+09:00
+Completed instance recovery at
+ Thread 2: RBA 25.7516.16, nab 7516, scn 0x0000000000468b4e
+ 622 data blocks read, 1071 data blocks written, 3754 redo k-bytes read
+Redo thread 2 internally disabled at seq 26 (SMON)
+
+-- 읽을 것이 많다. 순서대로 본다.
+--
+--   CDB IR excluding pdb 2 which was cleanly closed
+--     PDB$SEED 는 READ ONLY 로 깨끗이 닫혀 있었으므로 복구 대상에서 뺐다.
+--
+--   Beginning instance recovery of 1 threads
+--     스레드 하나만 복구한다. 죽은 것이 racdb2 이므로 스레드 2 다.
+--
+--   parallel recovery started with 3 processes
+--     병렬로 복구한다. 리두 양이 많으면 이 수가 늘어난다.
+--
+--   Thread 2: Recovery starting at checkpoint rba (logseq 25 block 8)
+--     복구 시작점이다. 마지막 체크포인트 이후의 리두만 읽으면 된다.
+--     체크포인트가 자주 일어날수록 이 구간이 짧아지고 복구가 빨라진다.
+--
+--   read 3754 KB redo, 1011 data blocks need recovery
+--     읽어야 할 리두 양과 손봐야 할 블록 수다. 작업량의 지표다.
+--
+--   Recovery of Online Redo Log: Thread 2 Group 3
+--     rac1 이 스레드 2 의 온라인 리두를 직접 읽고 있다.
+--     두 멤버 경로가 함께 나온다.
+--     13장에서 리두 그룹의 멤버를 +DATA 와 +FRA 에 나눠 둔 설계가
+--     여기서 실제로 쓰인다. 디스크그룹 하나를 잃어도 복구할 수 있다.
+--
+--   Completed redo application of 3.34MB
+--     적용 완료.
+--
+--   622 data blocks read, 1071 data blocks written
+--     실제 I/O 양이다.
+--
+--   Redo thread 2 internally disabled at seq 26 (SMON)
+--     복구가 끝났으므로 그 스레드를 잠시 비활성화한다.
+--     racdb2 가 다시 뜨면 다시 활성화된다.
+--     13장에서 다룬 enable/disable thread 가 여기서 자동으로 일어난다.
+
+--------------------------------------------------------------------------------
+ [8] 두 시간을 구분한다
+--------------------------------------------------------------------------------
+
+-- 시각을 정리하면 이렇다.
+--
+--   15:10:09.000  kill -9
+--   15:10:14.229  Reconfiguration started   ← 감지, 약 5초
+--   15:10:14.329  Reconfiguration complete  (0.1초)
+--   15:10:14.506  Beginning instance recovery
+--   15:10:15.155  Completed instance recovery
+--   15:11:06      racdb2 가 Open 으로 복귀
+--
+-- 인스턴스 복구 = 15:10:14.229 → 15:10:15.155 = 0.93초
+-- 인스턴스 재기동 = 15:10:09 → 15:11:06 = 57초
+--
+-- [2] 에서 조회한 ESTIMATED_MTTR 가 1초였다. 실측 0.93초와 거의 일치한다.
+-- 그 지표를 신뢰할 근거가 생겼다.
+--
+-- 두 시간이 영향을 주는 대상이 다르다.
+--
+--   살아 있는 인스턴스(racdb1)의 세션
+--     인스턴스 복구 시간만 영향을 받는다.
+--     GRD 가 얼어 있는 0.93초 동안 잠시 멈추지만 세션은 유지된다.
+--
+--   죽은 인스턴스(racdb2)의 세션
+--     아예 끊어진다. 복구 시간과 무관하며 재접속이 필요하다.
+--     그 재접속을 빠르게 만드는 것이 16장의 FAN 이고
+--     끊긴 작업을 이어 주는 것이 AC 다.
+--
+-- 이 구분이 장애 보고서를 쓸 때 결정적이다.
+-- "1초 미만의 영향" 과 "57초 동안 한 노드 사용 불가" 는 전혀 다른 이야기다.
+
+--------------------------------------------------------------------------------
+ [8-1] 흔한 오류 — 죽은 인스턴스에 붙어 있던 세션은
+--------------------------------------------------------------------------------
+
+-- rac2 에 붙어 있던 세션에서 무언가 실행하면 이렇게 된다.
+
+[rac2 세션] SQL> select count(*) from dual;
+select count(*) from dual
+*
+ERROR at line 1:
+ORA-03113: end-of-file on communication channel
+Process ID: 11512
+Session ID: 149 Serial number: 51263
+
+-- 원인 파악 : 그 세션이 붙어 있던 인스턴스가 죽었다.
+--             ORA-03113 은 서버 프로세스와의 통신이 끊어졌다는 뜻이며
+--             인스턴스 비정상 종료의 전형적인 증상이다.
+--             인스턴스 복구가 0.93초에 끝나도 이 세션은 돌아오지 않는다.
+--             복구된 것은 데이터이지 세션이 아니기 때문이다.
+--             확인은 다른 노드에서 한다.
+--               srvctl status database -d racdb -v
+--               select inst_id, instance_name, status from gv$instance;
+-- 조치     : 재접속한다. SCAN 으로 붙으면 살아 있는 인스턴스로 간다.
+--             애플리케이션이라면 16장에서 다룬 FAN 이 이 재접속을
+--             빠르게 만들고, AC 가 끊긴 작업을 이어 준다.
+--             통지가 없으면 TCP 타임아웃까지 수 분을 기다린다.
+-- 재확인   : 재접속 후 instance_name 이 살아 있는 인스턴스인지 보고
+--             필요하면 끊긴 트랜잭션의 커밋 여부를 확인한다.
+
+[oracle@rac1 ~]$ sqlplus system/<암호>@rac-scan:1521/racdb
+SQL> select instance_name from v$instance;   →  racdb1
+
+-- 이것이 두 시간을 구분해야 하는 이유다.
+-- 살아 있는 인스턴스의 세션은 0.93초만 영향을 받지만
+-- 죽은 인스턴스의 세션은 재접속이 필요하다.
+
+--------------------------------------------------------------------------------
+ [9] 복구 후 상태 확인
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, instance_name, status from gv$instance order by inst_id;
+
+   INST_ID INSTANCE_NAME    STATUS
+---------- ---------------- ------------
+         1 racdb1           OPEN
+         2 racdb2           OPEN
+
+SQL> select thread#, status, enabled, instance from v$thread order by thread#;
+
+   THREAD# STATUS ENABLED      INSTANCE
+---------- ------ -------- ------------
+         1 OPEN   PUBLIC   racdb1
+         2 OPEN   PUBLIC   racdb2
+
+-- 스레드 2 가 다시 OPEN 이다.
+-- [7] 에서 SMON 이 비활성화했던 것이 재기동과 함께 되돌아왔다.
+
+SQL> select thread#, max(sequence#) mx from v$archived_log
+  2   where deleted='NO' and name like '+FRA%ARCHIVELOG%'
+  3   group by thread# order by thread#;
+
+-- 아카이브도 정상적으로 계속 생성되는지 확인한다.
+-- 인스턴스가 죽었다 살아나면서 시퀀스가 건너뛸 수 있는데 정상이다.
+
+================================================================================
+ 실습 05 종료 — 두 인스턴스 OPEN, 스레드 2 재활성화 확인
+================================================================================

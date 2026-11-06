@@ -1,0 +1,220 @@
+================================================================================
+ 제20장 실습 05 — 종합 점검 스크립트 작성과 결함 수정
+ 대상   : rac1
+ 목표   : 12~17장에서 만든 점검 항목을 여섯 계층의 스크립트 하나로 합치고
+          그 스크립트의 결함을 직접 찾아 고친다
+ 소요   : 약 25분
+ 선행   : 없음
+ 계정   : oracle
+ 주의   : 조회만 하는 스크립트다. 구성을 바꾸는 명령을 넣지 않는다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 계층 설계
+--------------------------------------------------------------------------------
+
+--   1 클러스터 (14장)  스택 online, 자원 개수, TARGET/STATE 불일치
+--   2 알림     (16장)  ONS 데몬 생존, 상대 노드 연결
+--   3 서비스   (15·16장) 서비스 기동 여부, 선호 인스턴스 배치
+--   4 인스턴스 (12장)  Open 인스턴스 수, SPFILE 표기
+--   5 스토리지 (13장)  스레드별 CURRENT, UNDO 균형
+--   6 백업     (17장)  아카이브 모드·대상, 스레드별 아카이브, FRA
+--
+-- 이 순서가 그대로 진단 순서다. 아래 계층이 무너지면 위 계층에 단서가 없다.
+
+--------------------------------------------------------------------------------
+ [2] 스크립트 작성
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ cat > /tmp/rac_check.sh <<'SH'
+#!/bin/bash
+# rac_check.sh - RAC 일상 점검 (12~17장 통합)
+DB=${1:-racdb}
+GRID_HOME=/u01/app/19.3.0/grid
+DB_HOME=/u01/app/oracle/product/19.3.0/dbhome_rac
+FAIL=0
+
+ok()   { printf "  [ OK ] %s\n" "$1"; }
+bad()  { printf "  [FAIL] %s\n" "$1"; FAIL=$((FAIL+1)); }
+warn() { printf "  [WARN] %s\n" "$1"; }
+sec()  { printf "\n== %s ==\n" "$1"; }
+
+sec "1. 클러스터 계층"
+n=$($GRID_HOME/bin/crsctl check cluster -all 2>/dev/null | grep -c "is online")
+[ "$n" -eq 6 ] && ok "스택 online 6/6" || bad "스택 online $n/6"
+
+res=$($GRID_HOME/bin/crsctl stat res 2>/dev/null | grep -c "^NAME=")
+[ "$res" -eq 17 ] && ok "일반 자원 $res 개" || warn "일반 자원 $res 개 (기준선 17)"
+
+mis=$($GRID_HOME/bin/crsctl stat res -t 2>/dev/null \
+      | awk '/^ora\./{name=$1} /ONLINE  OFFLINE/{print name}' | sort -u | tr '\n' ' ')
+[ -z "$mis" ] && ok "TARGET/STATE 불일치 없음" || warn "불일치: $mis"
+
+sec "2. 알림 계층 (ONS)"
+$GRID_HOME/opmn/bin/onsctl ping >/dev/null 2>&1 && ok "ONS 응답" || bad "ONS 무응답"
+
+sec "4. 인스턴스 계층"
+opened=$($DB_HOME/bin/srvctl status database -d $DB -v 2>/dev/null | grep -c "Open")
+[ "$opened" -eq 2 ] && ok "인스턴스 $opened 개 Open" || bad "Open 인스턴스 $opened 개"
+
+sec "5~7. 스토리지·백업·인터커넥트"
+$DB_HOME/bin/sqlplus -s / as sysdba <<'EOS'
+set head off feed off pages 0 lines 200
+select '       thread '||thread#||' current='||cnt from (
+  select thread#, count(*) cnt from v$log where status='CURRENT' group by thread#);
+select '       '||tablespace_name||' '||round(sum(bytes)/1024/1024)||'MB'
+  from dba_data_files where tablespace_name like 'UNDO%' group by tablespace_name;
+select '       inst '||inst_id||' dest1='||status from gv$archive_dest
+ where dest_id=1 order by inst_id;
+select '       FRA '||round(space_used/space_limit*100,1)||'% used'
+  from v$recovery_file_dest;
+select '       thread '||thread#||' max_seq='||max(sequence#)
+  from v$archived_log where deleted='NO' group by thread# order by thread#;
+select '       inst '||inst_id||' '||name||' '||ip_address
+  from gv$cluster_interconnects order by inst_id;
+exit
+EOS
+
+printf "\n== 결과: 실패 %d 건 ==\n" "$FAIL"
+exit $FAIL
+SH
+
+[oracle@rac1 ~]$ chmod +x /tmp/rac_check.sh
+
+-- 설계 원칙 셋
+--   하나, 실패와 경고를 나눈다. 인스턴스가 안 떠 있는 것은 FAIL,
+--         자원 개수가 기준선과 다른 것은 WARN 이다.
+--   둘,   종료 코드로 실패 건수를 돌려준다. 감시 도구가 그것으로 판단한다.
+--   셋,   기준선을 숫자로 박아 둔다. 17 과 6 이 그것이다.
+--         자동으로 현재 값을 기준선 삼으면 구성 변경을 조용히 삼켜 버린다.
+
+--------------------------------------------------------------------------------
+ [3] 첫 실행
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ time /tmp/rac_check.sh racdb
+
+== 1. 클러스터 계층 ==
+  [ OK ] 스택 online 6/6
+  [ OK ] 일반 자원 17 개
+  [ OK ] -init 자원 13 개
+  [WARN] 불일치: ora.asmnet1.asmnetwork(ora.asmgroup)
+                 ora.ASMNET1LSNR_ASM.lsnr(ora.asmgroup)
+                 ora.asm(ora.asmgroup) ora.chad
+
+== 2. 알림 계층 (ONS) ==
+  [ OK ] ONS 데몬 응답
+  [ OK ] ONS 상대 노드 1 개
+
+== 4. 인스턴스 계층 ==
+  [ OK ] 인스턴스 2 개 Open
+
+== 5~7. 스토리지·백업·인터커넥트 ==
+       thread 1 current=1
+       thread 2 current=1
+       UNDOTBS1 350MB
+       UNDOTBS2 75MB
+       inst 1 dest1=VALID
+       inst 2 dest1=VALID
+       FRA 7.4% used
+       thread 1 max_seq=31
+       spfile=+DATA/RACDB/PARAMETERFILE/spfile.272.1242762487
+       inst 1 ens160:1 169.254.27.118
+       inst 2 ens160:1 169.254.26.245
+
+== 결과: 실패 0 건 ==
+
+real    0m11.5s
+
+-- 11.5 초다. 매일 돌리기에 부담이 없다.
+-- 몇 분씩 걸리는 점검은 결국 아무도 안 돌린다.
+--
+-- WARN 넷은 14장에서 확인한 의도된 OFFLINE 이다.
+-- ora.asmgroup 의 빈 슬롯 셋(Flex ASM 카디널리티 3, 노드 2)과 rac2 의 CHAD 다.
+-- FAIL 이 아니라 WARN 인 것이 맞다.
+
+--------------------------------------------------------------------------------
+ [4] 출력에서 결함을 발견한다
+--------------------------------------------------------------------------------
+
+-- 위 출력의 아카이브 항목을 다시 본다.
+--
+--       thread 1 max_seq=31
+--
+-- 스레드 2 가 없다. 문제인가, 스크립트가 잘못된 것인가.
+
+SQL> select thread#, sequence#, completion_time from v$archived_log
+  2   where thread#=2 and deleted='NO'
+  3     and completion_time > sysdate - 1/1440
+  4   order by sequence#;
+
+no rows selected
+
+-- 원인 파악: 스레드 2 는 정리 이후 아직 아카이브를 만들지 않았다.
+--            V$ARCHIVED_LOG 에 그 스레드의 행이 하나도 없으므로
+--            group by thread# 결과에서 통째로 빠진다.
+--
+--            이것이 점검 스크립트의 전형적인 결함이다.
+--            "없는 것" 을 알려 주지 못한다. 스레드 2 가 30 분째 아카이브를
+--            못 만들고 있어도 화면에는 아무것도 안 나온다.
+--
+-- 조치     : "있어야 할 것의 목록" 인 V$THREAD 를 기준으로 아우터 조인한다.
+
+SQL> select t.thread#, nvl(a.cnt,0) archived, a.mx max_seq,
+  2         to_char(a.last,'MM-DD HH24:MI') last
+  3    from v$thread t
+  4    left join (select thread#, count(*) cnt, max(sequence#) mx,
+  5                      max(completion_time) last
+  6                 from v$archived_log where deleted='NO' group by thread#) a
+  7      on t.thread# = a.thread#
+  8   order by t.thread#;
+
+   THREAD#   ARCHIVED    MAX_SEQ LAST
+---------- ---------- ---------- --------------
+         1          1         31 09-04 17:28
+         2          0
+
+-- 재확인: 스레드 2 가 archived=0 으로 드러났다. 없다는 사실이 보인다.
+
+SQL> alter system archive log current;        -- rac1
+SQL> alter system archive log current;        -- rac2
+
+   THREAD#   ARCHIVED    MAX_SEQ LAST
+---------- ---------- ---------- --------------
+         1          3         33 09-04 17:36
+         2          2         28 09-04 17:36
+
+-- 정상 상태에서는 둘 다 나온다.
+
+--------------------------------------------------------------------------------
+ [5] 스크립트에 반영
+--------------------------------------------------------------------------------
+
+-- 아카이브 조회 부분을 다음으로 교체한다.
+
+select '       thread '||t.thread#||' archived='||nvl(a.cnt,0)||
+       ' max_seq='||nvl(to_char(a.mx),'-')||
+       ' last='||nvl(to_char(a.last,'MM-DD HH24:MI'),'-')
+  from v$thread t
+  left join (select thread#, count(*) cnt, max(sequence#) mx,
+                    max(completion_time) last
+               from v$archived_log where deleted='NO' group by thread#) a
+    on t.thread# = a.thread#
+ order by t.thread#;
+
+-- 일반 원칙
+--   "있어야 할 것의 목록" 을 기준으로 조회하고 실제 값을 붙인다.
+--   "실제 있는 것" 을 기준으로 조회하면 없는 것이 안 보인다.
+--
+--   스레드는 V$THREAD, 인스턴스는 GV$INSTANCE, 자원은 기준선 개수가 그 목록이다.
+--   이 스크립트가 자원 개수를 17 과 비교하는 것도 같은 원리다.
+--
+-- 같은 함정이 남아 있는 곳
+--   스레드별 CURRENT 조회도 group by 만 쓰고 있다. 다음 실습에서 실제 장애를
+--   내면 그 행이 조용히 사라지는 것을 보게 된다.
+--   서비스 계층도 이 랩에는 사용자 서비스가 없어 항상 OK 로 나온다.
+--   서비스가 있어야 할 환경이라면 그 목록을 별도로 관리하고 개수까지 비교한다.
+
+================================================================================
+ 실습 05 종료 — /tmp/rac_check.sh 는 남겨 둔다. 실습 06 에서 계속 쓴다
+================================================================================

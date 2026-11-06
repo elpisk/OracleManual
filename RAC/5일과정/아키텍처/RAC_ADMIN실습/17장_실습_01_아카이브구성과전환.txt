@@ -1,0 +1,280 @@
+================================================================================
+ 제17장 실습 01 — 아카이브 구성 확인과 ARCHIVELOG 전환  [주의]
+ 대상   : rac1, rac2
+ 목표   : 아카이브 관련 구성을 확인하고 RAC 방식으로 ARCHIVELOG 로 전환한다.
+          스레드별로 아카이브가 생기는 것을 확인한다
+ 소요   : 약 30분 (전환에만 3분 남짓)
+ 선행   : racdb 양 노드 OPEN, 부하 4 이하
+ 계정   : oracle, grid
+ 주의   : 데이터베이스를 한 번 완전히 내린다. 다른 실습과 겹치지 않게 한다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 상태 확인
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ cat /proc/loadavg
+5.16 5.32 5.13 1/1064 26828
+
+[oracle@rac1 ~]$ srvctl status database -d racdb -v
+Instance racdb1 is running on node rac1. Instance status: Open.
+Instance racdb2 is running on node rac2. Instance status: Open.
+
+--------------------------------------------------------------------------------
+ [1] 현재 아카이브 모드
+--------------------------------------------------------------------------------
+
+SQL> select log_mode, name, dbid from v$database;
+
+LOG_MODE     NAME            DBID
+------------ --------- ----------
+NOARCHIVELOG RACDB     1240378513
+
+SQL> archive log list
+Database log mode              No Archive Mode
+Automatic archival             Disabled
+Archive destination            USE_DB_RECOVERY_FILE_DEST
+Oldest online log sequence     17
+Current log sequence           18
+
+-- 이 랩은 NOARCHIVELOG 다. dbca 의 기본값이며
+-- 10장에서 온라인 데이터파일 복사가 막혔던 이유이기도 하다.
+--
+-- DBID 1240378513 을 여기서 기록해 둔다.
+-- 컨트롤파일을 모두 잃으면 데이터베이스가 자기 DBID 를 모르므로
+-- 복구할 때 이 값이 필요하다. 실습 07 에서 다시 쓴다.
+
+--------------------------------------------------------------------------------
+ [2] 아카이브 관련 파라미터
+--------------------------------------------------------------------------------
+
+SQL> select inst_id, name, value from gv$parameter
+  2   where name in ('db_recovery_file_dest','db_recovery_file_dest_size',
+  3                  'log_archive_format','log_archive_dest_1')
+  4   order by name, inst_id;
+
+   INST_ID NAME                        VALUE
+---------- --------------------------- -----------------
+         1 db_recovery_file_dest       +FRA
+         2 db_recovery_file_dest       +FRA
+         1 db_recovery_file_dest_size  14687404032
+         2 db_recovery_file_dest_size  14687404032
+         1 log_archive_dest_1
+         2 log_archive_dest_1
+         1 log_archive_format          %t_%s_%r.dbf
+         2 log_archive_format          %t_%s_%r.dbf
+
+-- 세 가지를 읽는다.
+--
+--   db_recovery_file_dest = +FRA
+--     아카이브가 ASM 디스크그룹에 만들어진다. RAC 에서 가장 중요한 조건이다.
+--     양 노드가 같은 ASM 을 보므로 어느 노드가 만든 아카이브든
+--     다른 노드가 읽을 수 있다.
+--
+--   log_archive_dest_1 이 비어 있다
+--     지정된 적이 없다는 뜻이며 db_recovery_file_dest 가 암묵적으로 쓰인다.
+--     이 "지정된 적이 없는 상태" 가 실습 02 에서 중요해진다.
+--
+--   log_archive_format = %t_%s_%r.dbf
+--     %t 가 스레드 번호다. 스레드마다 아카이브가 따로 생기므로
+--     이 지시자가 없으면 두 스레드의 같은 시퀀스가 충돌한다.
+--     %s 는 시퀀스, %r 은 리셋로그 ID 다.
+
+SQL> select name, space_limit/1024/1024 limit_mb, round(space_used/1024/1024,1) used_mb,
+  2         round(space_reclaimable/1024/1024,1) reclaim_mb, number_of_files
+  3    from v$recovery_file_dest;
+
+NAME     LIMIT_MB    USED_MB RECLAIM_MB NUMBER_OF_FILES
+------ ---------- ---------- ---------- ---------------
++FRA        14007        825          0               5
+
+-- FRA 한도가 14007MB 다. 디스크그룹 +FRA 자체는 24576MB 이므로
+-- 디스크그룹 크기와 FRA 한도는 별개라는 것을 알 수 있다.
+--
+-- 지금 825MB, 5 개 파일이다. 컨트롤파일 하나와 리두 멤버 넷이며
+-- 이것이 이 장의 기준선이다. 실습 07 에서 이 값으로 돌아와야 한다.
+
+--------------------------------------------------------------------------------
+ [3] ARCHIVELOG 전환
+--------------------------------------------------------------------------------
+
+-- RAC 에서는 인스턴스가 하나만 MOUNT 된 상태에서 바꿔야 한다.
+-- 옛 자료에는 cluster_database=FALSE 로 바꾸라고 되어 있지만
+-- 11gR2 부터는 필요 없다. 조건은 하나만 MOUNT 되어 있는 것뿐이다.
+--
+-- 12장에서 그 파라미터를 한쪽만 FALSE 로 바꾸는 것이 오라클에 막히지
+-- 않는다는 것을 확인했다. 위험한 변경을 굳이 할 이유가 없다.
+
+[oracle@rac1 ~]$ srvctl stop database -d racdb
+[oracle@rac1 ~]$ srvctl status database -d racdb -v
+Instance racdb1 is not running on node rac1
+Instance racdb2 is not running on node rac2
+
+>>> 65.7초
+
+SQL> startup mount
+ORACLE instance started.
+Total System Global Area 1895823416 bytes
+Database mounted.
+
+SQL> select instance_name, status from v$instance;
+racdb1           MOUNTED
+
+>>> 31.8초
+
+SQL> select log_mode from v$database;
+NOARCHIVELOG
+
+SQL> alter database archivelog;
+
+Database altered.
+
+>>> 1.2초
+
+SQL> select log_mode from v$database;
+ARCHIVELOG
+
+SQL> alter database open;
+
+Database altered.
+
+SQL> archive log list
+Database log mode              Archive Mode
+Automatic archival             Enabled
+Archive destination            USE_DB_RECOVERY_FILE_DEST
+Oldest online log sequence     17
+Next log sequence to archive   18
+Current log sequence           18
+
+[oracle@rac1 ~]$ srvctl start instance -d racdb -i racdb2
+[oracle@rac1 ~]$ srvctl status database -d racdb -v
+Instance racdb1 is running on node rac1. Instance status: Open.
+Instance racdb2 is running on node rac2. Instance status: Open.
+
+>>> 69.7초
+
+-- 시간 배분을 눈여겨본다.
+--   정지 65.7초 / MOUNT 31.8초 / 전환 명령 1.2초 / racdb2 기동 69.7초
+--
+-- 명령 자체는 1.2초이고 기동과 정지가 시간을 다 쓴다.
+-- 전체 3분 남짓이며 유지보수 창을 잡을 때 이 비율이 그대로 적용된다.
+--
+-- srvctl 로 내리고 sqlplus 로 올린 뒤 다시 srvctl 로 돌아왔다.
+-- 12장에서 다룬 두 도구의 차이가 여기서 실제로 쓰인다.
+
+--------------------------------------------------------------------------------
+ [4] 양 노드에서 확인
+--------------------------------------------------------------------------------
+
+-- rac2 에서도 같은지 본다.
+
+[rac2] SQL> select log_mode from v$database;
+ARCHIVELOG
+
+[rac2] SQL> archive log list
+Database log mode              Archive Mode
+Automatic archival             Enabled
+Archive destination            USE_DB_RECOVERY_FILE_DEST
+
+-- 아카이브 모드는 데이터베이스 단위 속성이므로 양 노드가 같다.
+-- 인스턴스별로 다르게 설정할 수 없다.
+
+--------------------------------------------------------------------------------
+ [5] 스레드별로 아카이브가 생긴다
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter system archive log current;   -- 몇 번 반복
+[rac2] SQL> alter system archive log current;   -- rac2 에서도
+
+SQL> select thread#, sequence#, name from v$archived_log
+  2   where deleted='NO' and name like '+FRA%ARCHIVELOG%'
+  3   order by thread#, sequence#;
+
+   THREAD#  SEQUENCE# NAME
+---------- ---------- -----------------------------------------------------------------
+         1         18 +FRA/RACDB/ARCHIVELOG/2026_09_04/thread_1_seq_18.265.1243090845
+         1         19 +FRA/RACDB/ARCHIVELOG/2026_09_04/thread_1_seq_19.264.1243090847
+         1         20 +FRA/RACDB/ARCHIVELOG/2026_09_04/thread_1_seq_20.263.1243090851
+         2         13 +FRA/RACDB/ARCHIVELOG/2026_09_04/thread_2_seq_13.261.1243090689
+         2         14 +FRA/RACDB/ARCHIVELOG/2026_09_04/thread_2_seq_14.262.1243090847
+         2         15 +FRA/RACDB/ARCHIVELOG/2026_09_04/thread_2_seq_15.266.1243090853
+
+-- 파일 이름에 thread_1, thread_2 가 들어 있다.
+-- log_archive_format 의 %t 가 이렇게 나타난다.
+--
+-- 시퀀스 번호도 스레드마다 독립적이다.
+-- 13장에서 V$LOG 의 SEQUENCE# 가 스레드 1 은 15·16,
+-- 스레드 2 는 12·13 이었던 그대로다.
+-- %s 만으로는 구분되지 않는 이유가 여기 있다.
+
+--------------------------------------------------------------------------------
+ [6] ASM 쪽에서 확인
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd ls -l +FRA/RACDB/
+Type  Redund  Striped  Time  Sys  Name
+                             Y    ARCHIVELOG/
+                             Y    CONTROLFILE/
+                             Y    ONLINELOG/
+
+[grid@rac1 ~]$ asmcmd ls +FRA/RACDB/ARCHIVELOG/2026_09_04/
+thread_1_seq_18.265.1243090845
+thread_1_seq_19.264.1243090847
+thread_2_seq_13.261.1243090689
+thread_2_seq_14.262.1243090847
+
+-- ARCHIVELOG 디렉터리가 새로 생겼다. 전환 전에는 없었다.
+-- 그 아래 날짜별 디렉터리가 만들어지고 그 안에 스레드별 파일이 들어간다.
+-- 날짜 디렉터리는 ASM 이 자동으로 만들며 하루가 지나면 새것이 생긴다.
+
+--------------------------------------------------------------------------------
+ [7] 양 노드가 같은 아카이브를 보는가
+--------------------------------------------------------------------------------
+
+[rac2] SQL> select thread#, count(*) cnt from v$archived_log
+  2   where deleted='NO' and name like '+FRA%' group by thread# order by thread#;
+
+   THREAD#        CNT
+---------- ----------
+         1          7
+         2          8
+
+-- rac1 에서 조회한 것과 같은 개수다.
+-- 두 노드가 같은 컨트롤파일을 보고 같은 ASM 을 보기 때문이다.
+--
+-- 이것이 RAC 백업의 전제다.
+-- 어느 노드에서 백업하든 모든 스레드의 아카이브를 읽을 수 있어야 한다.
+-- 다음 실습에서 이 전제가 깨지면 무슨 일이 생기는지 본다.
+
+--------------------------------------------------------------------------------
+ [8] 흔한 오류 — 다른 인스턴스가 떠 있는데 전환하려 하면
+--------------------------------------------------------------------------------
+
+-- 참고로 srvctl stop database 를 하지 않고 한 인스턴스만 MOUNT 한 채
+-- 전환을 시도하면 거부된다. 이 실습에서는 재현하지 않는다.
+
+SQL> alter database archivelog;
+alter database archivelog
+*
+ERROR at line 1:
+ORA-01126: database must be mounted in this instance and not open in any instance
+
+-- 원인 파악 : 다른 인스턴스가 데이터베이스를 OPEN 하고 있으면
+--             아카이브 모드를 바꿀 수 없다.
+--             모드 변경은 컨트롤파일의 전역 속성을 바꾸는 일이므로
+--             한 인스턴스만 컨트롤파일을 잡고 있어야 한다.
+--             현재 상태는 다음으로 확인한다.
+--               srvctl status database -d racdb -v
+--               select inst_id, instance_name, status from gv$instance;
+-- 조치     : srvctl stop database -d racdb 로 전부 내린 뒤
+--             한 노드에서만 startup mount 하고 다시 시도한다.
+--             즉 [3] 의 절차를 순서대로 밟는다.
+-- 재확인   : select log_mode from v$database 가 ARCHIVELOG 인지 보고
+--             나머지 인스턴스를 올린 뒤 rac2 에서도 같은지 확인한다.
+
+-- 이 거부가 있어서 실수로 잘못될 여지가 크지 않다.
+-- cluster_database 를 건드리지 않아도 되는 이유이기도 하다.
+
+================================================================================
+ 실습 01 종료 — ARCHIVELOG 모드로 전환됨. 두 인스턴스 OPEN
+================================================================================
