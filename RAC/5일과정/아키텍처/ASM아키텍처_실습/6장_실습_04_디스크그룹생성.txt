@@ -1,0 +1,261 @@
+================================================================================
+ 제6장 실습 04 — 디스크그룹 생성
+ 대상   : rac1, rac2
+ 목표   : 디스크그룹을 만들고 양 노드에서 마운트한 뒤, ASM 계층과 Clusterware
+          계층의 상태가 어떻게 어긋나는지 확인한다
+ 소요   : 약 30분
+ 선행   : 실습 03 으로 CANDIDATE 디스크 6장이 확인되어 있을 것
+ 계정   : grid, root
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 만든다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> create diskgroup TEST external redundancy disk '/dev/asmdisk/test1'
+  2    attribute 'compatible.asm'='19.0.0.0.0', 'compatible.rdbms'='19.0.0.0.0';
+
+Diskgroup created.
+
+-- compatible 을 명시한 것이 핵심이다. 5장에서 겪은 문제 때문이다.
+-- gridSetup 이 만든 +CRS 는 compatible.rdbms 가 10.1 로 남아 디스크
+-- OFFLINE 이 ORA-15283 으로 막혔고, 되돌릴 수 없는 상향을 해야 했다.
+-- 직접 만들 때는 처음부터 지정한다.
+
+SQL> select name, value from v$asm_attribute
+  2   where group_number=(select group_number from v$asm_diskgroup where name='TEST')
+  3     and name like 'compatible%';
+
+NAME                VALUE
+------------------- ------------
+compatible.asm      19.0.0.0.0
+compatible.rdbms    19.0.0.0.0
+
+--------------------------------------------------------------------------------
+ [2] 크기를 확인한다
+--------------------------------------------------------------------------------
+
+SQL> select name, state, type, total_mb, free_mb, usable_file_mb, voting_files
+  2    from v$asm_diskgroup order by name;
+
+NAME       STATE       TYPE     TOTAL_MB    FREE_MB USABLE_FILE_MB V
+---------- ----------- ------ ---------- ---------- -------------- -
+CRS        MOUNTED     NORMAL      12288      11324           3614 Y
+DATA       MOUNTED     EXTERN      61440      56966          56966 N
+FRA        MOUNTED     EXTERN      24576      23636          23636 N
+TEST       MOUNTED     EXTERN       4096       4042           4042 N
+
+-- 4096MB 중 4042MB 가 남았다. 54MB 가 메타데이터 영역이다.
+-- External 이므로 FREE_MB 와 USABLE_FILE_MB 가 같다. 미러가 없으므로
+-- 남은 공간을 전부 쓸 수 있다.
+-- +CRS 를 보면 FREE_MB 11324 인데 USABLE_FILE_MB 는 3614 다. Normal 이라
+-- 미러 몫이 빠진 결과다.
+
+--------------------------------------------------------------------------------
+ [3] 디스크는 어떻게 바뀌었나
+--------------------------------------------------------------------------------
+
+SQL> select path, name, header_status, mount_status, group_number, total_mb, free_mb
+  2    from v$asm_disk where path like '%test%' order by path;
+
+PATH                     NAME       HEADER_STATU MOUNT_S GROUP_NUMBER   TOTAL_MB    FREE_MB
+------------------------ ---------- ------------ ------- ------------ ---------- ----------
+/dev/asmdisk/test1       TEST_0000  MEMBER       CACHED             4       4096       3998
+/dev/asmdisk/test2                  CANDIDATE    CLOSED             0          0          0
+/dev/asmdisk/test3                  CANDIDATE    CLOSED             0          0          0
+/dev/asmdisk/test4                  CANDIDATE    CLOSED             0          0          0
+/dev/asmdisk/test5                  CANDIDATE    CLOSED             0          0          0
+/dev/asmdisk/test6                  CANDIDATE    CLOSED             0          0          0
+
+-- test1 만 다섯 컬럼이 한꺼번에 바뀌었다.
+--   NAME           비어 있음 -> TEST_0000
+--   HEADER_STATUS  CANDIDATE -> MEMBER
+--   MOUNT_STATUS   CLOSED    -> CACHED
+--   GROUP_NUMBER   0         -> 4
+--   TOTAL_MB       0         -> 4096
+--
+-- 이름 규칙은 디스크그룹명 뒤에 4자리 번호다. NAME 절로 직접 지정할 수도 있다.
+
+--------------------------------------------------------------------------------
+ [4] rac2 에서는 어떻게 보이는가
+--------------------------------------------------------------------------------
+
+[grid@rac2 ~]$ sqlplus -s / as sysasm
+
+SQL> select name, state, type, total_mb, free_mb from v$asm_diskgroup order by name;
+
+NAME       STATE       TYPE     TOTAL_MB    FREE_MB
+---------- ----------- ------ ---------- ----------
+CRS        MOUNTED     NORMAL      12288      11324
+DATA       MOUNTED     EXTERN      61440      56966
+FRA        MOUNTED     EXTERN      24576      23636
+TEST       DISMOUNTED               0          0
+
+-- 존재는 보이는데 DISMOUNTED 다. TYPE 도 비어 있고 TOTAL_MB 도 0이다.
+--
+-- 디스크그룹의 존재와 메타데이터는 즉시 전파되지만 마운트는 인스턴스별
+-- 동작이다. 마운트하지 않았으므로 크기와 종류를 읽지 않았다.
+--
+-- 이 상태를 그대로 두면 rac2 에서 그 디스크그룹의 파일에 접근할 수 없다.
+-- 노드가 여덟 개라면 일곱 번을 더 마운트해야 한다.
+
+SQL> alter diskgroup TEST mount;
+
+Diskgroup altered.
+
+SQL> select name, state, type, total_mb from v$asm_diskgroup where name='TEST';
+
+NAME       STATE       TYPE     TOTAL_MB
+---------- ----------- ------ ----------
+TEST       MOUNTED     EXTERN       4096
+
+--------------------------------------------------------------------------------
+ [5] Clusterware 는 어떻게 보고 있는가
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# crsctl status resource ora.TEST.dg -t
+--------------------------------------------------------------------------------
+Name           Target  State        Server                   State details
+--------------------------------------------------------------------------------
+Cluster Resources
+--------------------------------------------------------------------------------
+ora.TEST.dg(ora.asmgroup)
+      1        OFFLINE OFFLINE                               STABLE
+      2        OFFLINE OFFLINE                               STABLE
+      3        OFFLINE OFFLINE                               STABLE
+
+[grid@rac1 ~]$ srvctl status diskgroup -g TEST
+Disk Group TEST is not running
+
+-- 두 계층이 어긋났다.
+--   ASM 계층         MOUNTED (양 노드)
+--   Clusterware 계층 OFFLINE, not running
+--
+-- 리소스 ora.TEST.dg 는 자동으로 만들어졌다. 디스크그룹 생성은 Clusterware
+-- 에 전파된다. 그러나 SQL 로 한 마운트는 리소스 상태에 반영되지 않는다.
+--
+-- TARGET 도 OFFLINE 이라는 점이 중요하다. Clusterware 는 TARGET 을 보고
+-- 노드 기동 시 무엇을 올릴지 정한다. 이대로 두면 rac2 를 재기동했을 때
+-- 이 디스크그룹이 올라오지 않고, 그 안에 파일이 있는 데이터베이스도
+-- 기동에 실패한다.
+
+--------------------------------------------------------------------------------
+ [6] srvctl 로 정합을 맞춘다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ srvctl start diskgroup -g TEST
+
+[root@rac1 ~]# crsctl status resource ora.TEST.dg -t
+--------------------------------------------------------------------------------
+Name           Target  State        Server                   State details
+--------------------------------------------------------------------------------
+ora.TEST.dg(ora.asmgroup)
+      1        ONLINE  ONLINE       rac1                     STABLE
+      2        ONLINE  ONLINE       rac2                     STABLE
+      3        OFFLINE OFFLINE                               STABLE
+
+[grid@rac1 ~]$ srvctl status diskgroup -g TEST
+Disk Group TEST is running on rac1,rac2
+
+-- 이제 TARGET 과 STATE 가 모두 ONLINE 이다. 세 번째 행이 OFFLINE 인 것은
+-- ora.asmgroup 의 카디널리티가 3인데 노드가 2개이기 때문이다. 1장에서
+-- crsctl status resource -t 를 읽을 때 본 것과 같은 이유다.
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 — 없는 디스크그룹을 조회한다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ srvctl status diskgroup -g NOSUCH
+PRCA-1000 : ASM Disk Group NOSUCH does not exist
+PRCR-1001 : Resource ora.NOSUCH.dg does not exist
+
+-- 오류 : PRCA-1000, PRCR-1001
+-- 원인 파악 : 두 계층이 각각 답한다. PRCA-1000 은 ASM 계층에서 그런
+--             디스크그룹이 없다는 뜻이고, PRCR-1001 은 Clusterware 계층에서
+--             그런 리소스가 없다는 뜻이다.
+--             이 조합은 디스크그룹을 삭제한 뒤 정상적으로 정리되었는지
+--             확인하는 데도 쓴다. 삭제 후 이 두 줄이 나오면 리소스까지
+--             깨끗이 지워진 것이다.
+-- 조치     : 이름 오타를 확인한다. srvctl config asm 으로 등록된
+--             디스크그룹 목록을 볼 수 있다.
+-- 재확인   : 올바른 이름으로 조회한다.
+
+[grid@rac1 ~]$ srvctl status diskgroup -g TEST
+Disk Group TEST is running on rac1,rac2
+
+--------------------------------------------------------------------------------
+ [8] 데이터베이스에서 써 본다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> create tablespace ts_test datafile '+TEST' size 500M;
+
+Tablespace created.
+
+SQL> select file_name, bytes/1024/1024 mb from dba_data_files
+  2   where tablespace_name='TS_TEST';
+
+FILE_NAME                                             MB
+--------------------------------------------------- ----
++TEST/RACDB/DATAFILE/ts_test.256.1242847583          500
+
+-- 데이터베이스 alert.log 를 확인한다.
+[oracle@rac1 ~]$ tail -12 /u01/app/oracle/diag/rdbms/racdb/racdb1/trace/alert_racdb1.log
+create tablespace ts_test datafile '+TEST' size 500M
+NOTE: ASMB mounting group 4 (TEST)
+NOTE: Assigned CGID 0x10004 for group 4
+NOTE: ASMB process initiating disk discovery for grp 4 (reqid:0)
+NOTE: Assigning number (4,0) to disk (/dev/asmdisk/test1)
+SUCCESS: mounted group 4 (TEST)
+NOTE: grp 4 disk 0: TEST_0000 path:/dev/asmdisk/test1
+NOTE: dependency between database racdb and diskgroup resource ora.TEST.dg is established
+Completed: create tablespace ts_test datafile '+TEST' size 500M
+
+-- 마지막 줄이 중요하다. 데이터베이스와 디스크그룹 리소스 사이에 의존 관계가
+-- 설정되었다. 이제부터 Clusterware 는 racdb 를 띄우기 전에 ora.TEST.dg 를
+-- 먼저 띄우려 한다.
+--
+-- 이 의존 관계 때문에 [5] 의 TARGET OFFLINE 상태가 위험했던 것이다.
+-- 디스크그룹이 안 올라오면 데이터베이스도 안 뜬다.
+
+--------------------------------------------------------------------------------
+ [9] 정리 — 실습 05 를 위해 남겨 둔다
+--------------------------------------------------------------------------------
+
+-- 이 실습에서 만든 TEST 디스크그룹과 TS_TEST 테이블스페이스는 실습 06 에서
+-- 언마운트 실험에 쓰므로 지우지 않는다.
+
+SQL> select name, state, type, total_mb, free_mb from v$asm_diskgroup order by name;
+
+NAME       STATE       TYPE     TOTAL_MB    FREE_MB
+---------- ----------- ------ ---------- ----------
+CRS        MOUNTED     NORMAL      12288      11324
+DATA       MOUNTED     EXTERN      61440      56966
+FRA        MOUNTED     EXTERN      24576      23636
+TEST       MOUNTED     EXTERN       4096       3535
+
+--------------------------------------------------------------------------------
+ [10] 정리
+--------------------------------------------------------------------------------
+
+-- 재현한 오류
+--   PRCA-1000 / PRCR-1001   없는 디스크그룹 조회
+--
+-- 확인한 것
+--   1) compatible 은 생성 시 명시한다. 나중에 올리면 되돌릴 수 없다
+--   2) External 은 FREE_MB 와 USABLE_FILE_MB 가 같다
+--   3) 편입된 디스크는 다섯 컬럼이 한꺼번에 바뀐다
+--   4) 다른 노드에서는 DISMOUNTED 로 보인다. 직접 마운트해야 한다
+--   5) SQL 마운트는 Clusterware 리소스 TARGET 을 바꾸지 않는다
+--   6) srvctl start diskgroup 으로 두 계층을 맞춘다
+--   7) 테이블스페이스를 만들면 DB 와 디스크그룹 리소스에 의존 관계가 생긴다
+--
+-- 실무 절차
+--   생성 -> 모든 노드 마운트 -> srvctl start diskgroup -> TARGET 확인
+--   마지막에 노드를 재기동해 자동으로 올라오는지 검증한다.
+================================================================================
+ 실습 04 종료
+================================================================================

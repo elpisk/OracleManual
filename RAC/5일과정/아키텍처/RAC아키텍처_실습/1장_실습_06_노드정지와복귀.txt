@@ -1,0 +1,324 @@
+================================================================================
+ 제1장 실습 06 — 노드 하나를 정지했을 때 무엇이 계속되는가
+ 대상   : rac1(racdb1) 과 rac2(racdb2)
+ 목표   : racdb2 인스턴스를 정지하고 정지 전후의 SCAN 접속 분포, V$THREAD,
+          자원 상태를 비교해 무엇이 계속되고 무엇이 끊기는지 확인한다
+ 소요   : 약 35분
+ 선행   : 두 인스턴스가 OPEN, 다른 실습을 병행하지 않을 것
+ 계정   : oracle, grid
+ 주의   : 인스턴스를 정지한다. 반드시 마지막 단계에서 되살린다.
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 정지 전 상태 기록
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+SQL> SELECT inst_id, instance_name, status, thread# FROM gv$instance ORDER BY 1;
+
+   INST_ID INSTANCE_NAME    STATUS          THREAD#
+---------- ---------------- ------------ ----------
+         1 racdb1           OPEN                  1
+         2 racdb2           OPEN                  2
+
+2 rows selected.
+
+SQL> SELECT thread#, status, enabled, instance FROM v$thread ORDER BY 1;
+
+   THREAD# STATUS ENABLED  INSTANCE
+---------- ------ -------- ----------------
+         1 OPEN   PUBLIC   racdb1
+         2 OPEN   PUBLIC   racdb2
+
+2 rows selected.
+
+SQL> EXIT
+
+--------------------------------------------------------------------------------
+ [2] 정지 전 SCAN 접속 분포 — 부하 분산이 실제로 일어나는가
+--------------------------------------------------------------------------------
+
+-- SCAN 이름으로 여섯 번 접속해 어느 인스턴스로 붙는지 본다.
+[oracle@rac1 ~]$ for i in 1 2 3 4 5 6; do
+>   sqlplus -s system/Oracle_4U@rac-scan:1521/racpdb1 <<EOS
+>   set head off feed off
+>   select instance_name from v\$instance;
+>   exit
+> EOS
+> done
+racdb2
+racdb1
+racdb2
+racdb1
+racdb2
+racdb1
+
+-- 두 인스턴스로 번갈아 붙는다. SCAN 리스너가 부하 정보를 보고 재지시하고
+-- 있다는 증거다. 완전히 균등하지는 않을 수 있으며, 부하가 한쪽에 몰려
+-- 있으면 여유 있는 쪽으로 더 많이 보낸다.
+
+--------------------------------------------------------------------------------
+ [3] racdb2 인스턴스 정지
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl stop instance -d racdb -i racdb2 -o immediate
+
+[oracle@rac1 ~]$ srvctl status database -d racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is not running on node rac2
+
+[grid@rac1 ~]$ crsctl status resource ora.racdb.db -t
+--------------------------------------------------------------------------------
+Name           Target  State        Server                   State details
+--------------------------------------------------------------------------------
+Cluster Resources
+--------------------------------------------------------------------------------
+ora.racdb.db
+      1        ONLINE  ONLINE       rac1                     Open,HOME=/u01/app/o
+                                                             racle/product/19.3.0
+                                                             /dbhome_rac,STABLE
+      2        OFFLINE OFFLINE                               Instance Shutdown,ST
+                                                             ABLE
+--------------------------------------------------------------------------------
+
+-- Target 도 State 도 OFFLINE 이다. srvctl 로 의도적으로 내렸기 때문에
+-- Clusterware 는 이 인스턴스를 다시 올리려 하지 않는다.
+-- 만약 비정상 종료였다면 Target 은 ONLINE 인 채 State 만 OFFLINE 이 되고
+-- Clusterware 가 즉시 재기동을 시도했을 것이다.
+-- State details 의 Instance Shutdown 도 정상 종료임을 알려 준다.
+
+--------------------------------------------------------------------------------
+ [4] 계속되는 것 — 데이터베이스는 열려 있다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+SQL> SELECT inst_id, instance_name, status, thread# FROM gv$instance ORDER BY 1;
+
+   INST_ID INSTANCE_NAME    STATUS          THREAD#
+---------- ---------------- ------------ ----------
+         1 racdb1           OPEN                  1
+
+1 row selected.
+
+SQL> SELECT thread#, status, enabled, instance FROM v$thread ORDER BY 1;
+
+   THREAD# STATUS ENABLED  INSTANCE
+---------- ------ -------- ----------------
+         1 OPEN   PUBLIC   racdb1
+         2 CLOSED PUBLIC   racdb2
+
+2 rows selected.
+
+-- GV$INSTANCE 는 1행으로 줄었지만 V$THREAD 는 여전히 2행이다.
+-- 스레드 2 의 STATUS 가 OPEN 에서 CLOSED 로 바뀌었다.
+-- 스레드 구성 자체는 컨트롤 파일에 남아 있고 인스턴스만 없는 상태다.
+
+-- 갱신도 정상 수행된다.
+SQL> ALTER SESSION SET CONTAINER = racpdb1;
+SQL> CREATE TABLE scott_check (id NUMBER, v VARCHAR2(20));
+
+Table created.
+
+SQL> INSERT INTO scott_check VALUES (1, 'node1-only');
+
+1 row created.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> SELECT * FROM scott_check;
+
+        ID V
+---------- --------------------
+         1 node1-only
+
+1 row selected.
+
+-- 데이터베이스는 완전히 정상이다. 인스턴스가 하나 줄었을 뿐이다.
+
+--------------------------------------------------------------------------------
+ [5] 계속되는 것 — Clusterware 는 두 노드 모두에서 동작
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ crsctl check cluster -all
+**************************************************************
+rac1:
+CRS-4537: Cluster Ready Services is online
+CRS-4529: Cluster Synchronization Services is online
+CRS-4533: Event Manager is online
+**************************************************************
+rac2:
+CRS-4537: Cluster Ready Services is online
+CRS-4529: Cluster Synchronization Services is online
+CRS-4533: Event Manager is online
+**************************************************************
+
+[grid@rac1 ~]$ olsnodes -s -n
+rac1    1       Active
+rac2    2       Active
+
+-- 두 노드 모두 Active 다. 인스턴스를 정지한 것이지 노드를 정지한 것이
+-- 아니기 때문이다. 세 가지를 구분해야 한다.
+--   인스턴스 정지     srvctl stop instance    — DB 만 내려간다
+--   Clusterware 정지  crsctl stop crs         — 그 노드의 자원이 모두 내려간다
+--   노드 정지         shutdown -h now         — 서버 자체가 꺼진다
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 — 정지한 노드의 VIP 로 직접 접속하면
+--------------------------------------------------------------------------------
+
+-- VIP 로 직접 접속하는 방식이 왜 위험한지 확인한다.
+
+[oracle@rac1 ~]$ sqlplus system/Oracle_4U@rac2-vip:1521/racpdb1
+
+SQL*Plus: Release 19.0.0.0.0 - Production
+
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in connect
+descriptor
+
+-- 원인 파악
+--   rac2 의 리스너는 살아 있다. 노드가 죽은 것이 아니기 때문이다.
+--   다만 racdb2 인스턴스가 내려가면서 그 인스턴스가 등록해 두었던 서비스가
+--   리스너에서 사라졌다. 그래서 리스너가 응답은 하되 해당 서비스를 모른다고
+--   답한 것이다. rac2 의 리스너 상태를 직접 확인한다.
+
+[grid@rac2 ~]$ lsnrctl status LISTENER
+...
+Services Summary...
+Service "+ASM" has 1 instance(s).
+Service "+ASM_CRS" has 1 instance(s).
+Service "+ASM_DATA" has 1 instance(s).
+Service "+ASM_FRA" has 1 instance(s).
+The command completed successfully
+
+--   ASM 서비스만 남아 있고 racdb 관련 서비스가 전혀 없다.
+--   ORA-12514 는 리스너가 죽었을 때가 아니라 서비스가 등록되어 있지 않을 때
+--   나오는 오류다. 이 구분이 중요하다.
+--     리스너 자체가 죽었으면 ORA-12541 TNS:no listener
+--     서비스가 없으면      ORA-12514
+--     노드가 꺼졌으면      TCP 타임아웃 뒤 ORA-12170 또는 ORA-12543
+
+-- 조치 — VIP 가 아니라 SCAN 으로 접속한다.
+[oracle@rac1 ~]$ for i in 1 2 3 4 5 6; do
+>   sqlplus -s system/Oracle_4U@rac-scan:1521/racpdb1 <<EOS
+>   set head off feed off
+>   select instance_name from v\$instance;
+>   exit
+> EOS
+> done
+racdb1
+racdb1
+racdb1
+racdb1
+racdb1
+racdb1
+
+-- 재확인
+--   여섯 번 모두 racdb1 로 붙었다. SCAN 리스너는 내려간 인스턴스로 보내지
+--   않는다. 정지 전에는 racdb1 과 racdb2 가 번갈아 나왔다는 점과 비교하면
+--   차이가 분명하다.
+--
+-- 배운 것
+--   클라이언트 접속 문자열에는 반드시 SCAN 이름을 쓴다. 노드 VIP 를 직접
+--   적으면 그 노드의 인스턴스가 내려갔을 때 접속이 실패한다. 노드를
+--   추가할 때 모든 클라이언트를 고쳐야 하는 문제도 함께 생긴다.
+
+--------------------------------------------------------------------------------
+ [7] 복귀
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl start instance -d racdb -i racdb2
+
+[oracle@rac1 ~]$ srvctl status database -d racdb -v
+Instance racdb1 is running on node rac1. Instance status: Open.
+Instance racdb2 is running on node rac2. Instance status: Open.
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+SQL> SELECT inst_id, instance_name, status, thread# FROM gv$instance ORDER BY 1;
+
+   INST_ID INSTANCE_NAME    STATUS          THREAD#
+---------- ---------------- ------------ ----------
+         1 racdb1           OPEN                  1
+         2 racdb2           OPEN                  2
+
+2 rows selected.
+
+SQL> SELECT thread#, status, enabled, instance FROM v$thread ORDER BY 1;
+
+   THREAD# STATUS ENABLED  INSTANCE
+---------- ------ -------- ----------------
+         1 OPEN   PUBLIC   racdb1
+         2 OPEN   PUBLIC   racdb2
+
+2 rows selected.
+
+-- PDB 도 함께 열렸는지 확인한다. 앞선 실습에서 SAVE STATE 를 해 두었으므로
+-- 인스턴스가 기동하면서 자동으로 열린다.
+SQL> SELECT inst_id, name, open_mode FROM gv$pdbs WHERE name='RACPDB1' ORDER BY 1;
+
+   INST_ID NAME       OPEN_MODE
+---------- ---------- ----------
+         1 RACPDB1    READ WRITE
+         2 RACPDB1    READ WRITE
+
+2 rows selected.
+
+-- SAVE STATE 를 하지 않았다면 racdb2 의 RACPDB1 은 MOUNTED 로 남았을 것이다.
+-- 그러면 SCAN 이 racdb2 로 재지시했을 때 접속이 실패한다.
+-- RAC 에서 PDB 를 다룰 때 SAVE STATE INSTANCES=ALL 이 중요한 이유다.
+
+--------------------------------------------------------------------------------
+ [8] 원상 복구
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION SET CONTAINER = racpdb1;
+SQL> DROP TABLE scott_check PURGE;
+
+Table dropped.
+
+SQL> SELECT table_name FROM dba_tables WHERE table_name = 'SCOTT_CHECK';
+
+no rows selected
+
+SQL> EXIT
+
+-- SCAN 접속 분포가 정지 전처럼 돌아왔는지 최종 확인한다.
+[oracle@rac1 ~]$ for i in 1 2 3 4; do
+>   sqlplus -s system/Oracle_4U@rac-scan:1521/racpdb1 <<EOS
+>   set head off feed off
+>   select instance_name from v\$instance;
+>   exit
+> EOS
+> done
+racdb2
+racdb1
+racdb2
+racdb1
+
+-- 두 인스턴스로 다시 번갈아 붙는다. 실습 전 상태로 완전히 복귀했다.
+
+--------------------------------------------------------------------------------
+ [9] 정리
+--------------------------------------------------------------------------------
+
+--   계속되는 것
+--     데이터베이스는 열려 있고 모든 데이터에 접근할 수 있다
+--     남은 인스턴스에서 조회와 갱신이 정상 수행된다
+--     Clusterware 는 두 노드 모두에서 동작하고 olsnodes 는 둘 다 Active
+--     SCAN 접속은 살아 있는 인스턴스로만 재지시된다
+--
+--   끊기는 것
+--     죽은 인스턴스에 붙어 있던 세션은 끊기고 트랜잭션은 롤백된다
+--     그 노드 VIP 로 직접 접속하면 ORA-12514 가 난다
+--
+--   Target 과 State
+--     srvctl stop  : Target OFFLINE, State OFFLINE — 재기동하지 않는다
+--     비정상 종료  : Target ONLINE,  State OFFLINE — 즉시 재기동 시도
+--
+-- 실습 완료 후 반드시 GV$INSTANCE 가 2행을 반환하는지 확인하고 종료한다.
+-- 복귀에 실패하면 rac-base 스냅샷으로 되돌린 뒤 다시 시작한다.
+================================================================================
+ 실습 06 종료
+================================================================================

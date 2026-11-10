@@ -1,0 +1,355 @@
+================================================================================
+ 제15장 실습 08 — PDB 서비스와 DBMS_SERVICE 서비스
+ 대상   : rac1
+ 목표   : -pdb 로 PDB 에 붙는 서비스를 만들고, CDB 루트 서비스와 접속 위치를
+          비교한다. DBMS_SERVICE 로 만든 서비스는 Clusterware 가 모른다는 것,
+          PDB 를 닫고 열 때 서비스가 어떻게 되는지 확인한다
+ 소요   : 약 30분
+ 선행   : 실습 07 완료 (사용자 서비스가 없는 기준선)
+ 계정   : oracle
+ 주의   : [7] [8] 에서 racdb1 의 RACPDB1 을 잠시 닫는다. racdb2 쪽은 열린 채다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] PDB 서비스와 루트 서비스를 하나씩
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ crsctl stat res -t > /tmp/base15.txt; wc -l /tmp/base15.txt
+68 /tmp/base15.txt
+
+-- 시작 전 자원 목록을 떠 둔다. 실습 12 끝에서 이 파일과 비교한다.
+
+[oracle@rac1 ~]$ srvctl add service -db racdb -service ch15_pdb -pdb racpdb1 \
+                   -preferred racdb1 -available racdb2
+>>> 5.4초
+[oracle@rac1 ~]$ srvctl add service -db racdb -service ch15_root \
+                   -preferred racdb1 -available racdb2
+>>> 4.8초
+
+[oracle@rac1 ~]$ srvctl config service -db racdb -service ch15_pdb
+Service name: ch15_pdb
+...
+Pluggable database name: racpdb1
+...
+Preferred instances: racdb1
+Available instances: racdb2
+
+[oracle@rac1 ~]$ srvctl start service -db racdb -service ch15_pdb,ch15_root
+>>> 1.9초
+
+-- 두 서비스의 차이는 -pdb 하나다. 실습 02 의 ch15_oltp 처럼 -pdb 없이 만든
+-- 서비스는 Pluggable database name 이 비어 있고 CDB 루트에 붙는다.
+-- 서비스 이름을 쉼표로 이어 한 번에 기동할 수 있다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — 없는 PDB 를 주면
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl add service -db racdb -service ch15_x -pdb racpdb9 \
+                   -preferred racdb1 -available racdb2
+>>> 3.9초
+
+[oracle@rac1 ~]$ srvctl config service -db racdb -service ch15_x | grep Pluggable
+Pluggable database name: racpdb9
+
+[oracle@rac1 ~]$ srvctl start service -db racdb -service ch15_x
+PRCD-1133 : failed to start services ch15_x for database racdb
+PRCR-1095 : Failed to start resources using filter ((NAME == ora.racdb.ch15_x.svc) AND (TYPE == ora.service.type))
+CRS-5017: The resource action "ora.racdb.ch15_x.svc start" encountered the following error:
+ORA-65011: Pluggable database RACPDB9 does not exist.
+. For details refer to "(:CLSN00107:)" in "/u01/app/grid/diag/crs/rac1/crs/trace/crsd_oraagent_oracle.trc".
+
+CRS-2674: Start of 'ora.racdb.ch15_x.svc' on 'rac1' failed
+CRS-5017: The resource action "ora.racdb.ch15_x.svc start" encountered the following error:
+ORA-65011: Pluggable database RACPDB9 does not exist.
+...
+CRS-2674: Start of 'ora.racdb.ch15_x.svc' on 'rac2' failed
+CRS-2632: There are no more servers to try to place resource 'ora.racdb.ch15_x.svc' on that would satisfy its placement policy
+
+[grid@rac1 ~]$ crsctl stat res -w "TYPE = ora.service.type" -t
+--------------------------------------------------------------------------------
+Name           Target  State        Server                   State details
+--------------------------------------------------------------------------------
+Cluster Resources
+--------------------------------------------------------------------------------
+ora.racdb.ch15_pdb.svc
+      1        ONLINE  ONLINE       rac1                     STABLE
+ora.racdb.ch15_root.svc
+      1        ONLINE  ONLINE       rac1                     STABLE
+ora.racdb.ch15_x.svc
+      1        ONLINE  OFFLINE                               STABLE
+--------------------------------------------------------------------------------
+
+-- 원인 파악 : 없는 PDB 이름은 add 에서 걸러지지 않는다. 저장까지 되고,
+--             기동할 때 데이터베이스가 ORA-65011 을 돌려준다.
+--             실습 02 [3] 에서 없는 인스턴스를 선호로 주면 add 단계에서 거부됐다.
+--             인스턴스 목록은 Clusterware 가 알지만 PDB 목록은 데이터베이스 안에 있다.
+--             rac1 에서 실패하자 가용 쪽 rac2 에서도 시도했고, 둘 다 실패했다(CRS-2632).
+-- 조치     : srvctl remove service 로 지우고 이름을 고쳐 다시 만든다.
+-- 재확인   : 실패한 자원이 TARGET ONLINE, STATE OFFLINE 으로 남았다.
+--             14장 실습 10 의 점검 필터(TARGET = ONLINE and STATE != ONLINE)에 걸린다.
+--             이 자원은 [9] 에서 지운다.
+
+--------------------------------------------------------------------------------
+ [3] 어디에 붙는가
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ cat /tmp/c15.sh
+#!/bin/bash
+sqlplus -s -L system/<비밀번호>@rac-scan:1521/$1 <<'E'
+set head off feed off
+select sys_context('userenv','instance_name')||' '||sys_context('userenv','con_name')
+       ||' '||sys_context('userenv','service_name') from dual;
+E
+
+[oracle@rac1 ~]$ for s in ch15_pdb ch15_root racpdb1 ch15_x; do /tmp/c15.sh $s; done
+racdb1 RACPDB1 ch15_pdb
+racdb1 CDB$ROOT ch15_root
+racdb1 RACPDB1 racpdb1
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in connect
+descriptor
+
+-- 같은 SYSTEM 으로 같은 SCAN 에 붙었는데 컨테이너가 다르다.
+-- ch15_pdb 는 바로 RACPDB1 안이다. alter session set container 가 필요 없다.
+-- ch15_root 는 CDB$ROOT 다. 애플리케이션이 이 서비스로 붙으면 PDB 의 테이블을 보지 못한다.
+-- racpdb1 은 PDB 를 만들 때 생긴 기본 서비스다. 결과는 ch15_pdb 와 같지만
+-- 선호·가용도, 드레인 속성도 줄 수 없다. 애플리케이션용으로는 쓰지 않는다.
+
+--------------------------------------------------------------------------------
+ [4] 뷰에서 보면
+--------------------------------------------------------------------------------
+
+[rac1] SQL> select inst_id, name, pdb from gv$services where name like 'ch15%' order by 1,2;
+
+   INST_ID NAME                 PDB
+---------- -------------------- ----------
+         1 ch15_pdb             RACPDB1
+         1 ch15_root            CDB$ROOT
+
+[rac1] SQL> select con_id, name from cdb_services where name like 'ch15%' order by 1;
+
+    CON_ID NAME
+---------- --------------------
+         1 ch15_root
+         3 ch15_pdb
+
+[rac1] SQL> alter session set container=racpdb1;
+[rac1] SQL> select name, network_name, creation_date from dba_services order by creation_date;
+
+NAME                 NETWORK_NAME         CREATION_
+-------------------- -------------------- ---------
+RACPDB1              RACPDB1              02-NOV-26
+ch15_pdb             ch15_pdb             10-NOV-26
+
+-- 서비스 정의가 PDB 의 데이터 딕셔너리(CON_ID 3)에 들어간다. 루트 서비스는 CON_ID 1 이다.
+-- PDB 를 다른 CDB 로 옮기면 ch15_pdb 의 딕셔너리 행도 함께 간다.
+-- Clusterware 쪽 정의(선호·가용)는 따라가지 않으므로 새 클러스터에서 srvctl add 를 다시 한다.
+-- 기본 서비스 RACPDB1 은 PDB 생성일(11월 2일)에 만들어졌다.
+
+--------------------------------------------------------------------------------
+ [5] DBMS_SERVICE 로 만든 서비스
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter session set container=racpdb1;
+[rac1] SQL> exec dbms_service.create_service(service_name=>'ch15_dbms', network_name=>'ch15_dbms')
+PL/SQL procedure successfully completed.
+[rac1] SQL> exec dbms_service.start_service('ch15_dbms')
+PL/SQL procedure successfully completed.
+
+[rac1] SQL> select inst_id, name from gv$services where name like 'ch15%' order by 1,2;
+
+   INST_ID NAME
+---------- ------------
+         1 ch15_dbms
+         1 ch15_pdb
+
+[oracle@rac1 ~]$ /tmp/c15.sh ch15_dbms
+racdb1 RACPDB1 ch15_dbms
+
+-- 접속도 되고 뷰에도 보인다. 여기까지는 srvctl 서비스와 다를 것이 없다.
+
+[oracle@rac1 ~]$ srvctl status service -db racdb
+Service ch15_pdb is running on instance(s) racdb1
+Service ch15_root is running on instance(s) racdb1
+Service ch15_x is not running.
+
+[oracle@rac1 ~]$ srvctl stop service -db racdb -service ch15_dbms
+PRCR-1001 : Resource ora.racdb.ch15_dbms.svc does not exist
+PRCD-1316 : failed to stop services ch15_dbms for database racdb
+PRCD-1132 : Database racdb does not have defined services: ch15_dbms
+
+-- srvctl 목록에 ch15_dbms 가 없다. crsctl 의 서비스 자원도 [2] 의 셋 그대로다.
+-- 선호·가용이 없으니 racdb1 이 죽어도 racdb2 로 옮겨 가지 않는다.
+-- 데이터베이스를 재기동해도 Clusterware 가 올려 주지 않는다.
+
+[rac1] SQL> exec dbms_service.start_service('ch15_dbms', dbms_service.all_instances)
+[rac1] SQL> select inst_id, name from gv$services where name like 'ch15%' order by 1,2;
+
+   INST_ID NAME
+---------- ------------
+         1 ch15_dbms
+         1 ch15_pdb
+         2 ch15_dbms
+
+-- all_instances 를 주면 두 인스턴스에서 돈다. 인자 없이 부르면 지금 붙은 인스턴스에서만 돈다.
+-- 문서는 RAC 의 서비스를 srvctl 로 만들라고 한다. DBMS_SERVICE 는 Clusterware 가 없는
+-- 단일 인스턴스용이다.
+
+--------------------------------------------------------------------------------
+ [6] 흔한 오류 — srvctl 서비스를 DBMS_SERVICE 로 멈추면
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter session set container=racpdb1;
+[rac1] SQL> exec dbms_service.stop_service('ch15_pdb')
+PL/SQL procedure successfully completed.
+
+[oracle@rac1 ~]$ srvctl status service -db racdb -service ch15_pdb
+Service ch15_pdb is not running.
+
+[grid@rac1 ~]$ crsctl stat res ora.racdb.ch15_pdb.svc -t
+...
+ora.racdb.ch15_pdb.svc
+      1        OFFLINE OFFLINE                               STABLE
+
+[rac1] SQL> select inst_id, name from gv$services where name like 'ch15%' order by 1,2;
+
+   INST_ID NAME
+---------- ------------
+         1 ch15_dbms
+         1 ch15_pdb
+         1 ch15_root
+         2 ch15_dbms
+
+[oracle@rac1 ~]$ /tmp/c15.sh ch15_pdb
+ERROR:
+ORA-12514: TNS:listener does not currently know of service requested in connect
+descriptor
+
+-- 원인 파악 : 데이터베이스 안에서 서비스를 멈추면 Clusterware 가 그 사실을 받아
+--             자원을 TARGET OFFLINE 으로 바꾼다. 장애가 아니라 의도된 정지로 본다.
+--             그래서 가용 인스턴스로 옮기지도, 다시 올리지도 않는다.
+--             GV$SERVICES 에는 ch15_pdb 가 그대로 있다. 이 뷰는 인스턴스가 아는 서비스다.
+--             지금 도는 서비스는 GV$ACTIVE_SERVICES 로 본다.
+-- 조치     : srvctl start service -db racdb -service ch15_pdb
+-- 재확인   : srvctl status service 로 running 을 보고 접속해 본다.
+
+[oracle@rac1 ~]$ srvctl start service -db racdb -service ch15_pdb
+[oracle@rac1 ~]$ srvctl status service -db racdb -service ch15_pdb
+Service ch15_pdb is running on instance(s) racdb1
+
+--------------------------------------------------------------------------------
+ [7] PDB 를 닫으면 서비스는 — 가용 인스턴스로 가지 않는다
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter pluggable database racpdb1 close immediate instances=('racdb1');
+Pluggable database altered.
+>>> 5.2초
+
+[oracle@rac1 ~]$ srvctl status service -db racdb -service ch15_pdb
+Service ch15_pdb is not running.
+
+[grid@rac1 ~]$ crsctl stat res ora.racdb.ch15_pdb.svc -t
+...
+ora.racdb.ch15_pdb.svc
+      1        OFFLINE OFFLINE                               STABLE
+
+-- 10 초 간격으로 네 번 봤다. 40 초 동안 내내 OFFLINE 이었다.
+-- racdb2 는 가용 인스턴스이고 거기서는 RACPDB1 이 READ WRITE 로 열려 있다.
+-- 그런데도 서비스가 그쪽으로 가지 않았다. [6] 과 같은 이유다. PDB 를 닫는 것은
+-- 관리자의 의도된 동작이라 서비스도 TARGET OFFLINE 이 된다.
+
+[rac1] SQL> select inst_id, name, open_mode from gv$pdbs where name='RACPDB1' order by 1;
+
+   INST_ID NAME         OPEN_MODE
+---------- ------------ ----------
+         1 RACPDB1      MOUNTED
+         2 RACPDB1      READ WRITE
+
+[rac1] SQL> select inst_id, name from gv$active_services where name like 'ch15%' order by 1,2;
+
+   INST_ID NAME
+---------- ------------
+         1 ch15_root
+         2 ch15_dbms
+
+-- racdb1 에서 돌던 ch15_dbms 도 사라졌다. PDB 서비스는 그 PDB 가 열려 있는 인스턴스에서만 돈다.
+
+[rac1] SQL> alter pluggable database racpdb1 open instances=('racdb1');
+Pluggable database altered.
+>>> 9.2초
+
+(15 초 뒤)
+[oracle@rac1 ~]$ srvctl status service -db racdb
+Service ch15_pdb is not running.
+Service ch15_root is running on instance(s) racdb1
+Service ch15_x is not running.
+
+[rac1] SQL> select con_name, instance_name, state from dba_pdb_saved_states;
+
+CON_NAME   INSTANCE_NAME   STATE
+---------- --------------- --------------
+RACPDB1    racdb1          OPEN
+RACPDB1    racdb2          OPEN
+
+-- PDB 를 다시 열어도 서비스는 돌아오지 않는다. 저장된 상태(save state)도 PDB 의
+-- 열림만 기억하고 서비스는 기억하지 않는다.
+-- PDB 를 닫았다 연 작업 뒤에는 srvctl status service 를 반드시 확인하고 손으로 올린다.
+
+[oracle@rac1 ~]$ srvctl start service -db racdb -service ch15_pdb
+[oracle@rac1 ~]$ srvctl status service -db racdb -service ch15_pdb
+Service ch15_pdb is running on instance(s) racdb1
+
+--------------------------------------------------------------------------------
+ [8] 거꾸로 — 서비스를 올리면 PDB 가 열린다
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter pluggable database racpdb1 close immediate instances=('racdb1');
+Pluggable database altered.
+
+[oracle@rac1 ~]$ srvctl start service -db racdb -service ch15_pdb
+>>> 5.9초
+[oracle@rac1 ~]$ srvctl status service -db racdb -service ch15_pdb
+Service ch15_pdb is running on instance(s) racdb1
+
+[oracle@rac1 ~]$ /tmp/c15.sh ch15_pdb
+racdb1 RACPDB1 ch15_pdb
+
+[rac1] SQL> alter pluggable database racpdb1 open instances=('racdb1');
+ERROR at line 1:
+ORA-65019: pluggable database RACPDB1 already open
+
+-- PDB 가 닫힌 racdb1 에 서비스를 올렸는데 실패하지 않았다. 서비스 기동이 PDB 를 열었다.
+-- 기동에 5.9 초가 걸린 것도 PDB 를 여는 시간이 들어 있어서다([1] 의 기동은 1.9 초).
+-- 그래서 PDB 를 열려고 하자 ORA-65019 가 났다.
+--
+-- [7] 과 짝으로 기억한다.
+--   PDB 를 닫으면    → 그 인스턴스의 PDB 서비스가 멈춘다 (다른 인스턴스로 가지 않음)
+--   PDB 를 열면      → 서비스는 그대로 멈춰 있다
+--   서비스를 올리면  → 닫혀 있던 PDB 가 열린다
+
+--------------------------------------------------------------------------------
+ [9] 정리 — DBMS_SERVICE 서비스와 ch15_x
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter session set container=racpdb1;
+[rac1] SQL> exec dbms_service.stop_service('ch15_dbms', dbms_service.all_instances)
+[rac1] SQL> exec dbms_service.delete_service('ch15_dbms')
+[rac1] SQL> select name from dba_services order by 1;
+
+NAME
+----------------
+RACPDB1
+ch15_pdb
+
+[oracle@rac1 ~]$ srvctl remove service -db racdb -service ch15_x
+[oracle@rac1 ~]$ srvctl status service -db racdb
+Service ch15_pdb is running on instance(s) racdb1
+Service ch15_root is running on instance(s) racdb1
+
+-- DBMS_SERVICE 서비스는 만든 방법 그대로 멈추고 지운다. srvctl 로는 손댈 수 없다([5]).
+-- ch15_x 는 기동에 실패해 돌지 않으므로 바로 지워진다.
+
+================================================================================
+ 실습 08 종료 — ch15_pdb · ch15_root 가 racdb1 에서 돈다. 실습 09 에서 계속 쓴다
+================================================================================

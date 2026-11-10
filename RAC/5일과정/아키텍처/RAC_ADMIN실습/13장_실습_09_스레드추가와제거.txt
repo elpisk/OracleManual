@@ -1,0 +1,223 @@
+================================================================================
+ 제13장 실습 09 — 세 번째 인스턴스를 위한 스토리지 준비와 되돌리기
+ 대상   : rac1
+ 목표   : 노드를 늘리기 전에 데이터베이스 안에서 준비하는 세 가지
+          (스레드 3 의 리두 그룹, 스레드 활성화, UNDO 테이블스페이스)를 직접 만들고
+          거꾸로 지운다. 각 단계에서 막히는 조건을 오류 번호로 확인한다
+ 소요   : 약 20분
+ 선행   : racdb 양 노드 OPEN
+ 계정   : oracle
+ 주의   : 노드나 인스턴스는 추가하지 않는다. 데이터베이스 쪽 구조만 만들고 지운다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 지금 스레드
+--------------------------------------------------------------------------------
+
+[rac1] SQL> select thread#, status, enabled, instance, groups from v$thread order by 1;
+
+   THREAD# STATUS ENABLED  INSTANCE   GROUPS
+---------- ------ -------- ---------- ----------
+         1 OPEN   PUBLIC   racdb1              2
+         2 OPEN   PUBLIC   racdb2              2
+
+-- 스레드 둘, 각각 그룹 둘이다. 세 번째 인스턴스를 띄우려면
+-- 이 표에 스레드 3 이 PUBLIC 으로 있어야 하고 UNDO 가 하나 더 있어야 한다.
+-- 노드 추가 때 dbca 가 하는 일을 손으로 나눠 해 본다.
+
+--------------------------------------------------------------------------------
+ [1] 스레드 3 의 첫 그룹
+--------------------------------------------------------------------------------
+
+[rac1] SQL> set timing on
+[rac1] SQL> alter database add logfile thread 3 group 21 ('+DATA','+FRA') size 50M;
+
+Database altered.
+
+Elapsed: 00:00:01.91
+
+[rac1] SQL> select thread#, status, enabled, instance, groups from v$thread order by 1;
+
+   THREAD# STATUS ENABLED  INSTANCE            GROUPS
+---------- ------ -------- ------------------- ----------
+         1 OPEN   PUBLIC   racdb1                       2
+         2 OPEN   PUBLIC   racdb2                       2
+         3 CLOSED DISABLED UNNAMED_INSTANCE_3           1
+
+-- 그룹을 하나 만들자 v$thread 에 스레드 3 이 나타났다. 따로 만드는 명령은 없다.
+-- 리두 그룹이 붙는 순간 스레드가 생긴다.
+--
+-- 세 열을 본다.
+--   STATUS   CLOSED   그 스레드로 리두를 쓰는 인스턴스가 없다
+--   ENABLED  DISABLED 아직 어떤 인스턴스도 이 스레드로 열 수 없다
+--   INSTANCE UNNAMED_INSTANCE_3  대응하는 인스턴스 이름이 정해지지 않았다
+
+[rac1] SQL> select group#, thread#, sequence#, bytes/1024/1024 mb, members, status
+  2    from v$log order by thread#, group#;
+
+    GROUP#    THREAD#  SEQUENCE#         MB    MEMBERS STATUS
+---------- ---------- ---------- ---------- ---------- ----------------
+         1          1         26        200          2 CURRENT
+         2          1         23        200          2 INACTIVE
+         3          2         21        200          2 INACTIVE
+         4          2         22        200          2 CURRENT
+        21          3          0         50          2 UNUSED
+
+--------------------------------------------------------------------------------
+ [2] 흔한 오류 — 그룹 하나로 활성화
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter database enable public thread 3;
+alter database enable public thread 3
+*
+ERROR at line 1:
+ORA-01613: instance UNNAMED_INSTANCE_3 (thread 3) only has 1 logs - at least 2 logs required to enable.
+
+-- 원인 파악 : 스레드를 활성화하려면 그룹이 둘 이상 있어야 한다.
+--             실습 07 의 ORA-01567 과 같은 규칙을 반대 방향에서 만난 것이다.
+--             그쪽은 지울 때, 이쪽은 켤 때 검사한다.
+-- 조치     : 그룹을 하나 더 만들고 다시 활성화한다.
+-- 재확인   : v$thread 의 GROUPS 가 2 이상인지 본다.
+
+[rac1] SQL> alter database add logfile thread 3 group 22 ('+DATA','+FRA') size 50M;
+Database altered.
+Elapsed: 00:00:03.41
+
+[rac1] SQL> alter database enable public thread 3;
+Database altered.
+Elapsed: 00:00:00.05
+
+[rac1] SQL> select thread#, status, enabled, instance, groups from v$thread order by 1;
+
+   THREAD# STATUS ENABLED  INSTANCE            GROUPS
+---------- ------ -------- ------------------- ----------
+         1 OPEN   PUBLIC   racdb1                       2
+         2 OPEN   PUBLIC   racdb2                       2
+         3 CLOSED PUBLIC   UNNAMED_INSTANCE_3           2
+
+-- ENABLED 가 PUBLIC 이 됐다. STATUS 는 여전히 CLOSED 다.
+-- 쓸 준비가 됐을 뿐 아직 쓰는 인스턴스가 없다.
+--
+-- PUBLIC 과 PRIVATE 의 차이.
+--   PUBLIC   thread 파라미터를 지정하지 않은 인스턴스도 이 스레드를 가져갈 수 있다
+--   PRIVATE  SPFILE 에 thread=3 을 지정한 인스턴스만 쓸 수 있다
+-- 이 랩은 SPFILE 에 racdb1.thread=1, racdb2.thread=2 가 들어 있다(실습 08 [0]).
+-- 새 인스턴스에도 racdb3.thread=3 을 넣어 대응을 고정하는 것이 보통이다.
+
+--------------------------------------------------------------------------------
+ [3] 세 번째 UNDO
+--------------------------------------------------------------------------------
+
+[rac1] SQL> create undo tablespace UNDOTBS3 datafile size 50M autoextend on next 10M maxsize 1G;
+
+Tablespace created.
+
+Elapsed: 00:00:03.66
+
+[rac1] SQL> select tablespace_name, file_name, bytes/1024/1024 mb from dba_data_files
+  2   where tablespace_name like 'UNDO%' order by 1;
+
+TABLESPACE FILE_NAME                                                  MB
+---------- -------------------------------------------------- ----------
+UNDOTBS1   +DATA/RACDB/DATAFILE/undotbs1.259.1248275505              350
+UNDOTBS2   +DATA/RACDB/DATAFILE/undotbs2.269.1248275981               75
+UNDOTBS3   +DATA/RACDB/DATAFILE/undotbs3.280.1248874013               50
+
+[rac1] SQL> select tablespace_name, count(*) cnt, max(status) st from dba_rollback_segs
+  2   where tablespace_name like 'UNDO%' group by tablespace_name order by 1;
+
+TABLESPACE        CNT ST
+---------- ---------- ----------------
+UNDOTBS1           10 ONLINE
+UNDOTBS2           10 ONLINE
+UNDOTBS3           10 OFFLINE
+
+-- 만들자마자 롤백 세그먼트 10 개가 생겼고 모두 OFFLINE 이다.
+-- 이 UNDO 를 undo_tablespace 로 지정한 인스턴스가 아직 없기 때문이다.
+-- 세 번째 인스턴스가 racdb3.undo_tablespace='UNDOTBS3' 로 기동하면 ONLINE 이 된다.
+--
+-- 여기까지가 노드 추가 전에 데이터베이스 안에 있어야 하는 것 전부다.
+--   스레드 3 + 그룹 둘 이상  → [1] [2]
+--   스레드 활성화            → [2]
+--   UNDO 테이블스페이스      → [3]
+-- 나머지(SPFILE 의 racdb3. 항목, 클러스터 자원 등록)는 데이터베이스 밖의 일이다.
+
+--------------------------------------------------------------------------------
+ [4] 흔한 오류 — 활성 스레드의 그룹을 줄이면
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter database drop logfile group 22;
+alter database drop logfile group 22
+*
+ERROR at line 1:
+ORA-01567: dropping log 22 would leave less than 2 log files for instance UNNAMED_INSTANCE_3 (thread 3)
+ORA-00312: online log 22 thread 3: '+DATA/RACDB/ONLINELOG/group_22.281.1248874009'
+ORA-00312: online log 22 thread 3: '+FRA/RACDB/ONLINELOG/group_22.276.1248874009'
+
+-- 원인 파악 : 실습 07 [1] 과 같은 오류다. 스레드 3 은 아무도 쓰지 않지만
+--             PUBLIC 으로 활성화되어 있으므로 그룹 둘 규칙이 걸린다.
+-- 조치     : 스레드를 먼저 비활성화한다. 그 뒤에는 그룹을 모두 지울 수 있다.
+-- 재확인   : v$thread 의 ENABLED 가 DISABLED 인지 본다.
+
+--------------------------------------------------------------------------------
+ [5] 흔한 오류 — 쓰고 있는 스레드를 끄려 하면
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter database disable thread 2;
+alter database disable thread 2
+*
+ERROR at line 1:
+ORA-01615: instance racdb2 (thread 2) is mounted - cannot disable
+
+-- 원인 파악 : racdb2 가 스레드 2 로 떠 있다. 쓰는 인스턴스가 있는 스레드는 끌 수 없다.
+--             실수로 번호를 잘못 넣었을 때 이 검사가 막아 준다.
+-- 조치     : 인스턴스를 영구히 뺄 때만 스레드를 끈다. 순서는
+--             인스턴스 정지 → 스레드 비활성화 → 그룹 삭제 → UNDO 삭제다.
+-- 재확인   : v$thread 의 STATUS 가 CLOSED 인 스레드만 끈다.
+
+--------------------------------------------------------------------------------
+ [6] 거꾸로 지우기
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter database disable thread 3;
+Database altered.
+Elapsed: 00:00:00.02
+
+[rac1] SQL> select thread#, status, enabled, instance, groups from v$thread order by 1;
+
+   THREAD# STATUS ENABLED  INSTANCE            GROUPS
+---------- ------ -------- ------------------- ----------
+         1 OPEN   PUBLIC   racdb1                       2
+         2 OPEN   PUBLIC   racdb2                       2
+         3 CLOSED DISABLED UNNAMED_INSTANCE_3           2
+
+[rac1] SQL> alter database drop logfile group 21;
+Database altered.
+[rac1] SQL> alter database drop logfile group 22;
+Database altered.
+[rac1] SQL> drop tablespace UNDOTBS3 including contents and datafiles;
+Tablespace dropped.
+
+-- 비활성화하자 [4] 에서 거부된 삭제가 두 그룹 모두 통과했다.
+-- 마지막 그룹까지 지워도 오류가 없다. 꺼진 스레드에는 그룹 수 규칙이 없다.
+
+[rac1] SQL> select thread#, status, enabled, instance, groups from v$thread order by 1;
+
+   THREAD# STATUS ENABLED  INSTANCE   GROUPS
+---------- ------ -------- ---------- ----------
+         1 OPEN   PUBLIC   racdb1              2
+         2 OPEN   PUBLIC   racdb2              2
+
+[rac1] SQL> select tablespace_name from dba_tablespaces where contents='UNDO' order by 1;
+
+TABLESPACE_NAME
+------------------------------
+UNDOTBS1
+UNDOTBS2
+
+-- 그룹이 모두 없어지자 스레드 3 도 v$thread 에서 사라졌다. [1] 의 반대다.
+-- 노드를 삭제할 때 dbca 가 하는 일이 이 [6] 이다.
+
+================================================================================
+ 실습 09 종료 — 스레드 3 · 그룹 21 · 22 · UNDOTBS3 삭제, 처음 구성과 같음
+================================================================================

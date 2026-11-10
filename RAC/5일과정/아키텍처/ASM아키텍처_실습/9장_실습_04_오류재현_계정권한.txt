@@ -1,0 +1,209 @@
+================================================================================
+ 제9장 실습 04 — 오류 재현 : oracle 계정으로 asmcmd 를 실행하면
+ 대상   : rac1
+ 목표   : ASMCMD-8102 를 재현하고, 메시지가 가리키는 곳과 실제 원인이 다르다는
+          것을 계층을 내려가며 확인한다
+ 소요   : 약 25분
+ 선행   : +ASM1 정상 기동 상태
+ 계정   : oracle, grid, root
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 사전 확인 — +ASM1 은 정말 떠 있는가
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> select instance_name, status from v$instance;
+
+INSTANCE_NAME    STATUS
+---------------- ------------
++ASM1            STARTED
+
+1 row selected.
+
+SQL> exit
+
+-- 이 확인을 반드시 먼저 한다.
+-- 곧 나올 오류 메시지가 인스턴스 상태를 잘못 말할 것이기 때문이다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — oracle 계정으로 asmcmd
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ export ORACLE_HOME=/u01/app/19.3.0/grid
+[oracle@rac1 ~]$ export ORACLE_SID=+ASM1
+[oracle@rac1 ~]$ $ORACLE_HOME/bin/asmcmd lsdg
+Connected to an idle instance.
+ASMCMD-8102: no connection to Oracle ASM; command requires Oracle ASM to run
+
+-- 오류 : ASMCMD-8102
+--
+-- 두 줄 모두 사실과 다르다.
+--   "Connected to an idle instance."  → [1] 에서 STARTED 를 확인했다
+--   "no connection to Oracle ASM"     → ASM 은 정상 동작 중이다
+--
+-- ORACLE_SID 를 racdb1 인 채로 두어도 같은 결과가 나온다.
+-- 즉 SID 문제도 아니다.
+
+--------------------------------------------------------------------------------
+ [3] 계층을 한 단계 내려간다
+--------------------------------------------------------------------------------
+
+-- asmcmd 도움말(실습 03 [1])에 이렇게 적혀 있었다.
+--   "in the same manner as a SQLPLUS / AS SYSASM"
+-- 그렇다면 같은 계정으로 sqlplus 를 직접 실행해 본다.
+
+[oracle@rac1 ~]$ $ORACLE_HOME/bin/sqlplus -s / as sysasm
+ERROR:
+ORA-01017: invalid username/password; logon denied
+
+-- 오류 : ORA-01017
+--
+-- 원인 파악 : 메시지의 성격이 완전히 달라졌다.
+--             "연결할 수 없다" 가 아니라 "인증이 거부되었다" 다.
+--             / as sysasm 은 OS 인증이므로 다음에 볼 것은 OS 그룹이다.
+
+--------------------------------------------------------------------------------
+ [4] 대조 실행 — grid 로는 되는가
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ export ORACLE_HOME=/u01/app/19.3.0/grid
+[grid@rac1 ~]$ export ORACLE_SID=+ASM1
+[grid@rac1 ~]$ $ORACLE_HOME/bin/sqlplus -s / as sysasm
+
+SQL> select instance_name, status from v$instance;
+
+INSTANCE_NAME    STATUS
+---------------- ------------
++ASM1            STARTED
+
+1 row selected.
+
+SQL> exit
+
+[grid@rac1 ~]$ $ORACLE_HOME/bin/asmcmd lsdg
+State    Type    Rebal  ...  Total_MB  Free_MB  Req_mir_free_MB  Usable_file_MB  Name
+MOUNTED  NORMAL  N      ...     12288    11324             4096            3614  CRS/
+MOUNTED  EXTERN  N      ...     61440    56916                0           56916  DATA/
+MOUNTED  EXTERN  N      ...     24576    23636                0           23636  FRA/
+
+-- 완전히 같은 환경 변수, 같은 바이너리인데 계정만 바뀌었더니 동작한다.
+-- 차이는 계정 하나뿐이므로 원인도 계정에 있다.
+
+--------------------------------------------------------------------------------
+ [5] OSASM 그룹이 무엇인지 확인
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ $ORACLE_HOME/bin/osdbagrp -a
+asmadmin
+
+[grid@rac1 ~]$ $ORACLE_HOME/bin/osdbagrp
+asmdba
+
+-- osdbagrp -a  → OSASM  그룹 = asmadmin
+-- osdbagrp     → OSDBA  그룹 = asmdba
+--
+-- -a 를 빠뜨리면 엉뚱한 그룹을 보게 되므로 주의한다.
+
+--------------------------------------------------------------------------------
+ [6] 그룹 소속 대조 — 원인 확정
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# id -nG oracle
+oinstall dba oper backupdba dgdba kmdba racdba asmdba
+
+[root@rac1 ~]# id -nG grid
+oinstall dba asmdba asmoper asmadmin
+
+[root@rac1 ~]# getent group asmadmin
+asmadmin:x:54329:grid
+
+-- 원인 확정.
+--   asmadmin 그룹의 구성원은 grid 하나뿐이다.
+--   oracle 은 asmdba 까지만 갖고 asmadmin 이 없다.
+--
+-- asmdba  = 데이터베이스가 ASM 파일을 읽고 쓰기 위한 권한
+-- asmadmin = 디스크그룹을 만들고 지우는 관리 권한
+--
+-- 그래서 racdb 는 +DATA 를 정상적으로 쓰면서도, oracle 계정으로
+-- asmcmd 관리 명령을 낼 수는 없다. 두 권한의 역할이 다르다.
+
+--------------------------------------------------------------------------------
+ [7] 예상과 다른 결과 — root 로는 된다
+--------------------------------------------------------------------------------
+
+[root@rac1 ~]# id -nG root
+root
+
+-- root 의 그룹은 root 하나뿐이다. asmadmin 이 없다.
+-- [6] 의 규칙대로면 실패해야 한다. 실제로 해 보자.
+
+[root@rac1 ~]# export ORACLE_HOME=/u01/app/19.3.0/grid
+[root@rac1 ~]# export ORACLE_SID=+ASM1
+[root@rac1 ~]# $ORACLE_HOME/bin/asmcmd lsdg
+State    Type    Rebal  Total_MB  Free_MB  Usable_file_MB  Name
+MOUNTED  NORMAL  N         12288    11324            3614  CRS/
+MOUNTED  EXTERN  N         61440    56906           56906  DATA/
+MOUNTED  EXTERN  N         24576    23636           23636  FRA/
+
+-- 성공한다.
+--
+-- 원인 파악 : 실행 파일의 권한을 본다.
+
+[root@rac1 ~]# ls -l /u01/app/19.3.0/grid/bin/oracle
+-rwsr-s--x. 1 grid oinstall 418591368 Aug 31 19:08 /u01/app/19.3.0/grid/bin/oracle
+
+-- 소유자 실행 비트 자리에 x 가 아니라 s 가 있다. setuid 비트다.
+-- 이 바이너리는 누가 실행하든 grid 의 권한으로 동작한다.
+-- uid 0 인 root 는 커널 수준에서 권한 검사를 통과하므로 이 경로를 그대로 탄다.
+-- 반면 oracle 은 일반 계정이라 오라클이 수행하는 그룹 소속 검사에 걸린다.
+--
+-- 조치 : [6] 의 결론을 다듬는다.
+--        정확히는 "일반 계정은 asmadmin 소속이어야 한다" 이고
+--        root 는 그 규칙의 바깥에 있다.
+
+--------------------------------------------------------------------------------
+ [8] 된다고 해서 해도 되는 것은 아니다
+--------------------------------------------------------------------------------
+
+-- root 로 ASM 관리 작업을 하면 두 가지 문제가 생긴다.
+--
+--  1) 감사 추적
+--     ASM 감사 로그에 root 로 남으면 실제로 누가 작업했는지 사후에 알 수 없다.
+--     여러 사람이 root 를 공유하는 환경에서는 추적이 불가능해진다.
+--
+--  2) 파일 소유권
+--     root 로 실행한 명령이 로그나 트레이스 파일을 만들면 그 파일의 소유자가
+--     root 가 된다. 이후 grid 로 돌아와 같은 디렉터리에 쓰려 할 때 권한
+--     오류가 난다.
+--     이 문제는 즉시 드러나지 않는다. 몇 달 뒤 장애가 났을 때 있어야 할
+--     진단 파일이 없는 형태로 나타나 원인을 찾기가 매우 어렵다.
+--
+-- 조치 : 관리 작업은 grid 로 전환해서 한다.
+--
+-- 재확인 : grid 로 전환한 뒤 같은 명령이 정상 동작하는지 확인한다.
+--          [4] 에서 이미 확인했다. 같은 환경 변수, 같은 바이너리인데
+--          계정만 grid 로 바꾸자 lsdg 가 정상 출력되었다.
+--          즉 원인이 계정 하나였음이 확정된다.
+
+--------------------------------------------------------------------------------
+ [9] 현장 대응 순서 정리
+--------------------------------------------------------------------------------
+
+-- "asmcmd 가 안 된다" 는 문의를 받으면 이 순서로 확인한다.
+--
+--  1. whoami            → grid 인가. 대개 oracle 이거나 root 다.
+--  2. echo $ORACLE_HOME → Grid 홈인가. DB 홈의 asmcmd 를 쓰고 있지 않은가.
+--  3. echo $ORACLE_SID  → +ASM1 인가.
+--  4. sqlplus -s / as sysasm 직접 실행 → 더 정확한 메시지를 얻는다.
+--  5. ORA-01017 이면 osdbagrp -a 로 OSASM 그룹 확인 후 id -nG 로 대조.
+--
+-- 가장 흔한 오진 : ASMCMD-8102 만 보고 ASM 인스턴스가 죽은 줄 알아
+--                  crsctl 로 재기동을 시도하는 것.
+--                  원인은 그룹 소속이므로 재기동으로 해소되지 않고,
+--                  멀쩡한 클러스터만 흔들게 된다.
+
+================================================================================
+ 실습 04 종료 — 랩 상태 변경 없음 (조회와 접속 시도만 수행)
+================================================================================

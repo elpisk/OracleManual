@@ -1,0 +1,283 @@
+================================================================================
+ 제9장 실습 03 — asmcmd 명령 체계
+ 대상   : rac1
+ 목표   : asmcmd 가 무엇에 어떻게 접속하는지 확인하고, ls·du·lsof·lsct·lsdsk·
+          iostat 을 목적에 맞게 쓰는 법을 익힌다
+ 소요   : 약 30분
+ 선행   : racdb1 OPEN 상태 (lsof 결과가 의미를 가지려면 필요)
+ 계정   : grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 도움말에 답이 미리 적혀 있다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd -h
+asmcmd
+        Starts asmcmd or executes the command
+
+Synopsis
+        asmcmd [-V] [--nocp] [-v {errors | warnings | normal | info | debug} ]
+               [--privilege {sysasm | sysdba} ] [-p] [--inst <instance_name>]
+               [--discover][<command>]
+
+Description
+        The environment variables ORACLE_HOME and ORACLE_SID determine the
+        instance to which the program connects, and ASMCMD establishes a
+        bequeath connection to it, in the same manner as a SQLPLUS / AS
+        SYSASM.  The user must be a member of the OSASM group.
+
+        If Flex ASM is enabled, the ASMCMD connects to any one of the ASM
+        instances running in the cluster. The connection to ASM instance does
+        not depend on the environment variables ORACLE_HOME and ORACLE_SID.
+   ... 이하 생략
+
+-- 읽어야 할 문장이 셋이다.
+--  1) "in the same manner as a SQLPLUS / AS SYSASM"
+--     → asmcmd 는 리스너를 거치지 않는 bequeath 접속을 맺는다.
+--       실습 04 에서 오류가 났을 때 sqlplus 로 내려가 보는 근거가 이 문장이다.
+--  2) "The user must be a member of the OSASM group."
+--     → 실습 04 의 정답이 여기 미리 적혀 있다.
+--  3) Flex ASM 이면 ORACLE_SID 와 무관하게 아무 ASM 에나 붙는다
+--     → 8장에서 racdb1 이 +ASM2 에 붙었던 것과 같은 메커니즘이다.
+
+--------------------------------------------------------------------------------
+ [2] lsdg — SQL 과 같은 값을 표로
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd lsdg
+State    Type    Rebal  Sector  Logical_Sector  Block       AU  Total_MB  Free_MB  Req_mir_free_MB  Usable_file_MB  Offline_disks  Voting_files  Name
+MOUNTED  NORMAL  N         512             512   4096  4194304     12288    11324             4096            3614              0             Y  CRS/
+MOUNTED  EXTERN  N         512             512   4096  1048576     61440    56916                0           56916              0             N  DATA/
+MOUNTED  EXTERN  N         512             512   4096  1048576     24576    23636                0           23636              0             N  FRA/
+
+-- 실습 01 의 v$asm_diskgroup 조회와 12288·11324·4096·3614 가 정확히 같다.
+-- asmcmd lsdg 는 그 뷰를 조회해 표로 찍어 주는 래퍼다.
+--
+-- SQL 에는 없던 두 열이 있다.
+--   AU           : +CRS 는 4194304 (4MB), DATA·FRA 는 1048576 (1MB)
+--                  +CRS 는 gridSetup 이 설치 중에 만들었고 나머지는 이후에
+--                  사람이 만들어 ASM 기본값 1MB 를 썼다.
+--                  AU 는 생성 후 변경할 수 없다.
+--   Voting_files : +CRS 만 Y. 5장에서 확인한 그대로다.
+
+--------------------------------------------------------------------------------
+ [3] ls — 파일 계층 둘러보기
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd ls +DATA
+RACDB/
+
+[grid@rac1 ~]$ asmcmd ls +DATA/RACDB
+5A566B559A25734BE06365E110AC68E0/
+5A569448ED6C2E8DE06365E110ACB045/
+86B637B62FE07A65E053F706E80A27CA/
+CONTROLFILE/
+DATAFILE/
+ONLINELOG/
+PARAMETERFILE/
+PASSWORD/
+TEMPFILE/
+
+-- 대문자 이름은 파일 종류별 OMF 디렉터리다. 7장에서 본 구조 그대로다.
+-- 32 자리 16 진수 세 개는 PDB 의 GUID 다.
+--
+-- 여기서 함정이 하나 있다. GUID 로 PDB 를 식별하려 하면 어긋난다.
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> col name for a12
+SQL> col guid for a34
+SQL> select con_id, name, open_mode, guid from v$containers order by con_id;
+
+    CON_ID NAME         OPEN_MODE  GUID
+---------- ------------ ---------- ----------------------------------
+         1 CDB$ROOT     READ WRITE 86B637B62FDF7A65E053F706E80A27CA
+         2 PDB$SEED     READ ONLY  5A566B559A25734BE06365E110AC68E0
+         3 RACPDB1      READ WRITE 5A569448ED6C2E8DE06365E110ACB045
+
+3 rows selected.
+
+-- CDB$ROOT 는 86B637B62F**DF**… 인데 ASM 디렉터리는 86B637B62F**E0**… 다.
+-- 끝 두 자리가 다르다. 어느 컨테이너의 것도 아닌 것처럼 보인다.
+-- 파일 단위로 추적한다.
+
+SQL> select con_id, substr(name, instr(name,'RACDB/')+6, 32) dir
+  2    from v$datafile where con_id=2;
+
+    CON_ID DIR
+---------- ----------------------------------
+         2 86B637B62FE07A65E053F706E80A27CA
+         2 86B637B62FE07A65E053F706E80A27CA
+         2 86B637B62FE07A65E053F706E80A27CA
+
+3 rows selected.
+
+SQL> select con_id, substr(name, instr(name,'RACDB/')+6, 32) dir
+  2    from v$tempfile where con_id=2;
+
+    CON_ID DIR
+---------- ----------------------------------
+         2 5A566B559A25734BE06365E110AC68E0
+
+1 row selected.
+
+-- PDB$SEED (CON_ID 2) 한 컨테이너의 파일이 두 디렉터리에 나뉘어 있다.
+--   데이터파일 3 개 → 86B637B62FE0…  (과거 GUID)
+--   템프파일   1 개 → 5A566B55…      (현재 GUID)
+--
+-- 원인 파악 : ASM 디렉터리 이름은 파일이 만들어지던 순간의 GUID 다.
+--             나중에 GUID 가 바뀌어도 이미 만들어진 파일은 옮겨지지 않는다.
+--             데이터파일은 DB 생성 초기에, 템프파일은 GUID 가 바뀐 뒤에
+--             만들어졌다.
+-- 조치     : 디렉터리 이름으로 PDB 를 식별하지 않는다.
+--             V$DATAFILE·V$TEMPFILE 의 CON_ID 로 역추적한다.
+-- 재확인   : 위 두 조회가 그 역추적 자체다. CON_ID 2 로 두 디렉터리가
+--             모두 PDB$SEED 의 것임이 확정되었다.
+
+--------------------------------------------------------------------------------
+ [4] du — 얼마나 쓰고 있나
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd du +DATA/RACDB
+Used_MB      Mirror_used_MB
+   4412                4412
+
+-- 리눅스 du 와 달리 열이 둘이다.
+--   Used_MB        : 중복도를 고려하지 않은 논리 크기
+--   Mirror_used_MB : 미러를 포함한 실제 소비량
+--
+-- +DATA 는 External 이라 미러가 없어 두 값이 같다.
+-- Normal 중복도 디스크그룹에서 같은 명령을 내리면 뒤 값이 정확히 두 배다.
+-- 사용자에게 "얼마나 쓰나" 는 앞 값, 스토리지 소비량은 뒤 값이다.
+
+--------------------------------------------------------------------------------
+ [5] lsof — 지금 열려 있는 파일
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd lsof
+DB_Name  Instance_Name  Path
++ASM     +ASM1          +CRS.255.1242835837
+racdb    racdb1         +DATA/RACDB/5A566B559A25734BE06365E110AC68E0/TEMPFILE/temp.268.1242762013
+racdb    racdb1         +DATA/RACDB/5A569448ED6C2E8DE06365E110ACB045/DATAFILE/sysaux.275.1242762677
+racdb    racdb1         +DATA/RACDB/5A569448ED6C2E8DE06365E110ACB045/DATAFILE/system.274.1242762677
+racdb    racdb1         +DATA/RACDB/5A569448ED6C2E8DE06365E110ACB045/DATAFILE/undo_2.277.1242762729
+racdb    racdb1         +DATA/RACDB/86B637B62FE07A65E053F706E80A27CA/DATAFILE/system.265.1242761983
+racdb    racdb1         +DATA/RACDB/CONTROLFILE/current.261.1242761745
+racdb    racdb1         +DATA/RACDB/DATAFILE/system.257.1242761643
+racdb    racdb1         +DATA/RACDB/DATAFILE/undotbs1.259.1242761683
+racdb    racdb1         +DATA/RACDB/DATAFILE/undotbs2.269.1242762281
+racdb    racdb1         +DATA/RACDB/ONLINELOG/group_1.262.1242761749
+racdb    racdb1         +FRA/RACDB/CONTROLFILE/current.256.1242761745
+racdb    racdb1         +FRA/RACDB/ONLINELOG/group_1.258.1242761759
+   ... 전체 27 행
+
+-- 관찰 포인트 넷.
+--  1) racdb1 만 보인다. racdb2 가 여는 파일은 +ASM2 쪽 lsof 에 나온다.
+--     실습 02 의 V$ASM_CLIENT 와 같은 구조다.
+--  2) undotbs1 과 undotbs2 가 둘 다 racdb1 에 열려 있다.
+--     RAC 에서 각 인스턴스는 자기 UNDO 에만 쓰지만, 일관성 읽기를 위해
+--     다른 인스턴스의 UNDO 를 읽어야 해서 파일 자체는 열어 둔다.
+--  3) 리두로그가 +DATA 와 +FRA 양쪽에 있다. 다중화 구조가 여기서도 보인다.
+--  4) +ASM1 이 여는 +CRS.255.1242835837 은 디렉터리 경로가 없다.
+--     ASM 자신의 SPFILE 로, 별칭이 붙기 전 형태로 열려 있다.
+
+--------------------------------------------------------------------------------
+ [6] lsct — 클라이언트를 CLI 로
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd lsct DATA
+DB_Name  Status     Software_Version  Compatible_version  Instance_Name  Disk_Group
++ASM     CONNECTED        19.0.0.0.0          19.0.0.0.0  +ASM1          DATA
+racdb    CONNECTED        19.0.0.0.0          19.0.0.0.0  racdb1         DATA
+
+-- V$ASM_CLIENT 를 CLI 로 본 것이다. 디스크그룹 이름을 인자로 준다.
+-- Compatible_version 은 클라이언트가 선언한 호환 버전이다.
+-- 이 값이 디스크그룹의 compatible.rdbms 보다 낮으면 접속이 거부된다.
+-- 5장에서 +CRS 의 compatible.rdbms 를 11.2 로 올릴 때 확인한 제약과 맞물린다.
+
+--------------------------------------------------------------------------------
+ [7] lsdsk — 옵션 이름에 속지 않기
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd lsdsk --candidate -k
+Total_MB  Free_MB  OS_MB  Name  Failgroup  ...  Redund   Path
+       0        0   4096                       UNKNOWN  /dev/asmdisk/test1
+       0        0   4096                       UNKNOWN  /dev/asmdisk/test2
+       0        0   4096                       UNKNOWN  /dev/asmdisk/test3
+       0        0   4096                       UNKNOWN  /dev/asmdisk/test4
+       0        0   4096                       UNKNOWN  /dev/asmdisk/test5
+       0        0   4096                       UNKNOWN  /dev/asmdisk/test6
+
+-- 조용한 함정 : 옵션 이름은 --candidate 인데 이 디스크들은 모두 FORMER 다.
+--               (실습 01 의 header_status 확인 결과)
+--
+-- 원인 파악 : 이 옵션의 실제 의미는 "HEADER_STATUS 가 CANDIDATE 인 것" 이
+--             아니라 "디스크그룹에 속하지 않은 디스크" 다.
+--             그래서 FORMER 도 함께 나온다.
+-- 조치     : 정확히 CANDIDATE 만 걸러 내려면 SQL 을 쓴다.
+-- 재확인   : 아래 조회로 확인한다.
+
+[grid@rac1 ~]$ sqlplus -s / as sysasm
+
+SQL> col path for a24
+SQL> select path from v$asm_disk where header_status='CANDIDATE';
+
+no rows selected
+
+SQL> exit
+
+-- 0 행이다. lsdsk --candidate 는 6 장을 보여 줬는데 실제 CANDIDATE 는
+-- 하나도 없다. test 디스크는 6~8장에서 이미 사용된 이력이 있어 모두
+-- FORMER 이기 때문이다.
+--
+-- 교훈 : 도구의 옵션 이름을 문서처럼 믿지 않는다. 실제 출력으로 확인한다.
+
+--------------------------------------------------------------------------------
+ [8] iostat — 균형을 본다
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd iostat -G DATA -t
+Group_Name  Dsk_Name   Reads      Writes    Read_Time   Write_Time
+DATA        DATA_0000  107812352  17897472  109.797937  9.172841
+DATA        DATA_0001  129977856  24286208  155.800055  11.726549
+DATA        DATA_0002  108091904  15201280  148.154092  8.721365
+
+-- 읽는 방법이 중요하다. 이 숫자는 ASM 인스턴스 기동 이후의 누적이라
+-- 절대값 자체는 의미가 적다. 봐야 할 것은 디스크 간 균형이다.
+--
+-- 읽기량   : 107.8M · 130.0M · 108.1M  → 대체로 고르다
+-- 읽기시간 : 109.8  · 155.8  · 148.2   → 순서가 어긋난다
+--
+-- DATA_0002 는 DATA_0000 보다 적게 읽었는데 시간은 더 걸렸다.
+-- 이 랩에서는 세 디스크가 같은 물리 스토리지 위의 가상 디스크라
+-- 호스트 쪽 경합이 그대로 반영된 결과다.
+--
+-- 실제 스토리지에서 이런 어긋남이 보이면 그 디스크만 경로나 장비가
+-- 다른지 의심해야 한다. 멀티패스 누락, 장비 세대 차이가 흔한 원인이다.
+--
+-- 현재 부하를 보려면 간격을 준다 (Ctrl+C 로 중단) :
+--   asmcmd iostat -G DATA -t 5
+
+--------------------------------------------------------------------------------
+ [9] spget / dsget — 구성값 확인
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ asmcmd spget
++CRS/rac-cluster/ASMPARAMETERFILE/registry.253.1242760241
+
+[grid@rac1 ~]$ asmcmd dsget
+parameter:/dev/asmdisk/*
+profile:/dev/asmdisk/*
+
+-- spget : ASM SPFILE 의 위치. +CRS 안에 있고 경로에 클러스터명이 들어간다.
+-- dsget : 디스크 검색 문자열.
+--           parameter = 현재 인스턴스의 asm_diskstring 값
+--           profile   = GPnP 프로파일에 기록된 값
+--
+-- 두 값이 다르면 문제다. 인스턴스는 A 경로를 보는데 다음 기동 때
+-- GPnP 가 B 경로를 주면 디스크를 못 찾는다. 여기서는 일치한다.
+
+================================================================================
+ 실습 03 종료 — 랩 상태 변경 없음 (조회만 수행)
+================================================================================

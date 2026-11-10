@@ -1,0 +1,194 @@
+================================================================================
+ 제15장 실습 09 — 서비스 속성 바꾸기, 바로 반영되는 것과 정의만 바뀌는 것
+ 대상   : rac1
+ 목표   : srvctl modify service 로 부하 분산 목표, 선호·가용, 관리 정책,
+          드레인 값을 바꾼다. 도는 서비스에 바로 반영되는 속성과 정의만
+          바뀌는 속성을 가른다. 관리자 관리형 서비스 뒤의 서버 풀을 본다
+ 소요   : 약 25분
+ 선행   : 실습 08 완료 (ch15_pdb · ch15_root 가 racdb1 에서 실행 중)
+ 계정   : oracle, grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 지금 값
+--------------------------------------------------------------------------------
+
+[rac1] SQL> select inst_id, name, goal, clb_goal, aq_ha_notification aq
+              from gv$active_services where name like 'ch15%' order by 1,2;
+
+   INST_ID NAME       GOAL         CLB_GOAL AQ
+---------- ---------- ------------ -------- ---
+         1 ch15_pdb   NONE         LONG     NO
+         1 ch15_root  NONE         LONG     NO
+
+-- GOAL 이 실행 중 부하 분산 목표(-rlbgoal), CLB_GOAL 이 연결 부하 분산 목표(-clbgoal)다.
+-- 둘 다 만들 때 준 적이 없으니 기본값 NONE · LONG 이다.
+
+--------------------------------------------------------------------------------
+ [2] 부하 분산 목표 — 도는 서비스에 바로 들어간다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl modify service -db racdb -service ch15_pdb -clbgoal SHORT -rlbgoal SERVICE_TIME
+>>> 4.5초
+
+[oracle@rac1 ~]$ srvctl config service -db racdb -service ch15_pdb | egrep 'Goal|AQ HA'
+AQ HA notifications: false
+Connection Load Balancing Goal: SHORT
+Runtime Load Balancing Goal: SERVICE_TIME
+
+[rac1] SQL> select inst_id, name, goal, clb_goal, aq_ha_notification aq
+              from gv$active_services where name like 'ch15%' order by 1,2;
+
+   INST_ID NAME       GOAL         CLB_GOAL AQ
+---------- ---------- ------------ -------- ---
+         1 ch15_pdb   SERVICE_TIME SHORT    NO
+         1 ch15_root  NONE         LONG     NO
+
+-- 서비스를 멈췄다 올리지 않았는데 인스턴스의 값이 바뀌었다.
+-- srvctl 이 Clusterware 의 정의를 고치고, 도는 인스턴스에도 같은 값을 넣는다.
+-- 이 두 목표는 리스너와 부하 분산 권고(16장)가 다음 접속부터 쓰는 값이라 재기동이 필요 없다.
+
+[oracle@rac1 ~]$ srvctl modify service -db racdb -service ch15_pdb -clbgoal MEDIUM
+PRKO-3125 : Invalid value MEDIUM for command line option clbgoal
+
+-- 원인 파악 : -clbgoal 은 LONG · SHORT 둘뿐이다. -rlbgoal 은 NONE · SERVICE_TIME · THROUGHPUT.
+--             PRKO 접두어는 srvctl 이 명령행을 검사하다 낸 오류다. Clusterware 까지 가지 않았다.
+-- 조치     : 값을 고친다.
+
+[oracle@rac1 ~]$ srvctl modify service -db racdb -service ch15_pdb -rlbgoal NONE -clbgoal LONG
+>>> 3.4초
+
+-- 원래 값으로 되돌렸다. GV$ACTIVE_SERVICES 도 NONE · LONG 으로 돌아왔다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — 선호·가용을 바꾸려면
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl modify service -db racdb -service ch15_root -preferred racdb2 -available racdb1
+PRKO-3145 : Option '-preferred' requires '-modifyconfig' option to be specified
+
+-- 원인 파악 : 선호·가용 목록을 통째로 바꾸는 것은 -modifyconfig 와 함께만 된다.
+--             정의를 갈아엎는 명령이라는 것을 명시하게 한다.
+-- 조치     : -modifyconfig 를 붙인다.
+
+[oracle@rac1 ~]$ srvctl modify service -db racdb -service ch15_root -modifyconfig \
+                   -preferred racdb2 -available racdb1
+>>> 4.2초
+
+[oracle@rac1 ~]$ srvctl config service -db racdb -service ch15_root | egrep 'Preferred|Available'
+Preferred instances: racdb2
+Available instances: racdb1
+
+[oracle@rac1 ~]$ srvctl status service -db racdb -service ch15_root
+Service ch15_root is running on instance(s) racdb1
+
+-- 정의는 선호 racdb2 로 바뀌었는데 서비스는 racdb1 에 그대로 있다.
+-- racdb1 은 이제 가용 인스턴스다. 서비스가 가용 쪽에서 도는 상태라 실습 05 에서 본
+-- "무슨 일이 있었다" 는 상태와 겉모습이 같다.
+-- 선호·가용 변경은 정의만 바꾼다. 서비스를 옮기려면 relocate 를 따로 한다([7]).
+
+--------------------------------------------------------------------------------
+ [4] 흔한 오류 — 선호와 가용이 겹치면
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl modify service -db racdb -service ch15_root -modifyconfig \
+                   -preferred racdb1,racdb2 -available racdb2
+PRCD-1113 : Failed to modify service ch15_root
+PRCS-1011 : Failed to modify server pool racdb_ch15_root
+PRCR-1071 : Failed to register or update server pool ora.racdb_ch15_root
+CRS-2714: 'rac2' is specified multiple times in 'SERVER_NAMES' of 'ora.racdb_ch15_root'
+
+-- 원인 파악 : racdb2 를 선호와 가용에 함께 넣었다. 두 목록은 겹칠 수 없다.
+--             오류가 srvctl(PRKO)이 아니라 Clusterware(CRS-2714)에서 났다. 메시지에
+--             서버 풀 ora.racdb_ch15_root 와 그 SERVER_NAMES 속성이 나온다.
+--             관리자 관리형 DB 에도 서비스마다 숨은 서버 풀이 있다는 뜻이다([5]).
+-- 조치     : 한 인스턴스는 선호나 가용 중 한 곳에만 둔다.
+-- 재확인   : config 는 [3] 의 값 그대로다. 실패한 modify 는 아무것도 바꾸지 않았다.
+
+--------------------------------------------------------------------------------
+ [5] 관리자 관리형 서비스 뒤의 서버 풀
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ crsctl stat serverpool -p | egrep '^NAME=ora.racdb|^SERVER_NAMES'
+NAME=ora.racdb
+SERVER_NAMES=rac1 rac2
+NAME=ora.racdb_ch15_pdb
+SERVER_NAMES=rac1 rac2
+NAME=ora.racdb_ch15_root
+SERVER_NAMES=rac2 rac1
+
+[grid@rac1 ~]$ crsctl stat res ora.racdb.ch15_root.svc -p \
+               | egrep '^(SERVER_POOLS|PLACEMENT|CARDINALITY|AUTO_START|START_DEPENDENCIES)='
+AUTO_START=restore
+CARDINALITY=1
+PLACEMENT=restricted
+SERVER_POOLS=ora.racdb_ch15_root
+START_DEPENDENCIES=hard(ora.racdb.db,type:ora.cluster_vip_net1.type) weak(type:ora.listener.type) pullup(type:ora.cluster_vip_net1.type) pullup:always(ora.racdb.db)
+
+-- 데이터베이스용 풀 ora.racdb 와 서비스마다 ora.racdb_<서비스> 풀이 있다.
+-- ch15_root 의 풀은 rac2 가 앞에 있다. [3] 에서 선호를 racdb2 로 바꾼 결과다.
+-- 서비스 자원은 PLACEMENT=restricted 로 자기 풀 안의 서버에만 놓인다.
+-- CARDINALITY=1 은 선호 인스턴스 수다.
+-- srvctl 의 선호·가용은 결국 이 서버 풀과 배치 속성으로 바뀌어 저장된다.
+-- 이 풀은 srvctl 이 관리한다. crsctl 로 직접 고치지 않는다.
+--
+-- START_DEPENDENCIES 에 pullup:always(ora.racdb.db) 가 있다. 데이터베이스가 올라오면
+-- 서비스도 끌려 올라온다. AUTO_START=restore 는 마지막 상태로 되돌린다는 뜻이다.
+
+--------------------------------------------------------------------------------
+ [6] 관리 정책 · 복귀 · 드레인 값을 서비스에 저장
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl modify service -db racdb -service ch15_root -policy MANUAL \
+                   -failback YES -drain_timeout 30 -stopoption TRANSACTIONAL
+>>> 1.6초
+
+[oracle@rac1 ~]$ srvctl config service -db racdb -service ch15_root \
+                   | egrep 'Management|Failback|Drain|Stop option'
+Management policy: MANUAL
+Failback :  true
+Drain timeout: 30 seconds
+Stop option: transactional
+
+[grid@rac1 ~]$ crsctl stat res ora.racdb.ch15_root.svc -p | egrep '^(AUTO_START|DRAIN_TIMEOUT|STOP_OPTION)='
+AUTO_START=never
+DRAIN_TIMEOUT=30
+STOP_OPTION=transactional
+
+-- MANUAL 은 AUTO_START=never 가 된다. 14장 실습 08 에서 데이터베이스 자원의 정책을
+-- 바꿨을 때와 같은 대응이다. 데이터베이스를 srvctl 로 올려도 이 서비스는 따라 뜨지 않는다.
+-- 드레인 값 둘은 서비스 자원 속성으로 그대로 들어갔다. 실습 10 에서 이 값으로 정지해 본다.
+-- -failback 은 19.3 부터 있는 옵션이다. 가용 인스턴스로 갔던 서비스가 선호 인스턴스가
+-- 돌아오면 되돌아간다. 확인하려면 인스턴스 장애가 필요해 이 실습에서는 설정만 본다.
+
+[oracle@rac1 ~]$ srvctl modify service -db racdb -service ch15_root -stopoption NORMAL
+PRCD-1067 : Invalid stop option NORMAL
+
+-- 원인 파악 : 정지 옵션은 NONE · IMMEDIATE · TRANSACTIONAL 셋이다.
+--             NORMAL 은 인스턴스 shutdown 의 모드다. 이름이 비슷해 섞어 쓰기 쉽다.
+--             [2] 의 MEDIUM 은 PRKO 였는데 이번에는 PRCD(데이터베이스 계층) 오류다.
+--             같은 "잘못된 값" 이라도 옵션마다 거르는 계층이 다르다.
+-- 조치     : 셋 가운데 하나를 쓴다. 값의 의미는 실습 10 에서 실측한다.
+
+--------------------------------------------------------------------------------
+ [7] 현실을 정의에 맞춘다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl relocate service -db racdb -service ch15_root -oldinst racdb1 -newinst racdb2
+>>> 1.1초
+
+[oracle@rac1 ~]$ srvctl status service -db racdb
+Service ch15_pdb is running on instance(s) racdb1
+Service ch15_root is running on instance(s) racdb2
+
+-- 이제 ch15_root 는 선호 인스턴스 racdb2 에서 돈다. 정의와 현실이 같다.
+--
+-- 바로 반영되는 속성과 정의만 바뀌는 속성을 정리하면 이렇다.
+--   바로 반영  : -clbgoal · -rlbgoal (GV$ACTIVE_SERVICES 에 즉시)
+--   정의만     : -preferred · -available (relocate 나 재기동 때 반영)
+--   다음 동작 때: -policy (다음 DB 기동) · -drain_timeout · -stopoption (다음 정지·이동)
+
+================================================================================
+ 실습 09 종료 — ch15_pdb 는 racdb1, ch15_root 는 racdb2 (정책 MANUAL,
+               드레인 30초 · TRANSACTIONAL 저장). 실습 10 에서 계속 쓴다
+================================================================================

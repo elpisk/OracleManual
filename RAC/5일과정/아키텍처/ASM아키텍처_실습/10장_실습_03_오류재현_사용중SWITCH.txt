@@ -1,0 +1,251 @@
+================================================================================
+ 제10장 실습 03 — 오류 재현 : 사용 중인 파일을 SWITCH 하면
+ 대상   : rac1
+ 목표   : SWITCH 가 OFFLINE 을 요구하는 것을 재현하고, 순서를 어겼을 때 생기는
+          SCN 불일치와 그 복구를 확인한다
+ 소요   : 약 25분
+ 선행   : 실습 02 완료 (file 23 이 +DATA 에 ONLINE)
+ 계정   : oracle
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] +FRA 로 사본 만들기 — 여기까지는 실습 02 와 같다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+
+SQL> alter tablespace ts_mig offline;
+
+Tablespace altered.
+
+[oracle@rac1 ~]$ rman target /
+
+RMAN> backup as copy datafile 23 format '+FRA';
+
+Starting backup at 03-SEP-26
+channel ORA_DISK_1: starting datafile copy
+input datafile file number=00023 name=+DATA/RACDB/DATAFILE/ts_mig.279.1243020779
+output file name=+FRA/RACDB/DATAFILE/ts_mig.262.1243020835
+   tag=TAG20260903T193355 RECID=6 STAMP=1243020835
+channel ORA_DISK_1: datafile copy complete, elapsed time: 00:00:01
+Finished backup at 03-SEP-26
+
+Starting Control File and SPFILE Autobackup at 03-SEP-26
+piece handle=+FRA/RACDB/AUTOBACKUP/2026_09_03/s_1243020836.263.1243020837
+Finished Control File and SPFILE Autobackup at 03-SEP-26
+                                                               (4.3초 소요)
+
+-- 4.3 초다. 실습 02 의 7.0 초보다 빨라졌다.
+-- 원본이 이미 ASM 에 있어 읽기 경로가 짧아졌기 때문이다.
+--
+-- RMAN 입장에서 원본이 파일 시스템인지 ASM 인지는 중요하지 않다.
+-- 같은 명령으로 처리된다.
+
+--------------------------------------------------------------------------------
+ [2] 실수를 해 본다 — 사본이 있으니 됐다고 생각하고 ONLINE
+--------------------------------------------------------------------------------
+
+SQL> alter tablespace ts_mig online;
+
+Tablespace altered.
+
+SQL> select file#, status from v$datafile where file#=23;
+
+     FILE# STATUS
+---------- -------
+        23 ONLINE
+
+1 row selected.
+
+-- 사본은 만들었으니 SWITCH 만 남았다고 생각하기 쉽다.
+-- 그동안 테이블스페이스를 쓸 수 있게 올려 두자는 판단도 자연스럽다.
+-- 실제로 해 보자.
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 — ONLINE 상태에서 SWITCH
+--------------------------------------------------------------------------------
+
+RMAN> switch datafile 23 to copy;
+
+using target database control file instead of recovery catalog
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of switch to copy command at 09/03/2026 19:34:01
+RMAN-06572: database is open and datafile 23 is not offline
+
+-- 오류 : RMAN-06572
+--
+-- 원인 파악 : 메시지가 조건을 그대로 말해 준다.
+--             "데이터베이스가 열려 있는데 데이터파일 23 이 오프라인이 아니다"
+--
+--             실습 02 의 ORA-19602 와 요구 조건이 겹쳐 헷갈리기 쉬우므로
+--             정리해 둔다.
+--
+--             단계    명령                요구 조건
+--             ----   ------------------  --------------------------------
+--             복사    BACKUP AS COPY      NOARCHIVELOG 면 OFFLINE 필요
+--                                         (ARCHIVELOG 면 ONLINE 가능)
+--             전환    SWITCH ... TO COPY  DB 가 OPEN 이면 항상 OFFLINE 필요
+--                                         (아카이브 모드와 무관)
+--
+--             즉 SWITCH 의 OFFLINE 요구는 아카이브 모드와 상관없다.
+--             ARCHIVELOG 라도 SWITCH 순간에는 파일이 오프라인이어야 한다.
+--
+--             이유는 두 작업의 성격이 다르기 때문이다.
+--             복사는 파일을 읽는 작업이라 일관된 시점만 확보되면 된다.
+--             SWITCH 는 그 파일에 대한 데이터베이스의 인식을 통째로 바꾸는
+--             작업이라 누구도 쓰고 있지 않아야 한다.
+-- 조치     : 다시 OFFLINE 으로 내리고 SWITCH 한다.
+-- 재확인   : [4] 에서 수행한다.
+
+--------------------------------------------------------------------------------
+ [4] OFFLINE 후 SWITCH — 그런데 이번엔 다른 문제가
+--------------------------------------------------------------------------------
+
+SQL> alter tablespace ts_mig offline;
+
+Tablespace altered.
+
+RMAN> switch datafile 23 to copy;
+
+datafile 23 switched to datafile copy "+FRA/RACDB/DATAFILE/ts_mig.262.1243020835"
+                                                               (2.2초 소요)
+
+-- SWITCH 는 성공했다. 이제 ONLINE 으로 올리면 될 것 같다.
+
+SQL> alter tablespace ts_mig online;
+alter tablespace ts_mig online
+*
+ERROR at line 1:
+ORA-01113: file 23 needs media recovery
+ORA-01110: data file 23: '+FRA/RACDB/DATAFILE/ts_mig.262.1243020835'
+
+-- 오류 : ORA-01113
+--
+-- 실습 02 에서는 복구 없이 바로 ONLINE 이 되었다. 무엇이 달라졌는가.
+
+--------------------------------------------------------------------------------
+ [5] 원인 파악 — SCN 을 비교한다
+--------------------------------------------------------------------------------
+
+SQL> col name for a48
+SQL> select file#, checkpoint_change# ckp_scn, name from v$datafile where file#=23;
+
+     FILE#    CKP_SCN NAME
+---------- ---------- ------------------------------------------------
+        23    3993926 +FRA/RACDB/DATAFILE/ts_mig.262.1243020835
+
+1 row selected.
+
+SQL> select current_scn from v$database;
+
+CURRENT_SCN
+-----------
+    3994002
+
+1 row selected.
+
+-- 원인 파악 : 사본의 체크포인트 SCN 은 3993926 인데
+--             데이터베이스의 현재 SCN 은 3994002 다. 76 만큼 벌어져 있다.
+--
+--             원인은 [2] 의 실수다. 사본을 만든 뒤 SWITCH 전에
+--             테이블스페이스를 ONLINE 으로 올렸고, 그 사이에 데이터베이스가
+--             앞으로 나아갔다. 사본은 그 이전 시점의 것이라 뒤처졌다.
+--
+--             뒤처진 파일을 그대로 열면 데이터가 어긋나므로 오라클이 막는다.
+
+SQL> select count(*) from sys.mig_t;
+select count(*) from sys.mig_t
+*
+ERROR at line 1:
+ORA-00376: file 23 cannot be read at this time
+ORA-01110: data file 23: '+FRA/RACDB/DATAFILE/ts_mig.262.1243020835'
+
+-- 읽기도 안 된다. ORA-00376 은 OFFLINE 상태인 파일에 접근할 때 나온다.
+-- ONLINE 이 실패했으니 파일은 여전히 OFFLINE 이다.
+
+--------------------------------------------------------------------------------
+ [6] 조치 — RECOVER DATAFILE
+--------------------------------------------------------------------------------
+
+RMAN> recover datafile 23;
+
+Starting recover at 03-SEP-26
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=283 instance=racdb1 device type=DISK
+starting media recovery
+media recovery complete, elapsed time: 00:00:02
+Finished recover at 03-SEP-26
+                                                               (4.1초 소요)
+
+SQL> alter tablespace ts_mig online;
+
+Tablespace altered.
+
+SQL> col name for a54
+SQL> select file#, name, status from v$datafile where file#=23;
+
+     FILE# NAME                                          STATUS
+---------- --------------------------------------------- -------
+        23 +FRA/RACDB/DATAFILE/ts_mig.262.1243020835     ONLINE
+
+1 row selected.
+
+SQL> select count(*) from sys.mig_t;
+
+  COUNT(*)
+----------
+     20000
+
+1 row selected.
+
+-- 재확인 : 복구 2 초, 전체 4.1 초로 끝났고 데이터도 온전하다.
+--          벌어진 76 만큼의 리두가 적용되어 사본이 현재 시점을 따라잡았다.
+
+--------------------------------------------------------------------------------
+ [7] 반드시 짚어야 할 질문 — NOARCHIVELOG 인데 왜 됐는가
+--------------------------------------------------------------------------------
+
+-- 아카이브 로그가 없는데 미디어 복구가 어떻게 성공했는가.
+--
+-- 미디어 복구는 아카이브 로그에서만 리두를 읽는 것이 아니다.
+-- 필요한 리두가 아직 온라인 리두로그에 남아 있으면 거기서 읽어 적용한다.
+-- 벌어진 SCN 이 76 뿐이라 그 사이의 변경이 아직 덮어써지지 않았다.
+--
+-- 그러나 이것은 보장되지 않는다.
+-- 온라인 리두로그는 순환한다. 로그 스위치가 여러 번 일어나 필요한 리두가
+-- 밀려나면 복구할 방법이 없고, 그 데이터파일은 되살릴 수 없다.
+--
+-- NOARCHIVELOG 에서 마이그레이션이 위험한 진짜 이유가 이것이다.
+-- 실패했을 때 되돌릴 수 있느냐가 시간에 달려 있다.
+--
+-- 예방은 간단하다.
+--   복사부터 SWITCH 까지 OFFLINE 을 유지하면 SCN 이 벌어지지 않는다.
+--   실습 06 에서 이 방식을 써서 복구가 0 초로 끝나는 것을 확인한다.
+
+--------------------------------------------------------------------------------
+ [8] rac2 확인 — 디스크그룹이 바뀌어도 문제없다
+--------------------------------------------------------------------------------
+
+[oracle@rac2 ~]$ sqlplus -s / as sysdba
+
+SQL> select count(*) from sys.mig_t;
+
+  COUNT(*)
+----------
+     20000
+
+1 row selected.
+
+-- +DATA 에서 +FRA 로 옮겼지만 rac2 는 계속 정상이다.
+-- 둘 다 공유 스토리지 위의 디스크그룹이기 때문이다.
+--
+-- 디스크그룹 간 이동은 RAC 관점에서 아무 차이를 만들지 않는다.
+-- 차이를 만드는 것은 공유냐 아니냐다.
+
+SQL> exit
+
+================================================================================
+ 실습 03 종료 — ts_mig 가 +FRA 에 있는 상태로 실습 04 에 인계
+================================================================================

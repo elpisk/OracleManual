@@ -1,0 +1,259 @@
+================================================================================
+ 제15장 실습 12 — 서비스로 보는 성능, 그리고 정리
+ 대상   : rac1, rac2
+ 목표   : 서비스 · 모듈 · 액션 단위로 통계를 모으고, 서비스를 옮긴 뒤 통계가
+          어디에 쌓이는지 본다. 병렬 쿼리가 서비스의 인스턴스 안에서만 도는지
+          확인한다. 실습 08~12 에서 만든 것을 모두 지워 기준선으로 돌아간다
+ 소요   : 약 30분
+ 선행   : 실습 11 완료
+ 계정   : oracle, grid
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 모듈 · 액션 단위 집계를 켠다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl start service -db racdb -service ch15_root
+[oracle@rac1 ~]$ srvctl status service -db racdb
+Service ch15_pdb is running on instance(s) racdb1
+Service ch15_root is running on instance(s) racdb2
+
+[rac1] SQL> alter session set container=racpdb1;
+[rac1] SQL> exec dbms_monitor.serv_mod_act_stat_enable(service_name=>'ch15_pdb', -
+                 module_name=>'ORDER', action_name=>'PAY')
+[rac1] SQL> select aggregation_type, primary_id, qualifier_id1, qualifier_id2
+              from dba_enabled_aggregations;
+
+AGGREGATION_TYPE       PRIMARY_ID QUALIFIE QUALIFIE
+---------------------- ---------- -------- --------
+SERVICE_MODULE_ACTION  ch15_pdb   ORDER    PAY
+
+-- 서비스 단위 통계는 늘 쌓인다. 그 안을 모듈 · 액션으로 쪼개 보려면 이렇게 켠다.
+-- 애플리케이션이 DBMS_APPLICATION_INFO.SET_MODULE 로 모듈 · 액션 이름을 달아야 쓸모가 있다.
+
+--------------------------------------------------------------------------------
+ [2] 부하를 준다
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ cat /tmp/wl15.sh               (요지)
+#!/bin/bash
+# wl15.sh <서비스> <모듈> <액션> <반복>
+sqlplus -s system/<비밀번호>@rac-scan:1521/$1 <<E
+exec dbms_application_info.set_module('$2','$3')
+declare n number; begin for i in 1..$4 loop
+  select count(*) into n from dba_objects o, (select level l from dual connect by level<=3);
+end loop; end;
+/
+E
+
+[oracle@rac1 ~]$ for i in 1 2 3; do /tmp/wl15.sh ch15_pdb ORDER PAY 20 & done
+[oracle@rac1 ~]$ for i in 1 2; do /tmp/wl15.sh ch15_pdb ORDER LIST 20 & done
+[oracle@rac1 ~]$ /tmp/wl15.sh ch15_root BATCH NIGHT 10 & wait
+>>> 6.1초
+
+-- ch15_pdb 로 다섯 세션(PAY 셋, LIST 둘), ch15_root 로 한 세션이 동시에 돌았다.
+
+--------------------------------------------------------------------------------
+ [3] 서비스별 통계
+--------------------------------------------------------------------------------
+
+[rac1] SQL> select inst_id, service_name, stat_name, round(value/1e6,1) sec
+              from gv$service_stats
+             where service_name like 'ch15%' and stat_name in ('DB time','DB CPU')
+             order by 1,2,3;
+
+   INST_ID SERVICE_NA STAT_NAME             SEC
+---------- ---------- -------------- ----------
+         1 ch15_pdb   DB CPU                4.3
+         1 ch15_pdb   DB time              28.9
+         1 ch15_root  DB CPU                  0
+         1 ch15_root  DB time                .2
+         2 ch15_root  DB CPU                3.1
+         2 ch15_root  DB time               6.6
+
+[rac1] SQL> select inst_id, service_name, value calls from gv$service_stats
+             where service_name like 'ch15%' and stat_name='user calls' order by 1,2;
+
+   INST_ID SERVICE_NA      CALLS
+---------- ---------- ----------
+         1 ch15_pdb          145
+         1 ch15_root          14
+         2 ch15_root         197
+
+-- 6 초 동안 다섯 세션이 돌았는데 ch15_pdb 의 DB time 이 28.9 초다. DB time 은 세션들의
+-- 시간을 더한 값이라 벽시계 시간보다 크다. 그 가운데 CPU 는 4.3 초뿐이다.
+-- 나머지는 대기다. 어떤 대기인지는 GV$SERVICE_EVENT 로 이어서 본다.
+-- inst 1 의 ch15_root 행은 실습 08~09 에서 이 서비스가 racdb1 에서 돌 때 쌓인 것이다.
+-- 서비스 통계는 인스턴스마다 기동 이후 누적된다. 서비스를 옮겨도 옛 인스턴스의 값은 남는다.
+
+--------------------------------------------------------------------------------
+ [4] 모듈 · 액션 단위
+--------------------------------------------------------------------------------
+
+[rac1] SQL> select inst_id, service_name, module, action, round(value/1e6,1) sec
+              from gv$serv_mod_act_stats where stat_name='DB time' order by 1,2,3,4;
+
+   INST_ID SERVICE_NA MODULE   ACTION        SEC
+---------- ---------- -------- ------ ----------
+         1 ch15_pdb   ORDER    PAY            17
+         2 ch15_pdb   ORDER    PAY             0
+
+-- 켠 조합(ORDER · PAY)만 나온다. 같은 서비스의 ORDER · LIST 는 없다.
+-- 28.9 초 가운데 PAY 세 세션이 17 초를 썼다.
+-- ch15_pdb 가 한 번도 돈 적 없는 inst 2 에도 0 인 행이 있다. 집계 설정은 데이터베이스
+-- 전체에 걸리고 모든 인스턴스가 따른다. 문서는 이 설정이 인스턴스 재시작과
+-- 서비스 relocate 뒤에도 유지된다고 한다.
+
+--------------------------------------------------------------------------------
+ [5] 서비스를 옮긴 뒤 같은 부하
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl relocate service -db racdb -service ch15_pdb -oldinst racdb1 -newinst racdb2
+[oracle@rac1 ~]$ for i in 1 2 3; do /tmp/wl15.sh ch15_pdb ORDER PAY 20 & done; wait
+
+[rac1] SQL> select inst_id, service_name, module, action, round(value/1e6,1) dbtime_s
+              from gv$serv_mod_act_stats where stat_name='DB time' order by 1;
+
+   INST_ID SERVICE_NA MODULE   ACTION   DBTIME_S
+---------- ---------- -------- ------ ----------
+         1 ch15_pdb   ORDER    PAY            17
+         2 ch15_pdb   ORDER    PAY           4.8
+
+[rac1] SQL> select inst_id, service_name, value calls from gv$service_stats
+             where service_name='ch15_pdb' and stat_name='user calls' order by 1;
+
+   INST_ID SERVICE_NA      CALLS
+---------- ---------- ----------
+         1 ch15_pdb          145
+         2 ch15_pdb           45
+
+-- 옮긴 뒤의 부하는 inst 2 에 쌓였다. 집계 설정을 다시 켜지 않아도 이어서 모였다.
+-- 서비스 하나의 총량을 보려면 GV$ 를 인스턴스 구분 없이 더해야 한다.
+-- 같은 PAY 부하인데 racdb1 에서 17 초, racdb2 에서 4.8 초다. racdb1 때는 LIST 둘과
+-- 다른 서비스 부하가 함께 돌았다. 조건이 다르면 이 숫자로 인스턴스를 비교하지 않는다.
+
+[rac1] SQL> select inst_id, service_name, to_char(begin_time,'hh24:mi:ss') b,
+                   to_char(end_time,'hh24:mi:ss') e,
+                   round(elapsedpercall/1000,1) ms_per_call, round(callspersec,2) callspersec
+              from gv$servicemetric where service_name like 'ch15%' and group_id=6 order by 1,2;
+
+   INST_ID SERVICE_NA B        E        MS_PER_CALL CALLSPERSEC
+---------- ---------- -------- -------- ----------- -----------
+         1 ch15_pdb   09:51:13 09:52:12       320.8        1.50
+         1 ch15_root  09:51:08 09:52:08           0        0.00
+         2 ch15_root  09:51:21 09:52:20         233        0.25
+
+-- GV$SERVICEMETRIC 은 60 초 구간의 값이다. [2] 의 부하가 들어간 구간이 보인다.
+-- [5] 의 부하는 아직 구간이 닫히지 않아 inst 2 의 ch15_pdb 행이 없다.
+-- 호출당 시간(ms_per_call)이 늘어나는 서비스를 찾는 것이 서비스 단위 튜닝의 출발점이다.
+
+--------------------------------------------------------------------------------
+ [6] 병렬 쿼리는 서비스의 인스턴스에서만
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ cat /tmp/px15.sh               (요지)
+sqlplus -s system/<비밀번호>@rac-scan:1521/$1 <<'E'
+select sys_context('userenv','instance_name') from dual;
+select /*+ parallel(4) */ count(*) from sys.obj$ a, sys.obj$ b
+ where a.owner#=b.owner# and a.obj#<40000 and b.obj#<40000;
+E
+
+-- 쿼리가 도는 동안 2 초 뒤에 GV$SESSION 에서 그 서비스로 붙은 SYSTEM 세션을 본다.
+
+== ch15_pdb (racdb2 에서만 도는 서비스) ==
+inst 2 (P000) svc=ch15_pdb
+inst 2 (P001) svc=ch15_pdb
+inst 2 (P002) svc=ch15_pdb
+inst 2 (P003) svc=ch15_pdb
+inst 2 (P004) svc=ch15_pdb
+inst 2 (P005) svc=ch15_pdb
+inst 2 (P006) svc=ch15_pdb
+inst 2 (P007) svc=ch15_pdb
+inst 2 V1-V3) svc=ch15_pdb          ← 쿼리 조정자(사용자 세션)
+racdb2
+1022886140
+Elapsed: 00:00:04.12
+
+== racpdb1 (두 인스턴스에서 도는 기본 서비스) ==
+inst 1 (P000) svc=racpdb1
+inst 1 (P001) svc=racpdb1
+inst 1 (P002) svc=racpdb1
+inst 1 (P003) svc=racpdb1
+inst 1 V1-V3) svc=racpdb1          ← 쿼리 조정자
+inst 2 (P000) svc=racpdb1
+inst 2 (P001) svc=racpdb1
+inst 2 (P002) svc=racpdb1
+inst 2 (P003) svc=racpdb1
+racdb1
+1022886140
+Elapsed: 00:00:03.70
+
+-- 같은 쿼리, 같은 병렬도다. 병렬 서버는 여덟 개(4 × 생산자 · 소비자 두 집합)다.
+-- ch15_pdb 로 붙으면 여덟 개 모두 racdb2 에 떴다. racdb1 은 쓰지 않았다.
+-- racpdb1 로 붙으면 네 개씩 두 인스턴스에 나뉘었다.
+-- 병렬 서버는 그 서비스를 제공하는 인스턴스에만 뜬다. 무거운 배치 쿼리가 OLTP 노드로
+-- 번지지 않게 하려면 배치용 서비스를 따로 두는 것으로 충분하다.
+
+-- 진단 — 처음 잰 값은 틀렸다
+--   처음에는 GV$PX_SESSION 을 4 초 뒤 한 번 봤다. QC 가 inst 1, 병렬 서버가 inst 1 · 2 에
+--   하나씩 보였다. 세션 정보를 붙여 보니 USERNAME SYS, SERVICE SYS$USERS, 프로그램 (PPA7)
+--   이었다. 관찰하려고 친 GV$ 조회 자체였다. GV$ 뷰는 인스턴스마다 병렬 서버를 띄워 값을 모은다.
+--   병렬 실행을 관찰할 때는 사용자 · 서비스로 걸러서 자기 조회를 빼고 본다.
+
+--------------------------------------------------------------------------------
+ [7] 정리 — 흔한 오류부터
+--------------------------------------------------------------------------------
+
+[rac1] SQL> alter session set container=racpdb1;
+[rac1] SQL> exec dbms_monitor.serv_mod_act_stat_disable(service_name=>'ch15_pdb', -
+                 module_name=>'ORDER', action_name=>'PAY')
+[rac1] SQL> select count(*) from dba_enabled_aggregations;
+
+  COUNT(*)
+----------
+         0
+
+[oracle@rac1 ~]$ srvctl remove service -db racdb -service ch15_pdb
+PRCR-1025 : Resource ora.racdb.ch15_pdb.svc is still running
+
+-- 원인 파악 : 도는 서비스는 지울 수 없다.
+-- 조치     : 먼저 멈춘다. 지우는 순서는 stop → remove 다.
+-- 재확인   : srvctl config service 목록에서 사라졌는지 본다.
+
+[oracle@rac1 ~]$ srvctl stop service -db racdb -service ch15_pdb,ch15_root
+[oracle@rac1 ~]$ srvctl remove service -db racdb -service ch15_pdb
+[oracle@rac1 ~]$ srvctl remove service -db racdb -service ch15_root
+[oracle@rac1 ~]$ srvctl config service -db racdb
+[oracle@rac1 ~]$ srvctl status service -db racdb
+
+-- 둘 다 아무것도 출력하지 않는다. 사용자 서비스가 없다.
+
+--------------------------------------------------------------------------------
+ [8] 기준선 확인
+--------------------------------------------------------------------------------
+
+[rac1] SQL> select con_id, name from cdb_services where name like 'ch15%';
+no rows selected
+[rac1] SQL> select inst_id, name from gv$services where name like 'ch15%';
+no rows selected
+
+-- srvctl remove 는 Clusterware 자원만이 아니라 데이터 딕셔너리의 서비스 정의도 지웠다.
+-- 실습 08 [4] 에서 본 RACPDB1 의 ch15_pdb 행도 없다.
+
+[grid@rac1 ~]$ crsctl stat serverpool | grep NAME
+NAME=Free
+NAME=Generic
+NAME=ora.racdb
+
+[grid@rac1 ~]$ crsctl stat res -t > /tmp/end15.txt
+[grid@rac1 ~]$ diff /tmp/base15.txt /tmp/end15.txt && echo SAME
+SAME
+
+-- 서비스마다 있던 숨은 서버 풀(실습 09 [5])도 서비스와 함께 사라졌다.
+-- 실습 08 을 시작하기 전에 떠 둔 자원 목록과 한 줄도 다르지 않다.
+
+[oracle@rac1 ~]$ rm -f /tmp/c15.sh /tmp/dr_*.sh /tmp/dr_*.out /tmp/wl15.sh /tmp/px15* /tmp/end15.txt /tmp/base15.txt
+
+================================================================================
+ 실습 12 종료 — 사용자 서비스 없음, 서버 풀 기본 3개, 자원 목록 기준선과 같음
+================================================================================

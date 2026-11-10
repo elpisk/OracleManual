@@ -1,0 +1,397 @@
+================================================================================
+ 제1장 실습 03 — Cache Fusion 실측
+ 대상   : rac1(racdb1) 과 rac2(racdb2) 를 함께 사용한다
+ 목표   : 한 노드에서 갱신한 블록을 다른 노드에서 읽게 만들고, gc 통계의
+          변화량과 GV$BH 의 블록 상태로 Cache Fusion 이 실제로 일어났음을
+          숫자로 확인한다
+ 소요   : 약 35분
+ 선행   : 두 인스턴스가 OPEN 이고 PDB RACPDB1 이 양쪽에서 READ WRITE 일 것
+ 계정   : oracle
+ 주의   : 실습용 사용자 CF 를 만들고 마지막에 지운다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] PDB 상태 확인 — 먼저 걸리는 함정
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+SQL> SELECT inst_id, name, open_mode FROM gv$pdbs WHERE name='RACPDB1' ORDER BY 1;
+
+   INST_ID NAME       OPEN_MODE
+---------- ---------- ----------
+         1 RACPDB1    MOUNTED
+         2 RACPDB1    MOUNTED
+
+2 rows selected.
+
+-- 두 인스턴스 모두 MOUNTED 다. 이 상태로 실습을 진행하면 다음 절의 오류를 만난다.
+-- 일부러 그대로 진행해 어떤 오류가 나는지 본다.
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 — MOUNTED 인 PDB 에서 객체를 만들면
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION SET CONTAINER = racpdb1;
+
+Session altered.
+
+SQL> CREATE USER cf IDENTIFIED BY cf QUOTA UNLIMITED ON users;
+CREATE USER cf IDENTIFIED BY cf QUOTA UNLIMITED ON users
+*
+ERROR at line 1:
+ORA-01109: database not open
+
+SQL> SELECT COUNT(*) FROM cf.t;
+SELECT COUNT(*) FROM cf.t
+                     *
+ERROR at line 1:
+ORA-01219: database or pluggable database not open: queries allowed on fixed
+tables or views only
+
+-- 원인 파악
+--   ALTER SESSION SET CONTAINER 는 성공했다. 컨테이너 전환 자체는 PDB 가
+--   MOUNTED 여도 가능하기 때문이다. 그러나 MOUNTED 인 PDB 에서는 데이터
+--   사전에 접근할 수 없어 DDL 도 일반 조회도 되지 않는다.
+--   ORA-01109 와 ORA-01219 는 둘 다 이 상황을 가리킨다.
+--
+--   왜 MOUNTED 인가. CDB 를 기동해도 PDB 는 자동으로 열리지 않는다.
+--   19c 에서는 SAVE STATE 로 저장해 둔 PDB 만 CDB 기동 시 함께 열린다.
+--   이 데이터베이스는 DBCA 로 만든 직후라 저장 상태가 없었다.
+
+SQL> SELECT con_name, instance_name, state FROM dba_pdb_saved_states;
+
+no rows selected
+
+-- 조치
+--   모든 인스턴스에서 열고, 다음 기동 때도 자동으로 열리도록 상태를 저장한다.
+
+SQL> ALTER SESSION SET CONTAINER = cdb$root;
+
+Session altered.
+
+SQL> ALTER PLUGGABLE DATABASE racpdb1 OPEN INSTANCES=ALL;
+
+Pluggable database altered.
+
+SQL> ALTER PLUGGABLE DATABASE racpdb1 SAVE STATE INSTANCES=ALL;
+
+Pluggable database altered.
+
+-- 재확인
+SQL> SELECT inst_id, name, open_mode FROM gv$pdbs WHERE name='RACPDB1' ORDER BY 1;
+
+   INST_ID NAME       OPEN_MODE
+---------- ---------- ----------
+         1 RACPDB1    READ WRITE
+         2 RACPDB1    READ WRITE
+
+2 rows selected.
+
+SQL> SELECT con_name, instance_name, state FROM dba_pdb_saved_states;
+
+CON_NAME     INSTANCE_NAME    STATE
+------------ ---------------- --------------
+RACPDB1      racdb1           OPEN
+RACPDB1      racdb2           OPEN
+
+2 rows selected.
+
+-- INSTANCES=ALL 이 RAC 고유의 구문이다. 이것을 빼면 접속한 인스턴스에서만
+-- 열리고 다른 노드에서는 여전히 MOUNTED 로 남아, 노드에 따라 결과가 다른
+-- 혼란스러운 상황이 된다. RAC 에서 PDB 를 다룰 때 항상 붙이는 습관을 들인다.
+
+--------------------------------------------------------------------------------
+ [3] 실습 테이블 준비
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION SET CONTAINER = racpdb1;
+
+Session altered.
+
+SQL> CREATE USER cf IDENTIFIED BY cf QUOTA UNLIMITED ON users;
+
+User created.
+
+SQL> GRANT connect, resource TO cf;
+
+Grant succeeded.
+
+SQL> CREATE TABLE cf.t (id NUMBER PRIMARY KEY, v VARCHAR2(30), upd DATE);
+
+Table created.
+
+SQL> INSERT INTO cf.t
+  2  SELECT level, 'init-'||level, SYSDATE FROM dual CONNECT BY level <= 2000;
+
+2000 rows created.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> EXEC dbms_stats.gather_table_stats('CF','T');
+
+PL/SQL procedure successfully completed.
+
+SQL> SELECT COUNT(*) FROM cf.t;
+
+  COUNT(*)
+----------
+      2000
+
+1 row selected.
+
+--------------------------------------------------------------------------------
+ [4] 기준 통계 측정 — 누적값이므로 앞뒤를 비교해야 한다
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION SET CONTAINER = cdb$root;
+SQL> COL name FOR a44
+SQL> SELECT inst_id, name, value FROM gv$sysstat
+  2   WHERE name IN ('gc cr blocks received','gc current blocks received',
+  3                  'gc cr blocks served','gc current blocks served')
+  4   ORDER BY name, inst_id;
+
+   INST_ID NAME                                             VALUE
+---------- -------------------------------------------- ----------
+         1 gc cr blocks received                               115
+         2 gc cr blocks received                               173
+         1 gc cr blocks served                                 173
+         2 gc cr blocks served                                 115
+         1 gc current blocks received                         1855
+         2 gc current blocks received                         4116
+         1 gc current blocks served                           4117
+         2 gc current blocks served                           1855
+
+8 rows selected.
+
+-- 이 값을 적어 둔다. GV$SYSSTAT 는 인스턴스 기동 이후의 누적값이므로
+-- 절대값에는 의미가 없다. 두 시점의 차이만 본다.
+
+--------------------------------------------------------------------------------
+ [5] 노드 1에서 갱신
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION SET CONTAINER = racpdb1;
+SQL> UPDATE cf.t SET v='node1-updated', upd=SYSDATE WHERE id <= 1000;
+
+1000 rows updated.
+
+SQL> COMMIT;
+
+Commit complete.
+
+SQL> SELECT COUNT(*) FROM cf.t WHERE v='node1-updated';
+
+  COUNT(*)
+----------
+      1000
+
+1 row selected.
+
+-- 이 시점에서 갱신된 블록의 최신본은 racdb1 의 버퍼 캐시에 있다.
+-- 커밋했다고 해서 디스크에 즉시 내려가는 것이 아니다. 리두만 기록됐을 뿐이다.
+
+--------------------------------------------------------------------------------
+ [6] 노드 2에서 같은 블록을 읽는다
+--------------------------------------------------------------------------------
+
+-- 두 번째 터미널을 열어 rac2 에 접속한다.
+[root@rac2 ~]# su - oracle
+[oracle@rac2 ~]$ echo $ORACLE_SID
+racdb2
+
+[oracle@rac2 ~]$ sqlplus -s / as sysdba
+SQL> ALTER SESSION SET CONTAINER = racpdb1;
+
+Session altered.
+
+SQL> SELECT COUNT(*) FROM cf.t WHERE v='node1-updated';
+
+  COUNT(*)
+----------
+      1000
+
+1 row selected.
+
+SQL> SELECT /*+ full(t) */ SUM(id), MAX(upd) FROM cf.t t;
+
+   SUM(ID) MAX(UPD)
+---------- ---------
+   2001000 31-AUG-26
+
+1 row selected.
+
+-- 노드 2에서 노드 1이 갱신한 값이 그대로 보인다. 디스크에는 아직 없는데도
+-- 최신 값을 읽었다. 이것이 Cache Fusion 이다. FULL 힌트를 준 것은 전체
+-- 블록을 훑어 전송을 확실히 일으키기 위해서다.
+
+--------------------------------------------------------------------------------
+ [7] 통계 재측정 — 숫자가 맞아떨어진다
+--------------------------------------------------------------------------------
+
+-- 다시 rac1 으로 돌아와 같은 조회를 반복한다.
+[oracle@rac1 ~]$ sqlplus -s / as sysdba
+SQL> SELECT inst_id, name, value FROM gv$sysstat
+  2   WHERE name IN ('gc cr blocks received','gc current blocks received',
+  3                  'gc cr blocks served','gc current blocks served')
+  4   ORDER BY name, inst_id;
+
+   INST_ID NAME                                             VALUE
+---------- -------------------------------------------- ----------
+         1 gc cr blocks received                               115
+         2 gc cr blocks received                               237
+         1 gc cr blocks served                                 237
+         2 gc cr blocks served                                 115
+         1 gc current blocks received                         1855
+         2 gc current blocks received                         4156
+         1 gc current blocks served                           4157
+         2 gc current blocks served                           1855
+
+8 rows selected.
+
+-- 변화량을 정리하면 이렇다.
+--
+--   항목                              이전   이후   변화
+--   ----------------------------------------------------
+--   노드2 gc cr blocks received        173    237    +64
+--   노드1 gc cr blocks served          173    237    +64
+--   노드1 gc cr blocks received        115    115      0
+--   노드2 gc cr blocks served          115    115      0
+--
+-- 노드 2가 요청한 64개의 CR 블록을 노드 1이 만들어 인터커넥트로 보냈다.
+-- 한쪽의 received 증가분과 다른 쪽의 served 증가분이 정확히 같다.
+-- 노드 1은 받은 것이 없으므로 자기 received 는 변하지 않았다.
+--
+-- CR 블록인 이유는 노드 2가 조회만 했기 때문이다. 갱신했다면
+-- gc current blocks received 가 늘었을 것이다.
+
+--------------------------------------------------------------------------------
+ [8] 오류 재현 — GV$BH 의 열 이름
+--------------------------------------------------------------------------------
+
+-- 블록이 어느 노드에 어떤 상태로 있는지 보려 한다. 상태 열 이름을 STATE 로
+-- 잘못 기억하는 경우가 많다.
+
+SQL> SELECT b.inst_id, b.state FROM gv$bh b WHERE rownum <= 1;
+SELECT b.inst_id, b.state FROM gv$bh b WHERE rownum <= 1
+                  *
+ERROR at line 1:
+ORA-00904: "B"."STATE": invalid identifier
+
+-- 원인 파악
+--   열 이름이 STATE 가 아니라 STATUS 다. 뷰의 실제 구성을 확인한다.
+
+SQL> DESC v$bh
+ Name                                Null?    Type
+ ----------------------------------- -------- ------------------
+ FILE#                                        NUMBER
+ BLOCK#                                       NUMBER
+ CLASS#                                       NUMBER
+ STATUS                                       VARCHAR2(10)
+ XNC                                          NUMBER
+ FORCED_READS                                 NUMBER
+ FORCED_WRITES                                NUMBER
+ LOCK_ELEMENT_ADDR                            RAW(8)
+ LOCK_ELEMENT_NAME                            NUMBER
+ LOCK_ELEMENT_CLASS                           NUMBER
+ DIRTY                                        VARCHAR2(1)
+ TEMP                                         VARCHAR2(1)
+ PING                                         VARCHAR2(1)
+ STALE                                        VARCHAR2(1)
+ DIRECT                                       VARCHAR2(1)
+ NEW                                          CHAR(1)
+ OBJD                                         NUMBER
+ TS#                                          NUMBER
+ LOBID                                        NUMBER
+ CACHEHINT                                    NUMBER
+ FLASH_CACHE                                  VARCHAR2(7)
+ CELL_FLASH_CACHE                             VARCHAR2(7)
+ CON_ID                                       NUMBER
+
+--   STATUS 가 맞다. FORCED_READS 와 FORCED_WRITES, PING 열도 RAC 전용
+--   지표이니 기억해 둘 만하다. PING 은 그 블록이 다른 노드로 넘어간 적이
+--   있는지를 나타낸다.
+
+-- 조치와 재확인
+SQL> ALTER SESSION SET CONTAINER = racpdb1;
+SQL> SELECT b.inst_id, b.status, COUNT(*) blocks
+  2    FROM gv$bh b, dba_objects o
+  3   WHERE b.objd = o.data_object_id
+  4     AND o.owner='CF' AND o.object_name='T'
+  5   GROUP BY b.inst_id, b.status ORDER BY 1,2;
+
+   INST_ID STATUS         BLOCKS
+---------- ---------- ----------
+         1 cr                  8
+         1 scur               14
+         1 xcur                2
+         2 cr                 28
+         2 scur                1
+
+5 rows selected.
+
+-- 읽는 법
+--   xcur : 배타적 current. 이 노드가 갱신 권한을 가진다. 클러스터에 하나뿐이다.
+--   scur : 공유 current. 읽기만 가능하며 여러 노드가 동시에 가질 수 있다.
+--   cr   : 읽기 일관성 이미지. 여러 개가 존재할 수 있다.
+--
+-- 갱신을 수행한 노드 1에만 xcur 가 있다. 조회만 한 노드 2에는 cr 이 가장 많다.
+-- 상태 분포가 각 노드가 무엇을 했는지 그대로 말해 준다.
+--
+-- 주의: GV$BH 는 버퍼 캐시의 모든 블록을 담고 있어 조건 없이 조회하면 매우
+-- 무겁다. 운영 환경에서는 반드시 특정 객체로 한정한다.
+
+--------------------------------------------------------------------------------
+ [9] gc 대기 이벤트 확인
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION SET CONTAINER = cdb$root;
+SQL> COL event FOR a34
+SQL> SELECT inst_id, event, total_waits, time_waited
+  2    FROM gv$system_event WHERE event LIKE 'gc %' AND total_waits > 0
+  3   ORDER BY inst_id, total_waits DESC;
+
+   INST_ID EVENT                              TOTAL_WAITS TIME_WAITED
+---------- ---------------------------------- ----------- -----------
+         1 gc cr grant 2-way                         2581          97
+         1 gc current block busy                      975        1769
+         1 gc current block 2-way                     641          41
+         1 gc current grant 2-way                     236          12
+         1 gc cr multi block grant                    118           7
+         2 gc current block 2-way                    2553         233
+         2 gc cr grant 2-way                         1072          45
+         2 gc current block busy                     1036        1797
+         2 gc cr block 2-way                          203          10
+...
+
+-- 이름을 뜯어 읽는다.
+--   gc + cr/current : 블록 종류
+--   + grant/block   : 잠금만 받았나, 블록까지 받았나
+--   + 2-way/busy    : 경로와 상태
+--
+-- gc current block busy 는 횟수가 gc cr grant 2-way 보다 적은데 총 대기 시간은
+-- 훨씬 길다. 상대 노드가 블록을 놓아 줄 때까지 기다린 것이기 때문이다.
+-- 횟수가 아니라 시간을 봐야 한다는 원칙이 여기서 확인된다.
+--
+-- 3-way 이벤트가 하나도 없다는 점도 확인해 둔다. 2노드 클러스터에서는
+-- 요청·마스터·소유가 최대 두 노드에만 있으므로 3-way 가 발생할 수 없다.
+
+--------------------------------------------------------------------------------
+ [10] 원상 복구
+--------------------------------------------------------------------------------
+
+SQL> ALTER SESSION SET CONTAINER = racpdb1;
+SQL> DROP USER cf CASCADE;
+
+User dropped.
+
+SQL> SELECT username FROM dba_users WHERE username='CF';
+
+no rows selected
+
+-- 실습용 사용자와 테이블이 지워졌다. PDB 의 OPEN 상태와 SAVE STATE 는
+-- 이후 장에서도 필요하므로 그대로 둔다.
+================================================================================
+ 실습 03 종료
+================================================================================

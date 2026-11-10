@@ -1,0 +1,317 @@
+================================================================================
+ 제13장 실습 11 — UNDO 를 운영 중에 바꾸기, PENDING OFFLINE 과 실행 위치의 함정
+ 대상   : rac1, rac2
+ 목표   : 트랜잭션이 열린 상태에서 racdb2 의 UNDO 를 새 테이블스페이스로 바꾸고
+          옛 세그먼트가 PENDING OFFLINE 으로 남는 것을 본다.
+          다른 노드에서 sid 를 붙여 바꿀 때와 sid 를 빼고 바꿀 때
+          SPFILE 과 메모리에 무엇이 남는지 확인한다
+ 소요   : 약 30분
+ 선행   : 실습 03 · 04 완료, racdb 양 노드 OPEN
+ 계정   : oracle
+ 주의   : 연습용 UNDOTBS2N 과 SYSTEM.T_UNDO 테이블을 만들고 끝에서 지운다.
+          [3] 의 상태를 그대로 두고 racdb2 를 재기동하지 않는다.
+          [3] 을 끝내면 바로 SPFILE 을 고친다
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] 준비 — 로컬 UNDO 와 연습용 객체
+--------------------------------------------------------------------------------
+
+[rac1] SQL> select property_name, property_value from database_properties
+  2   where property_name='LOCAL_UNDO_ENABLED';
+
+PROPERTY_NAME          PROPERTY_V
+---------------------- ----------
+LOCAL_UNDO_ENABLED     TRUE
+
+-- 로컬 UNDO 모드다. PDB 마다 자기 UNDO 가 따로 있다.
+-- 실습 03 의 UNDO_2 같은 PDB 쪽 UNDO 가 그것이다.
+-- 그래서 RACPDB1 안에서 만든 트랜잭션은 루트의 UNDOTBS2 를 쓰지 않는다.
+-- 루트의 UNDO 를 바꾸는 이 실습에서는 트랜잭션을 루트(CDB$ROOT)에서 만든다.
+
+[rac1] SQL> create undo tablespace UNDOTBS2N datafile size 50M autoextend on next 10M maxsize 1G;
+Tablespace created.
+Elapsed: 00:00:00.31
+
+[rac1] SQL> create table system.t_undo (id number, pad varchar2(100));
+Table created.
+
+--------------------------------------------------------------------------------
+ [2] rac2 에 트랜잭션 하나를 열어 둔다 (세션 A)
+--------------------------------------------------------------------------------
+
+-- rac2 에서 sqlplus 를 따로 열고 커밋하지 않은 채 150초 기다리게 한다.
+
+[rac2 세션 A] SQL> insert into system.t_undo
+  2  select level, rpad('x',100,'x') from dual connect by level <= 20000;
+20000 rows created.
+[rac2 세션 A] SQL> select to_char(sysdate,'HH24:MI:SS') t from dual;
+13:28:18
+[rac2 세션 A] SQL> exec dbms_session.sleep(150)
+
+[rac1] SQL> select t.inst_id, r.segment_name, r.tablespace_name, t.used_ublk, t.status
+  2    from gv$transaction t join dba_rollback_segs r on r.segment_id=t.xidusn;
+
+   INST_ID SEGMENT_NAME              TABLESPACE  USED_UBLK STATUS
+---------- ------------------------- ---------- ---------- ----------------
+         2 _SYSSMU15_2307333399$     UNDOTBS2           10 ACTIVE
+
+-- racdb2 의 트랜잭션이 UNDOTBS2 의 15 번 세그먼트를 쓰고 있다.
+-- UNDO 블록 10 개다.
+
+--------------------------------------------------------------------------------
+ [3] 흔한 오류 — rac1 에서 sid='racdb2' 로 바꾸면
+--------------------------------------------------------------------------------
+
+-- 실습 08 에서 open_cursors 는 rac1 에서 sid='racdb2' 로 바꿨고
+-- racdb2 의 메모리가 바로 바뀌었다. 같은 방법을 undo_tablespace 에 써 본다.
+
+[rac1] SQL> alter system set undo_tablespace='UNDOTBS2N' sid='racdb2';
+
+System altered.
+
+Elapsed: 00:00:00.01
+
+[rac1] SQL> select inst_id, value from gv$parameter where name='undo_tablespace' order by 1;
+
+   INST_ID VALUE
+---------- ------------
+         1 UNDOTBS1
+         2 UNDOTBS2
+
+[rac1] SQL> select sid, value from v$spparameter where name='undo_tablespace' order by 1;
+
+SID      VALUE
+-------- ------------
+racdb1   UNDOTBS1
+racdb2   UNDOTBS2N
+
+[rac1] SQL> select tablespace_name, status, count(*) cnt from dba_rollback_segs
+  2   where tablespace_name in ('UNDOTBS2','UNDOTBS2N')
+  3   group by tablespace_name, status order by 1,2;
+
+TABLESPACE STATUS                  CNT
+---------- ---------------- ----------
+UNDOTBS2   ONLINE                   10
+UNDOTBS2N  OFFLINE                  10
+
+-- 오류 없이 System altered 가 나왔다. 그런데 racdb2 는 여전히 UNDOTBS2 를 쓴다.
+-- 바뀐 것은 SPFILE 의 racdb2 줄뿐이다. UNDOTBS2N 의 세그먼트도 OFFLINE 그대로다.
+-- rac1 의 경고 로그에는 이렇게 남았다.
+--
+--   ALTER SYSTEM SET undo_tablespace='UNDOTBS2N' SCOPE=BOTH SID='racdb2';
+--
+-- SCOPE=BOTH 로 기록됐지만 이 랩에서 racdb2 의 메모리는 바뀌지 않았다.
+-- 이 상태가 위험한 이유는 다음 명령에서 드러난다.
+
+[rac1] SQL> drop tablespace UNDOTBS2N including contents and datafiles;
+
+Tablespace dropped.
+
+-- 지워졌다. 아무 인스턴스도 UNDOTBS2N 을 쓰고 있지 않으니 막을 이유가 없다.
+-- 그런데 SPFILE 은 racdb2.undo_tablespace='UNDOTBS2N' 이다.
+-- 이대로 racdb2 를 재기동하면 없는 UNDO 를 찾게 된다. 실습 04 의 ORA-30012
+-- (UNDO 가 없거나 유형이 다르다)와 같은 이유로 기동이 막힌다.
+-- 이 실습에서는 재기동하지 않고 바로 고쳤다.
+
+-- 원인 파악 : 명령은 성공했지만 반영된 곳이 SPFILE 뿐이었다.
+--             gv$parameter 와 v$spparameter 를 함께 봐야 알 수 있다.
+--             System altered 만 보고 다음 단계로 넘어가면 놓친다.
+-- 조치     : SPFILE 부터 되돌린다.
+--               alter system set undo_tablespace='UNDOTBS2' scope=spfile sid='racdb2';
+--             UNDO 교체는 바꿀 인스턴스에 직접 접속해서 한다([4]).
+-- 재확인   : v$spparameter 의 racdb2 줄이 실제로 있는 UNDO 인지 본다.
+
+[rac1] SQL> alter system set undo_tablespace='UNDOTBS2' scope=spfile sid='racdb2';
+
+System altered.
+
+[rac1] SQL> select sid, value from v$spparameter where name='undo_tablespace' order by 1;
+
+SID      VALUE
+-------- ------------
+racdb1   UNDOTBS1
+racdb2   UNDOTBS2
+
+--------------------------------------------------------------------------------
+ [4] racdb2 에서 직접 바꾸기 — 트랜잭션이 열린 채로
+--------------------------------------------------------------------------------
+
+[rac1] SQL> create undo tablespace UNDOTBS2N datafile size 50M autoextend on next 10M maxsize 1G;
+Tablespace created.
+
+-- rac2 에 트랜잭션을 하나 더 연다(세션 B). 세션 A 는 아직 기다리는 중이다.
+
+[rac2 세션 B] SQL> insert into system.t_undo
+  2  select level, rpad('x',100,'x') from dual connect by level <= 20000;
+20000 rows created.
+[rac2 세션 B] SQL> select to_char(sysdate,'HH24:MI:SS') t from dual;
+13:29:16
+[rac2 세션 B] SQL> exec dbms_session.sleep(150)
+
+[rac2] SQL> select instance_name from v$instance;
+racdb2
+
+[rac2] SQL> alter system set undo_tablespace='UNDOTBS2N';
+
+System altered.
+
+Elapsed: 00:00:00.22
+
+[rac2] SQL> select inst_id, value from gv$parameter where name='undo_tablespace' order by 1;
+
+   INST_ID VALUE
+---------- ------------
+         1 UNDOTBS1
+         2 UNDOTBS2N
+
+[rac2] SQL> select tablespace_name, status, count(*) cnt from dba_rollback_segs
+  2   where tablespace_name in ('UNDOTBS2','UNDOTBS2N')
+  3   group by tablespace_name, status order by 1,2;
+
+TABLESPACE STATUS                  CNT
+---------- ---------------- ----------
+UNDOTBS2   OFFLINE                   8
+UNDOTBS2   ONLINE                    2
+UNDOTBS2N  ONLINE                   10
+
+[rac2] SQL> select t.inst_id, r.segment_name, r.tablespace_name, t.used_ublk, t.status
+  2    from gv$transaction t join dba_rollback_segs r on r.segment_id=t.xidusn;
+
+   INST_ID SEGMENT_NAME              TABLESPACE  USED_UBLK STATUS
+---------- ------------------------- ---------- ---------- ----------------
+         2 _SYSSMU15_2307333399$     UNDOTBS2           10 ACTIVE
+         2 _SYSSMU19_6920379$        UNDOTBS2           11 ACTIVE
+
+-- 이번에는 메모리가 바로 바뀌었다. 0.22 초다. 트랜잭션이 끝나기를 기다리지 않는다.
+--
+--   UNDOTBS2N  세그먼트 10 개가 모두 ONLINE. 새 트랜잭션은 여기로 간다.
+--   UNDOTBS2   8 개는 OFFLINE, 2 개는 아직 ONLINE.
+--              2 개는 세션 A · B 가 쓰는 15 번 · 19 번 세그먼트다.
+--
+-- 열린 트랜잭션은 시작한 UNDO 에서 끝까지 간다. 교체가 이를 끊지 않는다.
+
+[rac1] SQL> drop tablespace UNDOTBS2N including contents and datafiles;
+drop tablespace UNDOTBS2N including contents and datafiles
+*
+ERROR at line 1:
+ORA-30013: undo tablespace 'UNDOTBS2N' is currently in use
+
+-- [3] 과 같은 명령이 이번에는 막혔다. racdb2 가 실제로 쓰고 있기 때문이다.
+-- [3] 에서 통과한 것이 오히려 이상 신호였다.
+
+--------------------------------------------------------------------------------
+ [5] 커밋 뒤의 옛 세그먼트 — PENDING OFFLINE
+--------------------------------------------------------------------------------
+
+-- 세션 A 는 13:30:49 에, 세션 B 는 13:31:46 쯤 커밋했다.
+
+[rac1] SQL> select segment_id, segment_name, tablespace_name, status from dba_rollback_segs
+  2   where tablespace_name='UNDOTBS2' and status<>'OFFLINE';
+
+SEGMENT_ID SEGMENT_NAME              TABLESPACE STATUS
+---------- ------------------------- ---------- ----------------
+        15 _SYSSMU15_2307333399$     UNDOTBS2   ONLINE
+        19 _SYSSMU19_6920379$        UNDOTBS2   ONLINE
+
+[rac1] SQL> select inst_id, usn, status, xacts from gv$rollstat where usn in (15,19) order by 1,2;
+
+   INST_ID        USN STATUS               XACTS
+---------- ---------- --------------- ----------
+         2         15 PENDING OFFLINE          0
+         2         19 PENDING OFFLINE          0
+
+-- 13:32:34 의 조회다. 두 트랜잭션 모두 끝나 XACTS 가 0 인데
+-- 세그먼트는 아직 OFFLINE 이 아니다.
+--
+-- 두 뷰가 다르게 말한다.
+--   dba_rollback_segs  ONLINE           딕셔너리에 기록된 상태
+--   gv$rollstat        PENDING OFFLINE  인스턴스가 메모리에 가진 실제 상태
+-- PENDING OFFLINE 은 새 트랜잭션은 받지 않고 남은 일이 끝나기를 기다리는 상태다.
+-- 문서는 활성 트랜잭션이 모두 끝나면 OFFLINE 이 된다고 적는다.
+-- 이 랩에서는 세션 B 가 커밋하고 50초 가까이 지난 이 시점에도 남아 있었다.
+-- 커밋과 OFFLINE 사이에 시차가 있다. 옛 UNDO 를 지우려면 이 상태가 풀린 뒤에 지운다.
+--
+-- v$rollstat 은 GV$ 로 본다. rac1 에서 V$ 로 보면 racdb1 의 세그먼트만 나와
+-- 이 두 줄이 보이지 않는다. v$rollname 도 접속한 인스턴스의 것만 담는다.
+
+--------------------------------------------------------------------------------
+ [6] 되돌리기와 또 하나의 함정 — sid 를 빼면
+--------------------------------------------------------------------------------
+
+[rac2] SQL> alter system set undo_tablespace='UNDOTBS2';
+
+System altered.
+
+Elapsed: 00:00:00.18
+
+[rac2] SQL> select tablespace_name, status, count(*) cnt from dba_rollback_segs
+  2   where tablespace_name in ('UNDOTBS2','UNDOTBS2N')
+  3   group by tablespace_name, status order by 1,2;
+
+TABLESPACE STATUS                  CNT
+---------- ---------------- ----------
+UNDOTBS2   ONLINE                   10
+UNDOTBS2N  OFFLINE                  10
+
+[rac1] SQL> drop tablespace UNDOTBS2N including contents and datafiles;
+Tablespace dropped.
+Elapsed: 00:00:00.25
+
+[rac1] SQL> drop table system.t_undo purge;
+Table dropped.
+
+[rac1] SQL> select sid, value from v$spparameter where name='undo_tablespace' order by 1;
+
+SID      VALUE
+-------- ------------
+*        UNDOTBS2
+racdb1   UNDOTBS1
+racdb2   UNDOTBS2
+
+-- 처음에 없던 *.undo_tablespace='UNDOTBS2' 줄이 생겼다.
+-- rac2 의 경고 로그에 원인이 있다.
+--
+--   ALTER SYSTEM SET undo_tablespace='UNDOTBS2N' SCOPE=BOTH;
+--   ALTER SYSTEM SET undo_tablespace='UNDOTBS2' SCOPE=BOTH;
+--
+-- [4] 와 [6] 에서 sid 를 빼고 실행했다. SPFILE 에는 SID 가 * 로 들어간다.
+-- 그런데도 racdb1 이 UNDOTBS2 로 바뀌지 않은 것은 racdb1. 줄이 * 줄을 이기기
+-- 때문이다(실습 08 [3]). 지금은 해가 없지만, 이 줄 때문에 [4] 와 [6] 사이에는
+-- SPFILE 에 *.undo_tablespace='UNDOTBS2N' 이 있었다.
+-- 언젠가 racdb1. 줄이 지워지면 racdb1 이 남의 UNDO 를 가리키게 된다.
+--
+-- 규칙으로 정리하면 이렇다.
+--   UNDO 교체는 그 인스턴스에 접속해 sid 를 그 인스턴스 이름으로 붙여 실행한다.
+--     alter system set undo_tablespace='UNDOTBS2N' sid='racdb2';   -- rac2 에서
+--   실행한 뒤 gv$parameter 와 v$spparameter 를 둘 다 본다.
+
+[rac1] SQL> alter system reset undo_tablespace scope=spfile sid='*';
+
+System altered.
+
+[rac1] SQL> select sid, value from v$spparameter where name='undo_tablespace' order by 1;
+
+SID      VALUE
+-------- ------------
+racdb1   UNDOTBS1
+racdb2   UNDOTBS2
+
+[rac1] SQL> select inst_id, value from gv$parameter where name='undo_tablespace' order by 1;
+
+   INST_ID VALUE
+---------- ------------
+         1 UNDOTBS1
+         2 UNDOTBS2
+
+[rac1] SQL> select inst_id, usn, status, xacts from gv$rollstat where status<>'ONLINE';
+
+no rows selected
+
+-- SPFILE · 메모리 · 롤백 세그먼트 모두 처음과 같다.
+-- [6] 의 되돌리기 직후에는 15 번 · 19 번이 아직 PENDING OFFLINE 이었다.
+-- 1 분쯤 뒤인 이 조회에서는 ONLINE 이 아닌 세그먼트가 하나도 없다.
+
+================================================================================
+ 실습 11 종료 — UNDOTBS2N · SYSTEM.T_UNDO 삭제, undo_tablespace 원복
+================================================================================
