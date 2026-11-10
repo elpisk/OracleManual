@@ -1,0 +1,217 @@
+================================================================================
+ 제16장 실습 11 — Transaction Guard 가 남기는 기록, 그리고 정리
+ 대상   : rac1, rac2
+ 목표   : -commit_outcome TRUE 서비스에서 커밋하면 LTXID_TRANS 에 무엇이
+          쌓이는지, 켜지 않은 서비스와 비교한다. 결과 조회 API 의 오류를
+          재현한다. 실습 07~11 에서 만든 것을 모두 지워 기준선으로 돌아간다
+ 소요   : 약 25분
+ 선행   : 실습 10 완료
+ 계정   : oracle, grid, root
+================================================================================
+
+--------------------------------------------------------------------------------
+ [1] Transaction Guard 서비스
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ srvctl add service -db racdb -service ch16_tg -pdb racpdb1 \
+                   -preferred racdb1 -available racdb2 -commit_outcome TRUE -retention 86400
+[oracle@rac1 ~]$ srvctl start service -db racdb -service ch16_tg
+[oracle@rac1 ~]$ srvctl status service -db racdb
+Service ch16_fan is running on instance(s) racdb2
+Service ch16_taf is running on instance(s) racdb2
+Service ch16_tg is running on instance(s) racdb1
+[oracle@rac1 ~]$ srvctl config service -db racdb -service ch16_tg | egrep 'Commit|Retention|Failover type'
+Commit Outcome: true
+Failover type:
+Retention: 86400 seconds
+
+-- racdb1 이 다시 올라와 ch16_tg 는 선호 인스턴스에서 떴다.
+-- Failover type 이 비어 있다. Transaction Guard 는 AC 없이 혼자 켤 수 있다.
+-- 반대(AC 를 켜면서 commit_outcome 을 빼는 것)는 실습 05 의 PRCD-1259 로 막혀 있다.
+
+[rac1] SQL> alter session set container=racpdb1;
+[rac1] SQL> select name, commit_outcome, retention_timeout, failover_type
+              from dba_services where name like 'ch16%' order by 1;
+
+NAME       COM RETENTION_TIMEOUT FAILOVER_TYPE
+---------- --- ----------------- -------------
+ch16_fan   NO              86400
+ch16_taf   NO              86400 SESSION
+ch16_tg    YES             86400
+
+-- RETENTION_TIMEOUT 86400 은 셋 모두 같다. 지정하지 않아도 기본값이 들어간다.
+-- 실제로 기록을 남기느냐는 COMMIT_OUTCOME 이 정한다.
+
+[rac1] SQL> select owner, table_name, partitioned from dba_tables where table_name like 'LTXID%';
+OWNER  TABLE_NAME    PAR
+------ ------------- ---
+SYS    LTXID_TRANS   YES
+[rac1] SQL> select count(*) from sys.ltxid_trans;
+  COUNT(*)
+----------
+         0
+
+-- 커밋 결과를 담는 테이블이다. 분할 테이블이다(본문 4.7: 인스턴스를 더하면 파티션이 는다).
+-- 아직 아무도 Transaction Guard 서비스로 커밋하지 않아 비어 있다.
+
+--------------------------------------------------------------------------------
+ [2] 흔한 실수 — 한 줄에 두 문장
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s system/<비밀번호>@rac-scan:1521/ch16_fan <<'X'
+insert into system.ch16_t values (10, 'ch16_fan'); commit;
+X
+insert into system.ch16_t values (10, 'ch16_fan'); commit
+                                                 *
+ERROR at line 1:
+ORA-00933: SQL command not properly ended
+
+-- 원인 파악 : SQL*Plus 는 줄 끝의 세미콜론만 문장의 끝으로 본다. 줄 가운데 세미콜론은
+--             문장의 일부가 되어 서버로 간다. 서버는 "insert ... ; commit" 을 한 문장으로 받는다.
+-- 조치     : 한 줄에 한 문장.
+-- 재확인   : 아래 [3] 은 줄을 나눴다.
+
+--------------------------------------------------------------------------------
+ [3] 커밋 세 번 — 켠 서비스와 켜지 않은 서비스
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s system/<비밀번호>@rac-scan:1521/ch16_fan <<'X'
+select sys_context('userenv','instance_name') from dual;
+insert into system.ch16_t values (10, 'ch16_fan');
+commit;
+insert into system.ch16_t values (11, 'ch16_fan');
+commit;
+insert into system.ch16_t values (12, 'ch16_fan');
+commit;
+X
+racdb2
+1 row created.
+Commit complete.
+  (세 번)
+
+[rac1] SQL> select inst_id, service_id, state, count(*) from sys.ltxid_trans group by inst_id, service_id, state;
+no rows selected
+
+-- 같은 세 번을 ch16_tg 로 (racdb1 에 붙었다)
+
+[rac1] SQL> select inst_id, service_id, state, count(*) from sys.ltxid_trans group by inst_id, service_id, state;
+   INST_ID SERVICE_ID      STATE   COUNT(*)
+---------- ---------- ---------- ----------
+         1          3          1          1
+
+[rac1] SQL> select service_id, name from dba_services where name like 'ch16%';
+SERVICE_ID NAME
+---------- --------
+         1 ch16_fan
+         2 ch16_taf
+         3 ch16_tg
+
+-- 켜지 않은 ch16_fan 의 커밋은 아무것도 남기지 않았다.
+-- ch16_tg 의 커밋 세 번은 행 하나를 남겼다. 커밋마다 한 행이 아니다.
+
+--------------------------------------------------------------------------------
+ [4] 행은 세션마다 하나, 커밋마다 번호가 오른다
+--------------------------------------------------------------------------------
+
+-- ch16_tg 로 세션 셋을 더 열었다. 커밋 1 번, 커밋 5 번, insert 뒤 rollback 만.
+
+[rac1] SQL> select inst_id, service_id, txn_uid, commit_no, state,
+                   to_char(start_date,'HH24:MI:SS') st
+              from sys.ltxid_trans order by start_date;
+
+   INST_ID SERVICE_ID    TXN_UID  COMMIT_NO      STATE ST
+---------- ---------- ---------- ---------- ---------- --------
+         1          3          9          2          1 14:45:50
+         1          3          9          0          1 14:46:08
+         1          3          9          4          1 14:46:10
+
+-- 커밋한 세션마다 한 행이다. COMMIT_NO 는 커밋 횟수보다 하나 작다(3 번→2, 1 번→0, 5 번→4).
+-- 세션의 LTXID 는 커밋할 때마다 다음 번호로 넘어가고, 테이블은 마지막 커밋만 기억한다.
+-- rollback 만 한 세션은 행이 없다. 문서의 "LTXID 는 커밋되면 영속되고 롤백되면 다시 쓰인다" 가 이것이다.
+-- 그래서 커밋이 많은 시스템에서도 이 테이블은 커밋 수가 아니라 세션 수만큼 자란다.
+-- 보관 기간(-retention 86400 초)이 지난 행은 데이터베이스가 지운다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 재현 — 결과 조회 API 에 엉뚱한 LTXID
+--------------------------------------------------------------------------------
+
+[oracle@rac1 ~]$ sqlplus -s system/<비밀번호>@rac-scan:1521/ch16_tg <<'X'
+declare c boolean; u boolean;
+begin
+  dbms_app_cont.get_ltxid_outcome(hextoraw('0102030405060708'), c, u);
+end;
+/
+X
+declare c boolean; u boolean;
+*
+ERROR at line 1:
+ORA-14903: Corrupt logical transaction detected.
+ORA-06512: at "SYS.DBMS_APP_CONT", line 20
+ORA-06512: at "SYS.DBMS_APP_CONT", line 71
+
+-- 원인 파악 : GET_LTXID_OUTCOME 은 클라이언트 드라이버가 끊긴 세션에서 받아 둔 LTXID 를
+--             그대로 넘겨야 한다. 임의의 8 바이트는 LTXID 형식이 아니다.
+--             SQL*Plus 는 LTXID 를 꺼내 주지 않는다. 이 API 는 OCI · JDBC 의 LTXID
+--             조회 함수와 짝으로 쓰는 것이다.
+-- 조치     : 애플리케이션에서 연결이 끊긴 직후 드라이버로 LTXID 를 받아 그 값을 넘긴다.
+--            AC 를 쓰면 드라이버가 알아서 부르므로 애플리케이션이 부를 일이 없다.
+-- system 은 DBA 라 실행 권한 문제는 없었다. 애플리케이션 사용자가 직접 부르려면
+-- GRANT EXECUTE ON DBMS_APP_CONT 가 필요하다(본문 4.7).
+
+--------------------------------------------------------------------------------
+ [6] 정리
+--------------------------------------------------------------------------------
+
+[rac1] SQL> drop table system.ch16_t purge;
+[rac1] SQL> drop function system.ch16_slow;
+
+[oracle@rac1 ~]$ srvctl stop service -db racdb -service ch16_fan -force
+[oracle@rac1 ~]$ srvctl remove service -db racdb -service ch16_fan
+-- ch16_taf, ch16_tg 도 같다
+[oracle@rac1 ~]$ srvctl config service -db racdb
+[oracle@rac1 ~]$ srvctl status database -db racdb
+Instance racdb1 is running on node rac1
+Instance racdb2 is running on node rac2
+
+[rac1] SQL> alter session set container=racpdb1;
+[rac1] SQL> select name from dba_services where name like 'ch16%';
+no rows selected
+[rac1] SQL> select count(*) from sys.ltxid_trans;
+  COUNT(*)
+----------
+         4
+
+-- 서비스는 사전에서도 지워졌는데 LTXID_TRANS 의 행은 남아 있다. 하나가 늘었다.
+-- 늘어난 하나는 drop 두 줄을 ch16_tg 세션에서 실행한 것이다. DDL 도 커밋이다.
+-- 남은 행은 보관 기간이 지나면 데이터베이스가 지운다. 손대지 않는다.
+
+[root@rac1 ~]# rm -f /u01/app/19.3.0/grid/racg/usrco/callout.sh /tmp/fan_*.log \
+                     /tmp/taf_*.sh /tmp/taf_*.out /tmp/notaf*.out
+[root@rac2 ~]# rm -f /u01/app/19.3.0/grid/racg/usrco/callout.sh /tmp/fan_*.log \
+                     /tmp/taf_*.sh /tmp/taf_*.out /tmp/notaf*.out
+[root@rac1 ~]# ls -la /u01/app/19.3.0/grid/racg/usrco/
+total 0
+drwxrwxr-x. 2 grid oinstall  6 Nov 10 14:46 .
+drwxr-xr-x. 6 grid oinstall 68 Nov  2 14:22 ..
+
+-- 콜아웃을 두 노드 모두에서 지웠다. 한쪽에만 남으면 그 노드 이벤트만 계속 기록된다.
+
+--------------------------------------------------------------------------------
+ [7] 기준선 확인
+--------------------------------------------------------------------------------
+
+[grid@rac1 ~]$ crsctl stat serverpool | grep NAME
+NAME=Free
+NAME=Generic
+NAME=ora.racdb
+
+[grid@rac1 ~]$ crsctl stat res -t > /tmp/end16.txt
+[grid@rac1 ~]$ diff /tmp/base16.txt /tmp/end16.txt && echo SAME
+SAME
+
+-- 실습 07 [1] 에서 떠 둔 자원 목록과 같다. racdb1 을 세 번 죽였다 살렸지만
+-- 자원의 상태와 배치는 모두 처음으로 돌아왔다.
+
+================================================================================
+ 실습 11 종료 — 사용자 서비스 없음, 콜아웃 없음, 자원 목록 기준선과 같음
+================================================================================
