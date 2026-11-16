@@ -1,0 +1,452 @@
+================================================================================
+ 제13장 실습 03 — ifcfg 파일 직접 편집과 반영
+ 대상   : ol7a (ens33)
+ 목표   : ifcfg 파일을 편집기로 고친 뒤 nmcli connection reload·load 를 하지 않으면
+          무엇이 쓰이는지 확인한다. ifup/ifdown·network 서비스가 NetworkManager 와
+          어떻게 얽혀 있는지, NM_CONTROLLED=no 가 장치를 어떻게 바꾸는지 본다
+ 배경   : OL 7.9 의 NetworkManager 는 ifcfg 파일을 시작할 때 한 번 읽어 메모리에 둔다.
+          파일을 고친 뒤에는 nmcli connection reload(전체) 나 load(파일 하나)로 다시
+          읽게 해야 한다. 옛 network 서비스와 ifup/ifdown 스크립트도 남아 있고,
+          NetworkManager 가 돌고 있으면 대부분 nmcli 로 넘겨 처리한다 (본문 13.2·13.3)
+ 소요   : 약 35분
+ 선행   : ol7-base 스냅샷
+ 계정   : root
+ 주의   : [9] 의 systemctl restart network 는 ens32 도 다시 올린다. SSH 가 잠시 멈출 수 있다
+ 되돌림 : ifcfg-ens33 원본, ens33 주소 없음, NetworkManager 가 ens33 관리
+          → md5sum ifcfg-ens33, nmcli device status
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 바꿀 대상은 두 번째 NIC ens33 하나다. SSH 가 붙은 ens32 는 건드리지 않는다
+-- [9] 의 network 서비스 재시작만 ens32 를 잠깐 다시 올린다
+-- 장치 상태, 파일 지문(md5sum), 주요 키 넷을 남기고 원본은 /root 에 복사해 둔다
+
+[root@ol7a ~]# nmcli device status; ip -br addr show ens33
+DEVICE  TYPE      STATE         CONNECTION 
+ens32   ethernet  connected     ens32      
+ens33   ethernet  disconnected  --         
+lo      loopback  unmanaged     --         
+ens33            UP             
+
+-- nmcli device status 의 네 열
+--   DEVICE      커널 장치 이름
+--   TYPE        ethernet·loopback 등 장치 종류
+--   STATE       connected(활성 연결 있음)·disconnected(관리하지만 활성 연결 없음)·unmanaged(관리 안 함)
+--   CONNECTION  지금 이 장치에 걸린 연결 프로필 이름. -- 는 없음
+-- ip -br addr 의 ens33 줄은 UP 뒤가 비어 있다. 링크는 살아 있고 주소는 없다
+
+[root@ol7a ~]# md5sum /etc/sysconfig/network-scripts/ifcfg-ens33; cp -p /etc/sysconfig/network-scripts/ifcfg-ens33 /root/ifcfg-ens33.orig
+709a178c513f436914a04106c09e3303  /etc/sysconfig/network-scripts/ifcfg-ens33
+
+-- 이 32자리 값이 되돌림 단계에서 그대로 나와야 한다
+-- 원본 사본(/root/ifcfg-ens33.orig)은 cp -p 로 만들었다. -p 는 권한·소유자·시각을 그대로 둔다
+-- 시각까지 같아야 되돌린 뒤 ls -l 로 비교해도 차이가 없다
+
+[root@ol7a ~]# grep -E '^(BOOTPROTO|ONBOOT|NAME|DEVICE)=' /etc/sysconfig/network-scripts/ifcfg-ens33
+BOOTPROTO=dhcp
+NAME=ens33
+DEVICE=ens33
+ONBOOT=no
+
+-- 설치 프로그램이 만든 기본값 그대로다. BOOTPROTO=dhcp(DHCP 로 받음), ONBOOT=no(부팅 때 올리지 않음)
+-- NAME 은 연결 프로필 이름, DEVICE 는 이 프로필이 묶일 장치 이름이다. 둘 다 ens33 이다
+
+--------------------------------------------------------------------------------
+ [1] NetworkManager 가 파일을 언제 읽나
+--------------------------------------------------------------------------------
+
+-- ifcfg-rh 플러그인 설정과 파일 감시 여부를 본다. monitor-connection-files 가 없으면 기본값 false 다.
+[root@ol7a ~]# NetworkManager --print-config | sed -n '/^\[main\]/,/^$/p'
+[main]
+# plugins=ifcfg-rh,ibft
+# rc-manager=file
+# auth-polkit=true
+# dhcp=dhclient
+no-auto-default=*
+ignore-carrier=*
+slaves-order=index
+
+-- --print-config 는 설정 파일과 기본값을 합친 실제 설정을 보인다. sed 로 [main] 묶음만 잘랐다
+-- # 이 붙은 줄은 기본값이라는 표시다. 설정 파일에 적지 않았는데 이 값으로 동작한다
+--   plugins=ifcfg-rh,ibft   ifcfg 파일을 읽고 쓰는 플러그인. 프로필이 /etc/sysconfig/network-scripts 에 저장된다
+--   dhcp=dhclient           DHCP 를 dhclient 프로세스에 맡긴다(실습 02 [변형])
+--   rc-manager=file         resolv.conf 를 파일로 직접 쓴다(실습 01 [10])
+-- 앞에 # 없는 세 줄은 설치 때 들어간 설정이다
+--   no-auto-default=*       프로필 없는 NIC 에 "Wired connection" 자동 프로필을 만들지 않는다
+--   ignore-carrier=*        케이블이 빠져도 주소를 내리지 않는다(서버용 설정)
+-- monitor-connection-files 줄은 없다. 기본값 false 라서, 파일을 고쳐도 NetworkManager 는 스스로 다시 읽지 않는다
+-- [3] 에서 그 결과를 본다
+-- 이 값을 바꾸는 방법은 [더 해 보기] 1 에 있다
+
+--------------------------------------------------------------------------------
+ [2] 편집기로 고친다 — 고정 IP 와 ONBOOT
+--------------------------------------------------------------------------------
+
+-- 실무에서는 vi 로 고친다. 여기서는 화면에 남도록 sed 와 printf 로 같은 편집을 한다
+-- BOOTPROTO 를 none 으로, ONBOOT 를 yes 로 바꾸고 IPADDR·PREFIX 와 설명 주석을 더한다.
+[root@ol7a ~]# sed -i 's/^BOOTPROTO=.*/BOOTPROTO=none/; s/^ONBOOT=.*/ONBOOT=yes/' /etc/sysconfig/network-scripts/ifcfg-ens33
+[root@ol7a ~]# printf '# lab: static address for ens33\nIPADDR=172.16.225.71\nPREFIX=24\n' >> /etc/sysconfig/network-scripts/ifcfg-ens33
+[root@ol7a ~]# diff /root/ifcfg-ens33.orig /etc/sysconfig/network-scripts/ifcfg-ens33
+4c4
+< BOOTPROTO=dhcp
+---
+> BOOTPROTO=none
+15c15,18
+< ONBOOT=no
+---
+> ONBOOT=yes
+> # lab: static address for ens33
+> IPADDR=172.16.225.71
+> PREFIX=24
+
+-- diff 의 4c4 는 4번째 줄이 바뀌었다(change)는 뜻이다. < 는 원본, > 는 고친 파일
+-- 15c15,18 은 원본 15줄이 고친 파일 15~18줄로 바뀌었다는 뜻이다. ONBOOT 와 새로 붙인 세 줄이다
+-- 파일은 고쳤다. 아직 NetworkManager 에게는 아무것도 알리지 않았다
+--
+-- 손으로 넣은 # lab: 줄은 셸 주석이다. ifcfg 는 셸 변수 파일이라 # 줄을 무시한다
+-- 이 줄이 nmcli 로 다시 쓸 때도 남는지는 [변형] 에서 본다
+
+--------------------------------------------------------------------------------
+ [3] 오류 ① — reload 없이 올린다
+--------------------------------------------------------------------------------
+
+-- 파일을 고쳤으니 올리면 될 것 같다.
+-- 올리기 전에 NetworkManager 가 이 프로필을 어떻게 알고 있는지 먼저 묻는다
+
+[root@ol7a ~]# nmcli -f ipv4.method,ipv4.addresses connection show ens33
+ipv4.method:                            auto
+ipv4.addresses:                         --
+
+-- 프로필의 ipv4.method 가 여전히 auto(DHCP), 주소는 -- 다. 파일과 NetworkManager 의 기억이 다르다
+-- 이 줄을 보고 멈췄다면 오류는 생기지 않는다. 보통은 이 확인 없이 바로 up 한다
+
+[root@ol7a ~]# nmcli connection up ens33
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/2)
+[root@ol7a ~]# ip -4 addr show ens33 | grep inet
+    inet 172.16.225.132/24 brd 172.16.225.255 scope global dynamic noprefixroute ens33
+
+-- 172.16.225.71 이 아니라 172.16.225.132 가 걸렸다. dynamic 은 DHCP 임대 주소라는 표시다
+-- VMware NAT 의 DHCP 서버가 준 주소다. 실습 02 [변형] 에서 그 서버(172.16.225.254)를 확인한다
+-- 오류 흐름
+-- 증상   : 파일에 IPADDR=172.16.225.71 을 넣고 up 했는데 inet 172.16.225.132 ... dynamic 이 걸렸다
+-- 원인   : NetworkManager 는 파일을 다시 읽지 않았다(monitor-connection-files 기본 false). 메모리의 옛 프로필(auto)로 올렸다
+-- 조치   : nmcli connection reload 로 다시 읽게 한 뒤 다시 올린다
+-- 재확인 : nmcli -f ipv4.method 가 manual, ip -4 addr 에 172.16.225.71/24 가 보여야 한다
+--
+-- 운영에서 이 실수는 조용히 지나간다. DHCP 서버가 있는 망이면 엉뚱한 주소로 잘 올라오기 때문이다
+-- 고정 IP 를 기대한 서버가 임대 주소로 떠 있다가 임대가 끝나면 주소가 바뀐다
+
+--------------------------------------------------------------------------------
+ [4] reload 후 다시 올린다
+--------------------------------------------------------------------------------
+
+-- reload 는 /etc/sysconfig/network-scripts 의 ifcfg 파일을 모두 다시 읽는다. 출력이 없으면 성공이다
+
+[root@ol7a ~]# nmcli connection reload
+
+-- 다시 읽었는지는 같은 질문을 한 번 더 해 보면 안다. 이번에는 connection.autoconnect 도 함께 본다
+
+[root@ol7a ~]# nmcli -f ipv4.method,ipv4.addresses,connection.autoconnect connection show ens33
+ipv4.method:                            manual
+ipv4.addresses:                         172.16.225.71/24
+connection.autoconnect:                 yes
+
+-- 세 값이 파일 내용으로 바뀌었다. ONBOOT=yes 가 connection.autoconnect yes 로 읽혔다
+-- 아직 장치에는 .132 가 걸려 있다. 다시 읽기와 반영은 다른 단계다
+-- nmcli connection show ens33 를 지금 -f 없이 보면 IP4.ADDRESS[1] 은 여전히 172.16.225.132/24 다
+
+-- 반영은 up 으로 한다. 같은 명령 줄에서 바로 주소를 확인한다
+
+[root@ol7a ~]# nmcli connection up ens33; ip -4 addr show ens33 | grep inet
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/3)
+    inet 172.16.225.71/24 brd 172.16.225.255 scope global noprefixroute ens33
+
+-- 이번에는 172.16.225.71/24 다. dynamic 이 없어졌다(고정 주소)
+-- noprefixroute 는 커널이 이 주소로 연결 경로를 자동으로 만들지 않게 한 표시다. 경로는 NetworkManager 가 따로 넣는다
+-- ActiveConnection/2 → /3 으로 번호가 올랐다. up 할 때마다 활성 연결 객체가 새로 생긴다
+-- 같은 프로필을 up 하면 내렸다 올린다. 그 사이 .132 임대는 버려졌다
+
+--------------------------------------------------------------------------------
+ [5] 파일 하나만 다시 읽기 — connection load
+--------------------------------------------------------------------------------
+
+-- reload 는 디렉터리 전체를 다시 읽는다. 파일 하나만 바꿨으면 load 로 그 파일만 읽힐 수 있다.
+-- 주소만 .74 로 바꿔 본다. 이번에는 reload 대신 load, up 대신 reapply 를 쓴다
+
+[root@ol7a ~]# sed -i 's/^IPADDR=.*/IPADDR=172.16.225.74/' /etc/sysconfig/network-scripts/ifcfg-ens33
+[root@ol7a ~]# nmcli connection load /etc/sysconfig/network-scripts/ifcfg-ens33; nmcli -g ipv4.addresses connection show ens33
+172.16.225.74/24
+
+-- load 다음에 -g 로 값만 뽑았다. 프로필이 곧바로 .74 를 알고 있다
+-- load 는 파일 경로 하나를 받는다. 여러 파일을 고쳤으면 reload 가 편하다
+
+-- reapply 는 장치 이름을 받는다(connection 이 아니라 device 하위 명령이다)
+
+[root@ol7a ~]# nmcli device reapply ens33; ip -4 addr show ens33 | grep inet
+Connection successfully reapplied to device 'ens33'.
+    inet 172.16.225.74/24 brd 172.16.225.255 scope global noprefixroute ens33
+
+-- reapply 는 연결을 내리지 않고 바뀐 속성만 적용한다. .71 이 빠지고 .74 가 들어갔다
+-- 활성 연결 번호를 새로 받지 않았다(출력에 D-Bus 경로가 없다). up 과의 차이는 실습 02 [9] 에서 로그로 비교한다
+
+--------------------------------------------------------------------------------
+ [6] ifdown/ifup 은 누구에게 일을 넘기나
+--------------------------------------------------------------------------------
+
+-- 옛 스크립트 ifup·ifdown 은 7.9 에도 있다. NetworkManager 가 관리하는 장치면 nmcli 로 넘긴다.
+-- 먼저 ifdown 으로 내린다. grep -c 는 맞는 줄 수만 센다. 0 이면 IPv4 주소가 없다
+
+[root@ol7a ~]# ifdown ens33; ip -4 addr show ens33 | grep -c inet
+Device 'ens33' successfully disconnected.
+0
+
+-- ifdown 의 출력이 nmcli device disconnect 의 출력과 같다. grep -c inet 이 0 이니 주소가 모두 빠졌다
+
+-- 다시 ifup 으로 올린다. 출력 문구를 [4] 의 nmcli connection up 과 비교한다
+
+[root@ol7a ~]# ifup ens33; ip -4 addr show ens33 | grep inet
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/4)
+    inet 172.16.225.74/24 brd 172.16.225.255 scope global noprefixroute ens33
+
+-- ifup 은 Connection successfully activated (D-Bus active path: ...) 를 찍었다. nmcli connection up 과 같은 문구다
+-- 셸 스크립트가 직접 ip 명령을 친 것이 아니라 NetworkManager 에게 맡겼다
+-- 주소도 .74 그대로다. ifup 이 파일을 다시 읽은 것이 아니라 NetworkManager 메모리의 프로필을 올렸다
+
+-- 넘기는 부분은 스크립트 안에서 확인할 수 있다.
+[root@ol7a ~]# grep -n 'nmcli' /etc/sysconfig/network-scripts/ifup /etc/sysconfig/network-scripts/ifdown | head -6
+/etc/sysconfig/network-scripts/ifup:73:    nmcli con up uuid "$UUID"
+/etc/sysconfig/network-scripts/ifdown:46:        DEVICE=$(nmcli -t --fields uuid,device con show --active | awk -F ':' "\$1 == \"$UUID\" { print \$2 }")
+/etc/sysconfig/network-scripts/ifdown:49:        if ! LC_ALL=C nmcli -t -f STATE,DEVICE dev status | egrep -q "^(failed|disconnected|unmanaged|unavailable):$DEVICE$"; then
+/etc/sysconfig/network-scripts/ifdown:50:            nmcli dev disconnect "$DEVICE"
+
+-- head -6 으로 앞 몇 줄만 봤다. 짚을 줄
+--   ifup:73      nmcli con up uuid "$UUID"   → ifcfg 의 UUID 로 연결을 올린다
+--   ifdown:46    활성 연결 목록에서 UUID 로 장치 이름을 찾는다
+--   ifdown:49~50 장치가 이미 끊긴 상태가 아니면 nmcli dev disconnect
+-- 이 분기는 NetworkManager 가 돌고 있고 NM_CONTROLLED 가 no 가 아닐 때만 탄다. [8] 에서 반대 경우를 본다
+-- [OL8/9] OL 8 의 ifup 은 network-scripts 패키지를 따로 깔지 않으면 nmcli 를 부르는 얇은 래퍼다. OL 9 에는 이 스크립트가 없다
+
+--------------------------------------------------------------------------------
+ [7] NM_CONTROLLED=no — NetworkManager 에서 빼기
+--------------------------------------------------------------------------------
+
+-- 이 키를 no 로 두면 NetworkManager 가 장치를 관리하지 않는다(unmanaged).
+-- 파일 끝에 한 줄을 붙이고 reload 한다. sleep 2 는 NetworkManager 가 장치를 놓아줄 시간을 준다
+
+[root@ol7a ~]# echo 'NM_CONTROLLED=no' >> /etc/sysconfig/network-scripts/ifcfg-ens33; nmcli connection reload; sleep 2
+[root@ol7a ~]# nmcli device status; ip -4 addr show ens33 | grep inet
+DEVICE  TYPE      STATE      CONNECTION 
+ens32   ethernet  connected  ens32      
+ens33   ethernet  unmanaged  --         
+lo      loopback  unmanaged  --         
+
+-- ens33 의 STATE 가 unmanaged 로 바뀌었다. reload 만으로 관리 대상에서 빠졌다
+-- ip -4 addr ... | grep inet 이 아무것도 찍지 않았다. NetworkManager 가 손을 떼면서 .74 를 내렸다
+-- 관리 주체가 바뀌는 순간 장치는 주소 없는 상태가 된다. 원격으로 이 키를 넣을 때 조심할 점이다
+-- 같은 일을 ens32 에 하면 SSH 가 그 자리에서 끊긴다
+--
+-- 예전 RAC 설치 문서는 사설망 NIC 에 NM_CONTROLLED=no 를 권하기도 했다
+-- NetworkManager 가 사설망 주소를 건드리는 사고를 막으려는 것이었다. 7.9 에서는 그 대가로 nmcli 를 쓸 수 없다
+
+--------------------------------------------------------------------------------
+ [8] 오류 ② — 관리 주체가 바뀐 장치를 nmcli 로 다룬다
+--------------------------------------------------------------------------------
+
+-- nmcli 로 평소처럼 올려 본다
+
+[root@ol7a ~]# nmcli connection up ens33
+Error: unknown connection 'ens33'.
+
+-- 연결 목록에 ens33 이 있는지 머리글과 함께 grep 한다
+
+[root@ol7a ~]# nmcli connection show | grep -E 'NAME|ens33'
+NAME   UUID                                  TYPE      DEVICE 
+
+-- 연결 목록에서 ens33 줄이 아예 사라졌다. 머리글만 남았다
+-- 오류 흐름
+-- 증상   : nmcli connection up ens33 → Error: unknown connection 'ens33'.
+-- 원인   : NM_CONTROLLED=no 인 ifcfg 는 NetworkManager 의 프로필 목록에서 빠진다. 파일은 그대로 있다
+-- 조치   : 이 장치는 ifup/ifdown(initscripts)으로 다룬다. 다시 nmcli 로 다루려면 [10] 처럼 키를 지우고 reload
+-- 재확인 : ifup 뒤 ip -4 addr 에 새 주소, nmcli device status 에 unmanaged
+
+-- 이제 이 장치는 ifup/ifdown 이 직접 다룬다. 주소를 바꾸고 ifdown/ifup 으로 반영한다.
+[root@ol7a ~]# sed -i 's/^IPADDR=.*/IPADDR=172.16.225.76/' /etc/sysconfig/network-scripts/ifcfg-ens33
+[root@ol7a ~]# ifdown ens33; ifup ens33; ip -4 addr show ens33 | grep inet
+    inet 172.16.225.76/24 brd 172.16.225.255 scope global ens33
+
+-- 이번 inet 줄에는 noprefixroute 가 없다. NetworkManager 가 아니라 ifup-eth 스크립트가 ip 명령으로 넣었기 때문이다
+-- 같은 장치라도 누가 구성했는지 inet 줄의 꼬리표로 구분할 수 있다
+-- ifdown·ifup 이 아무 문구도 찍지 않았다. [6] 처럼 nmcli 로 넘기지 않았다는 뜻이다
+
+-- NetworkManager 는 이 변화를 모른다.
+-- device show 는 장치 쪽 정보다. 관리하지 않는 장치도 보인다
+
+[root@ol7a ~]# nmcli -f GENERAL.STATE,IP4.ADDRESS device show ens33
+GENERAL.STATE:                          10 (unmanaged)
+IP4.ADDRESS[1]:                         172.16.225.76/24
+
+-- 10 (unmanaged) 의 10 은 NetworkManager 의 장치 상태 번호다(100 이 activated)
+--   30 disconnected, 70 ip-config, 100 activated 처럼 커질수록 활성화에 가깝다
+-- 관리하지 않아도 주소는 커널에서 읽어 보여 준다. 바꾸지는 못한다
+
+--------------------------------------------------------------------------------
+ [9] network 서비스 재시작 — 모든 ONBOOT=yes 장치를 다시 올린다
+--------------------------------------------------------------------------------
+
+-- network 서비스가 부팅 때 켜지는지, 지금 돌고 있는지 본다
+
+[root@ol7a ~]# systemctl is-enabled network; systemctl is-active network
+
+-- network.service 는 systemd 유닛이 아니라 /etc/rc.d/init.d/network 스크립트다. 그래서 chkconfig 로 넘긴다는 안내가 먼저 나온다
+-- enabled·active. NetworkManager 와 함께 켜져 있는 것이 7.9 기본 상태다
+
+network.service is not a native service, redirecting to /sbin/chkconfig.
+Executing /sbin/chkconfig network --level=5
+enabled
+active
+
+-- network 서비스는 ONBOOT=yes 인 장치를 차례로 ifdown/ifup 한다. ens32 도 포함된다.
+[root@ol7a ~]# time systemctl restart network
+
+real    0m4.723s
+user    0m0.000s
+sys     0m0.002s
+
+-- 4.7초 걸렸다. 그동안 ens32 도 내렸다 올렸다(아래 로그). SSH 세션은 그 사이를 버텼다
+
+-- 결과는 두 군데서 본다. 장치의 주소와 network 서비스의 로그(tail -6 으로 끝 여섯 줄)
+
+[root@ol7a ~]# ip -br addr; journalctl -u network --since '-3min' --no-pager | tail -6
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens32            UP             172.16.225.61/24 fe80::87f4:d993:7b43:e0c1/64 
+ens33            UP             172.16.225.76/24 fe80::20c:29ff:feac:5eaa/64 
+Nov 16 09:48:52 ol7a.example.com systemd[1]: Starting LSB: Bring up/down networking...
+Nov 16 09:48:52 ol7a.example.com network[3052]: Bringing up loopback interface:  [  OK  ]
+Nov 16 09:48:52 ol7a.example.com network[3052]: Bringing up interface ens32:  Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/5)
+Nov 16 09:48:52 ol7a.example.com network[3052]: [  OK  ]
+Nov 16 09:48:56 ol7a.example.com network[3052]: Bringing up interface ens33:  [  OK  ]
+Nov 16 09:48:56 ol7a.example.com systemd[1]: Started LSB: Bring up/down networking.
+
+-- 세 장치가 모두 주소를 갖고 있다. ens33 은 .76 이 그대로이고 IPv6 링크 로컬 주소가 새로 생겼다
+-- 로그를 위에서부터
+--   loopback      → ifcfg-lo 를 올림
+--   ens32         → Connection successfully activated ... NetworkManager 관리라 nmcli 로 넘김
+--   ens33         → [  OK  ] 만 찍힘. NM_CONTROLLED=no 라 스크립트가 직접 올림
+-- 같은 network 서비스 안에서 두 장치가 서로 다른 길로 올라갔다
+-- time 의 real 은 걸린 시간, user·sys 는 이 셸이 쓴 CPU 시간이다. 일은 systemd 가 했으니 0 에 가깝다
+-- 원격 접속 중 systemctl restart network 는 ONBOOT=yes 인 모든 장치를 건드린다. 접속 장치가 끊길 수 있다
+
+--------------------------------------------------------------------------------
+ [10] NetworkManager 관리로 되돌린다
+--------------------------------------------------------------------------------
+
+-- 스크립트가 건 주소를 스크립트로 먼저 내린다. 그다음 키를 지우고 reload 한다
+
+[root@ol7a ~]# ifdown ens33; sed -i '/^NM_CONTROLLED=/d' /etc/sysconfig/network-scripts/ifcfg-ens33; nmcli connection reload; sleep 2
+[root@ol7a ~]# nmcli device status
+DEVICE  TYPE      STATE      CONNECTION 
+ens32   ethernet  connected  ens32      
+ens33   ethernet  connected  ens33      
+lo      loopback  unmanaged  --         
+
+-- ifdown 으로 스크립트가 걸었던 .76 을 먼저 내리고, 키를 지운 뒤 reload 했다
+-- ens33 이 connected, CONNECTION 이 ens33 이다. ONBOOT=yes(autoconnect yes)라 reload 만으로 자동 활성화됐다
+
+--------------------------------------------------------------------------------
+ [변형] 손으로 고친 파일을 nmcli 가 다시 쓰면
+--------------------------------------------------------------------------------
+
+-- 지금 파일에는 [2] 에서 손으로 넣은 주석 한 줄이 있다. nmcli 로 속성 하나를 바꾸면 파일이 어떻게 되는지 본다
+[root@ol7a ~]# cp -p /etc/sysconfig/network-scripts/ifcfg-ens33 /root/ifcfg-ens33.hand
+
+-- 사본을 떠 두고 DNS 서버 하나를 nmcli 로 넣는다. 사본과 diff 하면 NetworkManager 가 고친 줄만 보인다
+
+[root@ol7a ~]# nmcli connection modify ens33 ipv4.dns 172.16.225.2
+[root@ol7a ~]# diff /root/ifcfg-ens33.hand /etc/sysconfig/network-scripts/ifcfg-ens33
+18a19
+> DNS1=172.16.225.2
+
+-- 18a19 는 18번째 줄 뒤에 한 줄이 더해졌다는 뜻이다. 바뀐 것은 DNS1 한 줄뿐이다
+-- 18번째 줄은 PREFIX=24 다(원본 15줄 + [2] 에서 더한 세 줄). DNS1 은 파일 끝에 붙었다
+-- [2] 에서 넣은 # lab: 주석 줄은 살아 있다. 7.9 의 ifcfg-rh 플러그인은 이 파일에서 손댈 키만 고쳐 썼다
+-- 그래도 손으로 쓴 키 이름이 틀렸거나 따옴표가 엉켰다면 nmcli 가 다시 쓸 때 정리될 수 있다. 손 편집 뒤에는 diff 로 확인한다
+
+--------------------------------------------------------------------------------
+ [되돌림]
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# nmcli connection down ens33; cp -p /root/ifcfg-ens33.orig /etc/sysconfig/network-scripts/ifcfg-ens33; nmcli connection reload
+Connection 'ens33' successfully deactivated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/6)
+
+-- 연결을 먼저 내리고 원본을 덮은 뒤 reload 했다. 순서를 바꾸면 .71·.74 같은 주소가 장치에 남는다
+-- 원본은 ONBOOT=no 라 reload 해도 자동으로 올라오지 않는다
+
+-- [0] 과 같은 세 가지를 다시 본다. 파일 지문, 장치 상태, 주소
+
+[root@ol7a ~]# md5sum /etc/sysconfig/network-scripts/ifcfg-ens33; nmcli device status; ip -br addr show ens33
+709a178c513f436914a04106c09e3303  /etc/sysconfig/network-scripts/ifcfg-ens33
+DEVICE  TYPE      STATE         CONNECTION 
+ens32   ethernet  connected     ens32      
+ens33   ethernet  disconnected  --         
+lo      loopback  unmanaged     --         
+ens33            UP             
+
+-- md5sum 이 [0] 과 같은 709a178c… 다. 파일이 한 글자도 다르지 않다
+-- ens33 은 다시 disconnected, 주소 없음. 시작 전과 같은 상태다
+
+-- 실습 중 만든 사본 두 개를 지운다. /root 에도 흔적을 남기지 않는다
+
+[root@ol7a ~]# rm -f /root/ifcfg-ens33.orig /root/ifcfg-ens33.hand
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                     시작 전          변경 중                         되돌린 뒤
+--  ifcfg-ens33 md5          709a178c…        (여러 번 바뀜)                   709a178c…
+--  ens33 STATE              disconnected     connected → unmanaged → connected disconnected
+--  reload 없이 up 한 주소   -                172.16.225.132 (dynamic, DHCP)   -
+--  reload 뒤 up 한 주소     -                172.16.225.71/24                 -
+--  load + reapply           -                172.16.225.74/24                 -
+--  NM_CONTROLLED=no 뒤 주소 -                없음 → ifup 으로 .76 (noprefixroute 없음) -
+--  network 재시작 시간      -                4.7초 (ens32 는 nmcli, ens33 은 스크립트) -
+--
+--
+-- 파일 → (reload/load) → NetworkManager 메모리 → (up/reapply) → 커널
+-- 두 화살표 중 하나라도 빠지면 옛 값이 쓰인다
+--
+--  어느 층을 보는가          명령
+--  디스크(ifcfg)             cat·grep·diff /etc/sysconfig/network-scripts/ifcfg-ens33
+--  NetworkManager 메모리     nmcli -f ipv4.method,ipv4.addresses connection show ens33
+--  커널(장치에 걸린 값)      ip -4 addr show ens33
+--  관리 주체                 nmcli device status 의 STATE (unmanaged 인가)
+--
+--  반영 명령                 하는 일                          이번 실습에서
+--  nmcli connection reload   ifcfg 전체를 다시 읽음           [4] [10]
+--  nmcli connection load F   파일 하나를 다시 읽음            [5]
+--  nmcli connection up       연결을 내렸다 올림               [4]
+--  nmcli device reapply      활성 연결을 유지한 채 적용       [5]
+--  ifup / ifdown             관리 장치면 nmcli 로, 아니면 직접 [6] [8]
+--  systemctl restart network ONBOOT=yes 장치 전체 ifdown·ifup [9]
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. /etc/NetworkManager/conf.d/90-monitor.conf 에 [main] monitor-connection-files=true 를 넣고 NetworkManager 를 재시작한 뒤
+--    [3] 을 다시 해 본다. 확인: 파일 저장 직후 nmcli -f ipv4.addresses connection show ens33 값이 바뀌는가
+--    (NetworkManager.conf(5) 는 이 옵션을 쓰지 말라고 권한다. 반쯤 쓴 파일을 읽을 수 있어서다)
+-- 2. ens33 에 NM_CONTROLLED=no 를 둔 채 재부팅하면 누가 주소를 거는지 journalctl -b -u network 로 확인한다
+--    확인: ens33 줄에 Bringing up interface ens33:  [  OK  ] 가 있고, nmcli device status 가 unmanaged 인가
+-- 3. route-ens33 파일에 10.10.10.0/24 via 172.16.225.2 dev ens33 을 넣고 reload·up 한 뒤 ip route 로 반영 여부를 본다
+--    확인: ip route 에 10.10.10.0/24 via 172.16.225.2 dev ens33 proto static 줄이 생기는가
+-- 4. ifcfg 에 키 이름을 일부러 틀리게(IPADR=) 쓰고 reload 한다
+--    확인: 오류 메시지가 나오는가, nmcli 가 그 값을 어떻게 읽었는가(-f ipv4.addresses)
+--    키 이름 오타는 대개 오류 없이 무시된다. 그래서 고친 뒤에는 파일이 아니라 nmcli 의 값으로 확인한다
+-- [OL8/9] OL 9 에서는 새 프로필이 /etc/NetworkManager/system-connections/*.nmconnection 으로 저장된다
+-- [OL8/9] 그 파일을 고친 뒤에도 nmcli connection reload 가 필요한 것은 같다
+
+================================================================================
+ 실습 03 종료
+================================================================================

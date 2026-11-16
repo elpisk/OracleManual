@@ -1,0 +1,458 @@
+================================================================================
+ 제18장 실습 02 — 메모리 압박과 스왑, OOM 킬러
+ 대상   : ol7a (메모리 3.6GB, 스왑 3.9GB)
+ 목표   : 페이지 캐시와 익명 메모리를 따로 채워 free 의 free·available 열이
+          어떻게 다르게 움직이는지 보고, 메모리를 넘치게 써서 vmstat 의 si·so
+          와 스왑 사용량을 확인한다. 스왑을 끈 상태에서 OOM 킬러를 일으켜
+          dmesg 기록으로 누가 왜 죽었는지 읽는다
+ 배경   : 리눅스는 남는 메모리를 페이지 캐시로 쓴다. 그래서 free 열은 늘 작고,
+          "지금 새로 쓸 수 있는 양"은 캐시 중 회수할 수 있는 몫을 더한 available
+          열이 알려 준다. 익명 메모리(프로세스가 malloc 한 것)가 실제 메모리를
+          넘으면 스왑으로 밀려나고, 스왑까지 모자라면 커널이 점수가 가장 높은
+          프로세스 하나를 죽인다(본문 18.3)
+ 소요   : 약 30분
+ 선행   : ol7-base 스냅샷. 끝나고 스냅샷으로 되돌리는 것을 권한다(⚠)
+ 계정   : root
+ 주의   : OOM 킬러가 실제로 프로세스를 죽인다. 시험용 프로세스만 죽도록
+          범위를 잡았다. /var/tmp 에 2GB 파일을 잠깐 만든다
+ 되돌림 : 시험 프로세스 0개, swapon 으로 스왑 다시 켬, 시험 파일 삭제.
+          확인은 free -m · swapon -s · ls /var/tmp
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629         169        3294           8         164        3255
+Swap:          3967           0        3967
+-- 시작 값: total 3629, used 169, free 3294, buff/cache 164,
+-- available 3255, 스왑 사용 0
+[root@ol7a ~]# swapon -s; cat /proc/sys/vm/swappiness /proc/sys/vm/overcommit_memory
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+30
+0
+-- 스왑 장치는 /dev/dm-1(LV ol/swap) 하나, 4063228 KB, 우선순위 -2
+-- swappiness 30(7.9 기본), overcommit_memory 0(추정 방식 허용)
+-- sshd 가 OOM 킬러에서 빠져 있는지 먼저 본다. 접속이 끊기면 실습을
+-- 이어 갈 수 없다.
+-- oom_score_adj 는 -1000~1000. -1000 이면 OOM 킬러가 고르지 않는다.
+[root@ol7a ~]# for p in $(pgrep -x sshd); do echo "$p $(cat /proc/$p/oom_score_adj) $(tr '\0' ' ' </proc/$p/cmdline)"; done
+1411 -1000 /usr/sbin/sshd -D 
+1984 0 sshd: root@notty     
+-- 1411 이 연결을 받는 sshd 리스너다. oom_score_adj -1000 → OOM
+-- 킬러가 고르지 않는다
+-- 1984 는 이 러너의 접속을 맡은 자식 sshd 로 0 이다. 리스너만 살아
+-- 있으면 다시 접속할 수 있다
+-- sshd 가 스스로 리스너 값을 -1000 으로 둔다(OpenSSH 의 리눅스 OOM
+-- 보호)
+
+--------------------------------------------------------------------------------
+ [1] free 의 여섯 열
+--------------------------------------------------------------------------------
+-- -m : MiB 단위. -h 는 사람이 읽는 단위를 골라 준다.
+[root@ol7a ~]# free -h
+              total        used        free      shared  buff/cache   available
+Mem:           3.5G        169M        3.2G        8.6M        164M        3.2G
+Swap:          3.9G          0B        3.9G
+-- 여섯 열
+--   total       : 커널이 관리하는 메모리. 4GB VM 에서 3.5G(3629MB)
+--   used        : total - free - buff/cache. 프로세스와 커널이 쓰는 몫
+--   free        : 아무 데도 안 쓰인 메모리
+--   shared      : tmpfs·공유 메모리(meminfo 의 Shmem 8880 kB)
+--   buff/cache  : 페이지 캐시 + 버퍼 + 회수할 수 있는 slab
+--   available   : 스왑 없이 새로 쓸 수 있다는 커널 추정치
+-- Swap 줄은 total·used·free 셋만 있다
+
+--------------------------------------------------------------------------------
+ [2] /proc/meminfo — free 가 읽는 원본
+--------------------------------------------------------------------------------
+-- free·vmstat·top 은 모두 /proc/meminfo 를 읽어 계산한다. 이
+-- 실습에서 볼 필드만 고른다.
+[root@ol7a ~]# grep -E '^(MemTotal|MemFree|MemAvailable|Buffers|Cached|SwapCached|Active\(anon\)|Inactive\(anon\)|Active\(file\)|Inactive\(file\)|SwapTotal|SwapFree|Dirty|AnonPages|Shmem|SReclaimable|CommitLimit|Committed_AS):' /proc/meminfo
+MemTotal:        3716112 kB
+MemFree:         3373516 kB
+MemAvailable:    3333984 kB
+Buffers:            2116 kB
+Cached:           136180 kB
+SwapCached:            0 kB
+Active(anon):      72320 kB
+Inactive(anon):     8504 kB
+Active(file):      56792 kB
+Inactive(file):    72624 kB
+SwapTotal:       4063228 kB
+SwapFree:        4063228 kB
+Dirty:                16 kB
+AnonPages:         72028 kB
+Shmem:              8880 kB
+SReclaimable:      30544 kB
+CommitLimit:     5921284 kB
+Committed_AS:     361740 kB
+-- MemTotal 3716112 kB = free 의 total 3629MB
+-- MemFree 3373516 → free 열, MemAvailable 3333984 → available 열
+-- Cached 136180·Buffers 2116·SReclaimable 30544 의 합이 buff/cache
+-- 에 가깝다
+-- AnonPages 72028 : 지금 프로세스들의 익명 메모리 70MB 남짓
+-- Active·Inactive 의 anon·file : 커널이 회수 후보를 고르는 LRU
+-- 목록. Inactive(file) 가 먼저 버려진다
+-- CommitLimit 5921284 = 스왑 + 메모리의 50%. overcommit_memory 가 2
+-- 일 때만 강제된다
+-- Committed_AS 361740 : 프로세스들이 약속받은 가상 메모리 합
+
+--------------------------------------------------------------------------------
+ [3] 페이지 캐시 채우기 — free 열만 보면 틀린다
+--------------------------------------------------------------------------------
+-- 캐시를 비우고 시작한다. drop_caches 에 3 을 쓰면 페이지 캐시와
+-- dentry·inode 캐시를 버린다.
+-- sync 로 더러운 페이지를 먼저 내려야 버릴 수 있는 몫이 커진다.
+[root@ol7a ~]# sync; echo 3 > /proc/sys/vm/drop_caches; free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629         164        3394           8          69        3308
+-- 캐시를 버리자 buff/cache 164 → 69, free 3294 → 3394. 출발점이다
+Swap:          3967           0        3967
+-- 2GB 파일을 쓰고 다시 읽는다. 읽은 내용은 페이지 캐시에 남는다.
+[root@ol7a ~]# dd if=/dev/zero of=/var/tmp/cache.dat bs=1M count=2000 status=none; cat /var/tmp/cache.dat >/dev/null; free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629         162        1388           8        2078        3246
+-- 2GB 파일 하나를 쓰고 읽었더니 buff/cache 69 → 2078, free 3394 →
+-- 1388
+-- used 는 162 그대로, available 은 3308 → 3246 으로 거의 그대로다
+Swap:          3967           0        3967
+-- 흔한 감시 스크립트를 흉내 낸다. free 열이 1024MB 아래면 경보를
+-- 낸다.
+[root@ol7a ~]# f=$(free -m | awk '/^Mem:/{print $4}'); a=$(free -m | awk '/^Mem:/{print $7}'); [ $f -lt 1024 ] && echo "ALERT: low memory free=${f}MB" ; echo "available=${a}MB"
+available=3246MB
+-- 경보 기준 1024 에는 닿지 않아 ALERT 줄은 안 나왔다. 파일이 2GB 라
+-- free 가 1388 에서 멈췄다
+-- 증상   : free 열이 3394 → 1388 MB 로 59% 줄었다. free 열만 보는
+--          감시라면 "메모리가 반 넘게 사라졌다" 로 읽는다
+-- 원인   : 늘어난 것은 buff/cache(2078) 다. 읽은 파일 내용을 캐시에
+--          둔 것이고,
+--          필요하면 커널이 바로 회수한다
+-- 조치   : 판단은 available(3246) 과 스왑 입출력으로 한다. free 열
+--          경보는 쓰지 않는다
+-- 재확인 : 아래에서 캐시를 버리자 free 가 3085 로 돌아왔다
+-- 캐시를 다시 버리면 free 가 돌아오는지 본다. 돌아오면 그 메모리는
+-- 원래 쓸 수 있던 것이다.
+[root@ol7a ~]# echo 3 > /proc/sys/vm/drop_caches; free -m; rm -f /var/tmp/cache.dat
+              total        used        free      shared  buff/cache   available
+Mem:           3629         161        3085           8         381        3248
+-- free 1388 → 3085. buff/cache 381 이 남은 것은 rm 전이라 파일
+-- 일부가 다시 읽혔기 때문이다
+-- available 은 이 과정 내내 3246~3248 로 움직이지 않았다
+Swap:          3967           0        3967
+
+--------------------------------------------------------------------------------
+ [4] 익명 메모리 — 프로세스가 직접 잡은 메모리
+--------------------------------------------------------------------------------
+-- 메모리를 정해진 만큼 잡고 버티는 작은 프로그램을 쓴다.
+--   인자 1 : 잡을 MB(50MB 씩 0.1초 간격으로 늘린다)  2 : 버틸 초  3 : 1 이면 잡은 페이지를 계속 건드린다
+-- bytearray 는 0 으로 채워 만들어지므로 페이지가 실제로 할당된다.
+[root@ol7a ~]# mkdir -p /root/load; cat > /root/load/memhog.py <<'EOF'
+import sys, time
+mb, secs = int(sys.argv[1]), int(sys.argv[2])
+touch = len(sys.argv) > 3 and sys.argv[3] == "1"
+blk = []
+for i in range(mb // 50):
+    blk.append(bytearray(50 << 20))
+    time.sleep(0.1)
+end = time.time() + secs
+while time.time() < end:
+    if touch:
+        for b in blk:
+            for off in range(0, len(b), 4096):
+                b[off] = 1
+    else:
+        time.sleep(1)
+EOF
+-- 같은 파이썬을 이름만 다르게 부르려고 심볼릭 링크를 둔다. 프로세스
+-- 이름(comm)이 링크 이름이 된다.
+[root@ol7a ~]# ln -s /usr/bin/python2.7 /root/load/dbsim; ln -s /usr/bin/python2.7 /root/load/runaway; ln -s /usr/bin/python2.7 /root/load/batch; ls -l /root/load
+total 4
+lrwxrwxrwx. 1 root root  18 Nov 16 16:08 batch -> /usr/bin/python2.7
+lrwxrwxrwx. 1 root root  18 Nov 16 16:08 dbsim -> /usr/bin/python2.7
+-rw-r--r--. 1 root root 395 Nov 16 16:08 memhog.py
+lrwxrwxrwx. 1 root root  18 Nov 16 16:08 runaway -> /usr/bin/python2.7
+-- dbsim(DB 흉내), batch(배치 작업), runaway(폭주 프로세스) 세 이름.
+-- 몸은 같은 python2.7
+[root@ol7a ~]# nohup /root/load/dbsim /root/load/memhog.py 1500 600 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# free -m; ps -o pid,rss,vsz,pmem,comm -C dbsim
+              total        used        free      shared  buff/cache   available
+Mem:           3629        1669        1885           8          74        1801
+Swap:          3967           0        3967
+  PID   RSS    VSZ %MEM COMMAND
+ 2232 1542444 1663136 41.5 dbsim
+-- 익명 메모리 1.5GB 를 잡자 used 169 → 1669, available 3255 → 1801
+-- 이번에는 free 와 available 이 같이 줄었다. 캐시가 아니라 실제
+-- 사용이다
+-- RSS 1542444 KB(상주), VSZ 1663136 KB(가상), %MEM 41.5
+[root@ol7a ~]# grep -E '^(MemAvailable|AnonPages|Committed_AS):' /proc/meminfo
+MemAvailable:    1844256 kB
+AnonPages:       1609812 kB
+Committed_AS:    1884664 kB
+-- AnonPages 72028 → 1609812 kB. 늘어난 1.5GB 가 그대로 여기에
+-- 잡혔다
+-- Committed_AS 361740 → 1884664 kB. 약속받은 가상 메모리도 1.5GB
+-- 늘었다
+-- MemAvailable 1844256 kB 는 free 의 available 1801MB 와 같은
+-- 값이다
+
+--------------------------------------------------------------------------------
+ [5] 실제 메모리를 넘긴다 — 스왑과 si·so
+--------------------------------------------------------------------------------
+-- dbsim 1.5GB 는 그대로 두고, 잡은 페이지를 계속 건드리는 batch
+-- 2.1GB 를 더한다.
+-- 합계가 available 을 넘으므로 일부가 스왑으로 밀려난다.
+[root@ol7a ~]# nohup timeout 100 /root/load/batch /root/load/memhog.py 2100 80 1 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# vmstat 3 8
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0 1875832      0  76904    0    0  3790 36664  992 1798  3 29 67  0  0
+ 1  0      0 979652      0  76956    0    0     0     0  552  210  0 20 79  0  0
+ 0  0      0 337784      0  76956    0    0     0     0  725  239  0 29 71  0  0
+ 3  0 676408  94488      0  31868  463 225400  3792 225463 2044  914  8 31 58  3  0
+ 1  0 676864  95756      0  43348 1200 1365  5445  1366 1381  892 40  2 58  0  0
+ 1  0 676864  95756      0  43348    1    0     1     0  748  109 39  0 60  0  0
+ 1  0 676864  95756      0  43348    0    0     0     0  748  114 39  0 60  0  0
+ 1  0 676864  95756      0  43348    0    0     0     0  764  113 40  0 60  0  0
+-- 첫 줄은 버린다. 둘째·셋째 줄에서 batch 가 메모리를 잡으며 free
+-- 979652 → 337784
+-- 넷째 줄에서 swpd 0 → 676408, so 225400 KB/s. 메모리를 넘친 순간
+-- 한꺼번에 스왑으로 나갔다
+-- 다섯째 줄 si 1200·so 1365 : 들어오고 나가는 일이 동시에. 작업
+-- 집합이 메모리보다 클 때 모양
+-- 뒤쪽 줄은 si·so 0, us 39~40. batch 의 페이지 건드리기 루프만 CPU
+-- 를 쓴다
+-- sy 29~31 은 bytearray 를 0 으로 채우는 동안의 커널 페이지 할당
+-- 몫이다
+[root@ol7a ~]# free -m; swapon -s
+              total        used        free      shared  buff/cache   available
+Mem:           3629        3484          90           1          53           0
+Swap:          3967         665        3302
+-- free 90, available 0. 스왑 665MB 사용. 메모리가 바닥이다
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 680960  -2
+-- swapon -s 의 Used 680960 KB = free 의 665MB
+[root@ol7a ~]# ps -o pid,rss,comm -C dbsim,batch; grep VmSwap /proc/$(pgrep -x dbsim)/status /proc/$(pgrep -x batch)/status
+  PID   RSS COMMAND
+ 2232 932556 dbsim
+ 2288 2154968 batch
+/proc/2232/status:VmSwap:         606756 kB
+/proc/2288/status:VmSwap:              0 kB
+-- 스왑으로 나간 것은 전부 dbsim(606756 kB) 이고 batch 는 0 이다
+-- dbsim 은 잡고 가만히 있었고 batch 는 계속 건드렸다. 커널은 오래
+-- 안 쓴 페이지를 내보낸다
+-- 그래서 dbsim RSS 1542444 → 932556 으로 줄었다. 나중에 dbsim 이
+-- 다시 일하면 si 가 생긴다
+-- DB 의 SGA 가 이렇게 밀려나지 않게 하려고 17장에서 HugePages 를
+-- 쓴다(HugePages 는 스왑되지 않음)
+-- sar 가 없어도 /proc/vmstat 의 누적 카운터로 스왑 입출력 페이지
+-- 수를 본다.
+[root@ol7a ~]# grep -E '^(pswpin|pswpout) ' /proc/vmstat
+pswpin 1336
+pswpout 171098
+-- 부팅 이후 누적 페이지 수. 내보냄 171098 × 4KB ≈ 668MB, 들임 1336
+-- 페이지
+-- 이 카운터는 줄지 않는다. 장애 시각 앞뒤로 두 번 읽어 빼면 그 사이
+-- 스왑 양이 나온다
+-- sar -W 의 pswpin/s·pswpout/s 가 같은 값을 초당으로 바꿔
+-- 기록한다(실습 04)
+
+--------------------------------------------------------------------------------
+ [6] 압박이 끝난 뒤 — 스왑은 바로 비지 않는다
+--------------------------------------------------------------------------------
+[root@ol7a ~]# pkill -x batch; sleep 3; free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629        1375        2199           1          54        2109
+Swap:          3967         665        3302
+-- batch 를 끝내자 used 3484 → 1375, available 0 → 2109. 그런데 Swap
+-- used 665 는 그대로다
+[root@ol7a ~]# grep -E '^(SwapCached|SwapTotal|SwapFree):' /proc/meminfo; grep VmSwap /proc/$(pgrep -x dbsim)/status
+SwapCached:       372312 kB
+SwapTotal:       4063228 kB
+SwapFree:        3382268 kB
+VmSwap:   606756 kB
+-- SwapCached 372312 : 스왑에서 다시 읽었지만 스왑에도 사본이 남은
+-- 페이지
+-- dbsim 의 VmSwap 606756 그대로. 주인이 건드리거나 끝날 때까지
+-- 스왑에 남는다
+-- SwapFree 3382268 = SwapTotal 4063228 - 680960. swapon -s 의 Used
+-- 와 맞는다
+-- 스왑 사용량 경보는 "얼마나 남았나" 보다 "지금 오가고
+-- 있나"(si·so)로 거는 편이 정확하다
+
+--------------------------------------------------------------------------------
+ [7] OOM 킬러 준비 — 스왑을 끈다
+--------------------------------------------------------------------------------
+-- 스왑이 있으면 OOM 전에 한참 스왑으로 버텨 VM 이 느려진다.
+-- 실습에서는 스왑을 끄고 바로 부족하게 만든다.
+-- swapoff 는 스왑에 있던 페이지를 메모리로 다시 읽어 들인 뒤에야
+-- 끝난다.
+[root@ol7a ~]# pkill -x dbsim; sleep 2; swapoff -a; swapon -s; free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629         159        3408           8          61        3317
+Swap:             0           0           0
+-- dbsim 을 먼저 끝내 스왑에 남은 페이지가 없으므로 swapoff 가 바로
+-- 끝났다
+-- swapon -s 는 아무것도 찍지 않았고 free 의 Swap total 이 0 이 됐다
+-- dbsim 이 2GB 를 잡은 상태에서 runaway 가 조금씩 늘어나 2.4GB 를
+-- 원한다. 둘을 합치면 메모리보다 크다.
+[root@ol7a ~]# nohup /root/load/dbsim /root/load/memhog.py 2000 600 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# P=$(pgrep -x dbsim); echo "dbsim pid=$P rss=$(ps -o rss= -p $P) oom_score=$(cat /proc/$P/oom_score) adj=$(cat /proc/$P/oom_score_adj)"
+dbsim pid=2449 rss=2054500 oom_score=1035 adj=0
+-- oom_score 1035 : 메모리 거의 전부를 혼자 가졌다는 점수. 0~1000
+-- 범위에 더해지는 보정 때문에 1000 을 조금 넘는다
+-- rss 2054500 KB : 2000MB 를 다 잡았다. 남은 available 은 1.3GB
+-- 남짓
+-- runaway 가 2.4GB 를 원하므로 중간에 반드시 모자란다
+[root@ol7a ~]# dmesg -c >/dev/null; date '+%T start runaway'
+16:08:56 start runaway
+-- dmesg -c 로 커널 링 버퍼를 비워 두었다. 이제부터의 OOM 기록만
+-- 남는다
+
+--------------------------------------------------------------------------------
+ [8] OOM 킬러가 고른 것
+--------------------------------------------------------------------------------
+[root@ol7a ~]# nohup timeout 120 /root/load/runaway /root/load/memhog.py 2400 60 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# date '+%T'; ps -o pid,rss,etime,comm -C dbsim,runaway; free -m
+16:09:17
+  PID   RSS     ELAPSED COMMAND
+ 2508 2461748     00:20 runaway
+              total        used        free      shared  buff/cache   available
+Mem:           3629        2564        1008           8          56         915
+Swap:             0           0           0
+-- 20초 뒤 dbsim 이 없다. runaway 는 RSS 2461748 KB 로 원하던 2.4GB
+-- 를 다 잡았다
+-- 커널 메시지에서 OOM 관련 줄만 고른다. 전체는 메모리 영역별
+-- 덤프까지 수십 줄이다.
+[root@ol7a ~]# dmesg | grep -E 'invoked oom-killer|Out of memory|Killed process|oom_reaper|(dbsim|runaway|sshd)$' | cut -c1-200
+[   62.120777] runaway invoked oom-killer: gfp_mask=0x100dca(GFP_HIGHUSER_MOVABLE|__GFP_ZERO), order=0, oom_score_adj=0
+[   62.120847] [   1411]     0  1411    28254      258   262144        0         -1000 sshd
+[   62.120852] [   1984]     0  1984    40277      345   364544        0             0 sshd
+[   62.120852] [   2449]     0  2449   543794   512688  4198400        0             0 dbsim
+[   62.120854] [   2508]     0  2508   377381   346173  2859008        0             0 runaway
+[   62.120868] Out of memory: Killed process 2449 (dbsim) total-vm:2175176kB, anon-rss:2050752kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:4100kB oom_score_adj:0
+[   62.125961] oom_reaper: reaped process 2449 (dbsim), now anon-rss:0kB, file-rss:0kB, shmem-rss:0kB
+-- 1줄 : runaway invoked oom-killer — 메모리를 요청하다 OOM 을
+-- 일으킨 쪽은 runaway
+-- 표 줄: [pid] uid tgid total_vm rss pgtables_bytes swapents
+-- oom_score_adj name (rss 는 페이지 수)
+--        dbsim rss 512688 페이지(≈2GB), runaway 346173 페이지(≈1.35GB), sshd 리스너 -1000
+-- Killed process 2449 (dbsim) : 죽은 쪽은 dbsim. anon-rss 2050752kB
+-- oom_reaper 줄 : 죽은 프로세스의 메모리를 거둬 anon-rss 0 이 됐다
+-- 증상   : 메모리를 늘린 것은 runaway 인데 가만히 있던 dbsim 이
+--          사라졌다
+-- 원인   : OOM 킬러는 요청한 프로세스가 아니라 점수(대체로 메모리
+--          크기)가 가장
+--          큰 프로세스를 고른다. 그 순간 dbsim 2GB > runaway 1.35GB
+-- 조치   : 원인 프로세스를 찾아 막는다. 지켜야 할 프로세스는
+--          oom_score_adj 를
+--          낮춘다([변형])
+-- 재확인 : [변형] 에서 dbsim adj -1000 으로 두자 runaway 가 죽었다
+-- 같은 기록이 journal 에도 남는다. 재부팅 뒤 조회할 때는 journalctl
+-- -k 를 쓴다.
+[root@ol7a ~]# journalctl -k --since '-2min' --no-pager | grep -E 'Out of memory|Killed process' | cut -c1-160
+Nov 16 16:08:59 ol7a.example.com kernel: Out of memory: Killed process 2449 (dbsim) total-vm:2175176kB, anon-rss:2050752kB, file-rss:0kB, shmem-rss:0kB, UID:0 p
+-- journal 의 시각 16:08:59. runaway 를 띄우고 3초 만이다. dmesg 의
+-- 62.12 초는 부팅 이후 초
+[root@ol7a ~]# systemctl is-active sshd; pgrep -x sshd | wc -l
+active
+2
+-- sshd 는 active, 리스너와 접속 자식 두 개 그대로. -1000 이
+-- 리스너를 지켰다
+
+--------------------------------------------------------------------------------
+ [9] 메모리 사용량 순위로 확인
+--------------------------------------------------------------------------------
+-- 범인을 찾을 때는 RSS 순위를 본다. 죽은 쪽(dbsim)이 아니라 늘어난
+-- 쪽(runaway)이 원인이다.
+[root@ol7a ~]# ps -eo pid,rss,vsz,pmem,comm --sort=-rss | head -6
+  PID   RSS    VSZ %MEM COMMAND
+ 2508 2461748 2584808 66.2 runaway
+ 1055 22396 360216  0.6 firewalld
+ 1412 11296 575772  0.3 tuned
+    1  6044 151816  0.1 systemd
+  990  5984 615108  0.1 polkitd
+-- RSS 1위 runaway 2461748 KB(%MEM 66.2). 그다음 firewalld 22MB
+-- 부터는 작다
+-- OOM 뒤에 남은 큰 프로세스가 원인 후보 1순위다
+-- 열: PID, RSS(KB), VSZ(KB), %MEM, COMMAND. --sort=-rss 는 RSS
+-- 내림차순
+-- 장애 뒤라도 원인 프로세스가 아직 살아 있으면 이 순위로 바로
+-- 잡힌다
+[root@ol7a ~]# pkill -x runaway; sleep 2; free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629         158        3411           8          59        3319
+Swap:             0           0           0
+-- runaway 를 끝내자 available 3319 로 돌아왔다
+
+--------------------------------------------------------------------------------
+ [변형] oom_score_adj 로 지킬 프로세스를 빼면
+--------------------------------------------------------------------------------
+-- 같은 상황을 다시 만들되 dbsim 의 oom_score_adj 를 -1000 으로
+-- 둔다.
+-- (Oracle DB 는 systemd 유닛의 OOMScoreAdjust= 나
+-- /proc/PID/oom_score_adj 로 같은 일을 한다)
+[root@ol7a ~]# nohup /root/load/dbsim /root/load/memhog.py 2000 600 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# P=$(pgrep -x dbsim); echo -1000 > /proc/$P/oom_score_adj; echo "dbsim pid=$P oom_score=$(cat /proc/$P/oom_score) adj=$(cat /proc/$P/oom_score_adj)"
+dbsim pid=2645 oom_score=0 adj=-1000
+-- adj -1000 을 쓰자 oom_score 가 0 이 됐다. 고를 대상에서 빠진다
+[root@ol7a ~]# dmesg -c >/dev/null
+[root@ol7a ~]# nohup timeout 120 /root/load/runaway /root/load/memhog.py 2400 60 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# ps -o pid,rss,etime,comm -C dbsim,runaway; dmesg | grep -E 'Out of memory|Killed process' | cut -c1-200
+  PID   RSS     ELAPSED COMMAND
+ 2645 2050624     00:28 dbsim
+[   92.633509] Out of memory: Killed process 2702 (runaway) total-vm:1509524kB, anon-rss:1382292kB, file-rss:8kB, shmem-rss:0kB, UID:0 pgtables:2792kB oom_score_adj:0
+-- dbsim(2645) 은 살아 있고 RSS 2050624. 이번에는 runaway 가
+-- anon-rss 1382292kB 에서 죽었다
+-- 남은 메모리가 1.4GB 남짓이라 runaway 는 2.4GB 에 닿지 못했다
+-- -1000 은 강력하다. 이 값을 단 프로세스가 폭주하면 다른 것이 다
+-- 죽는다. 지킬 것만 고른다
+
+--------------------------------------------------------------------------------
+ [10] 되돌림
+--------------------------------------------------------------------------------
+[root@ol7a ~]# pkill -x dbsim; pkill -x runaway; sleep 2; swapon -a; rm -rf /root/load /var/tmp/cache.dat
+[root@ol7a ~]# free -m; swapon -s; ls /var/tmp; pgrep -c -x dbsim
+              total        used        free      shared  buff/cache   available
+Mem:           3629         160        3410           8          58        3318
+Swap:          3967           0        3967
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+abrt
+systemd-private-1b8c992727c74e0ca62a8f0f53111546-chronyd.service-I6O2xG
+-- 스왑 다시 켬(Used 0), 시험 파일·스크립트 없음
+0
+-- dbsim 0개. free 의 available 3318 은 시작 때 3255 와 비슷하다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                시작 전   캐시 2GB   dbsim 1.5G   +batch 2.1G   OOM 뒤   되돌린 뒤
+--  free(MB)            3294      1388       1885         90            1008     3410
+--  buff/cache(MB)      164       2078       74           53            56       58
+--  available(MB)       3255      3246       1801         0             915      3318
+--  Swap used(MB)       0         0          0            665           (끔)     0
+--  dbsim VmSwap        -         -          0            606756 kB     -        -
+--  OOM 희생자          -         -          -            -             dbsim    -
+-- 캐시는 free 만 줄이고 available 은 그대로 둔다. 익명 메모리는 둘
+-- 다 줄인다
+-- [변형] dbsim adj -1000 → 희생자 runaway(anon-rss 1382292kB)
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. vm.swappiness 를 10 으로 낮추고 [5] 를 다시 해 스왑 사용량을
+--    비교한다
+--    확인: free -m 의 Swap used, /proc/PID/status 의 VmSwap
+-- 2. dbsim 을 띄운 뒤 sar -B 1 5 와 sar -W 1 5 로
+--    pgscank/s·pswpout/s 를 본다
+--    확인: batch 를 더한 순간 두 값이 튀는지
+-- 3. systemd 유닛에 OOMScoreAdjust=-500 을 주고 서비스로 dbsim 을
+--    띄운다
+--    확인: systemctl show 의 OOMScoreAdjust, /proc/PID/oom_score_adj
+
+================================================================================
+ 실습 02 종료 — 캐시 2GB 에도 available 3246MB, 스왑 665MB 는 쉬던 dbsim 몫, OOM 은 늘어난 runaway 대신 큰 dbsim 을 죽임
+================================================================================

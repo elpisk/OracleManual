@@ -1,0 +1,515 @@
+================================================================================
+ 제13장 실습 07 — 인터페이스 이름 규칙
+ 대상   : ol7a
+ 목표   : ens32·ens33 이라는 이름이 어디서 왔는지 udev 의 근거로 확인하고,
+          net.ifnames=0 으로 이름 체계를 바꿨을 때 ifcfg 파일과 어긋나 연결이
+          안 되는 상황을 직렬 콘솔에서 복구한다. MAC 기준 이름 고정도 해 본다
+ 배경   : 커널은 NIC 를 eth0·eth1 로 먼저 만든다. 부팅 중 udev 가 펌웨어·PCI 슬롯·
+          경로·MAC 정보로 새 이름을 정해 바꾼다(예측 가능한 이름). 슬롯 정보가 있으면
+          ens<슬롯>, 없으면 enp<버스>s<슬롯> 이다. ifcfg 파일과 NetworkManager 연결은
+          이 이름(DEVICE)이나 MAC(HWADDR)으로 장치를 찾는다 (본문 13.1)
+ 소요   : 약 40분 (재부팅 4회)
+ 선행   : ol7-base 스냅샷 (⚠ 부트 파라미터와 ifcfg 를 바꾼다)
+ 계정   : root
+ 주의   : [7]~[9] 동안 SSH 로 접속할 수 없다. 직렬 콘솔로 작업한다
+ 되돌림 : 부트 파라미터·ifcfg 원래대로, 재부팅 후 ens32/ens33 → ip -br link, cat /proc/cmdline
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ip -br link; cat /proc/cmdline
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+ens32            UP             00:0c:29:ac:5e:a0 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+ens33            UP             00:0c:29:ac:5e:aa <BROADCAST,MULTICAST,UP,LOWER_UP> 
+BOOT_IMAGE=/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol-root ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync
+-- 장치는 ens32(…5e:a0)·ens33(…5e:aa) 둘이다
+-- /proc/cmdline 끝의 console=tty0 console=ttyS0,115200 은 랩 콘솔 캡처용 설정이다
+-- [7]·[8] 을 직렬 콘솔로 할 수 있는 이유다
+-- 같은 줄의 scsi_mod.scan=sync 는 디스크 이름 순서를 고정하려고 넣은 랩 설정이다. 이 장과는 관계없다
+-- 지금은 net.ifnames 인자가 없다. 예측 가능한 이름 정책이 켜진 기본 상태다
+[root@ol7a ~]# grep -H -E '^(DEVICE|NAME|HWADDR)=' /etc/sysconfig/network-scripts/ifcfg-ens3?
+/etc/sysconfig/network-scripts/ifcfg-ens32:NAME=ens32
+/etc/sysconfig/network-scripts/ifcfg-ens32:DEVICE=ens32
+/etc/sysconfig/network-scripts/ifcfg-ens33:NAME=ens33
+/etc/sysconfig/network-scripts/ifcfg-ens33:DEVICE=ens33
+-- 두 ifcfg 에 HWADDR 줄이 없다
+-- 두 프로필은 MAC 이 아니라 이름(DEVICE)으로만 장치를 찾는다
+-- 이 사실이 [7] 의 장애를 만든다
+[root@ol7a ~]# mkdir -p /root/net0; cp -p /etc/sysconfig/network-scripts/ifcfg-ens3? /root/net0/; ls /root/net0
+ifcfg-ens32
+ifcfg-ens33
+-- 두 ifcfg 원본을 /root/net0 에 보관했다. [5]·[되돌림] 에서 쓴다
+
+--------------------------------------------------------------------------------
+ [1] 커널이 처음 붙인 이름 — eth0 에서 ens32 로
+--------------------------------------------------------------------------------
+
+-- 부팅 로그에서 이름이 바뀐 기록을 찾는다.
+[root@ol7a ~]# journalctl -b -k | grep -E 'eth[01]: \(PCI|renamed' | cut -c17-
+ol7a.example.com kernel: e1000 0000:02:00.0 eth0: (PCI:66MHz:32-bit) 00:0c:29:ac:5e:a0
+ol7a.example.com kernel: e1000 0000:02:01.0 eth1: (PCI:66MHz:32-bit) 00:0c:29:ac:5e:aa
+ol7a.example.com kernel: e1000 0000:02:01.0 ens33: renamed from eth1
+ol7a.example.com kernel: e1000 0000:02:00.0 ens32: renamed from eth0
+-- cut -c17- 로 앞의 날짜·시각을 잘랐다
+-- e1000 드라이버가 PCI 0000:02:00.0 을 eth0,
+-- 0000:02:01.0 을 eth1 로 먼저 만들었다
+-- 곧바로 udev 가 eth1 → ens33, eth0 → ens32 로 바꿨다
+-- 바꾼 순서는 udev 가 처리한 순서일 뿐이다
+-- 커널이 붙이는 ethN 은 장치를 찾은 순서다
+-- 드라이버가 둘이거나 NIC 를 추가하면 순서가 바뀔 수 있다
+
+--------------------------------------------------------------------------------
+ [2] udev 가 계산한 이름 후보 — ID_NET_NAME_*
+--------------------------------------------------------------------------------
+
+-- udevadm info 는 udev 데이터베이스에 저장된 장치 속성을 보인다.
+[root@ol7a ~]# udevadm info /sys/class/net/ens32 | grep -E 'ID_NET_NAME|ID_PATH=|INTERFACE=|ID_NET_DRIVER'
+E: ID_NET_DRIVER=e1000
+E: ID_NET_NAME_MAC=enx000c29ac5ea0
+E: ID_NET_NAME_PATH=enp2s0
+E: ID_NET_NAME_SLOT=ens32
+E: ID_PATH=pci-0000:02:00.0
+E: INTERFACE=ens32
+-- E: 로 시작하는 줄은 udev 가 장치에 붙여 둔 속성(환경 변수)이다
+--   ID_NET_DRIVER=e1000           드라이버
+--   ID_NET_NAME_MAC=enx000c29ac5ea0  MAC 기준 후보 (enx + MAC)
+--   ID_NET_NAME_PATH=enp2s0       PCI 경로 기준 후보 (버스 2, 슬롯 0)
+--   ID_NET_NAME_SLOT=ens32        핫플러그 슬롯 기준 후보 (슬롯 32)
+--   INTERFACE=ens32               실제로 고른 이름
+-- 내장 포트 후보(ID_NET_NAME_ONBOARD, eno1 형식)는 없다
+-- VMware 가 내장 포트 번호를 알려 주지 않는다
+
+-- 후보 가운데 무엇을 고를지는 udev 규칙이 정한다
+-- 7.9 는 80-net-name-slot.rules 에 순서가 적혀 있다.
+-- grep -v 로 주석과 빈 줄을 뺐다.
+[root@ol7a ~]# ls /usr/lib/udev/rules.d/ | grep -E 'net|biosdev'
+60-net.rules
+71-biosdevname.rules
+75-net-description.rules
+80-net-name-slot.rules
+80-net-setup-link.rules
+-- 이름과 관련된 규칙 다섯 개다. 앞 번호가 먼저 돈다
+--   60-net.rules            ifcfg 의 HWADDR·DEVICE 로 이름을 정함([10])
+--   71-biosdevname.rules    biosdevname 이름([4])
+--   75-net-description.rules 장치 설명 속성
+--   80-net-name-slot.rules  예측 가능한 이름(아래)
+--   80-net-setup-link.rules .link 파일 처리
+[root@ol7a ~]# grep -v '^#' /usr/lib/udev/rules.d/80-net-name-slot.rules | grep -v '^$'
+ACTION!="add", GOTO="net_name_slot_end"
+SUBSYSTEM!="net", GOTO="net_name_slot_end"
+NAME!="", GOTO="net_name_slot_end"
+IMPORT{cmdline}="net.ifnames"
+ENV{net.ifnames}=="0", GOTO="net_name_slot_end"
+NAME=="", ENV{ID_NET_NAME_ONBOARD}!="", NAME="$env{ID_NET_NAME_ONBOARD}"
+NAME=="", ENV{ID_NET_NAME_SLOT}!="", NAME="$env{ID_NET_NAME_SLOT}"
+NAME=="", ENV{ID_NET_NAME_PATH}!="", NAME="$env{ID_NET_NAME_PATH}"
+LABEL="net_name_slot_end"
+-- 줄마다 읽으면
+--   NAME!="" 이면 끝       앞 규칙이 이미 이름을 정했으면 건드리지 않는다
+--   IMPORT{cmdline}         커널 인자 net.ifnames 를 읽는다
+--   net.ifnames==0 이면 끝  [6] 에서 이 줄을 탄다. 이름을 바꾸지 않아 ethN 이 남는다
+--   ONBOARD → SLOT → PATH   먼저 있는 후보를 이름으로 쓴다
+-- ens32 는 ONBOARD 후보가 없고 SLOT 후보가 있어 ens32 가 됐다
+-- MAC 후보는 이 규칙에 없다
+
+--------------------------------------------------------------------------------
+ [3] 슬롯 번호 32 는 어디서 왔나
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ethtool -i ens32 | grep bus-info; ethtool -i ens33 | grep bus-info
+bus-info: 0000:02:00.0
+bus-info: 0000:02:01.0
+-- 두 NIC 의 PCI 주소다. 버스 02, 장치 00·01
+
+-- 펌웨어(ACPI)가 알려 준 PCI 핫플러그 슬롯 목록이다
+-- 디렉터리 이름이 슬롯 번호, address 가 그 슬롯의 PCI 주소다.
+[root@ol7a ~]# for s in 32 33; do echo "slot $s -> $(cat /sys/bus/pci/slots/$s/address)"; done
+slot 32 -> 0000:02:00
+slot 33 -> 0000:02:01
+-- /sys/bus/pci/slots/32 의 주소가 0000:02:00 이다
+-- ens32 의 bus-info 와 같다
+-- 슬롯 번호 32·33 은 VMware 가상 하드웨어가 ACPI 로 알려 준 값이다
+-- 이 번호가 이름에 들어갔다
+-- VirtualBox 처럼 슬롯 정보를 주지 않는 하이퍼바이저에서는 SLOT 후보가 없어 PATH 후보(enp0s3)가 이름이 된다
+
+-- net_id 빌트인을 직접 돌려 계산 과정을 본다.
+[root@ol7a ~]# udevadm test-builtin net_id /sys/class/net/ens33 2>/dev/null | grep ID_NET_NAME
+ID_NET_NAME_MAC=enx000c29ac5eaa
+ID_NET_NAME_PATH=enp2s1
+ID_NET_NAME_SLOT=ens33
+-- 2>/dev/null 로 디버그 출력을 버리고 결과만 봤다
+-- ens33 의 후보도 같은 방식으로 계산된다
+
+--------------------------------------------------------------------------------
+ [4] biosdevname 은 쓰이지 않는다
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# rpm -q biosdevname; grep -o 'biosdevname=[01]' /proc/cmdline || echo "cmdline 에 biosdevname 없음"
+-- biosdevname 패키지는 설치돼 있다
+-- 커널 인자에는 biosdevname= 이 없다
+biosdevname-0.7.3-2.0.1.el7.x86_64
+cmdline 에 biosdevname 없음
+[root@ol7a ~]# grep -v '^#' /usr/lib/udev/rules.d/71-biosdevname.rules | grep -v '^$' | head -8
+SUBSYSTEM!="net", GOTO="netdevicename_end"
+ACTION!="add",    GOTO="netdevicename_end"
+NAME=="?*",       GOTO="netdevicename_end"
+ATTR{type}!="1",  GOTO="netdevicename_end"
+ENV{DEVTYPE}=="?*", GOTO="netdevicename_end"
+ATTR{[dmi/id]sys_vendor}=="Dell*", ENV{UDEV_BIOSDEVNAME}="1"
+IMPORT{cmdline}="biosdevname"
+ENV{biosdevname}=="?*", ENV{UDEV_BIOSDEVNAME}="$env{biosdevname}"
+-- head -8 로 규칙 앞부분만 봤다
+-- 시스템 제조사(sys_vendor)가 Dell 이면 기본으로 켜고,
+-- 아니면 커널 인자 biosdevname 을 따른다
+-- 이 VM 은 VMware 이고 인자가 없어 biosdevname 이 동작하지 않는다
+-- Dell 서버에서 OL 7 을 설치하면 em1·p1p1 같은 이름이 나오는 이유가 이 규칙이다
+
+--------------------------------------------------------------------------------
+ [5] 오류 ② — MAC 이 바뀐 NIC (VM 복제 상황 흉내)
+--------------------------------------------------------------------------------
+
+-- VM 을 복제하면 NIC 의 MAC 이 새로 생긴다
+-- ifcfg 에 HWADDR 가 박혀 있으면 프로필이 장치를 찾지 못한다.
+-- ens33 의 ifcfg 에 다른 MAC 을 넣어 같은 상황을 만든다
+-- SSH 가 붙은 ens32 는 건드리지 않는다.
+[root@ol7a ~]# cat /sys/class/net/ens33/address
+00:0c:29:ac:5e:aa
+-- ens33 의 실제 MAC 이다
+[root@ol7a ~]# echo 'HWADDR=00:0C:29:AA:BB:CC' >> /etc/sysconfig/network-scripts/ifcfg-ens33; nmcli connection reload
+[root@ol7a ~]# nmcli connection up ens33
+Error: Connection activation failed: No suitable device found for this connection (device ens32 not available because profile is not compatible with device (mismatching interface name)).
+-- 오류 문구 안의 mismatching interface name 은 ens32 가 거절된 이유다(줄이 길어 잘림)
+-- NetworkManager 는 모든 장치를 후보로 따져 보고,
+-- 맞는 장치가 하나도 없다고 답했다
+
+[root@ol7a ~]# nmcli -f GENERAL.DEVICE,GENERAL.HWADDR device show ens33; nmcli -g 802-3-ethernet.mac-address connection show ens33
+GENERAL.DEVICE:                         ens33
+GENERAL.HWADDR:                         00:0C:29:AC:5E:AA
+00\:0C\:29\:AA\:BB\:CC
+-- 장치의 GENERAL.HWADDR 은 00:0C:29:AC:5E:AA,
+-- 프로필의 802-3-ethernet.mac-address 는 00:0C:29:AA:BB:CC 다
+-- -g 출력의 \: 는 콜론을 구분자와 헷갈리지 않게 이스케이프한 것이다
+-- 오류 흐름
+-- 증상   : nmcli connection up ens33 → Error: Connection activation failed: No suitable device found for this connection
+-- 원인   : ifcfg 의 HWADDR(00:0C:29:AA:BB:CC)와 장치의 실제 MAC(00:0c:29:ac:5e:aa)이 다르다. 프로필이 붙을 장치가 없다
+-- 조치   : HWADDR 를 실제 MAC 으로 고치거나 지우고 reload
+-- 재확인 : nmcli connection up ens33 이 activated
+-- VM 을 복제하거나 NIC 를 교체한 뒤 네트워크가 안 올라오는 경우가 이것이다
+-- 템플릿 VM 의 ifcfg 에서는 HWADDR·UUID 를 지워 둔다
+
+-- 고친다. 실제 MAC 으로 바꾸거나 HWADDR 줄을 지운다
+-- 여기서는 실제 MAC 으로 바꾼다.
+[root@ol7a ~]# sed -i "s/^HWADDR=.*/HWADDR=$(cat /sys/class/net/ens33/address)/" /etc/sysconfig/network-scripts/ifcfg-ens33; nmcli connection reload
+[root@ol7a ~]# nmcli connection up ens33; nmcli -g GENERAL.STATE connection show ens33
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/2)
+-- 실제 MAC 으로 고치자 바로 활성화됐다
+-- HWADDR 는 대소문자를 가리지 않는다(파일에는 소문자를 넣었다)
+activated
+[root@ol7a ~]# nmcli connection down ens33; cp -p /root/net0/ifcfg-ens33 /etc/sysconfig/network-scripts/; nmcli connection reload
+Connection 'ens33' successfully deactivated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/2)
+-- 원본 ifcfg-ens33 으로 되돌렸다
+-- 다음 단계는 HWADDR 가 없는 원래 상태에서 시작한다
+
+--------------------------------------------------------------------------------
+ [6] 이름 체계 바꾸기 — net.ifnames=0
+--------------------------------------------------------------------------------
+
+-- 커널 인자 net.ifnames=0 은 udev 의 예측 가능한 이름 정책을 끈다
+-- 커널이 붙인 ethN 이 그대로 남는다.
+-- grubby 는 grub.cfg 의 부팅 항목에 인자를 더한다
+-- 기본 항목 하나에만 넣는다.
+[root@ol7a ~]# grubby --default-kernel
+/boot/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+[root@ol7a ~]# grubby --update-kernel=$(grubby --default-kernel) --args=net.ifnames=0
+[root@ol7a ~]# grubby --info=$(grubby --default-kernel) | grep -E '^(kernel|args)'
+kernel=/boot/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+args="ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync net.ifnames=0"
+-- grubby --info 의 args 끝에 net.ifnames=0 이 붙었다
+-- 기본 커널 항목 하나에만 들어갔다
+
+-- ifcfg 파일은 손대지 않고 재부팅한다
+-- 이름만 바뀌면 무슨 일이 생기는지 보려는 것이다.
+-- 재부팅 (SSH 가 돌아오지 않을 것이므로 전원을 내렸다 올리고 직렬 콘솔로 본다)
+   The selected entry will be started automatically in 1s.                        The selected entry will be started automatically in 0s.                     [    0.988753] integrity: Unable to open file: /etc/keys/x509_ima.der (-2)
+-- 이 줄부터 직렬 콘솔에 찍힌 화면이다
+-- GRUB 메뉴가 1초, 0초 카운트다운 뒤 기본 항목으로 부팅했다
+[    1.488140] sd 2:0:0:0: [sda] Assuming drive cache: write through
+[    1.489633] sd 2:0:1:0: [sdb] Assuming drive cache: write through
+[    1.492815] sd 2:0:2:0: [sdc] Assuming drive cache: write through
+[    1.498519] sd 2:0:3:0: [sdd] Assuming drive cache: write through
+[    1.506798] sd 2:0:4:0: [sde] Assuming drive cache: write through
+[    3.161679] piix4_smbus 0000:00:07.3: SMBus Host Controller not enabled!
+-- quiet 인자 때문에 커널 메시지는 몇 줄만 나온다
+-- 디스크 다섯 개와 VMware 가상 칩셋의 흔한 경고 줄이다
+-- 네트워크 관련 오류는 화면에 나오지 않는다. 부팅은 정상으로 끝난다
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+
+--------------------------------------------------------------------------------
+ [7] 오류 ① — 이름과 ifcfg 가 어긋남 (직렬 콘솔)
+--------------------------------------------------------------------------------
+
+root
+
+Password: 
+-- 콘솔에서 root 로 로그인한다. 비밀번호는 화면에 찍히지 않는다
+
+Last login: Wed Nov 11 20:40:42 on ttyS0
+[root@ol7a ~]# 
+cat /proc/cmdline
+BOOT_IMAGE=/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol-root ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync net.ifnames=0
+[root@ol7a ~]# 
+ip -br link; ip -br addr
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+eth0             UP             00:0c:29:ac:5e:a0 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+eth1             UP             00:0c:29:ac:5e:aa <BROADCAST,MULTICAST,UP,LOWER_UP> 
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+eth0             UP             
+eth1             UP             
+-- 장치 이름이 eth0·eth1 이 됐다
+-- MAC 으로 보면 eth0 이 옛 ens32(…5e:a0), eth1 이 옛 ens33 이다
+-- 두 장치 모두 링크는 UP 인데 IPv4 주소가 없다
+-- 172.16.225.61 이 사라졌다. SSH 가 들어올 수 없다
+[root@ol7a ~]# 
+nmcli device status
+DEVICE  TYPE      STATE         CONNECTION 
+eth0    ethernet  disconnected  --         
+eth1    ethernet  disconnected  --         
+lo      loopback  unmanaged     --         
+-- 두 장치 모두 disconnected. 관리는 하지만 붙일 연결 프로필이 없다
+[root@ol7a ~]# 
+nmcli connection show
+
+NAME   UUID                                  TYPE      DEVICE 
+ens32  987096e5-6a52-4e8e-bce9-5978c9bb9f51  ethernet  --     
+ens33  09e33476-a93c-4005-a933-74479920bb5b  ethernet  --     
+-- 프로필 ens32·ens33 은 그대로 있다. 둘 다 DEVICE 가 -- 다
+-- NetworkManager.conf 의 no-auto-default=* (실습 03 [1]) 때문에 eth0 에 Wired connection 같은 자동 프로필도 생기지 않았다
+
+[root@ol7a ~]# 
+grep -E '^(DEVICE|NAME)=' /etc/sysconfig/network-scripts/ifcfg-en 
+s32
+NAME=ens32
+DEVICE=ens32
+-- 콘솔 폭(80칸)에 맞춰 명령이 접혀 보인다
+-- 친 명령은 grep -E '^(DEVICE|NAME)=' …/ifcfg-ens32 한 줄이다
+-- 프로필은 DEVICE=ens32 라는 장치를 찾는다. 그런 장치가 없다
+-- 오류 흐름
+-- 증상   : net.ifnames=0 부팅 뒤 SSH 불가. 콘솔에서 eth0·eth1 에 주소 없음, 두 장치 disconnected
+-- 원인   : 장치 이름이 ens32 → eth0 으로 바뀌었는데 ifcfg-ens32 의 DEVICE 는 ens32 그대로다
+-- 조치   : ifcfg 를 새 이름으로 바꾸고(파일 이름·DEVICE·NAME) reload → up. 또는 net.ifnames=0 을 빼고 재부팅
+-- 재확인 : ip -br addr 의 eth0 에 172.16.225.61/24, SSH 재접속
+[root@ol7a ~]# 
+
+--------------------------------------------------------------------------------
+ [8] 조치 — ifcfg 를 새 이름에 맞춘다
+--------------------------------------------------------------------------------
+
+-- 파일 이름과 DEVICE 를 eth0 로 바꾼다. NAME 도 맞춘다.
+cd /etc/sysconfig/network-scripts; mv ifcfg-ens32 ifcfg-eth0; sed 
+ -i 's/^DEVICE=.*/DEVICE=eth0/; s/^NAME=.*/NAME=eth0/' ifcfg-eth0
+-- 이번에도 명령이 접혀 두 줄로 보인다. 파일 이름 변경과 sed 두 치환이 한 줄이다
+-- 프롬프트가 [root@ol7a network-scripts]# 로 바뀌었다
+-- 작업 디렉터리가 바뀐 표시다
+[root@ol7a network-scripts]# 
+grep -E '^(DEVICE|NAME)=' ifcfg-eth0; cd /root
+NAME=eth0
+DEVICE=eth0
+-- NAME·DEVICE 가 eth0 이다. UUID 는 그대로라 같은 프로필이 이름만 바뀐다
+[root@ol7a ~]# 
+nmcli connection reload; nmcli connection up eth0
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/2)
+-- reload 로 바뀐 파일을 읽고 eth0 이라는 연결을 올렸다
+[root@ol7a ~]# 
+ip -br addr; nmcli connection show
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+eth0             UP             172.16.225.61/24 fe80::49d1:1888:9c31:c7f7/64 
+eth1             UP             
+
+NAME   UUID                                  TYPE      DEVICE 
+eth0   987096e5-6a52-4e8e-bce9-5978c9bb9f51  ethernet  eth0   
+ens33  09e33476-a93c-4005-a933-74479920bb5b  ethernet  --     
+-- eth0 에 172.16.225.61/24 가 돌아왔다
+-- 연결 목록의 eth0 은 UUID 987096e5… 로 예전 ens32 프로필과 같다
+-- IPv6 링크 로컬 주소는 fe80::49d1:… 로 바뀌었다
+-- stable-privacy 방식은 장치 이름을 넣어 계산하므로 이름이 바뀌면 주소도 바뀐다
+-- ens33 프로필은 아직 고치지 않았다. eth1 은 계속 비어 있다
+
+[root@ol7a ~]# 
+exit
+logout
+-- 콘솔에서 나왔다. 이제 SSH 로 다시 들어간다
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+
+--------------------------------------------------------------------------------
+ [9] SSH 복귀 확인
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ip -br addr; ip route; ss -tn state established '( sport = :22 )' | head -3
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+eth0             UP             172.16.225.61/24 fe80::49d1:1888:9c31:c7f7/64 
+eth1             UP             
+default via 172.16.225.2 dev eth0 proto static metric 100 
+172.16.225.0/24 dev eth0 proto kernel scope link src 172.16.225.61 metric 100 
+Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+0      144    172.16.225.61:22   172.16.225.1:55212       
+-- 기본 경로와 연결 경로가 eth0 으로 돌아왔다. metric 도 100 그대로다
+-- 새 SSH 세션이 172.16.225.61:22 로 붙었다
+-- Send-Q 144 는 출력을 보내는 중인 바이트다
+
+--------------------------------------------------------------------------------
+ [변형] HWADDR 로 묶은 프로필은 이름이 바뀌어도 따라간다
+--------------------------------------------------------------------------------
+
+-- eth1(원래 ens33)의 ifcfg 를 DEVICE 없이 HWADDR 만으로 장치를 찾게 만든다.
+[root@ol7a ~]# cd /etc/sysconfig/network-scripts; mv ifcfg-ens33 ifcfg-lan33; sed -i "/^DEVICE=/d; s/^NAME=.*/NAME=lan33/" ifcfg-lan33; echo "HWADDR=$(cat /sys/class/net/eth1/address)" >> ifcfg-lan33; grep -E '^(NAME|DEVICE|HWADDR|BOOTPROTO|ONBOOT)=' ifcfg-lan33
+BOOTPROTO=dhcp
+NAME=lan33
+ONBOOT=no
+HWADDR=00:0c:29:ac:5e:aa
+-- grep 으로 네 키만 봤다. DEVICE 줄이 없고 HWADDR 만 있다
+-- NAME 은 lan33 으로 바꿨다
+-- BOOTPROTO=dhcp, ONBOOT=no 는 원본 그대로다
+[root@ol7a ~]# nmcli connection reload; nmcli -f NAME,DEVICE,TYPE connection show
+NAME   DEVICE  TYPE     
+eth0   eth0    ethernet 
+lan33  --      ethernet 
+-- 새 프로필 lan33 이 목록에 생겼다. 아직 활성화하지 않았다
+[root@ol7a ~]# nmcli connection up lan33; nmcli -f NAME,DEVICE connection show --active
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/3)
+NAME   DEVICE 
+eth0   eth0   
+lan33  eth1   
+-- lan33 이 eth1 에 붙었다
+-- 장치 이름을 전혀 적지 않았는데 MAC 으로 eth1 을 찾았다
+-- 이름이 어떻게 바뀌든 MAC 이 같으면 따라간다
+-- 반대로 MAC 이 바뀌면 [5] 처럼 붙을 곳을 잃는다
+[root@ol7a ~]# nmcli connection down lan33
+Connection 'lan33' successfully deactivated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/3)
+-- 다음 단계에서 이 파일을 이름 고정에 다시 쓴다
+
+--------------------------------------------------------------------------------
+ [10] MAC 으로 이름을 직접 정하기 — ifcfg 의 HWADDR 와 DEVICE
+--------------------------------------------------------------------------------
+
+-- 7.9 의 udev 는 이름을 고르기 전에 60-net.rules 를 먼저 거친다.
+-- 이 규칙은 rename_device 도우미로 ifcfg 파일들의 HWADDR 를 뒤져,
+-- MAC 이 맞는 파일의 DEVICE 로 이름을 붙인다.
+[root@ol7a ~]# grep -v '^#' /usr/lib/udev/rules.d/60-net.rules | grep -v '^$'
+ACTION=="add", SUBSYSTEM=="net", PROGRAM="/lib/udev/detect_failover", RESULT=="?*", ENV{NET_FAILOVER}="$result"
+ACTION=="add", SUBSYSTEM=="net", DRIVERS=="?*", ATTR{type}=="1", ENV{NET_FAILOVER}=="[01]*", PROGRAM="/lib/udev/rename_device", RESULT=="?*", NAME="$result"
+-- 두 줄 모두 장치 추가(add) 때 돈다
+--   detect_failover  가상 장애 조치 NIC 인지 검사(여기서는 해당 없음)
+--   rename_device    ifcfg 를 뒤져 이름을 정하고, 결과가 있으면 NAME 에 넣는다
+-- NAME 이 정해지면 80-net-name-slot.rules 의 NAME!="" 줄에 걸려 슬롯 이름을 붙이지 않는다
+
+-- lan33 프로필을 lan1 로 바꾸고 DEVICE=lan1 을 적는다
+-- HWADDR 는 [변형]에서 넣은 eth1 의 MAC 이다.
+-- 이 파일 하나에 MAC(HWADDR)과 원하는 이름(DEVICE=lan1)이 함께 있다
+[root@ol7a ~]# cd /etc/sysconfig/network-scripts; mv ifcfg-lan33 ifcfg-lan1; sed -i 's/^NAME=.*/NAME=lan1/' ifcfg-lan1; echo 'DEVICE=lan1' >> ifcfg-lan1; grep -E '^(NAME|DEVICE|HWADDR)=' ifcfg-lan1
+NAME=lan1
+HWADDR=00:0c:29:ac:5e:aa
+-- grub.cfg 에서 net.ifnames=0 이 사라졌다(grep -c 0)
+DEVICE=lan1
+
+-- 이름 체계는 원래대로(net.ifnames 제거) 돌리고,
+-- eth0 으로 바꿨던 ens32 프로필도 되돌린다.
+[root@ol7a ~]# grubby --update-kernel=$(grubby --default-kernel) --remove-args=net.ifnames=0; grep -c 'net.ifnames=0' /boot/grub2/grub.cfg
+0
+[root@ol7a ~]# cd /etc/sysconfig/network-scripts; mv ifcfg-eth0 ifcfg-ens32; sed -i 's/^DEVICE=.*/DEVICE=ens32/; s/^NAME=.*/NAME=ens32/' ifcfg-ens32; ls ifcfg-*
+ifcfg-ens32
+ifcfg-lan1
+ifcfg-lo
+-- ifcfg 는 ens32·lan1·lo 셋이다
+-- ifcfg-ens33 은 없다(lan33 → lan1 로 바뀌었다)
+
+-- 재부팅
+[root@ol7a ~]# cat /proc/cmdline | grep -o 'net.ifnames=0' || echo "net.ifnames=0 없음"; ip -br link
+net.ifnames=0 없음
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+ens32            UP             00:0c:29:ac:5e:a0 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+lan1             UP             00:0c:29:ac:5e:aa <BROADCAST,MULTICAST,UP,LOWER_UP> 
+-- …5e:aa 장치의 이름이 lan1 이다. ens32 는 슬롯 이름 그대로다
+[root@ol7a ~]# nmcli device status; journalctl -b -k | grep -i renamed | cut -c17-
+DEVICE  TYPE      STATE         CONNECTION 
+ens32   ethernet  connected     ens32      
+lan1    ethernet  disconnected  --         
+lo      loopback  unmanaged     --         
+ol7a.example.com kernel: e1000 0000:02:01.0 ens33: renamed from eth1
+ol7a.example.com kernel: e1000 0000:02:00.0 ens32: renamed from eth0
+ol7a.example.com kernel: e1000 0000:02:01.0 lan1: renamed from ens33
+-- lan1 은 disconnected 다
+-- ifcfg-lan1 이 ONBOOT=no 이기 때문이다. 이름 고정과 활성화는 별개다
+-- 커널 로그에 이름 변경이 세 줄이다
+-- 02:01.0 장치는 eth1 → ens33 → lan1 로 두 번 바뀌었다
+-- 처음 이름은 슬롯 규칙이, 두 번째는 ifcfg 의 DEVICE 를 본 rename_device 가 붙였다
+[root@ol7a ~]# udevadm info /sys/class/net/lan1 | grep -E 'INTERFACE=|ID_NET_NAME_SLOT'
+E: ID_NET_NAME_SLOT=ens33
+E: INTERFACE=lan1
+-- 슬롯 후보(ID_NET_NAME_SLOT=ens33)는 그대로 계산돼 있지만 실제 이름(INTERFACE)은 lan1 이다
+-- 운영 서버에서 공용망·사설망 NIC 이름을 pub0·priv0 처럼 뜻 있는 이름으로 고정할 때 이 방법을 쓴다
+
+--------------------------------------------------------------------------------
+ [되돌림]
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# rm -f /etc/sysconfig/network-scripts/ifcfg-lan1; cp -p /root/net0/ifcfg-ens3? /etc/sysconfig/network-scripts/
+-- lan1 파일을 지우고 원본 두 파일을 되돌린 뒤 재부팅한다
+-- 이름은 부팅 때 정해지므로 재부팅이 필요하다
+-- 재부팅
+[root@ol7a ~]# ip -br link; cat /proc/cmdline | grep -c 'net.ifnames'; ls /etc/sysconfig/network-scripts/ifcfg-*
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+-- 이름이 ens32·ens33 으로 돌아왔다
+-- cmdline 에 net.ifnames 가 없다(grep -c 0)
+ens32            UP             00:0c:29:ac:5e:a0 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+ens33            UP             00:0c:29:ac:5e:aa <BROADCAST,MULTICAST,UP,LOWER_UP> 
+0
+/etc/sysconfig/network-scripts/ifcfg-ens32
+/etc/sysconfig/network-scripts/ifcfg-ens33
+/etc/sysconfig/network-scripts/ifcfg-lo
+[root@ol7a ~]# for f in ens32 ens33; do cmp /root/net0/ifcfg-$f /etc/sysconfig/network-scripts/ifcfg-$f && echo "ifcfg-$f same"; done; rm -rf /root/net0
+ifcfg-ens32 same
+ifcfg-ens33 same
+-- cmp 로 원본과 바이트 단위로 비교했다
+-- 두 파일 모두 같다. 보관본 /root/net0 은 지웠다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                시작 전          net.ifnames=0      HWADDR+DEVICE=lan1   되돌린 뒤
+--  02:00.0 (…5e:a0)    ens32            eth0               ens32                ens32
+--  02:01.0 (…5e:aa)    ens33            eth1               lan1                 ens33
+--  172.16.225.61       ens32            없음 → 콘솔로 eth0  ens32                ens32
+--  ifcfg 파일          ens32, ens33     eth0(콘솔에서 바꿈) ens32, lan1          ens32, ens33 (cmp same)
+--  커널 인자           net.ifnames 없음 net.ifnames=0      없음                 없음
+--
+--  장치를 찾는 방법     프로필 키             이름이 바뀌면        MAC 이 바뀌면
+--  이름                 DEVICE                못 찾음([7])         따라감
+--  MAC                  HWADDR                따라감([변형])       못 찾음([5])
+--  이름 고정            HWADDR + DEVICE       60-net.rules 가 DEVICE 이름을 붙임([10])
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. biosdevname=1 을 커널 인자로 넣고 재부팅한다
+-- 확인: 가상 NIC 에서 이름이 바뀌는가, udevadm info 의 속성은 무엇인가
+-- 2. ifcfg-ens33 에 HWADDR 만 더한 채 net.ifnames=0 으로 부팅한다
+-- 확인: eth1 에 ens33 프로필이 자동으로 붙는가
+-- 3. ip link set ens33 down; ip link set ens33 name lan9; ip link set lan9 up 으로 런타임 이름을 바꾼다
+--    확인: nmcli device status 와 ens33 프로필은 어떻게 반응하는가. 재부팅 뒤 이름은 무엇인가
+-- [OL8/9] OL 8/9 에서는 이름 고정을 /etc/systemd/network/*.link 파일로 하라고 안내한다. 7.9 에는 기본 .link 디렉터리가 없다
+
+================================================================================
+ 실습 07 종료
+================================================================================

@@ -1,0 +1,453 @@
+================================================================================
+ 제19장 실습 02 — 셀렉터로 로그 분리
+ 대상   : ol7a
+ 목표   : /etc/rsyslog.d 에 규칙 파일을 넣어 local3 facility 와 특정 프로그램의 메시지를
+          별도 파일로 보낸다. messages 에도 같은 줄이 계속 쌓이는 이유를 찾아 stop 으로
+          막고, priority 비교 연산(=, !)과 속성 필터, 새 파일의 권한까지 확인한다
+ 배경   : rsyslog 규칙은 "셀렉터  액션" 한 줄이다. 셀렉터는 facility.priority 이고
+          priority 는 그 값 이상을 뜻한다. 메시지 하나는 위에서부터 모든 규칙과 비교되고
+          일치하는 규칙마다 액션이 실행된다. 그래서 별도 파일로 보내도 *.info 규칙이
+          또 잡는다. rsyslog.d/*.conf 는 rsyslog.conf 의 RULES 앞에서 읽힌다 (본문 19.2·19.3)
+ 소요   : 약 30분
+ 선행   : ol7-base 스냅샷
+ 계정   : root, student
+ 주의   : rsyslog 를 여러 번 재시작한다. 끝에서 규칙 파일과 만든 로그 파일을 지운다
+ 되돌림 : /etc/rsyslog.d 원래 목록, 만든 파일 없음 → ls /etc/rsyslog.d, ls /var/log/lab*
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 규칙을 넣을 디렉터리와 기본 설정의 지문.
+[root@ol7a ~]# ls -l /etc/rsyslog.d/; md5sum /etc/rsyslog.conf
+total 4
+-rw-r--r--. 1 root root 49 Oct 10  2024 listen.conf
+0dd94a0c285fb32f41fa5b226e83c26b  /etc/rsyslog.conf
+-- rsyslog.d 에는 패키지가 넣은 listen.conf(49바이트) 하나
+-- rsyslog.conf md5 는 0dd94a0c…. 되돌림에서 다시 본다
+-- 만들 파일이 아직 없는지, 데몬이 도는지
+[root@ol7a ~]# ls /var/log/lab* 2>&1; systemctl is-active rsyslog
+ls: cannot access /var/log/lab*: No such file or directory
+active
+-- /var/log/lab* 파일은 아직 없다. 이 실습이 만드는 파일은 모두 lab- 으로 시작한다
+
+--------------------------------------------------------------------------------
+ [1] rsyslog.d 가 읽히는 위치
+--------------------------------------------------------------------------------
+
+-- IncludeConfig 줄이 RULES 구역보다 위에 있는지 본다. 위에 있으면 rsyslog.d 규칙이 먼저 비교된다.
+-- 구역 머리글(####)과 IncludeConfig, messages 규칙의 줄 번호만 뽑는다
+[root@ol7a ~]# grep -nE 'IncludeConfig|^#### |^\*\.info' /etc/rsyslog.conf
+6:#### MODULES ####
+23:#### GLOBAL DIRECTIVES ####
+36:$IncludeConfig /etc/rsyslog.d/*.conf
+46:#### RULES ####
+54:*.info;mail.none;authpriv.none;cron.none                /var/log/messages
+-- 줄 번호 순서: MODULES(6) → GLOBAL(23) → IncludeConfig(36) → RULES(46) → messages 규칙(54)
+-- rsyslog.d 의 파일은 36행 자리에 끼워진다. 54행보다 먼저 비교된다
+
+-- 기본 규칙 일곱 줄만 다시 본다.
+[root@ol7a ~]# sed -n '/#### RULES/,$p' /etc/rsyslog.conf | grep -Ev '^#|^$'
+*.info;mail.none;authpriv.none;cron.none                /var/log/messages
+authpriv.*                                              /var/log/secure
+mail.*                                                  -/var/log/maillog
+cron.*                                                  /var/log/cron
+*.emerg                                                 :omusrmsg:*
+uucp,news.crit                                          /var/log/spooler
+local7.*                                                /var/log/boot.log
+-- 이 일곱 줄이 기본 RULES 전부다
+-- *.info 는 facility 를 가리지 않으므로 local3 도 messages 로 간다
+
+--------------------------------------------------------------------------------
+ [2] local3 을 별도 파일로 — 첫 시도
+--------------------------------------------------------------------------------
+
+-- 규칙 파일 이름은 .conf 로 끝나야 읽힌다. 앞에 숫자를 붙여 읽는 순서를 정하는 관례가 있다.
+[root@ol7a ~]# cat > /etc/rsyslog.d/10-local3.conf <<'EOF'
+# 19장 실습 02: local3 를 별도 파일로
+local3.*    /var/log/lab-local3.log
+EOF
+-- heredoc 으로 쓴 내용을 다시 읽어 확인
+[root@ol7a ~]# cat /etc/rsyslog.d/10-local3.conf
+# 19장 실습 02: local3 를 별도 파일로
+local3.*    /var/log/lab-local3.log
+
+-- 재시작 전에 메시지를 하나 보낸다. 설정이 즉시 반영되는지 확인한다.
+[root@ol7a ~]# logger -t lab19 -p local3.info "LAB19-02 before restart"; sleep 2; ls -l /var/log/lab-local3.log 2>&1
+ls: cannot access /var/log/lab-local3.log: No such file or directory
+-- 규칙 파일을 만들었지만 파일이 없다. rsyslog 는 새 파일을 스스로 읽지 않는다
+
+-- 문법 검사 후 재시작.
+--   -N1 : 설정을 읽어 검사만 하고 끝낸다(레벨 1). 데몬은 띄우지 않는다
+-- 이후 단계에서는 검사 출력의 마지막 줄만 본다(tail -1).
+[root@ol7a ~]# rsyslogd -N1; echo "exit=$?"
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: End of config validation run. Bye.
+exit=0
+-- 첫 줄은 버전과 검사 레벨, 둘째 줄 End of config validation run. Bye. 가 오류 없음이다
+-- 오류가 있으면 둘째 줄 대신 오류 문장이 나오고 exit 가 1 이 된다(실습 06)
+[root@ol7a ~]# systemctl restart rsyslog; logger -t lab19 -p local3.info "LAB19-02 after restart"; sleep 2
+[root@ol7a ~]# cat /var/log/lab-local3.log
+Nov 16 16:02:33 ol7a lab19: LAB19-02 after restart
+-- 재시작 뒤에 보낸 메시지가 lab-local3.log 에 들어갔다
+
+--------------------------------------------------------------------------------
+ [3] messages 에도 남아 있다
+--------------------------------------------------------------------------------
+
+-- 오류 흐름 ①. 별도 파일로 보냈는데 messages 에도 같은 줄이 있는지 본다.
+-- messages 쪽도 본다
+[root@ol7a ~]# grep LAB19-02 /var/log/messages
+Nov 16 16:02:25 ol7a lab19: LAB19-02 before restart
+Nov 16 16:02:33 ol7a lab19: LAB19-02 after restart
+-- messages 에도 두 건 다 있다. "before restart" 는 규칙이 없을 때, "after restart" 는 규칙이 있을 때다
+-- 둘째 줄이 문제다. 별도 파일로 보냈는데 messages 에도 같은 줄이 남았다
+--
+-- 증상   : local3 메시지가 lab-local3.log 와 /var/log/messages 양쪽에 기록됨
+-- 원인   : 규칙은 위에서부터 모두 비교된다. 10-local3.conf 규칙 다음에 54행 *.info 규칙도
+--          같은 메시지를 잡아 messages 에 썼다
+-- 조치   : 10-local3.conf 에 & stop 을 더한다([4])
+-- 재확인 : 새 local3 메시지의 grep -c 결과가 messages 0, lab-local3.log 1
+
+--------------------------------------------------------------------------------
+ [4] stop 으로 처리 끝내기
+--------------------------------------------------------------------------------
+
+-- & 는 "바로 위 줄과 같은 셀렉터" 라는 뜻이다. 그 셀렉터에 stop 액션을 하나 더 붙인다.
+-- stop 은 이 메시지의 처리를 여기서 끝낸다. 아래 규칙(*.info → messages)까지 내려가지 않는다.
+-- 고치기 전 파일을 남겨 diff 에 쓴다
+[root@ol7a ~]# cp /etc/rsyslog.d/10-local3.conf /root/10-local3.conf.v1
+[root@ol7a ~]# cat > /etc/rsyslog.d/10-local3.conf <<'EOF'
+# 19장 실습 02: local3 를 별도 파일로, messages 에는 남기지 않음
+local3.*    /var/log/lab-local3.log
+&           stop
+EOF
+[root@ol7a ~]# diff /root/10-local3.conf.v1 /etc/rsyslog.d/10-local3.conf
+1c1
+< # 19장 실습 02: local3 를 별도 파일로
+---
+> # 19장 실습 02: local3 를 별도 파일로, messages 에는 남기지 않음
+2a3
+> &           stop
+-- 주석 한 줄이 바뀌고 셋째 줄 & stop 이 더해졌다(2a3)
+[root@ol7a ~]# rsyslogd -N1 2>&1 | tail -1; systemctl restart rsyslog
+rsyslogd: End of config validation run. Bye.
+[root@ol7a ~]# logger -t lab19 -p local3.warning "LAB19-04 with stop"; sleep 2
+-- -c 는 맞는 줄 수만 센다
+[root@ol7a ~]# grep -c LAB19-04 /var/log/messages; grep LAB19-04 /var/log/lab-local3.log
+0
+Nov 16 16:02:42 ol7a lab19: LAB19-04 with stop
+-- messages 0건, lab-local3.log 1건. stop 이 54행에 닿기 전에 처리를 끝냈다
+-- local3.warning 으로 보냈다. local3.* 는 priority 를 가리지 않는다
+
+--------------------------------------------------------------------------------
+ [5] 옛 문법 ~ (버림)
+--------------------------------------------------------------------------------
+
+-- rsyslog 5 이전에는 stop 대신 ~ 를 썼다. 7.9 의 rsyslog 8.24 가 이것을 받아 주는지, 검사가 무엇을 말하는지 본다.
+[root@ol7a ~]# sed -i 's/^&           stop/\&           ~/' /etc/rsyslog.d/10-local3.conf; cat /etc/rsyslog.d/10-local3.conf
+# 19장 실습 02: local3 를 별도 파일로, messages 에는 남기지 않음
+local3.*    /var/log/lab-local3.log
+&           ~
+-- ~ 로 바뀌었다. & 앞의 \ 는 sed 에서 & 를 글자로 쓰려고 붙였다
+[root@ol7a ~]# rsyslogd -N1 2>&1 | tail -1
+rsyslogd: End of config validation run. Bye.
+-- 7.9 의 rsyslog 8.24 는 ~ 를 경고 없이 받아 준다. 동작도 stop 과 같다
+-- 설계에서는 폐기 경고를 예상했지만 나오지 않았다. 새 규칙에는 stop 을 쓴다
+-- 다시 stop 으로 돌린다.
+[root@ol7a ~]# sed -i 's/^&           ~/\&           stop/' /etc/rsyslog.d/10-local3.conf; rsyslogd -N1 2>&1 | tail -1; systemctl restart rsyslog
+rsyslogd: End of config validation run. Bye.
+
+--------------------------------------------------------------------------------
+ [6] priority 비교 — 이상, 같음, 아님
+--------------------------------------------------------------------------------
+
+-- 셀렉터의 priority 앞에 붙는 기호
+--   (없음)    그 값과 그보다 심각한 것 전부
+--   =         그 값 하나만
+--   !         그 값 이상을 뺀다 (!=  는 그 값 하나만 뺀다)
+-- local3 하나로 세 파일을 만든다. 이 규칙은 10-local3.conf 보다 앞에서 읽혀야 하니 05- 로 시작한다.
+[root@ol7a ~]# cat > /etc/rsyslog.d/05-local3-prio.conf <<'EOF'
+local3.err            /var/log/lab-local3-err.log
+local3.=warning       /var/log/lab-local3-onlywarn.log
+local3.*;local3.!err  /var/log/lab-local3-belowerr.log
+EOF
+-- 05- 로 시작해 10-local3.conf 보다 먼저 읽힌다. 10- 의 stop 앞에서 처리돼야 하기 때문이다
+[root@ol7a ~]# rsyslogd -N1 2>&1 | tail -1; systemctl restart rsyslog
+rsyslogd: End of config validation run. Bye.
+-- 여섯 priority 를 하나씩 보낸다
+[root@ol7a ~]# for p in debug info notice warning err crit; do logger -t lab19 -p local3.$p "LAB19-06 $p"; done; sleep 2
+-- awk '{print $NF}' 는 줄의 마지막 단어. 메시지 끝에 priority 이름을 넣어 두었다
+[root@ol7a ~]# cd /var/log; for f in lab-local3-err.log lab-local3-onlywarn.log lab-local3-belowerr.log; do echo "== $f"; awk '{print $NF}' $f; done
+== lab-local3-err.log
+err
+crit
+== lab-local3-onlywarn.log
+warning
+== lab-local3-belowerr.log
+debug
+info
+notice
+warning
+-- 파일별로 마지막 단어(priority)만 뽑았다
+--   lab-local3-err.log       err·crit          err 이상
+--   lab-local3-onlywarn.log  warning           warning 하나
+--   lab-local3-belowerr.log  debug~warning     err 이상을 뺀 나머지
+-- debug 도 들어갔다. local3.* 의 * 가 debug 를 포함한다. *.info 와 다르다
+
+--------------------------------------------------------------------------------
+ [7] 속성 필터 — 프로그램 이름으로 고르기
+--------------------------------------------------------------------------------
+
+-- facility 로 나눌 수 없는 메시지(대부분 user·daemon)는 속성으로 거른다.
+-- 형식  :속성, 비교연산, "값"   액션
+-- programname 은 태그에서 콜론·PID 를 뗀 이름이다.
+[root@ol7a ~]# cat > /etc/rsyslog.d/20-dbapp.conf <<'EOF'
+:programname, isequal, "dbapp"      /var/log/lab-dbapp.log
+& stop
+:msg, contains, "ORA-"              /var/log/lab-ora.log
+EOF
+[root@ol7a ~]# rsyslogd -N1 2>&1 | tail -1; systemctl restart rsyslog
+rsyslogd: End of config validation run. Bye.
+[root@ol7a ~]# logger -t dbapp "LAB19-07 backup started"; logger -t dbapp "LAB19-07 ORA-01555 inside dbapp"; logger -t other "LAB19-07 ORA-00600 from other"; sleep 2
+-- -H 는 줄 앞에 파일 이름을 붙인다. 어느 파일에 갔는지 한눈에 본다
+[root@ol7a ~]# grep -H LAB19-07 /var/log/lab-dbapp.log /var/log/lab-ora.log /var/log/messages
+/var/log/lab-dbapp.log:Nov 16 16:03:04 ol7a dbapp: LAB19-07 backup started
+/var/log/lab-dbapp.log:Nov 16 16:03:04 ol7a dbapp: LAB19-07 ORA-01555 inside dbapp
+/var/log/lab-ora.log:Nov 16 16:03:04 ol7a other: LAB19-07 ORA-00600 from other
+/var/log/messages:Nov 16 16:03:04 ol7a other: LAB19-07 ORA-00600 from other
+-- dbapp 의 두 줄은 lab-dbapp.log 에만 있다. & stop 때문에 ORA- 규칙에도 닿지 않았다
+-- other 의 ORA- 줄은 lab-ora.log 와 messages 양쪽에 있다. 둘째 규칙에는 stop 이 없다
+-- 속성 필터는 :속성, 비교, "값" 형식. isequal 은 같음, contains 는 포함
+
+-- 같은 규칙을 RainerScript if 문으로 쓰면
+[root@ol7a ~]# cat > /etc/rsyslog.d/20-dbapp.conf <<'EOF'
+if $programname == 'dbapp' then {
+    action(type="omfile" file="/var/log/lab-dbapp.log")
+    stop
+}
+if $msg contains 'ORA-' then action(type="omfile" file="/var/log/lab-ora.log")
+EOF
+[root@ol7a ~]# rsyslogd -N1 2>&1 | tail -1; systemctl restart rsyslog
+rsyslogd: End of config validation run. Bye.
+[root@ol7a ~]# logger -t dbapp "LAB19-07b rainer dbapp"; logger -t other "LAB19-07b ORA-00942 rainer"; sleep 2
+-- 같은 확인
+[root@ol7a ~]# grep -H LAB19-07b /var/log/lab-dbapp.log /var/log/lab-ora.log /var/log/messages
+/var/log/lab-dbapp.log:Nov 16 16:03:12 ol7a dbapp: LAB19-07b rainer dbapp
+/var/log/lab-ora.log:Nov 16 16:03:12 ol7a other: LAB19-07b ORA-00942 rainer
+/var/log/messages:Nov 16 16:03:12 ol7a other: LAB19-07b ORA-00942 rainer
+-- if 문으로 바꿔도 결과가 같다. dbapp 는 한 파일에만, other 의 ORA- 는 두 곳에
+-- 중괄호 안에 액션과 stop 을 여러 개 넣을 수 있다. 조건이 복잡해지면 이 형식이 읽기 쉽다
+
+--------------------------------------------------------------------------------
+ [8] 새 파일의 권한
+--------------------------------------------------------------------------------
+
+-- 오류 흐름 ②. rsyslog 가 만든 파일을 일반 사용자가 읽을 수 있는지 본다.
+[root@ol7a ~]# ls -l /var/log/lab-*.log
+-rw-------. 1 root root 163 Nov 16 16:03 /var/log/lab-dbapp.log
+-rw-------. 1 root root 174 Nov 16 16:02 /var/log/lab-local3-belowerr.log
+-rw-------. 1 root root  83 Nov 16 16:02 /var/log/lab-local3-err.log
+-rw-------. 1 root root 355 Nov 16 16:02 /var/log/lab-local3.log
+-rw-------. 1 root root  45 Nov 16 16:02 /var/log/lab-local3-onlywarn.log
+-rw-------. 1 root root 113 Nov 16 16:03 /var/log/lab-ora.log
+-- rsyslog 가 만든 여섯 파일이 모두 -rw------- root root(0600) 다
+-- 일반 계정(student, wheel)으로 읽어 본다
+[student@ol7a ~]$ tail -1 /var/log/lab-dbapp.log
+tail: cannot open ‘/var/log/lab-dbapp.log’ for reading: Permission denied
+-- student 는 wheel 그룹이지만 읽지 못한다. 그룹 권한 비트가 없다
+
+-- 만들 때의 권한은 rsyslog 전역 지시어로 정한다. 기본 설정에는 줄이 없다.
+[root@ol7a ~]# grep -nE 'FileCreateMode|FileGroup|Umask' /etc/rsyslog.conf; echo "grep exit=$?"
+grep exit=1
+-- rsyslog.conf 에 권한 지시어가 없다. 0600 은 다른 곳에서 온다
+-- 서비스 유닛 쪽에도 권한에 관여하는 값이 있는지 본다.
+-- systemctl cat 은 유닛 파일과 drop-in 을 합쳐 보여 준다. 필요한 줄만 고른다
+[root@ol7a ~]# systemctl cat rsyslog | grep -E '^\[|^Type|^ExecStart|^Restart|^UMask'
+[Unit]
+[Service]
+Type=notify
+ExecStart=/usr/sbin/rsyslogd -n $SYSLOGD_OPTIONS
+Restart=on-failure
+UMask=0066
+Restart=on-failure
+[Install]
+-- [Service] 의 UMask=0066 이 원인이다. 새 파일에서 그룹·기타의 rw 를 뺀다
+-- Type=notify: rsyslogd 가 준비됐다고 systemd 에 알린다. Restart=on-failure: 비정상 종료 때 다시 띄운다
+-- Restart 줄이 두 번 나오는 것은 패키지 유닛 파일 그대로다
+
+-- 액션 매개변수 fileCreateMode·fileGroup 으로 이 파일만 바꾼다. 파일을 지우고 다시 만들게 한다.
+[root@ol7a ~]# sed -i 's|action(type="omfile" file="/var/log/lab-dbapp.log")|action(type="omfile" file="/var/log/lab-dbapp.log" fileCreateMode="0640" fileGroup="wheel")|' /etc/rsyslog.d/20-dbapp.conf; grep dbapp.log /etc/rsyslog.d/20-dbapp.conf
+    action(type="omfile" file="/var/log/lab-dbapp.log" fileCreateMode="0640" fileGroup="wheel")
+[root@ol7a ~]# rsyslogd -N1 2>&1 | tail -1; rm -f /var/log/lab-dbapp.log; systemctl restart rsyslog; logger -t dbapp "LAB19-08 recreated"; sleep 2; ls -l /var/log/lab-dbapp.log
+rsyslogd: End of config validation run. Bye.
+-rw-------. 1 root wheel 47 Nov 16 16:03 /var/log/lab-dbapp.log
+-- 그룹은 wheel 이 됐지만 권한은 여전히 0600 이다
+-- 0640 을 요청해도 UMask 0066 이 그룹 읽기(040)를 다시 뺐다. 0640 & ~0066 = 0600
+--
+-- 증상   : student(wheel)가 lab-dbapp.log 를 읽지 못함 "Permission denied".
+--          fileCreateMode="0640" 을 줘도 새 파일이 -rw------- root wheel
+-- 원인   : rsyslog.service 의 UMask=0066 이 파일 생성 권한을 다시 깎음
+-- 조치   : $Umask 0022 로 rsyslog 프로세스 umask 를 바꾸고 파일을 지워 다시 만들게 함
+-- 재확인 : ls -l 이 -rw-r----- root wheel, student 의 tail -1 성공
+
+-- 프로세스 umask 를 rsyslog 지시어로 바꾼다. 전역 지시어라 별도 파일 00- 로 맨 앞에 둔다.
+[root@ol7a ~]# echo '$Umask 0022' > /etc/rsyslog.d/00-umask.conf; rsyslogd -N1 2>&1 | tail -1
+rsyslogd: End of config validation run. Bye.
+[root@ol7a ~]# rm -f /var/log/lab-dbapp.log; systemctl restart rsyslog; logger -t dbapp "LAB19-08 after umask"; sleep 2; ls -l /var/log/lab-dbapp.log
+-rw-r-----. 1 root wheel 49 Nov 16 16:03 /var/log/lab-dbapp.log
+-- 이번에는 0640 root wheel 이다
+-- 실행 중인 프로세스의 umask 를 직접 본다
+[root@ol7a ~]# grep Umask /proc/$(pidof rsyslogd)/status
+Umask:  0022
+-- 실행 중인 rsyslogd 의 umask 가 0022 로 바뀌었다(UEK 5.4 의 /proc 에 Umask 줄이 있다)
+-- $Umask 는 전역 값이라 다른 파일도 0644 로 만들어진다. fileCreateMode 를 함께 주는 이유다
+[student@ol7a ~]$ id -Gn; tail -1 /var/log/lab-dbapp.log
+student wheel
+Nov 16 16:03:29 ol7a dbapp: LAB19-08 after umask
+-- student 가 읽었다. 기존 파일은 rsyslog 가 권한을 고치지 않으니 지우고 다시 만들게 했다
+
+--------------------------------------------------------------------------------
+ [9] 즉시 반영되는가
+--------------------------------------------------------------------------------
+
+-- rsyslog 8 은 SIGHUP 을 받으면 열린 파일만 닫았다 다시 연다. 설정은 다시 읽지 않는다.
+-- 규칙을 하나 더 넣고 HUP 만 보낸다.
+-- local4 규칙 하나를 더한다
+[root@ol7a ~]# echo 'local4.*  /var/log/lab-local4.log' > /etc/rsyslog.d/30-local4.conf
+-- syslogd.pid 에 rsyslogd 의 PID 가 들어 있다(이름은 옛 syslogd 그대로)
+[root@ol7a ~]# kill -HUP $(cat /var/run/syslogd.pid); logger -p local4.info -t lab19 "LAB19-09 after HUP"; sleep 2; ls -l /var/log/lab-local4.log 2>&1
+ls: cannot access /var/log/lab-local4.log: No such file or directory
+-- HUP 뒤에도 파일이 없다. rsyslog 8 의 HUP 은 열린 파일을 닫았다 다시 열 뿐이다
+[root@ol7a ~]# systemctl restart rsyslog; logger -p local4.info -t lab19 "LAB19-09 after restart"; sleep 2; cat /var/log/lab-local4.log
+Nov 16 16:03:39 ol7a lab19: LAB19-09 after restart
+-- restart 뒤에야 규칙이 적용됐다. 설정 변경은 restart 로 반영한다
+-- [OL8/9] rsyslog 버전이 올라가도 HUP 이 설정을 다시 읽지 않는 것은 같다
+
+--------------------------------------------------------------------------------
+ [10] 규칙 순서가 바뀌면
+--------------------------------------------------------------------------------
+
+-- stop 은 그 위치에서만 효과가 있다. 같은 규칙을 rsyslog.conf 의 RULES 뒤(파일 끝)에 붙이면 어떻게 되나.
+-- 기본 파일을 고치기 전에 원본을 남긴다
+[root@ol7a ~]# cp /etc/rsyslog.conf /root/rsyslog.conf.orig; rm -f /etc/rsyslog.d/30-local4.conf
+[root@ol7a ~]# printf 'local4.*  /var/log/lab-local4.log\n& stop\n' >> /etc/rsyslog.conf; tail -3 /etc/rsyslog.conf
+# ### end of the forwarding rule ###
+local4.*  /var/log/lab-local4.log
+& stop
+-- 기본 파일 끝(전송 견본 뒤)에 두 줄이 붙었다
+[root@ol7a ~]# rsyslogd -N1 2>&1 | tail -1; systemctl restart rsyslog; logger -p local4.info -t lab19 "LAB19-10 rule at end"; sleep 2
+rsyslogd: End of config validation run. Bye.
+[root@ol7a ~]# grep -H LAB19-10 /var/log/messages /var/log/lab-local4.log
+/var/log/messages:Nov 16 16:03:47 ol7a lab19: LAB19-10 rule at end
+/var/log/lab-local4.log:Nov 16 16:03:47 ol7a lab19: LAB19-10 rule at end
+-- 양쪽 다 기록됐다. 54행 *.info 가 먼저 messages 에 쓴 뒤에 stop 을 만났다
+-- stop 은 놓인 자리 뒤의 규칙만 막는다. 그래서 rsyslog.d 에 둔다
+[root@ol7a ~]# cp /root/rsyslog.conf.orig /etc/rsyslog.conf; md5sum /etc/rsyslog.conf
+0dd94a0c285fb32f41fa5b226e83c26b  /etc/rsyslog.conf
+-- 원본으로 되돌렸다. md5 가 [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [11] restart 를 연달아 하면
+--------------------------------------------------------------------------------
+
+-- 규칙을 고칠 때마다 restart 를 반복하다 보면 마주치는 오류. 1초 안에 여섯 번 재시작한다.
+-- || 뒤는 restart 가 실패했을 때만 실행된다
+[root@ol7a ~]# for i in 1 2 3 4 5 6; do systemctl restart rsyslog || echo "restart $i failed"; done; systemctl is-active rsyslog
+Job for rsyslog.service failed because start of the service was attempted too often. See "systemctl status rsyslog.service" and "journalctl -xe" for details.
+To force a start use "systemctl reset-failed rsyslog.service" followed by "systemctl start rsyslog.service" again.
+restart 6 failed
+failed
+-- 다섯 번은 됐고 여섯 번째가 실패했다. 서비스는 failed 상태로 남았다. 로그를 받는 데몬이 없다
+-- 상태의 Result 칸이 이유를 말한다
+[root@ol7a ~]# systemctl status rsyslog --no-pager | sed -n '1,4p'
+● rsyslog.service - System Logging Service
+   Loaded: loaded (/usr/lib/systemd/system/rsyslog.service; enabled; vendor preset: enabled)
+   Active: failed (Result: start-limit) since Mon 2026-11-16 16:04:00 KST; 20ms ago
+     Docs: man:rsyslogd(8)
+-- Active 줄의 Result: start-limit 가 원인을 말한다
+-- 제한값은 show 로 본다
+[root@ol7a ~]# systemctl show rsyslog -p StartLimitBurst -p StartLimitInterval -p Restart
+Restart=on-failure
+StartLimitInterval=10000000
+StartLimitBurst=5
+-- StartLimitInterval=10000000 은 마이크로초(10초)다. 10초 안에 다섯 번까지 시작을 허용한다
+--
+-- 증상   : "Job for rsyslog.service failed because start of the service was attempted too often."
+--          is-active 가 failed, status 에 Result: start-limit
+-- 원인   : systemd 의 시작 횟수 제한(StartLimitBurst=5, StartLimitInterval=10초)
+-- 조치   : systemctl reset-failed rsyslog 후 systemctl start rsyslog
+-- 재확인 : systemctl is-active rsyslog → active
+-- 규칙을 고치며 restart 를 연달아 할 때 실제로 마주친다. 이 실습 첫 실측에서도 [8] 에서 걸렸다
+-- 실패 횟수를 지우고 다시 띄운다.
+[root@ol7a ~]# systemctl reset-failed rsyslog; systemctl start rsyslog; systemctl is-active rsyslog
+active
+
+--------------------------------------------------------------------------------
+ [변형] messages 셀렉터에 .none 을 더하기
+--------------------------------------------------------------------------------
+
+-- stop 대신 기본 messages 규칙에 local3.none 을 더하는 방법. 기본 설정이 mail·authpriv·cron 을 뺀 방식과 같다.
+[root@ol7a ~]# rm -f /etc/rsyslog.d/10-local3.conf /etc/rsyslog.d/05-local3-prio.conf; echo 'local3.*    /var/log/lab-local3.log' > /etc/rsyslog.d/10-local3.conf
+-- 54행 셀렉터에 local3.none 을 붙인다
+[root@ol7a ~]# sed -i 's|^\*\.info;mail\.none;authpriv\.none;cron\.none|*.info;mail.none;authpriv.none;cron.none;local3.none|' /etc/rsyslog.conf
+-- 바뀐 줄만 확인
+[root@ol7a ~]# diff /root/rsyslog.conf.orig /etc/rsyslog.conf
+54c54
+< *.info;mail.none;authpriv.none;cron.none                /var/log/messages
+---
+> *.info;mail.none;authpriv.none;cron.none;local3.none                /var/log/messages
+-- 54행 셀렉터 끝에 ;local3.none 이 붙었다. 액션 열의 공백은 그대로다
+[root@ol7a ~]# rsyslogd -N1 2>&1 | tail -1; systemctl restart rsyslog; logger -t lab19 -p local3.err "LAB19-V none method"; sleep 2
+rsyslogd: End of config validation run. Bye.
+-- messages 0, 별도 파일 1 이 기대값
+[root@ol7a ~]# grep -c LAB19-V /var/log/messages; grep LAB19-V /var/log/lab-local3.log
+0
+Nov 16 16:04:13 ol7a lab19: LAB19-V none method
+-- messages 0건, lab-local3.log 1건. stop 없이도 같은 결과다
+-- 차이는 기본 파일을 고쳤다는 점이다. rpm 업데이트 때 rsyslog.conf.rpmnew 가 생길 수 있다
+
+--------------------------------------------------------------------------------
+ 되돌림
+--------------------------------------------------------------------------------
+
+-- 기본 파일 원본 복구, 만든 규칙·로그 파일 삭제
+[root@ol7a ~]# cp /root/rsyslog.conf.orig /etc/rsyslog.conf; rm -f /etc/rsyslog.d/00-umask.conf /etc/rsyslog.d/10-local3.conf /etc/rsyslog.d/20-dbapp.conf /var/log/lab-*.log /root/10-local3.conf.v1 /root/rsyslog.conf.orig
+[root@ol7a ~]# rsyslogd -N1 2>&1 | tail -1; systemctl restart rsyslog; ls -l /etc/rsyslog.d/; md5sum /etc/rsyslog.conf; ls /var/log/lab* 2>&1
+rsyslogd: End of config validation run. Bye.
+total 4
+-rw-r--r--. 1 root root 49 Oct 10  2024 listen.conf
+0dd94a0c285fb32f41fa5b226e83c26b  /etc/rsyslog.conf
+ls: cannot access /var/log/lab*: No such file or directory
+-- rsyslog.d 는 listen.conf 하나, rsyslog.conf md5 는 [0] 과 같은 0dd94a0c…, lab 파일 없음
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  시험                              messages     별도 파일
+--  local3.* 만 넣음                  기록됨       lab-local3.log
+--  local3.* + & stop                 0건          lab-local3.log
+--  & ~ (옛 문법)                     경고 없이 통과, stop 과 같음
+--  local3 여섯 priority              —            err: err·crit / =warning: warning / !err: debug~warning
+--  :programname isequal + & stop     dbapp 0건    lab-dbapp.log
+--  fileCreateMode=0640 만            —            0600 root wheel (UMask 0066)
+--  + $Umask 0022                     —            0640 root wheel, student 읽기 가능
+--  HUP / restart                     —            HUP 은 새 규칙 미적용, restart 는 적용
+--  & stop 을 rsyslog.conf 끝에        기록됨       lab-local4.log
+--  restart 6회 연속                  —            start-limit, reset-failed 로 복구
+--
+--  항목             시작 전          변경 중                          되돌린 뒤
+--  rsyslog.d        listen.conf      00-·05-·10-·20-·30- 파일         listen.conf
+--  rsyslog.conf     0dd94a0c…        local4 줄·local3.none 추가       0dd94a0c…
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. :msg, regex, "ORA-[0-9]{5}" 형식으로 바꿔 보고 rsyslogd -N1 이 받아 주는지, 결과가 같은지 본다
+-- 2. local3.info;local3.!=notice 가 받는 priority 를 logger 여섯 번으로 확인한다
+-- 3. fileCreateMode 와 $Umask 를 모두 지우고 $FileCreateMode 0640 전역 지시어만 줬을 때의 권한을 본다
+
+================================================================================
+ 실습 02 종료 — 규칙은 모두 비교되므로 stop 을 달고, 새 파일 권한은 UMask 까지 본다
+================================================================================

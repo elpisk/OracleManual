@@ -1,0 +1,533 @@
+================================================================================
+ 제20장 실습 06 — 종합 진단: 정보 수집에서 보고까지
+ 대상   : ol7a
+ 목표   : "느리고 일부 마운트가 안 된다"는 신고에서 원인 두 개를 찾아 근거를 남기고,
+          sosreport 로 묶고, 고치고, 재부팅으로 재확인해 보고서로 정리한다
+ 배경   : 1단계는 넓게 보며 정상/비정상만 가른다. 2단계는 비정상 하나로 가설을 세워
+          확인하고, 틀리면 1단계로 돌아간다. 조치는 증상을 지우므로 근거부터 남긴다
+          (본문 20.1~20.4)
+ 소요   : 약 40분
+ 선행   : storage-clean 스냅샷. plant.sh 로 장애 두 개를 심고 재부팅([더 해 보기])
+ 계정   : root
+ 주의   : sdb 를 쓴다. /etc/fstab 을 고친다. 한 번 재부팅한다
+ 되돌림 : report-gen·fstab 두 줄·vgapp 제거 → grep -c vgapp /etc/fstab (0)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록 — 신고 접수
+--------------------------------------------------------------------------------
+
+-- 신고: "오늘 아침부터 ol7a 가 느리다. 앱 데이터 디렉터리 /app 이 비어 있다."
+-- 언제 무엇을 보았는지가 보고서의 첫 줄이다.
+-- 시각과 부팅 시점부터 남긴다.
+[root@ol7a ~]# date; uptime; who -b
+Mon Nov 16 21:06:19 KST 2026
+ 21:06:19 up 1 min,  0 users,  load average: 3.72, 1.44, 0.53
+         system boot  2026-11-16 21:04
+-- 부팅 21:04, 지금 21:06.
+-- "아침부터"라는 신고와 맞춰 보면 그사이 재부팅이 있었다.
+-- 1분 평균 부하 3.72.
+-- 부팅 2분 만에 이 값이면 무언가 계속 돈다.
+-- 증거 디렉터리를 만든다.
+-- 이후 출력은 tee 로 여기에도 남긴다.
+[root@ol7a ~]# mkdir -p /root/case; date > /root/case/00_opened.txt; ls /root/case
+00_opened.txt
+-- 진단 도구가 있는지 본다.
+[root@ol7a ~]# rpm -q sos sysstat
+sos-3.9-5.0.29.el7_9.10.noarch
+sysstat-10.1.5-20.0.3.el7_9.x86_64
+-- sos 3.9 와 sysstat 10.1 이 있다.
+-- 없으면 장애 중에 설치해야 한다.
+
+--------------------------------------------------------------------------------
+ [1] 1단계 — 넓게 보기: 부하·메모리·디스크
+--------------------------------------------------------------------------------
+
+-- load average 는 실행 대기와 D 상태 프로세스 수의 평균이다.
+-- CPU 수와 비교한다.
+[root@ol7a ~]# nproc; cat /proc/loadavg | tee /root/case/01_loadavg.txt
+2
+3.72 1.44 0.53 5/210 10230
+-- CPU 2개에 1분 평균 3.72.
+-- 실행할 일이 CPU 의 두 배 가까이 줄 서 있다.
+-- 네 번째 칸 5/210 : 지금 실행 가능 5개 / 전체 210개.
+-- 1·5·15분 값이 3.72 > 1.44 > 0.53.
+-- 부팅 뒤 계속 오르는 중이다.
+[root@ol7a ~]# free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629         181        3186           8         260        3221
+Swap:          3967           0        3967
+-- available 3221MB, 스왑 사용 0. 메모리는 정상.
+[root@ol7a ~]# df -hT -x tmpfs -x devtmpfs | tee /root/case/02_df.txt
+Filesystem              Type  Size  Used Avail Use% Mounted on
+/dev/mapper/ol-root     xfs    36G  4.3G   31G  13% /
+/dev/sda1               xfs  1014M  268M  747M  27% /boot
+/dev/mapper/vgapp-lvlog xfs  1014M   33M  982M   4% /applog
+-- 사용률 모두 30% 아래. 공간은 정상.
+-- /applog 는 보이는데 /app 이 없다.
+-- 신고의 두 번째 증상이다.
+
+--------------------------------------------------------------------------------
+ [2] 1단계 — 실패 유닛·오류 로그·마운트 대조
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# systemctl --failed --no-pager
+0 loaded units listed. Pass --all to see loaded but inactive units, too.
+To show all installed unit files use 'systemctl list-unit-files'.
+-- 실패한 유닛 0개.
+-- nofail 마운트의 실패는 여기 잡히지 않는다.
+[root@ol7a ~]# journalctl -b -p err --no-pager -q | cut -c1-150 | tee /root/case/03_err.txt
+Nov 16 21:04:20 ol7a.example.com kernel: integrity: Unable to open file: /etc/keys/x509_ima.der (-2)
+Nov 16 21:04:20 ol7a.example.com kernel: sd 2:0:0:0: [sda] Assuming drive cache: write through
+Nov 16 21:04:20 ol7a.example.com kernel: sd 2:0:1:0: [sdb] Assuming drive cache: write through
+Nov 16 21:04:20 ol7a.example.com kernel: sd 2:0:2:0: [sdc] Assuming drive cache: write through
+Nov 16 21:04:21 ol7a.example.com kernel: sd 2:0:3:0: [sdd] Assuming drive cache: write through
+Nov 16 21:04:21 ol7a.example.com kernel: sd 2:0:4:0: [sde] Assuming drive cache: write through
+Nov 16 21:04:22 ol7a.example.com kernel: piix4_smbus 0000:00:07.3: SMBus Host Controller not enabled!
+Nov 16 21:05:53 ol7a.example.com systemd[1]: Timed out waiting for device dev-disk-by\x2duuid-e7f0708c\x2dd499\x2d4861\x2d82a5\x2d6ec80dbde33e.device.
+-- 앞 일곱 줄은 부팅마다 나오는 커널 메시지다.
+-- 실습 05 의 [0] 에서 센 7줄과 같다.
+--   x509_ima.der : 무결성 키 파일 없음, 무해
+--   Assuming drive cache : 가상 디스크라 캐시 정보를 못 읽음, 무해
+-- 마지막 줄만 새롭다.
+-- 부팅 90초 뒤 장치를 기다리다 포기했다.
+-- fstab 의 마운트 지점이 실제로 붙었는지 하나씩 대조한다.
+[root@ol7a ~]# awk '$1 !~ /^#/ && $2 ~ /^\// {print $2}' /etc/fstab | while read m; do findmnt -n "$m" >/dev/null && echo "mounted     $m" || echo "NOT mounted $m"; done | tee /root/case/04_fstab_check.txt
+mounted     /
+mounted     /boot
+NOT mounted /app
+mounted     /applog
+-- /app 만 NOT mounted.
+-- 1단계의 비정상 표시 두 개가 모였다(부하, /app).
+-- [OL8/9] util-linux 2.29 이상은 findmnt --verify 로 fstab 을 검사한다. 7.9 는 2.23.
+[root@ol7a ~]# findmnt --verify 2>&1 | head -2
+findmnt: unrecognized option '--verify'
+-- 7.9 의 util-linux 에는 --verify 가 없다.
+-- 위의 반복문이 대신한다.
+-- kdump 준비 상태도 1단계에서 본다.
+-- kexec_crash_loaded 가 1 이면 덤프 커널이 올라 있다.
+[root@ol7a ~]# systemctl is-active kdump; cat /sys/kernel/kexec_crash_loaded; grep -o 'crashkernel=[^ ]*' /proc/cmdline; dmesg | grep -i 'Reserving.*crashkernel' | cut -c1-110; ls /var/crash | wc -l
+activating
+0
+crashkernel=auto
+[    0.012467] kexec: Reserving the low 1M of memory for crashkernel
+[    0.012909] Reserving 280MB of memory at 2790MB for crashkernel (System RAM: 4095MB)
+0
+-- kdump 는 activating,
+-- 아직 준비 중이라 kexec_crash_loaded 가 0 이다.
+-- crashkernel=auto 로 280MB 를 예약했다.
+-- /var/crash 는 비어 있다.
+-- 이 순간 패닉이 나면 덤프가 남지 않는다.
+-- [11] 에서 다시 본다.
+
+--------------------------------------------------------------------------------
+ [3] 2단계 — 첫 가설: 디스크가 고장 나고 있다
+--------------------------------------------------------------------------------
+
+-- 첫 가설: 마운트가 빠지고 느리니 디스크가 고장 나고 있다.
+-- 맞다면 I/O 오류 로그, iostat 의 %util·await 상승,
+-- vmstat 의 wa 상승이 보여야 한다.
+[root@ol7a ~]# dmesg -l err,crit,alert,emerg | wc -l; dmesg | grep -ciE 'i/o error|blk_update_request'
+7
+0
+-- err 이상 7줄은 위의 부팅 메시지.
+-- I/O 오류 문자열은 0건.
+-- iostat -dxy 1 1 : 장치별 확장 통계,
+-- 부팅 후 누적(첫 보고)은 뺀다.
+[root@ol7a ~]# iostat -dxy 1 1 | grep -E '^Device|^sda |^sdb |^dm-'
+Device:         rrqm/s   wrqm/s     r/s     w/s    rkB/s    wkB/s avgrq-sz avgqu-sz   await r_await w_await  svctm  %util
+sda               0.00     0.00    0.99    0.00     7.92     0.00    16.00     0.00    0.00    0.00    0.00 1.0000   0.10
+sdb               0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00    0.00    0.00 0.0000   0.00
+dm-0              0.00     0.00    0.99    0.00     7.92     0.00    16.00     0.00    0.00    0.00    0.00 1.0000   0.10
+dm-1              0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00    0.00    0.00 0.0000   0.00
+dm-2              0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00    0.00    0.00 0.0000   0.00
+dm-3              0.00     0.00    0.00    0.00     0.00     0.00     0.00     0.00    0.00    0.00    0.00 0.0000   0.00
+-- 열: r/s·w/s 초당 읽기·쓰기, rkB/s·wkB/s 양,
+-- await 평균 대기(ms), %util 바쁜 비율.
+-- sda %util 0.10, await 0.00.
+-- sdb·dm-2·dm-3(vgapp)은 전부 0.
+-- 디스크는 한가하다.
+-- vmstat 1 5 : 1초 간격 5회.
+-- r·b·us·sy·id·wa 열을 본다.
+[root@ol7a ~]# vmstat 1 5 | tee /root/case/05_vmstat.txt
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 5  0      0 3250408   2180 276448    0    0  1384   180 1246  923 86 13  1  0  0
+ 3  0      0 3247888   2180 278576    0    0     0     0 1339  409 90 10  0  0  0
+ 4  0      0 3245164   2180 281248    0    0     0     0 1347  456 88 12  0  0  0
+ 5  0      0 3282488   2180 247324    0    0     0 16866 1376  539 85 15  0  0  0
+ 3  0      0 3245852   2180 258140    0    0 10884     0 1414  525 87 13  0  0  0
+-- 첫 줄은 부팅 후 평균,
+-- 둘째 줄부터가 실제 1초 값이다.
+-- r 3~5 : 실행 대기. CPU 2개보다 많다.
+-- b 0 : D 상태 없음. wa 0 : I/O 대기 없음.
+-- us 85~90, sy 10~15,
+-- id 0 : CPU 가 사용자 공간 일로 꽉 찼다.
+-- bo 16866·bi 10884 가 한 번씩 튄다.
+-- 이때 kdump 가 덤프용 initramfs 를 만들던 중이다.
+-- 증상   : "느리다"와 /app 누락을 묶어 디스크 고장을 의심했다
+-- 원인   : I/O 오류 0건, %util 0.10, wa 0. 대신 us 85~90, r 3~5 의 CPU 포화
+-- 조치   : 가설을 버리고 1단계의 부하 표시로 돌아간다
+-- 재확인 : top 의 %CPU 상위 프로세스, ps 의 시작 시각
+
+--------------------------------------------------------------------------------
+ [4] 가설 바꾸기 — CPU 를 누가 쓰나
+--------------------------------------------------------------------------------
+
+-- top -b -n 1 : 배치 모드로 한 번.
+-- 머리 다섯 줄과 상위 프로세스.
+[root@ol7a ~]# top -b -n 1 | head -12
+top - 21:06:30 up 2 min,  0 users,  load average: 3.92, 1.56, 0.58
+Tasks: 175 total,   3 running,  93 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 88.9 us, 11.1 sy,  0.0 ni,  0.0 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+KiB Mem :  3716112 total,  3274168 free,   181216 used,   260728 buff/cache
+KiB Swap:  4063228 total,  4063228 free,        0 used.  3302880 avail Mem 
+
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+ 1052 root      20   0  118244   1420   1160 R 100.0  0.0   1:56.80 sha256sum
+ 1053 root      20   0  118244   1384   1124 R  87.5  0.0   1:55.56 sha256sum
+    1 root      20   0  151808  10748   7124 S   0.0  0.3   0:00.80 systemd
+    2 root      20   0       0      0      0 S   0.0  0.0   0:00.00 kthreadd
+    3 root       0 -20       0      0      0 I   0.0  0.0   0:00.00 rcu_gp
+-- 머리: 부하, 작업 수(running 3),
+-- CPU %(us 88.9 id 0), 메모리, 스왑.
+-- 열: PID, 사용자, 우선순위(PR·NI),
+-- 가상·상주·공유 메모리, 상태, %CPU, %MEM, CPU 시간, 명령.
+-- sha256sum 두 개가 각각 CPU 하나씩을 다 쓴다.
+-- 누적 CPU 시간 1분 56초.
+[root@ol7a ~]# ps -eo pid,ppid,user,ni,stat,pcpu,lstart,cmd --sort=-pcpu | head -4
+  PID  PPID USER      NI STAT %CPU                  STARTED CMD
+ 1052  1039 root       0 R    92.0 Mon Nov 16 21:04:23 2026 sha256sum /dev/zero
+ 1053  1039 root       0 R    91.0 Mon Nov 16 21:04:23 2026 sha256sum /dev/zero
+    1     0 root       0 Ss    0.6 Mon Nov 16 21:04:21 2026 /usr/lib/systemd/systemd --switched-root --system --deserialize 22
+-- 시작 21:04:23, 부팅 2초 뒤. 부모 PID 1039.
+-- 사람이 띄운 것이 아니라 부팅 때 무언가가 띄웠다.
+
+--------------------------------------------------------------------------------
+ [5] 오류 흐름 — 근거를 남기기 전에 죽였다
+--------------------------------------------------------------------------------
+
+-- 범인이 보였으니 바로 죽이고 싶어진다.
+-- 그렇게 해 본다.
+[root@ol7a ~]# pkill -x sha256sum; echo "rc=$?"
+rc=0
+-- pkill 성공.
+[root@ol7a ~]# ps -eo pid,ppid,pcpu,lstart,cmd --sort=-pcpu | head -3
+  PID  PPID %CPU                  STARTED CMD
+10611 10610 99.3 Mon Nov 16 21:06:31 2026 sha256sum /dev/zero
+10612 10610 99.3 Mon Nov 16 21:06:31 2026 sha256sum /dev/zero
+-- 1초도 안 돼 새 PID 로 다시 떴다.
+-- 시작 21:06:31.
+-- 원래 PID(1052·1053)와 부팅 때 시작 시각이 사라졌다.
+-- 부모 PID 를 따라 올라간다.
+[root@ol7a ~]# ps -o pid,ppid,lstart,cmd -p $(pgrep -f report-gen.sh)
+  PID  PPID                  STARTED CMD
+10610     1 Mon Nov 16 21:06:31 2026 /bin/bash /usr/local/bin/report-gen.sh
+-- 부모는 report-gen.sh, 그 부모는 PID 1(systemd).
+-- 서비스로 돈다.
+-- 증상   : pkill 직후 sha256sum 이 새 PID 로 다시 떴고 처음 시작 시각이 사라졌다
+-- 원인   : Restart=always 서비스가 다시 띄웠다. 부모·유닛을 먼저 남기지 않았다
+-- 조치   : 프로세스 → 부모 → 유닛 근거를 tee 로 남긴 뒤 서비스로 멈춘다([6]·[10])
+-- 재확인 : /root/case 에 유닛 상태·유닛 파일·부팅 로그가 저장됨
+
+--------------------------------------------------------------------------------
+ [6] 근거부터 남기기 — 프로세스에서 유닛으로
+--------------------------------------------------------------------------------
+
+-- systemctl status 에 PID 를 주면 그 프로세스가 속한 유닛을 보여 준다.
+[root@ol7a ~]# systemctl status $(pgrep -x sha256sum | head -1) --no-pager | head -12 | tee /root/case/06_unit_status.txt
+● report-gen.service - Nightly report generator
+   Loaded: loaded (/etc/systemd/system/report-gen.service; enabled; vendor preset: disabled)
+   Active: active (running) since Mon 2026-11-16 21:06:31 KST; 4s ago
+ Main PID: 10610 (report-gen.sh)
+   CGroup: /system.slice/report-gen.service
+           ├─10610 /bin/bash /usr/local/bin/report-gen.sh
+           ├─10611 sha256sum /dev/zero
+           └─10612 sha256sum /dev/zero
+
+Nov 16 21:06:31 ol7a.example.com systemd[1]: Started Nightly report generator.
+-- 유닛 report-gen.service, enabled.
+-- 부팅 때마다 뜬다.
+-- CGroup 아래 세 프로세스가 한 묶음이다.
+-- since … 4s ago : [5] 의 pkill 로 재시작된 시각이다.
+[root@ol7a ~]# systemctl cat report-gen.service | tee /root/case/07_unit_file.txt
+# /etc/systemd/system/report-gen.service
+[Unit]
+Description=Nightly report generator
+[Service]
+ExecStart=/usr/local/bin/report-gen.sh
+Restart=always
+[Install]
+WantedBy=multi-user.target
+-- Restart=always 가 [5] 의 원인이다.
+-- 누가 언제 만든 파일인지는 ls -l 로 따로 본다.
+-- 언제부터 켜져 있었나, 몇 번 재시작했나.
+-- [OL8/9] systemd 235 이상은 -p NRestarts 로 재시작 횟수를 준다. 7.9 의 219 에는 없다.
+[root@ol7a ~]# systemctl is-enabled report-gen; systemctl show report-gen -p NRestarts -p ExecMainStartTimestamp -p ActiveEnterTimestamp 2>&1
+enabled
+ExecMainStartTimestamp=Mon 2026-11-16 21:06:31 KST
+ActiveEnterTimestamp=Mon 2026-11-16 21:06:31 KST
+-- NRestarts 줄이 아예 없다.
+-- 두 시각 모두 재시작 시각이라 처음 뜬 시각은 사라졌다.
+[root@ol7a ~]# journalctl -u report-gen -b --no-pager -q | tail -4
+Nov 16 21:06:31 ol7a.example.com report-gen.sh[1039]: /usr/local/bin/report-gen.sh: line 5:  1053 Terminated              sha256sum /dev/zero
+Nov 16 21:06:31 ol7a.example.com systemd[1]: report-gen.service holdoff time over, scheduling restart.
+Nov 16 21:06:31 ol7a.example.com systemd[1]: Stopped Nightly report generator.
+Nov 16 21:06:31 ol7a.example.com systemd[1]: Started Nightly report generator.
+-- 저널에는 재시작 과정이 남았다.
+-- 1053 Terminated → holdoff time over → Started.
+-- 프로세스는 다시 떴어도 로그는 지워지지 않는다.
+
+--------------------------------------------------------------------------------
+ [7] 두 번째 증상 — /app 은 왜 안 붙었나
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# grep -E '/app' /etc/fstab
+UUID=e7f0708c-d499-4861-82a5-6ec80dbde33e /app xfs defaults,nofail 0 0
+/dev/mapper/vgapp-lvlog /applog xfs defaults 0 0
+-- /app 은 UUID 로, /applog 는 장치 경로로 적혀 있다.
+-- /app 만 nofail.
+[root@ol7a ~]# systemctl status app.mount --no-pager 2>&1 | head -5
+● app.mount - /app
+   Loaded: loaded (/etc/fstab; bad; vendor preset: disabled)
+   Active: inactive (dead)
+    Where: /app
+     What: /dev/disk/by-uuid/e7f0708c-d499-4861-82a5-6ec80dbde33e
+-- Loaded 줄의 bad : 유닛이 지금 상태와 맞지 않는다.
+-- inactive (dead).
+-- 기다리던 장치가 by-uuid/e7f0708c… 다.
+-- 이번 부팅에서 /app 관련 줄.
+-- 장치 유닛 이름은 UUID 의 - 를 \x2d 로 바꾼 형태다.
+[root@ol7a ~]# journalctl -b --no-pager -q | grep -E 'app\.mount|/app|Timed out waiting' | cut -c17-170 | tee /root/case/08_app_boot.txt
+ol7a.example.com systemd[1]: Mounting /applog...
+ol7a.example.com systemd[1]: Mounted /applog.
+ol7a.example.com kernel: xfs filesystem being mounted at /applog supports timestamps until (%ptR?) (0x7fffffff)
+ol7a.example.com systemd[1]: Timed out waiting for device dev-disk-by\x2duuid-e7f0708c\x2dd499\x2d4861\x2d82a5\x2d6ec80dbde33e.device.
+ol7a.example.com systemd[1]: Dependency failed for /app.
+ol7a.example.com systemd[1]: Job app.mount/start failed with result 'dependency'.
+-- 장치 대기 시간 초과 → Dependency failed for /app → app.mount 실패.
+-- nofail 이라 부팅은 계속됐고 --failed 에도 남지 않았다.
+-- fstab 의 UUID 와 실제 장치의 UUID 를 대조한다.
+[root@ol7a ~]# blkid /dev/vgapp/lvapp /dev/vgapp/lvlog; ls /dev/disk/by-uuid | wc -l
+/dev/vgapp/lvapp: UUID="221877bb-d4f8-478c-a53e-48545eeb2e03" TYPE="xfs" 
+/dev/vgapp/lvlog: UUID="000fb3ca-a207-4155-89da-0d941983b2b3" TYPE="xfs" 
+6
+-- 실제 lvapp 의 UUID 는 221877bb….
+-- fstab 의 e7f0708c… 와 다르다.
+-- by-uuid 링크 6개 중에 fstab 의 UUID 는 없다.
+[root@ol7a ~]# U=$(awk '$2=="/app"{sub("UUID=","",$1); print $1}' /etc/fstab); ls -l /dev/disk/by-uuid/$U 2>&1; blkid -U $U; echo "blkid rc=$?"
+ls: cannot access /dev/disk/by-uuid/e7f0708c-d499-4861-82a5-6ec80dbde33e: No such file or directory
+blkid rc=2
+-- 그 UUID 를 가진 장치가 없다(blkid rc=2).
+-- 누군가 lvapp 에 mkfs 를 다시 해 UUID 가 바뀌었다고 본다.
+
+--------------------------------------------------------------------------------
+ [8] sosreport 로 묶기
+--------------------------------------------------------------------------------
+
+-- 지원 요청(SR)에 붙일 자료를 모은다.
+-- 전체는 수 분이 걸려 관련 플러그인만 고른다.
+-- --batch : 질문 없이 진행, -o : 이 플러그인만,
+-- --tmp-dir : 결과를 둘 디렉터리
+[root@ol7a ~]# sosreport -l | grep -cE '^ [a-z]'
+322
+-- 사용 가능한 플러그인·옵션 322줄.
+[root@ol7a ~]# time sosreport --batch -o block,filesys,lvm2,logs,process,systemd,kernel --tmp-dir /var/tmp 2>&1 | tail -9
+Your sosreport has been generated and saved in:
+  /var/tmp/sosreport-ol7a-2026-11-16-dsnyqov.tar.xz
+
+ Size   1.67MiB
+ Owner  root
+ md5    6f30e893724d33139cd8b09d2b48510b
+
+Please send this file to your support representative.
+
+
+real    0m8.077s
+user    0m1.497s
+sys     0m1.712s
+-- 7개 플러그인으로 8초, 1.67MiB.
+-- md5 는 전송 뒤 대조하는 값이다.
+[root@ol7a ~]# ls -l /var/tmp/sosreport-* | cut -c1-140
+-rw-------. 1 root root 1748008 Nov 16 21:06 /var/tmp/sosreport-ol7a-2026-11-16-dsnyqov.tar.xz
+-rw-r--r--. 1 root root      33 Nov 16 21:06 /var/tmp/sosreport-ol7a-2026-11-16-dsnyqov.tar.xz.md5
+-- tar.xz 는 root 만 읽을 수 있다(600).
+-- 비밀번호 해시 같은 민감한 파일이 들어 있다.
+-- 이름 끝 dsnyqov 는 실행마다 붙는 임의 문자열이다.
+
+--------------------------------------------------------------------------------
+ [9] sosreport 안에서 같은 근거 찾기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cd /var/tmp; tar xf sosreport-*.tar.xz; d=$(ls -d /var/tmp/sosreport-*/ | head -1); echo $d; ls $d | tr '\n' ' '; echo
+/var/tmp/sosreport-ol7a-2026-11-16-dsnyqov/
+df etc lib lsmod lsof mount proc ps run sos_commands sos_logs sos_reports sys uname usr var version.txt vgdisplay 
+-- 맨 위 df·ps 등은 sos_commands 로 가는 바로가기다.
+-- 원본 파일은 같은 경로로,
+-- 명령 출력은 sos_commands/플러그인/ 아래에 저장된다.
+[root@ol7a ~]# d=$(ls -d /var/tmp/sosreport-*/ | head -1); grep /app $d/etc/fstab; ls $d/sos_commands/block | head -8
+UUID=e7f0708c-d499-4861-82a5-6ec80dbde33e /app xfs defaults,nofail 0 0
+/dev/mapper/vgapp-lvlog /applog xfs defaults 0 0
+blkid_-c_.dev.null
+blockdev_--report
+fdisk_-l_.dev.dm-0
+fdisk_-l_.dev.dm-1
+fdisk_-l_.dev.dm-2
+fdisk_-l_.dev.dm-3
+fdisk_-l_.dev.sda
+fdisk_-l_.dev.sdb
+-- 파일 이름은 실행한 명령을 그대로 옮긴 것이다(공백 → _, / → .).
+[root@ol7a ~]# d=$(ls -d /var/tmp/sosreport-*/ | head -1); grep lvapp $d/sos_commands/block/blkid* 2>/dev/null | head -2; grep -c sha256sum $d/sos_commands/process/ps_* 2>/dev/null | head -3
+/dev/mapper/vgapp-lvapp: UUID="221877bb-d4f8-478c-a53e-48545eeb2e03" TYPE="xfs" 
+/var/tmp/sosreport-ol7a-2026-11-16-dsnyqov//sos_commands/process/ps_alxwww:2
+/var/tmp/sosreport-ol7a-2026-11-16-dsnyqov//sos_commands/process/ps_auxwww:2
+/var/tmp/sosreport-ol7a-2026-11-16-dsnyqov//sos_commands/process/ps_auxwwwm:2
+-- blkid 결과에 실제 UUID 221877bb…, fstab 사본에 e7f0708c….
+-- 서버 없이도 불일치가 보인다.
+-- ps 출력 세 종류마다 sha256sum 이 2줄.
+-- 어떤 프로세스가 돌았는지도 남았다.
+
+--------------------------------------------------------------------------------
+ [10] 조치 — 서비스 정지와 fstab 수정
+--------------------------------------------------------------------------------
+
+-- 근거가 남았으니 고친다.
+-- stop 으로 끄고 disable 로 다음 부팅도 막는다(--now 가 둘을 함께).
+[root@ol7a ~]# systemctl disable --now report-gen.service; systemctl is-active report-gen
+Removed symlink /etc/systemd/system/multi-user.target.wants/report-gen.service.
+unknown
+-- is-active 가 unknown 인 것은 유닛이 내려가 정보가 없다는 뜻이다.
+-- inactive 와 같게 읽는다.
+[root@ol7a ~]# cp -p /etc/fstab /root/case/fstab.before
+[root@ol7a ~]# sed -i "s|^UUID=[^ ]* /app |UUID=$(blkid -s UUID -o value /dev/vgapp/lvapp) /app |" /etc/fstab; diff /root/case/fstab.before /etc/fstab
+12c12
+< UUID=e7f0708c-d499-4861-82a5-6ec80dbde33e /app xfs defaults,nofail 0 0
+---
+> UUID=221877bb-d4f8-478c-a53e-48545eeb2e03 /app xfs defaults,nofail 0 0
+-- 12번째 줄의 UUID 만 바뀌었다.
+-- fstab 을 고친 뒤 daemon-reload 로 마운트 유닛을 다시 만든다.
+-- 빠뜨리면 옛 유닛이 남는다.
+[root@ol7a ~]# systemctl daemon-reload; mount -a; echo "rc=$?"; findmnt /app
+rc=0
+TARGET SOURCE                  FSTYPE OPTIONS
+/app   /dev/mapper/vgapp-lvapp xfs    rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+-- mount -a rc=0, /app 이 붙었다.
+
+--------------------------------------------------------------------------------
+ [11] 재확인 — 재부팅 뒤
+--------------------------------------------------------------------------------
+
+-- 조치가 재부팅 뒤에도 유지되는지 확인한다.
+-- 신고가 "아침부터"였으니 부팅 직후가 기준이다.
+-- 재부팅 (@reboot)
+[root@ol7a ~]# uptime; systemctl is-active report-gen; findmnt -n -o TARGET,SOURCE /app; findmnt -n -o TARGET,SOURCE /applog
+ 21:07:57 up 0 min,  0 users,  load average: 0.35, 0.12, 0.04
+unknown
+/app   /dev/mapper/vgapp-lvapp
+/applog /dev/mapper/vgapp-lvlog
+-- 부팅 직후 부하 0.35. report-gen 은 뜨지 않았다.
+-- /app·/applog 모두 붙었다.
+[root@ol7a ~]# systemctl is-active kdump; cat /sys/kernel/kexec_crash_loaded
+active
+1
+-- kdump active, kexec_crash_loaded 1.
+-- 부팅 뒤 1분 안에 준비를 마쳤다.
+[root@ol7a ~]# systemd-analyze; journalctl -b --no-pager -q | grep -c 'Timed out waiting'
+Startup finished in 509ms (kernel) + 1.288s (initrd) + 15.779s (userspace) = 17.577s
+0
+-- 부팅 17.6초. Timed out 0건.
+-- 장치 대기 90초가 사라졌다.
+
+--------------------------------------------------------------------------------
+ [변형] 같은 범인을 cgroup 단위로 찾기
+--------------------------------------------------------------------------------
+
+-- [4] 는 프로세스 → 부모 → 유닛 순으로 올라갔다.
+-- systemd 는 유닛마다 cgroup 을 둔다.
+[root@ol7a ~]# systemctl start report-gen; sleep 5; systemd-cgtop -b -n 2 -d 2 | grep -E 'report-gen' | tail -1
+/system.slice/report-gen.service                                            3      -        -        -        -
+-- 열: 경로, 작업 수, %CPU, 메모리, 입출력.
+-- 작업 3개, 나머지 -.
+-- 7.9 의 systemd 219 는 유닛별 CPU 계정이 기본으로 꺼져 있다.
+-- 런타임에만 켜서 다시 본다.
+[root@ol7a ~]# systemctl show report-gen -p CPUAccounting; systemctl set-property --runtime report-gen CPUAccounting=yes; sleep 3; systemd-cgtop -b -n 2 -d 2 | grep -E 'report-gen' | tail -1
+CPUAccounting=no
+/system.slice/report-gen.service                                            3      -        -        -        -
+-- CPUAccounting=no 였다.
+-- 켠 뒤에도 3초 만에는 - 그대로였다.
+-- CPU 값은 계정을 켠 뒤부터 쌓인다.
+-- 여기서는 값이 나오기 전에 끝냈다.
+[root@ol7a ~]# systemd-cgls --no-pager /system.slice/report-gen.service
+/system.slice/report-gen.service:
+├─10358 /bin/bash /usr/local/bin/report-gen.sh
+├─10359 sha256sum /dev/zero
+└─10360 sha256sum /dev/zero
+-- cgls 는 유닛의 프로세스를 나무 모양으로 보인다.
+-- [6] 의 CGroup 과 같다.
+[root@ol7a ~]# systemctl stop report-gen
+
+--------------------------------------------------------------------------------
+ [12] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /app /applog; sed -i '/vgapp\|\/app /d' /etc/fstab; systemctl daemon-reload; grep -c -E 'vgapp|/app ' /etc/fstab
+0
+-- fstab 의 vgapp·/app 줄 0개.
+[root@ol7a ~]# rm -f /etc/systemd/system/report-gen.service /usr/local/bin/report-gen.sh; systemctl daemon-reload; systemctl is-enabled report-gen 2>&1
+Failed to get unit file state for report-gen.service: No such file or directory
+-- 유닛 파일이 없다.
+[root@ol7a ~]# lvremove -qy vgapp; vgremove -q vgapp; pvremove -q /dev/sdb; rmdir /app /applog; rm -rf /var/tmp/sosreport-*; lsblk -no NAME,FSTYPE /dev/sdb; cat /proc/loadavg
+  Logical volume "lvapp" successfully removed
+  Logical volume "lvlog" successfully removed
+  Volume group "vgapp" successfully removed
+  Labels on physical volume "/dev/sdb" successfully wiped.
+sdb  
+0.60 0.18 0.06 1/188 10543
+-- sdb 는 FSTYPE 이 비었다.
+-- 부하 0.60 은 lvremove 등 방금 한 작업의 몫이다.
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목            내용
+--  신고            느리다, /app 이 비었다 (21:06 접수, 부팅 21:04)
+--  원인 1          report-gen.service(Restart=always, enabled)가 sha256sum 2개로 CPU 2개 포화
+--  근거 1          load 3.72(CPU 2), vmstat us 85~90 id 0 wa 0, top·status·unit 파일
+--  원인 2          fstab 의 /app UUID(e7f0708c…)가 실제 LV UUID(221877bb…)와 다름, nofail
+--  근거 2          Timed out waiting for device, blkid rc=2, sosreport 의 blkid·fstab
+--  버린 가설       디스크 고장 — I/O 오류 0, %util 0.10, wa 0
+--  실수            근거 전에 pkill → 재시작으로 원래 PID·시작 시각 잃음(로그는 남음)
+--  조치            disable --now report-gen, fstab UUID 수정, daemon-reload, mount -a
+--  재확인          재부팅 뒤 load 0.35, /app 마운트, Timed out 0, kdump active
+--  첨부            /root/case/*, sosreport-ol7a-…-dsnyqov.tar.xz (md5 6f30e893…)
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. 아래 스크립트의 장애를 하나 바꿔 짝에게 진단을 맡긴다.
+--    짝의 보고서가 [정리] 항목을 다 채웠는지 본다.
+-- 2. sosreport 를 전체 플러그인으로 돌려 8초·1.67MiB 와 비교한다.
+-- 3. report-gen 에 CPUQuota=50% 를 걸고 vmstat 의 id 가 어떻게 변하는지 본다.
+
+-- 이 실습의 장애는 아래 스크립트로 심었다.
+-- 다른 장애로 바꿔 짝과 서로 진단해 본다.
+[root@ol7a ~]# cat /root/plant.sh
+#!/bin/bash
+# 장애 심기 (실습 06 준비) — /app 은 UUID 가 맞지 않게, report-gen 은 CPU 두 개를 다 쓰게
+vgcreate -q vgapp /dev/sdb
+lvcreate -q -L 1G -n lvapp vgapp; lvcreate -q -L 1G -n lvlog vgapp
+mkfs.xfs -q /dev/vgapp/lvapp; mkfs.xfs -q /dev/vgapp/lvlog
+mkdir -p /app /applog
+echo "UUID=$(blkid -s UUID -o value /dev/vgapp/lvapp) /app xfs defaults,nofail 0 0" >> /etc/fstab
+echo "/dev/mapper/vgapp-lvlog /applog xfs defaults 0 0" >> /etc/fstab
+mkfs.xfs -q -f /dev/vgapp/lvapp      # 누군가 다시 만들어 UUID 가 바뀜
+printf '#!/bin/bash\nsha256sum /dev/zero &\nsha256sum /dev/zero &\nwait\n' > /usr/local/bin/report-gen.sh
+chmod 755 /usr/local/bin/report-gen.sh
+printf '[Unit]\nDescription=Nightly report generator\n[Service]\nExecStart=/usr/local/bin/report-gen.sh\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/report-gen.service
+systemctl daemon-reload; systemctl enable report-gen.service
+-- 장애 심기 스크립트.
+-- 실습 전에 실행하고 재부팅한 뒤 [0] 부터 진행했다.
+
+================================================================================
+ 실습 06 종료 — 디스크 가설을 버리고 CPU 포화와 UUID 불일치 두 원인을 근거와 함께 보고
+================================================================================

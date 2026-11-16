@@ -1,0 +1,450 @@
+================================================================================
+ 제9장 실습 06 — 스왑 추가와 제거
+ 대상   : ol7a
+ 목표   : 스왑 파티션과 스왑 파일을 추가하고 우선순위를 정한 뒤 fstab 에 반영,
+          재부팅으로 확인하고 제거한다. 구멍 난 파일로 만든 스왑이 거부되는 것과,
+          쓰고 있는 스왑을 끌 때 메모리가 모자라면 생기는 일을 본다
+ 배경   : 스왑은 메모리가 모자랄 때 쓰지 않는 페이지를 내려놓는 디스크 공간이다.
+          파티션(유형 82)과 파일 둘 다 쓸 수 있고 mkswap 으로 서명을 쓴 뒤
+          swapon 으로 켠다. 여러 개면 우선순위가 높은 쪽부터 쓰고, 같으면
+          번갈아 쓴다 (본문 9.8절)
+ 소요   : 약 30분 (재부팅 1회 포함)
+ 선행   : storage-clean 스냅샷
+ 계정   : root
+ 주의   : [9] 에서 메모리를 일부러 소진한다. OOM killer 가 동작할 수 있다
+ 되돌림 : 추가한 스왑을 끄고 fstab 원본 복원, 파일 삭제, wipefs.
+          확인 명령 swapon -s (ol-swap 하나), diff /root/fstab.orig /etc/fstab
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+-- 지금 켜진 스왑. swapon -s 는 /proc/swaps 를 그대로 보여 준다
+[root@ol7a ~]# swapon -s
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+
+-- 다섯 열: Filename·Type(partition/file)·Size(KiB)·Used(KiB)·Priority
+--   /dev/dm-1 은 LVM 스왑 ol-swap 의 커널 이름. 4063228KiB ≈ 3.9GiB
+--   Used 0: 아직 아무것도 내려가지 않았다. Priority -2 는 자동으로 매긴 값
+[root@ol7a ~]# cat /proc/swaps
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+
+-- 같은 내용이다. 이후로는 swapon -s 만 쓴다
+-- Size 와 Used 단위는 KiB, Priority 는 정수. 높을수록 먼저 쓴다
+[root@ol7a ~]# free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629         174        3289           8         164        3250
+Swap:          3967           0        3967
+
+-- free -m 의 Mem 줄 여섯 열
+--   total 3629      : 커널이 쓸 수 있는 RAM(4GB 에서 커널·예약 영역을 뺀 값)
+--   used 174        : 프로세스가 쓰는 양
+--   free 3289       : 아무도 쓰지 않는 양
+--   shared 8        : tmpfs 등 공유 메모리
+--   buff/cache 164  : 페이지 캐시. 필요하면 비워서 내줄 수 있다
+--   available 3250  : 스왑 없이 새 프로세스가 쓸 수 있는 추정치. [9] 에서 볼 열
+-- Swap 줄 total 3967MiB 는 위 4063228KiB 와 같은 값이다(÷1024)
+[root@ol7a ~]# grep -i swap /etc/fstab; sysctl vm.swappiness
+/dev/mapper/ol-swap     swap                    swap    defaults        0 0
+vm.swappiness = 30
+
+-- fstab 의 스왑 줄은 하나. swappiness 30 은 tuned 의 virtual-guest 프로파일이 정한 값([8])
+[root@ol7a ~]# cp -p /etc/fstab /root/fstab.orig
+
+--------------------------------------------------------------------------------
+ [1] 스왑 파티션 만들기
+--------------------------------------------------------------------------------
+-- 2G 주 파티션을 만들고 t 로 유형을 82(Linux swap)로 바꾼다.
+[root@ol7a ~]# printf 'o\nn\np\n1\n\n+2G\nt\n82\nw\n' | fdisk /dev/sdb >/dev/null; fdisk -l /dev/sdb | grep '^/dev'
+Device does not contain a recognized partition table
+Building a new DOS disklabel with disk identifier 0x50f182f7.
+Building a new DOS disklabel with disk identifier 0x6d134f5e.
+/dev/sdb1            2048     4196351     2097152   82  Linux swap / Solaris
+
+-- 맨 앞 두 줄은 fdisk 의 표준 오류 안내.
+-- 대화 출력은 >/dev/null 로 버렸다
+-- printf 입력: o(새 MBR) n p 1 기본 +2G(2GiB 주 파티션) t 82(유형 변경) w(쓰기)
+-- Id 82 로 2GiB 파티션이 생겼다. Start 2048 은 1MiB 정렬
+-- 유형만 82 일 뿐 아직 스왑 서명은 없다.
+[root@ol7a ~]# blkid /dev/sdb1; swapon /dev/sdb1; echo rc=$?
+swapon: /dev/sdb1: read swap header failed: Invalid argument
+rc=255
+
+-- 증상   : "swapon: /dev/sdb1: read swap header failed: Invalid argument", rc=255
+-- 원인   : blkid 가 아무것도 찍지 않았다. 유형 82 는 꼬리표일 뿐 스왑 서명이 없다
+-- 조치   : mkswap 으로 서명을 쓴다(바로 아래)
+-- 재확인 : blkid 에 TYPE="swap" 이 나오고 swapon 이 조용히 끝난다([2])
+-- mkswap 으로 서명을 쓴다. -L 레이블.
+[root@ol7a ~]# mkswap -L swap2 /dev/sdb1
+Setting up swapspace version 1, size = 2097148 KiB
+LABEL=swap2, UUID=82fdad74-210e-4cdb-9205-2e1ce48ead1a
+
+[root@ol7a ~]# blkid /dev/sdb1
+/dev/sdb1: LABEL="swap2" UUID="82fdad74-210e-4cdb-9205-2e1ce48ead1a" TYPE="swap" 
+
+-- mkswap 이 2097148KiB(파티션 2097152 에서 머리 4KiB 를 뺀 값)짜리 스왑 영역을 만들었다
+-- LABEL=swap2 와 UUID 가 생겼다. fstab 에 둘 중 하나로 적는다
+
+--------------------------------------------------------------------------------
+ [2] 켜고 확인
+--------------------------------------------------------------------------------
+[root@ol7a ~]# swapon /dev/sdb1; swapon -s
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+/dev/sdb1                               partition       2097148 0       -3
+
+-- sdb1 이 Priority -3 으로 붙었다. 자동 값은 켤 때마다 하나씩 낮아진다
+-- 지금은 dm-1(-2)이 더 높아 dm-1 이 먼저 차고, 넘치면 sdb1 을 쓴다
+-- swapon 은 성공하면 아무 말도 하지 않는다.
+-- swapon -s 로 다시 읽어 확인하는 습관을 둔다
+[root@ol7a ~]# free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629         177        3285           8         165        3247
+Swap:          6015           0        6015
+
+-- Swap total 이 3967 → 6015MiB.
+-- 2048MiB 가 늘었다. 켜는 즉시 반영된다
+-- swapon --show 는 열을 고를 수 있는 새 형식이다.
+[root@ol7a ~]# swapon --show=NAME,TYPE,SIZE,USED,PRIO
+NAME      TYPE      SIZE USED PRIO
+/dev/dm-1 partition 3.9G   0B   -2
+/dev/sdb1 partition   2G   0B   -3
+
+-- --show 는 크기를 사람이 읽는 단위로 보여 준다.
+-- 열 이름이 NAME·TYPE·SIZE·USED·PRIO
+
+--------------------------------------------------------------------------------
+ [3] 스왑 파일 만들기 (fallocate)
+--------------------------------------------------------------------------------
+-- fallocate 는 블록을 실제로 할당하되 0 을 쓰지 않아 빠르다.
+[root@ol7a ~]# time fallocate -l 1G /swapfile
+
+real    0m0.001s
+user    0m0.000s
+sys     0m0.001s
+
+-- 1GiB 할당에 0.001초. 블록만 예약하고 0 을 쓰지 않는다
+-- time 의 세 줄: real 경과 시간, user·sys 는 사용자·커널 CPU 시간
+[root@ol7a ~]# ls -ls /swapfile
+-- ls -ls 첫 열 1048576 = 실제로 할당된 KiB. 1GiB 가 전부 할당됐다
+-- 권한은 umask 대로 -rw-r--r--(0644)
+1048576 -rw-r--r--. 1 root root 1073741824 Nov 13 20:00 /swapfile
+
+-- 권한을 바꾸지 않고 mkswap·swapon 하면.
+[root@ol7a ~]# mkswap /swapfile; swapon /swapfile; echo rc=$?
+Setting up swapspace version 1, size = 1048572 KiB
+no label, UUID=6786c374-abdb-409a-86a3-ab5855b172d7
+swapon: /swapfile: insecure permissions 0644, 0600 suggested.
+rc=0
+
+-- mkswap 출력: 크기 1048572KiB, 레이블 없음, 새 UUID
+-- 0644 인 채로 켜자 경고 "swapon: /swapfile: insecure permissions 0644,
+-- 0600 suggested." 가 나왔다
+-- 경고일 뿐 켜졌다(rc=0).
+-- 다른 사용자가 스왑 파일을 읽으면 메모리 내용을 볼 수 있다
+[root@ol7a ~]# swapoff /swapfile; chmod 600 /swapfile; swapon /swapfile; ls -l /swapfile
+-- 끄고 600 으로 바꾼 뒤 다시 켰다. 경고가 없다
+-rw-------. 1 root root 1073741824 Nov 13 20:00 /swapfile
+
+[root@ol7a ~]# swapon -s
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+/dev/sdb1                               partition       2097148 0       -3
+/swapfile                               file    1048572 0       -4
+
+-- Type file, Priority -4. 켠 순서대로 -2·-3·-4
+
+--------------------------------------------------------------------------------
+ [4] 구멍 난 파일(sparse file)로 스왑 만들기
+--------------------------------------------------------------------------------
+-- truncate 는 크기만 정하고 블록은 할당하지 않는다. ls -ls 첫 열(실제 할당 KiB)을 본다.
+[root@ol7a ~]# truncate -s 512M /swaphole; chmod 600 /swaphole; ls -ls /swaphole
+0 -rw-------. 1 root root 536870912 Nov 13 20:00 /swaphole
+
+-- 크기는 512MiB 인데 첫 열(할당)이 0. 블록이 하나도 없는 구멍 난 파일이다
+[root@ol7a ~]# mkswap /swaphole
+Setting up swapspace version 1, size = 524284 KiB
+no label, UUID=982699b2-fb2a-4fe5-950c-004226de549f
+
+-- mkswap 은 성공했다. 앞부분 머리 한 블록만 쓰기 때문이다
+[root@ol7a ~]# swapon /swaphole; echo rc=$?
+swapon: /swaphole: skipping - it appears to have holes.
+rc=255
+
+-- 증상   : "swapon: /swaphole: skipping - it appears to have holes.", rc=255
+-- 원인   : 커널은 스왑 파일을 파일 시스템을 거치지 않고 블록 주소로 직접 읽고 쓴다
+--          할당되지 않은 구간(구멍)이 있으면 주소가 없다. swapon 이 미리 검사해 거부했다
+-- 조치   : fallocate 나 dd 로 블록을 모두 할당한 파일을 쓴다([3]·[변형])
+-- 재확인 : ls -ls 첫 열이 크기와 같고 swapon 이 조용히 끝난다
+[root@ol7a ~]# rm -f /swaphole
+
+--------------------------------------------------------------------------------
+ [5] 우선순위
+--------------------------------------------------------------------------------
+-- 지금은 자동 우선순위(음수, 켠 순서대로 -2, -3 …)다.
+[root@ol7a ~]# cat /proc/swaps
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+/dev/sdb1                               partition       2097148 0       -3
+/swapfile                               file            1048572 0       -4
+
+-- 우선순위가 다르면 높은 쪽부터 쓴다. 지금은 dm-1(-2)이 가장 높아 먼저 쓰인다
+-- 빠른 장치(SSD 파티션)를 높게, 느린 장치·파일을 낮게 두는 것이 일반적인 배치다
+-- 같은 값을 주면 커널이 번갈아 쓴다. 디스크가 여러 개면 I/O 가 나뉜다
+-- sdb1 을 우선순위 10 으로 다시 켠다. -p 범위는 0~32767.
+[root@ol7a ~]# swapoff /dev/sdb1; swapon -p 10 /dev/sdb1; cat /proc/swaps
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+/dev/sdb1                               partition       2097148 0       10
+/swapfile                               file            1048572 0       -3
+
+-- sdb1 을 다시 켜며 -p 10 을 주자 Priority 10 으로 가장 높아졌다
+-- /swapfile 이 -4 → -3 으로 올랐다.
+-- 자동 값은 남은 장치 사이에서 다시 매겨진다
+
+--------------------------------------------------------------------------------
+ [6] fstab 에 반영
+--------------------------------------------------------------------------------
+-- 스왑 줄은 둘째 필드가 swap, 다섯째·여섯째 0. 우선순위는 pri= 옵션.
+[root@ol7a ~]# cat >> /etc/fstab <<'EOF'
+LABEL=swap2  swap  swap  defaults,pri=10  0 0
+/swapfile    swap  swap  defaults         0 0
+EOF
+
+[root@ol7a ~]# diff /root/fstab.orig /etc/fstab
+11a12,13
+> LABEL=swap2  swap  swap  defaults,pri=10  0 0
+> /swapfile    swap  swap  defaults         0 0
+
+-- 두 줄이 추가됐다. LABEL=swap2 줄에 pri=10, /swapfile 은 기본
+-- 스왑 줄의 둘째 필드 swap 은 마운트 지점 자리를 채우는 값이다. 실제 디렉터리가 아니다
+-- 파일 스왑은 파일 경로를 그대로 첫 필드에 쓴다. UUID 로 적지 않는다
+-- 재부팅 전에 swapon -a 로 시험한다. 먼저 둘 다 끄고 -a 로 다시 켠다.
+[root@ol7a ~]# swapoff /dev/sdb1 /swapfile; swapon -a; echo rc=$?; swapon -s
+rc=0
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+/dev/sdb1                               partition       2097148 0       10
+/swapfile                               file    1048572 0       -3
+
+-- swapon -a 가 fstab 의 swap 줄을 모두 켰다(rc=0).
+-- 이미 켜진 dm-1 은 건너뛴다
+-- sdb1 은 pri=10 으로 붙었다.
+-- 재부팅 전에 fstab 을 시험하는 방법이 mount -a 와 같다
+
+--------------------------------------------------------------------------------
+ [7] 재부팅 후 확인
+--------------------------------------------------------------------------------
+-- 재부팅(systemctl reboot).
+[root@ol7a ~]# swapon -s
+Filename                                Type            Size    Used    Priority
+/swapfile                               file    1048572 0       -2
+/dev/sdb1                               partition       2097148 0       10
+/dev/dm-1                               partition       4063228 0       -3
+
+-- 재부팅 전과 비교: sdb1·/swapfile·dm-1 세 줄이 모두 다시 켜졌다. fstab 반영이 확인됐다
+-- 재부팅 뒤 sdb1 은 그대로 10.
+-- 자동 값을 받은 둘은 순서가 뒤집혔다(/swapfile -2, dm-1 -3)
+-- 부팅 때 켜지는 순서에 따라 자동 값이 정해진다. 순서가 중요하면 pri= 를 적는다
+[root@ol7a ~]# systemctl list-units -t swap --no-pager | grep -E 'UNIT|swap'
+UNIT                            LOAD   ACTIVE SUB    
+dev-disk-by\x2dlabel-swap2.swap loaded active active /dev/disk/by-label/swap2
+dev-mapper-ol\x2dswap.swap      loaded active active /dev/mapper/ol-swap
+swapfile.swap                   loaded active active /swapfile
+
+-- systemd 는 스왑 줄마다 .swap 유닛을 만든다.
+-- LABEL=swap2 → dev-disk-by\x2dlabel-swap2.swap
+-- 마운트와 같은 generator 가 만든다.
+-- swap.target 이 이 유닛들을 요구한다
+-- 스왑 장치가 없으면 마운트와 같은 90초 대기가 생긴다(실습 04 참고)
+
+--------------------------------------------------------------------------------
+ [8] swappiness 와 스왑 사용
+--------------------------------------------------------------------------------
+-- vm.swappiness 는 페이지 캐시와 익명 메모리 중 무엇을 먼저 내보낼지의 경향(0~100).
+-- 값과 함께 그 값을 정하는 tuned 프로파일을 본다. 이 실습에서는 바꾸지 않는다.
+[root@ol7a ~]# sysctl vm.swappiness; tuned-adm active
+vm.swappiness = 30
+Current active profile: virtual-guest
+
+-- swappiness 30 은 virtual-guest 프로파일의 값(커널 기본은 60). 이 실습에서는 바꾸지 않는다
+-- 값이 낮을수록 페이지 캐시를 먼저 비우고 프로세스 메모리는 늦게 스왑으로 보낸다
+-- DB 서버 권고값은 17장에서 tuned 프로파일과 함께 다룬다
+[root@ol7a ~]# grep -E '^(MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo
+MemTotal:        3716112 kB
+MemFree:         3248572 kB
+MemAvailable:    3292400 kB
+SwapTotal:       7208948 kB
+SwapFree:        7208948 kB
+
+-- /proc/meminfo 는 free 의 원자료다. 단위는 kB
+--   MemTotal 3716112kB = free 의 total 3629MiB
+--   MemAvailable 3292400kB 가 free 의 available 열이 된다
+-- SwapTotal 7208948kB = 4063228 + 2097148 + 1048572. 세 스왑의 합이다
+-- SwapFree 가 SwapTotal 과 같다. 아직 아무것도 스왑에 내려가지 않았다
+
+--------------------------------------------------------------------------------
+ [9] 쓰고 있는 스왑을 끌 때 메모리가 모자라면
+--------------------------------------------------------------------------------
+-- sdb1 하나만 남기고 나머지 스왑을 끈다.
+[root@ol7a ~]# swapoff /dev/mapper/ol-swap /swapfile; swapon -s
+Filename                                Type            Size    Used    Priority
+/dev/sdb1                               partition       2097148 0       10
+
+-- 이제 스왑은 sdb1(2GiB) 하나뿐이다
+-- RAM 약 3.6GiB + 스왑 2GiB 로 4.5GiB 를 잡으면 1GiB 넘게 스왑에 밀린다
+-- nohup … & 로 띄운 python 은 문자열 'x' 4500MiB 를 만들고 1시간 잠든다
+-- python 으로 약 4.5GiB 를 잡고 놓지 않는 프로세스를 띄운다. RAM(3.5GiB)을 넘는 만큼은 스왑으로 밀린다.
+[root@ol7a ~]# nohup python -c "import time; a='x'*(4500<<20); time.sleep(3600)" >/tmp/hog.log 2>&1 </dev/null &
+[root@ol7a ~]# free -m; swapon -s
+              total        used        free      shared  buff/cache   available
+Mem:           3629        3455         120           1          53          29
+Swap:          2047        1369         678
+Filename                                Type            Size    Used    Priority
+/dev/sdb1                               partition       2097148 1401856 10
+
+-- 40초 뒤: Mem available 29MiB, Swap used 1369MiB.
+-- sdb1 에 1401856KiB 가 내려갔다
+-- python 이 잡은 4.5GiB 중 RAM 에 못 담은 몫이다
+-- 이 상태에서 sdb1 을 끈다. 스왑에 있던 페이지를 전부 메모리로 올려야 끌 수 있다.
+[root@ol7a ~]# time swapoff /dev/sdb1; echo rc=$?
+/tmp/_ol7lab_root.sh: line 1: 10320 Killed                  swapoff /dev/sdb1
+
+real    0m0.208s
+user    0m0.000s
+sys     0m0.100s
+rc=137
+
+-- swapoff 가 Killed 로 끝났다. rc=137 = 128 + 9(SIGKILL)
+[root@ol7a ~]# dmesg | grep -iE 'out of memory|killed process' | tail -3
+[   57.035109] Out of memory: Killed process 10320 (swapoff) total-vm:125096kB, anon-rss:148kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:88kB oom_score_adj:0
+[   57.039230] Out of memory: Killed process 10186 (python) total-vm:4735020kB, anon-rss:3349100kB, file-rss:0kB, shmem-rss:0kB, UID:0 pgtables:9112kB oom_score_adj:0
+
+-- 증상   : "Killed swapoff /dev/sdb1", rc=137. dmesg 에 Out of memory 두 줄
+-- 원인   : swapoff 는 스왑의 1.4GiB 를 전부 RAM 으로 올려야 끝난다. 남은 RAM 이 29MiB 뿐이었다
+--          OOM killer 가 먼저 swapoff 자신을, 이어 python(anon-rss 3349100kB)을 죽였다
+-- 조치   : 끄기 전에 free 의 available 이 그 스왑의 Used 보다 넉넉한지 본다. 모자라면 다른 스왑을 먼저 켠다
+-- 재확인 : 아래 free 에서 available 이 다시 3000MiB 대,
+-- sdb1 Used 는 66100KiB 로 줄었다
+[root@ol7a ~]# pgrep -f 'time.sleep'; echo rc=$?
+rc=1
+
+-- pgrep 이 찾지 못했다(rc=1). python 은 이미 없다
+[root@ol7a ~]# free -m; swapon -s
+              total        used        free      shared  buff/cache   available
+Mem:           3629         107        3464           8          57        3372
+Swap:          2047          64        1983
+Filename                                Type            Size    Used    Priority
+/dev/sdb1                               partition       2097148 66100   10
+-- swapoff 가 도중에 죽어 sdb1 은 켜진 채 남았다.
+-- 66100KiB 는 아직 스왑에 있는 페이지
+-- 운영 서버라면 죽은 쪽이 DB 프로세스였을 수 있다
+-- OOM killer 는 /proc/PID/oom_score 가 가장 높은 프로세스를 고른다.
+-- 대개 메모리를 가장 많이 쓰는 쪽이다
+-- 이번에는 swapoff 가 먼저 죽었다. 메모리를 요구하던 당사자라 점수가 계산된 결과다
+-- 중요한 프로세스는 oom_score_adj 를 낮춰 보호할 수 있다(18장)
+-- 다음 단계를 위해 남은 프로세스를 정리하고 fstab 의 스왑을 모두 다시 켠다.
+[root@ol7a ~]# pkill -f 'time.sleep'; swapon -a; swapon -s
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+/dev/sdb1                               partition       2097148 66100   10
+/swapfile                               file    1048572 0       -3
+-- fstab 의 세 스왑이 다시 켜졌다. [변형] 과 [10] 의 시작 상태
+
+--------------------------------------------------------------------------------
+ [변형] dd 로 만든 스왑 파일과 비교
+--------------------------------------------------------------------------------
+-- 공식 문서의 절차는 dd 로 0 을 채운다. 같은 1G 를 dd 로 만들고 시간과 할당을 비교한다.
+[root@ol7a ~]# time dd if=/dev/zero of=/swapfile2 bs=1M count=1024
+1024+0 records in
+1024+0 records out
+1073741824 bytes (1.1 GB) copied, 0.403448 s, 2.7 GB/s
+
+real    0m0.407s
+user    0m0.000s
+sys     0m0.257s
+-- 같은 1GiB 를 dd 로 0 을 실제로 써서 만들었다.
+-- 0.407초. fallocate 는 0.001초였다
+[root@ol7a ~]# ls -ls /swapfile /swapfile2; filefrag /swapfile /swapfile2
+1048576 -rw-------. 1 root root 1073741824 Nov 13 20:00 /swapfile
+1048576 -rw-r--r--. 1 root root 1073741824 Nov 13 20:01 /swapfile2
+/swapfile: 1 extent found
+/swapfile2: 2 extents found
+-- 두 파일 모두 첫 열 1048576 으로 할당은 같다.
+-- dd 파일은 extent 2개, fallocate 는 1개
+-- extent 수는 연속성의 차이일 뿐 스왑으로 쓰는 데는 문제가 없다
+[root@ol7a ~]# chmod 600 /swapfile2; mkswap /swapfile2 >/dev/null; swapon /swapfile2; swapon -s; swapoff /swapfile2; rm -f /swapfile2
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+/dev/sdb1                               partition       2097148 66100   10
+/swapfile                               file    1048572 0       -3
+/swapfile2                              file    1048572 0       -4
+-- dd 로 만든 파일도 바로 켜진다. 확인 뒤 끄고 지웠다
+-- 이번에는 chmod 600 을 먼저 해 경고가 없었다.
+-- mkswap 출력은 >/dev/null 로 숨겼다
+-- /swapfile2 가 Priority -4 로 가장 낮다. 마지막에 켰기 때문이다
+-- OL7 문서의 절차는 dd 다. 크기가 클수록 fallocate 쪽이 빠르다
+
+--------------------------------------------------------------------------------
+ [10] 되돌리기
+--------------------------------------------------------------------------------
+-- 제거 순서: 끄기 → fstab 에서 빼기 → 파일·파티션 삭제.
+[root@ol7a ~]# swapoff /dev/sdb1 /swapfile; swapon -s
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+-- 끄자 /proc/swaps 에 dm-1 만 남았다. 순서는 끄기가 먼저다
+-- 켜진 스왑 파일을 지우면 파일 이름만 사라지고 공간은 계속 쓰인다.
+-- 끄지 않고 rm 하지 않는다
+[root@ol7a ~]# cp -p /root/fstab.orig /etc/fstab; diff /root/fstab.orig /etc/fstab; echo rc=$?
+rc=0
+-- fstab 원본으로 돌아왔다.
+-- 줄을 남겨 두면 다음 부팅 때 없는 파일을 찾느라 실패 기록이 남는다
+[root@ol7a ~]# rm -f /swapfile; wipefs -a /dev/sdb1 >/dev/null; udevadm settle; wipefs -a /dev/sdb; lsblk /dev/sdb
+/dev/sdb: 2 bytes were erased at offset 0x000001fe (dos): 55 aa
+/dev/sdb: calling ioclt to re-read partition table: Success
+NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdb    8:16   0  10G  0 disk 
+-- 파티션 서명은 >/dev/null 로 숨겼고,
+-- 디스크의 MBR 서명(55 aa)을 지웠다. sdb 에 자식이 없다
+[root@ol7a ~]# systemctl daemon-reload; swapon -s; free -m
+Filename                                Type            Size    Used    Priority
+/dev/dm-1                               partition       4063228 0       -2
+              total        used        free      shared  buff/cache   available
+Mem:           3629         170        3392           8          65        3304
+Swap:          3967           0        3967
+-- Swap total 3967MiB, [0] 과 같다
+-- daemon-reload 로 fstab 에서 빠진 스왑 유닛(swapfile.swap 등)도 systemd 에서 정리됐다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                시작 전          변경 후                            되돌린 뒤
+--  켜진 스왑           dm-1 (-2)        dm-1·sdb1(10)·/swapfile            dm-1 (-2)
+--  Swap total          3967MiB          7040MiB(SwapTotal 7208948kB)       3967MiB
+--  fstab 스왑 줄       1                3 (LABEL=swap2 pri=10, /swapfile)  1
+--  구멍 난 파일        -                swapon 거부(holes)                 -
+--  swapoff 중 메모리   -                OOM: swapoff·python 죽음, rc=137   -
+--  vm.swappiness       30               30 (변경 안 함)                    30
+--
+-- 확인한 사실
+--   스왑은 mkswap 서명이 있어야 켜진다. 유형 82 는 표시일 뿐이다
+--   스왑 파일은 모든 블록이 할당돼 있어야 한다. 권한 0644 는 경고만 낸다
+--   우선순위를 정하지 않으면 켠 순서가 값이 되고, 재부팅하면 바뀔 수 있다
+--   swapoff 는 스왑의 내용을 전부 RAM 으로 올려야 끝난다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. sdb1·/swapfile 을 같은 pri=5 로 켜고 메모리 부하를 준다
+--    확인: cat /proc/swaps 의 Used 가 두 장치에 고르게 늘면 번갈아 쓴 것
+-- 2. sysctl -w vm.swappiness=10 과 60 에서 같은 부하를 주고 Swap used 를 비교한다
+--    확인: free -m 의 Swap used. 끝나면 30 으로 되돌린다
+-- 3. xfs 대신 btrfs 위에 스왑 파일을 만들어 본다(12장 이후)
+--    확인: swapon 이 거부하는지, 메시지가 무엇인지. OL7 문서는 지원하지 않는다고 적었다
+-- 되돌린 뒤 확인: swapon -s 에 dm-1 하나,
+-- diff /root/fstab.orig /etc/fstab 출력 없음
+================================================================================
+ 실습 06 종료 — 스왑 파티션·파일 추가와 우선순위, 구멍 난 파일 거부, swapoff 중 OOM 재현
+================================================================================

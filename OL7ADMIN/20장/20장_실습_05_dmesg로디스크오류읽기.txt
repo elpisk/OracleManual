@@ -1,0 +1,552 @@
+================================================================================
+ 제20장 실습 05 — dmesg 로 디스크 오류 읽기
+ 대상   : ol7a
+ 목표   : 실습 디스크를 SCSI 계층에서 offline 으로 만들어 I/O 오류를 일으키고, dmesg -T·
+          journalctl -k 의 메시지를 장치 이름 → 마운트 지점으로 이어 읽는다. ext4 가
+          읽기 전용으로 다시 마운트되는 과정과 XFS 가 스스로 멈추는 과정을 비교한다
+ 배경   : 디스크 오류는 아래층부터 위층 순서로 커널 로그에 찍힌다. SCSI(sd H:C:T:L)
+          → 블록 계층(blk_update_request, dev sdX) → 파일 시스템(EXT4-fs (sdX1), XFS
+          (dm-N)). 메시지마다 장치를 부르는 이름이 다르다. LVM 위의 파일 시스템은
+          dm-N 으로 찍혀 lsblk·dmsetup 으로 이어 줘야 한다. VM 에서 디스크를 떼는 대신
+          /sys/block/sdX/device/state 에 offline 을 써서 같은 증상을 만든다 (본문 20.2·20.4)
+ 소요   : 약 30분
+ 선행   : storage-clean 스냅샷 (sdb~sde 비어 있음)
+ 계정   : root
+ 주의   : sdb·sdc·sdd 의 내용을 지운다. OS 디스크(sda, 2:0:0:0)는 건드리지 않는다
+ 되돌림 : 마운트·LV·VG·PV 제거, 디스크 서명 지움, 모든 장치 state=running
+          → lsblk 가 [0] 과 같고 /sys/block/sd?/device/state 가 모두 running
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 지울 디스크가 빈 실습 디스크인지부터 본다.
+-- HCTL = Host:Channel:Target:Lun, SCSI 주소다.
+[root@ol7a ~]# lsblk -o NAME,HCTL,SIZE,TYPE,FSTYPE,MOUNTPOINT
+NAME        HCTL        SIZE TYPE FSTYPE      MOUNTPOINT
+sdd         2:0:3:0      10G disk             
+sdb         2:0:2:0      10G disk             
+sr0         1:0:0:0     4.5G rom  iso9660     
+sde         2:0:4:0      10G disk             
+sdc         2:0:1:0      10G disk             
+sda         2:0:0:0      40G disk             
+├─sda2                   39G part LVM2_member 
+│ ├─ol-swap             3.9G lvm  swap        [SWAP]
+│ └─ol-root            35.1G lvm  xfs         /
+└─sda1                    1G part xfs         /boot
+-- 열은 이름·주소·크기·종류·파일 시스템·마운트 지점 순.
+-- OS 디스크는 sda(2:0:0:0).
+-- / 와 /boot 가 여기 있다.
+-- sdb~sde 는 FSTYPE·MOUNTPOINT 가 비었다.
+-- sr0(1:0:0:0)은 설치 ISO 다.
+-- 이번 부팅에서 sdb 가 2:0:2:0,
+-- sdc 가 2:0:1:0 이다.
+-- 이름 순서와 SCSI 주소 순서가 어긋났다.
+-- 이름만 보고 주소를 짐작하면 틀린다.
+-- 이름이 sdd, sdb,
+-- sr0 … 순으로 찍힌 것은 lsblk 가 sysfs 순서로 읽기 때문이다.
+-- wipefs -n : 지우지 않고 서명만 본다(no-act).
+[root@ol7a ~]# wipefs -n /dev/sdb /dev/sdc /dev/sdd; echo "rc=$?"
+rc=0
+-- 출력 없이 rc=0.
+-- 세 디스크 모두 서명이 없다.
+[root@ol7a ~]# grep . /sys/block/sd[a-e]/device/state
+/sys/block/sda/device/state:running
+/sys/block/sdb/device/state:running
+/sys/block/sdc/device/state:running
+/sys/block/sdd/device/state:running
+/sys/block/sde/device/state:running
+-- 다섯 디스크 모두 running.
+-- [3] 에서 이 값을 바꾼다.
+-- 커널 메시지 줄 수와,
+-- 이번 부팅의 err 이상 개수.
+[root@ol7a ~]# dmesg | wc -l; journalctl -k -b -p err --no-pager -q | wc -l
+1313
+7
+-- 링 버퍼 1313줄, err 이상 7줄.
+-- 7줄은 부팅 때부터 있던 것이다(실습 06 [2] 에서 내용을 본다).
+-- 기준값을 먼저 잡아야 실습이 만든 오류만 셀 수 있다.
+
+--------------------------------------------------------------------------------
+ [1] 실습 파일 시스템 두 개 만들기
+--------------------------------------------------------------------------------
+
+-- sdb 는 LVM 위 XFS, sdc 는 파티션 위 ext4.
+-- 오류 메시지의 장치 이름을 비교하려는 배치다.
+-- -q 는 진행 메시지를 줄인다.
+[root@ol7a ~]# pvcreate -q /dev/sdb; vgcreate -q vgt /dev/sdb; lvcreate -q -L 2G -n lvx vgt; mkfs.xfs -q /dev/vgt/lvx; mkdir -p /data1; mount /dev/vgt/lvx /data1
+  Physical volume "/dev/sdb" successfully created.
+  Volume group "vgt" successfully created
+  Logical volume "lvx" created.
+-- PV → VG → LV 순서로 세 줄.
+-- mkfs.xfs -q 는 조용하다.
+[root@ol7a ~]# parted -s /dev/sdc mklabel msdos mkpart primary 1MiB 2GiB; mkfs.ext4 -q /dev/sdc1; mkdir -p /data2
+-- ext4 의 오류 동작은 슈퍼블록 값과 마운트 옵션 errors= 로 정한다.
+[root@ol7a ~]# tune2fs -l /dev/sdc1 | grep -i 'errors behavior'
+Errors behavior:          Continue
+-- 슈퍼블록 기본값은 Continue.
+-- 오류가 나도 계속 쓴다.
+-- errors=remount-ro 를 명시한다.
+-- 오류가 나면 쓰기를 막는다.
+[root@ol7a ~]# mount -o errors=remount-ro /dev/sdc1 /data2; findmnt -o TARGET,SOURCE,FSTYPE,OPTIONS /data1 /data2
+-- findmnt 가 아무것도 찍지 않았다.
+-- 인자를 둘 주면 findmnt 는 "원본 장치, 마운트 지점" 한 쌍으로 읽는다.
+-- /data1 을 원본으로 하는 /data2 마운트는 없으니 빈 출력이다.
+-- 마운트 지점은 하나씩 주어야 한다([4] 에서 그렇게 한다).
+[root@ol7a ~]# for d in /data1 /data2; do dd if=/dev/urandom of=$d/base.dat bs=1M count=20 status=none; done; sync; ls -l /data1 /data2
+/data1:
+total 20480
+-rw-r--r--. 1 root root 20971520 Nov 16 22:05 base.dat
+
+/data2:
+total 20496
+-rw-r--r--. 1 root root 20971520 Nov 16 22:05 base.dat
+drwx------. 2 root root    16384 Nov 16 22:05 lost+found
+-- 두 곳에 20MB 파일 하나씩.
+-- ext4 에는 lost+found 가 미리 있다.
+
+--------------------------------------------------------------------------------
+ [2] 정상 메시지부터 읽기 — dmesg 와 dmesg -T
+--------------------------------------------------------------------------------
+
+-- dmesg 의 [ 초.마이크로초 ] 는 부팅 후 경과 시간.
+[root@ol7a ~]# dmesg | tail -4
+[   12.203151] XFS (dm-2): Ending clean mount
+[   12.203180] xfs filesystem being mounted at /data1 supports timestamps until (%ptR?) (0x7fffffff)
+[   12.269952]  sdc: sdc1
+[   12.518098] EXT4-fs (sdc1): mounted filesystem with ordered data mode. Opts: errors=remount-ro
+-- XFS (dm-2) : XFS 는 자신을 dm-2 로 부른다.
+-- LVM 이라서다.
+-- sdc: sdc1 : parted 뒤 커널이 파티션 표를 다시 읽은 기록.
+-- EXT4-fs (sdc1) : ext4 는 파티션 이름을 쓴다.
+-- 경과 시간만으로는 벽시계 시각을 알 수 없다.
+-- -T 는 경과 시간을 시각으로 바꾼다.
+[root@ol7a ~]# dmesg -T | tail -4
+[Mon Nov 16 22:05:12 2026] XFS (dm-2): Ending clean mount
+[Mon Nov 16 22:05:12 2026] xfs filesystem being mounted at /data1 supports timestamps until (%ptR?) (0x7fffffff)
+[Mon Nov 16 22:05:12 2026]  sdc: sdc1
+[Mon Nov 16 22:05:12 2026] EXT4-fs (sdc1): mounted filesystem with ordered data mode. Opts: errors=remount-ro
+-- 네 줄이 모두 22:05:12.
+-- 아래 저널과 비교한다.
+-- journalctl -k 는 같은 메시지를 저널에서 읽는다.
+[root@ol7a ~]# journalctl -k -b --no-pager | tail -2
+Nov 16 22:05:13 ol7a.example.com kernel:  sdc: sdc1
+Nov 16 22:05:14 ol7a.example.com kernel: EXT4-fs (sdc1): mounted filesystem with ordered data mode. Opts: errors=remount-ro
+-- 저널은 받은 시각을 기록한다.
+-- ext4 마운트가 22:05:14 다.
+-- dmesg -T 는 같은 줄을 22:05:12 로 찍었다. 2초 차이.
+-- 앞에 호스트 이름과 kernel: 이 붙는다.
+
+-- 새 메시지만 보려고 줄 수를 저장한다.
+-- dmesg -C 로 지우면 다른 사람이 볼 근거도 사라진다.
+[root@ol7a ~]# dmesg | wc -l > /root/dm.mark; cat /root/dm.mark
+1318
+-- 1318줄. [0] 의 1313 에서 마운트 메시지 5줄이 늘었다.
+
+--------------------------------------------------------------------------------
+ [3] sdc 를 offline 으로 — ext4 쪽 오류
+--------------------------------------------------------------------------------
+
+-- 디스크가 응답하지 않는 상황을 흉내 낸다.
+-- offline 이면 SCSI 중간층이 I/O 를 거절한다.
+[root@ol7a ~]# echo offline > /sys/block/sdc/device/state; cat /sys/block/sdc/device/state
+offline
+-- 즉시 바뀐다. 파일 시스템은 아직 모른다.
+-- oflag=direct : 페이지 캐시를 거치지 않는 직접 I/O.
+[root@ol7a ~]# dd if=/dev/zero of=/data2/new.dat bs=1M count=10 oflag=direct; echo "rc=$?"
+dd: error writing ‘/data2/new.dat’: Input/output error
+1+0 records in
+0+0 records out
+0 bytes (0 B) copied, 0.00519574 s, 0.0 kB/s
+-- 첫 1MB 블록에서 바로 Input/output error.
+-- 1+0 records in : 1MB 를 읽었고,
+-- 0+0 out : 하나도 못 썼다.
+rc=1
+-- 저널 커밋 주기(기본 5초)를 기다리며 메타데이터를 건드린다.
+[root@ol7a ~]# touch /data2/a; sync; sleep 7; touch /data2/b; echo "rc=$?"
+touch: cannot touch ‘/data2/b’: Read-only file system
+-- 첫 touch 는 조용히 지나갔고 7초 뒤의 touch 가 막혔다.
+-- 오류가 I/O error 가 아니라 Read-only file system 이다.
+-- 그사이 ext4 가 스스로 읽기 전용이 된 것이다.
+rc=1
+-- [2] 에서 저장한 줄 다음부터 새 메시지만.
+[root@ol7a ~]# dmesg -T | tail -n +$(( $(cat /root/dm.mark) + 1 )) | cut -c1-150 | head -24
+[Mon Nov 16 22:05:13 2026] sd 2:0:1:0: rejecting I/O to offline device
+[Mon Nov 16 22:05:13 2026] blk_update_request: I/O error, dev sdc, sector 266240 op 0x1:(WRITE) flags 0xc800 phys_seg 128 prio class 0
+[Mon Nov 16 22:05:13 2026] sd 2:0:1:0: rejecting I/O to offline device
+[Mon Nov 16 22:05:13 2026] blk_update_request: I/O error, dev sdc, sector 267264 op 0x1:(WRITE) flags 0x8800 phys_seg 98 prio class 0
+[Mon Nov 16 22:05:13 2026] sd 2:0:1:0: rejecting I/O to offline device
+[Mon Nov 16 22:05:13 2026] blk_update_request: I/O error, dev sdc, sector 1574984 op 0x1:(WRITE) flags 0x800 phys_seg 7 prio class 0
+[Mon Nov 16 22:05:13 2026] Aborting journal on device sdc1-8.
+[Mon Nov 16 22:05:13 2026] sd 2:0:1:0: rejecting I/O to offline device
+[Mon Nov 16 22:05:13 2026] blk_update_request: I/O error, dev sdc, sector 1574912 op 0x1:(WRITE) flags 0x800 phys_seg 1 prio class 0
+[Mon Nov 16 22:05:13 2026] Buffer I/O error on dev sdc1, logical block 196608, lost sync page write
+[Mon Nov 16 22:05:13 2026] JBD2: Error -5 detected when updating journal superblock for sdc1-8.
+[Mon Nov 16 22:05:19 2026] sd 2:0:1:0: rejecting I/O to offline device
+[Mon Nov 16 22:05:19 2026] blk_update_request: I/O error, dev sdc, sector 2048 op 0x1:(WRITE) flags 0x800 phys_seg 1 prio class 0
+[Mon Nov 16 22:05:19 2026] Buffer I/O error on dev sdc1, logical block 0, lost sync page write
+[Mon Nov 16 22:05:19 2026] EXT4-fs (sdc1): I/O error while writing superblock
+[Mon Nov 16 22:05:19 2026] EXT4-fs error (device sdc1): ext4_journal_check_start:61: Detected aborted journal
+[Mon Nov 16 22:05:19 2026] EXT4-fs (sdc1): Remounting filesystem read-only
+[Mon Nov 16 22:05:19 2026] sd 2:0:1:0: rejecting I/O to offline device
+[Mon Nov 16 22:05:19 2026] blk_update_request: I/O error, dev sdc, sector 2048 op 0x1:(WRITE) flags 0x800 phys_seg 1 prio class 0
+[Mon Nov 16 22:05:19 2026] Buffer I/O error on dev sdc1, logical block 0, lost sync page write
+[Mon Nov 16 22:05:19 2026] EXT4-fs (sdc1): I/O error while writing superblock
+-- 층별로 읽는다.
+--   SCSI   : sd 2:0:1:0: rejecting I/O to offline device
+--   블록   : blk_update_request: I/O error, dev sdc, sector …
+--            op 0x1:(WRITE) 는 쓰기, sector 는 실패한 위치
+--   버퍼   : Buffer I/O error on dev sdc1, logical block …
+--   저널   : Aborting journal on device sdc1-8 / JBD2: Error -5
+--            -5 는 EIO(입출력 오류) 번호
+--   FS     : EXT4-fs error … Detected aborted journal
+--            EXT4-fs (sdc1): Remounting filesystem read-only
+-- 아래층(SCSI)이 원인, 위층(EXT4)은 결과다.
+-- 첫 쓰기 실패 22:05:13, ro 전환 22:05:19.
+-- 저널 커밋 주기 동안 6초가 걸렸다.
+-- -T 의 시각은 경과 초로 거꾸로 계산한 추정값이라 저널과 몇 초 어긋난다([9]).
+
+--------------------------------------------------------------------------------
+ [4] 오류 흐름 — 메시지의 장치 이름과 마운트 지점 연결
+--------------------------------------------------------------------------------
+
+-- 메시지의 이름은 sd 2:0:1:0, sdc, sdc1 셋.
+-- 어느 마운트 지점인가.
+[root@ol7a ~]# lsblk -o NAME,HCTL,MOUNTPOINT /dev/sdc
+NAME   HCTL       MOUNTPOINT
+sdc    2:0:1:0    
+└─sdc1            /data2
+-- 2:0:1:0 = sdc, 그 파티션 sdc1 이 /data2.
+[root@ol7a ~]# findmnt -S /dev/sdc1 -o TARGET,SOURCE,OPTIONS
+TARGET SOURCE    OPTIONS
+/data2 /dev/sdc1 ro,relatime,seclabel,errors=remount-ro
+-- -S 는 원본 장치로 찾는다.
+-- 옵션 첫머리가 ro 다.
+-- by-path 이름에도 HCTL 이 들어 있다.
+-- 이 grep 은 지난 실측(sdc=2:0:2:0)을 보고 짠 것이다.
+[root@ol7a ~]# ls -l /dev/disk/by-path | grep -E '0:2:0($| )|0:2:0-part'
+lrwxrwxrwx. 1 root root  9 Nov 16 22:05 pci-0000:00:10.0-scsi-0:0:2:0 -> ../../sdb
+-- scsi-0:0:2:0 이 sdb 를 가리킨다.
+-- 오류가 난 sdc 가 아니다.
+-- 이번 부팅에서 sdc 는 2:0:1:0 이다.
+-- 주소를 기억에 기대 고르면 엉뚱한 디스크를 짚는다.
+-- 메시지의 HCTL(2:0:1:0)을 그대로 써야 한다.
+-- pci-0000:00:10.0 은 SCSI 컨트롤러 주소.
+-- by-path 는 슬롯이 같으면 부팅마다 같지만 sd 이름은 바뀔 수 있다.
+-- 장치 단위 I/O 계수. 16진수다.
+[root@ol7a ~]# grep . /sys/block/sdc/device/{ioerr_cnt,iodone_cnt}
+/sys/block/sdc/device/ioerr_cnt:0x6
+/sys/block/sdc/device/iodone_cnt:0x209
+-- ioerr_cnt 0x6 = 6건, iodone_cnt 0x209 = 521건.
+-- dmesg 의 rejecting 줄 수와 같은 6이다.
+-- 증상   : "EXT4-fs (sdc1): Remounting filesystem read-only" — 어느 디스크·어느 마운트인지 메시지만으론 모름
+-- 원인   : SCSI 는 2:0:1:0, 블록은 sdc, ext4 는 sdc1 로 부르고, sd 이름과 주소의 짝은 부팅마다 바뀔 수 있다
+-- 조치   : lsblk -o NAME,HCTL,MOUNTPOINT, findmnt -S /dev/sdc1, by-path 로 잇는다
+-- 재확인 : 2:0:1:0 → sdc → sdc1 → /data2, ioerr_cnt 0x6
+
+--------------------------------------------------------------------------------
+ [5] 오류 흐름 — 읽기 전용으로 다시 마운트된 ext4
+--------------------------------------------------------------------------------
+
+-- 새 파일을 만들어 본다.
+[root@ol7a ~]# touch /data2/c; echo "rc=$?"; findmnt -n -o OPTIONS /data2
+touch: cannot touch ‘/data2/c’: Read-only file system
+rc=1
+ro,relatime,seclabel,errors=remount-ro
+-- 마운트 옵션이 ro.
+-- 응용은 Read-only file system 만 본다.
+-- 장치를 되살리면 파일 시스템도 돌아올까.
+[root@ol7a ~]# echo running > /sys/block/sdc/device/state; touch /data2/c; echo "rc=$?"
+touch: cannot touch ‘/data2/c’: Read-only file system
+rc=1
+-- 장치는 running 인데 파일 시스템은 ro 그대로다.
+-- 저널이 중단(abort)된 ext4 는 스스로 rw 로 돌아오지 않는다.
+-- remount,rw 로 바로 올려 본다.
+[root@ol7a ~]# mount -o remount,rw /data2; echo "rc=$?"; dmesg | tail -2
+mount: cannot remount /dev/sdc1 read-write, is write-protected
+rc=32
+[   19.715839] EXT4-fs (sdc1): I/O error while writing superblock
+[   20.121029] EXT4-fs error (device sdc1): ext4_remount:5462: Abort forced by user
+-- 마운트가 write-protected 라며 거부했다(rc=32).
+-- 커널은 "Abort forced by user" 를 남겼다.
+-- 중단된 저널은 remount 로 못 살린다.
+-- 증상   : "touch: cannot touch ‘/data2/c’: Read-only file system", remount,rw 는 "is write-protected"
+-- 원인   : I/O 오류로 저널이 중단되자 errors=remount-ro 가 ro 로 바꿨다. 장치를 살려도 그대로다
+-- 조치   : umount → e2fsck -fy /dev/sdc1 → 다시 mount
+-- 재확인 : touch rc=0, findmnt 옵션 rw
+-- 떼고, 검사하고, 다시 붙인다.
+-- -f 는 깨끗해 보여도 강제 검사,
+-- -y 는 모든 질문에 yes.
+-- e2fsck 가 결과 줄 앞뒤에 찍는 별표 다섯 개는 교안 형식과 겹쳐 sed 로 하나로 줄인다.
+-- 종료 코드는 PIPESTATUS 로 e2fsck 것을 본다.
+[root@ol7a ~]# umount /data2; e2fsck -fy /dev/sdc1 2>&1 | sed 's/\*\{2,\}/*/g'; echo "rc=${PIPESTATUS[0]}"
+e2fsck 1.45.4 (23-Sep-2019)
+/dev/sdc1: recovering journal
+-- 남은 저널부터 재생했다.
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+Free blocks count wrong (506836, counted=501716).
+Fix? yes
+
+Free inodes count wrong (131061, counted=131060).
+Fix? yes
+
+
+/dev/sdc1: * FILE SYSTEM WAS MODIFIED *
+/dev/sdc1: 12/131072 files (8.3% non-contiguous), 22316/524032 blocks
+-- Pass 1~5 는 inode·디렉터리·연결·참조 수·그룹 요약 검사.
+-- 고친 것은 그룹 요약의 빈 블록·빈 inode 수뿐이다.
+-- 5120블록(20MB) 차이는 쓰다 만 new.dat 의 몫이다.
+-- FILE SYSTEM WAS MODIFIED 줄의 별표는 원래 다섯 개다.
+-- sed 로 하나로 줄였다.
+rc=1
+-- e2fsck 의 rc=1 은 "오류를 고쳤다".
+-- 0 은 이상 없음, 4 이상은 남은 오류.
+[root@ol7a ~]# mount -o errors=remount-ro /dev/sdc1 /data2; touch /data2/c; echo "rc=$?"; ls /data2; findmnt -n -o OPTIONS /data2
+rc=0
+base.dat
+c
+lost+found
+rw,relatime,seclabel,errors=remount-ro
+-- touch rc=0, 옵션 rw.
+-- c 가 생겼고 쓰다 만 new.dat 는 없다.
+
+--------------------------------------------------------------------------------
+ [6] sdb 를 offline 으로 — LVM 위 XFS 쪽 오류
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# dmesg | wc -l > /root/dm.mark; echo offline > /sys/block/sdb/device/state
+-- 이번에는 LVM 아래의 sdb 를 offline 으로.
+[root@ol7a ~]# dd if=/dev/zero of=/data1/new.dat bs=1M count=10 oflag=direct; echo "rc=$?"
+dd: error writing ‘/data1/new.dat’: Input/output error
+1+0 records in
+0+0 records out
+0 bytes (0 B) copied, 0.00555488 s, 0.0 kB/s
+-- ext4 와 같은 Input/output error.
+rc=1
+[root@ol7a ~]# touch /data1/a; sync; sleep 3; touch /data1/b; echo "rc=$?"
+touch: cannot touch ‘/data1/b’: Input/output error
+rc=1
+-- XFS 는 읽기 전용이 되지 않고 I/O error 를 돌려준다.
+[root@ol7a ~]# dmesg -T | tail -n +$(( $(cat /root/dm.mark) + 1 )) | cut -c1-150 | head -24
+[Mon Nov 16 22:05:20 2026] sd 2:0:2:0: rejecting I/O to offline device
+[Mon Nov 16 22:05:20 2026] blk_update_request: I/O error, dev sdb, sector 43104 op 0x1:(WRITE) flags 0xc800 phys_seg 128 prio class 0
+[Mon Nov 16 22:05:20 2026] sd 2:0:2:0: rejecting I/O to offline device
+[Mon Nov 16 22:05:20 2026] blk_update_request: I/O error, dev sdb, sector 44128 op 0x1:(WRITE) flags 0x8800 phys_seg 102 prio class 0
+[Mon Nov 16 22:05:20 2026] sd 2:0:2:0: rejecting I/O to offline device
+[Mon Nov 16 22:05:20 2026] blk_update_request: I/O error, dev sdb, sector 2099241 op 0x1:(WRITE) flags 0x1800 phys_seg 1 prio class 0
+[Mon Nov 16 22:05:20 2026] XFS (dm-2): log I/O error -5
+[Mon Nov 16 22:05:20 2026] XFS (dm-2): xfs_do_force_shutdown(0x2) called from line 1267 of file fs/xfs/xfs_log.c. Return address = 000000008022147f
+[Mon Nov 16 22:05:20 2026] XFS (dm-2): Log I/O Error Detected. Shutting down filesystem
+[Mon Nov 16 22:05:20 2026] XFS (dm-2): Please unmount the filesystem and rectify the problem(s)
+-- SCSI·블록 줄은 ext4 와 같고 장치만 sdb 다.
+-- XFS (dm-2): log I/O error -5 : 로그 쓰기 실패.
+-- xfs_do_force_shutdown(0x2) : 스스로 셧다운.
+-- 0x2 는 로그 I/O 오류.
+-- Please unmount … : 다시 쓰려면 떼라는 안내다.
+-- 파일 시스템 줄에 sdb 라는 말은 없다.
+-- dm-2 뿐이다.
+
+--------------------------------------------------------------------------------
+ [7] dm-N 을 LV 와 디스크로 잇기
+--------------------------------------------------------------------------------
+
+-- dm-2 가 무엇인지 잇는다. KNAME 은 커널 이름.
+[root@ol7a ~]# lsblk -o NAME,KNAME,HCTL,MOUNTPOINT /dev/sdb
+NAME      KNAME HCTL       MOUNTPOINT
+sdb       sdb   2:0:2:0    
+└─vgt-lvx dm-2             /data1
+-- sdb 위의 vgt-lvx, 커널 이름 dm-2, 마운트 /data1.
+[root@ol7a ~]# dmsetup ls; ls -l /dev/mapper/vgt-lvx
+ol-swap (252:1)
+ol-root (252:0)
+vgt-lvx (252:2)
+lrwxrwxrwx. 1 root root 7 Nov 16 22:05 /dev/mapper/vgt-lvx -> ../dm-2
+-- 괄호 안 252:2 는 major:minor.
+-- minor 2 가 dm-2 의 2 다.
+-- 반대 방향(dm → 밑의 디스크)은 deps 나 slaves 로.
+[root@ol7a ~]# dmsetup deps -o devname vgt-lvx; ls /sys/block/dm-*/slaves/ | head -8
+1 dependencies  : (sdb)
+/sys/block/dm-0/slaves/:
+sda2
+
+/sys/block/dm-1/slaves/:
+sda2
+
+/sys/block/dm-2/slaves/:
+sdb
+-- dm-0·dm-1(ol-root·ol-swap)은 sda2 위,
+-- dm-2 는 sdb 위.
+
+--------------------------------------------------------------------------------
+ [8] 멈춘 XFS 다루기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ls /data1; echo "rc=$?"; findmnt -n -o OPTIONS /data1
+ls: cannot access /data1: Input/output error
+rc=2
+rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+-- 셧다운된 XFS 는 ls 도 I/O error.
+-- 그런데 옵션은 rw 다.
+-- ext4 와 달리 findmnt 로는 이상이 안 보인다.
+-- 로그를 봐야 안다.
+[root@ol7a ~]# echo running > /sys/block/sdb/device/state; ls /data1; echo "rc=$?"
+ls: cannot access /data1: Input/output error
+-- 장치를 살려도 셧다운 상태는 그대로다.
+rc=2
+-- 셧다운 뒤에는 umount 가 필요하다.
+-- 다시 마운트하면 로그를 재생한다.
+[root@ol7a ~]# umount /data1; mount /dev/vgt/lvx /data1; dmesg | tail -3
+[   23.899885] XFS (dm-2): Starting recovery (logdev: internal)
+[   23.901469] XFS (dm-2): Ending recovery (logdev: internal)
+[   23.901482] xfs filesystem being mounted at /data1 supports timestamps until (%ptR?) (0x7fffffff)
+-- Starting recovery → Ending recovery : 로그 재생 성공.
+-- 로그를 비운 뒤 떼고 xfs_repair -n(검사만)으로 본다.
+[root@ol7a ~]# umount /data1; xfs_repair -n /dev/vgt/lvx 2>&1 | tail -4; echo "rc=$?"
+        - traversal finished ...
+        - moving disconnected inodes to lost+found ...
+Phase 7 - verify link counts...
+No modify flag set, skipping filesystem flush and exiting.
+-- 마지막 네 줄만 잘랐다.
+-- Phase 7 까지 문제 보고가 없다.
+rc=0
+[root@ol7a ~]# mount /dev/vgt/lvx /data1; ls -l /data1
+total 20480
+-rw-r--r--. 1 root root 20971520 Nov 16 22:05 base.dat
+-- 원래 파일만 남았다.
+-- 실패한 new.dat·a·b 는 없다.
+
+--------------------------------------------------------------------------------
+ [9] 저널에서 다시 읽기 — 우선순위로 거르기
+--------------------------------------------------------------------------------
+
+-- -p err 는 err(3) 이상.
+-- dmesg -l err,crit,alert,emerg 와 같은 범위.
+[root@ol7a ~]# journalctl -k -b -p err --no-pager -q | cut -c1-140 | tail -8
+Nov 16 22:05:22 ol7a.example.com kernel: blk_update_request: I/O error, dev sdb, sector 43104 op 0x1:(WRITE) flags 0xc800 phys_seg 128 prio 
+Nov 16 22:05:22 ol7a.example.com kernel: sd 2:0:2:0: rejecting I/O to offline device
+Nov 16 22:05:22 ol7a.example.com kernel: blk_update_request: I/O error, dev sdb, sector 44128 op 0x1:(WRITE) flags 0x8800 phys_seg 102 prio 
+Nov 16 22:05:22 ol7a.example.com kernel: sd 2:0:2:0: rejecting I/O to offline device
+Nov 16 22:05:22 ol7a.example.com kernel: blk_update_request: I/O error, dev sdb, sector 2099241 op 0x1:(WRITE) flags 0x1800 phys_seg 1 prio 
+Nov 16 22:05:22 ol7a.example.com kernel: XFS (dm-2): log I/O error -5
+Nov 16 22:05:22 ol7a.example.com kernel: XFS (dm-2): Log I/O Error Detected. Shutting down filesystem
+Nov 16 22:05:22 ol7a.example.com kernel: XFS (dm-2): Please unmount the filesystem and rectify the problem(s)
+-- 140자에서 잘랐고 마지막 8줄만 보였다.
+-- 저널 시각은 22:05:22.
+-- dmesg -T 의 22:05:20 과 2초 다르다.
+[root@ol7a ~]# journalctl -k -b -p err --no-pager -q | wc -l; dmesg -l err,crit,alert,emerg | wc -l
+38
+38
+-- 두 방법이 같은 38줄.
+-- [0] 의 7줄에서 31줄 늘었다.
+-- 장치·파일 시스템별로 센다.
+[root@ol7a ~]# journalctl -k -b --no-pager -q | grep -oE 'dev sd[a-e]|EXT4-fs \(sd..\)|EXT4-fs error \(device sd..\)|XFS \(dm-[0-9]\)' | sort | uniq -c
+      3 dev sdb
+      9 dev sdc
+      2 EXT4-fs error (device sdc1)
+      5 EXT4-fs (sdc1)
+      2 XFS (dm-0)
+     13 XFS (dm-2)
+-- XFS (dm-0) 2줄은 부팅 때 / 를 마운트한 기록이다.
+-- dev sdc 9 > dev sdb 3.
+-- ext4 는 슈퍼블록을 거듭 쓰려다 실패를 더 남겼다.
+
+--------------------------------------------------------------------------------
+ [변형] 장치를 떼었다 다시 찾기 — delete 와 scan
+--------------------------------------------------------------------------------
+
+-- offline 은 장치가 남은 고장.
+-- 디스크가 빠진 경우는 delete 로 흉내 낸다.
+-- 쓰지 않는 sdd.
+-- 주소(2:0:3:0 → host2)를 적어 둔다.
+[root@ol7a ~]# dmesg | wc -l > /root/dm.mark; lsblk -dno NAME,HCTL /dev/sdd; echo 1 > /sys/block/sdd/device/delete; lsblk -d -o NAME,HCTL | grep -c sd
+sdd  2:0:3:0
+4
+-- sd 로 시작하는 디스크가 5개에서 4개로 줄었다.
+[root@ol7a ~]# dmesg -T | tail -n +$(( $(cat /root/dm.mark) + 1 )) | cut -c1-150
+-- 출력이 없다.
+-- 정상적인 삭제는 기본 로그 수준에서 아무것도 남기지 않았다.
+-- 디스크가 사라졌는데 로그가 조용하다.
+-- lsblk 대조가 필요한 이유다.
+-- host2 를 다시 훑는다.
+-- "- - -" 는 채널·타깃·LUN 모두.
+[root@ol7a ~]# echo '- - -' > /sys/class/scsi_host/host2/scan; sleep 2; lsblk -d -o NAME,HCTL,SIZE | grep sd
+sdd  2:0:3:0      10G
+sdb  2:0:2:0      10G
+sde  2:0:4:0      10G
+sdc  2:0:1:0      10G
+sda  2:0:0:0      40G
+-- sdd 가 같은 이름, 같은 주소로 돌아왔다.
+-- 다른 디스크가 그사이 붙었다면 이름이 달라졌을 수 있다.
+[root@ol7a ~]# dmesg -T | tail -n +$(( $(cat /root/dm.mark) + 1 )) | grep -E 'Attached|sdd|2:0:3:0' | cut -c1-150 | tail -4
+[Mon Nov 16 22:05:24 2026] sd 2:0:3:0: [sdd] Cache data unavailable
+[Mon Nov 16 22:05:24 2026] sd 2:0:3:0: [sdd] Assuming drive cache: write through
+[Mon Nov 16 22:05:24 2026] sd 2:0:3:0: Attached scsi generic sg4 type 0
+[Mon Nov 16 22:05:24 2026] sd 2:0:3:0: [sdd] Attached SCSI disk
+-- 다시 찾은 기록은 남는다.
+-- Attached SCSI disk 가 마지막 줄.
+-- [OL8/9] 같은 sysfs 경로를 쓴다. rescan-scsi-bus.sh(sg3_utils)로도 할 수 있다.
+
+--------------------------------------------------------------------------------
+ [10] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /data1 /data2; lvremove -qy vgt/lvx; vgremove -q vgt; pvremove -q /dev/sdb; wipefs -qa /dev/sdc1; wipefs -qa /dev/sdc; rmdir /data1 /data2; rm -f /root/dm.mark
+  Logical volume "lvx" successfully removed
+  Volume group "vgt" successfully removed
+  Labels on physical volume "/dev/sdb" successfully wiped.
+/dev/sdc: calling ioclt to re-read partition table: Success
+-- 마지막 줄은 wipefs 가 파티션 표를 다시 읽힌 안내다(ioclt 는 원문 철자).
+[root@ol7a ~]# lsblk -o NAME,HCTL,SIZE,TYPE,FSTYPE,MOUNTPOINT; grep . /sys/block/sd[a-e]/device/state
+NAME        HCTL        SIZE TYPE FSTYPE      MOUNTPOINT
+sdd         2:0:3:0      10G disk             
+sdb         2:0:2:0      10G disk             
+sr0         1:0:0:0     4.5G rom  iso9660     
+sde         2:0:4:0      10G disk             
+sdc         2:0:1:0      10G disk             
+sda         2:0:0:0      40G disk             
+├─sda2                   39G part LVM2_member 
+│ ├─ol-swap             3.9G lvm  swap        [SWAP]
+│ └─ol-root            35.1G lvm  xfs         /
+└─sda1                    1G part xfs         /boot
+/sys/block/sda/device/state:running
+/sys/block/sdb/device/state:running
+/sys/block/sdc/device/state:running
+/sys/block/sdd/device/state:running
+/sys/block/sde/device/state:running
+-- lsblk 가 [0] 과 같다. 다섯 장치 모두 running.
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                    시작 전        장애 중                     되돌린 뒤
+--  sdc state(2:0:1:0)    running        offline                     running
+--  /data2(ext4) 옵션       rw             ro (remount-ro)             (제거)
+--  ext4 쓰기 오류          -              Read-only file system       -
+--  sdb state               running        offline                     running
+--  /data1(XFS) 옵션        rw             rw (셧다운, I/O error)      (제거)
+--  err 이상 커널 메시지    7              38                          38
+--  sdc ioerr_cnt           -              0x6                         -
+--  sd 디스크 수            5              4 (sdd delete)              5
+--
+--  메시지 이름 잇기 : sd 2:0:1:0 → sdc → sdc1 → /data2
+--                     dm-2 → vgt-lvx → sdb → /data1
+--  ext4 는 ro 로 바뀌어 findmnt 에 보이고, XFS 는 rw 그대로 셧다운된다.
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. errors=continue 로 마운트하고 [3] 을 반복한다.
+--    findmnt 옵션과 touch 결과가 어떻게 다른지 본다.
+-- 2. sde 에 RAID 1 의 한쪽을 두고 offline 으로 만든다(10장).
+--    cat /proc/mdstat 에서 (F) 표시와 dmesg 의 md 메시지를 확인한다.
+-- 3. dmesg -T 와 journalctl -k 의 시각 차이를 재부팅 직후와
+--    한 시간 뒤에 각각 재 본다.
+
+================================================================================
+ 실습 05 종료 — offline 디스크의 오류를 SCSI → 블록 → 파일 시스템 순으로 읽고 마운트 지점까지 이음
+================================================================================

@@ -1,0 +1,618 @@
+================================================================================
+ 제11장 실습 06 — 손상 복구
+ 대상   : ol7a
+ 목표   : 언마운트 상태에서 xfs_repair -n 으로 검사하고, xfs_db 로 디렉터리 inode 와
+          주 슈퍼블록을 일부러 망가뜨린 뒤 xfs_repair 로 고친다. 로그가 더러운
+          파일 시스템에서 xfs_repair 가 거부하는 이유와 -L 이 무엇을 버리는지
+          본다. xfs_fsr 로 조각난 파일을 모은다
+ 배경   : XFS 는 마운트할 때 로그를 재생해 일관성을 맞춘다. 그래서 부팅 때 fsck
+          단계가 사실상 없다(fsck.xfs 는 -f 없이는 검사하지 않는다). 메타데이터 자체가
+          깨졌을 때만 xfs_repair 를 언마운트 상태에서 돌린다. 로그를 재생할 수 없으면
+          -L 로 로그를 지우는데, 그 안의 변경은 사라진다 (본문 11.8)
+ 소요   : 약 30분
+ 선행   : storage-clean 스냅샷
+ 계정   : root
+ 주의   : xfs_db -x 는 실습 디스크 sdb·sdc 에서만 쓴다. sda(OS 디스크, VG ol)의
+          장치 이름을 절대 넣지 않는다. 명령마다 장치 이름을 두 번 확인한다
+ 되돌림 : 마운트 해제, wipefs. lsblk -f /dev/sdb /dev/sdc 가 비어 있으면 끝
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- OS 디스크와 실습 디스크를 구분해 둔다. 이후 xfs_db·xfs_repair 의 대상은
+-- /dev/sdb1 과 /dev/sdc1 뿐이다.
+[root@ol7a ~]# lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT /dev/sda /dev/sdb /dev/sdc
+NAME         SIZE TYPE FSTYPE      MOUNTPOINT
+sda           40G disk             
+├─sda2        39G part LVM2_member 
+│ ├─ol-swap  3.9G lvm  swap        [SWAP]
+│ └─ol-root 35.1G lvm  xfs         /
+└─sda1         1G part xfs         /boot
+sdb           10G disk             
+sdc           10G disk             
+-- sda 만 OS 구조를 품었다
+-- sdb·sdc 는 비었다
+
+[root@ol7a ~]# rpm -q xfsprogs; ls -l /usr/sbin/xfs_repair /usr/sbin/fsck.xfs /usr/sbin/xfs_db
+-- 셋 다 xfsprogs 5.4.0 의 파일
+-- 날짜 Jul 30 2020: 패키지 빌드 시점
+-- xfs_db 가 디버거, xfs_repair 가 복구 도구
+-- fsck.xfs 는 1968 바이트
+--   셸 스크립트다. [변형] 에서 본다
+xfsprogs-5.4.0-1.0.1.el7.x86_64
+-rwxr-xr-x. 1 root root   1968 Jul 30  2020 /usr/sbin/fsck.xfs
+-rwxr-xr-x. 1 root root 709128 Jul 30  2020 /usr/sbin/xfs_db
+-rwxr-xr-x. 1 root root 711664 Jul 30  2020 /usr/sbin/xfs_repair
+
+--------------------------------------------------------------------------------
+ [1] 실습용 파일 시스템과 표본 데이터
+--------------------------------------------------------------------------------
+
+-- 작업을 빠르게 하려고 1GiB 파티션에 만든다.
+[root@ol7a ~]# parted -s /dev/sdb mklabel gpt mkpart r1 1MiB 1025MiB; parted -s /dev/sdc mklabel gpt mkpart r2 1MiB 1025MiB; lsblk /dev/sdb /dev/sdc
+NAME   MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdb      8:16   0  10G  0 disk 
+└─sdb1   8:17   0   1G  0 part 
+sdc      8:32   0  10G  0 disk 
+-- sdb1 1G 가 보인다
+-- sdc1 은 아직 안 보인다
+--   udev 가 갱신하기 전에 lsblk 가 돌았다
+--   [8] 의 dd 에서는 sdc1 이 쓰였다
+[root@ol7a ~]# mkfs.xfs -q -L rep /dev/sdb1; mkdir -p /rep; mount /dev/sdb1 /rep
+
+-- 디렉터리 dir1 에 파일 다섯 개, 그 밖에 keep.txt 를 둔다. dir1 의 inode 번호를 적어 둔다.
+[root@ol7a ~]# mkdir /rep/dir1; for i in 1 2 3 4 5; do echo "file $i" > /rep/dir1/f$i.txt; done; echo keep > /rep/keep.txt
+[root@ol7a ~]# ls -i /rep; ls -i /rep/dir1; md5sum /rep/dir1/* /rep/keep.txt > /root/rep.md5
+131 dir1
+137 keep.txt
+132 f1.txt
+133 f2.txt
+134 f3.txt
+135 f4.txt
+136 f5.txt
+-- dir1 이 inode 131
+-- keep.txt 137, f1~f5 132~136
+-- 이 번호가 나중에 이름을 되찾는 열쇠다
+-- md5 는 /root/rep.md5 에 남겼다
+
+--------------------------------------------------------------------------------
+ [2] 마운트된 채로 xfs_repair — 오류 ①
+--------------------------------------------------------------------------------
+
+-- 부팅 때 fsck 를 돌리던 습관으로 마운트된 장치에 친다.
+[root@ol7a ~]# xfs_repair /dev/sdb1; echo "rc=$?"
+xfs_repair: /dev/sdb1 contains a mounted filesystem
+xfs_repair: /dev/sdb1 contains a mounted and writable filesystem
+
+fatal error -- couldn't initialize XFS library
+rc=1
+-- 마운트된 장치라 거부
+--   contains a mounted and writable filesystem
+--   fatal error -- couldn't initialize XFS library
+
+-- -n(검사만)도 마찬가지인가.
+[root@ol7a ~]# xfs_repair -n /dev/sdb1; echo "rc=$?"
+xfs_repair: /dev/sdb1 contains a mounted and writable filesystem
+
+fatal error -- couldn't initialize XFS library
+rc=1
+-- 증상   : -n 이어도 같은 메시지와 rc=1
+-- 원인   : xfs_repair 는 언마운트된 장치만 다룬다
+--          검사만 하는 -n 도 예외가 아니다
+-- 조치   : umount 뒤 다시 친다
+-- 재확인 : [3] 의 Phase 1~7 출력, rc=0
+-- 부팅 때 fsck 하던 습관으로 치면 이렇게 막힌다
+
+--------------------------------------------------------------------------------
+ [3] 깨끗한 파일 시스템 검사 — 7단계 출력 읽기
+--------------------------------------------------------------------------------
+
+-- agno = 0~3 처럼 AG 마다 반복되는 줄만 grep 으로 뺀다.
+[root@ol7a ~]# umount /rep; xfs_repair -n /dev/sdb1 2>&1 | grep -v 'agno = '; echo "rc=${PIPESTATUS[0]}"
+Phase 1 - find and verify superblock...
+Phase 2 - using internal log
+        - zero log...
+        - scan filesystem freespace and inode maps...
+        - found root inode chunk
+Phase 3 - for each AG...
+        - scan (but don't clear) agi unlinked lists...
+        - process known inodes and perform inode discovery...
+        - process newly discovered inodes...
+Phase 4 - check for duplicate blocks...
+        - setting up duplicate extent list...
+        - check for inodes claiming duplicate blocks...
+No modify flag set, skipping phase 5
+Phase 6 - check inode connectivity...
+        - traversing filesystem ...
+        - traversal finished ...
+        - moving disconnected inodes to lost+found ...
+Phase 7 - verify link counts...
+No modify flag set, skipping filesystem flush and exiting.
+rc=0
+-- AG 마다 반복하는 agno = 0~3 줄은 뺐다
+-- 일곱 단계
+--   1 슈퍼블록 찾기·확인
+--   2 로그 확인(zero log), 빈 공간·inode 맵
+--   3 AG 마다 inode 검사
+--   4 중복 블록 검사
+--   5 AG 헤더·트리 재구성(-n 이라 건너뜀)
+--   6 디렉터리 연결 검사, 고아는 lost+found
+--   7 링크 수 검사
+-- 깨끗하면 rc=0
+
+--------------------------------------------------------------------------------
+ [4] 디렉터리 inode 망가뜨리기 — xfs_db -x
+--------------------------------------------------------------------------------
+
+-- xfs_db 는 XFS 디버거다. -r 은 읽기 전용, -x 는 쓰기를 허용하는 전문가 모드다.
+-- 먼저 -r 로 dir1 의 inode 를 읽어 core.magic 과 core.mode 를 본다.
+[root@ol7a ~]# mount /dev/sdb1 /rep; ls -di /rep/dir1 | tee /root/dir1.ino; umount /rep
+131 /rep/dir1
+[root@ol7a ~]# xfs_db -r -c "inode $(awk '{print $1}' /root/dir1.ino)" -c 'print core.magic core.mode core.nlinkv2 core.size' /dev/sdb1
+core.magic = 0x494e
+core.mode = 040755
+core.nlinkv2 = 2
+core.size = 76
+-- core.magic 0x494e = "IN"(inode 표시)
+-- mode 040755: 디렉터리, 권한 755
+-- nlinkv2 2: . 과 부모의 항목
+-- size 76: 짧은 디렉터리(inode 안에 항목)
+
+-- magic(IN 을 뜻하는 0x494e)을 0 으로 덮어쓴다. inode 가 inode 로 보이지 않게 된다.
+[root@ol7a ~]# xfs_db -x -c "inode $(awk '{print $1}' /root/dir1.ino)" -c 'write core.magic 0' /dev/sdb1
+core.magic = 0
+-- -x 쓰기 모드에서 magic 을 0 으로 썼다
+-- 실제 장애라면 디스크·컨트롤러 오류다
+
+--------------------------------------------------------------------------------
+ [5] 증상 — 마운트와 디렉터리 읽기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# mount /dev/sdb1 /rep; echo "rc=$?"; cat /rep/keep.txt; ls /rep/dir1; echo "rc=$?"
+mount: mount /dev/sdb1 on /rep failed: Structure needs cleaning
+rc=32
+cat: /rep/keep.txt: No such file or directory
+ls: cannot access /rep/dir1: No such file or directory
+rc=2
+-- mount 가 거부됐다
+--   Structure needs cleaning (EUCLEAN)
+-- 그래서 cat·ls 는 / 아래 빈 /rep 를 본다
+[root@ol7a ~]# dmesg | grep -i xfs | tail -6
+[   12.496906] XFS (sdb1): Metadata corruption detected at xfs_inode_buf_verify+0x146/0x150 [xfs], xfs_inode block 0x40 xfs_inode_buf_verify
+[   12.498653] XFS (sdb1): Unmount and run xfs_repair
+[   12.499358] XFS (sdb1): First 128 bytes of corrupted metadata buffer:
+[   12.509638] XFS (sdb1): metadata I/O error in "xfs_trans_read_buf_map" at daddr 0x40 len 16 error 117
+[   12.510954] XFS (sdb1): xfs_imap_to_bp: xfs_trans_read_buf() returned error -117.
+[   12.510957] XFS (sdb1): Failed to read root inode 0x80, error 117
+-- 망가뜨린 것은 dir1(131)인데
+--   루트 inode(0x80=128)를 못 읽었다
+-- 원인: xfs_inode block 0x40 검증 실패
+--   inode 는 묶음(버퍼) 단위로 읽는다
+--   128 과 131 이 같은 묶음에 있다
+--   v4 라 inode 마다 체크섬이 없어 묶음째 실패
+-- error 117 = EUCLEAN
+-- 커널이 Unmount and run xfs_repair 를 권한다
+-- dmesg 의 First 128 bytes 줄은 tail -6 에서 잘렸다
+-- daddr 0x40 = 섹터 64. 첫 inode 묶음 위치
+
+--------------------------------------------------------------------------------
+ [6] 검사(-n)와 복구
+--------------------------------------------------------------------------------
+
+-- 이제부터 xfs_repair 출력은 '        - ' 로 시작하는 세부 단계 줄을 빼고 본다.
+[root@ol7a ~]# umount /rep; xfs_repair -n /dev/sdb1 2>&1 | grep -v -E '^\s+- ' ; echo "rc=${PIPESTATUS[0]}"
+umount: /rep: not mounted
+Phase 1 - find and verify superblock...
+Phase 2 - using internal log
+Phase 3 - for each AG...
+Metadata corruption detected at 0x435693, xfs_inode block 0x40/0x2000
+bad magic number 0x0 on inode 131
+bad magic number 0x0 on inode 131, would reset magic number
+would have cleared inode 131
+Phase 4 - check for duplicate blocks...
+bad magic number 0x0 on inode 131, would reset magic number
+would have cleared inode 131
+No modify flag set, skipping phase 5
+Phase 6 - check inode connectivity...
+Metadata corruption detected at 0x435693, xfs_inode block 0x40/0x2000
+Metadata corruption detected at 0x469b38, inode 0x83 dinode
+couldn't map inode 131, err = 117
+disconnected inode 132, would move to lost+found
+disconnected inode 133, would move to lost+found
+disconnected inode 134, would move to lost+found
+disconnected inode 135, would move to lost+found
+disconnected inode 136, would move to lost+found
+Phase 7 - verify link counts...
+Metadata corruption detected at 0x469b38, inode 0x83 dinode
+couldn't map inode 131, err = 117, can't compare link counts
+No modify flag set, skipping filesystem flush and exiting.
+rc=1
+-- umount 경고는 마운트가 안 됐기 때문
+-- '        - ' 세부 줄은 뺐다
+-- -n 의 예고
+--   inode 131 의 magic 을 되돌리겠다
+--   would have cleared inode 131
+--   132~136 을 lost+found 로 옮기겠다
+-- 손상이 있으면 rc=1
+
+[root@ol7a ~]# xfs_repair /dev/sdb1 2>&1 | grep -v -E '^\s+- '; echo "rc=${PIPESTATUS[0]}"
+Phase 1 - find and verify superblock...
+Phase 2 - using internal log
+Phase 3 - for each AG...
+Metadata corruption detected at 0x435693, xfs_inode block 0x40/0x2000
+bad magic number 0x0 on inode 131
+bad magic number 0x0 on inode 131, resetting magic number
+cleared inode 131
+Phase 4 - check for duplicate blocks...
+Phase 5 - rebuild AG headers and trees...
+Phase 6 - check inode connectivity...
+Phase 7 - verify and correct link counts...
+done
+rc=0
+-- 실제 복구
+--   resetting magic number
+--   cleared inode 131
+-- Phase 5 가 실제로 돌았다
+-- disconnected 줄이 없다
+-- 예고와 결과가 다르다
+--   -n 은 고치지 않은 상태로 다음 단계를 본다
+--   실제로는 magic 을 먼저 고쳐 디렉터리가 살았다
+-- rc=0 은 고칠 것을 다 고쳤다는 뜻
+
+-- 복구 뒤 마운트해서 무엇이 남았는지 본다.
+[root@ol7a ~]# mount /dev/sdb1 /rep; ls -l /rep /rep/dir1; ls -ld /rep/lost+found 2>&1
+/rep:
+total 4
+drwxr-xr-x. 2 root root 76 Nov 16 15:54 dir1
+-rw-r--r--. 1 root root  5 Nov 16 15:54 keep.txt
+
+/rep/dir1:
+total 20
+-rw-r--r--. 1 root root 7 Nov 16 15:54 f1.txt
+-rw-r--r--. 1 root root 7 Nov 16 15:54 f2.txt
+-rw-r--r--. 1 root root 7 Nov 16 15:54 f3.txt
+-rw-r--r--. 1 root root 7 Nov 16 15:54 f4.txt
+-rw-r--r--. 1 root root 7 Nov 16 15:54 f5.txt
+ls: cannot access /rep/lost+found: No such file or directory
+-- dir1 과 f1~f5 가 제자리에 있다
+-- lost+found 는 만들어지지 않았다
+--   옮길 고아가 없었다
+-- dir1 크기 76 그대로
+
+[root@ol7a ~]# md5sum -c /root/rep.md5
+/rep/dir1/f1.txt: OK
+/rep/dir1/f2.txt: OK
+/rep/dir1/f3.txt: OK
+/rep/dir1/f4.txt: OK
+/rep/dir1/f5.txt: OK
+/rep/keep.txt: OK
+-- 여섯 파일 모두 OK
+-- 이번 손상은 데이터 손실 없이 고쳤다
+-- 디렉터리를 지우는 경우라면
+--   파일은 lost+found/inode번호 로 간다
+--   [1] 의 ls -i 목록으로 이름을 되찾는다
+
+--------------------------------------------------------------------------------
+ [7] 주 슈퍼블록 망가뜨리기
+--------------------------------------------------------------------------------
+
+-- 슈퍼블록 0번(AG 0 의 머리)의 magicnum("XFSB")을 지운다. 각 AG 에 사본이 있다.
+[root@ol7a ~]# umount /rep; xfs_db -r -c 'sb 0' -c 'print magicnum agcount' /dev/sdb1; xfs_db -x -c 'sb 0' -c 'write magicnum 0' /dev/sdb1
+magicnum = 0x58465342
+-- 0x58465342 = "XFSB"
+-- 주 슈퍼블록 0번의 magic 을 0 으로
+agcount = 4
+magicnum = 0
+[root@ol7a ~]# mount /dev/sdb1 /rep; echo "rc=$?"; dmesg | tail -2; blkid /dev/sdb1; echo "blkid rc=$?"
+mount: wrong fs type, bad option, bad superblock on /dev/sdb1,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+rc=32
+[   12.779907] xfs filesystem being mounted at /rep supports timestamps until (%ptR?) (0x7fffffff)
+[   12.898787] XFS (sdb1): Unmounting Filesystem
+/dev/sdb1: PARTLABEL="r1" PARTUUID="6e0364e8-90b0-427d-b0fb-238bc8ebc31a" 
+blkid rc=0
+-- 마운트 실패, dmesg 에도 별말이 없다
+-- blkid 는 TYPE·UUID 를 잃었다
+--   PARTLABEL·PARTUUID(GPT) 만 남았다
+-- 장치에서 XFS 를 찾지 못하는 상태다
+-- mount 도 xfs 로 시도할 근거를 잃었다
+-- 데이터 블록은 그대로다. 위치 정보만 잃었다
+
+[root@ol7a ~]# xfs_repair /dev/sdb1 2>&1 | grep -v -E '^\s+- ' | cut -c1-100; echo "rc=${PIPESTATUS[0]}"
+Phase 1 - find and verify superblock...
+bad primary superblock - bad magic number !!!
+
+attempting to find secondary superblock...
+.found candidate secondary superblock...
+verified secondary superblock...
+writing modified primary superblock
+sb realtime bitmap inode 18446744073709551615 (NULLFSINO) inconsistent with calculated value 129
+resetting superblock realtime bitmap ino pointer to 129
+sb realtime summary inode 18446744073709551615 (NULLFSINO) inconsistent with calculated value 130
+resetting superblock realtime summary ino pointer to 130
+Phase 2 - using internal log
+sb_icount 0, counted 64
+sb_ifree 0, counted 54
+sb_fdblocks 259568, counted 259558
+Phase 3 - for each AG...
+Phase 4 - check for duplicate blocks...
+Phase 5 - rebuild AG headers and trees...
+Phase 6 - check inode connectivity...
+Phase 7 - verify and correct link counts...
+Note - stripe unit (0) and width (0) were copied from a backup superblock.
+Please reset with mount -o sunit=<value>,swidth=<value> if necessary
+done
+rc=0
+-- cut -c1-100 으로 긴 줄을 잘랐다
+-- bad primary superblock - bad magic number !!!
+-- 보조 슈퍼블록을 찾아 주 슈퍼블록에 다시 썼다
+--   .found candidate: 점 하나 = AG 하나 탐색
+-- realtime inode 포인터를 계산값으로 고쳤다
+-- 카운터 셋을 다시 셌다
+--   sb_icount 0 → 64, sb_ifree 0 → 54
+-- stripe 값은 백업에서 가져왔다는 안내
+
+[root@ol7a ~]# mount /dev/sdb1 /rep; cat /rep/keep.txt; blkid /dev/sdb1
+keep
+/dev/sdb1: LABEL="rep" UUID="7f7317a1-2da5-4191-a7a5-00e14a722137" TYPE="xfs" PARTLABEL="r1" PARTUUID="6e0364e8-90b0-427d-b0fb-238bc8ebc31a" 
+-- keep 이 읽힌다
+-- LABEL="rep"·UUID 가 돌아왔다
+-- AG 마다 사본이 있어 가능한 복구다
+-- UUID 는 보조 슈퍼블록 값 그대로다
+-- 운영이라면 복구 뒤 xfs_repair -n 을 한 번 더 친다
+
+--------------------------------------------------------------------------------
+ [8] 더러운 로그 — 오류 ②
+--------------------------------------------------------------------------------
+
+-- 전원이 갑자기 나간 상황을 흉내 낸다. xfs_io 의 shutdown 은 파일 시스템을
+-- 즉시 멈춰 그 뒤로 어떤 쓰기도 디스크에 가지 않게 한다. -f 를 주지 않으면
+-- 로그를 먼저 비우지 않는다.
+-- 표본: before.txt 는 sync 로 확실히 내리고, after 파일 20개는 만든 직후 로그만
+-- 디스크에 강제(sync)한 뒤 곧바로 멈춘다.
+[root@ol7a ~]# echo before > /rep/before.txt; sync; sleep 35; mkdir /rep/after; for i in $(seq 1 20); do echo $i > /rep/after/a$i; done; sync; xfs_io -x -c shutdown /rep; echo "rc=$?"
+rc=0
+-- 마지막 동기화 뒤의 변경은 없다
+-- shutdown: 파일 시스템을 강제 정지
+--   로그를 디스크에 내리지 않고 멈춘다
+--   전원이 나간 것과 비슷한 상태
+-- 두 번째 sync 는 로그를 디스크에 썼다
+--   제자리 반영(체크포인트)은 아직이다
+-- 그래서 로그 재생이 필요한 상태가 된다
+[root@ol7a ~]# ls /rep; echo "rc=$?"; dmesg | tail -3
+ls: cannot access /rep: Input/output error
+rc=2
+[   13.173628] XFS (sdb1): Ending clean mount
+[   13.173659] xfs filesystem being mounted at /rep supports timestamps until (%ptR?) (0x7fffffff)
+[   47.768853] XFS (sdb1): User initiated shutdown received. Shutting down filesystem
+-- 정지 뒤에는 읽기도 Input/output error
+-- dmesg: User initiated shutdown received.
+
+[root@ol7a ~]# umount /rep; xfs_repair -n /dev/sdb1 > /tmp/rn.txt 2>&1; echo "rc=$?"; sed -n '4,6p' /tmp/rn.txt
+rc=1
+ALERT: The filesystem has valuable metadata changes in a log which is being
+ignored because the -n option was used.  Expect spurious inconsistencies
+which may be resolved by first mounting the filesystem to replay the log.
+-- -n 은 rc=1, 경고만 하고 계속했다
+--   ALERT: ... is being ignored because the -n option was used.
+-- 그 뒤 결과는 믿을 수 없다(spurious)
+[root@ol7a ~]# xfs_repair /dev/sdb1 2>&1 | head -12; echo "rc=${PIPESTATUS[0]}"
+Phase 1 - find and verify superblock...
+Phase 2 - using internal log
+        - zero log...
+ERROR: The filesystem has valuable metadata changes in a log which needs to
+be replayed.  Mount the filesystem to replay the log, and unmount it before
+re-running xfs_repair.  If you are unable to mount the filesystem, then use
+the -L option to destroy the log and attempt a repair.
+Note that destroying the log may cause corruption -- please attempt a mount
+of the filesystem before doing this.
+rc=2
+-- 증상   : ERROR: The filesystem has valuable metadata changes in a log which needs to
+--          be replayed. 고치지 않고 rc=2
+-- 원인   : 강제 정지로 로그에 재생 안 된 변경이 남았다
+-- 조치   : 마운트로 로그를 재생하고 언마운트한 뒤 다시 친다
+--          마운트가 안 될 때만 -L
+-- 재확인 : 아래 repair -n rc=0
+-- 메시지 자체가 -L 전에 마운트를 시도하라고 한다
+
+-- 같은 상태의 사본을 sdc1 에 떠 둔다. 하나는 올바른 방법(마운트로 로그 재생),
+-- 하나는 -L 로 처리해 결과를 비교한다.
+[root@ol7a ~]# dd if=/dev/sdb1 of=/dev/sdc1 bs=4M 2>&1 | tail -1
+1073741824 bytes (1.1 GB) copied, 6.27476 s, 171 MB/s
+-- 두 길을 비교하려고 sdb1 을 sdc1 로 통째로 복사
+-- 1GiB, 약 6초
+-- 실습 디스크 안에서만 1GiB 를 썼다
+-- sdc1 은 sdb1 과 UUID 까지 같다
+
+-- 올바른 조치: 마운트하면 커널이 로그를 재생한다. 내렸다가 검사한다.
+[root@ol7a ~]# mount /dev/sdb1 /rep; dmesg | tail -3; ls /rep; ls /rep/after | wc -l
+[   54.289543] XFS (sdb1): Starting recovery (logdev: internal)
+[   54.290952] XFS (sdb1): Ending recovery (logdev: internal)
+[   54.290968] xfs filesystem being mounted at /rep supports timestamps until (%ptR?) (0x7fffffff)
+after
+before.txt
+dir1
+keep.txt
+20
+-- Starting recovery / Ending recovery
+--   마운트가 로그를 재생했다
+-- after 디렉터리와 파일 20개가 있다
+[root@ol7a ~]# umount /rep; xfs_repair -n /dev/sdb1 >/dev/null 2>&1; echo "repair -n rc=$?"
+repair -n rc=0
+-- 재생 뒤에는 깨끗하다
+-- 메시지가 시킨 순서 그대로였다
+-- 실무에서는 이 시점에 xfs_repair 를 다시 칠 필요도 없다
+--   마운트가 곧 복구다
+--   마운트 → 언마운트 → 검사
+-- 마운트가 되면 -L 은 필요 없다
+
+--------------------------------------------------------------------------------
+ [9] -L 이 버리는 것
+--------------------------------------------------------------------------------
+
+-- 사본 sdc1 에는 로그 재생을 하지 않고 -L 로 로그를 지운다.
+-- 마운트할 수 없는 상황(로그 자체가 깨진 경우)에서만 쓰는 최후 수단이다.
+[root@ol7a ~]# xfs_repair -L /dev/sdc1 2>&1 | grep -v -E '^\s+- '; echo "rc=${PIPESTATUS[0]}"
+Phase 1 - find and verify superblock...
+Phase 2 - using internal log
+ALERT: The filesystem has valuable metadata changes in a log which is being
+destroyed because the -L option was used.
+sb_fdblocks 251361, counted 259557
+Phase 3 - for each AG...
+Phase 4 - check for duplicate blocks...
+Phase 5 - rebuild AG headers and trees...
+Phase 6 - check inode connectivity...
+Phase 7 - verify and correct link counts...
+done
+rc=0
+-- ALERT: ... is being destroyed because the -L option was used.
+-- sb_fdblocks 를 다시 셌다
+-- rc=0. 성공으로 끝난다
+--   무엇을 잃었는지 알려 주지 않는다
+-- 로그의 변경을 버리고 나머지를 맞췄다
+-- 출력만으로는 손실 범위를 알 수 없다
+
+[root@ol7a ~]# mkdir -p /repL; mount -o nouuid /dev/sdc1 /repL; ls /repL; ls /repL/after 2>&1 | wc -l; ls /repL/lost+found 2>&1 | head
+before.txt
+dir1
+keep.txt
+1
+ls: cannot access /repL/lost+found: No such file or directory
+-- 같은 UUID 라 nouuid 로 붙였다(실습 01)
+-- after 디렉터리가 없다
+--   wc -l 의 1 은 ls 오류 메시지 한 줄
+-- lost+found 도 없다. 흔적 없이 사라졌다
+[root@ol7a ~]# mount /dev/sdb1 /rep; diff -r /rep /repL; echo "diff rc=$?"
+Only in /rep: after
+diff rc=1
+-- 차이: Only in /rep: after
+-- -L 쪽은 마지막 동기화 뒤의 mkdir 과
+--   파일 20개 생성을 잃었다
+-- before.txt 는 양쪽에 있다
+--   sleep 35 사이에 제자리에 반영됐다
+
+--------------------------------------------------------------------------------
+ [10] 조각 모음 — xfs_fsr
+--------------------------------------------------------------------------------
+
+-- 조각난 파일을 일부러 만든다. 두 파일에 4KB 씩 번갈아, 뒤에서부터 쓰고 매번 fsync 한다.
+[root@ol7a ~]# for i in $(seq 200 -1 1); do xfs_io -f -c "pwrite -q $((i*4))k 4k" -c fsync /rep/frag1; xfs_io -f -c "pwrite -q $((i*4))k 4k" -c fsync /rep/frag2; done; ls -l /rep/frag1
+-rw-------. 1 root root 823296 Nov 16 15:54 /rep/frag1
+-- 4KB 를 뒤에서부터 200번, 매번 fsync
+-- 크기 823296 = 201 x 4096
+--   0 번 블록은 쓰지 않아 구멍
+[root@ol7a ~]# xfs_bmap /rep/frag1 | wc -l; xfs_bmap -v /rep/frag1 | head -6
+202
+/rep/frag1:
+ EXT: FILE-OFFSET      BLOCK-RANGE      AG AG-OFFSET        TOTAL
+   0: [0..7]:          hole                                     8
+   1: [8..15]:         3520..3527        0 (3520..3527)         8
+   2: [16..23]:        3504..3511        0 (3504..3511)         8
+   3: [24..31]:        3488..3495        0 (3488..3495)         8
+-- xfs_bmap 줄 202 = 머리 1 + 구멍 1 + extent 200
+-- 열: EXT·FILE-OFFSET·BLOCK-RANGE·AG·AG-OFFSET·TOTAL
+--   단위는 512 바이트 블록
+-- 디스크 위치가 뒤로 갈수록 앞쪽 주소다
+[root@ol7a ~]# umount /repL; xfs_db -r -c frag /dev/sdb1
+actual 28, ideal 28, fragmentation factor 0.00%
+Note, this number is largely meaningless.
+Files on this filesystem average 1.00 extents per file
+-- frag 는 0.00%
+--   Note, this number is largely meaningless.
+-- 파일 시스템 숫자만 보면 놓친다
+
+-- xfs_fsr 은 파일을 임시 파일로 연속 할당해 복사한 뒤 extent 를 맞바꾼다.
+-- -v 는 진행을 보인다. 마운트된 채로 동작한다.
+[root@ol7a ~]# xfs_fsr -v /rep/frag1; xfs_bmap /rep/frag1 | wc -l; xfs_bmap -v /rep/frag1
+3
+/rep/frag1:
+ EXT: FILE-OFFSET      BLOCK-RANGE      AG AG-OFFSET        TOTAL
+   0: [0..7]:          hole                                     8
+   1: [8..1607]:       3536..5135        0 (3536..5135)      1600
+-- -v 출력이 없다. 대상 파일만 처리했다
+-- extent 200 → 1(구멍 빼고)
+-- 1600 블록 = 800KiB 연속 구간
+-- frag2 는 손대지 않아 그대로 조각나 있다
+-- 인자 없이 치면 마운트된 XFS 전체를 돈다
+
+--------------------------------------------------------------------------------
+ [변형] fsck.xfs 와 fsck -t xfs
+--------------------------------------------------------------------------------
+
+-- 검사를 다른 경로로 해 본다. /etc/fstab 의 여섯째 필드가 1·2 이면 부팅 때 fsck 가
+-- 불린다. XFS 에서 fsck 가 무엇을 하는지 직접 친다.
+[root@ol7a ~]# umount /rep; fsck /dev/sdb1; echo "rc=$?"; fsck.xfs -f /dev/sdb1 2>&1 | grep -v -E '^\s+- '; echo "rc=${PIPESTATUS[0]}"
+fsck from util-linux 2.23.2
+If you wish to check the consistency of an XFS filesystem or
+repair a damaged filesystem, see xfs_repair(8).
+rc=0
+-- fsck 는 fsck.xfs 를 불렀다
+--   안내 두 줄만 찍고 rc=0
+Phase 1 - find and verify superblock...
+Phase 2 - using internal log
+Phase 3 - for each AG...
+Phase 4 - check for duplicate blocks...
+Phase 5 - rebuild AG headers and trees...
+Phase 6 - check inode connectivity...
+Phase 7 - verify and correct link counts...
+done
+rc=0
+-- fsck.xfs -f 는 xfs_repair 를 실제로 돌렸다
+--   Phase 1~7, done
+-- -f 없는 fsck.xfs 는 검사하지 않는다
+
+[root@ol7a ~]# grep -E '^[^#].* xfs ' /etc/fstab
+/dev/mapper/ol-root     /                       xfs     defaults        0 0
+UUID=9e9b6650-ec84-4fa9-b7ec-e541592b4ecc /boot                   xfs     defaults        0 0
+-- 루트·/boot 둘 다 여섯째 칸 0
+--   부팅 때 fsck 를 하지 않는다
+
+--------------------------------------------------------------------------------
+ [11] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /rep /repL 2>/dev/null; wipefs -a /dev/sdb1 /dev/sdc1 >/dev/null; wipefs -a /dev/sdb /dev/sdc >/dev/null; rmdir /rep /repL; rm -f /root/rep.md5 /root/dir1.ino
+-- 두 디스크 모두 서명이 지워졌다
+[root@ol7a ~]# lsblk -f /dev/sdb /dev/sdc
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  상황               xfs_repair       결과
+--  마운트된 장치       거부 rc=1        -n 도 거부
+--  inode magic 0      rc=0             마운트 거부 → 복구, 손실 없음
+--  슈퍼블록 magic 0   rc=0             보조 SB 로 복구
+--  더러운 로그        거부 rc=2        마운트로 재생, 20개 유지
+--  더러운 로그 + -L   rc=0             after 20개 손실
+--  frag1 extent       -                200 → 1
+--
+--  항목       시작 전   실습 중          되돌린 뒤
+--  sdb·sdc    (없음)    GPT + xfs 1G     (없음)
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 0. -m crc=1(v5)로 만들어 [4] 를 되풀이한다
+--    확인: 마운트 거부 여부, dmesg 문구
+--    v5 는 inode 마다 체크섬이 있다
+
+-- 1. 파일 하나의 inode 에 core.mode 를 0 으로 써 넣고 xfs_repair -n 이 무엇이라고
+--    보고하는지 본다. 디렉터리 inode 와 결과가 어떻게 다른가.
+--    확인: lost+found 생성 여부, keep 할 파일 수
+-- 2. xfs_metadump 로 손상된 파일 시스템의 메타데이터만 떠서(xfs_mdrestore 로 이미지 복원)
+--    원본을 건드리지 않고 xfs_repair 를 연습한다.
+--    확인: 이미지 파일 크기와 xfs_repair -n 결과가 원본과 같은지
+-- 3. xfs_fsr 을 인자 없이 돌리면 마운트된 모든 XFS 를 대상으로 2시간 돈다.
+--    -t 60 으로 시간을 줄여 실행하고 /var/tmp/.fsrlast_xfs 를 확인한다.
+
+================================================================================
+ 실습 06 종료 — 손상은 xfs_repair 로 복구, 더러운 로그에 -L 을 쓰면 after 20개를 잃음
+================================================================================

@@ -1,0 +1,532 @@
+================================================================================
+ 제15장 실습 05 — sshd 구성 강화
+ 대상   : ol7b (서버 설정을 바꿈), ol7a (root, 클라이언트)
+ 목표   : PermitRootLogin·PasswordAuthentication·AllowUsers 를 바꿔 접속 결과가
+          어떻게 달라지는지 네 가지 조합으로 확인한다. 바꿀 때마다 sshd -t 로 문법을,
+          sshd -T 로 실제 적용값을 본다. sshd 를 다시 시작해도 이미 열린 세션은
+          유지된다는 것을 확인하고, 검증 없이 재시작해 sshd 가 못 뜬 상황을
+          직렬 콘솔로 복구한다
+ 배경   : sshd_config 는 같은 키워드가 여러 번 나오면 처음 값이 이긴다. 파일을 고쳐도
+          sshd 가 다시 읽기(reload·restart) 전에는 반영되지 않는다. OL7 의
+          sshd.service 는 KillMode=process 라 재시작해도 기존 세션 프로세스는 남는다.
+          그래서 원격 작업 중에는 세션 하나를 열어 둔 채 바꾸고 새 접속으로 확인한다
+          (본문 15.2)
+ 소요   : 약 40분
+ 선행   : ol7-base, ol7b-base 스냅샷 (⚠ 설정을 잘못 두면 원격 접속이 끊기므로 스냅샷 필수)
+ 계정   : root (두 노드), student (접속 대상)
+ 주의   : [10] 에서 ol7b 의 sshd 가 기동에 실패한다. 직렬 콘솔로 복구한다
+ 되돌림 : sshd_config 원본 복구 → diff, sshd -T, try 결과가 [2] 와 같음
+================================================================================
+
+-- 암호 입력은 SSH_ASKPASS 도우미가 대신한다. 결과 확인은 /usr/local/bin/try 하나로 한다.
+-- 이 랩을 돌리는 세션(ol7b 의 root 세션)은 끝까지 열린 채로 둔다.
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+[root@ol7b ~]# cp -p /etc/ssh/sshd_config /root/sshd_config.orig; grep -vE '^#|^$' /etc/ssh/sshd_config
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+-- HostKey 세 줄: 서버가 내밀 호스트 키. 01 에서 본 세 파일이다.
+-- 주석·빈 줄을 뺀 살아 있는 줄만.
+SyslogFacility AUTHPRIV
+-- AUTHPRIV 시설 → rsyslog 가 /var/log/secure 에 쓴다. 거부 이유를 찾는 곳.
+-- AuthorizedKeysFile 은 03 에서 다룸.
+AuthorizedKeysFile      .ssh/authorized_keys
+PasswordAuthentication yes
+-- 암호 인증이 주석 없이 yes 로 들어 있다. [4] 의 함정이 여기서 시작된다.
+-- ChallengeResponse 는 꺼져 있다.
+ChallengeResponseAuthentication no
+GSSAPIAuthentication yes
+GSSAPICleanupCredentials no
+-- GSSAPI 는 Kerberos 용. 랩에는 KDC 가 없어 시도만 하고 넘어간다.
+UsePAM yes
+X11Forwarding yes
+-- UsePAM yes: 계정 잠금·만료 같은 PAM 규칙을 SSH 에도 적용.
+-- X11Forwarding yes 는 7.9 배포 기본. [9] 에서 끈다.
+AcceptEnv LANG LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY LC_MESSAGES
+AcceptEnv LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE LC_MEASUREMENT
+AcceptEnv LC_IDENTIFICATION LC_ALL LANGUAGE
+AcceptEnv XMODIFIERS
+Subsystem       sftp    /usr/libexec/openssh/sftp-server
+-- AcceptEnv: 클라이언트의 언어 변수를 받아들인다. Subsystem sftp: sftp 요청을 받을 프로그램.
+-- PermitRootLogin 은 살아 있는 줄이 없다. 주석(#PermitRootLogin yes)만 있다.
+-- 살아 있는 줄은 모두 16줄.
+[root@ol7b ~]# sshd -T | grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|challengeresponseauthentication|allowusers|maxauthtries|logingracetime|x11forwarding|clientaliveinterval|usedns|banner) '
+logingracetime 120
+maxauthtries 6
+clientaliveinterval 0
+permitrootlogin yes
+pubkeyauthentication yes
+passwordauthentication yes
+challengeresponseauthentication no
+x11forwarding yes
+usedns yes
+banner none
+-- sshd -T 는 소문자 키워드로 최종값을 낸다. 파일에 없던 값도 컴파일 기본값으로 나온다.
+-- logingracetime 120초, maxauthtries 6, clientaliveinterval 0(끔), permitrootlogin yes.
+-- usedns yes 는 접속한 IP 를 이름으로 바꿔 로그에 적는다([7] 의 ol7a.example.com).
+-- 시작 전 원본은 /root/sshd_config.orig 로 남겼다. 끝에서 이 파일로 되돌린다.
+-- 볼 값: 위 여덟 줄과 banner none.
+
+--------------------------------------------------------------------------------
+ [1] 준비 — root 키를 ol7b 의 root·student 에 배포
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ssh-keygen -t ecdsa -N '' -f /root/.ssh/id_ecdsa -q; ssh-keyscan -t ecdsa ol7b 2>/dev/null > /root/.ssh/known_hosts
+[root@ol7a ~]# for u in root student; do SSH_ASKPASS=/usr/local/bin/ask DISPLAY=:0 ssh-copy-id $u@ol7b 2>&1 | grep Number; done
+Number of key(s) added: 1
+Number of key(s) added: 1
+-- root@ol7b, student@ol7b 두 계정에 같은 root@ol7a 의 키를 넣었다.
+-- 암호는 두 번 물었다(계정마다).
+-- 이제 ol7a 의 root 는 두 계정 모두 키로 들어간다.
+[root@ol7a ~]# cat /usr/local/bin/try
+#!/bin/bash
+# root·student 두 계정 × 공개 키·암호 두 방식으로 ol7b 에 접속해 본 결과를 한 줄씩
+for u in root student; do
+  for m in publickey password; do
+    r=$(SSH_ASKPASS=/usr/local/bin/ask DISPLAY=:0 timeout 20 ssh -o PreferredAuthentications=$m -o ConnectTimeout=5 $u@ol7b 'echo OK' 2>&1 | tail -1)
+    printf '%-8s %-10s %s\n' $u $m "$r"
+  done
+done
+-- try 는 PreferredAuthentications 로 방식을 하나만 쓰게 해서 네 조합을 따로 본다.
+-- tail -1 로 마지막 줄(OK 또는 오류 메시지)만 남긴다. timeout 20 은 걸림 방지.
+-- 열: 계정, 방식, 결과.
+
+--------------------------------------------------------------------------------
+ [2] 기본값에서의 접속 결과
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# try
+root     publickey  OK
+root     password   OK
+student  publickey  OK
+student  password   OK
+-- 기본값은 네 조합 모두 OK. root 암호 로그인도 열려 있다.
+-- 이 표가 바뀌는 모양으로 설정 하나하나의 효과를 본다.
+-- 기준 결과: 네 줄 OK.
+-- 이후 try 마다 바뀐 줄만 짚는다.
+
+--------------------------------------------------------------------------------
+ [3] root 는 키로만 — PermitRootLogin prohibit-password
+--------------------------------------------------------------------------------
+
+-- 7.4 의 값: yes(기본) / prohibit-password(=without-password) / forced-commands-only / no
+[root@ol7b ~]# sed -i 's/^#PermitRootLogin yes/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config; diff /root/sshd_config.orig /etc/ssh/sshd_config
+38c38
+< #PermitRootLogin yes
+---
+> PermitRootLogin prohibit-password
+-- 주석 줄을 고쳤다. 38번 줄. diff 의 38c38 은 38번 줄이 바뀌었다는 뜻.
+-- < 는 원본, > 는 새 파일.
+-- 파일만 고친 상태. sshd 는 아직 옛 설정으로 돈다.
+[root@ol7a ~]# try
+root     publickey  OK
+root     password   OK
+student  publickey  OK
+student  password   OK
+-- 파일을 고쳤지만 결과는 그대로. 실행 중인 sshd 는 아직 옛 설정이다.
+-- 즉시 반영되지 않는다.
+-- sshd -T 를 쳤다면 이미 새 값이 보였을 것이다(파일 기준).
+-- -t : 문법 검사(출력 없고 종료 코드 0 이면 통과). 그다음 reload 로 다시 읽게 한다.
+[root@ol7b ~]# sshd -t; echo rc=$?; systemctl reload sshd
+rc=0
+-- sshd -t 는 통과하면 아무 말도 없다. rc=0 이 유일한 신호.
+-- reload 는 sshd 에 HUP 을 보낸다(ExecReload, [6]). 출력이 없다.
+-- 이번 세션은 끊기지 않는다.
+[root@ol7a ~]# try
+root     publickey  OK
+root     password   Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password).
+-- root 암호만 막혔다. 서버가 받는 방식 목록에는 password 가 여전히 있다.
+-- 다른 계정은 암호를 써도 되기 때문이다. root 에게만 암호가 거부된다.
+-- 바뀐 줄: root password 하나.
+-- root 키 접속은 그대로 OK.
+student  publickey  OK
+student  password   OK
+[root@ol7b ~]# grep -E 'Failed password for root|Accepted' /var/log/secure | tail -2 | cut -c17-
+ol7b sshd[10286]: Accepted publickey for student from 172.16.225.61 port 37462 ssh2: ECDSA SHA256:EVF+V0TM+kb1lcYKW2nzR4QTlUh9GbPrSmZU5oXDZF0
+ol7b sshd[10300]: Accepted password for student from 172.16.225.61 port 37478 ssh2
+-- tail -2 에는 마지막 두 접속(student 키·암호)만 보였다. root 의 거부는 그 앞에 있다.
+-- PermitRootLogin 거부는 Failed password 로 기록된다(암호가 맞아도).
+-- 그래서 로그만 보면 암호 대입과 구분이 안 된다.
+
+--------------------------------------------------------------------------------
+ [4] 같은 키워드가 두 번 — 처음 값이 이긴다
+--------------------------------------------------------------------------------
+
+-- 흔한 실수: 기본 파일에 이미 PasswordAuthentication yes 가 있는데 끝에 no 를 덧붙인다.
+[root@ol7b ~]# grep -n '^PasswordAuthentication' /etc/ssh/sshd_config
+65:PasswordAuthentication yes
+-- 65번 줄에 살아 있는 yes 가 있다.
+-- -n: 줄 번호.
+[root@ol7b ~]# echo 'PasswordAuthentication no' >> /etc/ssh/sshd_config; grep -n '^PasswordAuthentication' /etc/ssh/sshd_config
+65:PasswordAuthentication yes
+140:PasswordAuthentication no
+-- 파일 끝(140번 줄)에 no 를 덧붙였다. 같은 키워드가 두 번.
+-- 셸 설정처럼 뒤가 이긴다고 생각하기 쉽다.
+[root@ol7b ~]# sshd -t; echo rc=$?; sshd -T | grep '^passwordauthentication'
+rc=0
+passwordauthentication yes
+-- 문법은 통과(rc=0), 적용값은 yes. 처음 나온 65번 줄이 이겼다.
+-- reload 했다면 암호 인증이 꺼진 줄 알고 넘어갔을 것이다. sshd -T 로만 잡힌다.
+-- 이 단계에서는 reload 하지 않았다.
+-- [OL8/9] OL8 이후는 sshd_config.d/*.conf 가 앞에서 include 되어 그쪽 값이 이긴다.
+
+--------------------------------------------------------------------------------
+ [5] 암호 인증 끄기 — PasswordAuthentication no
+--------------------------------------------------------------------------------
+
+-- 덧붙인 줄을 지우고, 원래 줄을 고친다.
+[root@ol7b ~]# sed -i '$d' /etc/ssh/sshd_config; sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+[root@ol7b ~]# diff /root/sshd_config.orig /etc/ssh/sshd_config; sshd -t && systemctl reload sshd; sshd -T | grep -E '^(passwordauthentication|permitrootlogin) '
+38c38
+< #PermitRootLogin yes
+---
+> PermitRootLogin prohibit-password
+65c65
+< PasswordAuthentication yes
+---
+> PasswordAuthentication no
+-- '$d' 로 덧붙인 마지막 줄을 지우고, 65번 줄을 sed 로 고쳤다. diff 는 두 곳만.
+-- 원래 줄을 고치는 것이 올바른 방법.
+permitrootlogin without-password
+-- 7.4 는 prohibit-password 를 옛 이름 without-password 로 출력한다. 같은 값이다.
+-- 둘 다 적용됐다.
+passwordauthentication no
+[root@ol7a ~]# try
+root     publickey  OK
+root     password   Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+student  publickey  OK
+student  password   Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+-- 암호 두 줄 모두 거부. 방식 목록 끝의 password 가 사라졌다.
+-- 키 두 줄은 OK. 키를 먼저 배포했기 때문에 끌 수 있었다.
+-- 바뀐 줄: student password.
+-- 이제 이 서버는 키로만 들어온다.
+-- 서버가 제시하는 인증 방식 목록에서 password 가 빠졌다.
+[root@ol7a ~]# ssh -v -o BatchMode=yes -o PubkeyAuthentication=no student@ol7b true 2>&1 | grep -E 'Authentications that can continue|Permission denied'
+debug1: Authentications that can continue: publickey,gssapi-keyex,gssapi-with-mic
+Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+-- 서버가 처음 알려 주는 목록부터 password 가 빠졌다. 클라이언트는 암호를 묻지도 않는다.
+-- [3] 의 목록과 비교하면 끝의 ,password 가 없다.
+
+--------------------------------------------------------------------------------
+ [6] 재시작해도 기존 세션은 남는다
+--------------------------------------------------------------------------------
+
+-- 지금 ol7b 의 sshd 프로세스: 리스너(-D) 하나와 세션마다 하나씩
+[root@ol7b ~]# ps -o pid,ppid,etime,args -C sshd
+  PID  PPID     ELAPSED COMMAND
+ 1352     1       00:19 /usr/sbin/sshd -D
+ 4837  1352       00:13 sshd: root@notty
+-- PID 1352 가 리스너(-D, 부모는 systemd). 4837 이 이 랩을 돌리는 root 세션(notty).
+-- 세션 프로세스의 부모(PPID)가 리스너다.
+-- ELAPSED 는 시작 뒤 경과 시간.
+[root@ol7b ~]# systemctl show sshd -p KillMode -p Restart -p RestartUSec -p ExecReload
+Restart=on-failure
+RestartUSec=42s
+ExecReload={ path=/bin/kill ; argv[]=/bin/kill -HUP $MAINPID ; ignore_errors=no ; start_time=[Mon 2026-11-16 12:50:18 KST] ; stop_time=[Mon 2026-11-16 12:50:18 KST] ; pid=10434 ; code=exited ; status=0 }
+KillMode=process
+-- KillMode=process: 멈출 때 주 프로세스(리스너)만 죽인다. 세션 프로세스는 남는다.
+-- Restart=on-failure, 42초: 비정상 종료하면 42초 뒤 다시 띄운다([10] 에서 보인다).
+-- ExecReload 는 kill -HUP $MAINPID. [3]·[5] 의 reload 기록이 status=0 으로 남았다.
+-- 볼 값: KillMode, Restart, RestartUSec.
+[root@ol7b ~]# systemctl restart sshd; ps -o pid,ppid,etime,args -C sshd
+  PID  PPID     ELAPSED COMMAND
+ 4837     1       00:13 sshd: root@notty
+10532     1       00:00 /usr/sbin/sshd -D
+-- 리스너는 새 PID 10532(경과 00:00). 세션 4837 은 그대로이고 부모가 1(systemd)로 바뀌었다.
+-- 옛 리스너가 죽어 고아가 되었기 때문이다. 세션은 끊기지 않았다.
+-- restart 는 출력이 없다.
+-- 이 명령이 실행된다는 것 자체가 기존 세션이 살아 있다는 증거다.
+[root@ol7b ~]# echo "still here: $(date +%T)"
+still here: 12:50:20
+-- 같은 세션으로 다음 명령이 돈다. 세션이 옛 설정으로 살아 있다는 것은 새 설정의 증거가 아니다.
+
+--------------------------------------------------------------------------------
+ [7] 접속 계정 제한 — AllowUsers
+--------------------------------------------------------------------------------
+
+-- 공백으로 여러 명. user@host 형식으로 출발지도 제한할 수 있다.
+[root@ol7b ~]# echo 'AllowUsers student' >> /etc/ssh/sshd_config; sshd -t && systemctl reload sshd; sshd -T | grep -E '^allowusers'
+allowusers student
+-- AllowUsers 는 기본 파일에 없어서 덧붙여도 된다. 적용값 확인.
+-- 목록에 없는 계정은 모두 거부.
+[root@ol7a ~]# try
+root     publickey  Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+root     password   Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+student  publickey  OK
+student  password   Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+-- root 는 키까지 막혔다. student 키만 OK. 암호는 [5] 부터 꺼져 있다.
+-- 바뀐 줄: root publickey.
+[root@ol7b ~]# grep 'not allowed' /var/log/secure | tail -1 | cut -c17-
+ol7b sshd[10647]: User root from ol7a.example.com not allowed because not listed in AllowUsers
+-- 이유가 명확히 남는다. 출발지는 IP 대신 이름(UseDNS yes 의 역할).
+-- 이 거부는 키 검증보다 먼저 일어난다. 키가 맞는지 보지도 않는다.
+-- 클라이언트에는 이유가 안 보인다.
+
+--------------------------------------------------------------------------------
+ [8] 오류 ② — AllowUsers 에서 자기 계정을 빼 버림
+--------------------------------------------------------------------------------
+
+-- 관리자는 student 로 들어와 sudo 를 쓰는 운영 규칙이라고 하자. oracle 만 허용하도록
+-- 바꾸면서 student 를 빠뜨린다. sshd -t 는 문법만 보므로 통과한다.
+[root@ol7b ~]# sed -i 's/^AllowUsers student/AllowUsers oracle/' /etc/ssh/sshd_config; sshd -t; echo rc=$?; systemctl reload sshd
+rc=0
+-- sshd -t 는 rc=0. oracle 이 이 서버에 없다는 것도, student 가 빠졌다는 것도 모른다.
+-- 문법만 본다.
+-- 계정 존재 여부는 모른다.
+[root@ol7a ~]# try
+root     publickey  Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+root     password   Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+student  publickey  Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+student  password   Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+-- 네 줄 모두 거부. 관리자 계정 student 도 새 접속으로는 못 들어온다.
+-- 이 root 세션만 살아 있다.
+[root@ol7b ~]# grep 'not allowed' /var/log/secure | tail -2 | cut -c17-
+ol7b sshd[10713]: User student from ol7a.example.com not allowed because not listed in AllowUsers
+ol7b sshd[10715]: User student from ol7a.example.com not allowed because not listed in AllowUsers
+
+-- 증상   : try 네 줄 모두 "Permission denied". secure "User student ... not listed in AllowUsers"
+-- 원인   : AllowUsers 를 oracle 로 바꾸며 관리자 계정 student 를 뺌. sshd -t 는 rc=0 으로 통과
+-- 조치   : 열어 둔 root 세션에서 AllowUsers student oracle 로 고치고 sshd -t, reload
+-- 재확인 : 새 접속 try 에서 student publickey OK (아래)
+-- 열어 둔 세션(이 root 세션)에서 바로 고친다. 이 세션까지 닫았다면 콘솔로 가야 한다.
+[root@ol7b ~]# sed -i 's/^AllowUsers oracle/AllowUsers student oracle/' /etc/ssh/sshd_config; sshd -t && systemctl reload sshd; sshd -T | grep '^allowusers'
+allowusers student
+allowusers oracle
+-- 적용값이 두 줄로 나온다. sshd -T 는 목록 값을 한 줄에 하나씩 찍는다.
+-- 고친 것도 이 세션에서 했다.
+[root@ol7a ~]# try
+root     publickey  Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+root     password   Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+student  publickey  OK
+student  password   Permission denied (publickey,gssapi-keyex,gssapi-with-mic).
+-- [7] 과 같은 결과로 돌아왔다. 이것을 새 접속으로 확인한 뒤에야 세션을 닫는다.
+
+--------------------------------------------------------------------------------
+ [9] 그 밖의 권장 설정
+--------------------------------------------------------------------------------
+
+-- 실습에서 계속 쓰려면 AllowUsers 는 뺀다. 나머지는 운영 서버에서 흔히 쓰는 값.
+[root@ol7b ~]# sed -i '/^AllowUsers/d' /etc/ssh/sshd_config; grep -c AllowUsers /etc/ssh/sshd_config
+0
+-- AllowUsers 줄을 모두 지웠다(0개).
+-- 이후 단계는 계정 제한 없이 진행.
+[root@ol7b ~]# cat >> /etc/ssh/sshd_config <<'EOF'
+MaxAuthTries 3
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+Banner /etc/issue.net
+EOF
+-- 다섯 키워드 모두 기본 파일에 살아 있는 줄이 없어서 덧붙여도 적용된다.
+-- X11Forwarding 은 살아 있는 줄이라 sed 로 고쳤다.
+[root@ol7b ~]# sed -i 's/^X11Forwarding yes/X11Forwarding no/' /etc/ssh/sshd_config; sshd -t && systemctl reload sshd
+[root@ol7b ~]# sshd -T | grep -E '^(maxauthtries|logingracetime|clientaliveinterval|clientalivecountmax|x11forwarding|banner|allowusers) '
+logingracetime 30
+maxauthtries 3
+clientaliveinterval 300
+clientalivecountmax 2
+x11forwarding no
+banner /etc/issue.net
+-- 인증 3회, 대기 30초, 300초마다 생존 확인 2회 무응답이면 끊음, X11 끔, 배너.
+-- allowusers 줄이 없다. 지운 것이 반영됐다.
+-- 모두 [0] 과 다른 값이다.
+[root@ol7b ~]# cat /etc/issue.net
+\S
+Kernel \r on an \m
+-- /etc/issue.net 의 \S·\r·\m 은 agetty 가 콘솔에서 바꿔 주는 이스케이프다.
+-- Banner 는 인증 전에 보내진다. 클라이언트는 stderr 로 출력한다.
+[root@ol7a ~]# ssh -o BatchMode=yes student@ol7b hostname
+\S
+Kernel \r on an \m
+ol7b.example.com
+-- sshd 는 이스케이프를 풀지 않고 그대로 보낸다. 배너 파일은 따로 평문으로 만든다.
+-- 배너는 stderr 로 나온다. 스크립트가 stdout 만 읽으면 영향이 없다.
+-- 법적 고지 문구를 넣는 자리.
+
+--------------------------------------------------------------------------------
+ [10] 오류 ① — sshd -t 없이 재시작
+--------------------------------------------------------------------------------
+
+-- 오타 하나를 넣고 바로 restart 한다.
+[root@ol7b ~]# sed -i 's/^MaxAuthTries 3/MaxAuthTry 3/' /etc/ssh/sshd_config; systemctl restart sshd; echo rc=$?
+Job for sshd.service failed because the control process exited with error code. See "systemctl status sshd.service" and "journalctl -xe" for details.
+-- sshd -t 를 건너뛰고 restart. 리스너가 내려간 뒤 새 리스너가 설정 오류로 못 떴다.
+-- rc=1.
+-- 22번 포트가 닫혔다.
+rc=1
+[root@ol7b ~]# systemctl status sshd --no-pager -l | head -12
+● sshd.service - OpenSSH server daemon
+   Loaded: loaded (/usr/lib/systemd/system/sshd.service; enabled; vendor preset: enabled)
+   Active: activating (auto-restart) (Result: exit-code) since Mon 2026-11-16 12:50:22 KST; 60ms ago
+-- auto-restart: Restart=on-failure 로 42초 뒤 다시 띄우려고 기다리는 중.
+-- 설정 파일이 그대로면 몇 번을 다시 띄워도 같은 자리에서 실패한다.
+     Docs: man:sshd(8)
+           man:sshd_config(5)
+  Process: 10840 ExecReload=/bin/kill -HUP $MAINPID (code=exited, status=0/SUCCESS)
+  Process: 10915 ExecStart=/usr/sbin/sshd -D $OPTIONS (code=exited, status=255)
+ Main PID: 10915 (code=exited, status=255)
+-- ExecStart 가 status=255 로 끝났다. 이유는 여기에 없다.
+-- head -12 로 잘랐다.
+
+Nov 16 12:50:22 ol7b.example.com systemd[1]: sshd.service: main process exited, code=exited, status=255/n/a
+Nov 16 12:50:22 ol7b.example.com systemd[1]: Failed to start OpenSSH server daemon.
+Nov 16 12:50:22 ol7b.example.com systemd[1]: Unit sshd.service entered failed state.
+[root@ol7b ~]# journalctl -u sshd --no-pager -n 4 -o cat
+sshd.service: main process exited, code=exited, status=255/n/a
+Failed to start OpenSSH server daemon.
+Unit sshd.service entered failed state.
+sshd.service failed.
+-- journalctl -u sshd 에도 systemd 의 말만 있다. 어느 줄이 틀렸는지는 나오지 않는다.
+-- 이유를 보려면 sshd -t 를 직접 쳐야 한다([11]).
+-- 이 root 세션은 여전히 살아 있다.
+[root@ol7a ~]# ssh -o BatchMode=yes -o ConnectTimeout=5 student@ol7b hostname; echo rc=$?
+ssh: connect to host ol7b port 22: Connection refused
+-- 22번을 듣는 프로세스가 없다. 인증까지 가지도 못하는 TCP 단계 실패.
+
+-- 증상   : restart "Job for sshd.service failed", 새 접속 "Connection refused" rc=255
+-- 원인   : MaxAuthTries 를 MaxAuthTry 로 잘못 씀. sshd 가 설정을 못 읽고 종료(status=255)
+-- 조치   : 콘솔에서 sshd -t 로 줄을 찾고(line 140) 고친 뒤 sshd -t && systemctl restart sshd
+-- 재확인 : systemctl is-active sshd → active, ol7a 에서 접속 rc=0
+rc=255
+-- 이 root 세션은 아직 살아 있지만, 이 세션까지 없다고 보고 직렬 콘솔로 복구한다.
+
+--------------------------------------------------------------------------------
+ [11] 직렬 콘솔로 복구
+--------------------------------------------------------------------------------
+
+-- VMware 의 직렬 포트(가상 콘솔)에 붙는다. 실제 서버라면 iLO·iDRAC 원격 콘솔이 이 자리다.
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7b login: 
+-- 직렬 콘솔에 Enter 를 보내자 getty 의 로그인 화면이 나왔다. 랩 콘솔 캡처용 설정(ttyS0).
+-- 네트워크와 무관한 길이다.
+root
+
+Password: 
+
+Last failed login: Mon Nov 16 12:50:16 KST 2026 from ol7a.example.com on ssh:notty
+There were 3 failed login attempts since the last successful login.
+-- 암호는 화면에 찍히지 않는다. 3회 실패는 앞 단계 try 의 root 접속 시도가 남긴 기록.
+[root@ol7b ~]# 
+sshd -t
+/etc/ssh/sshd_config: line 140: Bad configuration option: MaxAuthTry
+
+/etc/ssh/sshd_config: terminating, 1 bad configuration options
+-- 줄 번호(140)와 틀린 키워드(MaxAuthTry)를 정확히 알려 준다. journal 에 없던 정보.
+-- 그다음 sed 로 고쳤다.
+
+[root@ol7b ~]# 
+sed -i 's/^MaxAuthTry 3/MaxAuthTries 3/' /etc/ssh/sshd_config
+[root@ol7b ~]# 
+sshd -t && systemctl restart sshd; systemctl is-active sshd
+active
+-- 고친 뒤 검사 통과 → restart → active.
+-- 42초 재시도를 기다리지 않았다.
+[root@ol7b ~]# 
+exit
+logout
+-- 콘솔 세션을 닫았다. 콘솔 로그인 화면으로 돌아간다.
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7b login: 
+[root@ol7a ~]# ssh -o BatchMode=yes student@ol7b hostname; echo rc=$?
+\S
+Kernel \r on an \m
+ol7b.example.com
+rc=0
+-- 네트워크 접속이 돌아왔다. 배너는 아직 켜져 있다.
+
+--------------------------------------------------------------------------------
+ [변형] Match 블록 — 출발지에 따라 다른 설정
+--------------------------------------------------------------------------------
+
+-- 내부망(172.16.225.0/24)에서는 암호 인증을 허용하고 나머지는 키만. Match 는 파일 끝에 둔다.
+[root@ol7b ~]# printf 'Match Address 172.16.225.0/24\n    PasswordAuthentication yes\n' >> /etc/ssh/sshd_config; sshd -t && systemctl reload sshd; tail -3 /etc/ssh/sshd_config
+Banner /etc/issue.net
+Match Address 172.16.225.0/24
+    PasswordAuthentication yes
+-- Match 는 파일 끝, 조건 아래 줄은 들여 써서 구분한다(들여쓰기는 문법이 아니라 관례).
+-- -C : 가상의 접속 조건(user, host, addr)으로 sshd -T 를 계산해 본다.
+[root@ol7b ~]# sshd -T -C user=student,host=ol7a,addr=172.16.225.61 | grep '^passwordauthentication'
+passwordauthentication yes
+-- 내부망 주소로 가정하면 암호 인증 yes.
+-- 전역값은 [5] 의 no.
+[root@ol7b ~]# sshd -T -C user=student,host=x,addr=10.1.1.5 | grep '^passwordauthentication'
+passwordauthentication no
+-- 바깥 주소로 가정하면 전역값 no. 접속하지 않고 Match 효과를 미리 계산했다.
+-- -C 에는 user·host·addr 세 값을 모두 준다. 하나라도 빠지면 오류가 난다.
+[root@ol7a ~]# try
+root     publickey  OK
+root     password   Authentication failed.
+-- root 암호: PermitRootLogin 은 prohibit-password 그대로라 거부.
+-- 메시지가 다르다. MaxAuthTries 3 을 넘겨 서버가 끊었다(시도 세 번 × 실패).
+student  publickey  OK
+student  password   OK
+-- student 암호는 내부망 Match 덕분에 OK. 출발지 172.16.225.61 이 조건에 맞았다.
+-- 키 두 줄은 그대로 OK.
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+[root@ol7b ~]# cp -p /root/sshd_config.orig /etc/ssh/sshd_config; sshd -t && systemctl restart sshd; diff /root/sshd_config.orig /etc/ssh/sshd_config && echo same
+same
+-- 원본을 덮고 restart. diff 결과 같음.
+[root@ol7b ~]# sshd -T | grep -E '^(permitrootlogin|passwordauthentication|maxauthtries|x11forwarding) '
+maxauthtries 6
+permitrootlogin yes
+passwordauthentication yes
+x11forwarding yes
+-- 적용값이 [0] 과 같다.
+-- 리스너도 새로 떴다.
+[root@ol7a ~]# try
+root     publickey  OK
+root     password   OK
+student  publickey  OK
+student  password   OK
+-- 네 조합 모두 OK. [2] 와 같다.
+[root@ol7a ~]# rm -rf /root/.ssh /usr/local/bin/try; ssh -o BatchMode=yes student@ol7b true; echo rc=$?
+Host key verification failed.
+-- ol7a 의 /root/.ssh 를 지워 known_hosts 도 없다. 기준 상태(root 의 ~/.ssh 없음)와 같다.
+
+--  항목                     시작 전     [3]        [5]        [7]        [8]        되돌린 뒤
+--  root   publickey         OK          OK         OK         거부       거부       OK
+--  root   password          OK          거부       거부       거부       거부       OK
+--  student publickey        OK          OK         OK         OK         거부       OK
+--  student password         OK          OK         거부       거부       거부       OK
+--
+--  설정                     시작 전     변경                      되돌린 뒤
+--  permitrootlogin          yes         without-password          yes
+--  passwordauthentication   yes         no (덧붙이면 yes 그대로)  yes
+--  allowusers               없음        student / oracle          없음
+--  maxauthtries             6           3                         6
+--  x11forwarding            yes         no                        yes
+--  sshd 리스너 PID          1352        10532 (세션 4837 유지)    -
+--
+-- 바꾸면 sshd -t, reload, 새 접속으로 확인. 열어 둔 세션은 확인이 끝난 뒤 닫는다.
+rc=255
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. AllowGroups wheel 을 넣고 student(wheel)와 root 의 접속 결과를 try 로 비교한다.
+--    확인: secure 의 "not listed in AllowGroups"
+-- 2. DenyUsers student 와 AllowUsers student 를 함께 넣으면 어느 쪽이 이기는지 본다.
+--    확인: sshd -T 와 try, 그리고 man sshd_config 의 처리 순서
+-- 3. ClientAliveInterval 10, ClientAliveCountMax 1 로 두고 ol7a 쪽 방화벽으로 응답을 막으면
+--    몇 초 뒤 세션이 끊기는지 잰다. 확인: secure 의 Timeout 줄
+
+================================================================================
+ 실습 05 종료
+================================================================================

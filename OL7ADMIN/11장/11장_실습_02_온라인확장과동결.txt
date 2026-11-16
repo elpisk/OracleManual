@@ -1,0 +1,462 @@
+================================================================================
+ 제11장 실습 02 — 온라인 확장과 동결
+ 대상   : ol7a
+ 목표   : LVM 위의 XFS 를 마운트한 채로 xfs_growfs 로 늘리고, 늘어난 공간이
+          새 할당 그룹(AG)으로 붙는 모습을 xfs_info 로 확인한다. xfs_freeze 로
+          쓰기를 멈췄을 때 프로세스가 어떤 상태로 기다리는지 관찰한다
+ 배경   : xfs_growfs 는 마운트된 XFS 만 늘린다. 아래 장치(LV·파티션)를 먼저
+          키우고, 그다음 파일 시스템을 키우는 두 단계다. 줄이는 명령은 없다.
+          xfs_freeze -f 는 새 쓰기를 막고 더러운 데이터를 디스크로 내려
+          일관된 시점을 만든다. 하드웨어 스냅샷 직전에 쓴다 (본문 11.4·11.5)
+ 소요   : 약 25분
+ 선행   : storage-clean 스냅샷. LVM 개념은 10장
+ 계정   : root
+ 주의   : 루트 파일 시스템(/)에는 xfs_freeze 를 걸지 않는다. 셸까지 멈춘다.
+          sda(VG ol)는 건드리지 않는다
+ 되돌림 : 마운트 해제, VG·PV 제거, wipefs. lsblk -f /dev/sd[bc] 가 비어 있으면 끝
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 쓸 디스크는 sdb·sdc 두 개다. 비어 있는지, LVM 에 이미 잡혀 있지 않은지 본다.
+[root@ol7a ~]# lsblk -f /dev/sdb /dev/sdc; pvs; vgs
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+  PV         VG Fmt  Attr PSize   PFree
+  /dev/sda2  ol lvm2 a--  <39.00g 4.00m
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+-- sdb·sdc 는 비어 있다
+-- PV 는 sda2 하나, VG 는 ol 하나뿐이다
+--   PFree 4.00m: OS VG 에는 남은 공간이 거의 없다
+-- 이 실습의 VG 는 sdb·sdc 로 새로 만든다
+
+--------------------------------------------------------------------------------
+ [1] 작은 LV 에 XFS 만들기
+--------------------------------------------------------------------------------
+
+-- PV → VG → LV 순서. 처음에는 2G 로 작게 만든다.
+--   pvcreate  디스크를 LVM 물리 볼륨으로 표시
+--   vgcreate  볼륨 그룹 vgdata 를 sdb 하나로
+--   lvcreate  -L 2G 크기, -n 이름
+[root@ol7a ~]# pvcreate /dev/sdb; vgcreate vgdata /dev/sdb; lvcreate -L 2G -n lvxfs vgdata
+  Physical volume "/dev/sdb" successfully created.
+  Volume group "vgdata" successfully created
+  Logical volume "lvxfs" created.
+-- 세 줄이 세 명령에 하나씩 대응한다
+[root@ol7a ~]# mkfs.xfs /dev/vgdata/lvxfs
+meta-data=/dev/vgdata/lvxfs      isize=256    agcount=4, agsize=131072 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=0        finobt=0, sparse=0, rmapbt=0
+         =                       reflink=0
+data     =                       bsize=4096   blocks=524288, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=2560, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+-- 2G 라도 AG 는 4개다
+--   agsize 131072 블록 = 512MiB
+--   blocks 524288 = 4 x 131072
+-- 저널은 10G 때와 같은 2560 블록
+-- crc=0: 이 시스템의 기본 v4 형식
+
+-- 마운트하고 데이터를 조금 넣는다. 확장 뒤에도 그대로인지 확인할 표본이다.
+[root@ol7a ~]# mkdir -p /data; mount /dev/vgdata/lvxfs /data; cp -a /etc /data/; du -sh /data/etc; find /data/etc -type f | wc -l
+50M     /data/etc
+1847
+-- /etc 를 복사해 50M, 파일 1847 개
+[root@ol7a ~]# md5sum /data/etc/passwd /data/etc/services | tee /root/before.md5
+16c6a5c51b5adea05819726ff2351e3c  /data/etc/passwd
+8e0abe8547f0411554a35b97447b2fbd  /data/etc/services
+-- 두 파일의 md5 를 남겼다. [7] 에서 다시 대조한다
+
+--------------------------------------------------------------------------------
+ [2] LV 만 늘리기 — 파일 시스템은 그대로
+--------------------------------------------------------------------------------
+
+-- lvextend 는 블록 장치만 늘린다. -r 을 주지 않으면 파일 시스템은 모른다.
+[root@ol7a ~]# lvextend -L +3G /dev/vgdata/lvxfs
+  Size of logical volume vgdata/lvxfs changed from 2.00 GiB (512 extents) to 5.00 GiB (1280 extents).
+  Logical volume vgdata/lvxfs successfully resized.
+-- 512 extents → 1280 extents
+--   PE 4MiB x 1280 = 5GiB
+[root@ol7a ~]# lsblk /dev/vgdata/lvxfs; df -h /data
+NAME         MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+vgdata-lvxfs 252:2    0   5G  0 lvm  /data
+Filesystem                Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvxfs  2.0G  119M  1.9G   6% /data
+-- lsblk 는 5G, df 는 2.0G
+-- 장치만 커지고 파일 시스템은 그대로다
+-- 이 차이가 확장 작업의 두 단계를 보여 준다
+
+--------------------------------------------------------------------------------
+ [3] xfs_growfs 에 장치 이름을 준다, 언마운트 상태에서 친다 — 오류 ①
+--------------------------------------------------------------------------------
+
+-- 확장 전 기하 구조를 파일로 남겨 두고 diff 로 비교한다.
+[root@ol7a ~]# xfs_info /data > /root/info.before; head -1 /root/info.before
+meta-data=/dev/mapper/vgdata-lvxfs isize=256    agcount=4, agsize=131072 blks
+-- 확장 전 첫 줄. agcount=4
+
+-- 다른 파일 시스템 도구(resize2fs)는 장치 이름을 받는다. 같은 습관으로 친다.
+[root@ol7a ~]# xfs_growfs /dev/vgdata/lvxfs | tail -1; echo "rc=${PIPESTATUS[0]}"
+data blocks changed from 524288 to 1310720
+rc=0
+-- 장치 이름을 줬는데 성공했다
+--   data blocks changed from 524288 to 1310720
+-- xfsprogs 5.4 는 장치 이름을 받아
+--   그 장치의 마운트 지점을 찾아 늘린다
+-- 7.9 의 표준 xfsprogs 4.5 는 장치 이름이면 실패한다
+--   다른 OL7 서버에서는 마운트 지점을 쓰는 편이 안전하다
+[root@ol7a ~]# xfs_info /data > /root/info.after; diff /root/info.before /root/info.after
+1c1
+< meta-data=/dev/mapper/vgdata-lvxfs isize=256    agcount=4, agsize=131072 blks
+---
+> meta-data=/dev/mapper/vgdata-lvxfs isize=256    agcount=10, agsize=131072 blks
+5c5
+< data     =                       bsize=4096   blocks=524288, imaxpct=25
+---
+> data     =                       bsize=4096   blocks=1310720, imaxpct=25
+-- diff 는 두 줄만 바뀌었다
+--   1행 agcount 4 → 10
+--   5행 blocks 524288 → 1310720
+-- agsize 131072 는 그대로다
+--   늘어난 3GiB 가 512MiB AG 6개로 붙었다
+-- bsize·isize·log 줄은 diff 에 없다. 바뀌지 않았다
+
+-- 언마운트 상태에서 xfs_growfs 를 치면 어떻게 되는지도 본다.
+[root@ol7a ~]# umount /data; xfs_growfs /dev/vgdata/lvxfs; echo "rc=$?"; xfs_growfs /data; echo "rc=$?"
+xfs_growfs: /dev/vgdata/lvxfs is not a mounted XFS filesystem
+rc=1
+xfs_growfs: /data is not a mounted XFS filesystem
+rc=1
+-- 증상   : xfs_growfs: /dev/vgdata/lvxfs is not a mounted XFS filesystem
+-- 원인   : 언마운트 상태다. xfs_growfs 는 마운트된 XFS 만 늘린다
+--          마운트 지점 /data 를 줘도 같은 메시지다
+-- 조치   : 먼저 마운트하고 마운트 지점(또는 장치)으로 친다
+-- 재확인 : [4] 의 data blocks changed 줄과 df 의 Size
+-- 언마운트해야 하는 Ext4 축소와 반대다
+
+[root@ol7a ~]# mount /dev/vgdata/lvxfs /data
+-- 다시 마운트했다. 출력이 없으면 성공
+
+--------------------------------------------------------------------------------
+ [4] 마운트 지점으로 xfs_growfs
+--------------------------------------------------------------------------------
+
+-- LV 를 512M 더 늘리고 이번에는 문서대로 마운트 지점을 준다.
+-- 인자 없이(-d 생략) 치면 장치 끝까지 데이터 영역을 늘린다.
+[root@ol7a ~]# lvextend -q -L +512M /dev/vgdata/lvxfs; xfs_growfs /data | tail -1; echo "rc=${PIPESTATUS[0]}"; df -h /data
+  Size of logical volume vgdata/lvxfs changed from 5.00 GiB (1280 extents) to 5.50 GiB (1408 extents).
+  Logical volume vgdata/lvxfs successfully resized.
+data blocks changed from 1310720 to 1441792
+rc=0
+Filesystem                Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvxfs  5.5G   83M  5.5G   2% /data
+-- 1280 → 1408 extents (+512MiB)
+-- 1310720 → 1441792 블록 (+131072 = AG 한 개)
+-- df 5.5G. 마운트 지점을 준 문서 방식이다
+-- 인자 없이 치면 장치 끝까지 늘린다
+
+--------------------------------------------------------------------------------
+ [5] 크기를 정해 늘리기 — -D
+--------------------------------------------------------------------------------
+
+-- -D 는 블록 단위 목표 크기다(단위 없음, 블록 크기 4096 기준).
+-- LV 를 6.5G 로 먼저 늘리고 파일 시스템은 6G 까지만 늘린다.
+-- 6G = 6 * 1024 * 1024 * 1024 / 4096 = 1572864 블록
+[root@ol7a ~]# lvextend -q -L 6.5G /dev/vgdata/lvxfs; xfs_growfs -D 1572864 /data | tail -1; df -h /data
+  Size of logical volume vgdata/lvxfs changed from 5.50 GiB (1408 extents) to 6.50 GiB (1664 extents).
+  Logical volume vgdata/lvxfs successfully resized.
+data blocks changed from 1441792 to 1572864
+Filesystem                Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvxfs  6.0G   83M  6.0G   2% /data
+-- LV 6.5G, 파일 시스템 6.0G
+--   -D 1572864 까지만 늘렸다
+--   LV 뒤쪽 0.5G 는 아직 비어 있다
+
+-- 지금보다 작은 값을 주면 줄어드는가.
+[root@ol7a ~]# xfs_growfs -D 1048576 /data | head -1; echo "rc=${PIPESTATUS[0]}"
+data size 1048576 too small, old size is 1572864
+meta-data=/dev/mapper/vgdata-lvxfs isize=256    agcount=12, agsize=131072 blks
+rc=1
+-- 지금보다 작은 -D 는 거부한다
+--   data size 1048576 too small, old size is 1572864
+-- 거부 뒤에도 현재 기하를 출력한다. head -1 로 한 줄만 남겼다
+--   agcount=12: 6G / 512MiB
+-- -D 로도 줄일 수 없다
+
+--------------------------------------------------------------------------------
+ [6] lvextend -r — 두 단계를 한 번에
+--------------------------------------------------------------------------------
+
+-- -r(--resizefs)은 LV 를 늘린 뒤 fsadm 을 불러 파일 시스템까지 늘린다.
+-- XFS 이면 fsadm 이 내부에서 xfs_growfs 를 부른다. 남은 0.5G 와 VG 의 빈 공간까지 쓴다.
+[root@ol7a ~]# vgs vgdata; lvextend -r -l +100%FREE /dev/vgdata/lvxfs
+  VG     #PV #LV #SN Attr   VSize   VFree 
+  vgdata   1   1   0 wz--n- <10.00g <3.50g
+  Size of logical volume vgdata/lvxfs changed from 6.50 GiB (1664 extents) to <10.00 GiB (2559 extents).
+  Logical volume vgdata/lvxfs successfully resized.
+meta-data=/dev/mapper/vgdata-lvxfs isize=256    agcount=12, agsize=131072 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=0        finobt=0, sparse=0, rmapbt=0
+         =                       reflink=0
+data     =                       bsize=4096   blocks=1572864, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=2560, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+data blocks changed from 1572864 to 2620416
+-- VFree <3.50g 를 모두 LV 에 붙였다
+-- lvextend 출력 뒤에 xfs_growfs 의 출력이 이어진다
+--   fsadm 이 부른 것이다
+--   위 기하 줄은 확장 전 값(agcount=12)
+-- 마지막 줄이 실제 변화다
+[root@ol7a ~]# df -h /data; xfs_info /data | head -1
+Filesystem                Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvxfs   10G   84M   10G   1% /data
+meta-data=/dev/mapper/vgdata-lvxfs isize=256    agcount=20, agsize=131072 blks
+-- df 10G, agcount 20
+-- sdb 한 장(10G)을 거의 다 썼다
+
+--------------------------------------------------------------------------------
+ [7] 디스크를 하나 더 붙여 늘리기
+--------------------------------------------------------------------------------
+
+-- VG 의 빈 공간이 바닥났다. sdc 를 VG 에 넣고 다시 늘린다.
+-- 파일 시스템 입장에서는 어느 디스크든 상관없이 뒤에 블록이 붙을 뿐이다.
+[root@ol7a ~]# vgextend vgdata /dev/sdc; lvextend -r -L +5G /dev/vgdata/lvxfs | tail -3
+  Physical volume "/dev/sdc" successfully created.
+  Volume group "vgdata" successfully extended
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+data blocks changed from 2620416 to 3931136
+-- sdc 가 PV 로 만들어지며 VG 에 들어갔다
+--   vgextend 가 pvcreate 를 대신했다
+-- lvextend -r 출력은 tail -3 으로 끝 세 줄만
+[root@ol7a ~]# lvs -o lv_name,lv_size,devices vgdata; df -h /data
+  LV    LSize   Devices    
+  lvxfs <15.00g /dev/sdb(0)
+  lvxfs <15.00g /dev/sdc(0)
+Filesystem                Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvxfs   15G   84M   15G   1% /data
+-- LV 하나가 sdb(0)·sdc(0) 두 PV 에 걸쳐 있다
+-- 15G, 3931136 블록 = AG 30개
+[root@ol7a ~]# md5sum -c /root/before.md5
+/data/etc/passwd: OK
+/data/etc/services: OK
+-- 여섯 번 늘리는 동안 데이터는 그대로였다
+-- 모두 마운트된 채로, 서비스 중단 없이 했다
+
+--------------------------------------------------------------------------------
+ [8] 줄이기는 안 된다
+--------------------------------------------------------------------------------
+
+-- xfs_growfs 에는 축소가 없다. LVM 쪽에서 -r 로 줄이려 하면 fsadm 이 막는다.
+[root@ol7a ~]# lvreduce -r -L -1G /dev/vgdata/lvxfs; echo "rc=$?"
+fsadm: Xfs filesystem shrinking is unsupported.
+  /usr/sbin/fsadm failed: 1
+  Filesystem resize failed.
+rc=5
+-- fsadm 이 XFS 축소를 막았다
+--   Xfs filesystem shrinking is unsupported.
+-- lvreduce 는 LV 도 줄이지 않고 rc=5 로 끝났다
+-- -r 없이 치면 이 안전장치가 없다
+--   LV 끝이 잘리고 파일 시스템이 망가진다
+
+--------------------------------------------------------------------------------
+ [9] xfs_freeze — 쓰기 멈추기
+--------------------------------------------------------------------------------
+
+-- -f 동결: 진행 중인 쓰기를 마치고 디스크에 내린 뒤 새 쓰기를 막는다.
+-- 동결 중에도 읽기는 된다.
+[root@ol7a ~]# xfs_freeze -f /data; echo "rc=$?"; cat /data/etc/hostname; ls /data | head -3
+-- 동결 rc=0
+-- 동결 중에도 읽기(cat·ls)는 된다
+rc=0
+ol7a.example.com
+etc
+
+-- 동결 중에 쓰기를 시작한다. 셸이 멈추지 않도록 백그라운드로 띄운다.
+[root@ol7a ~]# nohup dd if=/dev/zero of=/data/frozen.dat bs=1M count=20 oflag=direct >/tmp/dd.log 2>&1 </dev/null &
+[root@ol7a ~]# sleep 3; ps -o pid,stat,wchan:30,cmd -C dd; ls -l /data/frozen.dat 2>&1
+  PID STAT WCHAN                          CMD
+ 2754 D    down_read                      dd if=/dev/zero of=/data/frozen.dat bs=1M count=20 oflag=direct
+ls: cannot access /data/frozen.dat: No such file or directory
+-- STAT D: 깨울 수 없는 대기(uninterruptible)
+-- WCHAN down_read: 동결 잠금을 기다린다
+-- 파일이 아직 없다. 생성 단계에서 멈췄다
+-- oflag=direct 는 캐시를 거치지 않게 했다
+
+-- 같은 파일 시스템을 한 번 더 동결해 본다.
+[root@ol7a ~]# xfs_freeze -f /data; echo "rc=$?"
+xfs_freeze: cannot freeze filesystem at /data: Device or resource busy
+rc=1
+-- 이미 동결된 상태라 거부(EBUSY)
+-- 동결 여부를 따로 보여 주는 명령은 없다
+--   이 거부가 동결 상태 확인 수단이 되기도 한다
+
+--------------------------------------------------------------------------------
+ [10] 해제를 잊으면 — 오류 ②
+--------------------------------------------------------------------------------
+
+-- 스냅샷을 뜬 뒤 -u 를 잊은 상황이다. 다른 작업이 이 파일 시스템에 쓰려 한다.
+-- touch 도 백그라운드로 띄운다. 전경에서 치면 이 셸이 그대로 멈춘다.
+[root@ol7a ~]# nohup touch /data/newfile >/tmp/touch.log 2>&1 </dev/null &
+[root@ol7a ~]# sleep 2; ps -o pid,stat,etime,wchan:30,cmd -C dd,touch; cat /proc/$(pgrep -x touch)/stack
+  PID STAT     ELAPSED WCHAN                          CMD
+ 2754 D          00:05 down_read                      dd if=/dev/zero of=/data/frozen.dat bs=1M count=20 oflag=direct
+ 2814 D          00:02 down_read                      touch /data/newfile
+[<0>] __down_read+0x5f/0x72
+[<0>] __percpu_down_read+0x60/0x76
+[<0>] __sb_start_write+0x83/0x85
+[<0>] mnt_want_write+0x24/0x4f
+[<0>] path_openat+0x888/0x1432
+[<0>] do_filp_open+0xa2/0x10d
+[<0>] do_sys_openat2+0x1be/0x2b7
+[<0>] do_sys_open+0x5c/0x76
+[<0>] __x64_sys_open+0x21/0x27
+[<0>] x64_sys_call+0x17b5/0x237b
+[<0>] do_syscall_64+0x58/0x1d9
+[<0>] entry_SYSCALL_64_after_hwframe+0x17b/0x0
+-- ELAPSED: dd 5초, touch 2초째 대기
+-- stack 을 아래에서 위로 읽는다
+--   open 시스템 호출 → path_openat
+--   mnt_want_write → __sb_start_write
+--   여기서 동결 잠금(percpu rwsem)을 기다린다
+-- 프로세스 문제가 아니라 파일 시스템 쪽 대기다
+
+-- 커널은 D 상태로 오래 멈춘 작업을 감시한다. 기준 시간을 본다.
+[root@ol7a ~]# sysctl kernel.hung_task_timeout_secs kernel.hung_task_panic
+kernel.hung_task_timeout_secs = 120
+kernel.hung_task_panic = 0
+-- 120초 넘게 D 상태면 경고를 남긴다
+-- panic=0: 경고만 하고 커널을 멈추지 않는다
+-- 기준 시간이 지나도록 기다린 뒤 커널 메시지를 본다(약 2분).
+[root@ol7a ~]# ps -o pid,stat,etime,cmd -C dd,touch; dmesg | grep -E 'blocked for more than|hung_task_timeout_secs' | head -6
+  PID STAT     ELAPSED CMD
+ 2754 D          04:15 dd if=/dev/zero of=/data/frozen.dat bs=1M count=20 oflag=direct
+ 2814 D          04:12 touch /data/newfile
+[  246.193779] INFO: task dd:2754 blocked for more than 122 seconds.
+[  246.196226] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+[  246.197453] INFO: task touch:2814 blocked for more than 122 seconds.
+[  246.199468] "echo 0 > /proc/sys/kernel/hung_task_timeout_secs" disables this message.
+-- 증상   : INFO: task dd:2754 blocked for more than 122 seconds.
+--          touch 도 같은 경고, 둘 다 STAT D 로 4분 넘게 대기
+-- 원인   : 동결을 풀지 않았다. 쓰기는 오류 없이 무한정 기다린다
+-- 조치   : xfs_freeze -u /data
+-- 재확인 : dd.log 의 20+0 records out, ps 에 dd·touch 없음
+-- 랩은 @sleep 250 으로 기다렸다. 감시 주기 때문에 120초 직후가 아니다
+-- kill -9 로는 D 상태를 깨우지 못한다
+
+-- 해제한다.
+[root@ol7a ~]# xfs_freeze -u /data; echo "rc=$?"; sleep 2; cat /tmp/dd.log; ps -C dd,touch >/dev/null || echo "dd·touch 끝남"
+-- 해제 rc=0, dd 가 바로 끝났다(21 MB)
+rc=0
+20+0 records in
+20+0 records out
+20971520 bytes (21 MB) copied, 0.010288 s, 2.0 GB/s
+dd·touch 끝남
+[root@ol7a ~]# ls -l /data/frozen.dat /data/newfile; cat /proc/loadavg
+-rw-r--r--. 1 root root 20971520 Nov 16 14:49 /data/frozen.dat
+-rw-r--r--. 1 root root        0 Nov 16 14:49 /data/newfile
+1.82 1.14 0.49 1/195 2920
+-- 두 파일 모두 만들어졌다
+-- loadavg 1분 값 1.82
+--   D 상태 두 개가 부하로 셈해진 흔적이다
+--   CPU 는 거의 쓰지 않았다
+
+--------------------------------------------------------------------------------
+ [변형] 파티션 위의 XFS 를 growpart 없이 늘리기 — parted resizepart
+--------------------------------------------------------------------------------
+
+-- LVM 이 아닌 파티션 위의 XFS 를 늘리는 경로다. sdd 에 3G 파티션을 만들고 XFS 를 올린다.
+[root@ol7a ~]# parted -s /dev/sdd mklabel gpt mkpart p1 xfs 1MiB 3GiB; partprobe /dev/sdd; udevadm settle; lsblk /dev/sdd
+NAME   MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdd      8:48   0  10G  0 disk 
+└─sdd1   8:49   0   3G  0 part 
+-- partprobe·udevadm settle 로 sdd1 이 바로 보인다
+[root@ol7a ~]# mkfs.xfs -q /dev/sdd1; mkdir -p /part; mount /dev/sdd1 /part; df -h /part
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdd1       3.0G   33M  3.0G   2% /part
+-- 3G 파티션 위의 XFS
+
+-- 파티션 끝을 8GiB 로 옮긴다. 마운트된 채로 parted 가 경고 없이 진행하는지 본다.
+[root@ol7a ~]# echo Yes | parted ---pretend-input-tty /dev/sdd resizepart 1 8GiB; echo "rc=$?"; lsblk /dev/sdd
+Error: Partition /dev/sdd1 is being used. You must unmount it before you modify it with Parted.
+
+rc=1
+NAME   MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdd      8:48   0  10G  0 disk 
+└─sdd1   8:49   0   3G  0 part /part
+-- parted 3.1 이 마운트된 파티션 변경을 거부했다
+--   You must unmount it before you modify it
+-- FS 문서의 "parted 로 XFS 파티션 크기를 바꿀 수 없다" 그대로다
+-- 이 파티션은 3G 그대로다
+[root@ol7a ~]# xfs_growfs /part | tail -1; df -h /part
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdd1       3.0G   33M  3.0G   2% /part
+-- 장치가 그대로라 xfs_growfs 도 늘릴 것이 없다
+--   data blocks changed 줄이 없다
+-- 파티션 위 XFS 는 언마운트 → 파티션 끝 이동 → 마운트 → xfs_growfs 순이다
+-- 서비스 중단 없이 늘리려면 처음부터 LVM 위에 둔다
+
+--------------------------------------------------------------------------------
+ [11] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /data /part; lvremove -qy vgdata; vgremove -q vgdata; pvremove -q /dev/sdb /dev/sdc
+  Logical volume "lvxfs" successfully removed
+  Volume group "vgdata" successfully removed
+  Labels on physical volume "/dev/sdb" successfully wiped.
+  Labels on physical volume "/dev/sdc" successfully wiped.
+-- LV → VG → PV 순서로 지웠다
+[root@ol7a ~]# wipefs -a /dev/sdb /dev/sdc /dev/sdd >/dev/null; rmdir /data /part; rm -f /root/info.* /root/before.md5
+[root@ol7a ~]# lsblk -f /dev/sdb /dev/sdc /dev/sdd; pvs; vgs
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+sdd                    
+  PV         VG Fmt  Attr PSize   PFree
+  /dev/sda2  ol lvm2 a--  <39.00g 4.00m
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+-- sdb·sdc·sdd 비었고 PV·VG 는 [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목              시작 전     변경 후                  되돌린 뒤
+--  /data 크기        -           2.0G → 15G               -
+--  agcount           -           4 → 10 → 11 → 12 → 20 → 30  -
+--  agsize            -           131072 (불변)            -
+--  vgdata PV         -           sdb, sdc                 -
+--  /data md5         -           OK (2파일)               -
+--  /part (sdd1)      -           3.0G, resizepart 거부    -
+--  sdb~sdd FSTYPE    (없음)      LVM2_member / xfs        (없음)
+-- 장치 이름을 준 xfs_growfs 는 5.4 에서 성공했다
+-- 언마운트 상태는 장치·마운트 지점 모두 실패
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. xfs_growfs -n /data 는 바꾸지 않고 현재 기하 구조만 보여 준다(xfs_info 와 같다).
+--    lvextend 직후 -n 으로 보고, 실제 확장 뒤와 비교한다.
+--    확인: data 줄 blocks 값
+-- 2. 동결한 채 lvcreate -s 로 스냅샷을 뜨면 어떻게 되는가. LVM 은 스냅샷 직전에
+--    스스로 동결하므로 이미 동결된 파일 시스템에서 어떤 메시지를 내는지 본다.
+--    확인: lvcreate 출력과 lvs 의 스냅샷 생성 여부
+-- 3. 1G LV 에 만든 XFS 를 100G 까지 여러 번 늘린 뒤 agcount 를 본다.
+--    처음부터 100G 로 만든 것과 AG 수를 비교한다.
+--    확인: xfs_info 의 agcount
+
+================================================================================
+ 실습 02 종료 — 2G → 15G 온라인 확장(AG 4 → 30), 동결 해제 누락은 D 상태와 hung task
+================================================================================

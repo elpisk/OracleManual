@@ -1,0 +1,450 @@
+================================================================================
+ 제9장 실습 04 — 오류 재현: fstab 오류와 emergency 모드
+ 대상   : ol7a (직렬 콘솔 포함)
+ 목표   : fstab 의 두 가지 오류 — 사라진 UUID, 옵션 오타 — 를 둔 채 부팅해
+          7.9 가 각각 어떻게 반응하는지 본다. emergency 모드에 빠진 서버를
+          콘솔에서 고쳐 부팅을 이어 가고, nofail 과 x-systemd.device-timeout 이
+          부팅을 어떻게 바꾸는지 비교한다
+ 배경   : systemd-fstab-generator 는 fstab 한 줄마다 .mount 유닛을 만든다.
+          nofail 이 없는 줄은 local-fs.target(또는 remote-fs.target)의 필수
+          조건(Requires)이 된다. 장치가 나타나지 않으면 기본 90초를 기다린다.
+          local-fs.target 이 실패하면 emergency.target 으로 가고, 이때 네트워크와
+          sshd 가 뜨지 않아 콘솔로만 들어갈 수 있다 (본문 9.6절)
+ 소요   : 약 35분 (부팅 5회 포함)
+ 선행   : pre-break 스냅샷. 콘솔 접근 수단(이 랩은 직렬 콘솔 ttyS0)
+ 계정   : root (emergency 셸도 root 암호를 묻는다)
+ 주의   : 서버가 부팅 도중 멈춘다. 운영 서버라면 콘솔(ILOM·iDRAC·가상화 콘솔)
+          접근을 먼저 확보한 상태에서만 재현한다
+ 되돌림 : fstab 원본 복원, sdb 비우기, 정상 부팅.
+          확인 명령 diff /root/fstab.orig /etc/fstab, systemctl is-system-running
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+-- 손대기 전 fstab. 주석과 빈 줄은 뺐다.
+[root@ol7a ~]# grep -v '^#' /etc/fstab | grep -v '^$'
+/dev/mapper/ol-root     /                       xfs     defaults        0 0
+UUID=9e9b6650-ec84-4fa9-b7ec-e541592b4ecc /boot                   xfs     defaults        0 0
+/dev/mapper/ol-swap     swap                    swap    defaults        0 0
+
+-- 설정 줄 셋: 루트·스왑은 LVM 이름, /boot 는 UUID.
+-- 이 실습은 넷째 줄을 더했다 고친다
+-- 원본을 남겨 둔다. 콘솔에서 고칠 때도, 끝에서 되돌릴 때도 이 파일을 쓴다.
+[root@ol7a ~]# cp -p /etc/fstab /root/fstab.orig; md5sum /etc/fstab
+ce225c529a1c469b473395e87371ca2d  /etc/fstab
+
+-- 끝에서 이 체크섬과 비교한다
+-- 기본 타깃, 지금 시스템 상태, 정상 부팅에 걸린 시간, systemd 버전.
+[root@ol7a ~]# systemctl get-default; systemctl is-system-running; systemd-analyze; rpm -q systemd
+multi-user.target
+running
+Startup finished in 980ms (kernel) + 1.405s (initrd) + 5.376s (userspace) = 7.762s
+systemd-219-78.0.17.el7_9.9.x86_64
+
+-- get-default: 부팅 목표는 multi-user.target(텍스트 서버)
+-- is-system-running: running = 실패한 유닛 없이 부팅이 끝났다.
+-- degraded 면 실패 유닛이 있다
+-- systemd-analyze: 커널 0.98초 + initramfs 1.4초 + 사용자 영역 5.4초 = 7.762초. 정상 부팅의 기준값
+-- systemd 219 는 7.9 의 버전이다.
+-- 아래 generator 동작은 이 버전에서 실측한 것이다
+-- [OL8/9] systemd 239(OL8)·252(OL9).
+-- 같은 실험의 결과가 다를 수 있다
+
+--------------------------------------------------------------------------------
+ [1] 데이터 볼륨을 UUID 로 등록
+--------------------------------------------------------------------------------
+-- 2GiB 파티션에 Ext4. -L 로 레이블도 붙여 둔다(복구 때 쓴다).
+[root@ol7a ~]# parted -s /dev/sdb mklabel msdos mkpart primary 1MiB 2049MiB; mkfs.ext4 -q -L appdata /dev/sdb1; blkid /dev/sdb1
+/dev/sdb1: LABEL="appdata" UUID="5cc6e81c-e97d-4aa2-8933-48c63ce2f102" TYPE="ext4" 
+
+-- 2GiB ext4. LABEL="appdata" 와 UUID 5cc6e81c-… 가 생겼다
+-- blkid 가 돌려준 UUID 를 그대로 fstab 에 넣는다. -s UUID -o value 는 값만 찍는다.
+[root@ol7a ~]# mkdir /data; echo "UUID=$(blkid -s UUID -o value /dev/sdb1)  /data  ext4  defaults  0 2" >> /etc/fstab; tail -1 /etc/fstab
+UUID=5cc6e81c-e97d-4aa2-8933-48c63ce2f102  /data  ext4  defaults  0 2
+
+-- 명령 치환 $(blkid …) 으로 UUID 를 옮겨 적었다.
+-- 손으로 베끼는 오타(실습 03)를 피하는 방법
+-- 등록하면 바로 mount -a 로 시험한다.
+[root@ol7a ~]# mount -a; echo rc=$?; findmnt /data
+rc=0
+TARGET SOURCE    FSTYPE OPTIONS
+/data  /dev/sdb1 ext4   rw,relatime,seclabel
+
+-- rc=0, /data 에 붙었다. 등록 직후의 정상 상태
+
+--------------------------------------------------------------------------------
+ [2] systemd 가 만든 data.mount 의 의존 관계
+--------------------------------------------------------------------------------
+-- generator 가 fstab 을 다시 읽게 한 뒤 유닛의 관계를 본다.
+[root@ol7a ~]# systemctl daemon-reload; systemctl show -p RequiredBy -p Requires data.mount
+Requires=system.slice -.mount
+RequiredBy=local-fs.target
+
+-- Requires=… -.mount: /data 는 루트(-.mount)가 먼저 있어야 한다
+-- RequiredBy=local-fs.target: 이 마운트가 실패하면 local-fs.target 도 실패한다
+-- nofail 이 없는 로컬 볼륨의 정상적인 관계다. 아래 [5] 에서 이 값이 바뀐다
+-- 장치 유닛 이름은 경로를 systemd 식으로 바꾼 것이다('-' → '\x2d', '/' → '-').
+[root@ol7a ~]# systemd-escape -p /dev/disk/by-uuid/$(blkid -s UUID -o value /dev/sdb1)
+dev-disk-by\x2duuid-5cc6e81c\x2de97d\x2d4aa2\x2d8933\x2d48c63ce2f102
+
+-- 장치 유닛 이름. 부팅 화면의 "A start job is running for dev-disk-by…" 가 이 이름이다
+
+--------------------------------------------------------------------------------
+ [3] 첫 번째 장애 — 디스크를 다시 포맷하고 fstab 은 그대로 둔다
+--------------------------------------------------------------------------------
+-- 흔한 경위: 볼륨을 다시 mkfs 하면 UUID 가 새로 생긴다. fstab 을 고치지 않고,
+-- mount -a 로 시험하지도 않은 채 재부팅한다.
+-- -F 는 이미 파일 시스템이 있어도 묻지 않고 만든다. 레이블은 같게 준다.
+[root@ol7a ~]# umount /data; mkfs.ext4 -q -F -L appdata /dev/sdb1; blkid /dev/sdb1
+/dev/sdb1: LABEL="appdata" UUID="8daf5c64-fa06-4b08-bf8f-0bd2506e92a7" TYPE="ext4" 
+
+-- 같은 디스크, 같은 레이블인데 UUID 가 1ef0…로 바뀌었다(mkfs 는 매번 새 UUID 를 만든다)
+[root@ol7a ~]# grep /data /etc/fstab
+UUID=5cc6e81c-e97d-4aa2-8933-48c63ce2f102  /data  ext4  defaults  0 2
+
+-- fstab 은 여전히 옛 UUID 5cc6e81c 를 가리킨다. 이 상태로 재부팅했다
+-- mount -a 를 쳤다면 여기서 "can't find UUID=5cc6e81c…" 로 잡혔을 것이다(실습 03 [5])
+-- 디스크 교체·재포맷 뒤에는 blkid 와 fstab 을 나란히 놓고 보는 것이 먼저다
+-- 재부팅(systemctl reboot).
+
+--------------------------------------------------------------------------------
+ [4] 사라진 UUID 로 부팅한 결과
+--------------------------------------------------------------------------------
+-- SSH 가 열리자마자 본다.
+[root@ol7a ~]# uptime; systemctl is-system-running; findmnt /data; echo rc=$?
+ 20:03:28 up 0 min,  0 users,  load average: 0.00, 0.00, 0.00
+starting
+
+-- 재부팅 직후. uptime 0 min,
+-- is-system-running 이 starting(부팅 작업이 남음)
+-- findmnt /data 출력 없이 rc=1.
+-- /data 가 붙지 않았다. 그런데 SSH 는 열렸다
+rc=1
+
+[root@ol7a ~]# systemctl list-jobs --no-pager | grep -E 'JOB|data|device|remote' | cut -c1-90
+JOB UNIT                                                           TYPE  STATE  
+239 remote-fs.target                                               start waiting
+241 dev-disk-by\x2duuid-...\x2d4aa2\x2d8933\x2d48c63ce2f102.device start running
+240 data.mount                                                     start waiting
+
+-- 남은 작업(job) 중 /data 관련 셋
+--   dev-disk-by\x2duuid-…device  running : 옛 UUID 장치를 기다리는 중
+--   data.mount, remote-fs.target  waiting : 장치가 오기를 기다린다
+-- remote-fs.target 이 끼어 있다.
+-- 로컬 디스크인데 원격 파일 시스템 목표에 걸렸다
+-- 장치 기다림(90초)이 끝난 뒤 다시 본다.
+[root@ol7a ~]# systemctl is-system-running; systemctl --failed --no-pager --no-legend; findmnt /data; echo rc=$?
+running
+rc=1
+
+[root@ol7a ~]# journalctl -b --no-pager | grep -E 'Timed out|Dependency failed' | cut -c17-120
+ol7a.example.com systemd[1]: Timed out waiting for device dev-disk-by\x2duuid-5cc6e81c\x2de97d\x2d4aa2\x
+ol7a.example.com systemd[1]: Dependency failed for File System Check on /dev/disk/by-uuid/5cc6e81c-e97d-
+ol7a.example.com systemd[1]: Dependency failed for /data.
+ol7a.example.com systemd[1]: Dependency failed for Remote File Systems.
+
+-- 90초 뒤: is-system-running 이 running,
+-- 실패 유닛 없음, /data 는 여전히 없음
+-- 로그 네 줄: 장치 대기 시간 초과 → fsck·/data·Remote File Systems 가 의존 실패
+-- "Dependency failed" 는 유닛 자체의 실패가 아니라 선행 조건 실패라 --failed 목록에 안 남는다
+
+--------------------------------------------------------------------------------
+ [5] 왜 emergency 로 가지 않았나
+--------------------------------------------------------------------------------
+-- [2] 에서는 local-fs.target 이 data.mount 를 요구했다. 지금 부팅에서는.
+[root@ol7a ~]# systemctl show -p RequiredBy data.mount; ls /run/systemd/generator/
+RequiredBy=remote-fs.target
+boot.mount
+data.mount
+dev-mapper-ol\x2dswap.swap
+getty.target.wants
+local-fs.target.requires
+-.mount
+remote-fs.target.requires
+swap.target.requires
+
+-- remote-fs.target.requires 디렉터리가 생겼다.
+-- 실습 03 의 목록에는 없던 것이다
+[root@ol7a ~]# cat /run/systemd/generator/data.mount
+# Automatically generated by systemd-fstab-generator
+
+[Unit]
+SourcePath=/etc/fstab
+Documentation=man:fstab(5) man:systemd-fstab-generator(8)
+Before=remote-fs.target
+RequiresOverridable=systemd-fsck@dev-disk-by\x2duuid-5cc6e81c\x2de97d\x2d4aa2\x2d8933\x2d48c63ce2f102.service
+After=systemd-fsck@dev-disk-by\x2duuid-5cc6e81c\x2de97d\x2d4aa2\x2d8933\x2d48c63ce2f102.service
+
+[Mount]
+What=/dev/disk/by-uuid/5cc6e81c-e97d-4aa2-8933-48c63ce2f102
+Where=/data
+Type=ext4
+
+-- Before=remote-fs.target.
+-- 부팅 때 generator 가 이 줄을 원격 볼륨처럼 다뤘다
+-- 부팅 초기 generator 가 돌 때 by-uuid/5cc6e81c… 장치가 없었다
+-- 7.9 의 systemd-219 는 그런 줄을 local-fs 대신 remote-fs 쪽에 거는 것으로 보인다
+-- 그래서 local-fs.target 은 성공했고 emergency 로 가지 않았다
+-- 증상   : 재부팅은 됐지만 90초 늦었고 /data 가 붙지 않았다. 오류 화면 없음
+-- 원인   : 다시 mkfs 해 UUID 가 바뀌었는데 fstab 은 옛 UUID. Timed out waiting for device …
+-- 조치   : 같은 레이블을 줬으므로 UUID= 를 LABEL= 로 바꾼다(바로 아래)
+-- 재확인 : daemon-reload 뒤 RequiredBy=local-fs.target,
+-- mount -a rc=0, findmnt /data
+-- 장치가 있는 지금 상태로 fstab 을 LABEL 로 고치고 generator 를 다시 돌리면.
+[root@ol7a ~]# sed -i 's|^UUID=[^ ]*  /data |LABEL=appdata  /data |' /etc/fstab; grep /data /etc/fstab
+LABEL=appdata  /data  ext4  defaults  0 2
+
+[root@ol7a ~]# systemctl daemon-reload; systemctl show -p RequiredBy data.mount; mount -a; echo rc=$?; findmnt /data
+RequiredBy=local-fs.target
+rc=0
+TARGET SOURCE    FSTYPE OPTIONS
+/data  /dev/sdb1 ext4   rw,relatime,seclabel
+
+-- 장치가 있는 상태에서 다시 만든 유닛은 RequiredBy=local-fs.target 으로 돌아왔다
+-- /data 가 비어 있는 동안 애플리케이션이 그 디렉터리에 쓰면 루트 파일 시스템에 쌓인다
+
+--------------------------------------------------------------------------------
+ [6] 두 번째 장애 — 옵션 오타
+--------------------------------------------------------------------------------
+-- 옵션을 고치다 defaults 를 defualts 로 잘못 쳤다. 이번에도 mount -a 없이 재부팅한다.
+[root@ol7a ~]# sed -i 's|/data  ext4  defaults |/data  ext4  defualts |' /etc/fstab; grep /data /etc/fstab
+LABEL=appdata  /data  ext4  defualts  0 2
+
+-- defaults 를 defualts 로 잘못 쳤다. 장치는 있다
+[root@ol7a ~]# umount /data; systemctl daemon-reload
+-- 이번 부팅에서는 SSH 가 다시 열리지 않는다. 전원을 내렸다 올리고 직렬 콘솔(ttyS0)로
+-- 들어간다. 부팅 메시지가 지나가기를 60초 기다린 뒤 콘솔을 연다.
+-- 아래 [7]·[8] 의 출력은 콘솔 화면을 그대로 옮긴 것이다.
+
+--------------------------------------------------------------------------------
+ [7] emergency 셸에 들어가 상태 보기
+--------------------------------------------------------------------------------
+-- 콘솔에는 root 암호를 묻는 줄이 떠 있다. 암호를 넣는다(화면에 찍히지 않는다).
+-- 암호 입력 화면(Give root password for maintenance)은 콘솔을 열기 전에 지나가 캡처에 없다
+-- 암호를 넣자 바로 셸 프롬프트가 나왔다.
+-- 콘솔에서는 친 명령이 프롬프트 다음 줄에 되찍힌다
+[root@ol7a ~]# 
+systemctl --failed --no-pager --no-legend
+data.mount loaded failed failed /data
+
+-- data.mount 가 failed. [4] 와 달리 이번에는 유닛 자체가 실패했다
+[root@ol7a ~]# 
+systemctl list-units -t target --no-legend | grep -E 'emerg|local 
+|multi'
+emergency.target      loaded active active Emergency Mode
+local-fs-pre.target   loaded active active Local File Systems (Pre)
+
+-- 명령 줄이 두 줄로 보이는 것은 콘솔 폭 80자에서 접힌 것이다
+-- active 인 목표는 emergency.target 과 local-fs-pre.target 뿐.
+-- local-fs.target·multi-user.target 은 없다
+[root@ol7a ~]# 
+systemctl is-active sshd network
+inactive
+inactive
+
+-- sshd·network 모두 inactive. 원격으로 들어올 방법이 없다
+[root@ol7a ~]# 
+findmnt -o TARGET,SOURCE,OPTIONS /
+TARGET SOURCE              OPTIONS
+/      /dev/mapper/ol-root rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize
+
+-- 루트는 rw 다. 루트까지는 마운트된 뒤 멈췄으니 fstab 을 바로 고칠 수 있다
+-- 루트가 ro 로 남은 경우에만 mount -o remount,rw / 를 먼저 친다
+[root@ol7a ~]# 
+
+--------------------------------------------------------------------------------
+ [8] 원인 찾기와 고치기
+--------------------------------------------------------------------------------
+-- 이 부팅의 로그에서 /data 와 emergency 관련 줄만 뽑는다.
+journalctl -b | grep -E '/data|Emergency' | cut -c17-99
+ol7a.example.com systemd[1]: Mounting /data...
+ol7a.example.com systemd[1]: Failed to mount /data.
+ol7a.example.com systemd[1]: Started Emergency Shell.
+ol7a.example.com systemd[1]: Reached target Emergency Mode.
+
+-- 순서: Mounting /data → Failed to mount /data → Emergency Shell → Emergency Mode
+-- 실패 이유는 이 줄들에 없다. 셸에서 직접 마운트해 본다
+[root@ol7a ~]# 
+-- 셸 안에서 mount -a 로 같은 오류를 다시 낸다.
+mount -a; echo rc=$?
+[   78.620347] EXT4-fs (sdb1): Unrecognized mount option "defualts" or missing value
+mount: wrong fs type, bad option, bad superblock on /dev/sdb1,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+rc=32
+
+-- 증상   : "Failed to mount /data." 후 Emergency Mode. 콘솔에서만 root 암호로 진입
+-- 원인   : 커널 메시지 Unrecognized mount option "defualts" or missing value
+--          장치는 있어 local-fs.target 의 필수 마운트가 실제로 실패했다
+-- 조치   : sed 로 오타를 고치고 mount -a, daemon-reload, systemctl default
+-- 재확인 : mount -a rc=0, findmnt /data,
+-- 그리고 SSH 접속 뒤 is-system-running running
+-- mount 의 rc=32 는 "마운트 실패".
+-- mount -a 가 부팅 때와 같은 오류를 그 자리에서 보여 준다
+[root@ol7a ~]# 
+grep /data /etc/fstab
+LABEL=appdata  /data  ext4  defualts  0 2
+[root@ol7a ~]# 
+-- 오타를 고치고 다시 시험한다.
+sed -i 's|defualts|defaults|' /etc/fstab; grep /data /etc/fstab
+LABEL=appdata  /data  ext4  defaults  0 2
+-- 고친 줄. 실제 운영에서는 고치기 전에 cp -p /etc/fstab /root/fstab.bad 로 틀린 판을 남겨 둔다
+[root@ol7a ~]# 
+mount -a; echo rc=$?; findmnt /data
+rc=0
+TARGET SOURCE    FSTYPE OPTIONS
+/data  /dev/sdb1 ext4   rw,relatime,seclabel
+-- 셸 안에서 /data 가 붙었다
+[root@ol7a ~]# 
+-- fstab 을 고쳤으니 generator 를 다시 돌리고, 멈췄던 부팅을 이어 간다.
+-- systemctl default = systemctl isolate default.target (multi-user.target)
+systemctl daemon-reload
+Authorization not available. Check if polkit service is running or see debug message for more information.
+-- polkit 이 아직 뜨지 않아 나오는 안내다. root 라 명령은 그대로 수행됐다
+[root@ol7a ~]# 
+systemctl default
+Authorization not available. Check if polkit service is running or see debug message for more information.
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+-- systemctl default 로 multi-user.target 을 다시 시작했다. 로그인 프롬프트가 나왔다
+-- 재부팅하지 않고 멈췄던 부팅을 이어 간 것이다
+
+--------------------------------------------------------------------------------
+ [9] 부팅이 이어졌는지 SSH 로 확인
+--------------------------------------------------------------------------------
+[root@ol7a ~]# systemctl is-system-running; findmnt /data; systemctl is-active sshd
+-- SSH 로 다시 들어왔다. running, /data 붙음, sshd active
+running
+TARGET SOURCE    FSTYPE OPTIONS
+/data  /dev/sdb1 ext4   rw,relatime,seclabel
+active
+[root@ol7a ~]# journalctl -b --no-pager -o short-monotonic | grep -E 'Emergency|Reached target (Local File|Multi-User)' | cut -c1-100
+[    3.148714] ol7a.example.com systemd[1]: Reached target Local File Systems (Pre).
+[    3.254329] ol7a.example.com systemd[1]: Started Emergency Shell.
+[    3.254394] ol7a.example.com systemd[1]: Reached target Emergency Mode.
+[   94.461047] ol7a.example.com systemd[1]: Stopped target Emergency Mode.
+[   94.461373] ol7a.example.com systemd[1]: Stopping Emergency Shell...
+[   94.462696] ol7a.example.com systemd[1]: Stopped Emergency Shell.
+[   94.478753] ol7a.example.com systemd[1]: Reached target Local File Systems.
+[   95.774919] ol7a.example.com systemd[1]: Reached target Multi-User System.
+-- 3.25초에 Emergency Mode,
+-- 94.46초에 빠져나와 Local File Systems, 95.77초에 Multi-User
+-- 그 사이 약 90초가 콘솔에서 고치는 데 쓴 시간이다
+
+--------------------------------------------------------------------------------
+ [10] nofail — 같은 오타가 부팅을 막지 않게 하기
+--------------------------------------------------------------------------------
+-- 같은 오타를 다시 넣되 이번에는 nofail 을 붙인다.
+[root@ol7a ~]# sed -i 's|/data  ext4  defaults |/data  ext4  defualts,nofail |' /etc/fstab; grep /data /etc/fstab
+LABEL=appdata  /data  ext4  defualts,nofail  0 2
+[root@ol7a ~]# umount /data; systemctl daemon-reload; systemctl show -p RequiredBy -p WantedBy data.mount
+RequiredBy=
+WantedBy=dev-disk-by\x2dlabel-appdata.device local-fs.target
+-- nofail 을 붙이자 RequiredBy 가 비고 WantedBy 에 local-fs.target 이 들어갔다
+-- 재부팅(systemctl reboot). nofail 이 맞다면 SSH 가 다시 열린다.
+[root@ol7a ~]# systemctl is-system-running; systemctl --failed --no-pager --no-legend; findmnt /data; echo rc=$?
+starting
+data.mount loaded failed failed /data
+rc=1
+-- 재부팅 뒤 SSH 로 들어왔다. emergency 로 가지 않았다
+-- data.mount 는 failed, /data 는 비었다.
+-- is-system-running 은 starting(곧 degraded 가 된다)
+[root@ol7a ~]# journalctl -b --no-pager | grep -E 'data.mount|/data' | cut -c17-120
+ol7a.example.com systemd[1]: Mounting /data...
+ol7a.example.com systemd[1]: data.mount mount process exited, code=exited status=32
+ol7a.example.com systemd[1]: Failed to mount /data.
+ol7a.example.com systemd[1]: Unit data.mount entered failed state.
+-- 마운트는 같은 오류로 실패했지만 local-fs.target 이 요구하지 않아 부팅이 계속됐다
+-- nofail 은 실패를 숨기지 않는다. --failed 와 로그에는 남는다
+-- 없으면 서비스가 의미 없는 볼륨(DB 데이터)에는 nofail 을 붙이지 않는다. 멈추는 편이 안전하다
+
+--------------------------------------------------------------------------------
+ [변형] x-systemd.device-timeout 으로 기다림 줄이기
+--------------------------------------------------------------------------------
+-- [4] 에서 사라진 UUID 는 90초를 기다렸다. nofail 줄에 대기 시간을 10초로 준다.
+-- 오타 줄은 정상으로 돌리고, 없는 UUID 를 가리키는 /backup 줄을 더한다.
+[root@ol7a ~]# sed -i 's|defualts,nofail|defaults|' /etc/fstab; mkdir /backup; echo "UUID=1b2c3d4e-0000-4000-8000-00000000dead  /backup  ext4  defaults,nofail,x-systemd.device-timeout=10  0 2" >> /etc/fstab
+[root@ol7a ~]# diff /root/fstab.orig /etc/fstab
+11a12,13
+> LABEL=appdata  /data  ext4  defaults  0 2
+> UUID=1b2c3d4e-0000-4000-8000-00000000dead  /backup  ext4  defaults,nofail,x-systemd.device-timeout=10  0 2
+-- /data 는 defaults 로 정상화,
+-- /backup 은 없는 UUID + nofail + 10초 대기
+-- generator 는 장치 유닛에 덧붙이는 설정 조각(drop-in)을 만든다.
+[root@ol7a ~]# systemctl daemon-reload; ls /run/systemd/generator/ | grep dead
+dev-disk-by\x2duuid-1b2c3d4e\x2d0000\x2d4000\x2d8000\x2d00000000dead.device.d
+-- 장치 유닛 이름 뒤에 .d 디렉터리.
+-- systemd 의 설정 덧붙이기(drop-in) 방식이다
+[root@ol7a ~]# cat /run/systemd/generator/dev-disk-by*dead.device.d/*.conf
+# Automatically generated by systemd-fstab-generator
+
+[Unit]
+JobTimeoutSec=10
+-- x-systemd.device-timeout=10 이 장치 유닛의 JobTimeoutSec=10 으로 바뀌었다(기본 90초)
+-- 재부팅(systemctl reboot).
+[root@ol7a ~]# systemctl is-system-running; findmnt /data; systemd-analyze
+running
+TARGET SOURCE    FSTYPE OPTIONS
+/data  /dev/sdb1 ext4   rw,relatime,seclabel
+Startup finished in 562ms (kernel) + 1.301s (initrd) + 10.556s (userspace) = 12.421s
+-- 사용자 영역 10.556초. [0] 의 5.376초보다 약 5초 길다.
+-- 90초를 기다린 [4] 와 비교된다
+[root@ol7a ~]# journalctl -b --no-pager -o short-monotonic | grep -E 'Timed out' | cut -c1-80
+[   12.418152] ol7a.example.com systemd[1]: Timed out waiting for device dev-dis
+-- 12.4초에 시간 초과. 장치 대기를 시작한 지 10초 뒤다.
+-- /data 는 정상으로 붙어 있다
+-- 가끔 연결되는 백업 디스크·USB 디스크처럼 없을 수도 있는 장치에 쓰는 조합이다
+-- nofail 만 주면 부팅은 되지만 그 장치를 90초 기다리는 동안 is-system-running 이 starting 에 머문다
+
+--------------------------------------------------------------------------------
+ [11] 되돌리기
+--------------------------------------------------------------------------------
+[root@ol7a ~]# umount /data; cp -p /root/fstab.orig /etc/fstab; diff /root/fstab.orig /etc/fstab; echo rc=$?; md5sum /etc/fstab
+rc=0
+ce225c529a1c469b473395e87371ca2d  /etc/fstab
+-- umount 는 조용히 끝났고 fstab 체크섬이 [0] 과 같다
+[root@ol7a ~]# systemctl daemon-reload; rmdir /data /backup; wipefs -a /dev/sdb1 >/dev/null; udevadm settle; wipefs -a /dev/sdb
+/dev/sdb: 2 bytes were erased at offset 0x000001fe (dos): 55 aa
+/dev/sdb: calling ioclt to re-read partition table: Success
+[root@ol7a ~]# lsblk /dev/sdb; systemctl reset-failed; systemctl --failed --no-pager --no-legend; echo rc=$?
+NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdb    8:16   0  10G  0 disk 
+rc=0
+-- sdb 에 자식이 없고 실패 유닛도 없다(reset-failed 로 [10] 의 기록을 지웠다)
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                  시작 전        사라진 UUID        옵션 오타          오타+nofail       되돌린 뒤
+--  부팅 결과             정상 7.8초     90초 지연 후 완료  Emergency Mode     완료             정상
+--  SSH                   됨             됨                 안 됨(콘솔만)      됨               됨
+--  /data                 -              안 붙음            안 붙음            안 붙음          -
+--  data.mount 관계       -              remote-fs 에 걸림  local-fs Required  local-fs Wanted  -
+--  data.mount 상태       -              의존 실패(목록 X)  failed             failed           -
+--  device-timeout=10     -              -                  -                  12.4초에 포기     -
+--
+-- 확인한 사실
+--   7.9 에서 사라진 장치는 emergency 가 아니라 지연과 빈 마운트 지점을 남겼다
+--   장치는 있는데 마운트가 실패하면 local-fs.target 이 실패해 emergency 로 간다
+--   emergency 셸에서는 mount -a 로 원인을 재현하고, 고친 뒤 systemctl default 로 이어 간다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. /data 의 유형을 ext4 대신 xfs 로 잘못 적고 재부팅한다
+--    확인: emergency 로 가는지, journalctl 에 어떤 메시지가 남는지 [8] 과 비교
+-- 2. 사라진 UUID 줄을 둔 채 부팅한 뒤 daemon-reload 를 하고 RequiredBy 를 다시 본다
+--    확인: 장치가 없을 때 generator 가 remote-fs 에 거는지 local-fs 에 거는지
+-- 3. 콘솔 대신 GRUB 에서 systemd.unit=rescue.target 으로 부팅해 같은 오류를 고친다(3장)
+--    확인: rescue 와 emergency 에서 active 인 목표가 어떻게 다른가
+-- 되돌린 뒤 확인: diff /root/fstab.orig /etc/fstab 출력 없음,
+-- systemctl --failed 비어 있음
+================================================================================
+ 실습 04 종료 — 사라진 UUID 는 지연, 옵션 오타는 emergency. 콘솔 복구와 nofail·device-timeout 비교
+================================================================================

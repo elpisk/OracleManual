@@ -10,7 +10,7 @@
 
 **실습 환경:** VMware Workstation Pro 17 | Oracle Linux 7/8/9 | Oracle Database 19c
 
-1. 리눅스
+1. 리눅스 — `OL7ADMIN` (Oracle Linux 7.9 시스템 관리, 20장 + 최종실습시험 5세트, 5일 과정)
 2. SQL
 3. ADMIN
 4. PL/SQL

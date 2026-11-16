@@ -1,0 +1,598 @@
+================================================================================
+ 제4장 실습 02 — ntpd 로 바꿨다가 chrony 로 되돌리기
+ 대상   : ol7a (ntpd 로 전환), ol7b (ol7a 에 시간을 물어보는 쪽)
+ 목표   : chronyd 를 내리고 ntpd 를 올리는 순서, 두 데몬이 동시에 켜지면 생기는 일,
+          ntpq -p 의 열, /etc/sysconfig/ntpd 의 -g 옵션이 하는 일을 확인한 뒤
+          다시 chronyd 로 되돌린다
+ 배경   : OL 7 에는 시간 데몬이 둘 있다. 기본은 chronyd, 예전 방식은 ntp 패키지의 ntpd.
+          둘 다 UDP 123 과 커널 시계 조정 기능을 쓰므로 하나만 켠다. chronyd 유닛에는
+          Conflicts=ntpd.service 가 들어 있어 한쪽을 켜면 다른 쪽이 내려간다.
+          ntpd 는 시간 차이가 1000초를 넘으면 스스로 종료하는데, -g 옵션이 첫 보정에
+          한해 이 제한을 풀어 준다. 이 옵션은 /etc/sysconfig/ntpd 에 있다 (본문 4.1·4.4 절)
+ 소요   : 약 25분 (재부팅 1회 포함)
+ 선행   : ol7a 는 ol7-base, ol7b 는 ol7b-base. 인터넷으로 yum.oracle.com 접속 가능
+ 계정   : root
+ 주의   : ol7a 의 시계를 일부러 2시간 앞으로 돌린다. 되돌림 단계에서 바로잡는다
+ 되돌림 : ntp 패키지 제거, chronyd enabled·active, ntpd 유닛 없음, timedatectl 의
+          NTP synchronized: yes
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 시간 데몬 두 개의 상태를 한 번에 본다. 없는 유닛은 오류 문장으로 나온다.
+[root@ol7a ~]# systemctl is-active chronyd; systemctl is-enabled chronyd; systemctl is-active ntpd
+active
+enabled
+inactive
+
+-- chronyd 는 active·enabled. ntpd 는 inactive.
+-- ntpd 유닛은 아직 없지만 is-active 는 오류 없이 inactive 를 찍는다.
+-- 없는 유닛을 구분하려면 is-enabled 를 본다([11] 에서 확인).
+
+[root@ol7a ~]# rpm -q ntp ntpdate chrony
+package ntp is not installed
+ntpdate-4.2.6p5-29.0.5.el7_8.2.x86_64
+chrony-3.4-1.0.3.el7.x86_64
+
+-- ntp 는 설치돼 있지 않다. ntpdate 와 chrony 는 있다.
+-- ntpdate 와 ntp 는 같은 소스(4.2.6p5)에서 나온 별도 패키지다.
+-- chrony 의 release 1.0.3 에서 .0.N 은 Oracle 이 고친 판이라는
+--   표시다(1장).
+
+-- ntpdate 패키지는 Infrastructure Server 설치에 이미 들어 있다. 유닛
+--   상태도 본다.
+[root@ol7a ~]# systemctl is-enabled ntpdate; cat /etc/sysconfig/ntpdate
+disabled
+# Options for ntpdate
+OPTIONS="-p 2"
+
+-- OPTIONS="-g" 한 줄. -g 의 의미는 [7] 에서 지워 보며 확인한다.
+
+-- ntpdate.service 는 disabled. 부팅 때 한 번 시계를 맞추는 유닛이다.
+-- OPTIONS="-p 2" : 서버마다 표본 2개를 받는다.
+-- SYNC_HWCLOCK=no : 맞춘 뒤 RTC 에는 쓰지 않는다.
+-- 이 파일도 /etc/sysconfig 의 시작 옵션 파일이다(본문 4.1).
+
+# Set to 'yes' to sync hw clock after successful ntpdate
+SYNC_HWCLOCK=no
+
+-- timedatectl 이 "NTP enabled" 를 판단할 때 보는 목록. 파일 이름 앞
+--   숫자가 우선순위다.
+[root@ol7a ~]# ls /usr/lib/systemd/ntp-units.d/; cat /usr/lib/systemd/ntp-units.d/*
+50-chronyd.list
+chronyd.service
+
+-- 지금 목록 파일은 50-chronyd.list 하나, 내용은 chronyd.service.
+-- timedatectl 의 "NTP enabled" 는 이 목록의 유닛이 enable 인지로
+--   정해진다.
+
+[root@ol7a ~]# timedatectl | grep NTP
+     NTP enabled: yes
+NTP synchronized: yes
+
+-- NTP enabled: yes  — 목록의 chronyd 가 enabled
+-- NTP synchronized: yes — 커널의 동기화 플래그가 켜져 있음
+-- [OL8/9] 두 줄 이름이 "NTP service", "System clock
+--   synchronized" 로 바뀐다.
+
+--------------------------------------------------------------------------------
+ [1] ntp 패키지 설치
+--------------------------------------------------------------------------------
+
+-- 설치 출력 끝부분만 본다(tail -n 6). 의존성으로 무엇이 함께 들어오는지 확인한다.
+[root@ol7a ~]# yum install -y ntp 2>&1 | tail -n 6
+  ntp.x86_64 0:4.2.6p5-29.0.5.el7_8.2                                           
+
+-- 설치 출력 끝 6 줄만 보였다. ntp 4.2.6p5 와 의존성 autogen-libopts
+--   가 들어왔다.
+-- [OL8/9] ntp 패키지가 저장소에 없다. 같은 명령이 "No match for
+--   argument" 로 끝난다(문서 기준).
+
+Dependency Installed:
+  autogen-libopts.x86_64 0:5.18-5.el7                                           
+
+Complete!
+[root@ol7a ~]# rpm -ql ntp | grep -E '^/etc|\.service$|ntp-units'
+/etc/dhcp/dhclient.d
+/etc/dhcp/dhclient.d/ntp.sh
+/etc/ntp.conf
+/etc/ntp/crypto
+/etc/ntp/crypto/pw
+/etc/sysconfig/ntpd
+/usr/lib/systemd/ntp-units.d/60-ntpd.list
+/usr/lib/systemd/system/ntpd.service
+
+-- 눈여겨볼 파일 넷.
+--   /etc/ntp.conf                            : 설정 파일
+--   /etc/sysconfig/ntpd                      : 시작 옵션([2])
+--   /usr/lib/systemd/system/ntpd.service     : 유닛
+--   /usr/lib/systemd/ntp-units.d/60-ntpd.list:
+--     timedatectl 목록에 ntpd 를 더함
+-- 60 이 50(chronyd)보다 뒤라 목록 순서는 chronyd, ntpd 가 된다.
+-- /etc/dhcp/dhclient.d/ntp.sh 는 DHCP 가 준 NTP 서버를 쓰게 하는
+--   스크립트다.
+
+--------------------------------------------------------------------------------
+ [2] ntpd 의 설정 파일 두 개
+--------------------------------------------------------------------------------
+
+-- ntp.conf 의 실제 지시어만 본다.
+[root@ol7a ~]# grep -v '^#' /etc/ntp.conf | grep -v '^$'
+driftfile /var/lib/ntp/drift
+restrict default nomodify notrap nopeer noquery
+restrict 127.0.0.1 
+restrict ::1
+server 0.rhel.pool.ntp.org iburst
+server 1.rhel.pool.ntp.org iburst
+server 2.rhel.pool.ntp.org iburst
+server 3.rhel.pool.ntp.org iburst
+includefile /etc/ntp/crypto/pw
+keys /etc/ntp/keys
+disable monitor
+
+-- 지시어별
+--   driftfile /var/lib/ntp/drift : chrony 의 driftfile
+--     과 같은 역할
+--   restrict default nomodify notrap nopeer noquery
+--       : 다른 호스트는 시간만 가져가고 설정 변경·조회·피어 맺기는 못 함
+--   restrict 127.0.0.1, ::1 : 로컬에서는 제한 없음(ntpq 가 여기로
+--     묻는다)
+--   server 0~3.rhel.pool.ntp.org iburst : 위쪽 서버 넷
+--   keys, includefile : 대칭 키 인증 파일
+--   disable monitor   : monlist 조회 기능 끔(증폭 공격에 쓰였던 기능)
+-- chrony.conf 는 0~3.pool.ntp.org 인데 ntp.conf 는
+--   rhel.pool 이다.
+--   업스트림 패키지의 기본값이 그대로 남은 흔적이다.
+-- restrict 줄에 noserve 가 없으므로 ntpd 는 기본으로 시간을 준다.
+--   chronyd 는 allow 가 있어야 준다(실습 01). 두 데몬의 기본값이 반대다.
+
+-- 데몬 시작 옵션은 sysconfig 파일에 있다. 유닛 파일의 EnvironmentFile 이
+--   이 파일을 읽는다.
+[root@ol7a ~]# cat /etc/sysconfig/ntpd
+# Command line options for ntpd
+OPTIONS="-g"
+[root@ol7a ~]# systemctl cat ntpd | grep -E 'Environment|ExecStart|Conflicts|After'
+After=syslog.target ntpdate.service sntp.service
+EnvironmentFile=-/etc/sysconfig/ntpd
+ExecStart=/usr/sbin/ntpd -u ntp:ntp $OPTIONS
+
+-- EnvironmentFile=-/etc/sysconfig/ntpd : 앞의 - 는 파일이
+--   없어도 된다는 뜻
+-- ExecStart=/usr/sbin/ntpd -u ntp:ntp $OPTIONS
+--   -u ntp:ntp 로 root 가 아닌 ntp 계정으로 돈다. $OPTIONS 자리에
+--     -g 가 들어간다
+-- Conflicts 줄이 없다. ntpd 유닛은 chronyd 와의 충돌을 선언하지 않는다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 ① — chronyd 가 켜진 채 ntpd 를 시작
+--------------------------------------------------------------------------------
+
+-- 흔한 실수: 패키지를 깔고 바로 start 만 한다.
+[root@ol7a ~]# systemctl start ntpd; sleep 2; systemctl is-active chronyd; systemctl is-active ntpd
+inactive
+active
+
+-- 재부팅 뒤 chronyd 가 active, ntpd 는 inactive.
+-- 둘 다 enable 돼 있었지만 Conflicts 때문에 systemd 가 하나만 남겼다.
+
+
+-- ntpd 를 시작했을 뿐인데 chronyd 가 inactive 가 됐다. 아무 경고도 없었다.
+
+[root@ol7a ~]# journalctl -u chronyd --no-pager -n 3
+-- Logs begin at Thu 2026-11-12 19:06:49 KST, end at Thu 2026-11-12 19:07:43 KST. --
+Nov 12 19:07:00 ol7a.example.com chronyd[1434]: System clock was stepped by 1.992348 seconds
+Nov 12 19:07:42 ol7a.example.com systemd[1]: Stopping NTP client/server...
+Nov 12 19:07:42 ol7a.example.com systemd[1]: Stopped NTP client/server.
+
+-- 첫 줄 "-- Logs begin at ..." 은 journalctl 의 머리말이다.
+-- systemd 가 chronyd 를 Stopping → Stopped 했다. ntpd 를
+--   시작한 바로 그 초(19:07:42)다.
+-- 그 위 "System clock was stepped by 1.992348 seconds" 는
+--   부팅 직후 기록이다.
+--   스냅샷 시각을 따라잡느라 chronyd 가 약 2초를 한 번에 옮겼다(makestep).
+-- 증상   : systemctl start ntpd 뒤 chronyd 가 inactive. 오류
+--          메시지는 없음
+-- 원인   : chronyd 유닛의 Conflicts=ntpd.service. 한쪽을 시작하면
+--          systemd 가 다른 쪽을 멈춘다
+-- 조치   : 전환은 한쪽을 disable --now, 다른 쪽을 enable --now 로
+--          한다([4])
+-- 재확인 : systemctl is-enabled chronyd ntpd 가 한쪽만
+--          enabled, is-active 도 한쪽만 active
+
+-- 어느 유닛에 Conflicts 가 적혀 있는지 본다.
+[root@ol7a ~]# systemctl show -p Conflicts chronyd; systemctl show -p Conflicts ntpd
+Conflicts=shutdown.target systemd-timesyncd.service ntpd.service
+Conflicts=shutdown.target
+
+-- chronyd 쪽에만 ntpd.service 가 있다.
+--   systemd-timesyncd.service 도 같이 적혀 있다.
+-- ntpd 쪽은 shutdown.target 뿐이다.
+-- Conflicts 는 한쪽에만 적어도 양방향으로 작동한다. 아래에서 확인한다.
+
+-- 반대로 chronyd 를 시작하면?
+[root@ol7a ~]# systemctl start chronyd; sleep 2; systemctl is-active chronyd; systemctl is-active ntpd
+active
+inactive
+
+-- 이번에는 ntpd 가 멈췄다. chronyd 쪽 선언 하나로 양방향이 성립했다.
+
+-- 부팅 때 무엇이 켜질지는 enable 상태가 정한다. 지금 enable 된 것은 chronyd
+--   뿐이다.
+[root@ol7a ~]# systemctl is-enabled chronyd; systemctl is-enabled ntpd
+enabled
+disabled
+
+-- start 는 지금만, enable 은 부팅 때다. Conflicts 는 enable 상태를
+--   건드리지 않는다.
+
+--------------------------------------------------------------------------------
+ [4] 올바른 전환 — chronyd 를 끄고 비활성화한 뒤 ntpd 를 켬
+--------------------------------------------------------------------------------
+
+-- disable --now 는 disable 과 stop 을 한 번에, enable --now
+--   는 enable 과 start 를 한 번에 한다.
+[root@ol7a ~]# systemctl disable --now chronyd
+Removed symlink /etc/systemd/system/multi-user.target.wants/chronyd.service.
+
+-- disable 은 multi-user.target.wants 아래의 링크를 지운다. --now
+--   로 멈추기까지 했다.
+
+[root@ol7a ~]# systemctl enable --now ntpd
+Created symlink from /etc/systemd/system/multi-user.target.wants/ntpd.service to /usr/lib/systemd/system/ntpd.service.
+
+-- 같은 위치에 ntpd 링크를 만들었다.
+
+[root@ol7a ~]# systemctl is-enabled chronyd ntpd; systemctl is-active chronyd ntpd
+disabled
+enabled
+unknown
+active
+
+-- 네 줄의 순서 — chronyd enabled?, ntpd enabled?, chronyd
+--   active?, ntpd active?
+-- 멈추고 disable 한 chronyd 의 is-active 가 inactive 가 아니라
+--   unknown 으로 찍혔다.
+--   스크립트에서 "inactive" 문자열만 비교하면 이 경우를 놓친다. "active 가
+--     아님" 으로 판단한다.
+
+[root@ol7a ~]# timedatectl | grep NTP
+     NTP enabled: yes
+NTP synchronized: no
+
+-- NTP enabled 는 여전히 yes. 목록의 ntpd 가 enabled 이기 때문이다.
+-- NTP synchronized 는 no. ntpd 가 막 떠서 아직 커널 플래그를 세우지
+--   않았다.
+
+--------------------------------------------------------------------------------
+ [5] ntpq -p — 피어 목록의 열
+--------------------------------------------------------------------------------
+
+-- ntpd 가 피어를 고르는 데 시간이 걸린다. iburst 라도 1분쯤 기다린다.
+[root@ol7a ~]# ntpq -p
+     remote           refid      st t when poll reach   delay   offset  jitter
+==============================================================================
+ mail.zeroweb.kr 220.73.142.66    3 u   48   64    1    8.421   -0.540   0.124
+*193.123.243.2   121.134.215.104  3 u   48   64    1    3.125    0.110   0.150
+ any.time.nl     133.243.238.164  2 u   47   64    1   33.176   -0.502   1.759
+ 121.134.215.104 192.168.0.220    2 u   46   64    1    2.431   -0.152   0.054
+
+-- 열별 해설
+--   첫 글자 : * 동기화 대상, + 후보, - 버림, 공백 아직 판단 전
+--   remote  : 피어 이름. 길면 잘린다
+--   refid   : 그 피어가 따르는 위쪽 원천
+--   st      : 피어의 stratum
+--   t       : u 유니캐스트
+--   when    : 마지막 응답 뒤 초, poll : 조회 간격 초(64 = 2^6)
+--   reach   : 8진수 성공 기록. 1 은 첫 응답 하나만 받았다는 뜻
+--   delay, offset, jitter : 왕복 지연, 차이, 흔들림. 단위는 모두 밀리초
+-- reach 가 1 인데도 * 가 이미 하나 골라졌다. iburst 덕분이다.
+
+[root@ol7a ~]# ntpq -pn
+     remote           refid      st t when poll reach   delay   offset  jitter
+==============================================================================
+ 121.174.142.81  220.73.142.66    3 u   48   64    1    8.421   -0.540   0.124
+*193.123.243.2   121.134.215.104  3 u   48   64    1    3.125    0.110   0.150
+ 194.0.5.123     133.243.238.164  2 u   47   64    1   33.176   -0.502   1.759
+ 121.134.215.104 192.168.0.220    2 u   46   64    1    2.431   -0.152   0.054
+
+-- -n 은 이름 대신 IP. remote 열만 바뀌고 나머지 값은 같다.
+-- 이름 해석이 느린 환경에서는 -n 을 붙여야 출력이 빨리 나온다.
+
+[root@ol7a ~]# ntpstat; echo "rc=$?"
+synchronised to NTP server (193.123.243.2) at stratum 4
+   time correct to within 942 ms
+   polling server every 64 s
+rc=0
+
+-- ntpstat 은 동기화 여부를 한 문단으로, 결과를 종료 코드로 알려 준다.
+--   rc=0 동기화됨, 1 안 됨, 2 ntpd 에 연결 못 함
+-- "time correct to within 942 ms" 는 아직 표본이 적어 오차 범위가
+--   크다는 뜻이다.
+
+--------------------------------------------------------------------------------
+ [6] ol7b 에서 ol7a 의 ntpd 에 시간을 물어봄
+--------------------------------------------------------------------------------
+
+-- ntpdate -q 는 시계를 바꾸지 않고 조회만 한다. ol7b 의 chronyd 는 그대로
+--   둔다.
+[root@ol7b ~]# ntpdate -q 172.16.225.61
+server 172.16.225.61, stratum 0, offset 0.000000, delay 0.00000
+12 Nov 19:08:55 ntpdate[10123]: no server suitable for synchronization found
+
+-- stratum 0, offset 0, delay 0 — 응답을 하나도 받지 못했다.
+-- "no server suitable for synchronization found" 는 쓸
+--   만한 서버가 없다는 ntpdate 의 결론이다.
+-- ntpd 는 restrict 기본값으로 시간을 줄 준비가 돼 있다. 막은 것은 ol7a
+--   방화벽이다.
+
+-- 실습 01 과 같은 이유로 ol7a 방화벽에 ntp 를 연다(런타임만. 되돌림에서 reload
+--   로 사라진다).
+[root@ol7a ~]# firewall-cmd --add-service=ntp
+success
+[root@ol7b ~]# ntpdate -q 172.16.225.61
+server 172.16.225.61, stratum 4, offset -0.001279, delay 0.02586
+12 Nov 19:09:01 ntpdate[10141]: adjust time server 172.16.225.61 offset -0.001279 sec
+
+-- 방화벽을 열자 stratum 4, offset -0.001279 초.
+-- 마지막 줄 "adjust time server ..." 는 -q 라서 실제로 맞추지는 않았다.
+-- chronyd 와 달리 ntpd 는 allow 같은 지시어 없이도 응답했다.
+
+--------------------------------------------------------------------------------
+ [7] 오류 ② — 큰 시간 차이와 -g 옵션
+--------------------------------------------------------------------------------
+
+-- ntpd 를 멈추고, 시계를 2시간 앞으로 돌리고, sysconfig 에서 -g 를 뺀다.
+-- date -s '+2 hours' 는 현재 시각에 2시간을 더한 값으로 시스템 시계를 바꾼다.
+[root@ol7a ~]# systemctl stop ntpd; date; date -s '+2 hours'
+Thu Nov 12 19:09:01 KST 2026
+Thu Nov 12 21:09:01 KST 2026
+
+-- date -s 는 바뀐 시각을 찍는다. 19:09:01 → 21:09:01. 7200초 차이다.
+
+[root@ol7a ~]# cp -p /etc/sysconfig/ntpd /root/ntpd.sysconfig.orig; sed -i 's/-g//' /etc/sysconfig/ntpd
+[root@ol7a ~]# diff /root/ntpd.sysconfig.orig /etc/sysconfig/ntpd
+2c2
+< OPTIONS="-g"
+---
+> OPTIONS=""
+
+-- OPTIONS="-g" 가 OPTIONS="" 로 바뀌었다.
+
+-- 이 상태로 시작해 본다. ntpd 는 서버 응답을 받은 뒤에야 차이를 판단하므로 잠시 기다린다.
+[root@ol7a ~]# systemctl start ntpd; sleep 45; systemctl is-active ntpd; date
+failed
+Thu Nov 12 21:09:46 KST 2026
+
+-- failed. 시계는 여전히 21:09 대, 2시간 틀린 채다.
+
+[root@ol7a ~]# journalctl -u ntpd --no-pager -n 6
+-- Logs begin at Thu 2026-11-12 19:06:49 KST, end at Thu 2026-11-12 21:09:10 KST. --
+Nov 12 21:09:05 ol7a.example.com ntpd[2632]: 0.0.0.0 c016 06 restart
+Nov 12 21:09:05 ol7a.example.com ntpd[2632]: 0.0.0.0 c012 02 freq_set kernel 0.000 PPM
+Nov 12 21:09:05 ol7a.example.com ntpd[2632]: 0.0.0.0 c011 01 freq_not_set
+Nov 12 21:09:10 ol7a.example.com systemd[1]: ntpd.service: main process exited, code=exited, status=255/n/a
+Nov 12 21:09:10 ol7a.example.com systemd[1]: Unit ntpd.service entered failed state.
+Nov 12 21:09:10 ol7a.example.com systemd[1]: ntpd.service failed.
+
+-- ntpd 는 21:09:05 에 시작해 5초 뒤 21:09:10 에 status=255 로
+--   끝났다.
+-- 마지막 여섯 줄에는 종료 이유 문장이 없다. journal 의 앞쪽 줄을 더 봐야 한다.
+-- 증상   : -g 없이 시작한 ntpd 가 "main process exited,
+--          code=exited, status=255/n/a",
+--          유닛 상태 failed, 시계는 2시간 틀린 그대로
+-- 원인   : ntpd 는 차이가 1000초를 넘으면 시계가 고장 났다고 보고 스스로 끝낸다.
+--          이번 차이는 7200초. 이 제한을 첫 보정에 한해 푸는 것이
+--            /etc/sysconfig/ntpd 의 -g
+-- 조치   : sysconfig 파일을 원본(OPTIONS="-g")으로 돌리고
+--          systemctl start ntpd
+-- 재확인 : is-active 가 active, date 가 실제 시각, journal 에
+--          clock_step 기록([8])
+
+--------------------------------------------------------------------------------
+ [8] -g 를 되살리고 다시 시작
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cp -p /root/ntpd.sysconfig.orig /etc/sysconfig/ntpd; cat /etc/sysconfig/ntpd
+# Command line options for ntpd
+OPTIONS="-g"
+
+-- 원본으로 돌렸다. 유닛은 시작할 때 이 파일을 읽으므로 다시 start 해야 반영된다.
+
+[root@ol7a ~]# systemctl start ntpd; sleep 30; systemctl is-active ntpd; date
+active
+Thu Nov 12 19:10:16 KST 2026
+
+-- active. 시각이 19:10:16 으로 돌아왔다.
+
+[root@ol7a ~]# journalctl -u ntpd --no-pager -n 4 | grep -E 'step|clock'
+Nov 12 21:09:53 ol7a.example.com ntpd[2695]: 0.0.0.0 c61c 0c clock_step -7199.997105 s
+
+-- clock_step -7199.997105 s — 2시간을 한 번에 뒤로 옮겼다.
+-- 줄 앞의 시각(21:09:53)은 옮기기 직전 시계로 찍힌 것이다.
+-- 운영 중인 DB 서버에서 이렇게 시각이 뒤로 뛰면 로그·트랜잭션 시각이 역전된다.
+
+[root@ol7a ~]# ntpq -pn
+     remote           refid      st t when poll reach   delay   offset  jitter
+==============================================================================
+-193.123.243.2   121.134.215.104  3 u   16   64    1    4.180    0.072   0.157
++121.134.215.104 192.168.0.220    2 u   14   64    1    2.798   -0.386   0.094
++115.15.44.33    158.247.202.103  3 u   14   64    1    9.887   -0.608   0.092
+*211.108.117.211 192.168.0.221    2 u   12   64    1    1.631   -0.242   0.109
+
+-- 피어 넷이 모두 판단을 마쳤다. * 하나, + 둘, - 하나.
+-- reach 는 아직 1. 재시작 직후라 응답이 하나씩만 쌓였다.
+
+--------------------------------------------------------------------------------
+ [9] ntpq 의 시스템 변수
+--------------------------------------------------------------------------------
+
+-- rv 는 read variables. 인자 없이 쓰면 ntpd 자신(연결 0)의 변수를 읽는다.
+-- 출력이 쉼표로 이어져 길어서 tr 로 한 줄에 하나씩 나눴다.
+[root@ol7a ~]# ntpq -c rv | tr ',' '\n' | sed 's/^ *//' | grep -E '^(version|leap|stratum|precision|refid|offset|frequency|sys_jitter|tc|mintc)='
+version="ntpd 4.2.6p5@1.2349-o Wed May 25 23:13:45 UTC 2022 (1)"
+leap=11
+stratum=3
+precision=-25
+refid=211.108.117.211
+tc=6
+mintc=3
+offset=0.000
+frequency=0.000
+sys_jitter=0.178
+
+-- 시스템 변수
+--   version   : ntpd 4.2.6p5
+--   leap=11   : 동기화되지 않음(경보) 상태. 00 이 정상. 방금 step 한
+--     직후라 그렇다
+--   stratum=3 : 하지만 이미 stratum 2 피어를 고른 상태
+--   precision=-25 : 시계 정밀도 2^-25 초
+--   refid     : 따르는 피어
+--   tc, mintc : 현재·최소 시간 상수(조회 간격 지수)
+--   offset, frequency : 0.000. 재시작해서 drift 학습이 아직 없다
+-- chronyc tracking 과 같은 종류의 정보다. chrony 쪽이 읽기 쉽다.
+
+--------------------------------------------------------------------------------
+ [10] 둘 다 enable 된 채 재부팅하면
+--------------------------------------------------------------------------------
+
+-- ntpd 를 쓰는 서버에 누군가 chronyd 를 다시 enable 했다고 가정한다.
+[root@ol7a ~]# systemctl enable chronyd; systemctl is-enabled chronyd ntpd
+Created symlink from /etc/systemd/system/multi-user.target.wants/chronyd.service to /usr/lib/systemd/system/chronyd.service.
+enabled
+enabled
+
+-- 두 유닛이 모두 enabled 다. 지금 돌고 있는 것은 ntpd 하나다.
+
+-- 재부팅 (러너가 재부팅 후 SSH 가 열릴 때까지 기다린다)
+[root@ol7a ~]# systemctl is-active chronyd; systemctl is-active ntpd
+active
+inactive
+[root@ol7a ~]# journalctl -b --no-pager -u chronyd -u ntpd | grep -E 'Start|Stop' | head -8
+Nov 12 19:10:31 ol7a.example.com systemd[1]: Starting NTP client/server...
+Nov 12 19:10:31 ol7a.example.com systemd[1]: Started NTP client/server.
+
+-- "NTP client/server" 는 chronyd 유닛의 Description 이다.
+-- ntpd 는 이번 부팅에서 Starting 도, Stopping 도 없다. 시작 시도조차 하지
+--   않았다.
+--   부팅 작업 목록을 만들 때 충돌하는 둘 중 하나를 빼 버린 결과다.
+-- 이번에는 chronyd 가 남았다. 어느 쪽이 남을지는 systemd 가 정하고 관리자는 고를
+--   수 없다.
+-- 증상   : ntpd 로 운영하던 서버를 재부팅했더니 chronyd 가 돌고 ntpd 는
+--          inactive
+-- 원인   : chronyd 와 ntpd 가 모두 enabled. Conflicts 는 부팅 때
+--          하나만 남기는데 어느 쪽인지 고정되지 않음
+-- 조치   : 쓰지 않을 쪽을 disable 한다. 다음 [변형] 의 timedatectl
+--          set-ntp 도 방법 하나다
+-- 재확인 : systemctl is-enabled chronyd ntpd 에서 enabled 가
+--          하나뿐
+
+--------------------------------------------------------------------------------
+ [변형] timedatectl set-ntp 로 chrony 에 되돌리기
+--------------------------------------------------------------------------------
+
+-- systemctl 로 하나씩 바꾸는 대신, timedatectl 이 ntp-units.d
+--   목록을 보고 처리하게 한다.
+-- set-ntp false 가 목록의 두 유닛을 어떻게 처리하는지 본다.
+[root@ol7a ~]# timedatectl set-ntp false; systemctl is-enabled chronyd ntpd; systemctl is-active chronyd ntpd
+disabled
+enabled
+unknown
+inactive
+
+-- chronyd 는 disabled 로 바뀌고 멈췄다. ntpd 는 enabled 그대로다.
+-- 7.9 의 timedatectl(systemd 219)은 목록의 유닛 가운데 지금 쓰는 것
+--   하나만 처리했다.
+-- 그래서 NTP 를 껐다고 생각해도 다음 부팅에서 ntpd 가 뜰 수 있다.
+
+-- set-ntp true 는 어느 유닛을 켜는지 본다.
+[root@ol7a ~]# timedatectl set-ntp true; sleep 3; systemctl is-enabled chronyd ntpd; systemctl is-active chronyd ntpd
+enabled
+enabled
+active
+inactive
+
+-- 목록 첫 유닛인 chronyd 를 enable·start 했다. ntpd 의 enabled 는
+--   손대지 않았다.
+-- 결국 둘 다 enabled 인 [10] 과 같은 상태가 됐다. 전환할 때는 systemctl
+--   disable 로 정리한다.
+-- 이 실습에서는 다음 단계에서 ntp 패키지를 지워 문제를 없앤다.
+
+--------------------------------------------------------------------------------
+ [11] ntp 패키지 제거와 상태 확인
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# yum remove -y ntp 2>&1 | grep -E 'Removing|Removed|Complete' | head -5
+Removing:
+Removed:
+Complete!
+
+-- 패키지를 지우면 유닛 파일과 ntp-units.d/60-ntpd.list 도 함께 사라진다.
+
+[root@ol7a ~]# rpm -q ntp; systemctl is-enabled ntpd
+package ntp is not installed
+Failed to get unit file state for ntpd.service: No such file or directory
+
+-- 유닛이 없으면 is-enabled 는 "No such file or directory" 오류를
+--   낸다.
+
+[root@ol7a ~]# firewall-cmd --reload; firewall-cmd --list-services
+success
+dhcpv6-client ssh
+
+-- [6] 에서 런타임에만 연 ntp 가 reload 로 사라졌다. 영구 설정을 다시 읽었기
+--   때문이다.
+
+[root@ol7a ~]# sleep 20; chronyc sources; timedatectl | grep NTP
+210 Number of sources = 4
+MS Name/IP address         Stratum Poll Reach LastRx Last sample               
+===============================================================================
+^- mail.zeroweb.kr               3   6    17    18   -518us[ -804us] +/-   48ms
+^- any.time.nl                   2   6    17    18  -2702us[-2702us] +/-   21ms
+^- 121.174.142.82                3   6    17    18   +301us[ +301us] +/-   48ms
+^* 122.45.50.24                  1   6    17    18   +361us[  +74us] +/- 2595us
+     NTP enabled: yes
+NTP synchronized: yes
+
+-- chronyd 가 pool 서버를 다시 ^* 로 따르고 NTP synchronized: yes.
+-- [0] 과 같은 상태다. pool 서버 이름은 매번 달라진다.
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+--  항목                     시작 전          변경 중                         되돌린 뒤
+--  ntp 패키지               없음             4.2.6p5 설치                     없음
+--  chronyd enabled/active   enabled/active   disabled/unknown → enabled       enabled/active
+--  ntpd enabled/active      없음             enabled/active, -g 없을 때 failed  없음
+--  /etc/sysconfig/ntpd      —                OPTIONS="" → OPTIONS="-g"        패키지와 함께 삭제
+--  ol7a 시각                정상             +2시간 → clock_step -7199.997105 s 정상
+--  ol7a 방화벽 ntp          닫힘             런타임만 열림                    닫힘(reload)
+--
+--  관찰 1  chronyd 유닛의 Conflicts=ntpd.service 한 줄로 양방향
+--    충돌이 성립한다
+--  관찰 2  Conflicts 는 enable 을 건드리지 않는다. 둘 다 enabled 면
+--    부팅 때 systemd 가 하나만 남긴다
+--  관찰 3  ntpd 는 -g 없이 1000초 넘는 차이를 만나면 status=255 로 끝난다
+--  관찰 4  ntpd 는 기본 restrict 로 시간을 주지만 chronyd 는 allow
+--    가 있어야 준다
+--  관찰 5  7.9 의 timedatectl set-ntp false/true 는
+--    chronyd 만 처리했고 ntpd 의 enable 은 남겼다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. ntp 를 다시 설치하고 /etc/sysconfig/ntpd 에 OPTIONS="-g
+--   -x" 를 넣는다.
+--    -x 가 step 대신 slew 를 쓰게 하는지 [7] 처럼 시계를 10분 틀어 놓고
+--      journal 로 확인한다.
+-- 2. 둘 다 enable 한 채 재부팅을 세 번 해서 매번 어느 데몬이 남는지 기록한다.
+--    systemctl is-active chronyd ntpd 로 확인한다.
+-- 3. ntp.conf 의 restrict default 줄에 noserve 를 더하고 ol7b
+--   의 ntpdate -q 결과가 어떻게 바뀌는지 본다.
+
+================================================================================
+ 실습 02 종료 — 시간 데몬은 하나만. Conflicts 는 시작만 막고 enable 은 관리자가 정리한다
+================================================================================

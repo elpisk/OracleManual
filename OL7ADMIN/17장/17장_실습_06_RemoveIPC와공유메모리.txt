@@ -1,0 +1,481 @@
+================================================================================
+ 제17장 실습 06 — RemoveIPC 와 공유 메모리: 로그아웃하면 세그먼트가 사라지는 경우
+ 대상   : ol7a
+ 목표   : logind.conf 의 RemoveIPC 값을 확인하고, yes 로 바꿨을 때 일반 사용자가
+          로그아웃하면 그 사용자의 공유 메모리·세마포어가 지워지는 것을 ipcmk·ipcs
+          로 재현한다. 설정을 바꾼 뒤 systemd-logind 를 다시 시작해야 적용된다는 것,
+          시스템 사용자와 열린 세션이 남은 사용자는 지워지지 않는다는 것도 본다
+ 배경   : systemd-logind 는 사용자의 마지막 세션이 끝나면 RemoveIPC=yes 일 때 그
+          사용자 소유의 System V IPC 와 POSIX 공유 메모리를 지운다. Oracle 인스턴스의
+          SGA 와 세마포어가 바로 이것이라, oracle 계정으로 접속했다 나가는 순간
+          인스턴스가 죽는다. 7.9 는 RemoveIPC=no 를 기본으로 둔다(RN79 5장, 본문 17.9)
+ 소요   : 약 20분
+ 선행   : ol7-base 스냅샷
+ 계정   : root, student(UID 1000), 시험용 사용자 두 개(ipcsys, dbown)
+ 주의   : systemd-logind 를 네 번 다시 시작한다. 현재 SSH 세션은 끊기지 않는다
+ 되돌림 : RemoveIPC=no, logind 재시작, 시험 사용자·키 삭제. 확인은 grep RemoveIPC, ipcs -a
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 바꿀 대상은 /etc/systemd/logind.conf 의
+--   RemoveIPC 한 줄. 원본을 복사해 두고 끝에서
+--   diff 로 되돌린 것을 보인다
+-- 이 실습은 oracle 을 만들지 않는다. UID 만 같은
+--   dbown 으로 대신한다
+-- 객체는 ipcmk 로 만든다. Oracle 인스턴스 없이도 같은
+--   System V IPC 가 생긴다
+-- grep -n : 줄 번호를 붙여 찍는다
+[root@ol7a ~]# grep -n 'RemoveIPC' /etc/systemd/logind.conf; cp -p /etc/systemd/logind.conf /root/logind.conf.orig
+33:#RemoveIPC=no
+36:RemoveIPC=no
+-- 33 번 줄 #RemoveIPC=no 는 systemd 기본
+--   파일의 주석 줄(기본값 안내)
+-- 36 번 줄 RemoveIPC=no 는 Oracle Linux 가
+--   7.9 에서 덧붙인 실제 설정이다
+-- systemd 자체의 기본값은 yes 다. 이 한 줄이
+--   없으면 yes 로 동작한다
+-- 릴리스 노트 5장의 설명과 같다. "By default,
+--   Oracle Linux 7.9 configures
+--   RemoveIPC=no"
+[root@ol7a ~]# rpm -qf /etc/systemd/logind.conf; rpm -V systemd | grep logind; echo "verify exit=$?"; ls /etc/systemd/logind.conf*
+systemd-219-78.0.17.el7_9.9.x86_64
+verify exit=1
+/etc/systemd/logind.conf
+-- rpm -qf : 이 파일은
+--   systemd-219-78.0.17.el7_9.9 패키지 소속
+-- rpm -V systemd : 패키지가 깐 파일과 지금 파일을
+--   비교. logind 줄이 없어 grep 은 1 을
+--   돌려줬다(고친 적 없음)
+-- logind.conf.rpmnew 도 없다. 업데이트 때 이
+--   파일을 고쳐 둔 서버라면 여기서 .rpmnew 가 보인다
+[root@ol7a ~]# ipcs -a
+
+------ Message Queues --------
+key        msqid      owner      perms      used-bytes   messages    
+
+------ Shared Memory Segments --------
+key        shmid      owner      perms      bytes      nattch     status      
+
+------ Semaphore Arrays --------
+key        semid      owner      perms      nsems     
+-- ipcs -a : 메시지 큐·공유 메모리·세마포어 세 가지를 모두
+--   본다. 지금은 머리줄만 있고 비어 있다
+-- 열 이름은 객체마다 조금씩 다르다. 아래에서 처음
+--   나올 때 하나씩 짚는다
+[root@ol7a ~]# loginctl list-sessions --no-legend; systemctl show systemd-logind -p ActiveEnterTimestamp
+         1          0 root                             
+ActiveEnterTimestamp=Mon 2026-11-16 11:10:43 KST
+-- loginctl list-sessions : 세션 번호, UID,
+--   사용자, 좌석. 러너가 root 로 SSH 접속한 세션 1 하나
+-- ActiveEnterTimestamp : systemd-logind 가 지금 프로세스로 떠 있기 시작한 시각. [4] 에서 설정 파일 시각과 비교한다
+
+--------------------------------------------------------------------------------
+ [1] ipcmk — 세 종류 IPC 하나씩 만들기
+--------------------------------------------------------------------------------
+
+-- ipcmk -M 바이트 : 공유 메모리, -S 개수 : 세마포어
+--   집합, -Q : 메시지 큐
+-- Oracle 인스턴스가 기동할 때 만드는 것과 같은 종류의
+--   객체다(SGA = 공유 메모리, 프로세스 대기 = 세마포어)
+-- 메시지 큐는 Oracle 이 쓰지 않지만 세 종류가 모두
+--   지워지는지 보려고 함께 만든다
+[student@ol7a ~]$ ipcmk -M 1048576; ipcmk -S 4; ipcmk -Q
+Shared memory id: 0
+Semaphore id: 2
+Message queue id: 0
+-- 각 id 는 커널이 붙인 번호. ipcs 의
+--   shmid·semid·msqid 열과 같다
+-- 세마포어 id 가 2 부터인 것은 0·1 번을 이전에 쓴 기록이
+--   커널에 남아 있어서다
+[student@ol7a ~]$ ipcs -m; ipcs -s
+
+------ Shared Memory Segments --------
+key        shmid      owner      perms      bytes      nattch     status      
+0xb4498ecb 0          student    644        1048576    0                       
+-- 열: key(ipcmk 가 무작위로 고른 키), shmid,
+--   owner, perms(644), bytes(1MiB),
+--   nattch(붙은 프로세스 0), status
+-- owner 가 student. RemoveIPC 는 이
+--   owner 를 보고 지울 대상을 고른다
+-- perms 644 : ipcmk 의 기본
+--   권한(-p 로 바꿀 수 있다)
+
+
+------ Semaphore Arrays --------
+key        semid      owner      perms      nsems     
+0x58346b34 2          student    644        4         
+-- 세마포어 집합 하나, 세마포어 4 개(nsems)
+-- Oracle 은 PROCESSES 만큼의 세마포어를 이런 집합
+--   여러 개로 잡는다(본문 17.5)
+[root@ol7a ~]# ipcs -a | grep -c student
+3
+-- root 세션에서 세었다. student 의 su 세션은 끝났지만
+--   세 객체가 그대로다. 지금 RemoveIPC=no 다
+
+--------------------------------------------------------------------------------
+ [2] su 세션은 logind 에 따로 잡히지 않는다
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ echo "XDG_SESSION_ID=$XDG_SESSION_ID"; loginctl list-sessions --no-legend
+XDG_SESSION_ID=1
+         1          0 root                             
+-- su - student 안에서 본 세션 번호가 1. root 의
+--   SSH 세션 번호를 그대로 물려받았다
+-- 목록에도 student 세션이 없다. 이미 세션 안에 있는
+--   프로세스가 su 를 하면 pam_systemd 가 새
+--   세션을 만들지 않는다
+-- 그래서 logind 입장에서 student 는 로그인한 적이
+--   없고, su 세션이 끝나도 정리가 일어나지 않는다
+-- 설계 단계에서는 su 로 재현하려 했으나 첫 실측에서 세그먼트가
+--   지워지지 않았다(.log 참조). SSH 로 바꾼 이유다
+-- 운영에서 su - oracle 로 작업하는 동안 문제가 안
+--   보이다가 oracle 로 직접 SSH
+--   접속하는 날 드러나는 이유다
+[root@ol7a ~]# loginctl list-users --no-legend
+         0 root            
+-- list-users 도 root 하나. 사용자 단위로 마지막
+--   세션이 끝났는지를 logind 가 추적한다
+
+
+--------------------------------------------------------------------------------
+ [3] SSH 로그인 세션 — logind 가 아는 세션
+--------------------------------------------------------------------------------
+-- 실제 로그인 세션을 만들려고 SSH 키로 student·ipcsys·dbown 이 localhost 에 들어가게 한다
+-- 시험 사용자 둘을 만든다. useradd -r : 시스템
+--   사용자(UID 를 SYS_UID 범위에서), -m : 홈 생성
+-- 세 사용자 모두 같은 root 키로 들어가게 해
+--   비밀번호 입력 없이 진행한다
+-- dbown 은 oracle 과 같은 UID 54321 로
+--   만든다. 이 VM 에는 oracle 이 없어서 번호가 비어 있다
+[root@ol7a ~]# useradd -r -m -s /bin/bash ipcsys; useradd -u 54321 dbown; id ipcsys; id dbown
+uid=996(ipcsys) gid=992(ipcsys) groups=992(ipcsys)
+uid=54321(dbown) gid=54321(dbown) groups=54321(dbown)
+-- ipcsys 는 UID 996, dbown 은 54321. 이
+--   번호 차이가 [6]·[7] 의 결과를 가른다
+[root@ol7a ~]# install -d -m 700 /root/.ssh; ssh-keygen -q -t rsa -N '' -f /root/.ssh/id_rsa >/dev/null 2>&1; for u in student ipcsys dbown; do h=$(getent passwd $u | cut -d: -f6); install -d -m 700 -o $u -g $(id -gn $u) $h/.ssh; install -m 600 -o $u -g $(id -gn $u) /root/.ssh/id_rsa.pub $h/.ssh/authorized_keys; done; echo done
+done
+-- root 의 RSA 키를 만들어 세 사용자의
+--   ~/.ssh/authorized_keys 에 넣었다.
+--   BatchMode=yes 로 비밀번호 없이 들어간다
+-- install -d -m 700 -o 사용자 : 디렉터리를 만들며
+--   권한·소유자를 한 번에 준다
+-- authorized_keys 는 600, .ssh 는 700
+--   이어야 sshd 가 키를 받아들인다
+[root@ol7a ~]# ssh -o StrictHostKeyChecking=no -o BatchMode=yes student@localhost 'echo "XDG_SESSION_ID=$XDG_SESSION_ID"; loginctl list-sessions --no-legend' 2>&1 | grep -v Warning
+XDG_SESSION_ID=2
+         2       1000 student                          
+         1          0 root                             
+-- SSH 로 들어간 student 는
+--   XDG_SESSION_ID=2, 목록에 세션 2(UID
+--   1000 student)가 새로 생겼다
+-- StrictHostKeyChecking=no : localhost 의 호스트 키를 묻지 않고 받는다(시험용)
+-- grep -v Warning : 처음 접속할 때 찍히는
+--   known_hosts 추가 경고를 걸렀다
+-- 이것이 logind 가 아는 진짜 로그인 세션이다. 명령이
+--   끝나면 세션 2 가 닫힌다
+[root@ol7a ~]# ipcs -a | grep -c student
+3
+-- SSH 세션이 끝난 뒤에도 student 객체 세 개가 그대로.
+--   RemoveIPC=no 에서는 로그아웃해도 지우지 않는다
+-- 이것이 7.9 의 기본 동작이다. 이 상태를 기준으로
+--   RemoveIPC=yes 의 영향을 비교한다
+
+--------------------------------------------------------------------------------
+ [4] RemoveIPC=yes 로 바꾸고 재시작은 하지 않음
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ipcrm --all; sed -i 's/^#\?RemoveIPC=.*/RemoveIPC=yes/' /etc/systemd/logind.conf; grep -n RemoveIPC /etc/systemd/logind.conf
+33:RemoveIPC=yes
+36:RemoveIPC=yes
+-- ipcrm --all : 모든 IPC 객체를 지운다.
+--   시험을 새로 시작하려는 것
+-- sed 's/^#\?RemoveIPC=.*/RemoveIPC=yes/' : 주석이든 아니든 RemoveIPC= 로 시작하는 줄을 yes 로
+-- 33·36 번 두 줄이 모두 yes 가 됐다. 같은 키가 두 번
+--   있으면 뒤의 값이 쓰인다
+[root@ol7a ~]# diff /root/logind.conf.orig /etc/systemd/logind.conf
+33c33
+< #RemoveIPC=no
+---
+> RemoveIPC=yes
+36c36
+< RemoveIPC=no
+---
+> RemoveIPC=yes
+-- diff 결과 두 줄이 바뀌었다. 업데이트 전에 이 파일을 이렇게
+--   고쳐 둔 서버가 릴리스 노트가 말하는 상황이다
+-- 릴리스 노트의 경우는 고친 내용이 RemoveIPC 와 상관없어도
+--   생긴다. 파일을 한 글자라도 고쳤으면 .rpmnew 가 된다
+[root@ol7a ~]# ssh -o BatchMode=yes student@localhost 'ipcmk -M 1048576; ipcmk -S 4'
+Shared memory id: 1
+Semaphore id: 3
+-- 파일만 바꾸고 logind 는 재시작하지 않았다. SSH 로
+--   들어가 공유 메모리·세마포어를 하나씩 만들고 나왔다
+[root@ol7a ~]# sleep 2; ipcs -m | grep student; ipcs -s | grep student
+0x1c244530 1          student    644        1048576    0                       
+0xebb9cf0d 3          student    644        4         
+-- sleep 2 : logind 가 세션 종료를 처리할 시간을
+--   준다. 그래도 두 객체가 남아 있다
+-- stat 으로 파일 수정 시각과 logind 의
+--   시작 시각을 나란히 본다
+[root@ol7a ~]# stat -c '%y %n' /etc/systemd/logind.conf; systemctl show systemd-logind -p ActiveEnterTimestamp
+2026-11-16 11:10:52.821214304 +0900 /etc/systemd/logind.conf
+ActiveEnterTimestamp=Mon 2026-11-16 11:10:43 KST
+-- 증상   : RemoveIPC=yes 로 바꿨는데 로그아웃 뒤에도
+--          student 의 세그먼트가 남는다
+-- 원인   : 파일 수정 시각 11:10:52 가 logind 시작
+--          시각 11:10:43 보다 뒤다
+--          logind 는 시작할 때만 logind.conf 를 읽으므로 지금 프로세스는 아직 RemoveIPC=no 로 돈다
+-- 조치   : systemctl restart
+--          systemd-logind (릴리스
+--          노트는 재부팅을 권한다)
+
+--------------------------------------------------------------------------------
+ [5] logind 재시작 뒤
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# systemctl restart systemd-logind; systemctl is-active systemd-logind; systemctl show systemd-logind -p ActiveEnterTimestamp
+active
+ActiveEnterTimestamp=Mon 2026-11-16 11:10:55 KST
+-- 재시작으로 시작 시각이 11:10:55 로
+--   바뀌었다. 이제 파일보다 뒤다
+-- 재확인은 아래 SSH 로그아웃 시험이다
+-- 재시작해도 열려 있는 SSH 세션은 끊기지 않았다. 러너의 다음
+--   명령이 그대로 이어진다
+[root@ol7a ~]# echo "before: $(ipcs -a | grep -c student)"
+before: 2
+-- [4] 에서 만든 두 객체가 남아 있다. 이미 끝난 세션의 객체를
+--   재시작이 소급해 지우지는 않는다
+[student@ol7a ~]$ ipcmk -M 2097152 >/dev/null; echo "su session made shm"
+su session made shm
+-- su 로 하나 더 만든다. 이 객체도
+--   owner 는 student 다
+-- su 는 세션이 아니므로 이 객체가 지워지는지는 다음
+--   SSH 로그아웃에 달렸다
+[root@ol7a ~]# echo "after su: $(ipcs -a | grep -c student)"; ipcs -m | grep student
+after su: 3
+0x1c244530 1          student    644        1048576    0                       
+0xaa071be8 2          student    644        2097152    0                       
+-- su 세션이 끝났는데 세 개가 그대로. [2] 에서 본 대로
+--   su 는 logind 세션을 만들지 않아
+--   "로그아웃" 이 일어나지 않았다
+[root@ol7a ~]# ssh -o BatchMode=yes student@localhost 'ipcmk -M 4194304; ipcs -m | grep student'
+Shared memory id: 3
+0x1c244530 1          student    644        1048576    0                       
+0xaa071be8 2          student    644        2097152    0                       
+0x8fbb6e8f 3          student    644        4194304    0                       
+-- 이번에는 SSH 로 들어가 4MiB 를 더 만들었다. 접속해 있는
+--   동안에는 네 객체가 모두 보인다
+-- ipcs 를 SSH 세션 안에서 실행했다. 세션이
+--   열린 동안의 모습이다
+[root@ol7a ~]# sleep 2; ipcs -m | grep student; ipcs -s | grep student; echo "after ssh logout: $(ipcs -a | grep -c student)"
+after ssh logout: 0
+-- 재확인 : SSH 세션이 끝나자 student 의 공유
+--         메모리·세마포어가 하나도 남지 않았다
+-- su 로 만든 것, 이전 세션에서 만든 것까지 모두 지워졌다.
+--   기준은 "누가 만들었나" 가 아니라
+--   "owner 가 누구인가" 다
+-- Oracle 이라면 SGA 세그먼트와 세마포어가 이렇게 사라진다.
+--   인스턴스 프로세스는 다음 접근에서 오류를 내고 죽는다
+[root@ol7a ~]# journalctl -u systemd-logind --no-pager -n 4 | cut -c1-110
+-- Logs begin at Mon 2026-11-16 11:10:40 KST, end at Mon 2026-11-16 11:10:55 KST. --
+Nov 16 11:10:55 ol7a.example.com systemd-logind[2478]: Watching system buttons on /dev/input/event0 (Power But
+Nov 16 11:10:55 ol7a.example.com systemd-logind[2478]: New session 1 of user root.
+Nov 16 11:10:55 ol7a.example.com systemd-logind[2478]: New session 4 of user student.
+Nov 16 11:10:55 ol7a.example.com systemd-logind[2478]: Removed session 4.
+-- logind 로그: New session 4 of user
+--   student → Removed session 4. 지우는
+--   동작 자체는 로그에 남지 않는다
+-- journalctl -u systemd-logind -n
+--   4 : 그 서비스의 마지막 네 줄
+-- 그래서 장애 분석 때는 /var/log/secure 의 세션 종료
+--   시각과 경고 로그의 인스턴스 종료 시각을 맞춰 본다
+
+--------------------------------------------------------------------------------
+ [6] 지워지지 않는 사용자 — root 와 시스템 사용자
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# grep -E '^(SYS_)?UID_(MIN|MAX)' /etc/login.defs
+UID_MIN                  1000
+UID_MAX                 60000
+SYS_UID_MIN               201
+SYS_UID_MAX               999
+-- SYS_UID 201~999 는 시스템 사용자, UID_MIN
+--   1000 부터 일반 사용자
+-- /etc/login.defs 는 useradd 가 번호를
+--   고를 때 쓰는 파일이다
+-- logind 는 일반 사용자만 정리한다. 기준은 이 파일이 아니라
+--   systemd 빌드 때 정한 값이지만 7.9 에서는 둘이 같다
+[root@ol7a ~]# ssh -o StrictHostKeyChecking=no -o BatchMode=yes ipcsys@localhost 'id -u; ipcmk -M 1048576' 2>&1 | grep -v Warning
+996
+Shared memory id: 4
+-- ipcsys(UID 996)로 SSH 접속해
+--   1MiB 를 만들고 나왔다
+-- id -u 로 UID 996 을 먼저 찍었다
+[root@ol7a ~]# ipcmk -M 1048576 >/dev/null; sleep 2; ipcs -m | awk 'NR<=3 || /ipcsys|root/'
+
+------ Shared Memory Segments --------
+key        shmid      owner      perms      bytes      nattch     status      
+0x81144675 4          ipcsys     644        1048576    0                       
+0xf51afac6 5          root       644        1048576    0                       
+-- 로그아웃 2초 뒤에도 ipcsys 의 세그먼트가 남았다.
+--   root 가 만든 세그먼트도 남는다
+-- awk 'NR<=3 || /ipcsys|root/' : 머리 세
+--   줄과 ipcsys·root 줄만
+-- 시스템 사용자로 DB 를 돌리면 피할 수 있지만 Oracle 은
+--   oracle(54321) 같은 일반 UID 를 쓴다
+
+--------------------------------------------------------------------------------
+ [7] oracle 과 같은 UID 54321 사용자
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ssh -o StrictHostKeyChecking=no -o BatchMode=yes dbown@localhost 'ipcmk -M 4194304; ipcmk -S 250; ipcs -m | grep dbown' 2>&1 | grep -v Warning
+Shared memory id: 6
+Semaphore id: 4
+0x989a0f67 6          dbown      644        4194304    0                       
+-- dbown(UID 54321)으로 SGA 흉내 4MiB, 세마포어
+--   250 개 집합을 만들었다. 접속 중에는 보인다
+-- 세마포어 250 개 = SEMMSL 권고값. 실제 인스턴스가
+--   잡는 집합 하나 크기다
+[root@ol7a ~]# sleep 2; ipcs -m | grep dbown; ipcs -s | grep dbown; echo "dbown objects: $(ipcs -a | grep -c dbown)"
+dbown objects: 0
+-- 로그아웃하자 둘 다 사라졌다. oracle 이 UID 54321
+--   이면 같은 일이 일어난다
+-- 증상   : dbown 으로 접속해 만든 4MiB 세그먼트와
+--          세마포어 250 개 집합이 로그아웃 2초 뒤 0 개
+-- 원인   : RemoveIPC=yes 이고 dbown 의 UID
+--          54321 이 SYS_UID_MAX(999) 보다 크다
+--          그 사용자의 마지막 세션이 닫히자 logind 가 owner 가 dbown 인 IPC 를 모두 지웠다
+-- 조치   : RemoveIPC=no 를
+--          drop-in(logind.conf.d/90-oracle.conf)으로 두고 logind 를 재시작한다([변형])
+-- 재확인 : [변형] 에서 같은 시험의 dbown
+--         shm 이 1 로 남았다
+-- DB 를 띄운 채 oracle 로 접속해 tail 로 경고 로그를
+--   보다가 나가는 것만으로 인스턴스가 죽는 이유다
+
+--------------------------------------------------------------------------------
+ [8] 세션이 하나라도 남아 있으면
+--------------------------------------------------------------------------------
+
+-- 이번에는 dbown 의 세션 하나를 열어 둔다. 백그라운드
+--   ssh 가 sleep 60 을 하는 동안 세션이 유지된다
+-- 앞에 nohup, 끝에 & : 러너가 기다리지 않고
+--   다음 명령으로 넘어간다
+[root@ol7a ~]# nohup ssh -o BatchMode=yes dbown@localhost 'sleep 60' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# sleep 2; loginctl list-users --no-legend; loginctl list-sessions --no-legend
+         0 root            
+     54321 dbown           
+         1          0 root                             
+         7      54321 dbown                            
+-- list-users 에 dbown 이,
+--   list-sessions 에 세션 7(UID
+--   54321)이 보인다
+-- 세션 번호 7 : 앞의 SSH 접속이 4·5·6 번을 썼다
+[root@ol7a ~]# ssh -o BatchMode=yes dbown@localhost 'ipcmk -M 4194304'
+Shared memory id: 7
+[root@ol7a ~]# sleep 2; ipcs -m | grep dbown; echo "dbown shm: $(ipcs -m | grep -c dbown)"
+0xaa7b0524 7          dbown      644        4194304    0                       
+dbown shm: 1
+-- 다른 SSH 세션으로 들어가 4MiB 를 만들고 나왔다. 세션
+--   7 이 아직 열려 있어 세그먼트가 남았다
+-- logind 는 "그 사용자의 마지막 세션" 이 끝날 때만 지운다
+-- 접속해 있는 다른 담당자가 있는 동안은 장애가 나지 않는다
+[root@ol7a ~]# pkill -u dbown sleep; sleep 3; loginctl list-users --no-legend; echo "dbown shm: $(ipcs -m | grep -c dbown)"
+         0 root            
+dbown shm: 0
+-- pkill 로 세션 7 의 sleep 을 끝내자 마지막 세션이
+--   닫혔고, 3초 뒤 세그먼트가 사라졌다
+-- list-users 에서 dbown 이 빠졌다. 사용자
+--   단위로 정리가 일어난다
+-- 장애는 접속한 순간이 아니라 "마지막 접속자가 나간 순간" 에
+--   난다. 원인 추적이 어려운 이유다
+
+--------------------------------------------------------------------------------
+ [변형] drop-in 으로 설정하기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cp -p /root/logind.conf.orig /etc/systemd/logind.conf; mkdir -p /etc/systemd/logind.conf.d; printf '[Login]\nRemoveIPC=no\n' > /etc/systemd/logind.conf.d/90-oracle.conf; cat /etc/systemd/logind.conf.d/90-oracle.conf
+[Login]
+RemoveIPC=no
+-- 원래 logind.conf 로 돌린 뒤 drop-in 디렉터리
+--   logind.conf.d 에
+--   RemoveIPC=no 만 담은 파일을 두었다
+-- systemd 219 도 logind.conf.d 를 읽는다.
+--   아래 결과가 그 증거다
+-- 업데이트가 logind.conf 를 바꾸거나 .rpmnew 를
+--   만들어도 drop-in 은 건드리지 않는다
+[root@ol7a ~]# systemctl restart systemd-logind
+[root@ol7a ~]# ssh -o BatchMode=yes dbown@localhost 'ipcmk -M 4194304'
+Shared memory id: 8
+[root@ol7a ~]# sleep 2; ipcs -m | grep dbown; echo "dbown shm: $(ipcs -m | grep -c dbown)"
+0xe71bd953 8          dbown      644        4194304    0                       
+dbown shm: 1
+-- 재시작 뒤 dbown 의 세그먼트가 로그아웃 후에도 남았다.
+--   drop-in 이 읽혔다
+[root@ol7a ~]# sed -i 's/^#\?RemoveIPC=.*/RemoveIPC=yes/' /etc/systemd/logind.conf; grep -n '^RemoveIPC' /etc/systemd/logind.conf; systemctl restart systemd-logind
+33:RemoveIPC=yes
+36:RemoveIPC=yes
+-- 본 파일을 일부러 yes 로 바꾸고 재시작했다. 본
+--   파일(yes)과 drop-in(no) 중
+--   어느 쪽이 이기는지 본다
+[root@ol7a ~]# ipcrm --all; ssh -o BatchMode=yes dbown@localhost 'ipcmk -M 4194304' >/dev/null; sleep 2; echo "dbown shm: $(ipcs -m | grep -c dbown)"
+dbown shm: 1
+-- 세그먼트가 남았다. 본 파일을 먼저 읽고
+--   logind.conf.d/*.conf 를 나중에 읽어
+--   drop-in 의 no 가 이겼다
+-- 같은 원리로 drop-in 끼리는 파일 이름
+--   순서로 읽혀 뒤가 이긴다
+-- 운영 서버에는 이 drop-in 하나를 표준으로 넣어 두면
+--   logind.conf 를 누가 고쳐도 안전하다
+
+--------------------------------------------------------------------------------
+ [9] 되돌리기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ipcrm --all; rm -rf /etc/systemd/logind.conf.d; cp -p /root/logind.conf.orig /etc/systemd/logind.conf; systemctl restart systemd-logind; grep -n RemoveIPC /etc/systemd/logind.conf
+33:#RemoveIPC=no
+36:RemoveIPC=no
+-- 되돌림: drop-in 삭제, 원본 복사, 재시작. 33·36 번
+--   줄이 [0] 과 같다
+-- diff 대신 원본을 그대로 복사해 파일 시각까지 되돌렸다
+[root@ol7a ~]# userdel -r ipcsys 2>/dev/null; userdel -r dbown; rm -rf /home/student/.ssh /root/.ssh; id dbown; ipcs -a | grep -cE 'student|dbown|ipcsys|root'
+id: dbown: no such user
+0
+-- 시험 사용자·키를 지웠다. 남은 IPC 객체 0. ipcsys 의
+--   메일 스풀 경고는 2>/dev/null 로 버렸다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+--  경우                                       RemoveIPC  logind 재시작  로그아웃 뒤 객체
+--  [1]·[2] su 로 만든 student 객체             no         -              남음
+--  [3] SSH 로 들어갔다 나온 student            no         -              남음 (3)
+--  [4] 파일만 yes                              yes        안 함          남음 (2)
+--  [5] su 로 만든 것(재시작 뒤)                yes        함             남음 (su 는 세션 아님)
+--  [5] SSH 로그아웃                            yes        함             모두 삭제 (0)
+--  [6] ipcsys(UID 996), root                   yes        함             남음
+--  [7] dbown(UID 54321)                        yes        함             삭제 (0)
+--  [8] 다른 세션이 열린 동안 / 닫힌 뒤         yes        함             남음 (1) / 삭제 (0)
+--  [변형] drop-in no + 본 파일 yes             drop-in 이 이김           남음 (1)
+--  되돌린 뒤                                   no (36 번 줄)             -
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. RemoveIPC=yes 상태에서 dbown 으로 POSIX
+--   공유 메모리(/dev/shm 아래 파일)를 만들고 로그아웃한다
+--    확인: ls -l /dev/shm 에서 dbown 소유 파일이 사라지는지
+-- 2. logind.conf.d 에 이름이 다른 drop-in 두
+--   개(10-a.conf: yes, 90-b.conf: no)를
+--   두고 어느 쪽이 이기는지 본다
+-- 3. loginctl enable-linger dbown 을 한
+--   뒤 같은 시험을 한다
+--    확인: loginctl show-user dbown -p Linger, 로그아웃 뒤 ipcs -m
+
+================================================================================
+ 실습 06 종료 — RemoveIPC=yes 는 logind 재시작 뒤부터, 일반 사용자의 마지막 로그인 세션이 끝날 때 IPC 를 모두 지웠다
+================================================================================

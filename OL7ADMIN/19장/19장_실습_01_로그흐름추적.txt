@@ -1,0 +1,501 @@
+================================================================================
+ 제19장 실습 01 — 로그 흐름 추적
+ 대상   : ol7a
+ 목표   : logger·systemd-cat·/dev/kmsg 로 남긴 메시지가 journald 를 거쳐 rsyslog 로,
+          다시 /var/log 의 어느 파일로 가는지 한 건씩 따라간다. facility·priority 를
+          바꿔 가며 파일이 갈리는 지점을 확인하고, rsyslog 를 멈췄을 때 어디까지 남는지 본다
+ 배경   : OL 7.9 에서 /dev/log 소켓은 journald 가 잡고 있다. 커널(/dev/kmsg), syslog()
+          호출, 서비스의 stdout·stderr 가 모두 journald 로 먼저 들어간다. rsyslog 는
+          imjournal 모듈로 journal 을 읽어 rsyslog.conf 의 셀렉터대로 파일에 쓴다.
+          그래서 journal 에는 있고 /var/log/messages 에는 없는 메시지가 생긴다 (본문 19.1·19.2·19.5)
+ 소요   : 약 30분
+ 선행   : ol7-base 스냅샷
+ 계정   : root
+ 주의   : [10] 에서 rsyslog 를 잠시 멈췄다 다시 시작한다. 설정 파일은 바꾸지 않는다
+ 되돌림 : rsyslog 실행 중, 설정 파일 원본 그대로 → systemctl is-active rsyslog, md5sum
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 이 실습에서 다루는 패키지 셋과 데몬 둘의 상태를 먼저 남긴다.
+[root@ol7a ~]# rpm -q rsyslog systemd logrotate util-linux
+rsyslog-8.24.0-57.0.3.el7_9.3.x86_64
+systemd-219-78.0.17.el7_9.9.x86_64
+logrotate-3.8.6-19.el7.x86_64
+util-linux-2.23.2-65.0.4.el7_9.1.x86_64
+-- rsyslog 8.24.0, systemd 219, logrotate 3.8.6, util-linux 2.23.2(logger 가 들어 있는 패키지)
+[root@ol7a ~]# systemctl is-active rsyslog systemd-journald; systemctl is-enabled rsyslog
+active
+active
+enabled
+-- 두 데몬 active, rsyslog 는 enabled
+-- journald 는 systemd 가 늘 띄우는 정적 유닛이라 is-enabled 대상이 아니다
+
+-- 설정 파일 두 개의 지문을 찍어 둔다. 끝에서 같은 값이 나와야 한다.
+[root@ol7a ~]# md5sum /etc/rsyslog.conf /etc/systemd/journald.conf
+0dd94a0c285fb32f41fa5b226e83c26b  /etc/rsyslog.conf
+61493a9d3062a5d0f9a2e7297ed9497d  /etc/systemd/journald.conf
+
+-- journal 이 어디에 저장되는지 본다. /run 은 tmpfs 라 재부팅하면 사라진다.
+[root@ol7a ~]# ls -ld /var/log/journal /run/log/journal; df -hT /run | tail -1
+ls: cannot access /var/log/journal: No such file or directory
+drwxr-sr-x. 3 root systemd-journal 60 Nov 16 12:34 /run/log/journal
+tmpfs          tmpfs  1.8G  8.7M  1.8G   1% /run
+-- /var/log/journal 이 없다. 그래서 journal 은 /run/log/journal 에 있다
+-- /run/log/journal 은 그룹 systemd-journal 에 setgid(s). 안의 파일이 그 그룹을 물려받는다
+-- df 의 열: 장치·형식 tmpfs, 크기 1.8G, 사용 8.7M, 남음 1.8G, 1%, /run. 메모리 위의 파일 시스템
+
+--------------------------------------------------------------------------------
+ [1] 누가 /dev/log 를 잡고 있나
+--------------------------------------------------------------------------------
+
+-- 프로그램이 syslog() 를 부르면 glibc 는 /dev/log 유닉스 소켓에 쓴다.
+-- 그 소켓의 실체가 무엇인지, 어느 프로세스가 열고 있는지 확인한다.
+[root@ol7a ~]# ls -l /dev/log; ls -l /run/systemd/journal/
+srw-rw-rw-. 1 root root 0 Nov 16 12:34 /dev/log
+total 4
+-rw-r--r--. 1 root root   0 Nov 16 12:34 flushed
+-rw-r--r--. 1 root root   8 Nov 16 12:34 kernel-seqnum
+srw-rw-rw-. 1 root root   0 Nov 16 12:34 socket
+srw-rw-rw-. 1 root root   0 Nov 16 12:34 stdout
+drwxr-xr-x. 2 root root 400 Nov 16 12:34 streams
+-- /dev/log 의 첫 글자 s 는 소켓이다. 심볼릭 링크가 아니라 소켓 파일 자체다
+-- socket 은 journald 고유 프로토콜 입구, stdout 은 서비스 표준 출력 입구다
+-- flushed 는 flush 요청(/run → /var)이 처리됐다는 표시 파일이다
+
+-- systemd 소켓 유닛으로 본 같은 사실. journald 는 소켓 세 개로 메시지를 받는다.
+[root@ol7a ~]# systemctl list-units --no-legend 'systemd-journald*'
+systemd-journald.service loaded active running Journal Service
+systemd-journald.socket  loaded active running Journal Socket
+-- systemd-journald.socket 이 /dev/log·socket·stdout 세 소켓을 만들어 journald 에 넘긴다
+
+-- rsyslog 는 /dev/log 를 열지 않는다. 열고 있는 유닉스 소켓과 파일을 본다.
+-- lsof -p 는 그 프로세스가 연 파일 전부. 로그 파일·journal 파일만 골라 본다.
+[root@ol7a ~]# lsof -p $(pidof rsyslogd) 2>/dev/null | awk 'NR==1 || /\/var\/log|journal|imjournal/'
+COMMAND   PID USER   FD      TYPE             DEVICE SIZE/OFF      NODE NAME
+rsyslogd 1417 root  mem       REG               0,25  8388608     12656 /run/log/journal/b8658360b45f49fe8174bcd0b610ae6e/system.journal
+rsyslogd 1417 root  mem       REG              252,0    29120 202919312 /usr/lib64/rsyslog/imjournal.so
+rsyslogd 1417 root    5r      REG               0,25  8388608     12656 /run/log/journal/b8658360b45f49fe8174bcd0b610ae6e/system.journal
+rsyslogd 1417 root    6w      REG              252,0  1047291  68145533 /var/log/messages
+rsyslogd 1417 root    7w      REG              252,0     2796  67109574 /var/log/cron
+rsyslogd 1417 root    8w      REG              252,0    10237  68145535 /var/log/secure
+rsyslogd 1417 root    9w      REG              252,0     1316  68145777 /var/log/maillog
+-- lsof 열: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+-- FD 의 5r 은 읽기(read)로 연 5번 기술자, 6w~9w 는 쓰기(write)로 연 파일이다
+-- rsyslogd 가 system.journal 을 읽기로 열었다. imjournal 이 읽는 파일이다
+-- mem 은 mmap 으로 올린 파일. journal 파일과 imjournal.so 모듈
+-- 쓰기로 연 것은 messages·cron·secure·maillog 넷. /dev/log 는 목록에 없다
+
+--------------------------------------------------------------------------------
+ [2] rsyslog.conf 의 살아 있는 줄
+--------------------------------------------------------------------------------
+
+-- 주석과 빈 줄을 빼면 기본 설정은 스무 줄 남짓이다.
+-- -n 으로 줄 번호를 붙여 [3] 이후 해설에서 줄을 가리킨다.
+[root@ol7a ~]# grep -nEv '^[[:space:]]*#|^[[:space:]]*$' /etc/rsyslog.conf
+9:$ModLoad imuxsock # provides support for local system logging (e.g. via logger command)
+10:$ModLoad imjournal # provides access to the systemd journal
+26:$WorkDirectory /var/lib/rsyslog
+29:$ActionFileDefaultTemplate RSYSLOG_TraditionalFileFormat
+36:$IncludeConfig /etc/rsyslog.d/*.conf
+40:$OmitLocalLogging on
+43:$IMJournalStateFile imjournal.state
+54:*.info;mail.none;authpriv.none;cron.none                /var/log/messages
+57:authpriv.*                                              /var/log/secure
+60:mail.*                                                  -/var/log/maillog
+64:cron.*                                                  /var/log/cron
+67:*.emerg                                                 :omusrmsg:*
+70:uucp,news.crit                                          /var/log/spooler
+73:local7.*                                                /var/log/boot.log
+-- 9·10행  입력 모듈 imuxsock(로컬 소켓)·imjournal(journal)
+-- 26행     상태 파일·큐 파일이 놓이는 작업 디렉터리
+-- 29행     파일 기본 줄 형식. 연도·초 아래 자릿수가 없다
+-- 36행     rsyslog.d/*.conf 를 이 자리에 끼워 넣는다. 54행 RULES 보다 위다
+-- 40행     OmitLocalLogging on. imuxsock 이 /dev/log 를 열지 않게 한다
+-- 43행     imjournal 의 커서 상태 파일 이름
+-- 54~73행  규칙 일곱 줄. 왼쪽 셀렉터, 오른쪽 액션
+
+-- 모듈 줄 중 주석으로 막혀 있는 것도 본다. imklog·imudp·imtcp 가 여기 있다.
+[root@ol7a ~]# grep -nE '^#[[:space:]]*\$(ModLoad|UDPServerRun|InputTCPServerRun)' /etc/rsyslog.conf
+11:#$ModLoad imklog # reads kernel messages (the same are read from journald)
+12:#$ModLoad immark  # provides --MARK-- message capability
+15:#$ModLoad imudp
+16:#$UDPServerRun 514
+19:#$ModLoad imtcp
+20:#$InputTCPServerRun 514
+-- 11행 imklog 의 주석 "the same are read from journald" 가 7.9 의 구조다. 커널 메시지도 journal 에서 받는다
+-- 15~20행 imudp·imtcp 가 원격 수신 모듈이다(실습 03)
+
+--------------------------------------------------------------------------------
+ [3] journald.conf 의 기본값
+--------------------------------------------------------------------------------
+
+-- journald.conf 는 모든 줄이 주석이다. 주석에 적힌 값이 컴파일된 기본값이다.
+[root@ol7a ~]# grep -c . /etc/systemd/journald.conf; grep -Ev '^#|^$' /etc/systemd/journald.conf
+39
+[Journal]
+-- 39줄 중 살아 있는 줄은 [Journal] 머리 하나뿐이다. 모든 값이 기본값이다
+[root@ol7a ~]# grep -E '^#(Storage|Compress|RateLimit|SystemMaxUse|RuntimeMaxUse|ForwardToSyslog|MaxLevelStore)' /etc/systemd/journald.conf
+#Storage=auto
+#Compress=yes
+#RateLimitInterval=30s
+#RateLimitBurst=1000
+#SystemMaxUse=
+#RuntimeMaxUse=
+#ForwardToSyslog=yes
+#MaxLevelStore=debug
+-- Storage=auto            /var/log/journal 이 있으면 영구, 없으면 휘발성(실습 05)
+-- Compress=yes            큰 필드를 압축해 저장
+-- RateLimitInterval·Burst 30초 동안 서비스 하나당 1000건까지 받고 나머지는 버림
+-- SystemMaxUse·RuntimeMaxUse  비어 있으면 파일 시스템 크기로 계산(실습 05)
+-- ForwardToSyslog=yes     syslog 소켓으로도 넘김. 7.9 의 rsyslog 는 이 길 대신 imjournal 로 읽는다
+-- MaxLevelStore=debug     debug 까지 모두 저장. journal 에 local0.debug 가 남는 이유다([5])
+
+-- 지금 journal 이 쓰는 공간과 파일 위치.
+[root@ol7a ~]# journalctl --disk-usage; ls -l /run/log/journal/*/
+Archived and active journals take up 8.0M on disk.
+total 8192
+-rwxr-x---+ 1 root systemd-journal 8388608 Nov 16 12:34 system.journal
+-- 파일 하나가 8,388,608 바이트(8.0M)다. journald 는 파일을 미리 큰 단위로 잡아 두고 안을 채운다
+
+--------------------------------------------------------------------------------
+ [4] logger 한 건을 끝까지 따라가기
+--------------------------------------------------------------------------------
+
+-- logger 는 셸에서 syslog 메시지를 남기는 도구다.
+--   -t TAG : 태그(프로그램 이름 자리). 주지 않으면 로그인 계정 이름이 들어간다
+--   -p F.P : facility.priority. 주지 않으면 user.notice
+-- imjournal 이 journal 을 읽어 파일에 쓰기까지 잠깐 걸린다. sleep 2 를 둔다.
+[root@ol7a ~]# logger -t lab19 "LAB19-01 first message"; sleep 2; grep LAB19-01 /var/log/messages
+Nov 16 12:34:21 ol7a lab19: LAB19-01 first message
+-- messages 한 줄의 네 부분: 시각(Nov 16 12:34:21)  호스트(ol7a)  태그(lab19:)  본문
+-- 호스트는 짧은 이름, 시각에는 연도가 없다. 29행의 RSYSLOG_TraditionalFileFormat 형식이다
+
+-- 같은 메시지를 journal 에서 본다. -t 는 SYSLOG_IDENTIFIER 로 거른다.
+[root@ol7a ~]# journalctl -t lab19 --no-pager
+-- Logs begin at Mon 2026-11-16 12:34:09 KST, end at Mon 2026-11-16 12:34:21 KST. --
+Nov 16 12:34:21 ol7a.example.com lab19[2240]: LAB19-01 first message
+-- "-- Logs begin at … --" 은 journalctl 이 붙이는 범위 머리 줄이다(출력)
+-- journal 쪽은 호스트가 FQDN(ol7a.example.com)이고 태그 뒤에 PID [2240] 가 붙는다
+
+-- -o verbose 는 journal 이 그 항목에 붙여 둔 필드 전부를 보여 준다.
+[root@ol7a ~]# journalctl -t lab19 -n 1 -o verbose --no-pager
+-- Logs begin at Mon 2026-11-16 12:34:09 KST, end at Mon 2026-11-16 12:34:21 KST. --
+Mon 2026-11-16 12:34:21.195245 KST [s=a120c77814f2429cb5c7223270e6a2e7;i=68e;b=76e33852833e43d0912bef446291fe91;m=c1411c;t=6605c741724bd;x=46fb3cbe81ad8b24]
+    _UID=0
+    _GID=0
+    _BOOT_ID=76e33852833e43d0912bef446291fe91
+    _MACHINE_ID=b8658360b45f49fe8174bcd0b610ae6e
+    _HOSTNAME=ol7a.example.com
+    PRIORITY=5
+    _TRANSPORT=syslog
+    SYSLOG_FACILITY=1
+    SYSLOG_IDENTIFIER=lab19
+    MESSAGE=LAB19-01 first message
+    _PID=2240
+    _SELINUX_CONTEXT=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023
+    _SOURCE_REALTIME_TIMESTAMP=1794800061195245
+-- [s=…;i=68e;b=…] 는 항목의 커서. i 항목 번호, b 부팅 ID
+-- 밑줄로 시작하는 필드는 journald 가 직접 채운 값이다
+--   _UID=0·_GID=0  보낸 프로세스의 계정(소켓 자격 증명에서 읽음)
+--   _BOOT_ID       이번 부팅의 ID. -b 필터가 이 값을 쓴다
+--   _TRANSPORT=syslog  /dev/log 로 들어왔다
+--   _PID=2240      logger 프로세스
+-- 밑줄 없는 필드는 보낸 쪽이 정한 값이다
+--   PRIORITY=5        notice. -p 를 안 줬을 때의 기본값
+--   SYSLOG_FACILITY=1 user
+--   SYSLOG_IDENTIFIER=lab19  -t 로 준 태그
+-- _COMM·_EXE 가 없다. logger 가 먼저 끝나 journald 가 /proc 에서 못 읽었다
+-- 짧게 끝나는 프로세스는 이 필드가 빠질 수 있다([11] 의 _COMM 필터)
+
+--------------------------------------------------------------------------------
+ [5] facility·priority 를 바꿔 보내기
+--------------------------------------------------------------------------------
+
+-- local0 은 관리자가 마음대로 쓰라고 비워 둔 facility(local0~local7) 중 하나다.
+-- 같은 facility 에 priority 만 바꿔 세 건을 보낸다.
+[root@ol7a ~]# logger -t lab19 -p local0.err "LAB19-05 local0 err"; logger -t lab19 -p local0.info "LAB19-05 local0 info"; logger -t lab19 -p local0.debug "LAB19-05 local0 debug"; sleep 2
+
+-- messages 에 몇 건이 들어갔나.
+[root@ol7a ~]# grep LAB19-05 /var/log/messages
+Nov 16 12:34:23 ol7a lab19: LAB19-05 local0 err
+Nov 16 12:34:23 ol7a lab19: LAB19-05 local0 info
+-- messages 에는 err·info 두 건. 54행 *.info 가 debug 를 받지 않는다
+
+-- journal 은 몇 건을 받았나. -p 는 그 priority 이상만 보여 준다.
+[root@ol7a ~]# journalctl -t lab19 --no-pager | grep LAB19-05
+Nov 16 12:34:23 ol7a.example.com lab19[2296]: LAB19-05 local0 err
+Nov 16 12:34:23 ol7a.example.com lab19[2297]: LAB19-05 local0 info
+Nov 16 12:34:23 ol7a.example.com lab19[2298]: LAB19-05 local0 debug
+-- journal 에는 세 건 모두. logger 세 번이라 PID 가 2296·2297·2298
+[root@ol7a ~]# journalctl -t lab19 -p err --no-pager
+-- Logs begin at Mon 2026-11-16 12:34:09 KST, end at Mon 2026-11-16 12:34:23 KST. --
+Nov 16 12:34:23 ol7a.example.com lab19[2296]: LAB19-05 local0 err
+-- -p err 는 err(3) 와 그보다 심각한 것만 보여 준다. 한 건이다
+
+-- 필드 값으로 보면 숫자가 보인다. -o export 는 필드=값 형식.
+[root@ol7a ~]# journalctl -t lab19 -o export --no-pager | grep -E '^(PRIORITY|SYSLOG_FACILITY|MESSAGE)=' | tail -9
+PRIORITY=3
+SYSLOG_FACILITY=16
+MESSAGE=LAB19-05 local0 err
+PRIORITY=6
+SYSLOG_FACILITY=16
+MESSAGE=LAB19-05 local0 info
+PRIORITY=7
+SYSLOG_FACILITY=16
+MESSAGE=LAB19-05 local0 debug
+-- facility 숫자: user 1, cron 9, authpriv 10, local0~7 은 16~23
+-- priority 는 err 3, info 6, debug 7. 숫자가 작을수록 심각하다
+-- 셀렉터 *.info 는 "PRIORITY 6 이하"와 같은 뜻이다
+
+--------------------------------------------------------------------------------
+ [6] authpriv 는 messages 에 없다
+--------------------------------------------------------------------------------
+
+-- 인증 관련 메시지는 authpriv facility 로 간다. sshd·su·sudo 가 이 facility 를 쓴다.
+[root@ol7a ~]# logger -t lab19 -p authpriv.notice "LAB19-06 authpriv test"; sleep 2
+[root@ol7a ~]# grep -c LAB19-06 /var/log/messages; grep LAB19-06 /var/log/secure
+0
+Nov 16 12:34:25 ol7a lab19: LAB19-06 authpriv test
+-- messages 에는 0건, secure 에 한 건
+
+-- 오류 흐름 ①을 위한 확인: messages 줄의 셀렉터를 다시 본다.
+[root@ol7a ~]# grep -n '/var/log/messages' /etc/rsyslog.conf; ls -l /var/log/messages /var/log/secure
+54:*.info;mail.none;authpriv.none;cron.none                /var/log/messages
+-rw-------. 1 root root 1047439 Nov 16 12:34 /var/log/messages
+-rw-------. 1 root root   10288 Nov 16 12:34 /var/log/secure
+-- 54행 셀렉터에 authpriv.none 이 있다. *.info 로 받은 것 중 authpriv 를 다시 뺀다
+--
+-- 증상   : logger -p authpriv.notice 로 보낸 메시지가 /var/log/messages 에 없음(grep -c 결과 0)
+-- 원인   : 기본 messages 규칙 *.info;mail.none;authpriv.none;cron.none 이 authpriv 를 뺌.
+--          57행 authpriv.* /var/log/secure 가 따로 받는다
+-- 조치   : 인증 메시지는 /var/log/secure 에서 찾는다. 규칙을 바꿀 일이 아니다
+-- 재확인 : grep LAB19-06 /var/log/secure 에 한 줄, journalctl -t lab19 에도 한 줄
+
+-- journal 은 facility 를 가리지 않고 모두 받는다.
+[root@ol7a ~]# journalctl -t lab19 -n 1 --no-pager
+-- Logs begin at Mon 2026-11-16 12:34:09 KST, end at Mon 2026-11-16 12:34:25 KST. --
+Nov 16 12:34:25 ol7a.example.com lab19[2393]: LAB19-06 authpriv test
+
+--------------------------------------------------------------------------------
+ [7] 커널 메시지 — /dev/kmsg
+--------------------------------------------------------------------------------
+
+-- 커널 링 버퍼는 dmesg 로 보고, journald 는 /dev/kmsg 를 읽어 journal 에 넣는다.
+-- root 는 /dev/kmsg 에 직접 써서 커널 메시지 흉내를 낼 수 있다. <4> 는 priority warning.
+[root@ol7a ~]# echo "<4>LAB19-07 written to kmsg" > /dev/kmsg; sleep 2
+[root@ol7a ~]# dmesg | tail -2
+[    4.192043] IPv6: ADDRCONF(NETDEV_CHANGE): ens33: link becomes ready
+[   18.893079] LAB19-07 written to kmsg
+-- dmesg 의 [초] 는 부팅 후 경과 시간이다. 부팅 18.9초 뒤에 쓴 줄로 기록됐다
+[root@ol7a ~]# journalctl -k -n 2 --no-pager
+-- Logs begin at Mon 2026-11-16 12:34:09 KST, end at Mon 2026-11-16 12:34:27 KST. --
+Nov 16 12:34:12 ol7a.example.com kernel: IPv6: ADDRCONF(NETDEV_CHANGE): ens33: link becomes ready
+Nov 16 12:34:27 ol7a.example.com unknown: LAB19-07 written to kmsg
+-- journalctl -k 에도 나온다. 태그를 주지 않아 식별자가 unknown 이다
+[root@ol7a ~]# grep LAB19-07 /var/log/messages
+Nov 16 12:34:27 ol7a journal: LAB19-07 written to kmsg
+-- messages 에는 태그가 journal 로 적혔다. rsyslog 가 식별자 없는 항목에 붙인 이름이다
+
+-- 사용자 공간에서 쓴 줄은 facility 가 kern 이 아니다. 필드로 확인한다.
+[root@ol7a ~]# journalctl -k -n 1 -o export --no-pager | grep -E '^(_TRANSPORT|PRIORITY|SYSLOG_FACILITY|SYSLOG_IDENTIFIER)='
+_TRANSPORT=kernel
+PRIORITY=4
+SYSLOG_FACILITY=1
+-- _TRANSPORT=kernel 이지만 SYSLOG_FACILITY=1(user)이다
+-- 커널은 사용자 공간이 /dev/kmsg 에 쓴 줄에 kern(0) facility 를 허락하지 않는다
+
+--------------------------------------------------------------------------------
+ [8] 서비스 stdout 도 journal 로 간다
+--------------------------------------------------------------------------------
+
+-- systemd 가 띄운 서비스의 stdout·stderr 는 journald 의 stdout 소켓으로 연결된다.
+-- systemd-run 은 명령을 임시 서비스 유닛으로 실행한다.
+[root@ol7a ~]# systemd-run --unit=lab19echo /bin/sh -c 'echo LAB19-08 to stdout; echo LAB19-08 to stderr >&2'; sleep 2
+Running as unit lab19echo.service.
+-- 임시 유닛 lab19echo.service 가 만들어졌다. 명령이 끝나면 유닛도 사라진다
+[root@ol7a ~]# journalctl -u lab19echo --no-pager
+-- Logs begin at Mon 2026-11-16 12:34:09 KST, end at Mon 2026-11-16 12:34:30 KST. --
+Nov 16 12:34:30 ol7a.example.com systemd[1]: Started /bin/sh -c echo LAB19-08 to stdout; echo LAB19-08 to stderr >&2.
+Nov 16 12:34:30 ol7a.example.com sh[2561]: LAB19-08 to stdout
+Nov 16 12:34:30 ol7a.example.com sh[2561]: LAB19-08 to stderr
+-- 첫 줄은 systemd 자신이 남긴 Started 메시지, 나머지 둘이 sh 의 stdout·stderr 이다
+[root@ol7a ~]# grep LAB19-08 /var/log/messages
+Nov 16 12:34:30 ol7a systemd: Started /bin/sh -c echo LAB19-08 to stdout; echo LAB19-08 to stderr >&2.
+Nov 16 12:34:30 ol7a sh: LAB19-08 to stdout
+Nov 16 12:34:30 ol7a sh: LAB19-08 to stderr
+-- 같은 세 줄이 messages 에도 있다. rsyslog 가 journal 을 읽어 *.info 규칙으로 썼다
+
+-- 이 항목들의 전송 경로 필드.
+[root@ol7a ~]# journalctl -u lab19echo -o export --no-pager | grep -E '^(_TRANSPORT|PRIORITY|SYSLOG_IDENTIFIER)=' | sort | uniq -c
+      3 PRIORITY=6
+      2 SYSLOG_IDENTIFIER=sh
+      1 SYSLOG_IDENTIFIER=systemd
+      1 _TRANSPORT=journal
+      2 _TRANSPORT=stdout
+-- stdout 두 건(sh), journal 한 건(systemd 의 Started 줄)
+-- stderr 줄도 PRIORITY=6(info). stderr 라고 err 로 저장되지 않는다
+
+--------------------------------------------------------------------------------
+ [9] journal 에 들어온 경로 전체 — _TRANSPORT
+--------------------------------------------------------------------------------
+
+-- -F 필드 는 그 필드의 서로 다른 값만 뽑는다. 이번 부팅에 어떤 경로로 메시지가 들어왔는지 본다.
+[root@ol7a ~]# journalctl -b -F _TRANSPORT
+syslog
+stdout
+journal
+kernel
+driver
+-- syslog  /dev/log
+-- stdout  서비스 표준 출력
+-- journal journald 고유 프로토콜(sd_journal_print 등). systemd 자신의 메시지가 여기로 온다
+-- kernel  /dev/kmsg
+-- driver  journald 자신이 남긴 내부 메시지
+
+-- 경로별 건수.
+[root@ol7a ~]# for t in $(journalctl -b -F _TRANSPORT); do printf '%-8s %s\n' $t $(journalctl -b _TRANSPORT=$t --no-pager -q | wc -l); done
+syslog   109
+stdout   33
+journal  226
+kernel   1313
+driver   5
+-- 이번 부팅의 항목은 커널 1313 건이 가장 많다. 부팅 직후라 커널 메시지 비중이 크다
+
+-- messages 파일 줄 수와 비교한다.
+[root@ol7a ~]# wc -l /var/log/messages
+12420 /var/log/messages
+-- messages 가 12420 줄로 journal(이번 부팅 1,686 건)보다 많다
+-- messages 는 디스크라 지난 부팅 기록도 있다. journal 은 이번 부팅 것뿐
+
+--------------------------------------------------------------------------------
+ [10] rsyslog 를 멈추면
+--------------------------------------------------------------------------------
+
+-- 오류 흐름 ②. rsyslog 가 멈춘 동안 남긴 메시지가 어디에 남는지 본다.
+[root@ol7a ~]# systemctl stop rsyslog; systemctl is-active rsyslog
+inactive
+[root@ol7a ~]# logger -t lab19 "LAB19-10 while rsyslog stopped"; sleep 2
+[root@ol7a ~]# grep -c LAB19-10 /var/log/messages; journalctl -t lab19 -n 1 --no-pager
+0
+-- Logs begin at Mon 2026-11-16 12:34:09 KST, end at Mon 2026-11-16 12:34:32 KST. --
+Nov 16 12:34:32 ol7a.example.com lab19[2727]: LAB19-10 while rsyslog stopped
+-- messages 에는 0건, journal 에는 있다. 입구인 journald 는 계속 받는다
+
+-- imjournal 은 마지막으로 읽은 journal 위치(커서)를 상태 파일에 적어 둔다.
+[root@ol7a ~]# ls -l /var/lib/rsyslog/; cut -c1-80 /var/lib/rsyslog/imjournal.state
+total 4
+-rw-------. 1 root root 120 Nov 16 12:34 imjournal.state
+s=a120c77814f2429cb5c7223270e6a2e7;i=696;b=76e33852833e43d0912bef446291fe91;m=14
+-- 상태 파일 내용은 [4] verbose 첫 줄과 같은 형식의 커서다. i=696 은 항목 번호
+-- [4] 의 첫 메시지가 i=68e 였다. rsyslog 가 그 뒤 몇 건을 더 읽고 멈췄다
+
+-- 다시 시작하면 그 커서부터 읽는다.
+[root@ol7a ~]# systemctl start rsyslog; sleep 3; grep LAB19-10 /var/log/messages
+Nov 16 12:34:32 ol7a lab19: LAB19-10 while rsyslog stopped
+-- 시작하자 정지 중이던 12:34:32 의 메시지가 messages 에 들어왔다. 시각은 보낸 시각 그대로다
+--
+-- 증상   : rsyslog 정지 중 logger 메시지가 messages 에 없음(grep -c 0), journal 에는 있음
+-- 원인   : 파일을 쓰는 것은 rsyslog 다. journald 는 받았지만 읽어 갈 rsyslog 가 없었다
+-- 조치   : systemctl start rsyslog. imjournal 이 imjournal.state 의 커서부터 이어 읽는다
+-- 재확인 : grep LAB19-10 /var/log/messages 에 12:34:32 줄
+-- journal 이 휘발성이면 rsyslog 가 멈춘 채 재부팅됐을 때 이 복구가 안 된다. 실습 05 의 동기다
+
+--------------------------------------------------------------------------------
+ [11] journalctl 필터 몇 가지
+--------------------------------------------------------------------------------
+
+-- 유닛과 시간: -u 유닛, --since 는 "-10min" 같은 상대 시각도 받는다.
+[root@ol7a ~]# journalctl -u rsyslog --since "-10min" --no-pager | tail -3
+Nov 16 12:34:34 ol7a.example.com rsyslogd[2785]:  [origin software="rsyslogd" swVersion="8.24.0-57.0.3.el7_9.3" x-pid="2785" x-info="http://www.rsyslog.com"] start
+Nov 16 12:34:34 ol7a.example.com systemd[1]: Starting System Logging Service...
+Nov 16 12:34:34 ol7a.example.com systemd[1]: Started System Logging Service.
+-- [10] 의 재시작 기록. start 줄에 버전과 PID 2785
+-- --since·--until 은 "-10min", "yesterday", "2026-11-16 12:00" 형식을 받는다
+
+-- 필드 일치: _COMM 은 실행 파일 이름. 같은 필드 둘은 OR, 다른 필드는 AND.
+[root@ol7a ~]# journalctl _COMM=logger -n 3 --no-pager
+-- Logs begin at Mon 2026-11-16 12:34:09 KST, end at Mon 2026-11-16 12:34:34 KST. --
+Nov 16 12:34:32 ol7a.example.com lab19[2727]: LAB19-10 while rsyslog stopped
+-- logger 를 여섯 번 넘게 불렀는데 _COMM=logger 로는 한 건만 나왔다
+-- 짧게 끝난 logger 는 _COMM 이 빠졌다([4]). 태그(-t)로 찾는 편이 확실하다
+
+-- priority 범위: -p warning..err 는 warning 부터 err 까지만.
+[root@ol7a ~]# journalctl -b -p warning..err --no-pager | tail -3
+Nov 16 12:34:12 ol7a.example.com firewalld[1052]: WARNING: AllowZoneDrifting is enabled. This is considered an insecure configuration option. It will be removed in a future release. Please consider disabling it now.
+Nov 16 12:34:23 ol7a.example.com lab19[2296]: LAB19-05 local0 err
+Nov 16 12:34:27 ol7a.example.com unknown: LAB19-07 written to kmsg
+-- warning(4)~err(3) 범위만 나왔다. firewalld 의 WARNING, local0.err, kmsg 의 <4>
+
+-- 출력 형식: short-iso, cat(메시지만)
+[root@ol7a ~]# journalctl -t lab19 -n 2 -o short-iso --no-pager; journalctl -t lab19 -n 2 -o cat --no-pager
+-- Logs begin at Mon 2026-11-16 12:34:09 KST, end at Mon 2026-11-16 12:34:34 KST. --
+2026-11-16T12:34:25+0900 ol7a.example.com lab19[2393]: LAB19-06 authpriv test
+2026-11-16T12:34:32+0900 ol7a.example.com lab19[2727]: LAB19-10 while rsyslog stopped
+LAB19-06 authpriv test
+LAB19-10 while rsyslog stopped
+-- short-iso 는 연도·시간대(+0900)를 붙이고, cat 은 본문만 찍는다
+
+--------------------------------------------------------------------------------
+ [변형] logger 대신 systemd-cat
+--------------------------------------------------------------------------------
+
+-- systemd-cat 은 표준 입력을 journal 에 바로 넣는다(syslog 소켓이 아니라 stdout 소켓).
+--   -t 태그, -p priority (facility 는 지정 못 함)
+[root@ol7a ~]# echo "LAB19-V via systemd-cat" | systemd-cat -t lab19cat -p warning; sleep 2
+[root@ol7a ~]# journalctl -t lab19cat -o export --no-pager | grep -E '^(_TRANSPORT|PRIORITY|SYSLOG_FACILITY|SYSLOG_IDENTIFIER)='
+PRIORITY=4
+_TRANSPORT=stdout
+SYSLOG_IDENTIFIER=lab19cat
+-- _TRANSPORT=stdout, PRIORITY=4(warning). SYSLOG_FACILITY 필드가 아예 없다
+-- logger 는 syslog 소켓, systemd-cat 은 stdout 소켓으로 들어간다
+[root@ol7a ~]# grep LAB19-V /var/log/messages
+Nov 16 12:34:37 ol7a lab19cat: LAB19-V via systemd-cat
+-- facility 가 없어도 rsyslog 는 user 로 보고 *.info 규칙에 따라 messages 에 썼다
+
+-- logger 는 원격 서버로 바로 보내는 옵션도 있다(실습 03 에서 쓴다). 7.9 의 logger 에서 그 옵션만 고른다.
+[root@ol7a ~]# logger --help | grep -E -- '--(tcp|udp|server|port)'
+ -T, --tcp             use TCP only
+ -d, --udp             use UDP only
+ -n, --server <name>   write to this remote syslog server
+ -P, --port <port>     use this port for UDP or TCP connection
+-- 7.9 의 logger 로도 원격 서버를 직접 시험할 수 있다
+-- [OL8/9] util-linux 2.32 이후 logger 는 --rfc5424, --msgid 같은 옵션이 더 있다
+
+--------------------------------------------------------------------------------
+ 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# systemctl is-active rsyslog systemd-journald; md5sum /etc/rsyslog.conf /etc/systemd/journald.conf
+active
+active
+0dd94a0c285fb32f41fa5b226e83c26b  /etc/rsyslog.conf
+61493a9d3062a5d0f9a2e7297ed9497d  /etc/systemd/journald.conf
+-- 두 데몬 active, md5 두 값이 [0] 과 같다. 설정 파일은 바꾸지 않았다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  보낸 방법                       journal   messages   기록된 곳·필드
+--  logger (user.notice)            있음      있음       _TRANSPORT=syslog, PRIORITY=5, FACILITY=1
+--  logger -p local0.err/info       있음      있음       FACILITY=16, PRIORITY=3·6
+--  logger -p local0.debug          있음      없음       *.info 미만
+--  logger -p authpriv.notice       있음      없음       /var/log/secure 에 기록
+--  echo "<4>…" > /dev/kmsg         있음      있음       _TRANSPORT=kernel, FACILITY=1(user), 태그 journal
+--  systemd-run 의 stdout·stderr    있음      있음       _TRANSPORT=stdout, 둘 다 PRIORITY=6
+--  rsyslog 정지 중 logger          있음      재시작 뒤  imjournal.state 커서부터 이어 읽음
+--  systemd-cat -p warning          있음      있음       _TRANSPORT=stdout, FACILITY 필드 없음
+--  되돌린 뒤: 두 데몬 active, 두 설정 파일 md5 가 시작 전(0dd94a0c…·61493a9d…)과 같음
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. logger -i 를 붙여 보내고 messages 줄에 PID 가 붙는지 본다. journal 쪽 _PID 와 같은지 비교한다
+-- 2. journalctl -f 를 한 창에 띄우고 다른 창에서 logger·systemd-cat 을 보낸다. 지연이 있는지 본다
+-- 3. journalctl -b -o json --no-pager | head -1 로 한 항목을 JSON 으로 보고 [4] 의 verbose 필드와 맞춰 본다
+
+================================================================================
+ 실습 01 종료 — 모든 메시지는 journald 를 먼저 거치고, rsyslog 는 셀렉터로 고른 것만 파일에 쓴다
+================================================================================

@@ -1,0 +1,524 @@
+================================================================================
+ 제14장 실습 01 — NFS 서버와 클라이언트
+ 대상   : ol7a (NFS 서버), ol7b (NFS 클라이언트)
+ 목표   : ol7a 의 내보내기를 ol7b 에서 마운트하고 exportfs -v·nfsstat -m 을 읽는다.
+          방화벽에서 열 서비스를 나눠 보고 fstab 으로 재부팅 뒤에도 붙인다
+ 배경   : NFS 서버는 /etc/exports 에 적은 디렉터리를 nfsd 가 커널 안에서 내보낸다.
+          exports 파일은 exportfs 가 읽어 커널 내보내기 표(/var/lib/nfs/etab)로
+          옮길 때만 반영된다. NFSv4 는 TCP 2049 하나로 통신하지만 showmount 와
+          NFSv3 는 rpcbind(111)와 mountd 가 따로 필요하다 (본문 14.1~14.3)
+ 소요   : 약 40분
+ 선행   : ol7-base, ol7b-base 스냅샷
+ 계정   : root, student (ol7b 에서 쓰기 시험)
+ 주의   : ol7b 를 한 번 재부팅한다. ol7a 의 firewalld 영구 설정을 바꿨다가 되돌린다
+ 되돌림 : ol7b 의 마운트·fstab 줄 제거, ol7a 의 exports 비움·nfs-server 정지·방화벽 원복
+          → findmnt -t nfs4 (빈 출력), firewall-cmd --list-services (ssh dhcpv6-client)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+-- 서버가 될 ol7a 에 NFS 패키지가 있는지,
+-- 서비스와 방화벽이 지금 어떤지 남긴다.
+-- 설치할 때 @file-server 그룹을 골랐으면 nfs-utils 가 이미 들어 있다.
+[root@ol7a ~]# rpm -q nfs-utils rpcbind
+nfs-utils-1.3.0-0.68.0.1.el7.2.x86_64
+rpcbind-0.2.0-49.el7.x86_64
+[root@ol7a ~]# systemctl is-enabled nfs-server rpcbind; systemctl is-active nfs-server rpcbind
+disabled
+enabled
+inactive
+active
+-- 네 줄은 순서대로 is-enabled 2개, is-active 2개
+--   nfs-server : disabled / inactive → 아직 서버가 아니다
+--   rpcbind    : enabled / active → 기본으로 떠 있다
+[root@ol7a ~]# firewall-cmd --get-default-zone; firewall-cmd --list-services
+public
+dhcpv6-client ssh
+-- 기본 영역 public 에 ssh·dhcpv6-client 둘뿐. [12] 에서 이 줄로 돌아온다
+[root@ol7a ~]# cat /etc/exports; ls -l /etc/exports /etc/exports.d
+-rw-r--r--. 1 root root 0 Jun  7  2013 /etc/exports
+
+/etc/exports.d:
+total 0
+-- exports 는 0 바이트(빈 파일), exports.d 도 비어 있다
+[root@ol7b ~]# rpm -q nfs-utils; findmnt -t nfs,nfs4; grep -c nfs /etc/fstab
+nfs-utils-1.3.0-0.68.0.1.el7.2.x86_64
+0
+-- findmnt 는 출력이 없고(NFS 마운트 없음), grep -c 는 0
+
+--------------------------------------------------------------------------------
+ [1] 내보낼 디렉터리 만들기
+--------------------------------------------------------------------------------
+-- /srv/nfs 아래에 공유용 디렉터리를 둔다.
+-- 소유자를 student 로 해 ol7b 의 student 가 쓸 수 있게 한다.
+-- student 의 UID 는 두 노드 모두 1000 이다.
+-- NFS 는 이름이 아니라 UID 숫자로 권한을 판단한다.
+[root@ol7a ~]# id student
+uid=1000(student) gid=1000(student) groups=1000(student),10(wheel)
+[root@ol7b ~]# id student
+uid=1000(student) gid=1000(student) groups=1000(student),10(wheel)
+-- 두 노드의 student 가 1000 으로 같다.
+-- 이 실습이 쓰기 시험에 student 를 쓰는 이유
+[root@ol7a ~]# mkdir -p /srv/nfs/share; chown student:student /srv/nfs/share; chmod 755 /srv/nfs/share
+[root@ol7a ~]# echo "hello from ol7a" > /srv/nfs/share/readme.txt; ls -ln /srv/nfs/share; df -hT /srv/nfs
+total 4
+-rw-r--r--. 1 0 0 16 Nov 16 10:13 readme.txt
+-- ls -ln : 소유자를 이름 대신 숫자로. readme.txt 는 root(0)가 만들었다
+Filesystem          Type  Size  Used Avail Use% Mounted on
+/dev/mapper/ol-root xfs    36G  4.3G   31G  13% /
+-- /srv/nfs 는 루트 파일 시스템(XFS 36G)
+-- 안의 디렉터리다. 따로 디스크를 붙이지 않았다
+
+--------------------------------------------------------------------------------
+ [2] /etc/exports 작성
+--------------------------------------------------------------------------------
+-- 한 줄 형식: 내보낼경로  클라이언트(옵션,옵션)  [클라이언트2(옵션)] ...
+-- 클라이언트와 여는 괄호 사이에 공백이 없어야 한다(실습 02 에서 공백을 넣어 본다).
+--   rw   : 읽기·쓰기 허용 (기본값은 ro)
+--   sync : 디스크에 쓴 뒤에 응답 (기본값. 적지 않으면 exportfs 가 경고한다)
+[root@ol7a ~]# echo '/srv/nfs/share  ol7b.example.com(rw,sync)' > /etc/exports; cat /etc/exports
+-- 클라이언트를 이름으로 적었다.
+-- ol7b 의 IP 를 /etc/hosts 로 역조회한 결과와 맞아야 한다
+/srv/nfs/share  ol7b.example.com(rw,sync)
+
+--------------------------------------------------------------------------------
+ [3] nfs-server 시작과 rpc 서비스 확인
+--------------------------------------------------------------------------------
+-- enable --now : 부팅 때 자동 시작 등록과 지금 시작을 함께 한다.
+[root@ol7a ~]# systemctl enable --now nfs-server
+Created symlink from /etc/systemd/system/multi-user.target.wants/nfs-server.service to /usr/lib/systemd/system/nfs-server.service.
+[root@ol7a ~]# systemctl status nfs-server --no-pager -n 0
+● nfs-server.service - NFS server and services
+   Loaded: loaded (/usr/lib/systemd/system/nfs-server.service; enabled; vendor preset: disabled)
+  Drop-In: /run/systemd/generator/nfs-server.service.d
+           └─order-with-mounts.conf
+   Active: active (exited) since Mon 2026-11-16 10:13:28 KST; 66ms ago
+  Process: 2219 ExecStartPost=/bin/sh -c if systemctl -q is-active gssproxy; then systemctl reload gssproxy ; fi (code=exited, status=0/SUCCESS)
+  Process: 2205 ExecStart=/usr/sbin/rpc.nfsd $RPCNFSDARGS (code=exited, status=0/SUCCESS)
+  Process: 2203 ExecStartPre=/usr/sbin/exportfs -r (code=exited, status=0/SUCCESS)
+ Main PID: 2205 (code=exited, status=0/SUCCESS)
+   CGroup: /system.slice/nfs-server.service
+-- 읽을 곳
+--   Active         : active (exited). 시작 작업이 끝나고 커널 스레드만 남은 상태
+--   ExecStartPre   : exportfs -r. 시작할 때 exports 를 읽는다
+--   ExecStart      : rpc.nfsd. 커널에 스레드를 만들라고 시키고 끝난다
+--   ExecStartPost  : gssproxy 가 떠 있으면 다시 읽힌다(Kerberos 용). 여기서는 해당 없음
+--   Drop-In        : fstab 의 마운트와 순서를 맞추는 generator 설정
+-- nfs-server 는 커널 nfsd 스레드를 띄우는 oneshot 유닛이라 "active (exited)" 로 남는다.
+-- 함께 뜨는 서비스를 본다. rpcbind 는 소켓으로,
+-- mountd·idmapd 는 의존성으로 올라온다.
+[root@ol7a ~]# systemctl is-active rpcbind nfs-mountd nfs-idmapd rpc-statd
+active
+active
+active
+active
+-- rpcinfo -p : rpcbind 에 등록된 RPC 프로그램과 포트. program 번호 100003 이 nfs, 100005 가 mountd.
+[root@ol7a ~]# rpcinfo -p | awk '$3=="tcp" || NR==1'
+-- awk 로 tcp 줄만 남겼다(udp 줄은 같은 프로그램이 한 번 더 나온다)
+   program vers proto   port  service
+    100000    4   tcp    111  portmapper
+    100000    3   tcp    111  portmapper
+    100000    2   tcp    111  portmapper
+    100024    1   tcp  42143  status
+    100005    1   tcp  20048  mountd
+    100005    2   tcp  20048  mountd
+    100005    3   tcp  20048  mountd
+    100003    3   tcp   2049  nfs
+    100003    4   tcp   2049  nfs
+    100227    3   tcp   2049  nfs_acl
+    100021    1   tcp  40633  nlockmgr
+    100021    3   tcp  40633  nlockmgr
+    100021    4   tcp  40633  nlockmgr
+-- 열 해설
+--   program : RPC 프로그램 번호   vers : 그 프로그램의 버전
+--   proto   : tcp/udp             port : 등록된 포트
+-- 이 실습에서 볼 줄
+--   100000 portmapper 111   : rpcbind 자신
+--   100005 mountd     20048 : v1·v2·v3 세 버전 (v3 마운트·showmount 용)
+--   100003 nfs        2049  : vers 3·4. 4.1·4.2 는 4 안에 들어 있다
+--   100227 nfs_acl    2049  : v3 의 ACL 보조 프로토콜
+--   100024 status 42143, 100021 nlockmgr 40633 : v3 잠금. 포트가 고정돼 있지 않다
+-- 실제로 듣고 있는 TCP 포트.
+-- 2049(nfsd)는 커널이 열어서 프로세스 이름이 없다.
+[root@ol7a ~]# ss -tlnp | grep -E ':(111|2049|20048) '
+LISTEN 0      64           0.0.0.0:2049       0.0.0.0:*                                        
+LISTEN 0      128          0.0.0.0:111        0.0.0.0:*    users:(("rpcbind",pid=988,fd=8))    
+LISTEN 0      128          0.0.0.0:20048      0.0.0.0:*    users:(("rpc.mountd",pid=2201,fd=8))
+LISTEN 0      64              [::]:2049          [::]:*                                        
+LISTEN 0      128             [::]:111           [::]:*    users:(("rpcbind",pid=988,fd=11))   
+LISTEN 0      128             [::]:20048         [::]:*    users:(("rpc.mountd",pid=2201,fd=10))
+-- 2049 줄에는 users:(...) 가 없다. nfsd 는 커널이 연 소켓이라 프로세스가 없다
+-- 111 은 rpcbind, 20048 은 rpc.mountd. IPv4·IPv6 각각 한 줄씩
+-- 커널 nfsd 스레드 개수. RPCNFSDCOUNT 기본값 8.
+[root@ol7a ~]# cat /proc/fs/nfsd/threads; ps -e | grep -c nfsd
+8
+-- threads 8 = ps 의 nfsd 8개. /etc/sysconfig/nfs 의 RPCNFSDCOUNT 로 바꾼다
+8
+-- 서버가 받아 주는 NFS 버전. +는 허용, -는 거부.
+[root@ol7a ~]# cat /proc/fs/nfsd/versions
+-2 +3 +4 +4.1 +4.2
+-- v2 는 꺼져 있고 3·4·4.1·4.2 를 받는다.
+-- 4.2 는 문서 목록에 없지만 서버는 받는다
+
+--------------------------------------------------------------------------------
+ [4] exportfs -v — 내보내기 표 읽기
+--------------------------------------------------------------------------------
+-- exportfs -v : 커널에 지금 걸린 내보내기 목록을 기본값까지 펼쳐 보여 준다.
+-- exports 에는 rw,sync 두 개만 적었다. 나머지는 전부 기본값이다.
+[root@ol7a ~]# exportfs -v
+/srv/nfs/share  ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+-- 적은 것: rw, sync. 나머지가 기본값
+--   wdelay            : 쓰기를 잠시 모아 내림
+--   hide              : 하위 파일 시스템을 따로 내보내야 보임
+--   no_subtree_check  : 하위 트리 검사 생략
+--   sec=sys           : UID·GID 숫자 인증
+--   secure            : 클라이언트 포트 1024 미만만
+--   root_squash       : 클라이언트 root → 65534
+--   no_all_squash     : 일반 사용자는 그대로
+-- exportfs 가 읽은 결과는 /var/lib/nfs/etab 에 저장된다.
+-- 여기에는 생략 없이 모든 옵션이 적힌다.
+[root@ol7a ~]# cat /var/lib/nfs/etab
+/srv/nfs/share  ol7b.example.com(rw,sync,wdelay,hide,nocrossmnt,secure,root_squash,no_all_squash,no_subtree_check,secure_locks,acl,no_pnfs,anonuid=65534,anongid=65534,sec=sys,rw,secure,root_squash,no_all_squash)
+-- etab 은 더 길다. nocrossmnt, secure_locks, acl, no_pnfs, anonuid=65534 등
+-- 끝에 rw,secure,root_squash,no_all_squash 가 한 번 더 붙는 것은 출력 형식이다
+
+--------------------------------------------------------------------------------
+ [5] 방화벽 때문에 막힌다 — 클라이언트에서 확인
+--------------------------------------------------------------------------------
+-- showmount -e 서버 : 서버의 mountd 에 내보내기 목록을 묻는다. rpcbind(111) → mountd 순서로 붙는다.
+[root@ol7b ~]# showmount -e ol7a
+clnt_create: RPC: Port mapper failure - Unable to receive: errno 113 (No route to host)
+-- 증상   : showmount -e 가 "Port mapper failure ... errno 113 (No route to host)" 로 끝남
+-- 111(rpcbind)에 닿지 못했다. 원인은 아래 마운트 결과와 함께 본다
+-- 마운트도 시도한다.
+-- 버전을 적지 않으면 7.9 클라이언트는 높은 버전부터 협상한다.
+--   -v : mount.nfs 가 무엇을 시도하는지 보여 준다
+--   timeout 40 : 멈춰 있으면 40초 뒤에 끊는다 (rc=124 가 나오면 시간 초과)
+-- mount(2) 가 No route to host 를 7번 받고도 계속 재시도했다
+-- 40초 뒤 timeout 이 끊어 rc=124. 그냥 두면 mount.nfs 는 2분(retry=2)을 채운다
+-- ping 이 되는 상대에게서 No route to host 가 오면 상대 방화벽의 거부부터 의심한다
+[root@ol7b ~]# mkdir -p /mnt/share
+[root@ol7b ~]# time timeout 40 mount -v -t nfs ol7a:/srv/nfs/share /mnt/share; echo "rc=$?"
+mount.nfs: mount(2): No route to host
+mount.nfs: mount(2): No route to host
+mount.nfs: mount(2): No route to host
+mount.nfs: mount(2): No route to host
+mount.nfs: mount(2): No route to host
+mount.nfs: mount(2): No route to host
+mount.nfs: mount(2): No route to host
+
+real    0m40.023s
+user    0m0.000s
+sys     0m0.002s
+rc=124
+-- 서버 쪽 방화벽을 본다.
+-- 기본 영역 public 에 열린 서비스는 ssh·dhcpv6-client 뿐이다.
+[root@ol7a ~]# firewall-cmd --list-all | sed -n '1,8p'
+public (active)
+  target: default
+  icmp-block-inversion: no
+  interfaces: ens32
+  sources: 
+  services: dhcpv6-client ssh
+  ports: 
+  protocols: 
+-- 원인   : 서버 firewalld 의 public 영역에 nfs·rpc-bind·mountd 가 없다
+--          거부 패킷(icmp-host-prohibited)이 클라이언트에 No route to host 로 보인다
+
+--------------------------------------------------------------------------------
+ [6] nfs 서비스만 연다 — v4 는 되고 showmount 는 안 된다
+--------------------------------------------------------------------------------
+-- firewalld 의 nfs 서비스 정의에 무슨 포트가 들어 있는지 먼저 본다.
+[root@ol7a ~]# for s in nfs mountd rpc-bind; do firewall-cmd --info-service=$s | grep -E '^[a-z]|  ports:'; done
+nfs
+  ports: 2049/tcp
+mountd
+  ports: 20048/tcp 20048/udp
+rpc-bind
+  ports: 111/tcp 111/udp
+-- 서비스마다 포트
+--   nfs      : 2049/tcp 하나
+--   mountd   : 20048/tcp·udp ([3] 의 rpcinfo 와 같은 값)
+--   rpc-bind : 111/tcp·udp
+-- --permanent 는 디스크 설정만 바꾼다. --reload 로 런타임에 올린다.
+[root@ol7a ~]# firewall-cmd --permanent --add-service=nfs; firewall-cmd --reload; firewall-cmd --list-services
+success
+success
+dhcpv6-client nfs ssh
+-- 조치   : nfs 서비스를 영구 설정에 넣고 reload. 런타임과 영구 둘 다 반영됐다
+[root@ol7b ~]# time timeout 40 mount -t nfs ol7a:/srv/nfs/share /mnt/share; echo "rc=$?"
+
+real    0m0.037s
+user    0m0.000s
+sys     0m0.004s
+rc=0
+-- 이번에는 0.037초 만에 rc=0. v4 는 2049 하나로 끝났다
+[root@ol7b ~]# findmnt /mnt/share
+TARGET     SOURCE              FSTYPE OPTIONS
+/mnt/share ol7a:/srv/nfs/share nfs4   rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none,addr=172.16.225.61
+-- FSTYPE nfs4, vers=4.1. 옵션 없는 마운트가 4.1 로 협상됐다
+[root@ol7b ~]# showmount -e ol7a
+clnt_create: RPC: Port mapper failure - Unable to receive: errno 113 (No route to host)
+-- showmount 는 여전히 실패. 111 이 아직 닫혀 있다
+-- showmount 를 쓰려면 rpcbind 와 mountd 를 함께 연다.
+[root@ol7a ~]# firewall-cmd --permanent --add-service=rpc-bind --add-service=mountd; firewall-cmd --reload; firewall-cmd --list-services
+success
+success
+dhcpv6-client mountd nfs rpc-bind ssh
+[root@ol7b ~]# showmount -e ol7a
+Export list for ol7a:
+/srv/nfs/share ol7b.example.com
+-- 재확인 : showmount -e 가 내보내기 목록(경로, 허용 클라이언트)을 보여 준다
+[root@ol7b ~]# showmount -a ol7a
+All mount points on ol7a:
+-- 비어 있다. v4 마운트는 mountd 를 거치지 않아 mountd 의 기록에 남지 않는다
+
+--------------------------------------------------------------------------------
+ [7] 클라이언트에서 마운트 상태 읽기
+--------------------------------------------------------------------------------
+[root@ol7b ~]# findmnt -t nfs4 -o TARGET,SOURCE,FSTYPE,OPTIONS
+TARGET     SOURCE              FSTYPE OPTIONS
+/mnt/share ol7a:/srv/nfs/share nfs4   rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none,addr=172.16.225.61
+[root@ol7b ~]# nfsstat -m
+/mnt/share from ol7a:/srv/nfs/share
+ Flags: rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none,addr=172.16.225.61
+-- Flags 필드
+--   rw, relatime     : 일반 마운트 옵션
+--   vers=4.1         : 협상된 버전
+--   rsize/wsize      : 524288(512KiB). 서버 최대값으로 협상됐다
+--   namlen=255       : 파일 이름 최대 길이
+--   hard             : 서버 무응답 시 끝없이 재시도
+--   proto=tcp        : 전송 프로토콜
+--   timeo=600        : 60초(단위 0.1초)
+--   retrans=2        : 주요 시간 초과까지 재시도 횟수
+--   sec=sys          : 인증
+--   clientaddr       : v4 에서 클라이언트가 알린 자기 주소
+--   local_lock=none  : 잠금을 서버에 맡긴다
+--   addr             : 서버 주소
+[root@ol7b ~]# df -hT /mnt/share
+Filesystem          Type  Size  Used Avail Use% Mounted on
+ol7a:/srv/nfs/share nfs4   36G  4.3G   31G  13% /mnt/share
+[root@ol7b ~]# grep /mnt/share /proc/mounts
+ol7a:/srv/nfs/share /mnt/share nfs4 rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none,addr=172.16.225.61 0 0
+
+--------------------------------------------------------------------------------
+ [8] 읽기와 쓰기 시험
+--------------------------------------------------------------------------------
+-- 읽기는 누구나 된다(디렉터리 755, 파일 644).
+[root@ol7b ~]# cat /mnt/share/readme.txt; ls -l /mnt/share
+hello from ol7a
+total 4
+-rw-r--r--. 1 root root 16 Nov 16 10:13 readme.txt
+-- 클라이언트에서도 소유자가 root 로 보인다. UID 0 은 어디서나 root 다
+-- student 는 디렉터리 소유자라 쓸 수 있다.
+[student@ol7b ~]$ echo "written by student on ol7b" > /mnt/share/from_b.txt; ls -l /mnt/share
+total 8
+-rw-rw-r--. 1 student student 27 Nov 16 10:14 from_b.txt
+-rw-r--r--. 1 root    root    16 Nov 16 10:13 readme.txt
+-- student 가 만든 파일. 권한 -rw-rw-r-- 는 student 의 umask 002 결과
+-- 서버에서 같은 파일을 본다. 소유자가 student(1000) 로 찍혔다.
+[root@ol7a ~]# ls -ln /srv/nfs/share; cat /srv/nfs/share/from_b.txt
+total 8
+-rw-rw-r--. 1 1000 1000 27 Nov 16 10:14 from_b.txt
+-rw-r--r--. 1    0    0 16 Nov 16 10:13 readme.txt
+written by student on ol7b
+-- 서버 쪽 소유자 1000:1000. 서버에서도 student 다
+-- 클라이언트의 root 가 쓰면 어떻게 되는지는 실습 02 에서 자세히 본다.
+-- 여기서는 결과만.
+[root@ol7b ~]# touch /mnt/share/by_root; echo "rc=$?"
+touch: cannot touch ‘/mnt/share/by_root’: Permission denied
+rc=1
+-- root 는 Permission denied.
+-- root_squash 로 65534 가 되어 student 755 디렉터리에 쓸 수 없다
+
+--------------------------------------------------------------------------------
+ [9] exports 를 고쳤는데 반영되지 않는다
+--------------------------------------------------------------------------------
+-- 두 번째 디렉터리를 내보내려고 exports 에 한 줄을 더한다.
+[root@ol7a ~]# mkdir -p /srv/nfs/data; echo "data dir" > /srv/nfs/data/info.txt
+[root@ol7a ~]# cp -p /etc/exports /root/exports.v1
+[root@ol7a ~]# echo '/srv/nfs/data   ol7b.example.com(ro,sync)' >> /etc/exports; cat /etc/exports
+-- 파일에는 두 줄이 있다
+/srv/nfs/share  ol7b.example.com(rw,sync)
+/srv/nfs/data   ol7b.example.com(ro,sync)
+-- 파일만 고치고 아무것도 하지 않은 채 클라이언트에서 본다.
+[root@ol7b ~]# showmount -e ol7a
+Export list for ol7a:
+/srv/nfs/share ol7b.example.com
+-- 증상   : showmount -e 에 /srv/nfs/data 가 없다
+[root@ol7b ~]# mkdir -p /mnt/data
+[root@ol7b ~]# timeout 40 mount -t nfs ol7a:/srv/nfs/data /mnt/data; echo "rc=$?"
+mount.nfs: mounting ol7a:/srv/nfs/data failed, reason given by server: No such file or directory
+rc=32
+-- 마운트도 실패. 서버가 준 이유는 "No such file or directory" 다
+-- 디렉터리는 있다. 서버 커널 표에 그 경로가 없어서 이렇게 답한다
+-- rc=32 는 mount 의 "마운트 실패" 종료 코드
+[root@ol7a ~]# exportfs -v
+/srv/nfs/share  ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+-- 원인   : exportfs -v 에는 share 한 줄뿐. 파일을 고친 뒤 커널 표에 올리지 않았다
+-- exportfs -r : exports 와 exports.d 를 다시 읽어 커널 표를 맞춘다(없어진 항목은 빼고 새 항목은 넣는다).
+-- exportfs -a 는 추가만 한다. 지운 항목까지 반영하려면 -r 을 쓴다.
+[root@ol7a ~]# exportfs -rv
+exporting ol7b.example.com:/srv/nfs/data
+exporting ol7b.example.com:/srv/nfs/share
+-- 조치   : exportfs -rv. -v 로 무엇을 내보내는지 한 줄씩 보인다
+[root@ol7a ~]# exportfs -v
+/srv/nfs/share  ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/srv/nfs/data   ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,ro,secure,root_squash,no_all_squash)
+-- data 는 ro 로 올라갔다. 나머지 옵션은 share 와 같다
+[root@ol7b ~]# showmount -e ol7a
+Export list for ol7a:
+/srv/nfs/data  ol7b.example.com
+/srv/nfs/share ol7b.example.com
+-- 재확인 : showmount -e 에 두 경로가 모두 보인다
+[root@ol7b ~]# mount -t nfs ol7a:/srv/nfs/data /mnt/data; ls -l /mnt/data; touch /mnt/data/x; echo "rc=$?"
+total 4
+-rw-r--r--. 1 root root 9 Nov 16 10:14 info.txt
+touch: cannot touch ‘/mnt/data/x’: Read-only file system
+-- 마운트는 되고 쓰기는 Read-only file system. ro 내보내기라 서버가 거부했다
+rc=1
+
+
+--------------------------------------------------------------------------------
+ [10] fstab 에 넣고 재부팅
+--------------------------------------------------------------------------------
+-- 부팅 때 마운트하려면 fstab 에 넣는다.
+-- 네트워크가 올라온 뒤 마운트해야 하므로 _netdev 를 붙인다.
+[root@ol7b ~]# umount /mnt/data /mnt/share; cp -p /etc/fstab /root/fstab.orig
+[root@ol7b ~]# echo 'ol7a:/srv/nfs/share  /mnt/share  nfs  defaults,_netdev  0 0' >> /etc/fstab; tail -2 /etc/fstab
+/dev/mapper/ol_ol7b-swap swap                    swap    defaults        0 0
+ol7a:/srv/nfs/share  /mnt/share  nfs  defaults,_netdev  0 0
+[root@ol7b ~]# diff /root/fstab.orig /etc/fstab
+11a12
+> ol7a:/srv/nfs/share  /mnt/share  nfs  defaults,_netdev  0 0
+-- 칸 : 장치(서버:경로) 마운트지점 종류 옵션 dump fsck
+-- mount -a 로 fstab 줄이 맞는지 재부팅 전에 확인한다.
+-- 오타가 있으면 여기서 걸린다.
+[root@ol7b ~]# mount -a; findmnt /mnt/share
+TARGET     SOURCE              FSTYPE OPTIONS
+/mnt/share ol7a:/srv/nfs/share nfs4   rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none,addr=172.16.225.61
+-- fstab 의 종류는 nfs 인데 붙은 것은 nfs4. nfs 는 "버전 협상" 이라는 뜻이다
+-- systemd 는 fstab 줄마다 .mount 유닛을 만든다.
+-- 이름은 경로의 / 를 - 로 바꾼 것.
+[root@ol7b ~]# systemctl daemon-reload; systemctl list-units --type=mount --no-pager | grep -E 'UNIT|mnt'
+UNIT                          LOAD   ACTIVE SUB     
+mnt-share.mount               loaded active mounted /mnt/share
+-- /mnt/share → mnt-share.mount. 지금 mount -a 로 붙인 것도 이 유닛으로 보인다
+-- ol7b 재부팅
+-- (ol7b 재부팅 — 러너가 SSH 가 다시 열릴 때까지 기다림)
+[root@ol7b ~]# uptime; findmnt /mnt/share
+ 10:14:41 up 0 min,  0 users,  load average: 0.86, 0.20, 0.06
+-- up 0 min : 방금 부팅했다. 그런데도 /mnt/share 가 붙어 있다
+TARGET     SOURCE              FSTYPE OPTIONS
+/mnt/share ol7a:/srv/nfs/share nfs4   rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none,addr=172.16.225.61
+[root@ol7b ~]# systemctl status mnt-share.mount --no-pager -n 0 | head -6
+● mnt-share.mount - /mnt/share
+   Loaded: loaded (/etc/fstab; bad; vendor preset: disabled)
+   Active: active (mounted) since Mon 2026-11-16 10:14:29 KST; 11s ago
+    Where: /mnt/share
+     What: ol7a:/srv/nfs/share
+     Docs: man:fstab(5)
+-- Loaded 줄의 bad 는 유닛 파일 상태 표시다.
+-- generator 가 만든 유닛이라 이렇게 나온다
+-- Active 10:14:29, 부팅 몇 초 뒤 네트워크가 올라오자 붙었다
+
+--------------------------------------------------------------------------------
+ [11] 서버 쪽 통계와 클라이언트 쪽 통계
+--------------------------------------------------------------------------------
+-- nfsstat -s : 서버가 받은 요청을 연산별로 센다. -o 로 범주를 고를 수 있다.
+[root@ol7a ~]# nfsstat -s | head -8
+Server rpc stats:
+calls      badcalls   badclnt    badauth    xdrcall
+146        0          0          0          0       
+
+Server nfs v3:
+null         getattr      setattr      lookup       access       readlink     
+1       100% 0         0% 0         0% 0         0% 0         0% 0         0% 
+read         write        create       mkdir        symlink      mknod        
+-- 첫 블록 rpc stats : calls 146, badcalls 0
+-- 다음은 v3 연산 표(이름 줄 + 횟수·비율 줄). v3 은 쓰지 않아 0 이다
+[root@ol7b ~]# nfsstat -c -r
+Client rpc stats:
+calls      retrans    authrefrsh
+26         0          26      
+-- calls 26, retrans 0. 재전송이 없으니 망과 서버 응답이 깨끗했다
+
+--------------------------------------------------------------------------------
+ [변형] exports 파일 없이 exportfs 로 임시 내보내기
+--------------------------------------------------------------------------------
+-- exportfs -o 옵션 클라이언트:경로 : 파일을 고치지 않고 커널 표에만 넣는다. 재부팅·exportfs -r 에 사라진다.
+[root@ol7a ~]# mkdir -p /srv/nfs/tmp; exportfs -o ro,sync ol7b.example.com:/srv/nfs/tmp; exportfs -v | grep -A1 tmp
+/srv/nfs/tmp    ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,ro,secure,root_squash,no_all_squash)
+[root@ol7b ~]# showmount -e ol7a
+Export list for ol7a:
+/srv/nfs/tmp   ol7b.example.com
+-- 임시 항목도 showmount 에 바로 보인다
+/srv/nfs/data  ol7b.example.com
+/srv/nfs/share ol7b.example.com
+[root@ol7a ~]# grep tmp /etc/exports; echo "exports 에는 없음 rc=$?"
+exports 에는 없음 rc=1
+-- grep 이 못 찾아 rc=1. 커널 표에만 있고 파일에는 없다
+-- exportfs -r 은 파일 기준으로 표를 다시 맞춘다.
+-- 파일에 없는 임시 항목이 빠진다.
+[root@ol7a ~]# exportfs -r; exportfs -v | grep -c tmp
+0
+-- -r 뒤 tmp 는 0 줄. 파일에 없는 항목이 빠졌다
+-- exportfs -u 클라이언트:경로 : 하나만 내보내기를 내린다. 파일은 그대로다.
+[root@ol7a ~]# exportfs -u ol7b.example.com:/srv/nfs/data; exportfs -v | grep -c data; grep -c data /etc/exports
+0
+1
+-- 커널 표에서 data 는 0 줄,
+-- 파일에는 여전히 1 줄. 다음 -r 에서 다시 올라온다
+
+--------------------------------------------------------------------------------
+ [12] 되돌리기
+--------------------------------------------------------------------------------
+-- 클라이언트부터 정리한다.
+-- 서버를 먼저 내리면 클라이언트의 umount 가 기다리게 된다.
+[root@ol7b ~]# umount /mnt/share; cp -p /root/fstab.orig /etc/fstab; systemctl daemon-reload; rmdir /mnt/share /mnt/data
+[root@ol7b ~]# findmnt -t nfs,nfs4; grep -c nfs /etc/fstab
+0
+-- 클라이언트: NFS 마운트 없음, fstab 의 nfs 줄 0
+[root@ol7a ~]# exportfs -ua; : > /etc/exports; systemctl disable --now nfs-server
+Removed symlink /etc/systemd/system/multi-user.target.wants/nfs-server.service.
+-- exportfs -ua 로 전부 내리고 exports 를 0 바이트로 비운 뒤 서버를 멈췄다
+[root@ol7a ~]# firewall-cmd --permanent --remove-service=nfs --remove-service=mountd --remove-service=rpc-bind; firewall-cmd --reload
+success
+success
+[root@ol7a ~]# rm -rf /srv/nfs /root/exports.v1
+[root@ol7a ~]# systemctl is-enabled nfs-server; systemctl is-active nfs-server; firewall-cmd --list-services; exportfs -v | wc -l
+disabled
+inactive
+dhcpv6-client ssh
+0
+-- [0] 과 같다: disabled, inactive, dhcpv6-client ssh, 내보내기 0
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                    시작 전           변경 후                     되돌린 뒤
+--  nfs-server              disabled/inactive enabled/active(exited)      disabled/inactive
+--  방화벽 서비스           dhcpv6-client ssh +nfs +rpc-bind +mountd      dhcpv6-client ssh
+--  ol7a 내보내기           0                 share(rw), data(ro)         0
+--  ol7b NFS 마운트         없음              /mnt/share nfs4 vers=4.1    없음
+--  ol7b fstab nfs 줄       0                 1 (_netdev)                 0
+--
+--  방화벽별 결과            v4 mount           showmount -e
+--  아무것도 안 엶           No route to host   Port mapper failure
+--  nfs 만                   성공(0.037초)      Port mapper failure
+--  nfs+rpc-bind+mountd      성공               Export list 표시
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. 서버 /etc/sysconfig/nfs 에서 RPCNFSDCOUNT=16 으로 바꾸고 nfs-server 를 재시작한다
+--    확인: cat /proc/fs/nfsd/threads
+-- 2. 클라이언트에서 mount -o vers=3 으로 붙인 뒤 showmount -a ol7a 를 본다
+--    확인: [6] 에서 비어 있던 목록에 172.16.225.62 가 보이는지
+-- 3. fstab 줄에서 _netdev 를 빼고 재부팅해 본다
+--    확인: systemctl show mnt-share.mount -p After 에 remote-fs-pre.target 이 남는지
+
+================================================================================
+ 실습 01 종료 — v4 는 nfs 하나로, showmount 는 셋을 열어야 됨. fstab 재부팅 확인
+================================================================================

@@ -1,0 +1,475 @@
+================================================================================
+ 제12장 실습 02 — 서브볼륨과 스냅샷
+ 대상   : ol7a (추가 디스크 sdb 사용)
+ 목표   : 서브볼륨을 만들고 목록·상세를 읽는다. 쓰기 가능·읽기 전용 스냅샷을 뜨고
+          subvol=/subvolid= 마운트와 기본 서브볼륨 변경의 효과를 확인한다
+ 배경   : Btrfs 서브볼륨은 따로 마운트할 수 있는 독립된 파일 트리다. 블록 장치가
+          아니라 같은 공간을 나눠 쓰는 디렉터리처럼 보인다. 스냅샷은 서브볼륨의 한
+          종류로, 만드는 순간 원본과 블록을 공유하고 바뀐 블록만 따로 쓴다(CoW).
+          최상위 서브볼륨의 ID 는 5 다(본문 12.5절)
+ 소요   : 약 20분
+ 선행   : storage-clean 스냅샷, UEK R6 로 부팅
+ 계정   : root
+ 주의   : 없음(빈 디스크 sdb 만 씀). 시작 전에 OS 디스크가 sda 인지 확인한다(아래 [0])
+ 되돌림 : 마운트 해제, wipefs. 확인 lsblk -f /dev/sdb, findmnt -t btrfs
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 실행 커널과 실습 디스크 sdb 의 상태를 먼저 남긴다
+-- uname -r 이 el7uek 로 끝나야 한다.
+-- Btrfs 는 UEK 에서만 지원된다(본문 12.1.3)
+[root@ol7a ~]# uname -r; lsblk -f /dev/sdb
+5.4.17-2136.338.4.2.el7uek.x86_64
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+-- lsblk -f 의 다섯 열 NAME·FSTYPE·LABEL·UUID·MOUNTPOINT 가 모두 비어 있다
+--   파티션도 서명도 없는 빈 디스크. 이 실습은 이 디스크 하나만 쓴다
+-- 랩 VM 은 부팅에 따라 OS 디스크 이름이 sdb 로 잡힌 적이 있다(UEK 의 비동기 SCSI 탐색)
+--   sdb 아래에 sdb1·sdb2 가 보이면 OS 디스크이므로 여기서 멈춘다
+[root@ol7a ~]# findmnt -t btrfs; echo "btrfs mounts: $(findmnt -t btrfs -n | wc -l)"
+btrfs mounts: 0
+-- findmnt -t btrfs 는 출력이 없고 개수는 0.
+-- 지금 마운트된 Btrfs 가 하나도 없다
+-- btrfs-progs 판을 확인한다. 기준 상태에 이미 들어 있다(설치 경로는 실습 01 [1])
+[root@ol7a ~]# rpm -q btrfs-progs
+btrfs-progs-5.12.1-1.el7.x86_64
+-- 5.12.1 은 ol7_UEKR6 저장소 판이다.
+-- ol7_latest 의 4.9.1 보다 새로워 mkfs 출력 모양이
+-- 문서 예시와 다르다
+
+--------------------------------------------------------------------------------
+ [1] 단일 장치 Btrfs 만들기
+--------------------------------------------------------------------------------
+
+-- 장치가 하나면 데이터는 single, 메타데이터는 DUP(같은 장치에 두 벌)이 기본이다.
+[root@ol7a ~]# mkfs.btrfs -L subv /dev/sdb | grep -E 'Label|UUID|Node size|Metadata|Data|Total devices'
+Label:              subv
+UUID:               25409aae-5d57-44d4-8853-f61070b09d91
+Node size:          16384
+  Data:             single            8.00MiB
+  Metadata:         DUP             256.00MiB
+-- grep 으로 다섯 줄만 남겼다. mkfs.btrfs 전체 출력은 실습 01 에 있다
+--   Label   : -L 로 준 subv
+--   UUID    : 파일 시스템 UUID. fstab 에 쓰는 값([변형])
+--   Node size 16384 : 메타데이터 B-tree 노드 하나가 16KiB
+--   Data single 8.00MiB : 데이터 사본 하나. 첫 Data chunk 를 8MiB 로 떼어 둠
+--   Metadata DUP 256.00MiB : 같은 장치에 두 벌. 장치가 하나라 사본을 같은 디스크에 둔다
+-- 장치가 하나일 때의 기본값이 이 조합이다. 옵션을 주지 않았다
+[root@ol7a ~]# mkdir -p /btrfs; mount /dev/sdb /btrfs; ls -la /btrfs
+total 20
+drwxr-xr-x.  1 root root    0 Nov 13 19:58 .
+dr-xr-xr-x. 18 root root 4096 Nov 13 19:58 ..
+-- 마운트 직후 최상위는 비어 있다. lost+found 가 없다(Ext4 와 다른 점)
+-- . 의 크기 0 은 Btrfs 디렉터리 크기 규칙이다. 안에 든 이름 길이의 합의 두 배
+--   빈 디렉터리라 0. [7] 의 inner 가 10, data 가 34 인 것도 같은 계산이다
+
+--------------------------------------------------------------------------------
+ [2] 서브볼륨 만들기
+--------------------------------------------------------------------------------
+
+-- 서브볼륨은 "그 자리에" 만든다. 경로가 곧 이름이다.
+[root@ol7a ~]# btrfs subvolume create /btrfs/data; btrfs subvolume create /btrfs/logs
+Create subvolume '/btrfs/data'
+Create subvolume '/btrfs/logs'
+-- 두 서브볼륨 생성. 크기를 정하는 옵션이 없다. 파일 시스템의 빈 공간을 함께 쓴다
+[root@ol7a ~]# mkdir /btrfs/plain; ls -l /btrfs
+total 0
+drwxr-xr-x. 1 root root 0 Nov 13 19:58 data
+drwxr-xr-x. 1 root root 0 Nov 13 19:58 logs
+drwxr-xr-x. 1 root root 0 Nov 13 19:58 plain
+-- ls -l 로는 data·logs(서브볼륨)와 plain(mkdir)이 똑같아 보인다
+-- 권한·링크 수 1·크기 0 까지 같다. Btrfs 디렉터리는 링크 수를 늘 1 로 보인다
+-- 서브볼륨과 일반 디렉터리를 구별하는 가장 쉬운 방법은 inode 번호다.
+[root@ol7a ~]# stat -c '%i %F %n' /btrfs /btrfs/data /btrfs/logs /btrfs/plain
+256 directory /btrfs
+256 directory /btrfs/data
+256 directory /btrfs/logs
+257 directory /btrfs/plain
+-- stat 의 %i 는 inode 번호
+--   /btrfs(최상위, ID 5)·data·logs 는 모두 256 : 서브볼륨 루트 디렉터리의 고정 번호
+--   plain 은 257 : 최상위 서브볼륨 안에서 처음 만든 일반 객체
+-- 서브볼륨마다 inode 번호 공간이 따로라 256 이 세 번 나와도 충돌이 아니다
+-- 스크립트에서 서브볼륨 여부를 가를 때 [ "$(stat -c %i 경로)" = 256 ] 을 쓴다
+
+--------------------------------------------------------------------------------
+ [3] 서브볼륨 목록과 상세
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# btrfs subvolume list /btrfs
+ID 256 gen 6 top level 5 path data
+ID 258 gen 7 top level 5 path logs
+-- list 의 필드
+--   ID        : 서브볼륨 ID. data 256, logs 258. 257 은 plain 이 아니라 내부 객체 몫이다
+--   gen       : 마지막으로 바뀐 트랜잭션 세대 번호
+--   top level : 부모 서브볼륨 ID. 둘 다 최상위 5 바로 아래
+--   path      : 최상위 기준 경로. subvol= 마운트에 이 값을 쓴다([8])
+-- 최상위 5 자신은 목록에 나오지 않는다
+-- -p 는 부모 ID, -t 는 표 형식.
+[root@ol7a ~]# btrfs subvolume list -pt /btrfs
+ID      gen     parent  top level       path    
+--      ---     ------  ---------       ----    
+256     6       5       5               data
+258     7       5       5               logs
+-- -t 는 같은 정보를 머리 줄이 있는 표로 보인다. -p 로 parent 열이 붙었다
+-- parent 와 top level 이 모두 5.
+-- 중첩 서브볼륨을 만들면 둘이 달라진다([11] 의 data/inner)
+[root@ol7a ~]# btrfs subvolume show /btrfs/data
+data
+        Name:                   data
+        UUID:                   9dd67ca3-01a6-2e4e-b783-502d0261f296
+        Parent UUID:            -
+        Received UUID:          -
+        Creation time:          2026-11-13 19:58:02 +0900
+        Subvolume ID:           256
+        Generation:             6
+        Gen at creation:        6
+        Parent ID:              5
+        Top level ID:           5
+        Flags:                  -
+        Snapshot(s):
+-- show 의 필드
+--   Name·Subvolume ID : data, 256
+--   UUID              : 서브볼륨마다 따로 붙는 UUID. 파일 시스템 UUID 와 다르다
+--   Parent UUID       : - (스냅샷이 아니다). 스냅샷이면 원본 UUID 가 들어간다
+--   Received UUID     : - (receive 로 받은 것이 아니다. 실습 03)
+--   Generation·Gen at creation : 6, 6. 만든 뒤 아직 바뀌지 않았다
+--   Parent ID·Top level ID : 5
+--   Flags             : - (읽기 전용이면 readonly)
+--   Snapshot(s)       : 아직 이 서브볼륨으로 뜬 스냅샷이 없다
+
+--------------------------------------------------------------------------------
+ [4] 파일을 넣고 스냅샷 두 개 — 쓰기 가능과 읽기 전용
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# echo "version 1" > /btrfs/data/app.conf; dd if=/dev/zero of=/btrfs/data/blob bs=1M count=200 status=none; sync
+-- app.conf 한 줄과 200MiB 파일 blob 을 넣었다.
+-- 스냅샷 뒤 공간 비교용이다
+-- 옵션 없이 뜨면 쓰기 가능한 스냅샷, -r 을 주면 읽기 전용이다.
+[root@ol7a ~]# btrfs subvolume snapshot /btrfs/data /btrfs/data_snap1
+Create a snapshot of '/btrfs/data' in '/btrfs/data_snap1'
+[root@ol7a ~]# btrfs subvolume snapshot -r /btrfs/data /btrfs/data_ro1
+Create a readonly snapshot of '/btrfs/data' in '/btrfs/data_ro1'
+-- 두 출력 문구가 다르다. a snapshot / a readonly snapshot
+-- 200MiB 가 든 서브볼륨인데 둘 다 바로 끝났다. 블록을 복사하지 않는다
+-- -s 는 스냅샷만, -r 은 읽기 전용만 보여 준다.
+[root@ol7a ~]# btrfs subvolume list -s /btrfs
+ID 260 gen 9 cgen 9 top level 5 otime 2026-11-13 19:58:02 path data_snap1
+ID 261 gen 10 cgen 10 top level 5 otime 2026-11-13 19:58:03 path data_ro1
+-- -s 는 스냅샷만 보이고 열이 둘 늘었다
+--   cgen  : 만들 때의 세대 번호
+--   otime : 만든 시각. 스냅샷 이름에 시각을 넣지 않았어도 여기서 확인된다
+-- data_snap1 260, data_ro1 261.
+-- 259 는 건너뛰었다. 서브볼륨 ID 는 내부 객체와 번호를 나눠 쓴다
+[root@ol7a ~]# btrfs subvolume list -r /btrfs
+ID 261 gen 10 top level 5 path data_ro1
+-- -r 은 읽기 전용만. data_ro1 하나
+[root@ol7a ~]# btrfs property get /btrfs/data_ro1 ro; btrfs property get /btrfs/data_snap1 ro
+ro=true
+ro=false
+-- property get 으로 ro 속성을 직접 읽었다.
+-- data_ro1 true, data_snap1 false
+-- property set 경로 ro true 로 쓰기 가능 스냅샷을 나중에 읽기 전용으로 바꿀 수도 있다
+
+--------------------------------------------------------------------------------
+ [5] 원본을 바꾸고 스냅샷과 비교
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# echo "version 2" > /btrfs/data/app.conf
+[root@ol7a ~]# cat /btrfs/data/app.conf /btrfs/data_snap1/app.conf /btrfs/data_ro1/app.conf
+version 2
+version 1
+version 1
+-- 원본만 version 2, 두 스냅샷은 스냅샷 시점의 version 1 그대로
+-- 원본에 쓴 블록은 새 자리에 쓰였고 스냅샷은 옛 블록을 계속 가리킨다(CoW)
+-- 읽기 전용 스냅샷에 쓰기를 시도한다.
+[root@ol7a ~]# echo "x" > /btrfs/data_ro1/app.conf
+/tmp/_ol7lab_root.sh: line 1: /btrfs/data_ro1/app.conf: Read-only file system
+-- 셸의 리다이렉션이 실패했다.
+-- 메시지 앞의 /tmp/_ol7lab_root.sh: line 1: 은
+-- 랩 러너가 명령을 스크립트 파일로 실행해 생긴 접두어다.
+-- 터미널에서는 -bash: 로 나온다
+-- 읽기 전용 스냅샷은 root 도 쓸 수 없다
+-- 공간은 얼마나 들었나. filesystem du 는 서브볼륨 사이에 공유된 블록을 따로 센다
+[root@ol7a ~]# btrfs filesystem du -s /btrfs/data /btrfs/data_snap1 /btrfs/data_ro1
+     Total   Exclusive  Set shared  Filename
+ 200.00MiB       0.00B   200.00MiB  /btrfs/data
+ 200.00MiB       0.00B   200.00MiB  /btrfs/data_snap1
+ 200.00MiB       0.00B   200.00MiB  /btrfs/data_ro1
+-- filesystem du 의 네 열
+--   Total      : 파일들이 가리키는 전체 크기
+--   Exclusive  : 이 경로만 가진 블록
+--   Set shared : 다른 서브볼륨과 공유하는 블록
+--   Filename
+-- 세 서브볼륨 모두 Total 200MiB,
+-- Exclusive 0, Set shared 200MiB
+-- 원본 app.conf 를 바꿨는데도 Exclusive 가 0 이다.
+-- 10바이트 남짓한 파일은 메타데이터
+-- 안에 인라인으로 저장돼 데이터 블록으로 세지 않는다
+-- 디스크에는 blob 한 벌만 있다. 일반 du 로 보면 600MiB 처럼 세어진다
+
+--------------------------------------------------------------------------------
+ [6] 일반 디렉터리를 스냅샷하려 하면
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cp /etc/hosts /btrfs/plain/; btrfs subvolume snapshot /btrfs/plain /btrfs/plain_snap; echo "rc=$?"
+ERROR: Not a Btrfs subvolume: Invalid argument
+rc=1
+-- 증상   : btrfs subvolume snapshot /btrfs/plain /btrfs/plain_snap 이
+--          'ERROR: Not a Btrfs subvolume: Invalid argument', rc=1
+-- 원인   : plain 은 mkdir 로 만든 일반 디렉터리다. [2] 의 stat 에서 inode 257.
+--          스냅샷 대상은 서브볼륨(inode 256)만 된다
+-- 조치   : 디렉터리를 서브볼륨으로 바꾸는 명령은 없다. 새 서브볼륨을 만들고
+--          cp -a --reflink=always 로 옮긴 뒤 이름을 바꾼다
+-- 재확인 : stat -c %i 새경로 가 256,
+-- btrfs subvolume snapshot 이 Create a snapshot 출력
+-- 데이터 디렉터리를 처음부터 서브볼륨으로 만들어야 하는 이유가 여기 있다
+
+--------------------------------------------------------------------------------
+ [7] 중첩 서브볼륨은 스냅샷에 따라 들어가지 않는다
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# btrfs subvolume create /btrfs/data/inner; echo "inner file" > /btrfs/data/inner/f.txt
+Create subvolume '/btrfs/data/inner'
+-- data 안에 서브볼륨 inner 를 하나 더 만들고 파일 하나를 넣었다
+[root@ol7a ~]# btrfs subvolume snapshot /btrfs/data /btrfs/data_snap2
+Create a snapshot of '/btrfs/data' in '/btrfs/data_snap2'
+[root@ol7a ~]# ls -la /btrfs/data/inner /btrfs/data_snap2/inner
+/btrfs/data/inner:
+total 4
+drwxr-xr-x. 1 root root 10 Nov 13 19:58 .
+drwxr-xr-x. 1 root root 34 Nov 13 19:58 ..
+-rw-r--r--. 1 root root 11 Nov 13 19:58 f.txt
+-- 원본 쪽 inner 에는 f.txt(11바이트)가 있다.
+-- inner 디렉터리 크기 10 = "f.txt" 5글자 × 2
+
+/btrfs/data_snap2/inner:
+total 0
+drwxr-xr-x. 1 root root  0 Nov 13 19:58 .
+drwxr-xr-x. 1 root root 34 Nov 13 19:58 ..
+-- 스냅샷 쪽 inner 는 total 0, 비어 있다
+-- 스냅샷은 재귀가 아니다. 하위 서브볼륨 자리에 같은 이름의 빈 디렉터리만 남는다(문서 Note)
+[root@ol7a ~]# stat -c '%i %n' /btrfs/data/inner /btrfs/data_snap2/inner
+256 /btrfs/data/inner
+2 /btrfs/data_snap2/inner
+-- 원본 inner 는 서브볼륨이라 256. 스냅샷 쪽 inner 는 inode 2
+--   2 는 Btrfs 가 "비어 있는 서브볼륨 자리"에 쓰는 특수 번호다. 일반 디렉터리(257~)와도 다르다
+-- 하위 서브볼륨까지 백업하려면 각각 따로 스냅샷해야 한다
+
+--------------------------------------------------------------------------------
+ [8] 서브볼륨을 따로 마운트 — subvol= 와 subvolid=
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# mkdir -p /mnt/data /mnt/logs
+[root@ol7a ~]# mount -o subvol=data /dev/sdb /mnt/data; ls /mnt/data
+app.conf
+blob
+inner
+-- subvol=data 는 최상위 기준 경로 data.
+-- /mnt/data 에 data 서브볼륨만 보인다
+-- inner 도 보인다. data 안에 있는 하위 서브볼륨이라 함께 따라온다
+[root@ol7a ~]# btrfs subvolume list /btrfs | grep -w logs
+ID 258 gen 7 top level 5 path logs
+-- 번호로 마운트하려고 logs 의 ID 를 찾는다. 258
+[root@ol7a ~]# LID=$(btrfs subvolume list /btrfs | awk '$NF=="logs"{print $2}'); mount -o subvolid=$LID /dev/sdb /mnt/logs; echo "logs id=$LID"
+logs id=258
+-- awk 로 마지막 필드가 logs 인 줄의 둘째 필드(ID)를 꺼내 subvolid=258 로 마운트했다
+[root@ol7a ~]# findmnt -t btrfs -o TARGET,SOURCE,OPTIONS
+TARGET    SOURCE          OPTIONS
+/btrfs    /dev/sdb        rw,relatime,seclabel,space_cache,subvolid=5,subvol=/
+/mnt/data /dev/sdb[/data] rw,relatime,seclabel,space_cache,subvolid=256,subvol=/data
+/mnt/logs /dev/sdb[/logs] rw,relatime,seclabel,space_cache,subvolid=258,subvol=/logs
+-- findmnt 의 세 열
+--   TARGET  : 마운트 지점 셋
+--   SOURCE  : 같은 /dev/sdb 인데 대괄호 안이 서브볼륨 경로. 최상위는 대괄호가 없다
+--   OPTIONS : 커널이 subvolid 와 subvol 을 둘 다 채워 보인다
+--     subvol= 로 마운트한 /mnt/data 에도 subvolid=256 이 붙고, subvolid= 로 마운트한
+--     /mnt/logs 에도 subvol=/logs 가 붙었다
+--   seclabel : SELinux 레이블 지원 표시. space_cache : 빈 공간 캐시(v1) 사용
+
+--------------------------------------------------------------------------------
+ [9] 기본 서브볼륨 바꾸기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# btrfs subvolume get-default /btrfs
+ID 5 (FS_TREE)
+-- 기본 서브볼륨은 ID 5, 이름 FS_TREE. 최상위다
+-- OL7 문서의 "parent btrfs volume,
+-- which has an ID of 0" 은 실측과 다르다
+[root@ol7a ~]# DID=$(btrfs subvolume list /btrfs | awk '$NF=="data"{print $2}'); btrfs subvolume set-default $DID /btrfs; btrfs subvolume get-default /btrfs
+ID 256 gen 12 top level 5 path data
+-- set-default 는 출력이 없고,
+-- 뒤의 get-default 가 data(256)를 보인다
+-- 이미 마운트된 곳은 그대로인지, 다시 마운트하면 무엇이 보이는지.
+[root@ol7a ~]# ls /btrfs
+data
+data_ro1
+data_snap1
+data_snap2
+logs
+plain
+-- 이미 마운트된 /btrfs 는 그대로 최상위가 보인다.
+-- set-default 는 지금 마운트에 손대지 않는다
+[root@ol7a ~]# umount /btrfs; mount /dev/sdb /btrfs; ls /btrfs
+app.conf
+blob
+inner
+-- 같은 명령 mount /dev/sdb /btrfs 로 다시 마운트했더니 최상위 대신 data 의 내용이 보인다
+[root@ol7a ~]# findmnt /btrfs -o TARGET,SOURCE,OPTIONS
+TARGET SOURCE          OPTIONS
+/btrfs /dev/sdb[/data] rw,relatime,seclabel,space_cache,subvolid=256,subvol=/data
+-- SOURCE 가 /dev/sdb[/data], subvolid=256.
+-- 옵션 없는 마운트가 data 를 골랐다
+--
+-- 증상   : 기본 서브볼륨을 바꾼 뒤 umount·mount 를 하자 /btrfs 에 data_ro1·logs·plain 이
+--          사라지고 app.conf·blob·inner 만 보임. 오류 메시지는 없다
+-- 원인   : 옵션 없는 마운트는 기본 서브볼륨을 고른다. get-default 가 ID 256 path data.
+--          findmnt 의 subvolid=256,subvol=/data 로 확인했다
+-- 조치   : umount 뒤 mount -o subvolid=5 로 최상위를 열고 set-default 5
+-- 재확인 : get-default 가 ID 5 (FS_TREE),
+-- 옵션 없이 다시 마운트해 최상위 목록이 보임([10])
+-- 재부팅 뒤 fstab 마운트에서 이 일이 생기면 "데이터가 사라졌다"는 보고로 들어온다
+
+--------------------------------------------------------------------------------
+ [10] 최상위로 되돌리기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /btrfs; mount -o subvolid=5 /dev/sdb /btrfs; ls /btrfs
+data
+data_ro1
+data_snap1
+data_snap2
+logs
+plain
+-- subvolid=5 로 최상위를 직접 열었다. 다시 여섯 항목이 보인다
+[root@ol7a ~]# btrfs subvolume set-default 5 /btrfs; btrfs subvolume get-default /btrfs
+ID 5 (FS_TREE)
+-- 최상위에서 기본을 5 로 되돌렸다
+[root@ol7a ~]# umount /btrfs; mount /dev/sdb /btrfs; ls /btrfs
+data
+data_ro1
+data_snap1
+data_snap2
+logs
+plain
+-- 옵션 없이 마운트해도 최상위. [9] 이전으로 돌아왔다
+-- 루트를 Btrfs 로 쓰는 시스템은 이 동작으로 롤백한다(본문 12.10). 스냅샷 ID 를 기본으로
+-- 정하고 재부팅한다
+
+--------------------------------------------------------------------------------
+ [11] 서브볼륨 지우기
+--------------------------------------------------------------------------------
+
+-- 마운트돼 있는 서브볼륨을 지우려 하면.
+[root@ol7a ~]# btrfs subvolume delete /btrfs/logs; echo "rc=$?"
+Delete subvolume (no-commit): '/btrfs/logs'
+rc=0
+-- /mnt/logs 에 마운트돼 있는 logs 를 지웠는데 rc=0. 거부되지 않았다
+--   (no-commit) 은 트랜잭션 커밋을 기다리지 않고 돌아왔다는 뜻. -c 를 주면 커밋까지 기다린다
+-- UEK 5.4 는 다른 곳에 마운트된 서브볼륨도 지운다.
+-- 지운 뒤에도 /mnt/logs 의 마운트는
+-- 남아 있어 umount 할 때까지 내용이 보인다.
+-- 지우기 전에 findmnt 로 마운트 여부를 본다
+[root@ol7a ~]# umount /mnt/logs /mnt/data
+[root@ol7a ~]# btrfs subvolume delete /btrfs/logs /btrfs/data_snap2
+ERROR: Could not statfs: No such file or directory
+Delete subvolume (no-commit): '/btrfs/data_snap2'
+-- logs 는 이미 지워져 'ERROR: Could not statfs: No such file or directory'
+-- 같은 명령의 두 번째 인자 data_snap2 는 지워졌다. 인자마다 따로 처리한다
+[root@ol7a ~]# btrfs subvolume list /btrfs
+ID 256 gen 12 top level 5 path data
+ID 260 gen 11 top level 5 path data_snap1
+ID 261 gen 10 top level 5 path data_ro1
+ID 262 gen 12 top level 256 path data/inner
+-- logs(258)·data_snap2 가 목록에서 빠졌다
+-- data/inner 는 ID 262, top level 256.
+-- 부모가 최상위 5 가 아니라 data 다
+-- rm -r 로 서브볼륨을 지우면.
+[root@ol7a ~]# rm -rf /btrfs/data_snap1; echo "rc=$?"; btrfs subvolume list /btrfs | wc -l
+rc=0
+3
+-- rm -rf 가 rc=0 으로 data_snap1 을 통째로 지웠다. 목록이 4줄에서 3줄
+-- rm -rf 는 파일을 지운 뒤 빈 서브볼륨에 rmdir 을 한다.
+-- UEK 5.4 커널은 빈 서브볼륨의
+-- rmdir 을 받아 준다(커널 4.18 이후). 서브볼륨이라고 rm 에서 보호되지 않는다
+-- [OL8/9] UEK R6·R7 도 같다.
+-- 오래된 커널에서는 rmdir 이 거부돼 subvolume delete 가 필요했다
+
+--------------------------------------------------------------------------------
+ [변형] fstab 에 서브볼륨 마운트 적기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cp /etc/fstab /root/fstab.before; U=$(blkid -s UUID -o value /dev/sdb); echo "UUID=$U /mnt/data btrfs subvol=data,noatime 0 0" >> /etc/fstab
+-- fstab 원본을 남기고, UUID 로 data 서브볼륨을 /mnt/data 에 거는 줄을 덧붙였다
+--   네 번째 필드에 subvol=data 와 noatime(읽을 때 atime 을 쓰지 않음)
+--   다섯·여섯 번째 0 0 : dump 안 함, 부팅 때 fsck 안 함. Btrfs 는 fsck 순서를 0 으로 둔다
+[root@ol7a ~]# diff /root/fstab.before /etc/fstab
+11a12
+> UUID=25409aae-5d57-44d4-8853-f61070b09d91 /mnt/data btrfs subvol=data,noatime 0 0
+-- 바뀐 것은 12번째 줄 추가 하나(11a12)
+[root@ol7a ~]# mount -a; findmnt /mnt/data -o TARGET,SOURCE,FSTYPE,OPTIONS
+TARGET    SOURCE          FSTYPE OPTIONS
+/mnt/data /dev/sdb[/data] btrfs  rw,noatime,seclabel,space_cache,subvolid=256,subvol=/data
+-- mount -a 가 fstab 의 새 줄을 마운트했다.
+-- OPTIONS 에 noatime 과 subvol=/data
+-- [8] 의 명령행 마운트와 같은 결과다. 명령행이냐 fstab 이냐만 다르다
+-- 같은 UUID 를 두 곳에 마운트해도 df 의 Size 는 같다. 공간을 나눠 갖지 않는다.
+[root@ol7a ~]# df -h /btrfs /mnt/data
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb         10G  205M  9.3G   3% /btrfs
+/dev/sdb         10G  205M  9.3G   3% /mnt/data
+-- df 의 여섯 열(Filesystem·Size·Used·Avail·Use%·Mounted on)이 두 줄 모두 같다
+--   Size 10G : 장치 하나 10G
+--   Used 205M : blob 200MiB 와 메타데이터. 스냅샷이 둘 남아 있어도 한 벌만 센다
+--   Avail 9.3G : Metadata DUP 이 두 벌로 떼어 둔 공간이 빠졌다
+-- 서브볼륨은 공간을 나눠 갖지 않는다. 한도가 필요하면 qgroup(실습 05)
+
+--------------------------------------------------------------------------------
+ [12] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /mnt/data /btrfs; cp /root/fstab.before /etc/fstab; rmdir /mnt/data /mnt/logs /btrfs
+-- 마운트 해제, fstab 원래대로, 마운트 지점 셋 삭제. 출력이 없으면 성공
+[root@ol7a ~]# wipefs -a /dev/sdb; lsblk -f /dev/sdb; findmnt -t btrfs -n | wc -l
+/dev/sdb: 8 bytes were erased at offset 0x00010040 (btrfs): 5f 42 48 52 66 53 5f 4d
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+0
+-- wipefs 는 0x10040(64KiB + 0x40) 자리의 8바이트 _BHRfS_M 만 지웠다. 주 슈퍼블록의 매직이다
+--   Btrfs 는 64MiB·256GiB 자리에 백업 슈퍼블록을 두지만 wipefs 는 주 슈퍼블록만 지운다
+--   blkid 가 찾는 것이 주 슈퍼블록이라 lsblk -f 는 다시 빈 칸이다
+-- findmnt -t btrfs 개수 0. [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                      시작 전      변경 후                           되돌린 뒤
+--  sdb 서명                  없음         btrfs (subv)                      없음
+--  서브볼륨 ID               -            data 256, logs 258, inner 262     -
+--  스냅샷 ID                 -            data_snap1 260, data_ro1 261      -
+--  기본 서브볼륨             -            ID 256 (data)                     ID 5 (FS_TREE)
+--  옵션 없는 mount 의 SOURCE -            /dev/sdb[/data]                   /dev/sdb
+--  /etc/fstab                11줄         12줄 (subvol=data,noatime)        11줄
+--  btrfs 마운트 수           0            3                                 0
+--
+-- 확인한 사실
+--   서브볼륨 루트 inode 256, 일반 디렉터리 257~, 스냅샷 속 빈 하위 서브볼륨 자리 2
+--   스냅샷은 블록을 공유한다. filesystem du 의 Exclusive 0, Set shared 200MiB
+--   set-default 는 다음 마운트부터. 최상위로는 subvolid=5
+--   UEK 5.4 는 마운트 중인 서브볼륨도 지우고, rm -rf 로도 서브볼륨이 지워진다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. 쓰기 가능 스냅샷 data_snap1 을 btrfs property set 경로 ro true 로 읽기 전용으로 바꾼다
+--    확인: btrfs subvolume list -r 에 나타나는지, echo x > 그 안의 파일 이 거부되는지
+-- 2. plain 디렉터리를 서브볼륨으로 옮긴다(새 서브볼륨 + cp -a --reflink=always + mv)
+--    확인: stat -c %i 가 256, btrfs filesystem du 의 Set shared 로 블록 복사가 없었는지
+-- 3. btrfs subvolume delete -c 로 지워 (no-commit) 대신 무엇이 출력되는지 본다
+--    확인: 출력 문구, 지운 직후 btrfs subvolume list -d 의 대기 목록
+
+================================================================================
+ 실습 02 종료 — 서브볼륨 inode 256, 스냅샷 공유 블록, 기본 서브볼륨의 다음 마운트 적용 확인
+================================================================================

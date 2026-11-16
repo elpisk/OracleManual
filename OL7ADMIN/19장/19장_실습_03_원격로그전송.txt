@@ -1,0 +1,453 @@
+================================================================================
+ 제19장 실습 03 — 원격 로그 전송
+ 대상   : ol7a (전송 클라이언트), ol7b (수신 서버)
+ 목표   : ol7b 의 rsyslog 를 TCP·UDP 514 수신 서버로 만들고 ol7a 에서 @@(TCP)·@(UDP)로
+          보낸다. 방화벽이 닫혀 있을 때 클라이언트 쪽 증상, 수신 서버가 멈춘 동안의
+          유실을 TCP·UDP 로 나눠 보고, 액션 큐(디스크 보조 가능)로 유실을 막는다
+ 배경   : rsyslog 는 입력 모듈 imtcp·imudp 를 올려야 네트워크 메시지를 받는다. 기본
+          rsyslog.conf 에는 두 모듈 줄이 주석으로 들어 있다. 보내는 쪽은 omfwd 액션
+          (@ 는 UDP, @@ 는 TCP)이다. 액션 큐 기본값은 direct 라서 대상이 응답하지 않는
+          동안 쌓아 두지 않는다. queue.type 과 queue.filename 으로 디스크 보조 큐를 준다 (본문 19.4)
+ 소요   : 약 40분
+ 선행   : ol7-base, ol7b-base 스냅샷
+ 계정   : root
+ 주의   : ol7b 의 firewalld 영구 설정을 바꿨다가 되돌린다. 끝에 ol7b 를 끈다
+ 되돌림 : 두 노드의 rsyslog.d 비움, ol7b 의 514 닫힘 → ss -tulnp | grep 514, firewall-cmd --list-ports
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 수신 서버가 될 ol7b 에서 514 를 듣는 프로세스가 있는지, 방화벽에 무엇이 열려 있는지.
+[root@ol7b ~]# rpm -q rsyslog; ss -tulnp | grep -w 514; echo "ss exit=$?"
+rsyslog-8.24.0-57.0.3.el7_9.3.x86_64
+ss exit=1
+
+-- 수신 서버도 같은 rsyslog 8.24 다. 별도 패키지가 필요 없다
+-- imtcp·imudp 모듈 파일은 rsyslog 패키지의 /usr/lib64/rsyslog 에 이미 들어 있다
+-- grep 이 아무것도 못 찾아 exit=1 이다. 지금 ol7b 에서 514 를 듣는 프로세스는 없다
+-- 세 명령의 출력이 차례로 나온다: 기본 존, 존의 서비스, 존의 포트
+[root@ol7b ~]# firewall-cmd --get-default-zone; firewall-cmd --list-services; firewall-cmd --list-ports
+public
+dhcpv6-client ssh
+
+-- 기본 존은 public. 열린 서비스는 ssh·dhcpv6-client 둘뿐이고
+-- --list-ports 는 아무것도 출력하지 않았다. 따로 연 포트가 없다
+[root@ol7b ~]# ls /etc/rsyslog.d/; md5sum /etc/rsyslog.conf
+listen.conf
+0dd94a0c285fb32f41fa5b226e83c26b  /etc/rsyslog.conf
+
+-- 전송할 ol7a 도 같은 상태인지.
+[root@ol7a ~]# ls /etc/rsyslog.d/; md5sum /etc/rsyslog.conf; getent hosts ol7b
+listen.conf
+0dd94a0c285fb32f41fa5b226e83c26b  /etc/rsyslog.conf
+172.16.225.62   ol7b.example.com ol7b
+
+-- 두 노드의 rsyslog.conf md5 가 같다(0dd94a0c…). 같은 패키지의 기본 파일이다
+-- rsyslog.d 에는 listen.conf 하나. 내용은 $SystemLogSocketName 한 줄로 기본 설정에서는 쓰이지 않는다
+-- 이름 해석은 /etc/hosts 로 된다. 전송 규칙에 ol7b.example.com 을 그대로 쓴다
+
+--------------------------------------------------------------------------------
+ [1] 기본 설정에 들어 있는 수신·전송 견본
+--------------------------------------------------------------------------------
+
+-- 수신 모듈 줄. 주석만 풀면 되지만 이 실습은 rsyslog.conf 를 건드리지 않고 rsyslog.d 에 새 파일을 둔다.
+[root@ol7b ~]# grep -nE 'imudp|UDPServerRun|imtcp|InputTCPServerRun' /etc/rsyslog.conf
+15:#$ModLoad imudp
+16:#$UDPServerRun 514
+19:#$ModLoad imtcp
+20:#$InputTCPServerRun 514
+
+-- 15~20행의 네 줄이 수신 견본이다. 앞의 # 만 지우면 UDP·TCP 514 가 열린다
+-- 기본 파일을 고치면 rpm 업데이트 때 .rpmnew 가 생기므로 rsyslog.d 쪽에 같은 내용을 둔다
+
+-- 파일 끝의 전송 견본. 큐 지시어가 함께 들어 있다.
+[root@ol7a ~]# sed -n '/### begin forwarding rule ###/,/### end of the forwarding rule ###/p' /etc/rsyslog.conf
+# ### begin forwarding rule ###
+# The statement between the begin ... end define a SINGLE forwarding
+# rule. They belong together, do NOT split them. If you create multiple
+# forwarding rules, duplicate the whole block!
+# Remote Logging (we use TCP for reliable delivery)
+#
+# An on-disk queue is created for this action. If the remote host is
+# down, messages are spooled to disk and sent when it is up again.
+#$ActionQueueFileName fwdRule1 # unique name prefix for spool files
+#$ActionQueueMaxDiskSpace 1g   # 1gb space limit (use as much as possible)
+#$ActionQueueSaveOnShutdown on # save messages to disk on shutdown
+#$ActionQueueType LinkedList   # run asynchronously
+#$ActionResumeRetryCount -1    # infinite retries if host is down
+# remote host is: name/ip:port, e.g. 192.168.0.1:514, port optional
+#*.* @@remote-host:514
+# ### end of the forwarding rule ###
+
+-- 견본의 지시어 뜻
+--   $ActionQueueFileName      큐 파일 이름. 이 줄이 있어야 디스크로 넘길 수 있다
+--   $ActionQueueMaxDiskSpace  디스크 큐 상한
+--   $ActionQueueSaveOnShutdown 종료할 때 큐를 디스크에 남김
+--   $ActionQueueType LinkedList 비동기 메모리 큐
+--   $ActionResumeRetryCount -1 대상이 살아날 때까지 무한 재시도
+-- 마지막 *.* @@remote-host:514 가 실제 전송 규칙이다. [8] 에서 같은 내용을 action() 형식으로 쓴다
+
+--------------------------------------------------------------------------------
+ [2] ol7b 를 TCP 수신 서버로
+--------------------------------------------------------------------------------
+
+-- RainerScript 형식. module() 로 모듈을 올리고 input() 으로 포트를 연다.
+[root@ol7b ~]# cat > /etc/rsyslog.d/10-recv.conf <<'EOF'
+module(load="imtcp")
+input(type="imtcp" port="514")
+EOF
+
+-- module(load=) 은 $ModLoad 의 새 형식, input() 은 $InputTCPServerRun 의 새 형식이다
+-- input() 에는 port 말고도 address(듣는 주소), ruleset(규칙 묶음) 같은 매개변수를 줄 수 있다
+-- 파일 이름 10- 은 다른 규칙보다 먼저 읽히게 붙인 번호다
+[root@ol7b ~]# rsyslogd -N1; systemctl restart rsyslog
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: End of config validation run. Bye.
+
+-- 수신 서버 설정 검사 통과. 이어서 재시작
+[root@ol7b ~]# ss -tlnp | grep -w 514
+LISTEN 0      25           0.0.0.0:514       0.0.0.0:*    users:(("rsyslogd",pid=5829,fd=3))
+LISTEN 0      25              [::]:514          [::]:*    users:(("rsyslogd",pid=5829,fd=4))
+
+-- -t TCP, -l 듣는 소켓, -n 숫자로, -p 프로세스
+-- 0.0.0.0:514 와 [::]:514 둘이다. IPv4·IPv6 모두 듣는다
+-- 열의 뜻: State LISTEN, Recv-Q 0(받기 대기열에 쌓인 연결 수), Send-Q 25(backlog 상한)
+-- 데몬 쪽 준비는 끝났다. 방화벽은 아직 그대로다
+
+--------------------------------------------------------------------------------
+ [3] ol7a 에서 TCP 로 보내기
+--------------------------------------------------------------------------------
+
+-- local5 만 보낸다. *.* 로 전부 보내면 수신 쪽 messages 가 ol7a 의 일상 로그로 차서 관찰이 어렵다.
+--   @@호스트:포트  TCP
+[root@ol7a ~]# echo 'local5.*  @@ol7b.example.com:514' > /etc/rsyslog.d/50-fwd.conf; cat /etc/rsyslog.d/50-fwd.conf
+local5.*  @@ol7b.example.com:514
+
+-- 셀렉터 local5.*, 액션 @@호스트:포트. 포트를 빼면 514 가 기본이다
+-- 이 규칙에 stop 이 없으므로 local5 메시지는 ol7a 의 messages 에도 남는다
+[root@ol7a ~]# rsyslogd -N1; systemctl restart rsyslog
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: End of config validation run. Bye.
+
+-- ol7a 쪽 검사도 통과했다. 문법은 맞다
+-- 3초는 imjournal 이 읽고 omfwd 가 보내기에 충분한 시간이다
+[root@ol7a ~]# logger -t lab19 -p local5.info "LAB19-03 tcp first"; sleep 3
+
+-- 수신 쪽에 도착했나.
+[root@ol7b ~]# grep -c LAB19-03 /var/log/messages
+0
+
+-- 수신 쪽에 0건. 보낸 메시지가 도착하지 않았다
+
+--------------------------------------------------------------------------------
+ [4] 오류 흐름 ① — 수신 포트가 닫혀 있다
+--------------------------------------------------------------------------------
+
+-- 보내는 쪽에서 증상을 찾는다. rsyslog 자신의 오류는 journal 에 남는다.
+-- 7.9 의 journalctl 은 --since 에 "-2min" 같은 상대 시각을 받는다
+-- 앞 네 줄은 restart 기록이다. Stopped → Starting → start → Started 순서
+[root@ol7a ~]# journalctl -u rsyslog --since "-2min" --no-pager | tail -5
+Nov 16 12:26:52 ol7a.example.com systemd[1]: Stopped System Logging Service.
+Nov 16 12:26:52 ol7a.example.com systemd[1]: Starting System Logging Service...
+Nov 16 12:26:52 ol7a.example.com rsyslogd[2076]:  [origin software="rsyslogd" swVersion="8.24.0-57.0.3.el7_9.3" x-pid="2076" x-info="http://www.rsyslog.com"] start
+Nov 16 12:26:52 ol7a.example.com systemd[1]: Started System Logging Service.
+Nov 16 12:26:52 ol7a.example.com rsyslogd[2076]: action 'action 0' suspended, next retry is Mon Nov 16 12:27:22 2026 [v8.24.0-57.0.3.el7_9.3 try http://www.rsyslog.com/e/2007 ]
+
+-- 보내는 쪽 rsyslog 가 남긴 줄. 첫 액션(action 0, 전송 규칙)이 suspended 됐다
+-- next retry 가 12:26:52 + 30초다. omfwd 의 기본 재시도 간격이 30초다
+-- 메시지 본문에 연결 실패 이유는 없다. 이유는 아래 연결 시험으로 찾는다
+[root@ol7a ~]# ss -tn state syn-sent '( dport = :514 )'; ss -tn '( dport = :514 )'
+Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+State Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+
+-- 두 ss 모두 머리 줄뿐이다. 연결 중(SYN-SENT)도, 연결된 것도 없다
+-- firewalld 가 SYN 에 거부 응답을 바로 보내 연결 시도가 즉시 끝났다
+
+-- 수신 서버에서 직접 연결은 되나, 밖에서는 되나. bash 의 /dev/tcp 로 TCP 연결만 시험한다.
+-- bash 는 /dev/tcp/호스트/포트 를 열면 TCP 연결을 맺는다. telnet·nc 가 없어도 포트 시험이 된다
+-- timeout 3 은 응답이 없을 때(DROP) 3초 뒤 끝내려고 붙였다
+[root@ol7b ~]# timeout 3 bash -c 'echo > /dev/tcp/127.0.0.1/514' && echo "local: open"
+local: open
+
+-- 수신 서버 자신에서 127.0.0.1:514 로는 연결된다. 데몬은 받을 준비가 돼 있다
+[root@ol7a ~]# timeout 3 bash -c 'echo > /dev/tcp/ol7b.example.com/514' && echo "remote: open"
+bash: connect: No route to host
+bash: /dev/tcp/ol7b.example.com/514: No route to host
+
+-- 밖에서는 No route to host. 경로 문제처럼 보이지만 firewalld 의 reject 응답(icmp-host-prohibited)이다
+-- ping ol7b 는 되는 상황이라 경로가 아니라 포트 단위 차단이다
+--
+-- 증상   : 수신 서버에 0건. 보내는 쪽 journal 에 "action 'action 0' suspended",
+--          /dev/tcp 시험에 "No route to host"
+-- 원인   : ol7b 의 firewalld public 존에 514/tcp 가 열려 있지 않음(--list-ports 출력 없음)
+-- 조치   : firewall-cmd --permanent --add-port=514/tcp; firewall-cmd --reload
+-- 재확인 : ol7a 에서 /dev/tcp 시험이 open, 새 메시지가 ol7b messages 에 도착
+
+-- 방화벽을 연다. --permanent 는 재부팅 뒤에도 남기는 값, --reload 로 지금 값에 반영한다.
+-- --add-service=syslog 를 써도 된다. firewalld 의 syslog 서비스 정의는 514/udp 하나라 TCP 에는 맞지 않는다
+[root@ol7b ~]# firewall-cmd --permanent --add-port=514/tcp; firewall-cmd --reload; firewall-cmd --list-ports
+success
+success
+514/tcp
+
+-- success 두 줄은 --permanent 추가와 --reload 의 응답이다. --list-ports 에 514/tcp 가 보인다
+[root@ol7a ~]# timeout 3 bash -c 'echo > /dev/tcp/ol7b.example.com/514' && echo "remote: open"
+remote: open
+
+-- 이제 밖에서도 연결된다
+
+-- 열기 전에 보낸 첫 메시지는? 잠시 기다린 뒤 수신 쪽을 본다(omfwd 는 30초마다 재연결을 시도한다).
+[root@ol7b ~]# grep LAB19-03 /var/log/messages; echo "grep exit=$?"
+grep exit=1
+
+-- 35초를 기다렸는데도 "tcp first" 는 없다. 포트를 열기 전에 보낸 메시지는 버려졌다
+-- 액션이 suspended 인 동안 들어온 메시지를 direct 큐는 쌓아 두지 않는다
+-- 재시도 시각(12:27:22)이 지났으므로 새 메시지가 오면 다시 연결을 시도한다
+[root@ol7a ~]# logger -t lab19 -p local5.info "LAB19-03 tcp second"; sleep 3
+[root@ol7b ~]# grep LAB19-03 /var/log/messages
+Nov 16 12:27:32 ol7a lab19: LAB19-03 tcp second
+
+-- 포트를 연 뒤 보낸 "tcp second" 는 도착했다. 셋째 열 ol7a 가 보낸 쪽 호스트 이름이다
+[root@ol7a ~]# ss -tn '( dport = :514 )'
+State Recv-Q Send-Q Local Address:Port   Peer Address:PortProcess
+ESTAB 0      0      172.16.225.61:36624 172.16.225.62:514        
+
+-- 연결이 ESTAB 이다. 출발 포트 36624 는 임의 포트, 도착은 ol7b:514
+-- rsyslog 는 연결을 계속 열어 두고 메시지마다 재사용한다
+
+--------------------------------------------------------------------------------
+ [5] 수신 쪽 줄 읽기
+--------------------------------------------------------------------------------
+
+-- 원격 메시지가 ol7b 의 messages 에 ol7b 자신의 로그와 섞여 있다. 호스트 이름 열로 구분한다.
+-- 줄 형식: 시각  호스트  태그:  본문. 연도가 없는 것은 기본 RSYSLOG_TraditionalFileFormat 때문이다
+[root@ol7b ~]# tail -4 /var/log/messages
+Nov 16 12:27:04 ol7b systemd: Starting Update UTMP about System Runlevel Changes...
+Nov 16 12:27:04 ol7b systemd: Started Update UTMP about System Runlevel Changes.
+Nov 16 12:27:04 ol7b systemd: Startup finished in 712ms (kernel) + 1.228s (initrd) + 25.061s (userspace) = 27.002s.
+Nov 16 12:27:32 ol7a lab19: LAB19-03 tcp second
+
+-- 원격 메시지가 ol7b 자신의 부팅 메시지 바로 뒤에 섞여 들어갔다
+-- 기본 RULES 의 *.info 규칙이 원격 메시지도 똑같이 처리하기 때문이다
+[root@ol7b ~]# awk '{print $4}' /var/log/messages | sort | uniq -c
+      1 ol7a
+   5627 ol7b
+-- 넷째 열(호스트 이름)로 세면 ol7a 1건, ol7b 5627건
+-- 수집 서버에서 이렇게 섞이면 읽기 어렵다. 실습 04 에서 호스트별 파일로 나눈다
+
+--------------------------------------------------------------------------------
+ [6] UDP 수신과 전송
+--------------------------------------------------------------------------------
+
+-- UDP 는 옛 지시어 형식으로 써 본다. 두 형식을 한 서버에 섞어도 된다.
+[root@ol7b ~]# printf '$ModLoad imudp\n$UDPServerRun 514\n' > /etc/rsyslog.d/11-recv-udp.conf; cat /etc/rsyslog.d/11-recv-udp.conf
+$ModLoad imudp
+$UDPServerRun 514
+
+-- 옛 형식 두 줄. $ModLoad 로 모듈을 올리고 $UDPServerRun 으로 포트를 연다
+[root@ol7b ~]# rsyslogd -N1; systemctl restart rsyslog; ss -ulnp | grep -w 514
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: End of config validation run. Bye.
+UNCONN 0      0            0.0.0.0:514       0.0.0.0:*    users:(("rsyslogd",pid=10458,fd=5))
+UNCONN 0      0               [::]:514          [::]:*    users:(("rsyslogd",pid=10458,fd=6))
+
+-- UDP 는 연결 상태가 없어 State 가 UNCONN 이다
+-- pid 가 10458 로 바뀌었다. restart 로 새 프로세스가 떴다
+[root@ol7b ~]# firewall-cmd --permanent --add-port=514/udp; firewall-cmd --reload; firewall-cmd --list-ports
+success
+success
+514/tcp 514/udp
+
+-- 같은 포트 번호라도 tcp·udp 는 따로 연다
+
+--   @호스트:포트  UDP (골뱅이 하나)
+-- local6 은 UDP 로, local5 는 계속 TCP 로 보낸다. 규칙 두 개가 나란히 동작한다
+[root@ol7a ~]# echo 'local6.*  @ol7b.example.com:514' > /etc/rsyslog.d/51-fwd-udp.conf; rsyslogd -N1; systemctl restart rsyslog
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: End of config validation run. Bye.
+[root@ol7a ~]# logger -t lab19 -p local6.info "LAB19-03 udp first"; sleep 3
+-- tail -2 로 마지막 두 건만 본다. TCP 와 UDP 로 온 줄의 모양은 같다
+-- 수신 쪽 줄만 봐서는 어느 프로토콜로 왔는지 알 수 없다. 실습 04 의 템플릿으로 fromhost-ip 를 남길 수 있다
+[root@ol7b ~]# grep LAB19-03 /var/log/messages | tail -2
+Nov 16 12:27:32 ol7a lab19: LAB19-03 tcp second
+Nov 16 12:27:36 ol7a lab19: LAB19-03 udp first
+
+-- UDP 첫 메시지는 바로 도착했다. 연결을 맺는 과정이 없다
+
+-- UDP 는 연결이 없다. 보내는 쪽 소켓 상태를 TCP 와 비교한다.
+[root@ol7a ~]# ss -tunp | grep -w 514
+-- 출력이 없다. -u 를 줬지만 UDP 송신 소켓은 보낼 때만 잠깐 쓰여 목록에 남지 않는다
+-- TCP 연결도 없다. 직전 restart 로 연결이 끊긴 뒤 새 local5 메시지가 없어 아직 다시 맺지 않았다
+
+--------------------------------------------------------------------------------
+ [7] 오류 흐름 ② — 수신 서버가 멈춘 동안
+--------------------------------------------------------------------------------
+
+-- ol7b 의 rsyslog 를 멈추고 TCP·UDP 로 세 건씩 보낸다.
+[root@ol7b ~]# systemctl stop rsyslog; ss -tulnp | grep -w 514; echo "ss exit=$?"
+ss exit=1
+
+-- 수신 서버의 514 가 TCP·UDP 모두 닫혔다
+-- TCP·UDP 로 한 건씩 번갈아 세 번 보낸다. 번호로 어느 것이 살아남는지 본다
+[root@ol7a ~]# for i in 1 2 3; do logger -t lab19 -p local5.info "LAB19-07 tcp down $i"; logger -t lab19 -p local6.info "LAB19-07 udp down $i"; sleep 1; done; sleep 3
+[root@ol7a ~]# journalctl -u rsyslog --since "-1min" --no-pager | tail -4
+Nov 16 12:27:36 ol7a.example.com systemd[1]: Starting System Logging Service...
+Nov 16 12:27:36 ol7a.example.com rsyslogd[2237]:  [origin software="rsyslogd" swVersion="8.24.0-57.0.3.el7_9.3" x-pid="2237" x-info="http://www.rsyslog.com"] start
+Nov 16 12:27:36 ol7a.example.com systemd[1]: Started System Logging Service.
+Nov 16 12:27:39 ol7a.example.com rsyslogd[2237]: action 'action 0' suspended, next retry is Mon Nov 16 12:28:09 2026 [v8.24.0-57.0.3.el7_9.3 try http://www.rsyslog.com/e/2007 ]
+
+-- TCP 액션이 12:27:39 에 suspended 됐다. 첫 "tcp down" 을 보낸 직후다
+-- UDP 액션(action 1)은 아무 기록도 없다. 보내는 쪽은 실패를 모른다
+
+-- 다시 켜고 35초 기다린다.
+-- 켠 뒤 러너가 35초를 기다린다. 보내는 쪽 재시도 간격 30초보다 길게 잡았다
+[root@ol7b ~]# systemctl start rsyslog
+[root@ol7a ~]# logger -t lab19 -p local5.info "LAB19-07 tcp after restart"; sleep 3
+-- "tcp after restart" 는 재시도 시각 12:28:09 이후에 보냈으므로 새 연결로 갔다
+[root@ol7b ~]# grep LAB19-07 /var/log/messages
+Nov 16 12:28:20 ol7a lab19: LAB19-07 tcp after restart
+
+-- 다시 켠 뒤 도착한 것은 "tcp after restart" 한 건뿐이다
+-- tcp down 1~3, udp down 1~3 여섯 건이 모두 없다
+--
+-- 증상   : 수신 서버가 멈춘 동안 보낸 6건이 재시작 뒤에도 도착하지 않음.
+--          보내는 쪽 journal 에는 TCP 쪽 "suspended" 한 줄만
+-- 원인   : UDP 는 연결이 없어 유실을 알 수 없다. TCP 는 액션 큐가 direct(기본)라
+--          suspended 동안의 메시지를 버린다
+-- 조치   : [8] 처럼 액션에 queue.type="LinkedList"·queue.filename·action.resumeRetryCount="-1" 을 준다
+-- 재확인 : 같은 정지 시험에서 queued 1~3 이 모두 도착
+-- [OL8/9] 같은 rsyslog 매개변수를 쓴다. 8/9 기본 rsyslog.conf 의 견본도 action() 형식으로 들어 있다
+
+--------------------------------------------------------------------------------
+ [8] 디스크 보조 큐를 단 액션
+--------------------------------------------------------------------------------
+
+-- 옛 형식 한 줄을 action() 으로 바꾸고 큐 매개변수를 붙인다.
+--   queue.type="LinkedList"      메모리 큐(기본 direct 대신)
+--   queue.filename="fwd_ol7b"    이 이름을 주면 메모리가 넘치거나 종료할 때 디스크(WorkDirectory)에 쓴다
+--   queue.saveOnShutdown="on"    rsyslog 를 멈출 때 큐 내용을 디스크에 남긴다
+--   action.resumeRetryCount="-1" 대상이 살아날 때까지 무한히 재시도
+--   action.resumeInterval="5"    재시도 간격(초). 기본 30
+-- 바꾸기 전 파일을 남겨 diff 로 비교한다
+[root@ol7a ~]# cp /etc/rsyslog.d/50-fwd.conf /root/50-fwd.conf.v1
+[root@ol7a ~]# cat > /etc/rsyslog.d/50-fwd.conf <<'EOF'
+local5.* action(type="omfwd" target="ol7b.example.com" port="514" protocol="tcp"
+                queue.type="LinkedList" queue.filename="fwd_ol7b"
+                queue.saveOnShutdown="on"
+                action.resumeRetryCount="-1" action.resumeInterval="5")
+EOF
+[root@ol7a ~]# diff /root/50-fwd.conf.v1 /etc/rsyslog.d/50-fwd.conf
+1c1,4
+< local5.*  @@ol7b.example.com:514
+
+-- 한 줄짜리 옛 형식이 네 줄 action() 으로 바뀌었다
+---
+> local5.* action(type="omfwd" target="ol7b.example.com" port="514" protocol="tcp"
+>                 queue.type="LinkedList" queue.filename="fwd_ol7b"
+>                 queue.saveOnShutdown="on"
+>                 action.resumeRetryCount="-1" action.resumeInterval="5")
+
+-- ol7a 의 rsyslog 를 재시작했으니 ol7b 로 가는 연결도 새로 맺는다
+[root@ol7a ~]# rsyslogd -N1; systemctl restart rsyslog; logger -t lab19 -p local5.info "LAB19-08 queue warmup"; sleep 3
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: End of config validation run. Bye.
+[root@ol7b ~]# grep LAB19-08 /var/log/messages
+Nov 16 12:28:23 ol7a lab19: LAB19-08 queue warmup
+-- 큐를 단 뒤에도 평소 전송은 그대로 된다
+
+-- 다시 수신 서버를 멈추고 세 건.
+-- 큐를 단 상태에서 같은 정지 시험을 한다
+[root@ol7b ~]# systemctl stop rsyslog
+-- 수신 서버가 멈춘 동안 1초 간격으로 세 건을 보내고 8초 기다린다
+[root@ol7a ~]# for i in 1 2 3; do logger -t lab19 -p local5.info "LAB19-08 queued $i"; sleep 1; done; sleep 8
+[root@ol7a ~]# ls -l /var/lib/rsyslog/
+total 4
+-rw-------. 1 root root 120 Nov 16 12:28 imjournal.state
+-- 큐 파일(fwd_ol7b.*)은 없다. 메시지 세 건은 메모리 큐에 들어 있다
+-- queue.filename 의 디스크 파일은 메모리 큐가 넘치거나 rsyslog 가 종료될 때만 생긴다
+-- 이번에는 켠 뒤 20초만 기다린다. resumeInterval 이 5초라 충분하다
+[root@ol7b ~]# systemctl start rsyslog
+[root@ol7b ~]# grep LAB19-08 /var/log/messages
+Nov 16 12:28:23 ol7a lab19: LAB19-08 queue warmup
+Nov 16 12:28:26 ol7a lab19: LAB19-08 queued 1
+Nov 16 12:28:27 ol7a lab19: LAB19-08 queued 2
+Nov 16 12:28:28 ol7a lab19: LAB19-08 queued 3
+-- queued 1~3 이 모두 도착했다. 시각은 보낸 시각(12:28:26~28) 그대로다
+-- resumeInterval 5초마다 재시도하다가 수신 서버가 뜨자 쌓인 것을 보냈다
+
+--------------------------------------------------------------------------------
+ [9] 연결 상태 확인
+--------------------------------------------------------------------------------
+
+-- 양쪽에서 같은 TCP 연결을 본다. 수신 쪽은 연결한 클라이언트 주소를 보여 준다.
+-- dport 는 목적지 포트로 거르는 ss 필터다. 수신 쪽에서는 sport(출발 포트 514)로 본다
+[root@ol7a ~]# ss -tnp '( dport = :514 )'
+State Recv-Q Send-Q Local Address:Port   Peer Address:PortProcess
+ESTAB 0      0      172.16.225.61:44150 172.16.225.62:514  users:(("rsyslogd",pid=2421,fd=7))
+-- 보내는 쪽: 172.16.225.61:44150 → 172.16.225.62:514, 프로세스 rsyslogd
+[root@ol7b ~]# ss -tnp '( sport = :514 )'
+State Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+ESTAB 0      0      172.16.225.62:514  172.16.225.61:44150 users:(("rsyslogd",pid=10655,fd=13))
+-- 받는 쪽: 같은 연결을 거꾸로 본 것. 포트 44150 이 양쪽에서 같다
+-- Recv-Q·Send-Q 가 0 이면 밀린 데이터가 없다. 수신 서버가 느리면 보내는 쪽 Send-Q 가 커진다
+
+--------------------------------------------------------------------------------
+ [변형] logger 로 rsyslog 를 거치지 않고 보내기
+--------------------------------------------------------------------------------
+-- 앞 단계까지는 ol7a 의 rsyslog 가 규칙에 따라 보냈다. 여기서는 logger 가 직접 UDP 패킷을 만든다
+-- 두 경로를 나눠 시험하면 "보내는 쪽 설정 문제인가, 받는 쪽 문제인가"를 가를 수 있다
+
+-- 7.9 의 logger(util-linux 2.23)는 -n 서버, -P 포트, -d(UDP) 를 받는다. ol7a 의 rsyslog 를 거치지 않는다.
+--   -n 서버  -P 포트  -d UDP 만  -t 태그  -p facility.priority
+-- 이 메시지는 ol7a 의 journal 에도, ol7a 의 messages 에도 남지 않는다
+[root@ol7a ~]# logger -n ol7b.example.com -P 514 -d -t lab19direct -p user.notice "LAB19-V direct udp"; sleep 2
+[root@ol7b ~]# grep LAB19-V /var/log/messages
+Nov 16 12:28:57 ol7a.example.com lab19direct: LAB19-V direct udp
+-- 도착했다. 호스트 이름이 ol7a 가 아니라 ol7a.example.com 이다
+-- logger 는 메시지 헤더에 FQDN 을 넣고, rsyslog 는 자기 호스트 이름(짧은 이름)을 넣는다
+-- rsyslog 를 거치지 않으니 큐도 없다. 수신 서버만 따로 시험할 때 쓴다
+-- 7.9 의 logger 는 -T(TCP)도 받는다(실습 01 [변형])
+
+--------------------------------------------------------------------------------
+ 되돌림
+--------------------------------------------------------------------------------
+-- 보내는 쪽 규칙을 먼저 지운다. 수신 서버를 먼저 닫으면 ol7a 가 suspended 기록을 남긴다
+
+[root@ol7a ~]# rm -f /etc/rsyslog.d/50-fwd.conf /etc/rsyslog.d/51-fwd-udp.conf /root/50-fwd.conf.v1; systemctl restart rsyslog; ls /etc/rsyslog.d/
+listen.conf
+-- --remove-port 는 한 번에 여러 개를 받는다. success 는 permanent 쪽, 다음 success 는 reload
+[root@ol7b ~]# rm -f /etc/rsyslog.d/10-recv.conf /etc/rsyslog.d/11-recv-udp.conf; firewall-cmd --permanent --remove-port=514/tcp --remove-port=514/udp; firewall-cmd --reload
+success
+success
+[root@ol7b ~]# systemctl restart rsyslog; ss -tulnp | grep -w 514; echo "ss exit=$?"; firewall-cmd --list-ports; ls /etc/rsyslog.d/
+ss exit=1
+
+listen.conf
+-- 514 를 듣는 소켓이 없고 --list-ports 는 다시 출력이 없다(빈 줄 하나). rsyslog.d 는 listen.conf 하나
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                     시작 전        변경 후(실습 중)              되돌린 뒤
+--  ol7b 514/tcp·udp 듣기    없음           rsyslogd LISTEN·UNCONN        없음
+--  ol7b --list-ports        (출력 없음)    514/tcp 514/udp               (출력 없음)
+--  ol7a rsyslog.d           listen.conf    50-fwd.conf, 51-fwd-udp.conf  listen.conf
+--  방화벽 닫힘              tcp first 유실, suspended, No route to host
+--  수신 정지(큐 없음)       tcp down 3·udp down 3 모두 유실
+--  수신 정지(LinkedList 큐) queued 1~3 모두 도착
+--  logger -n -d 직접 전송   호스트 이름이 FQDN(ol7a.example.com)으로 기록
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. [8] 에서 queue.saveOnShutdown 이 하는 일을 보려면 수신 서버를 멈춘 채 ol7a 의 rsyslog 를
+--    재시작한다. /var/lib/rsyslog 에 fwd_ol7b.* 파일이 생기는지, 수신 서버를 켠 뒤 도착하는지 본다
+-- 2. 수신 쪽 input 에 ruleset 을 묶어 원격 메시지를 messages 에서 빼 본다(실습 04 의 주제).
+--    확인은 awk '{print $4}' /var/log/messages | sort | uniq -c
+-- 3. tcpdump -nn -i ens32 port 514 로 UDP 한 건과 TCP 한 건의 패킷 수를 비교한다
+
+================================================================================
+ 실습 03 종료 — TCP·UDP 수신과 전송, 방화벽·수신 정지 때의 유실, 큐로 유실 막기
+================================================================================

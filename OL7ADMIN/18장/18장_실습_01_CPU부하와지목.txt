@@ -1,0 +1,460 @@
+================================================================================
+ 제18장 실습 01 — CPU 부하를 걸고 원인 프로세스 지목하기
+ 대상   : ol7a (2 vCPU)
+ 목표   : 셸 루프와 다중 스레드 압축으로 CPU 부하를 만들고 top 헤더 다섯 줄과
+          %CPU 열, mpstat -P ALL 의 CPU 별 값, vmstat 의 r·us·sy·id·wa 를
+          읽어 부하를 만든 프로세스를 지목한다. 부하 평균과 CPU 사용률이
+          서로 다른 값이라는 것을 숫자로 확인한다
+ 배경   : CPU 가 바쁜지는 사용률(us+sy)과 대기열 길이(r, 부하 평균) 두 쪽으로
+          본다. 사용률은 "쓰고 있는 시간의 비율"이고 부하 평균은 "실행 중이거나
+          실행을 기다리는(그리고 D 상태인) 작업 수의 평균"이다. CPU 가 2개면
+          부하 2 가 꽉 찬 상태다. top 의 %CPU 는 CPU 한 개를 100 으로 친다
+          (본문 18.1, 18.2)
+ 소요   : 약 25분
+ 선행   : ol7-base 스냅샷
+ 계정   : root
+ 주의   : 부하 프로세스는 모두 timeout 으로 시간이 정해져 있다. /var/tmp 에
+          1GB 파일을 잠깐 만들고 지운다
+ 되돌림 : 부하 프로세스 0개, 부하 평균이 내려가는 중, /var/tmp 의 시험 파일 없음.
+          확인은 pgrep -c -f '^sh -c while' · ls /var/tmp
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+-- 이 장에서 쓰는 도구가 기준 상태에 깔려 있는지부터 본다.
+-- procps-ng 는 top·vmstat·free·ps, sysstat 은 mpstat·iostat·pidstat·sar
+-- 를 준다.
+[root@ol7a ~]# rpm -q procps-ng sysstat psmisc strace tcpdump iotop sos nmap-ncat
+procps-ng-3.3.10-28.0.1.el7.x86_64
+sysstat-10.1.5-20.0.3.el7_9.x86_64
+package psmisc is not installed
+strace-4.24-7.el7_9.x86_64
+tcpdump-4.9.2-4.0.1.el7_7.1.x86_64
+package iotop is not installed
+sos-3.9-5.0.29.el7_9.10.noarch
+package nmap-ncat is not installed
+-- 설치된 것: procps-ng 3.3.10, sysstat 10.1.5, strace 4.24, tcpdump
+-- 4.9.2, sos 3.9
+-- 없는 것: psmisc(fuser·pstree), iotop, nmap-ncat. iotop 은 실습 03,
+-- ncat 은 06 에서 넣는다
+-- CPU 개수. 부하 평균을 읽으려면 이 숫자를 먼저 알아야 한다.
+[root@ol7a ~]# nproc; lscpu | grep -E '^(CPU\(s\)|Thread|Core|Socket|Model name|Hypervisor)'
+2
+CPU(s):                2
+Thread(s) per core:    1
+Core(s) per socket:    1
+Socket(s):             2
+Model name:            12th Gen Intel(R) Core(TM) i5-12400
+Hypervisor vendor:     VMware
+-- CPU(s) 2 : 논리 CPU 2개. 소켓 2 × 코어 1 × 스레드 1 로 VMware 가 vCPU
+-- 를 내준 모양
+-- 이 VM 에서는 부하 평균 2 가 "CPU 가 꽉 찬" 기준선이다
+-- 부팅 직후의 부하 평균. /proc/loadavg 의 다섯 값: 1분·5분·15분 평균,
+-- 실행 중/전체 작업 수, 마지막 PID
+[root@ol7a ~]# uptime; cat /proc/loadavg
+ 12:38:45 up 0 min,  0 users,  load average: 0.07, 0.02, 0.00
+0.07 0.02 0.00 1/191 2053
+-- 부팅 직후라 세 평균 모두 0 근처. 1/191 은 실행 중 1개(이 cat), 전체
+-- 191개 작업
+-- 마지막 2053 은 가장 최근에 만든 PID 다. 끝에서 이 다섯 값과 비교한다
+
+--------------------------------------------------------------------------------
+ [1] top 한 화면 — 헤더 다섯 줄
+--------------------------------------------------------------------------------
+-- 러너는 터미널이 없으므로 top 을 배치 모드로 돌린다.
+--   -b : batch, 화면 제어 없이 표준 출력으로   -n 1 : 한 번만 찍고 끝
+[root@ol7a ~]# top -b -n 1 | head -12
+top - 12:38:45 up 0 min,  0 users,  load average: 0.07, 0.02, 0.00
+Tasks: 164 total,   2 running,  93 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  0.0 us,  3.1 sy,  0.0 ni, 96.9 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+KiB Mem :  3716120 total,  3364380 free,   175648 used,   176092 buff/cache
+KiB Swap:  4063228 total,  4063228 free,        0 used.  3328720 avail Mem 
+
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+    1 root      20   0   69884  10572   6988 S   0.0  0.3   0:01.16 systemd
+    2 root      20   0       0      0      0 S   0.0  0.0   0:00.00 kthreadd
+    3 root       0 -20       0      0      0 I   0.0  0.0   0:00.00 rcu_gp
+    4 root       0 -20       0      0      0 I   0.0  0.0   0:00.00 rcu_par_gp
+    5 root      20   0       0      0      0 I   0.0  0.0   0:00.00 kworker/0:+
+-- 헤더 다섯 줄
+--   1줄 top -   : 시각 12:38:45, up 0 min, 사용자 0, 부하 평균 0.07·0.02·0.00(uptime 과 같음)
+--   2줄 Tasks   : 164 total, running 2, sleeping 93, stopped 0, zombie 0
+--   3줄 %Cpu(s) : us sy ni id wa hi si st. 여기서는 sy 3.1, id 96.9
+--   4줄 Mem     : KiB 단위 total 3716120(≈3629MiB), free, used, buff/cache
+--   5줄 Swap    : total 4063228, used 0. 끝의 avail Mem 은 free 명령의 available 과 같은 값
+-- 목록 열: PID USER PR NI VIRT RES SHR S %CPU %MEM TIME+ COMMAND
+--   PR·NI 는 우선순위·nice, VIRT·RES·SHR 은 가상·상주·공유 메모리(KiB), S 는 상태
+--   S 의 I 는 idle 커널 스레드(UEK 5.4 의 표기), R 실행, S 잠듦, D I/O 대기
+-- 줄 끝의 + 는 이름이 열 폭보다 길어 잘렸다는 표시다
+
+--------------------------------------------------------------------------------
+ [2] 첫 화면의 함정 — 두 번째 갱신을 본다
+--------------------------------------------------------------------------------
+-- top 의 첫 화면 %Cpu(s) 는 직전 갱신이 없어서 부팅 이후 누적값으로
+-- 계산된다.
+-- -n 2 -d 2 로 2초 간격 두 번 찍고 awk 로 두 번째 화면만 남긴다.
+[root@ol7a ~]# top -b -n 2 -d 2 | awk '/^top -/{n++} n==2' | head -8
+top - 12:38:47 up 0 min,  0 users,  load average: 0.07, 0.02, 0.00
+Tasks: 165 total,   1 running,  94 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  0.0 us,  0.2 sy,  0.0 ni, 99.8 id,  0.0 wa,  0.0 hi,  0.0 si,  0.0 st
+KiB Mem :  3716120 total,  3364528 free,   175460 used,   176132 buff/cache
+KiB Swap:  4063228 total,  4063228 free,        0 used.  3328888 avail Mem 
+
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+  508 root      20   0       0      0      0 I   0.5  0.0   0:00.01 kworker/1:+
+-- 같은 시점인데 첫 화면은 sy 3.1, 둘째 화면은 sy 0.2. 첫 화면은 부팅
+-- 직후 바빴던 시간까지 섞였다
+-- 스크립트로 top 을 남길 때 첫 화면 %Cpu(s) 를 쓰면 이 차이만큼 틀린다
+
+--------------------------------------------------------------------------------
+ [3] 부하 하나 — 셸 무한 루프
+--------------------------------------------------------------------------------
+-- while :; do :; done 은 아무 일도 하지 않고 CPU 를 계속 쓰는 루프다.
+-- timeout 300 이 5분 뒤에 끝내 준다. nohup ... & 로 세션과 떼어 놓는다.
+[root@ol7a ~]# nohup timeout 300 sh -c 'while :; do :; done' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# top -b -n 2 -d 2 | awk '/^top -/{n++} n==2' | head -12
+top - 12:38:56 up 0 min,  0 users,  load average: 0.22, 0.05, 0.02
+Tasks: 166 total,   3 running,  94 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 40.1 us,  0.3 sy,  0.0 ni, 59.3 id,  0.0 wa,  0.3 hi,  0.0 si,  0.0 st
+KiB Mem :  3716120 total,  3364788 free,   175044 used,   176288 buff/cache
+KiB Swap:  4063228 total,  4063228 free,        0 used.  3329228 avail Mem 
+
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+ 2111 root      20   0  114764   2752   2604 R  99.5  0.1   0:08.14 sh
+-- 루프 sh(PID 2111)가 %CPU 99.5, 상태 R. CPU 하나를 거의 다 쓴다
+-- 그런데 3줄의 us 는 40.1. %Cpu(s) 는 CPU 2개 전체의 비율이라 CPU 하나
+-- 몫이 최대 50 이다
+-- (40 인 것은 이 2초 앞부분에 루프가 막 뜬 직후라 덜 찬 표본이
+-- 섞여서다)
+-- 부하 평균 1분 0.22. 루프를 띄운 지 10초가 안 돼 아직 오르는 중이다
+    1 root      20   0   69884  10572   6988 S   0.0  0.3   0:01.16 systemd
+    2 root      20   0       0      0      0 S   0.0  0.0   0:00.00 kthreadd
+    3 root       0 -20       0      0      0 I   0.0  0.0   0:00.00 rcu_gp
+    4 root       0 -20       0      0      0 I   0.0  0.0   0:00.00 rcu_par_gp
+-- ps 로 같은 것을 본다. --sort=-pcpu 는 %CPU 내림차순.
+-- ps 의 %CPU 는 "프로세스가 산 시간 전체의 평균"이라 top 의 순간값과
+-- 다를 수 있다.
+[root@ol7a ~]# ps -eo pid,ppid,user,stat,pcpu,etime,comm --sort=-pcpu | head -5
+  PID  PPID USER     STAT %CPU     ELAPSED COMMAND
+ 2111  2110 root     R    95.4       00:08 sh
+    1     0 root     Ss    5.1       00:22 systemd
+  994     1 root     Ss    3.7       00:19 rngd
+   16     2 root     S     1.5       00:22 migration/1
+-- ps 의 %CPU 95.4 는 8초 동안의 평균. systemd 가 5.1 인 것은 부팅 22초
+-- 동안 일한 몫이 남아서다
+-- 지금 바쁜 프로세스를 고를 때는 top·pidstat 의 간격 값을 본다
+
+--------------------------------------------------------------------------------
+ [4] mpstat -P ALL — CPU 별로 나눠 보기
+--------------------------------------------------------------------------------
+-- -P ALL : 전체 평균(all)과 CPU 0, 1 을 따로. 2 2 : 2초 간격 2번 + 평균
+[root@ol7a ~]# mpstat -P ALL 2 2
+Linux 5.4.17-2136.338.4.2.el7uek.x86_64 (ol7a.example.com)      11/16/2026      _x86_64_        (2 CPU)
+
+12:38:56 PM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+12:38:58 PM  all   39.21    0.00    0.00    0.00    0.30    0.00    0.00    0.00    0.00   60.49
+12:38:58 PM    0   50.31    0.00    0.00    0.00    0.62    0.00    0.00    0.00    0.00   49.07
+12:38:58 PM    1   28.57    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00   71.43
+
+12:38:58 PM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+12:39:00 PM  all   39.94    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00   60.06
+12:39:00 PM    0  100.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00
+12:39:00 PM    1    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00  100.00
+
+Average:     CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+Average:     all   39.58    0.00    0.00    0.00    0.15    0.00    0.00    0.00    0.00   60.27
+Average:       0   72.79    0.00    0.00    0.00    0.34    0.00    0.00    0.00    0.00   26.87
+Average:       1   13.04    0.00    0.00    0.00    0.00    0.00    0.00    0.00    0.00   86.96
+-- 열: %usr %nice %sys %iowait %irq %soft %steal %guest %gnice %idle
+-- 두 번째 표본(12:39:00) 이 가장 분명하다: CPU 0 은 %usr 100, CPU 1 은
+-- %idle 100
+-- all 은 39.94. 전체 평균만 보면 "아직 60% 남았다" 로 읽힌다
+-- 첫 표본에서 CPU 0·1 이 50·28 로 나뉜 것은 스케줄러가 루프를 한 번
+-- 옮겼기 때문이다
+-- 단일 스레드 병목은 이런 모양이다. CPU 를 더 줘도 이 sh 는 빨라지지
+-- 않는다
+
+--------------------------------------------------------------------------------
+ [5] vmstat — r 과 us·sy·id·wa
+--------------------------------------------------------------------------------
+-- vmstat 1 5 : 1초 간격 5줄. 첫 줄은 부팅 이후 평균이라 버리고 둘째
+-- 줄부터 읽는다.
+[root@ol7a ~]# vmstat 1 5
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 3  0      0 3365024   2116 174344    0    0  3503   102  872 1636 20 14 66  0  0
+ 1  0      0 3365056   2116 174380    0    0     0     0  702  115 38  0 63  0  0
+ 1  0      0 3365056   2116 174380    0    0     0     0  722  115 39  1 61  0  0
+ 1  0      0 3365056   2116 174380    0    0     0     0  730  111 38  1 61  0  0
+ 1  0      0 3365056   2116 174380    0    0     0     0  741  105 39  0 61  0  0
+-- 첫 줄(r 3, us 20, sy 14)은 부팅 이후 평균이라 버린다
+-- 둘째 줄부터: r 1(루프 하나), b 0, us 38~39, sy 0~1, id 61~63, wa 0
+-- free 3365056 KB, si·so 0, bi·bo 0. 메모리·디스크는 조용하다
+-- in·cs 는 초당 인터럽트·문맥 교환. 루프는 시스템 호출이 없어 cs 가
+-- 105~115 로 낮다
+
+--------------------------------------------------------------------------------
+ [6] pidstat — 프로세스별 CPU 를 시간 간격으로
+--------------------------------------------------------------------------------
+-- pidstat -u 2 2 : 2초 동안 CPU 를 쓴 프로세스만 찍는다(sysstat). 0% 인
+-- 프로세스는 빠진다.
+[root@ol7a ~]# pidstat -u 2 2 | grep -v '^$'
+Linux 5.4.17-2136.338.4.2.el7uek.x86_64 (ol7a.example.com)      11/16/2026      _x86_64_        (2 CPU)
+12:39:04 PM   UID       PID    %usr %system  %guest    %CPU   CPU  Command
+12:39:06 PM     0       132    0.00    0.50    0.00    0.50     1  kworker/1:1H-kblockd
+12:39:06 PM     0      2111  100.00    0.00    0.00  100.00     0  sh
+12:39:06 PM   UID       PID    %usr %system  %guest    %CPU   CPU  Command
+12:39:08 PM     0       988    0.00    0.50    0.00    0.50     1  vmtoolsd
+12:39:08 PM     0      2111   99.50    0.00    0.00   99.50     0  sh
+Average:      UID       PID    %usr %system  %guest    %CPU   CPU  Command
+Average:        0       132    0.00    0.25    0.00    0.25     -  kworker/1:1H-events_highpri
+Average:        0       988    0.00    0.25    0.00    0.25     -  vmtoolsd
+Average:        0      2111   99.75    0.00    0.00   99.75     -  sh
+-- 2초 동안 CPU 를 쓴 프로세스만 나왔다. PID 2111 sh 가 %usr 99.75
+-- CPU 열은 마지막에 돈 CPU 번호(0). %system 0 → 커널 시간 없이 사용자
+-- 공간만 쓴다
+
+--------------------------------------------------------------------------------
+ [7] 부하 넷 — 부하 평균을 키운다
+--------------------------------------------------------------------------------
+-- 루프를 세 개 더 띄워 CPU 2개에 일거리 4개를 준다.
+[root@ol7a ~]# nohup timeout 200 sh -c 'while :; do :; done' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# nohup timeout 200 sh -c 'while :; do :; done' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# nohup timeout 200 sh -c 'while :; do :; done' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# pgrep -c -f '^sh -c while'
+4
+-- timeout 아래의 sh 4개. pgrep -f '^sh -c while' 로 timeout 프로세스는
+-- 세지 않았다
+-- 1분 부하 평균은 지수 이동 평균이라 바로 오르지 않는다. 75초 동안
+-- 15초마다 찍는다.
+[root@ol7a ~]# for i in 1 2 3 4 5 6; do cat /proc/loadavg; sleep 15; done
+0.63 0.15 0.05 5/193 2302
+1.53 0.37 0.12 5/193 2304
+2.22 0.58 0.20 5/193 2306
+2.76 0.78 0.27 5/193 2308
+3.11 0.95 0.33 5/193 2316
+3.38 1.12 0.40 5/193 2318
+-- 15초마다 1분 평균이 0.63 → 1.53 → 2.22 → 2.76 → 3.11 → 3.38. 4 를
+-- 향해 천천히 오른다
+-- 4번째 필드 5/193 : 실행 가능 작업 5개(루프 4 + cat 1)
+-- 1분 평균은 지수 이동 평균이다. 부하가 바뀐 뒤 1분이 지나도 목표의 63%
+-- 쯤만 따라간다
+-- 증상   : 부하 평균 3.38 을 보고 "CPU 를 338% 쓴다", "CPU 가 4개는
+--          있어야 한다" 고 읽는다
+-- 원인   : 부하 평균은 사용률이 아니라 실행 가능(R)·D 상태 작업 수의
+--          평균이다
+--          CPU 2개에 일거리 4개면 둘은 늘 기다린다. 사용률은 100% 에서 멈춘다
+-- 조치   : CPU 개수(nproc 2)로 나눠 읽고, 사용률은 vmstat·mpstat 으로
+--          따로 본다
+-- 재확인 : 아래 vmstat 에서 us 99~100, r 4~5 — 사용률은 100, 대기열은
+--          CPU 의 두 배
+[root@ol7a ~]# vmstat 2 3
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 7  0      0 3364028   2116 174624    0    0   951    51  940  628 73  4 22  0  0
+ 4  0      0 3364076   2116 174624    0    0     0     0 1243  335 100  0  0  0  0
+ 5  0      0 3364076   2116 174624    0    0     0     0 1236  330 99  1  0  0  0
+-- r 4~5 : 루프 4개 + 가끔 다른 작업. CPU 2개보다 큰 값이 이어지면
+-- 포화다
+-- us 100, id 0. 루프 하나일 때(us 39)와 비교하면 사용률은 두 배 반이
+-- 됐을 뿐이다
+[root@ol7a ~]# top -b -n 2 -d 2 | awk '/^top -/{n++} n==2' | head -13
+top - 12:40:48 up 2 min,  0 users,  load average: 3.63, 1.32, 0.48
+Tasks: 171 total,   5 running,  96 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 99.6 us,  0.0 sy,  0.0 ni,  0.0 id,  0.0 wa,  0.4 hi,  0.0 si,  0.0 st
+KiB Mem :  3716120 total,  3363800 free,   175580 used,   176740 buff/cache
+KiB Swap:  4063228 total,  4063228 free,        0 used.  3328468 avail Mem 
+
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+ 2111 root      20   0  114764   2752   2604 R  49.5  0.1   1:10.49 sh
+ 2228 root      20   0  114764   2600   2448 R  49.5  0.1   0:49.80 sh
+ 2247 root      20   0  114764   2744   2596 R  49.5  0.1   0:49.76 sh
+ 2266 root      20   0  114764   2656   2508 R  49.5  0.1   0:49.17 sh
+-- 1분 평균 3.63, Tasks 의 running 5
+-- 루프 4개가 똑같이 49.5%. CPU 2개를 넷이 나눠 쓰니 하나당 반이다
+-- %Cpu(s) 99.6 us. 부하는 3.63 인데 사용률은 100 을 넘지 못한다
+    1 root      20   0  151812  10600   6988 S   0.0  0.3   0:01.17 systemd
+    2 root      20   0       0      0      0 S   0.0  0.0   0:00.00 kthreadd
+
+--------------------------------------------------------------------------------
+ [8] 루프 정리, 부하 평균이 내려가는 모습
+--------------------------------------------------------------------------------
+[root@ol7a ~]# pkill -f 'while :'; sleep 1; pgrep -c -f '^sh -c while'
+0
+-- 루프 4개를 끝냈다. pkill -f 'while :' 는 timeout 과 sh 를 함께 죽인다
+[root@ol7a ~]# sleep 30; cat /proc/loadavg; vmstat 1 2 | tail -1
+2.41 1.30 0.51 1/185 2396
+ 0  0      0 3365676   2116 174672    0    0     0     0  110  155  0  0 100  0  0
+-- 30초 뒤 1분 평균 2.41. 실제 대기열은 0(r 0, id 100) 인데 평균은
+-- 천천히 내려온다
+-- 장애가 끝난 직후의 uptime 은 아직 높게 보인다. 지금 상태는 vmstat r
+-- 로 본다
+
+--------------------------------------------------------------------------------
+ [9] 한 프로세스가 100% 를 넘는다 — 다중 스레드
+--------------------------------------------------------------------------------
+-- xz 5.2 는 -T 로 스레드 수를 정한다. --block-size 로 입력을 잘라
+-- 스레드마다 나눠 준다.
+-- /dev/zero 를 계속 압축하는 일을 60초 동안 시킨다. 결과는 버린다.
+[root@ol7a ~]# xz --version | head -1
+xz (XZ Utils) 5.2.2
+-- 7.9 의 xz 5.2.2 는 -T(스레드 수)를 지원한다
+[root@ol7a ~]# nohup timeout 60 sh -c 'xz -T2 -6 --block-size=8MiB -c </dev/zero >/dev/null' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# top -b -n 2 -d 2 | awk '/^top -/{n++} n==2' | head -9
+top - 12:41:28 up 2 min,  0 users,  load average: 2.46, 1.33, 0.52
+Tasks: 166 total,   2 running,  94 sleeping,   0 stopped,   0 zombie
+%Cpu(s): 97.2 us,  2.0 sy,  0.0 ni,  0.4 id,  0.0 wa,  0.4 hi,  0.0 si,  0.0 st
+KiB Mem :  3716120 total,  3157224 free,   382020 used,   176876 buff/cache
+KiB Swap:  4063228 total,  4063228 free,        0 used.  3121960 avail Mem 
+
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+ 2437 root      20   0  501084 209180   2208 S 199.5  5.6   0:14.73 xz
+-- 프로세스 하나(xz, PID 2437)가 %CPU 199.5
+-- 증상   : %CPU 199.5. "100% 가 최대인데 값이 틀렸다" 고 보기 쉽다
+-- 원인   : top 의 %CPU 는 CPU 하나를 100 으로 친다. 스레드 둘이 CPU
+--          둘을 쓰면 200 에 가깝다
+--          3줄 %Cpu(s) 는 전체 기준이라 97.2 us 로 나온다
+-- 조치   : 스레드별로 펼쳐 본다(top -H, ps -L). 전체 기준 비율은 mpstat
+--          의 all
+--          대화형 top 에서는 I 키로 Irix 모드를 끄면 CPU 개수로 나눠 보여 준다
+-- 재확인 : 아래 top -H 에서 스레드 2438·2439 가 각각 96.5·97.5
+-- RES 209180 KiB : 8MiB 블록을 스레드마다 압축하느라 메모리 약 200MB 를
+-- 잡았다
+    1 root      20   0  151812  10600   6988 S   0.0  0.3   0:01.17 systemd
+-- -H : 스레드 단위로 펼친다. -p : 그 PID 만
+[root@ol7a ~]# top -H -b -n 2 -d 2 -p $(pgrep -x xz) | awk '/^top -/{n++} n==2' | sed -n '7,12p'
+  PID USER      PR  NI    VIRT    RES    SHR S %CPU %MEM     TIME+ COMMAND
+ 2439 root      20   0  501084 209180   2208 R 97.5  5.6   0:09.68 xz
+ 2438 root      20   0  501084 209180   2208 R 96.5  5.6   0:09.60 xz
+ 2437 root      20   0  501084 209180   2208 S  3.5  5.6   0:00.32 xz
+-- PID 열에 스레드 ID(LWP)가 나온다. 2437 은 주 스레드로 입력만 나눠
+-- 주고(S, 3.5)
+-- 2438·2439 두 작업 스레드가 압축을 한다(R)
+-- ps 로 스레드 수(nlwp)와 스레드별 CPU 를 본다. -L : 스레드마다 한 줄
+[root@ol7a ~]# ps -o pid,nlwp,pcpu,comm -p $(pgrep -x xz); ps -L -o pid,lwp,pcpu,comm -p $(pgrep -x xz)
+  PID NLWP %CPU COMMAND
+ 2437    3  197 xz
+  PID   LWP %CPU COMMAND
+ 2437  2437  3.2 xz
+ 2437  2438 96.6 xz
+ 2437  2439 97.7 xz
+-- NLWP 3 : 스레드 3개. ps 의 %CPU 197 은 스레드 합계
+[root@ol7a ~]# mpstat -P ALL 2 1 | head -7
+Linux 5.4.17-2136.338.4.2.el7uek.x86_64 (ol7a.example.com)      11/16/2026      _x86_64_        (2 CPU)
+
+12:41:31 PM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+12:41:33 PM  all   97.24    0.00    1.57    0.00    0.39    0.00    0.00    0.00    0.00    0.79
+12:41:33 PM    0   97.67    0.00    1.55    0.00    0.00    0.00    0.00    0.00    0.00    0.78
+12:41:33 PM    1   96.80    0.00    1.60    0.00    0.80    0.00    0.00    0.00    0.00    0.80
+-- 이번에는 두 CPU 가 모두 %usr 97 근처. 다중 스레드가 일을 나눠 갖는
+-- 모양이다
+[root@ol7a ~]# pkill -x xz; sleep 1; pgrep -x xz; echo "xz left: $?"
+xz left: 1
+-- pgrep 이 아무것도 못 찾아 종료 코드 1. xz 가 남지 않았다
+
+--------------------------------------------------------------------------------
+ [10] 사용자 공간(us)과 커널(sy)
+--------------------------------------------------------------------------------
+-- 같은 "CPU 100%" 라도 어디서 시간을 쓰는지가 다르다.
+-- dd if=/dev/zero of=/dev/null bs=1 : 1바이트씩 read/write 시스템
+-- 호출을 끝없이 부른다.
+[root@ol7a ~]# nohup timeout 30 dd if=/dev/zero of=/dev/null bs=1 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# vmstat 2 3
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 2  0      0 3365352   2116 174860    0    0   616    34  729  452 57  4 40  0  0
+ 1  0      0 3365384   2116 174864    0    0     0     0  759  210  7 31 62  0  0
+ 1  0      0 3365384   2116 174864    0    0     0     0  725  172  8 30 62  0  0
+-- dd bs=1 은 us 7~8, sy 30~31. 1바이트 read·write 를 끝없이 불러
+-- 커널에서 시간을 쓴다
+-- CPU 하나 몫(50) 가운데 3/4 이 sy 다. 루프(us 39, sy 0)와 정반대
+-- 모양이다
+-- sy 가 크면 strace -c 로 어떤 시스템 호출이 많은지 본다(실습 05)
+[root@ol7a ~]# pkill -x dd; sleep 1
+
+--------------------------------------------------------------------------------
+ [변형] CPU 는 놀고 부하 평균만 오르는 경우 — D 상태
+--------------------------------------------------------------------------------
+-- 부하 평균에는 디스크를 기다리는 D(uninterruptible) 상태 작업도
+-- 들어간다.
+-- oflag=direct : 페이지 캐시를 거치지 않고 디스크에 바로 쓴다. 두 개를
+-- 같이 돌린다(합계 1GB).
+[root@ol7a ~]# cat /proc/loadavg
+2.69 1.44 0.57 1/185 2614
+-- 앞 단계 부하가 남아 1분 평균 2.69 에서 출발한다. 실행 중 작업 1/185
+[root@ol7a ~]# nohup dd if=/dev/zero of=/var/tmp/io1 bs=64k count=8000 oflag=direct >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# nohup dd if=/dev/zero of=/var/tmp/io2 bs=64k count=8000 oflag=direct >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# sleep 2; ps -eo pid,stat,pcpu,wchan:22,comm | awk 'NR==1 || $NF=="dd"'
+  PID STAT %CPU WCHAN                  COMMAND
+ 2650 D     4.8 iomap_dio_rw           dd
+-- STAT D : 깰 수 없는 잠. WCHAN iomap_dio_rw 는 XFS 직접 I/O 완료를
+-- 기다리는 커널 함수
+-- 이 순간 ps 에 dd 는 하나뿐이었다. 끝의 ls 로 보면 두 파일 모두 500MB
+-- 를 다 썼다
+-- %CPU 4.8 : CPU 는 거의 쓰지 않는다
+[root@ol7a ~]# vmstat 2 4
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 1  1      0 3365284   2116 174988    0    0   588  2034  745  480 54  4 40  1  0
+ 0  1      0 3365304   2116 174976    0    0     0  1696  165  206  0  0 50 50  0
+ 0  1      0 3365304   2116 174976    0    0     0 78656 2642 2599  0  5 49 45  0
+ 0  1      0 3365304   2116 174976    0    0     0 58944 2004 1992  0  4 50 47  0
+-- r 0, b 1 : 실행할 작업은 없고 디스크를 기다리는 작업이 하나
+-- us 0, sy 4~5, id 49~50, wa 45~50. CPU 하나 몫이 통째로 I/O 대기다
+-- bo 58944~78656 KB/s : 블록 쓰기. 직접 쓰기라 캐시에 쌓이지 않고 바로
+-- 나간다
+[root@ol7a ~]# cat /proc/loadavg
+2.51 1.44 0.58 1/186 2706
+-- 사용률은 거의 0 인데 1분 평균은 2.51 에 머문다
+-- 앞 단계의 2.69 가 아무 부하 없이 식었다면 10초 뒤 2.3 아래로
+-- 내려갔어야 한다
+-- D 상태 작업 하나가 부하에 1 만큼 계속 들어가 하강을 받친다
+[root@ol7a ~]# sleep 20; pgrep -x dd; ls -l /var/tmp/io1 /var/tmp/io2; cat /proc/loadavg
+-rw-r--r--. 1 root root 524288000 Nov 16 12:41 /var/tmp/io1
+-rw-r--r--. 1 root root 524288000 Nov 16 12:41 /var/tmp/io2
+1.79 1.35 0.57 1/185 2727
+-- 두 dd 가 각각 500MB 를 다 쓰고 끝나자 다시 내려가기 시작했다(1.79)
+-- CPU 사용률이 낮아도 부하 평균이 높으면 vmstat b 와 ps STAT D 부터
+-- 본다
+
+--------------------------------------------------------------------------------
+ [11] 되돌림
+--------------------------------------------------------------------------------
+[root@ol7a ~]# pkill -x dd; rm -f /var/tmp/io1 /var/tmp/io2; pgrep -c -f '^sh -c while'; ls /var/tmp
+0
+abrt
+systemd-private-4164181be2b0490a924252a6876cf813-chronyd.service-vDASZQ
+-- 루프 0개, 시험 파일 io1·io2 없음. /var/tmp 에는 기준 상태의
+-- abrt·chronyd 디렉터리만 남았다
+[root@ol7a ~]# uptime
+ 12:42:11 up 3 min,  0 users,  load average: 1.79, 1.35, 0.57
+-- 부하 평균은 몇 분에 걸쳐 0 근처로 돌아간다. 시작 전 0.07·0.02·0.00
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                   시작 전      루프 1개      루프 4개      xz -T2       dd 직접쓰기 2개
+--  1분 부하 평균           0.07         0.22(상승중)  3.63          2.46(식는중)  2.51(받침)
+--  vmstat r / b           -            1 / 0         4~5 / 0       -            0 / 1
+--  us / sy / wa           0 / 3 / 0    39 / 0 / 0    100 / 0 / 0   97 / 2 / 0   0 / 5 / 47
+--  최대 %CPU(top)          -            99.5          49.5 ×4       199.5        4.8
+--  남은 부하 프로세스       0            -             -             -            0 (되돌린 뒤)
+-- 부하 평균은 대기열, 사용률은 시간 비율이다. 같은 100% 라도 dd bs=1 은
+-- sy 30 이었다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. nice -n 19 로 루프 하나를 더 띄우고 top 의 NI·%CPU 와 vmstat 의 ni
+--    쪽을 비교한다
+--    확인: top -b -n 2 의 둘째 화면에서 NI 19 줄과 3줄의 ni 값
+-- 2. taskset -c 1 로 루프 둘을 CPU 1 에만 묶고 mpstat -P ALL 을 본다
+--    확인: CPU 1 은 100, CPU 0 은 0 근처인데 부하 평균은 2 로 오른다
+-- 3. 대화형 top 에서 1(CPU 별 표시), I(Irix 모드), P·M(정렬)을 눌러
+--    본다
+--    확인: xz 같은 다중 스레드 프로세스의 %CPU 가 I 를 누르면 절반으로 바뀐다
+
+================================================================================
+ 실습 01 종료 — 루프 하나 99.5%, 넷이면 부하 3.63·r 4~7, xz 하나 199.5%, D 상태 dd 는 us 0·wa 45~50
+================================================================================

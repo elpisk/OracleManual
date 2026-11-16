@@ -1,0 +1,450 @@
+================================================================================
+ 제14장 실습 02 — 내보내기 옵션 비교
+ 대상   : ol7a (NFS 서버), ol7b (NFS 클라이언트)
+ 목표   : root_squash·no_root_squash·all_squash, ro·rw, sync·async 를 디렉터리마다
+          다르게 걸고 ol7b 에서 같은 동작을 해 결과를 비교한다. 클라이언트를 이름·IP·
+          서브넷·와일드카드로 지정하는 방법과, 클라이언트 뒤에 공백 하나가 들어가
+          내보내기 대상이 바뀌는 사고를 재현한다
+ 배경   : NFS(sec=sys) 서버는 클라이언트가 보낸 UID·GID 숫자를 그대로 믿는다.
+          그래서 클라이언트의 root(UID 0)를 서버의 익명 계정(nfsnobody, 65534)으로
+          바꾸는 root_squash 가 기본값이다. 권한 판단은 서버 쪽 파일 시스템에서
+          서버의 UID 기준으로 한다. 클라이언트의 ro 마운트와 서버의 ro 내보내기는
+          막는 위치가 다르다 (본문 14.2)
+ 소요   : 약 40분
+ 선행   : ol7-base, ol7b-base 스냅샷
+ 계정   : root, student
+ 주의   : [8] 에서 모든 호스트(*)에 rw 로 내보내지는 잘못된 설정을 일부러 만든다.
+          실습 안에서 바로 고친다
+ 되돌림 : 마운트 해제, exports 비움, nfs-server 정지, 방화벽 원복, nfsuser(1500) 삭제
+          → findmnt -t nfs4, exportfs -v, firewall-cmd --list-services, id 1500
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# systemctl is-active nfs-server; firewall-cmd --list-services; wc -c /etc/exports
+inactive
+dhcpv6-client ssh
+0 /etc/exports
+-- 서버: nfs-server inactive, 방화벽 기본, exports 0 바이트
+-- 익명 계정을 확인한다. 7.9 의 nfs-utils 는 nfsnobody(65534)를 만들어 둔다.
+[root@ol7a ~]# getent passwd nfsnobody nobody; getent group nfsnobody
+nfsnobody:x:65534:65534:Anonymous NFS User:/var/lib/nfs:/sbin/nologin
+-- passwd 의 일곱 칸: 이름:x:UID:GID:설명:홈:셸
+--   nfsnobody : UID 65534, GID 65534, "Anonymous NFS User", 셸 nologin
+--   nobody    : UID 99. NFS 가 쓰는 익명 계정은 이것이 아니다
+-- [OL8/9] OL8 부터 nfsnobody 가 없어지고 nobody 가 65534 를 쓴다
+nobody:x:99:99:Nobody:/:/sbin/nologin
+nfsnobody:x:65534:
+[root@ol7b ~]# getent passwd nfsnobody nobody; findmnt -t nfs,nfs4 | wc -l
+nfsnobody:x:65534:65534:Anonymous NFS User:/var/lib/nfs:/sbin/nologin
+nobody:x:99:99:Nobody:/:/sbin/nologin
+0
+-- 클라이언트에도 같은 두 계정이 있다. NFS 마운트는 0
+
+--------------------------------------------------------------------------------
+ [1] 서버 준비 — 옵션별 디렉터리 다섯 개
+--------------------------------------------------------------------------------
+-- 디렉터리 이름이 옵션을 말하게 만든다.
+--   sq    : root_squash (기본값)        nosq : no_root_squash
+--   all   : all_squash + anonuid/anongid  ro   : 읽기 전용
+--   async : 비동기 응답
+-- 퍼미션은 처음에 모두 root 755 로 둔다.
+-- 쓰기가 되는지는 squash 옵션과 퍼미션이 함께 정한다.
+[root@ol7a ~]# mkdir -p /srv/nfs/{sq,nosq,all,ro,async}; ls -ld /srv/nfs/*
+drwxr-xr-x. 2 root root 6 Nov 16 10:15 /srv/nfs/all
+drwxr-xr-x. 2 root root 6 Nov 16 10:15 /srv/nfs/async
+drwxr-xr-x. 2 root root 6 Nov 16 10:15 /srv/nfs/nosq
+drwxr-xr-x. 2 root root 6 Nov 16 10:15 /srv/nfs/ro
+drwxr-xr-x. 2 root root 6 Nov 16 10:15 /srv/nfs/sq
+-- 다섯 개 모두 root 755. 기타 사용자에게 쓰기 권한이 없다
+-- 퍼미션을 일부러 같게 둔다.
+-- 결과가 달라지면 원인은 내보내기 옵션뿐이다
+[root@ol7a ~]# useradd -u 1500 -M -s /sbin/nologin nfsuser; id nfsuser
+uid=1500(nfsuser) gid=1500(nfsuser) groups=1500(nfsuser)
+-- all_squash 대상 계정. -M 홈 없음, -s 로그인 셸 없음
+-- ol7b 에는 만들지 않는다. [6] 에서 숫자로 보이는 이유가 된다
+[root@ol7a ~]# chown nfsuser:nfsuser /srv/nfs/all; echo "read only data" > /srv/nfs/ro/info.txt
+[root@ol7a ~]# cat > /etc/exports <<'EOF'
+/srv/nfs/sq     ol7b.example.com(rw,sync)
+/srv/nfs/nosq   ol7b.example.com(rw,sync,no_root_squash)
+/srv/nfs/all    ol7b.example.com(rw,sync,all_squash,anonuid=1500,anongid=1500)
+/srv/nfs/ro     ol7b.example.com(ro)
+/srv/nfs/async  ol7b.example.com(rw,async,no_root_squash)
+-- 줄마다 다른 옵션을 하나씩 바꿨다. ro 줄만 sync·async 를 적지 않았다
+EOF
+[root@ol7a ~]# firewall-cmd -q --permanent --add-service={nfs,mountd,rpc-bind}; firewall-cmd -q --reload; systemctl enable --now nfs-server
+Created symlink from /etc/systemd/system/multi-user.target.wants/nfs-server.service to /usr/lib/systemd/system/nfs-server.service.
+[root@ol7a ~]# exportfs -rv
+exporting ol7b.example.com:/srv/nfs/async
+exporting ol7b.example.com:/srv/nfs/ro
+exporting ol7b.example.com:/srv/nfs/all
+exporting ol7b.example.com:/srv/nfs/nosq
+exporting ol7b.example.com:/srv/nfs/sq
+-- ro 줄에 sync 를 빠뜨렸는데도 경고가 없었다.
+-- 7.9 의 nfs-utils 1.3.0 은 이 경우 조용히 sync 를 쓴다
+-- 경고는 옵션 괄호 자체가 없을 때 나온다([8] 에서 본다)
+
+--------------------------------------------------------------------------------
+ [2] exportfs -v 로 다섯 줄 비교
+--------------------------------------------------------------------------------
+-- 옵션 목록에서 바뀐 곳만 본다: rw/ro, sync/async,
+-- root_squash/no_root_squash/all_squash, anonuid
+[root@ol7a ~]# exportfs -v
+/srv/nfs/sq     ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/srv/nfs/nosq   ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/srv/nfs/all    ol7b.example.com(sync,wdelay,hide,no_subtree_check,anonuid=1500,anongid=1500,sec=sys,rw,secure,root_squash,all_squash)
+/srv/nfs/ro     ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,ro,secure,root_squash,no_all_squash)
+/srv/nfs/async  ol7b.example.com(async,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+-- 줄별로 다른 곳만 본다
+--   sq    : rw, root_squash, no_all_squash  (기본 squash)
+--   nosq  : no_root_squash
+--   all   : all_squash, anonuid=1500, anongid=1500. root_squash 도 함께 켜져 있다
+--   ro    : ro. sync 는 기본값으로 채워졌다
+--   async : async, no_root_squash
+-- exports 와 순서가 같다. exportfs -rv 의 exporting 줄은 거꾸로였다
+-- etab 에는 anonuid·anongid 기본값(65534)도 적힌다.
+[root@ol7a ~]# cut -c1-160 /var/lib/nfs/etab
+/srv/nfs/async  ol7b.example.com(rw,async,wdelay,hide,nocrossmnt,secure,no_root_squash,no_all_squash,no_subtree_check,secure_locks,acl,no_pnfs,anonuid=65534,anon
+/srv/nfs/ro     ol7b.example.com(ro,sync,wdelay,hide,nocrossmnt,secure,root_squash,no_all_squash,no_subtree_check,secure_locks,acl,no_pnfs,anonuid=65534,anongid=655
+/srv/nfs/all    ol7b.example.com(rw,sync,wdelay,hide,nocrossmnt,secure,root_squash,all_squash,no_subtree_check,secure_locks,acl,no_pnfs,anonuid=1500,anongid=1500,s
+/srv/nfs/nosq   ol7b.example.com(rw,sync,wdelay,hide,nocrossmnt,secure,no_root_squash,no_all_squash,no_subtree_check,secure_locks,acl,no_pnfs,anonuid=65534,anongi
+/srv/nfs/sq     ol7b.example.com(rw,sync,wdelay,hide,nocrossmnt,secure,root_squash,no_all_squash,no_subtree_check,secure_locks,acl,no_pnfs,anonuid=65534,anongid=655
+-- cut -c1-160 으로 줄 끝을 잘랐다. 볼 곳은 anonuid 값이다
+--   all 줄만 anonuid=1500,anongid=1500. 나머지는 65534
+-- etab 에는 exportfs -v 에 없는 nocrossmnt, secure_locks, acl, no_pnfs 도 있다
+
+--------------------------------------------------------------------------------
+ [3] ol7b 에서 다섯 개를 모두 마운트
+--------------------------------------------------------------------------------
+[root@ol7b ~]# mkdir -p /mnt/{sq,nosq,all,ro,async}
+[root@ol7b ~]# for d in sq nosq all ro async; do mount -t nfs ol7a:/srv/nfs/$d /mnt/$d; done; findmnt -t nfs4 -o TARGET,SOURCE,OPTIONS | cut -c1-110
+TARGET     SOURCE              OPTIONS
+/mnt/sq    ol7a:/srv/nfs/sq    rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=
+/mnt/nosq  ol7a:/srv/nfs/nosq  rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=
+/mnt/all   ol7a:/srv/nfs/all   rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=
+/mnt/ro    ol7a:/srv/nfs/ro    rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=
+/mnt/async ol7a:/srv/nfs/async rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=
+-- 클라이언트 쪽 옵션은 다섯 개가 모두 같다(rw, vers=4.1, hard ...)
+-- 내보내기 옵션 차이는 마운트 옵션에 드러나지 않는다.
+-- 서버가 요청을 받을 때 적용한다
+-- cut -c1-110 으로 잘라 timeo= 뒤는 보이지 않는다
+
+--------------------------------------------------------------------------------
+ [4] root_squash — 클라이언트 root 의 쓰기가 거부된다
+--------------------------------------------------------------------------------
+-- ol7b 의 root 가 /mnt/sq 에 파일을 만든다.
+-- 로컬 디스크라면 root 는 퍼미션과 상관없이 쓴다.
+[root@ol7b ~]# touch /mnt/sq/by_root; echo "rc=$?"
+touch: cannot touch ‘/mnt/sq/by_root’: Permission denied
+rc=1
+-- 증상   : 클라이언트 root 의 touch 가 "Permission denied", rc=1
+[root@ol7b ~]# ls -ld /mnt/sq; id
+drwxr-xr-x. 2 root root 6 Nov 16 10:15 /mnt/sq
+uid=0(root) gid=0(root) groups=0(root) context=unconfined_u:unconfined_r:unconfined_t:s0-s0:c0.c1023
+-- 클라이언트에서 디렉터리는 root 755,
+-- 나는 uid=0. 로컬이라면 쓸 수 있는 조합이다
+-- 원인   : 서버가 root_squash 로 요청자를 65534(nfsnobody)로 바꿨다
+--          서버의 /srv/nfs/sq 는 root 755 라 65534 에게 쓰기가 없다
+-- 서버는 이 요청을 누구로 보았나. root 를 nfsnobody(65534)로 바꿔 판단했고,
+-- 디렉터리는 root 755 라 기타 사용자에게 쓰기가 없다.
+-- 디렉터리에 기타 쓰기 권한을 준 뒤 다시 쓴다(스티키 비트를 같이 줘 남의 파일은 못 지우게).
+[root@ol7a ~]# chmod 1777 /srv/nfs/sq; ls -ld /srv/nfs/sq
+drwxrwxrwt. 2 root root 6 Nov 16 10:15 /srv/nfs/sq
+-- 조치   : 디렉터리에 기타 쓰기와 스티키 비트(t)를 준다. 1777
+--   마지막 t : 스티키. 쓰기 권한이 있어도 남의 파일은 지우지 못한다(/tmp 와 같다)
+--   운영에서는 1777 대신 공유 그룹을 만들어 775 + setgid 로 주는 편이 낫다
+[root@ol7b ~]# touch /mnt/sq/by_root; echo "rc=$?"; ls -l /mnt/sq
+rc=0
+total 0
+-rw-r--r--. 1 nfsnobody nfsnobody 0 Nov 16 10:15 by_root
+-- 재확인 : rc=0. 그런데 파일 주인은 root 가 아니라 nfsnobody 다
+[root@ol7a ~]# ls -ln /srv/nfs/sq
+total 0
+-rw-r--r--. 1 65534 65534 0 Nov 16 10:15 by_root
+-- 서버에서도 65534:65534. 클라이언트 root 가 만든 파일의 실제 소유자다
+-- root 로 만든 파일이 nfsnobody 소유가 된다.
+-- 그 다음 root 가 그 파일을 chown 하려 하면?
+[root@ol7b ~]# chown root:root /mnt/sq/by_root; echo "rc=$?"
+chown: changing ownership of ‘/mnt/sq/by_root’: Operation not permitted
+-- chown 도 거부. 서버 입장에서 요청자는 65534 이고 65534 는 chown 권한이 없다
+-- 오류 문구가 Permission denied 가 아니라 Operation not permitted(EPERM)다
+rc=1
+-- 일반 사용자는 영향이 없다. student(1000)는 서버에서도 1000 이다.
+[student@ol7b ~]$ touch /mnt/sq/by_student; ls -ln /mnt/sq
+total 0
+-rw-r--r--. 1 65534 65534 0 Nov 16 10:15 by_root
+-rw-rw-r--. 1  1000  1000 0 Nov 16 10:15 by_student
+-- student 는 1000 그대로 기록됐다. squash 는 root 만 바꾼다
+
+--------------------------------------------------------------------------------
+ [5] no_root_squash — root 가 그대로 root 다
+--------------------------------------------------------------------------------
+[root@ol7b ~]# touch /mnt/nosq/by_root; echo "rc=$?"; ls -ln /mnt/nosq
+rc=0
+total 0
+-rw-r--r--. 1 0 0 0 Nov 16 10:15 by_root
+-- no_root_squash: 클라이언트 root 가 만든 파일이 UID 0
+[root@ol7a ~]# ls -ln /srv/nfs/nosq
+total 0
+-rw-r--r--. 1 0 0 0 Nov 16 10:15 by_root
+-- 서버 쪽도 0:0. 디렉터리가 root 755 인데도 썼다.
+-- 서버가 요청자를 root 로 봤다
+-- root 권한이 서버로 넘어간다는 것은 setuid 파일도 만들 수 있다는 뜻이다.
+[root@ol7b ~]# cp /bin/id /mnt/nosq/myid; chmod u+s /mnt/nosq/myid; ls -l /mnt/nosq/myid
+-rwsr-xr-x. 1 root root 37400 Nov 16 10:15 /mnt/nosq/myid
+-- 퍼미션의 s : setuid. 실행하면 소유자(root) 권한으로 돈다
+[root@ol7a ~]# ls -l /srv/nfs/nosq/myid
+-rwsr-xr-x. 1 root root 37400 Nov 16 10:15 /srv/nfs/nosq/myid
+-- 서버에도 root 소유 setuid 파일이 생겼다.
+-- 클라이언트 root 가 서버 디스크에 심은 것이다
+-- 이 경로를 다른 클라이언트도 마운트한다면,
+-- 그쪽의 일반 사용자도 이 파일로 root 가 된다
+-- 클라이언트가 nosuid 로 마운트하면 setuid 비트를 무시한다.
+-- 7.9 기본 마운트 옵션에는 nosuid 가 없다.
+[student@ol7b ~]$ /mnt/nosq/myid -u
+0
+-- student 가 실행했는데 id -u 가 0. 일반 사용자가 root 권한을 얻었다
+[root@ol7b ~]# mount -o remount,nosuid /mnt/nosq; findmnt -no OPTIONS /mnt/nosq | cut -c1-60
+rw,nosuid,relatime,vers=4.1,rsize=524288,wsize=524288,namlen
+-- remount 로 nosuid 를 더했다. 7.9 기본 마운트 옵션에는 nosuid 가 없다
+[student@ol7b ~]$ /mnt/nosq/myid -u
+1000
+-- nosuid 마운트에서는 setuid 비트를 무시해 1000 이 나온다
+-- 같은 파일, 같은 사용자, 마운트 옵션 하나 차이
+
+--------------------------------------------------------------------------------
+ [6] all_squash — 누가 쓰든 nfsuser(1500)
+--------------------------------------------------------------------------------
+[root@ol7b ~]# touch /mnt/all/by_root
+[student@ol7b ~]$ touch /mnt/all/by_student; ls -ln /mnt/all
+total 0
+-rw-r--r--. 1 1500 1500 0 Nov 16 10:15 by_root
+-rw-rw-r--. 1 1500 1500 0 Nov 16 10:15 by_student
+-- root 가 만든 것도 student 가 만든 것도 1500:1500
+-- 권한 비트는 각자의 umask 그대로(root 022 → rw-r--r--, student 002 → rw-rw-r--)
+[root@ol7a ~]# ls -l /srv/nfs/all
+total 0
+-rw-r--r--. 1 nfsuser nfsuser 0 Nov 16 10:15 by_root
+-rw-rw-r--. 1 nfsuser nfsuser 0 Nov 16 10:15 by_student
+-- 서버에서는 이름이 보인다. 1500 이 서버에만 있는 nfsuser 다
+-- 클라이언트에 1500 이 없어 숫자로 보인다. 서버에서는 이름으로 보인다.
+[root@ol7b ~]# getent passwd 1500; echo "rc=$?"
+rc=2
+-- 클라이언트 getent 는 rc=2(찾지 못함). 그래서 ls 에 숫자가 나왔다
+-- 공용 업로드 경로라면 이것이 원하는 동작이다.
+-- 누가 올렸는지는 파일 소유자로 알 수 없다
+
+--------------------------------------------------------------------------------
+ [7] ro — 서버가 막는 읽기 전용
+--------------------------------------------------------------------------------
+[root@ol7b ~]# cat /mnt/ro/info.txt; touch /mnt/ro/x
+read only data
+touch: cannot touch ‘/mnt/ro/x’: Read-only file system
+-- 읽기는 되고 쓰기는 Read-only file system
+-- 마운트 옵션에는 rw 라고 적혀 있다. 거부는 서버가 했다.
+[root@ol7b ~]# findmnt -no OPTIONS /mnt/ro | cut -c1-40
+rw,relatime,vers=4.1,rsize=524288,wsize=
+-- 마운트 옵션은 rw 다.
+-- 막은 쪽은 클라이언트 커널이 아니라 서버의 ro 내보내기다
+
+--------------------------------------------------------------------------------
+ [8] 클라이언트 지정 공백 실수 — host (rw)
+--------------------------------------------------------------------------------
+-- 흔한 실수를 일부러 넣는다. ol7b.example.com 과 (rw) 사이에 공백 하나.
+[root@ol7a ~]# cp -p /etc/exports /root/exports.good
+[root@ol7a ~]# sed -i 's|^/srv/nfs/sq .*|/srv/nfs/sq     ol7b.example.com (rw,sync)|' /etc/exports; grep '^/srv/nfs/sq' /etc/exports
+-- ol7b.example.com 과 ( 사이에 공백 하나가 들어갔다
+/srv/nfs/sq     ol7b.example.com (rw,sync)
+[root@ol7a ~]# exportfs -rv
+exportfs: No options for /srv/nfs/sq ol7b.example.com: suggest ol7b.example.com(sync) to avoid warning
+exportfs: No host name given with /srv/nfs/sq (rw,sync), suggest *(rw,sync) to avoid warning
+exporting ol7b.example.com:/srv/nfs/async
+exporting ol7b.example.com:/srv/nfs/ro
+exporting ol7b.example.com:/srv/nfs/all
+exporting ol7b.example.com:/srv/nfs/nosq
+exporting ol7b.example.com:/srv/nfs/sq
+exporting *:/srv/nfs/sq
+-- exportfs 의 경고 두 줄
+--   No options for /srv/nfs/sq ol7b.example.com : 옵션 없는 항목 → 기본값(ro)
+--   No host name given with /srv/nfs/sq (rw,sync) : 호스트 없는 항목 → *
+-- 경고만 하고 둘 다 내보냈다. 마지막 줄 exporting *:/srv/nfs/sq
+[root@ol7a ~]# exportfs -v | grep -A1 '/srv/nfs/sq'
+/srv/nfs/sq     ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,ro,secure,root_squash,no_all_squash)
+/srv/nfs/nosq   ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+--
+/srv/nfs/sq     <world>(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+-- sq 가 두 줄이 됐다
+--   ol7b.example.com : ro, root_squash
+--   <world>          : rw (모든 호스트)
+-- 가운데 nosq 줄은 grep -A1 이 함께 잡은 것
+-- 클라이언트 쪽에서 무엇이 달라졌나. 이미 마운트된 /mnt/sq 에 쓴다.
+[root@ol7b ~]# touch /mnt/sq/after_space; echo "rc=$?"
+touch: cannot touch ‘/mnt/sq/after_space’: Read-only file system
+rc=1
+-- 증상   : ol7b 의 쓰기가 Read-only file system. 이미 마운트돼 있던 /mnt/sq 에 곧바로 적용됐다
+[root@ol7b ~]# showmount -e ol7a | grep -E 'Export|/srv/nfs/sq'
+Export list for ol7a:
+/srv/nfs/sq    (everyone)
+-- 클라이언트 showmount 에도 (everyone). 의도와 정반대다
+-- (everyone) 은 망 안의 어느 호스트든 rw 로 마운트할 수 있다는 뜻이다
+-- 원인   : 클라이언트 이름과 괄호 사이의 공백. ol7b 는 옵션 없는 항목(ro)에 맞았다
+--          더 구체적인 항목이 이기므로 ol7b 는 world 의 rw 를 받지 못한다
+-- 고친다. 원본으로 되돌리고 다시 읽힌다.
+[root@ol7a ~]# cp -p /root/exports.good /etc/exports; exportfs -r; exportfs -v | grep -A1 '/srv/nfs/sq'
+/srv/nfs/sq     ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/srv/nfs/nosq   ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+-- 조치   : 원본 exports 를 되살리고 exportfs -r. sq 는 다시 한 줄, rw
+[root@ol7b ~]# touch /mnt/sq/after_fix; echo "rc=$?"
+rc=0
+-- 재확인 : after_fix 가 rc=0
+
+--------------------------------------------------------------------------------
+ [9] 클라이언트를 지정하는 네 가지 방법
+--------------------------------------------------------------------------------
+-- 한 경로에 여러 클라이언트를 다른 옵션으로 줄 수 있다.
+-- 같은 클라이언트가 여러 항목에 맞으면 더 구체적인 쪽이 먼저다.
+--   호스트 이름 ol7b.example.com, IP 172.16.225.62, 서브넷 172.16.225.0/24, 와일드카드 *.example.com
+[root@ol7a ~]# mkdir -p /srv/nfs/multi
+[root@ol7a ~]# echo '/srv/nfs/multi  172.16.225.0/24(ro,sync) 172.16.225.62(rw,sync,no_root_squash) *.example.com(ro,sync)' >> /etc/exports
+[root@ol7a ~]# exportfs -r; exportfs -v | grep -A1 multi
+/srv/nfs/multi  ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,no_root_squash,no_all_squash)
+/srv/nfs/multi  172.16.225.0/24(sync,wdelay,hide,no_subtree_check,sec=sys,ro,secure,root_squash,no_all_squash)
+/srv/nfs/multi  *.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,ro,secure,root_squash,no_all_squash)
+-- 172.16.225.62 로 적은 항목이 ol7b.example.com 으로 보인다.
+-- exportfs 가 IP 를 이름으로 바꿔 보여 준다
+-- 순서: IP(호스트) 항목 → 서브넷 → 와일드카드
+-- 적은 순서와 상관없이 exportfs 가 구체적인 순으로 정렬해 보여 준다
+[root@ol7b ~]# mkdir -p /mnt/multi; mount -t nfs ol7a:/srv/nfs/multi /mnt/multi; touch /mnt/multi/by_b; echo "rc=$?"; ls -ln /mnt/multi
+rc=0
+total 0
+-rw-r--r--. 1 0 0 0 Nov 16 10:15 by_b
+-- ol7b 는 IP 항목(rw, no_root_squash)에 맞았다. root 가 쓴 파일이 0:0
+-- 서브넷(ro)과 와일드카드(ro)에도 맞지만 구체적인 IP 항목이 이겼다
+-- ol7a 자신(172.16.225.61)은 서브넷 항목에 맞아 ro 다.
+-- 서버가 자기 자신을 마운트해 본다.
+[root@ol7a ~]# mkdir -p /mnt/self; mount -t nfs localhost:/srv/nfs/multi /mnt/self 2>&1; mount -t nfs ol7a:/srv/nfs/multi /mnt/self; touch /mnt/self/by_a; echo "rc=$?"; umount /mnt/self
+mount.nfs: access denied by server while mounting localhost:/srv/nfs/multi
+-- localhost 로 붙으면 출발지가 127.0.0.1 이다.
+-- 어느 항목에도 맞지 않아 access denied
+touch: cannot touch ‘/mnt/self/by_a’: Read-only file system
+rc=1
+-- ol7a 이름으로 붙으면 출발지 172.16.225.61.
+-- 서브넷 항목(ro)에 맞아 Read-only file system
+
+--------------------------------------------------------------------------------
+ [10] sync 와 async — 응답 시점의 차이
+--------------------------------------------------------------------------------
+-- 두 디렉터리 모두 no_root_squash 로 맞췄다(nosq=sync,
+-- async=async). 같은 크기를 써서 걸린 시간을 비교한다.
+--   oflag=direct : 클라이언트 페이지 캐시를 거치지 않고 바로 서버로 보낸다
+--   256MiB 만 쓴다(델타 디스크가 커지지 않게)
+[root@ol7b ~]# dd if=/dev/zero of=/mnt/nosq/sync.dat bs=1M count=256 oflag=direct 2>&1 | tail -1
+268435456 bytes (268 MB) copied, 5.88419 s, 45.6 MB/s
+-- dd 끝 줄: 바이트, 걸린 초, 속도. 첫 sync 쓰기 45.6 MB/s
+[root@ol7b ~]# dd if=/dev/zero of=/mnt/async/async.dat bs=1M count=256 oflag=direct 2>&1 | tail -1
+268435456 bytes (268 MB) copied, 1.68984 s, 159 MB/s
+-- async 159 MB/s
+[root@ol7b ~]# dd if=/dev/zero of=/mnt/nosq/sync.dat bs=1M count=256 oflag=direct 2>&1 | tail -1
+268435456 bytes (268 MB) copied, 1.73359 s, 155 MB/s
+[root@ol7b ~]# dd if=/dev/zero of=/mnt/async/async.dat bs=1M count=256 oflag=direct 2>&1 | tail -1
+268435456 bytes (268 MB) copied, 1.27511 s, 211 MB/s
+-- 두 번째 쌍은 sync 155, async 211 MB/s
+-- 첫 sync 가 유난히 느린 것은 서버가 처음으로 파일 공간을 할당하며 디스크에 내렸기 때문으로 보인다
+-- 두 번 모두 async 가 빨랐다.
+-- 차이의 크기는 VM 디스크 캐시 때문에 흔들린다
+-- 서버에서 디스크로 아직 안 내려간 양(Dirty). async 는 응답 뒤에 내린다.
+[root@ol7a ~]# grep -E '^(Dirty|Writeback):' /proc/meminfo
+Dirty:            262108 kB
+Writeback:             0 kB
+-- 서버 Dirty 262108 kB(약 256MiB).
+-- 방금 async 로 받은 데이터가 아직 메모리에 있다
+-- 이 순간 서버 전원이 나가면 클라이언트가 성공으로 받은 256MiB 가 사라진다
+[root@ol7b ~]# rm -f /mnt/nosq/sync.dat /mnt/async/async.dat
+
+--------------------------------------------------------------------------------
+ [변형] 클라이언트 ro 마운트와 서버 ro 내보내기
+--------------------------------------------------------------------------------
+-- rw 로 내보낸 nosq 를 클라이언트에서 ro 로 다시 마운트한다.
+-- 막는 주체가 클라이언트 커널로 바뀐다.
+[root@ol7b ~]# umount /mnt/nosq; mount -t nfs -o ro ol7a:/srv/nfs/nosq /mnt/nosq; touch /mnt/nosq/x
+touch: cannot touch ‘/mnt/nosq/x’: Read-only file system
+-- 서버는 rw(no_root_squash)로 내보내는 경로인데 클라이언트 ro 마운트라 거부
+[root@ol7b ~]# findmnt -no OPTIONS /mnt/nosq | cut -c1-30; findmnt -no OPTIONS /mnt/ro | cut -c1-30
+ro,relatime,vers=4.1,rsize=524
+rw,relatime,vers=4.1,rsize=524
+-- 첫 줄(nosq) ro, 둘째 줄(/mnt/ro) rw.
+-- 같은 Read-only 오류가 서로 다른 곳에서 나왔다
+--   /mnt/nosq : 클라이언트 커널이 거부(마운트 옵션 ro)
+--   /mnt/ro   : 서버가 거부(내보내기 ro)
+-- 반대로 서버가 ro 인 경로를 클라이언트가 rw 로 달라고 해도 마운트는 된다.
+-- 거부는 쓰는 순간에 온다([7]).
+-- 차이가 드러나는 곳은 오류 문구가 아니라 nfsstat 의 서버 통계다.
+-- 클라이언트 ro 는 요청 자체를 보내지 않는다.
+[root@ol7a ~]# nfsstat -s -4 | grep -A1 -E 'setattr|write' | head -6
+renew        restorefh    savefh       secinfo      setattr      setcltid     
+0         0% 0         0% 0         0% 0         0% 12        0% 0         0% 
+setcltidconf verify       write        rellockowner bc_ctl       bind_conn    
+0         0% 0         0% 2049     20% 0         0% 0         0% 0         0% 
+-- v4 서버 연산 표의 setattr 12, write 2049.
+-- 이름 줄 아래 숫자 줄이 그 칸의 횟수와 비율이다
+[root@ol7b ~]# touch /mnt/nosq/y 2>/dev/null; touch /mnt/ro/y 2>/dev/null; echo done
+done
+[root@ol7a ~]# nfsstat -s -4 | grep -A1 -E 'setattr|write' | head -6
+renew        restorefh    savefh       secinfo      setattr      setcltid     
+0         0% 0         0% 0         0% 0         0% 12        0% 0         0% 
+setcltidconf verify       write        rellockowner bc_ctl       bind_conn    
+0         0% 0         0% 2049     20% 0         0% 0         0% 0         0% 
+-- 두 touch 뒤에도 setattr·write 는 그대로다
+--   /mnt/nosq 의 touch 는 요청을 보내지 않았다(클라이언트 ro)
+--   /mnt/ro 의 touch 는 파일 생성이라 OPEN 연산으로 갔고 서버가 거부했다. 이 두 칸에는 잡히지 않는다
+
+--------------------------------------------------------------------------------
+ [11] 되돌리기
+--------------------------------------------------------------------------------
+[root@ol7b ~]# umount /mnt/{sq,nosq,all,ro,async,multi}; rmdir /mnt/{sq,nosq,all,ro,async,multi}; findmnt -t nfs4 | wc -l
+0
+-- 클라이언트 NFS 마운트 0
+[root@ol7a ~]# exportfs -ua; : > /etc/exports; systemctl disable --now nfs-server
+Removed symlink /etc/systemd/system/multi-user.target.wants/nfs-server.service.
+[root@ol7a ~]# firewall-cmd -q --permanent --remove-service={nfs,mountd,rpc-bind}; firewall-cmd -q --reload; firewall-cmd --list-services
+dhcpv6-client ssh
+-- 서버 방화벽 기본값으로
+[root@ol7a ~]# rm -rf /srv/nfs /mnt/self /root/exports.good; userdel nfsuser; id 1500; exportfs -v | wc -l
+id: 1500: no such user
+0
+-- nfsuser 삭제(id 1500 없음), 내보내기 0
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  디렉터리  내보내기 옵션                클라이언트 root 쓰기          student 쓰기
+--  sq        rw,sync (root_squash)        755: Permission denied        1000 으로 기록
+--                                         1777: 65534 소유로 생성
+--  nosq      no_root_squash               0:0 으로 생성, setuid 가능    -
+--  all       all_squash,anonuid=1500      1500 으로 기록                1500 으로 기록
+--  ro        ro                           Read-only file system         -
+--  async     async,no_root_squash         256MiB 159·211 MB/s (sync 45.6·155)
+--
+--  상황                    exportfs -v                     ol7b 결과
+--  공백 없음               ol7b(rw)                        쓰기 rc=0
+--  공백 있음               ol7b(ro) + <world>(rw)          Read-only file system
+--
+--  항목             시작 전       변경 후                  되돌린 뒤
+--  내보내기         0             5~7 개                   0
+--  방화벽           ssh dhcpv6    +nfs +mountd +rpc-bind   dhcpv6-client ssh
+--  UID 1500         없음          nfsuser(ol7a)            없음
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. all 줄에서 anonuid·anongid 를 빼고 다시 쓴다
+--    확인: 서버 ls -ln 에서 소유자가 65534 로 바뀌는지
+-- 2. /srv/nfs/sq 에 student 의 파일을 만든 뒤 클라이언트 root 가 지워 본다
+--    확인: 스티키 비트(1777) 때문에 Operation not permitted 가 나는지
+-- 3. exports 에 같은 경로를 *.example.com(rw) 와 ol7b.example.com(ro) 로 주고
+--    ol7b 의 쓰기가 되는지 본다. 확인: exportfs -v 의 줄 순서와 touch 결과
+
+================================================================================
+ 실습 02 종료 — root_squash 는 65534, 공백 하나가 ol7b 를 ro 로·world 를 rw 로 만듦
+================================================================================

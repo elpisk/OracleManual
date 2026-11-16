@@ -1,0 +1,451 @@
+================================================================================
+ 제15장 실습 04 — ssh-agent 와 점프 호스트
+ 대상   : ol7a (student, 클라이언트), ol7b (student, 중계 서버)
+ 목표   : 암호문이 걸린 키를 ssh-agent 에 한 번 올려 두고 여러 번 쓴다. 에이전트
+          포워딩으로 ol7b 에서 ol7b 밖으로 다시 나가 보고, ProxyJump(-J) 로 중계
+          서버를 거치는 접속을 만든다. ~/.ssh/config 의 Host 블록으로 이것들을
+          짧은 이름 하나에 묶는다
+ 배경   : ssh-agent 는 복호화한 개인 키를 메모리에 들고 있다가 서명만 대신해 주는
+          프로세스다. 클라이언트는 SSH_AUTH_SOCK 변수가 가리키는 유닉스 소켓으로
+          에이전트를 찾는다. 포워딩(-A)은 이 소켓을 원격 서버까지 연장하고,
+          ProxyJump 는 중계 서버를 통로(-W)로만 쓴다 (본문 15.3, 15.6)
+ 소요   : 약 30분
+ 선행   : ol7-base, ol7b-base 스냅샷
+ 계정   : student (두 노드), root (로그 확인·정리)
+ 주의   : 없음
+ 되돌림 : 에이전트 종료, 두 노드의 /home/student/.ssh 삭제
+          → pgrep -u student ssh-agent, ls -ld /home/student/.ssh
+================================================================================
+
+-- 이 랩은 명령 한 줄마다 새 셸에서 실행된다(터미널 없음). 그래서 eval 로 설정한 변수는
+-- 다음 줄에 남지 않는다. [3] 이 그 상황을 그대로 보여 준다. 이후에는 에이전트를 고정
+-- 소켓(-a)으로 띄우고 줄마다 SSH_AUTH_SOCK 를 지정한다.
+-- 암호문·암호 입력은 SSH_ASKPASS 도우미(/usr/local/bin/ask)가 대신하고 질문은
+-- /tmp/ask.log 에 남는다. 수업에서는 키보드로 입력한다.
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ echo "SSH_AUTH_SOCK=[$SSH_AUTH_SOCK]"; pgrep -u student -l ssh-agent; ls -ld ~/.ssh
+SSH_AUTH_SOCK=[]
+-- 변수가 비었다. 에이전트가 없다. pgrep 도 아무것도 찾지 못했다.
+-- 그래픽 데스크톱 로그인이라면 세션 관리자가 에이전트를 띄워 주기도 한다. SSH 로 들어온 셸에는 없다.
+-- 이 값을 정리 단계와 비교한다.
+ls: cannot access /home/student/.ssh: No such file or directory
+[root@ol7b ~]# sshd -T | grep -E '^(allowagentforwarding|allowtcpforwarding|permittunnel) '
+allowtcpforwarding yes
+allowagentforwarding yes
+permittunnel no
+-- 서버 ol7b 는 에이전트 포워딩·TCP 포워딩 모두 기본 허용(yes). 이 실습은 서버 설정을 바꾸지 않는다.
+-- permittunnel 은 tun 장치 터널(-w). 기본 no 이고 여기서는 쓰지 않는다.
+
+--------------------------------------------------------------------------------
+ [1] 준비 — 암호문 걸린 키, 두 노드에 배포
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ ssh-keygen -t ecdsa -N 'Lab15-pass' -C 'student@ol7a' -f ~/.ssh/id_ecdsa -q; ls ~/.ssh
+id_ecdsa
+id_ecdsa.pub
+-- 암호문 Lab15-pass 를 건 ECDSA 256 키 하나만 쓴다.
+-- -b 없이 만든 ECDSA 는 256비트(nistp256).
+-- known_hosts 에는 두 노드의 짧은 이름·FQDN 네 줄을 넣었다(출력 없음).
+[student@ol7a ~]$ ssh-keyscan -t ecdsa ol7a ol7b ol7a.example.com ol7b.example.com 2>/dev/null > ~/.ssh/known_hosts
+-- ol7b 에서 ol7a 로 다시 나갈 때 쓸 known_hosts 도 미리 둔다.
+[student@ol7b ~]$ mkdir -m 700 -p ~/.ssh; ssh-keyscan -t ecdsa ol7a ol7a.example.com 2>/dev/null > ~/.ssh/known_hosts; wc -l ~/.ssh/known_hosts
+2 /home/student/.ssh/known_hosts
+-- ol7b 쪽 student 에게 ol7a 의 호스트 키를 미리 준다. [7] 에서 ol7b → ol7a 로 나갈 때 쓴다.
+-- 이름 두 개만 넣고 IP 는 넣지 않았다. [7] 에서 그 결과가 보인다.
+-- mkdir -m 700 -p: 디렉터리를 만들면서 권한을 바로 700 으로.
+[student@ol7a ~]$ for h in ol7b ol7a; do SSH_ASKPASS=/usr/local/bin/ask DISPLAY=:0 ssh-copy-id -i ~/.ssh/id_ecdsa.pub $h 2>&1 | grep Number; done
+Number of key(s) added: 1
+Number of key(s) added: 1
+-- ol7b 와 ol7a(자기 자신) 두 곳에 공개 키를 넣었다. [8] 의 ProxyJump 목적지가 ol7a 라서다.
+-- 키를 받는 쪽은 두 곳, 개인 키는 ol7a 한 곳에만 있다.
+[root@ol7a ~]# sort /tmp/ask.log | uniq -c
+      1 student@ol7a's password: 
+      1 student@ol7b's password: 
+-- 질문은 계정 암호 두 번. 배포 때는 개인 키를 열 필요가 없어 암호문을 묻지 않았다.
+-- sort | uniq -c: 같은 질문이 몇 번 나왔는지 센다.
+
+--------------------------------------------------------------------------------
+ [2] 에이전트 없이 — 접속할 때마다 암호문
+--------------------------------------------------------------------------------
+
+-- BatchMode 에서는 암호문을 물을 수 없어 키를 못 쓴다.
+[student@ol7a ~]$ ssh -o BatchMode=yes ol7b hostname; echo rc=$?
+Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password).
+rc=255
+-- 키는 배포됐지만 BatchMode 라 암호문을 물을 수 없다. 암호문 걸린 키는 이렇게 쓸 수 없다.
+-- cron 에서 이 키를 쓰는 스크립트가 실패하는 모양과 같다.
+[student@ol7a ~]$ for i in 1 2 3; do SSH_ASKPASS=/usr/local/bin/ask DISPLAY=:0 ssh ol7b hostname; done
+ol7b.example.com
+ol7b.example.com
+ol7b.example.com
+[root@ol7a ~]# cat /tmp/ask.log
+Enter passphrase for key '/home/student/.ssh/id_ecdsa': 
+Enter passphrase for key '/home/student/.ssh/id_ecdsa': 
+Enter passphrase for key '/home/student/.ssh/id_ecdsa': 
+-- 세 번 접속에 암호문 세 번. 스크립트에서 열 번 접속하면 열 번 묻는다.
+-- 결과는 성공이지만 사람이 매번 쳐야 한다.
+-- 이 불편 때문에 암호문 없는 키를 만드는 일이 생긴다. 에이전트가 그 대안이다.
+-- 질문 문구에 키 파일 경로가 들어 있다. 어느 키의 암호문인지 확인하고 친다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 ① — 에이전트를 띄웠는데 ssh-add 가 못 찾는다
+--------------------------------------------------------------------------------
+
+-- ssh-agent 는 자기를 찾는 데 필요한 변수를 셸 명령 형태로 출력한다.
+[student@ol7a ~]$ ssh-agent
+SSH_AUTH_SOCK=/tmp/ssh-clphI0jxXAyN/agent.2463; export SSH_AUTH_SOCK;
+SSH_AGENT_PID=2464; export SSH_AGENT_PID;
+echo Agent pid 2464;
+-- ssh-agent 는 뒤로 떠 있고(pid 2464), 자기를 찾는 방법을 셸 명령으로 출력만 한다.
+-- SSH_AUTH_SOCK: 유닉스 소켓 경로(/tmp/ssh-무작위/agent.부모PID). SSH_AGENT_PID: 에이전트 PID.
+-- 이 출력을 셸이 실행해야 변수가 생긴다. 지금은 화면에 찍혔을 뿐이다.
+-- -s 를 주면 sh 형식, -c 는 csh 형식. 아무것도 안 주면 SHELL 변수로 고른다.
+-- 출력만 했을 뿐 이 셸에 변수가 생긴 것은 아니다. 다른 셸(새 터미널, su, cron)도 마찬가지.
+[student@ol7a ~]$ ssh-add -l; echo rc=$?; pgrep -u student -l ssh-agent
+Could not open a connection to your authentication agent.
+rc=2
+2464 ssh-agent
+-- 에이전트는 떠 있는데(pgrep 2464) ssh-add 는 못 찾는다. rc=2 는 연결 실패.
+-- 같은 셸에서 실행한 것처럼 보여도 변수가 없으면 남과 같다.
+-- 에이전트가 떠 있는지(pgrep)와 찾을 수 있는지(변수)는 별개다.
+-- rc=2 를 기억해 둔다.
+-- eval 로 출력을 실행하면 그 셸에서만 변수가 생긴다.
+[student@ol7a ~]$ eval $(ssh-agent) >/dev/null; echo $SSH_AUTH_SOCK; ssh-add -l; echo rc=$?
+/tmp/ssh-Y2wqsmRHoZ0f/agent.2533
+The agent has no identities.
+rc=1
+-- eval 로 실행하자 같은 줄 안에서는 찾았다. rc=1 은 연결 성공·키 없음.
+-- rc 로 상태를 가릴 수 있다: 0 키 있음, 1 키 없음, 2 에이전트 연결 실패.
+-- 이번 에이전트는 두 번째 것(2533 의 자식). 앞의 2464 는 아무도 못 쓰고 남아 있다.
+[student@ol7a ~]$ ssh-add -l; echo rc=$?
+Could not open a connection to your authentication agent.
+rc=2
+-- 다음 명령(새 셸)에서는 다시 못 찾는다. 새 터미널, su, cron, 스크립트가 모두 이렇다.
+
+-- 증상   : ssh-add -l → "Could not open a connection to your authentication agent." rc=2
+-- 원인   : 이 셸에 SSH_AUTH_SOCK 가 없다. ssh-agent 출력을 eval 하지 않았거나 다른 셸에서 띄움
+-- 조치   : 같은 셸에서 eval $(ssh-agent), 또는 -a 로 소켓 경로를 정해 SSH_AUTH_SOCK 를 지정([4])
+-- 재확인 : SSH_AUTH_SOCK=/tmp/student-agent.sock ssh-add -l → rc=1(키 없음, 연결 성공)
+-- 남은 에이전트들을 정리한다. 변수가 없으니 ssh-agent -k 도 못 쓴다.
+[student@ol7a ~]$ ssh-agent -k; echo rc=$?; pkill -u student ssh-agent; pgrep -u student ssh-agent; echo rc=$?
+SSH_AGENT_PID not set, cannot kill agent
+-- -k 도 변수(SSH_AGENT_PID)로 대상을 찾는다. 그래서 pkill 로 두 에이전트를 지웠다.
+-- 로그인할 때마다 eval $(ssh-agent) 를 하면 이렇게 주인 없는 에이전트가 쌓인다.
+-- 마지막 rc=1 은 pgrep 이 남은 에이전트를 찾지 못했다는 뜻(모두 정리됨).
+rc=1
+rc=1
+
+--------------------------------------------------------------------------------
+ [4] 소켓 경로를 정해 띄우기 — ssh-agent -a
+--------------------------------------------------------------------------------
+
+-- -a : 소켓 경로 지정. 경로를 알면 어느 셸에서든 SSH_AUTH_SOCK 로 붙을 수 있다.
+[student@ol7a ~]$ ssh-agent -a /tmp/student-agent.sock | head -2
+SSH_AUTH_SOCK=/tmp/student-agent.sock; export SSH_AUTH_SOCK;
+SSH_AGENT_PID=2641; export SSH_AGENT_PID;
+-- head -2 로 echo 줄은 잘랐다. 소켓 경로가 지정한 /tmp/student-agent.sock 이다.
+-- PID 2641. 이후 정리 단계에서 이 번호로 끝낸다.
+-- 이번에는 출력을 eval 하지 않는다.
+[student@ol7a ~]$ ls -l /tmp/student-agent.sock; pgrep -u student -l ssh-agent
+srw-------. 1 student student 0 Nov 16 15:41 /tmp/student-agent.sock
+2641 ssh-agent
+-- 소켓은 srw------- student. 다른 사용자는 이 소켓에 붙을 수 없다(root 는 예외).
+-- 첫 글자 s 는 소켓 파일. 크기는 늘 0.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh-add -l; echo rc=$?
+The agent has no identities.
+rc=1
+-- 이번에는 별도 셸에서도 찾는다. 경로만 알면 된다.
+-- 실무에서는 ~/.bash_profile 에 export SSH_AUTH_SOCK=고정경로 를 두고 쓰기도 한다.
+
+--------------------------------------------------------------------------------
+ [5] ssh-add — 키를 올리고 목록 보기
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock SSH_ASKPASS=/usr/local/bin/ask DISPLAY=:0 ssh-add ~/.ssh/id_ecdsa
+Identity added: /home/student/.ssh/id_ecdsa (/home/student/.ssh/id_ecdsa)
+-- 터미널이 없어 SSH_ASKPASS 로 암호문을 받았다. 질문 문구가 ssh 와 조금 다르다(key 가 없음).
+-- 수업에서는 Enter passphrase 질문에 Lab15-pass 를 친다.
+[root@ol7a ~]# cat /tmp/ask.log
+Enter passphrase for /home/student/.ssh/id_ecdsa: 
+-- -l : 지문 목록, -L : 공개 키 목록
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh-add -l
+256 SHA256:0j3zMjpo2yrBY8dh4CwhLbiy18wjs8RrrPh83a1yI94 /home/student/.ssh/id_ecdsa (ECDSA)
+-- -l 열: 비트 수, 지문, 키를 올린 파일 경로, 종류. 주석 대신 경로가 나온다.
+-- 키를 여러 개 올리면 줄이 늘어난다. ssh 는 이 순서대로 내민다.
+-- -L 은 본문을 60자로 잘랐다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh-add -L | cut -c1-60
+ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlz
+-- -L 은 공개 키 본문. 이 출력을 그대로 authorized_keys 에 넣을 수도 있다.
+[student@ol7a ~]$ ssh-keygen -lf ~/.ssh/id_ecdsa.pub
+256 SHA256:0j3zMjpo2yrBY8dh4CwhLbiy18wjs8RrrPh83a1yI94 student@ol7a (ECDSA)
+-- 파일의 지문과 에이전트의 지문이 같다. 에이전트에 든 것이 이 키다.
+-- 에이전트는 복호화된 키를 메모리에만 든다. 디스크에 새 파일을 쓰지 않는다.
+
+--------------------------------------------------------------------------------
+ [6] 에이전트로 접속 — 암호문을 다시 묻지 않는다
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ for i in 1 2 3; do SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -o BatchMode=yes ol7b hostname; done
+ol7b.example.com
+ol7b.example.com
+ol7b.example.com
+[root@ol7a ~]# wc -c /tmp/ask.log
+0 /tmp/ask.log
+-- BatchMode 인데도 세 번 모두 성공. 질문 기록은 0바이트. 서명은 에이전트가 했다.
+-- [2] 와 같은 명령인데 결과가 다르다. 차이는 SSH_AUTH_SOCK 하나다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -v -o BatchMode=yes ol7b true 2>&1 | grep -E 'Offering|Server accepts|Authentication succeeded'
+debug1: Offering ECDSA public key: /home/student/.ssh/id_ecdsa
+debug1: Server accepts key: pkalg ecdsa-sha2-nistp256 blen 104
+debug1: Authentication succeeded (publickey).
+-- ssh 는 에이전트에 든 키를 먼저 내민다. 파일을 열지 않으니 암호문이 필요 없다.
+-- Server accepts key 다음에 에이전트가 서명을 만들어 돌려줬다.
+-- 키를 올린 뒤로는 암호문을 묻지 않는다.
+
+--------------------------------------------------------------------------------
+ [7] 에이전트 포워딩 — ol7b 에서 다시 밖으로
+--------------------------------------------------------------------------------
+
+-- 포워딩 없이: ol7b 에는 개인 키가 없으므로 ol7b → ol7a 는 실패한다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -o BatchMode=yes ol7b 'echo "sock=[$SSH_AUTH_SOCK]"; ssh -o BatchMode=yes ol7a hostname; echo rc=$?'
+sock=[]
+-- -A 없이: ol7b 의 셸에는 SSH_AUTH_SOCK 가 없다.
+-- 원격 명령은 작은따옴표 안이라 $SSH_AUTH_SOCK 가 ol7b 에서 풀렸다.
+Warning: Permanently added the ECDSA host key for IP address '172.16.225.61' to the list of known hosts.
+-- ol7b 의 known_hosts 에 이름만 넣었더니, ssh 가 IP 줄을 스스로 더했다(CheckHostIP).
+-- 01 의 ssh-keygen -R 에서 본 이름,IP 한 줄과 다른 모양이다. 이번에는 IP 가 따로 한 줄.
+Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password).
+rc=255
+-- ol7b 에는 student 의 개인 키가 없다. 키를 ol7b 에 복사하지 않는 한 여기서 막힌다.
+-- 개인 키를 중계 서버에 복사하는 것은 공식 문서가 하지 말라는 일이다.
+-- 이제 -A 를 붙여 같은 명령을 친다.
+-- -A : 에이전트 포워딩. ol7b 의 sshd 가 /tmp/ssh-* 아래에 소켓을 만들고 변수를 넣어 준다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -A -o BatchMode=yes ol7b 'echo "sock=[$SSH_AUTH_SOCK]"; ls -l $SSH_AUTH_SOCK; ssh-add -l; ssh -o BatchMode=yes ol7a hostname; echo rc=$?'
+sock=[/tmp/ssh-XJ46WLx0wY/agent.4312]
+-- -A: ol7b 의 sshd 가 /tmp/ssh-*/agent.4312 소켓을 만들고 변수를 넣었다. 4312 는 그 세션의 sshd PID.
+srwxr-xr-x. 1 student student 0 Nov 16 15:41 /tmp/ssh-XJ46WLx0wY/agent.4312
+-- 소켓 소유자는 student. ol7b 의 root 는 이 소켓을 쓸 수 있다. 포워딩의 위험이 여기 있다.
+-- 접속이 끝나면 sshd 가 소켓과 디렉터리를 지운다.
+-- ssh-add -l 은 ol7b 에서 실행됐다.
+256 SHA256:0j3zMjpo2yrBY8dh4CwhLbiy18wjs8RrrPh83a1yI94 /home/student/.ssh/id_ecdsa (ECDSA)
+-- ol7b 에서 본 키 목록이 ol7a 의 에이전트와 같다. 요청이 연결을 거슬러 ol7a 로 간다.
+ol7a.example.com
+rc=0
+-- ol7b → ol7a 접속 성공. ol7b 에는 개인 키가 없다.
+-- 출력은 원격 hostname(ol7a.example.com) 다음에 rc=0.
+-- ol7a 의 로그로 두 번째 접속이 ol7b(172.16.225.62)에서 왔음을 확인한다.
+[root@ol7a ~]# grep 'Accepted publickey for student' /var/log/secure | tail -1 | cut -c17-
+ol7a sshd[3060]: Accepted publickey for student from 172.16.225.62 port 42068 ssh2: ECDSA SHA256:0j3zMjpo2yrBY8dh4CwhLbiy18wjs8RrrPh83a1yI94
+-- ol7a 의 로그: 출발지 172.16.225.62(ol7b), 키 지문은 ol7a 에 있는 그 키.
+
+-- 에이전트 포워딩: 키는 ol7a 에만, 서명 요청은 ol7b → ol7a, 접속은 ol7b → ol7a.
+
+--------------------------------------------------------------------------------
+ [8] ProxyJump — 중계 서버를 통로로만
+--------------------------------------------------------------------------------
+
+-- -J 중계 : 먼저 중계에 접속하고, 중계에서 목적지로 TCP 통로(-W)를 연 뒤
+-- 그 통로 안에서 목적지와 직접 SSH 를 한다. 중계 서버에는 키가 필요 없다.
+-- 랩에 노드가 둘뿐이라 ol7a → (ol7b 경유) → ol7a 로 돌아온다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -J ol7b -o BatchMode=yes ol7a 'hostname; echo $SSH_CONNECTION'
+ol7a.example.com
+172.16.225.62 42080 172.16.225.61 22
+-- 목적지 ol7a 가 본 출발지는 ol7b(172.16.225.62). TCP 는 ol7b 에서 나갔다.
+-- hostname 출력 ol7a.example.com 은 목적지 ol7a 의 것이다.
+Killed by signal 1.
+-- 끝날 때 ssh 가 통로용 ssh(-W) 프로세스를 SIGHUP 으로 정리하며 찍는 말이다. 오류가 아니다.
+[root@ol7a ~]# grep 'Accepted publickey for student' /var/log/secure | tail -1 | cut -c17-
+ol7a sshd[3131]: Accepted publickey for student from 172.16.225.62 port 42080 ssh2: ECDSA SHA256:0j3zMjpo2yrBY8dh4CwhLbiy18wjs8RrrPh83a1yI94
+-- 포트 42080 이 위 SSH_CONNECTION 과 같다. 인증은 ol7a 가 직접 했다(ol7b 는 바이트만 전달).
+-- 지문은 [7] 과 같은 키. 에이전트가 ol7a 안에서 서명했다.
+-- 목적지와 중계를 바꿔 쓰는 실무 예: 배스천 → 내부 DB 서버.
+-- 중계 서버(ol7b)의 로그에는 통로 요청이 남는다(LogLevel INFO 에서는 접속만).
+[root@ol7b ~]# grep 'sshd' /var/log/secure | grep student | tail -2 | cut -c17-
+ol7b sshd[4427]: pam_unix(sshd:session): session opened for user student by (uid=0)
+ol7b sshd[4427]: pam_unix(sshd:session): session closed for user student
+-- ol7b 에는 student 세션이 열렸다 닫힌 기록만 있다. 무엇을 중계했는지는 INFO 에 남지 않는다.
+-- 이 방식에서 ol7b 는 에이전트를 볼 수 없다. 공식 문서가 배스천에 ProxyJump 를 권하는 이유.
+-- [OL8/9] -J 는 OpenSSH 7.3 부터. 그 전에는 ProxyCommand 로 같은 일을 했다([변형]).
+
+--------------------------------------------------------------------------------
+ [9] ~/.ssh/config — Host 블록으로 묶기
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ cat > ~/.ssh/config <<'EOF'
+Host b
+    HostName ol7b.example.com
+    User student
+    IdentityFile ~/.ssh/id_ecdsa
+    ForwardAgent yes
+Host a-via-b
+    HostName ol7a.example.com
+    ProxyJump b
+Host *
+    ServerAliveInterval 60
+EOF
+-- Host b: 짧은 이름 b 에 실제 이름·사용자·키·에이전트 포워딩을 묶었다.
+-- Host a-via-b: b 를 거쳐 ol7a 로. Host *: 모든 호스트에 60초마다 keepalive.
+-- 구체적인 블록을 위에, Host * 를 맨 아래에 둔다. 처음 값이 이기기 때문이다.
+-- 들여쓰기는 사람이 읽기 위한 것이다. 블록 경계는 다음 Host 줄이다.
+[student@ol7a ~]$ chmod 600 ~/.ssh/config; ls -l ~/.ssh/config
+-rw-------. 1 student student 201 Nov 16 15:41 /home/student/.ssh/config
+-- -G : 접속하지 않고 이 호스트에 실제로 적용될 설정을 출력한다.
+[student@ol7a ~]$ ssh -G b | grep -E '^(hostname|user|port|identityfile|forwardagent|serveraliveinterval|proxyjump|stricthostkeychecking) '
+Pseudo-terminal will not be allocated because stdin is not a terminal.
+-- 이 경고는 랩 러너에 터미널이 없어서 나온 것이다. -G 결과와는 무관하다.
+-- -G 는 접속하지 않는다. 계산만 하고 끝난다.
+user student
+hostname ol7b.example.com
+port 22
+forwardagent yes
+stricthostkeychecking ask
+serveraliveinterval 60
+identityfile ~/.ssh/id_ecdsa
+-- 블록 b 의 값과 기본값(port 22, stricthostkeychecking ask)이 함께 계산됐다.
+-- proxyjump 줄이 없다. b 에는 경유 설정이 없다는 뜻이다.
+-- grep 으로 볼 줄만 골랐다. 전체 출력은 70줄이 넘는다.
+[student@ol7a ~]$ ssh -G a-via-b | grep -E '^(hostname|proxyjump|forwardagent) '
+Pseudo-terminal will not be allocated because stdin is not a terminal.
+hostname ol7a.example.com
+forwardagent no
+proxyjump b
+-- a-via-b 는 forwardagent no(Host b 의 값을 물려받지 않는다), proxyjump b.
+-- 다만 경유 단계(b 접속)에는 Host b 의 설정이 그대로 쓰인다.
+-- 이제 실제로 접속해 본다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -o BatchMode=yes b 'hostname; ssh-add -l | wc -l'
+ol7b.example.com
+1
+-- b 로 접속하자 ForwardAgent 가 적용돼 ol7b 에서 키 1개가 보였다. -A 를 칠 필요가 없다.
+-- 사용자 이름도 config 의 User student 에서 왔다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -o BatchMode=yes a-via-b hostname
+ol7a.example.com
+Killed by signal 1.
+-- a-via-b 한 단어로 [8] 과 같은 경유 접속이 됐다.
+-- 운영·대기 DB 서버를 이렇게 이름 하나로 등록해 두면 스크립트가 짧아진다.
+
+--------------------------------------------------------------------------------
+ [10] 오류 ② — config 파일 권한
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ chmod 666 ~/.ssh/config; ls -l ~/.ssh/config
+-rw-rw-rw-. 1 student student 201 Nov 16 15:41 /home/student/.ssh/config
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -o BatchMode=yes b hostname; echo rc=$?
+Bad owner or permissions on /home/student/.ssh/config
+rc=255
+-- 666: 다른 사람이 쓸 수 있는 config. ssh 는 접속을 시도하지도 않고 끝냈다.
+-- 서버 쪽 검사와 달리 이유가 화면에 찍힌다.
+-- 664 와 644 를 이어서 본다.
+-- 그룹 쓰기(664)는? 읽기(644)는?
+[student@ol7a ~]$ chmod 664 ~/.ssh/config; SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -o BatchMode=yes b hostname; echo rc=$?
+Bad owner or permissions on /home/student/.ssh/config
+rc=255
+-- 664(그룹 쓰기)도 거부.
+[student@ol7a ~]$ chmod 644 ~/.ssh/config; SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -o BatchMode=yes b hostname; echo rc=$?
+ol7b.example.com
+rc=0
+-- 644(읽기만)는 통과. 기준은 쓰기 권한이다.
+
+-- 증상   : "Bad owner or permissions on /home/student/.ssh/config", rc=255
+-- 원인   : config 에 그룹·다른 사용자 쓰기 권한(666·664). ProxyCommand 등으로 명령 실행 위험
+-- 조치   : chmod 600 ~/.ssh/config
+-- 재확인 : ssh -o BatchMode=yes b hostname → ol7b.example.com, rc=0
+[student@ol7a ~]$ chmod 600 ~/.ssh/config
+
+--------------------------------------------------------------------------------
+ [11] 키 빼기와 수명 — ssh-add -d, -t, -D
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh-add -d ~/.ssh/id_ecdsa; SSH_AUTH_SOCK=/tmp/student-agent.sock ssh-add -l; echo rc=$?
+Identity removed: /home/student/.ssh/id_ecdsa (student@ol7a)
+-- -d 는 .pub 파일로 어느 키인지 찾는다. 괄호 안은 공개 키의 주석.
+-- -D 는 키를 모두 뺀다. 에이전트 프로세스는 남는다.
+The agent has no identities.
+rc=1
+-- -t 초 : 그 시간 뒤 에이전트가 키를 스스로 지운다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock SSH_ASKPASS=/usr/local/bin/ask DISPLAY=:0 ssh-add -t 10 ~/.ssh/id_ecdsa
+Identity added: /home/student/.ssh/id_ecdsa (/home/student/.ssh/id_ecdsa)
+Lifetime set to 10 seconds
+-- -t 10: 10초 뒤 에이전트가 스스로 지운다. 자리를 비우는 시간을 줄이는 장치.
+-- 에이전트를 띄울 때 ssh-agent -t 로 기본 수명을 정할 수도 있다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh-add -l
+256 SHA256:0j3zMjpo2yrBY8dh4CwhLbiy18wjs8RrrPh83a1yI94 /home/student/.ssh/id_ecdsa (ECDSA)
+-- 바로 확인하면 있다. 이어서 12초 기다린다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh-add -l; echo rc=$?
+The agent has no identities.
+rc=1
+-- 12초 뒤에는 없다. rc=1(에이전트는 살아 있고 키만 없음).
+-- 다시 쓰려면 ssh-add 로 암호문을 다시 넣어야 한다([변형] 첫 줄).
+-- 키가 사라져도 에이전트 프로세스는 그대로다.
+-- -x : 에이전트 잠그기(암호를 받아 잠그고, -X 로 풀 때 같은 암호). 자리를 비울 때.
+
+--------------------------------------------------------------------------------
+ [변형] ProxyCommand 로 같은 경유 접속
+--------------------------------------------------------------------------------
+
+-- ProxyJump 가 나오기 전 방식. %h %p 는 목적지 이름과 포트로 바뀐다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock SSH_ASKPASS=/usr/local/bin/ask DISPLAY=:0 ssh-add ~/.ssh/id_ecdsa 2>&1 | tail -1
+Identity added: /home/student/.ssh/id_ecdsa (/home/student/.ssh/id_ecdsa)
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -o BatchMode=yes -o ProxyCommand='ssh -W %h:%p ol7b' ol7a 'echo $SSH_CONNECTION'
+172.16.225.62 39054 172.16.225.61 22
+-- ProxyCommand 로 같은 결과. %h %p 가 ol7a 와 22 로 바뀌었다.
+-- 출발지는 이번에도 ol7b(172.16.225.62).
+-- Killed by signal 1 도 같다.
+Killed by signal 1.
+-- -v 로 보면 -J 가 내부적으로 같은 ProxyCommand 를 만든다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh -v -J ol7b -o BatchMode=yes ol7a true 2>&1 | grep -E 'Executing proxy command|Setting implicit ProxyCommand' | cut -c1-110
+debug1: Setting implicit ProxyCommand from ProxyJump: ssh -v -W %h:%p ol7b
+debug1: Executing proxy command: exec ssh -v -W ol7a:22 ol7b
+-- -J 는 내부적으로 ProxyCommand ssh -W %h:%p ol7b 를 만든다. -v 도 안쪽 ssh 에 전달됐다.
+-- 7.3 보다 옛 클라이언트에서는 이 ProxyCommand 를 직접 쓴다.
+-- 7.9 의 OpenSSH 7.4 는 둘 다 된다.
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+-- ssh-agent -k 는 SSH_AGENT_PID 변수로 대상을 찾는다. 소켓 변수만으로는 끝내지 못한다.
+[student@ol7a ~]$ SSH_AUTH_SOCK=/tmp/student-agent.sock ssh-agent -k; echo rc=$?
+SSH_AGENT_PID not set, cannot kill agent
+rc=1
+-- 소켓 변수만 주면 -k 가 실패한다(rc=1).
+-- -k 는 SSH_AGENT_PID 만 본다.
+[student@ol7a ~]$ SSH_AGENT_PID=$(pgrep -u student ssh-agent) ssh-agent -k; pgrep -u student ssh-agent; echo rc=$?
+unset SSH_AUTH_SOCK;
+unset SSH_AGENT_PID;
+echo Agent pid 2641 killed;
+-- PID 를 넘기자 2641 이 끝났다. 끝에 변수를 지우는 명령을 출력한다(eval 용).
+-- 실제 셸이라면 eval $(ssh-agent -k) 로 변수까지 지운다.
+rc=1
+-- pgrep 결과 없음. 에이전트가 하나도 남지 않았다.
+-- 소켓 파일 /tmp/student-agent.sock 은 다음 줄에서 지웠다.
+[root@ol7a ~]# rm -rf /home/student/.ssh /tmp/student-agent.sock; ls -ld /home/student/.ssh
+ls: cannot access /home/student/.ssh: No such file or directory
+[root@ol7b ~]# rm -rf /home/student/.ssh; ls -ld /home/student/.ssh
+ls: cannot access /home/student/.ssh: No such file or directory
+
+--  항목                       시작 전    변경 후                           되돌린 뒤
+--  ol7a student ssh-agent     없음       /tmp/student-agent.sock(2641)     없음
+--  BatchMode 접속(암호문 키)  -          에이전트 없음 거부, 있으면 성공   -
+--  ol7b 의 SSH_AUTH_SOCK      -          -A 일 때만 /tmp/ssh-*/agent.N    -
+--  ol7a 로그의 출발지         -          -A·-J 모두 172.16.225.62          -
+--  ~/.ssh/config              없음       600 통과, 644 통과, 664·666 거부  없음
+--  두 노드 ~/.ssh             없음       키·known_hosts                    없음
+--
+-- 에이전트는 변수로 찾는다. 포워딩은 상대 서버를 믿을 때만, 중계에는 ProxyJump.
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. ssh-add -x 로 에이전트를 잠그고 BatchMode 접속이 되는지, -X 로 풀면 어떤지 본다.
+--    확인: ssh-add -l 의 출력과 접속 rc
+-- 2. ol7b 의 sshd_config 에 AllowAgentForwarding no 를 넣고 [7] 의 -A 접속을 다시 한다.
+--    확인: ol7b 쪽 echo $SSH_AUTH_SOCK
+-- 3. ~/.ssh/config 에 Host * 블록을 맨 위로 옮기고 ssh -G b 의 결과가 바뀌는지 본다.
+
+================================================================================
+ 실습 04 종료
+================================================================================

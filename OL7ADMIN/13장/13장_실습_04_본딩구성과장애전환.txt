@@ -1,0 +1,551 @@
+================================================================================
+ 제13장 실습 04 — 본딩 구성과 장애 전환
+ 대상   : ol7a (NIC 두 개 ens32·ens33)
+ 목표   : active-backup 본드 bond0 를 nmcli 로 만들고 SSH 가 붙은 172.16.225.61 을
+          bond0 로 옮긴다. /proc/net/bonding/bond0 를 읽고, 슬레이브 링크를 내려
+          전환과 패킷 손실을 잰다. 같은 이중화를 팀(teamd)으로도 만든다
+ 배경   : bonding 모듈은 NIC 여러 개를 논리 장치 하나로 묶는다. active-backup(mode 1)
+          은 슬레이브 하나만 쓰고 MII 감시(miimon)로 링크 끊김을 알면 대기 슬레이브로
+          넘긴다. 스위치 설정이 필요 없어 DB 서버 공용망에 가장 흔하다. NetworkManager
+          에서는 본드 연결 하나 + 슬레이브 연결 여러 개로 만든다 (본문 13.6)
+ 소요   : 약 45분
+ 선행   : ol7-base 스냅샷 (⚠ ens32 의 주소를 본드로 옮긴다)
+ 계정   : root
+ 주의   : [7] 과 [변형] 에서 접속 주소가 다른 장치로 옮겨 간다. 옮기는 스크립트에
+          180초 되돌림 타이머를 넣는다. 링크 끊기는 게스트 안의 ip link set down 으로 한다
+ 되돌림 : 본드·팀 연결 삭제, ens32 에 172.16.225.61, ifcfg 원본
+          → nmcli connection show, md5sum ifcfg-ens3?
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 시작 전 주소, 연결 프로필, bonding 모듈 적재 여부, 두 ifcfg 지문을 남긴다
+-- 원본 ifcfg 는 /root 로 복사한다
+[root@ol7a ~]# ip -br addr; nmcli connection show
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens32            UP             172.16.225.61/24 fe80::87f4:d993:7b43:e0c1/64 
+ens33            UP             
+NAME   UUID                                  TYPE      DEVICE 
+ens32  987096e5-6a52-4e8e-bce9-5978c9bb9f51  ethernet  ens32  
+ens33  09e33476-a93c-4005-a933-74479920bb5b  ethernet  --     
+[root@ol7a ~]# lsmod | grep -c '^bonding'; md5sum /etc/sysconfig/network-scripts/ifcfg-ens3?
+0
+f552067d2505b12131aa64d5d47de68c  /etc/sysconfig/network-scripts/ifcfg-ens32
+709a178c513f436914a04106c09e3303  /etc/sysconfig/network-scripts/ifcfg-ens33
+-- lsmod | grep -c 가 0 이다. bonding 모듈은 아직 올라와 있지 않다
+-- 본드 연결을 만들면 NetworkManager 가 자동으로 올린다
+[root@ol7a ~]# cp -p /etc/sysconfig/network-scripts/ifcfg-ens3? /root/
+
+--------------------------------------------------------------------------------
+ [1] bonding 모듈과 옵션
+--------------------------------------------------------------------------------
+
+-- 본딩 드라이버가 어느 커널 파일인지,
+-- 어떤 옵션을 받는지 먼저 본다
+[root@ol7a ~]# modinfo bonding | grep -E '^(filename|description)'
+filename:       /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/net/bonding/bonding.ko.xz
+description:    Ethernet Channel Bonding Driver, v3.7.1
+[root@ol7a ~]# modinfo -p bonding | grep -E '^(mode|miimon|primary|fail_over_mac):' | cut -c1-110
+miimon:Link check interval in milliseconds (int)
+mode:Mode of operation; 0 for balance-rr, 1 for active-backup, 2 for balance-xor, 3 for broadcast, 4 for 802.3
+primary:Primary network device to use (charp)
+fail_over_mac:For active-backup, do not set all slaves to the same MAC; 0 for none (default), 1 for active, 2 
+-- cut -c1-110 으로 긴 설명 줄을 잘랐다
+-- 이 실습에서 쓰는 네 옵션이다
+--  mode  0~6 또는 이름. active-backup 은 1
+--  miimon  링크 확인 주기(ms). 0 이면 감시하지 않아 전환이 일어나지 않는다
+--  primary  링크가 살아 있으면 늘 쓸 슬레이브
+--  fail_over_mac  active-backup 에서 슬레이브 MAC 을 어떻게 둘지. 0 none(기본, 모두 같은 MAC), 1 active, 2 follow
+
+--------------------------------------------------------------------------------
+ [2] 오류 ② — 모드 이름 오타
+--------------------------------------------------------------------------------
+
+-- 본드 연결을 만든다. 모드 이름을 한 글자 틀리게 쓴 경우다.
+[root@ol7a ~]# nmcli connection add type bond con-name bond0 ifname bond0 bond.options "mode=active-bakcup,miimon=100" ipv4.method manual ipv4.addresses 172.16.225.71/24
+Error: failed to modify bond.options: 'active-bakcup' not among [balance-rr, active-backup, balance-xor, broadcast, 802.3ad, balance-tlb, balance-alb].
+-- 오류 문구가 허용되는 모드 이름 일곱 개를 그대로 알려 준다
+-- 숫자(1)로 써도 된다
+[root@ol7a ~]# nmcli connection show | grep -c bond0
+-- 연결이 만들어지지 않았다(grep -c 0)
+-- 잘못된 옵션은 파일에 남지 않는다
+--
+--
+-- 오류 흐름
+-- 증상   : nmcli connection add … mode=active-bakcup → Error: failed to modify bond.options: 'active-bakcup' not among [...]
+-- 원인   : bond.options 의 mode 값 오타. nmcli 가 생성 전에 값을 검사한다
+-- 조치   : mode=active-backup(또는 mode=1)으로 다시 add
+-- 재확인 : Connection 'bond0' (...) successfully added., ifcfg-bond0 의 BONDING_OPTS
+0
+
+-- 바르게 다시 만든다. 주소는 일단 임시 주소 .71 이다.
+[root@ol7a ~]# nmcli connection add type bond con-name bond0 ifname bond0 bond.options "mode=active-backup,miimon=100,fail_over_mac=active" ipv4.method manual ipv4.addresses 172.16.225.71/24
+Connection 'bond0' (8d619e07-f73f-4d09-b93d-e648253dba3d) successfully added.
+-- 이번에는 fail_over_mac=active 를 함께 줬다
+-- 이 랩의 첫 실측(기본값 none)에서 전환 직후 SSH 세션이 끊겼기 때문이다
+-- none 은 모든 슬레이브에 같은 MAC 을 입힌다
+-- 가상 스위치가 MAC 을 포트에 묶어 두면 전환한 슬레이브로 프레임이 가지 않는다
+
+--------------------------------------------------------------------------------
+ [3] 본드만 있고 슬레이브는 없을 때
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# grep -E '^(BONDING_OPTS|TYPE|BONDING_MASTER|BOOTPROTO|IPADDR|DEVICE|ONBOOT)=' /etc/sysconfig/network-scripts/ifcfg-bond0
+BONDING_OPTS="fail_over_mac=active miimon=100 mode=active-backup"
+TYPE=Bond
+BONDING_MASTER=yes
+BOOTPROTO=none
+IPADDR=172.16.225.71
+DEVICE=bond0
+ONBOOT=yes
+-- nmcli 의 bond.options 가 BONDING_OPTS 한 줄로 저장됐다
+-- 키 순서는 알파벳순으로 바뀌었다
+-- TYPE=Bond, BONDING_MASTER=yes 가 본드 장치 파일의 표시다
+-- 고정 주소 .71, 부팅 때 올라옴
+[root@ol7a ~]# lsmod | grep '^bonding'; ip link show bond0
+bonding               172032  0 
+4: bond0: <NO-CARRIER,BROADCAST,MULTICAST,MASTER,UP> mtu 1500 qdisc noqueue state DOWN mode DEFAULT group default qlen 1000
+    link/ether 7e:49:a5:6b:16:16 brd ff:ff:ff:ff:ff:ff
+-- 플래그 MASTER 는 본드 장치,
+-- NO-CARRIER 와 state DOWN 은 슬레이브가 없어 링크가 없다는 뜻이다
+-- MAC 은 임의로 만든 값이다
+-- 첫 슬레이브가 붙으면 그 MAC 으로 바뀐다
+[root@ol7a ~]# grep -E 'Bonding Mode|Currently Active|MII Status' /proc/net/bonding/bond0
+Bonding Mode: fault-tolerance (active-backup) (fail_over_mac active)
+Currently Active Slave: None
+MII Status: down
+-- 모드 줄 끝에 (fail_over_mac active) 가 보인다
+-- 활성 슬레이브 None, MII 상태 down
+
+--------------------------------------------------------------------------------
+ [4] 슬레이브 연결 추가 — ens33
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# nmcli connection add type bond-slave con-name bond0-ens33 ifname ens33 master bond0
+Connection 'bond0-ens33' (605f12e9-e198-4dc5-a16e-0e6419fbfbcf) successfully added.
+-- type bond-slave 는 장치를 본드에 넣는 슬레이브 프로필이다
+-- master bond0 로 본드를 지정했다
+[root@ol7a ~]# grep -E '^(DEVICE|ONBOOT|MASTER|SLAVE)=' /etc/sysconfig/network-scripts/ifcfg-bond0-ens33
+DEVICE=ens33
+ONBOOT=yes
+MASTER=bond0
+SLAVE=yes
+-- 슬레이브 파일은 짧다. MASTER=bond0, SLAVE=yes 두 키가 본드와의 관계다. 주소 키가 없다
+-- ONBOOT=yes 라 만들자마자 비어 있던 ens33 에 자동으로 붙었다
+[root@ol7a ~]# nmcli device status; ip -4 addr show bond0 | grep inet
+DEVICE  TYPE      STATE      CONNECTION  
+ens32   ethernet  connected  ens32       
+bond0   bond      connected  bond0       
+ens33   ethernet  connected  bond0-ens33 
+lo      loopback  unmanaged  --          
+    inet 172.16.225.71/24 brd 172.16.225.255 scope global noprefixroute bond0
+-- ens33 의 CONNECTION 이 bond0-ens33 이다
+-- bond0 에 임시 주소 .71 이 걸렸다
+-- ens32 는 여전히 원래 프로필 ens32 로 SSH 를 받고 있다
+[root@ol7a ~]# grep -E 'Currently Active|^Slave Interface|^MII Status' /proc/net/bonding/bond0
+Currently Active Slave: ens33
+MII Status: up
+Slave Interface: ens33
+MII Status: up
+-- 첫 MII Status 는 본드 전체, Slave Interface 아래의 것은 그 슬레이브다
+-- 슬레이브 하나(ens33)가 붙어 활성이 됐다
+
+--------------------------------------------------------------------------------
+ [5] 오류 ① — ens32 슬레이브 연결을 만들었는데 본드에 들어가지 않는다
+--------------------------------------------------------------------------------
+
+-- autoconnect no 는 만들자마자 ens32 를 빼앗아 가지 않게 하려는 것이다.
+[root@ol7a ~]# nmcli connection add type bond-slave con-name bond0-ens32 ifname ens32 master bond0 connection.autoconnect no
+Connection 'bond0-ens32' (2cb53859-8ddd-423e-b61e-45e10dc76ae8) successfully added.
+-- autoconnect no 로 만들었다
+-- 운영 중인 ens32 를 바로 빼앗기면 SSH 가 끊긴다
+[root@ol7a ~]# grep -E 'Slave Interface|Currently Active' /proc/net/bonding/bond0
+Currently Active Slave: ens33
+Slave Interface: ens33
+-- 프로필은 만들었는데 Slave Interface 는 여전히 ens33 하나다
+[root@ol7a ~]# nmcli connection show
+NAME         UUID                                  TYPE      DEVICE 
+ens32        987096e5-6a52-4e8e-bce9-5978c9bb9f51  ethernet  ens32  
+bond0        8d619e07-f73f-4d09-b93d-e648253dba3d  bond      bond0  
+bond0-ens33  605f12e9-e198-4dc5-a16e-0e6419fbfbcf  ethernet  ens33  
+bond0-ens32  2cb53859-8ddd-423e-b61e-45e10dc76ae8  ethernet  --     
+ens33        09e33476-a93c-4005-a933-74479920bb5b  ethernet  --     
+-- bond0-ens32 의 DEVICE 가 -- 다. 프로필은 있지만 활성화되지 않았다
+-- ens32 에는 원래 프로필 ens32 가 걸려 있다
+-- 오류 흐름
+-- 증상   : bond0-ens32 를 만들었는데 /proc/net/bonding/bond0 에 Slave Interface: ens32 가 없다
+-- 원인   : 슬레이브 연결이 활성화되지 않았다. 다른 연결이 걸린 장치는 자동으로 넘어오지 않고, 여기서는 autoconnect no 다
+-- 조치   : nmcli connection up bond0-ens32. 접속 장치이므로 [6] 의 되돌림 타이머 스크립트로 실행한다
+-- 재확인 : /proc/net/bonding/bond0 에 Slave Interface 두 줄, nmcli device status 의 ens32 가 bond0-ens32
+
+--------------------------------------------------------------------------------
+ [6] 옮기기 전 준비 — 되돌림 스크립트와 타이머
+--------------------------------------------------------------------------------
+
+-- 원래 구성으로 돌리는 스크립트를 먼저 만든다
+-- 타이머와 [되돌림] 이 함께 쓴다.
+[root@ol7a ~]# cat > /root/tobase.sh <<'EOF'
+-- tobase.sh 는 본드·팀 연결을 모두 지우고 원본 ifcfg 를 덮은 뒤 ens32 를 올린다
+-- 연결이 없으면 delete 가 오류를 내므로 2>/dev/null 로 버렸다
+-- [되돌림] 과 타이머가 이 스크립트를 함께 쓴다
+#!/bin/bash
+for c in bond0-ens32 bond0-ens33 bond0 team0-ens32 team0-ens33 team0; do nmcli connection delete $c 2>/dev/null; done
+cp -p /root/ifcfg-ens32 /root/ifcfg-ens33 /etc/sysconfig/network-scripts/
+nmcli connection reload; nmcli connection up ens32
+EOF
+-- 접속 주소를 본드로 옮기는 스크립트
+-- 180초 안에 /root/bond.ok 가 생기지 않으면 tobase.sh 를 부른다.
+[root@ol7a ~]# cat > /root/tobond.sh <<'EOF'
+#!/bin/bash
+nmcli connection modify bond0 ipv4.addresses 172.16.225.61/24 ipv4.gateway 172.16.225.2 ipv4.dns 172.16.225.2
+nmcli connection modify ens32 connection.autoconnect no
+nmcli connection modify bond0-ens32 connection.autoconnect yes
+nmcli connection up bond0-ens32; nmcli device reapply bond0
+sleep 180; [ -f /root/bond.ok ] || /root/tobase.sh
+EOF
+[root@ol7a ~]# chmod +x /root/tobase.sh /root/tobond.sh; rm -f /root/bond.ok; bash -n /root/tobond.sh && echo "syntax ok"
+--
+-- tobond.sh 의 순서
+--  1. bond0 프로필에 .61·게이트웨이·DNS 를 넣는다(아직 반영 안 됨)
+--  2. ens32 프로필의 자동 연결을 끈다. 재부팅해도 ens32 가 본드에서 빠져나가지 않게
+--  3. bond0-ens32 를 자동 연결로 바꾸고 올린다. 이때 ens32 의 .61 이 빠진다
+--  4. reapply 로 bond0 에 .61 이 걸린다
+--  5. 180초 뒤 /root/bond.ok 가 없으면 tobase.sh 로 원상 복구
+-- bash -n 은 문법만 검사하고 실행하지 않는다
+-- 원격에서 돌리기 전에 반드시 한 번 친다
+syntax ok
+
+--------------------------------------------------------------------------------
+ [7] 172.16.225.61 을 bond0 로 옮긴다
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# nohup /root/tobond.sh >/tmp/tobond.log 2>&1 </dev/null &
+[root@ol7a ~]# touch /root/bond.ok; cat /tmp/tobond.log
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/4)
+Connection successfully reapplied to device 'bond0'.
+-- 실습 러너는 20초 기다렸다가 SSH 를 새로 연결했다(같은 172.16.225.61)
+-- 접속이 돌아오자마자 bond.ok 를 만들어 타이머를 무력화했다
+-- 로그 두 줄은 3 단계 up 과 4 단계 reapply 의 결과다
+
+--------------------------------------------------------------------------------
+ [8] 옮긴 뒤의 상태
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ip -br addr; ip route
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens32            UP             
+ens33            UP             
+bond0            UP             172.16.225.61/24 fe80::6068:ab0d:e643:88ae/64 
+default via 172.16.225.2 dev bond0 proto static metric 300 
+172.16.225.0/24 dev bond0 proto kernel scope link src 172.16.225.61 metric 300 
+-- ens32·ens33 에는 주소가 없고 bond0 에 172.16.225.61/24 가 있다
+-- 경로의 metric 이 300 이다
+-- NetworkManager 는 본드 장치의 기본 metric 을 300 으로 준다(이더넷은 100)
+[root@ol7a ~]# nmcli device status
+DEVICE  TYPE      STATE      CONNECTION  
+bond0   bond      connected  bond0       
+ens32   ethernet  connected  bond0-ens32 
+ens33   ethernet  connected  bond0-ens33 
+lo      loopback  unmanaged  --          
+[root@ol7a ~]# ss -tn state established '( sport = :22 )'
+Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+0      0      172.16.225.61:22   172.16.225.1:63000       
+
+--------------------------------------------------------------------------------
+ [9] /proc/net/bonding/bond0 읽기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cat /proc/net/bonding/bond0
+Ethernet Channel Bonding Driver: v3.7.1 (April 27, 2011)
+
+Bonding Mode: fault-tolerance (active-backup) (fail_over_mac active)
+Primary Slave: None
+Currently Active Slave: ens33
+MII Status: up
+MII Polling Interval (ms): 100
+Up Delay (ms): 0
+Down Delay (ms): 0
+Peer Notification Delay (ms): 0
+
+Slave Interface: ens33
+MII Status: up
+Speed: 1000 Mbps
+Duplex: full
+Link Failure Count: 0
+Permanent HW addr: 00:0c:29:ac:5e:aa
+Slave queue ID: 0
+
+Slave Interface: ens32
+MII Status: up
+Speed: 1000 Mbps
+Duplex: full
+Link Failure Count: 0
+Permanent HW addr: 00:0c:29:ac:5e:a0
+Slave queue ID: 0
+-- 머리 묶음
+--  Bonding Mode  fault-tolerance (active-backup), fail_over_mac active
+--  Primary Slave: None  primary 미지정. [11] 에서 넣는다
+--  Currently Active Slave  지금 패킷을 주고받는 슬레이브 ens33
+--  MII Polling Interval 100  miimon=100
+--  Up/Down Delay 0  링크 변화를 곧바로 반영
+--
+-- 슬레이브 묶음
+--  MII Status  슬레이브 링크
+--  Link Failure Count  이 슬레이브가 끊긴 횟수. 장애 이력의 증거
+--  Permanent HW addr  슬레이브의 원래 MAC
+-- ens33 이 먼저 붙어 활성이 됐다
+-- 나중에 붙은 ens32 는 대기(backup)다
+[root@ol7a ~]# for d in bond0 ens32 ens33; do echo "$d $(cat /sys/class/net/$d/address)"; done
+bond0 00:0c:29:ac:5e:aa
+ens32 00:0c:29:ac:5e:a0
+ens33 00:0c:29:ac:5e:aa
+-- fail_over_mac=active 라 슬레이브는 각자 제 MAC 을 갖고,
+-- 본드 MAC 은 활성 슬레이브 ens33 의 …5e:aa 다
+-- 기본값 none 이었다면 세 줄 모두 같은 MAC 이 찍힌다
+[root@ol7a ~]# cat /sys/class/net/bond0/bonding/mode /sys/class/net/bond0/bonding/miimon /sys/class/net/bond0/bonding/active_slave
+active-backup 1
+100
+ens33
+-- /sys/class/net/bond0/bonding/ 아래 파일 하나가 옵션 하나다
+-- 스크립트에서 한 값만 읽을 때 쓴다
+
+--------------------------------------------------------------------------------
+ [10] 장애 전환 — 활성 슬레이브의 링크를 내린다
+--------------------------------------------------------------------------------
+
+-- 0.2초 간격 ping 150개(30초)를 걸어 두고,
+-- 25초 뒤 링크를 되살리는 안전장치도 띄운다.
+[root@ol7a ~]# A=$(cat /sys/class/net/bond0/bonding/active_slave); echo "active=$A"; echo $A > /tmp/active0
+active=ens33
+-- 지금 활성 슬레이브 이름을 파일에 적어 둔다
+-- 링크를 되살리는 안전장치가 이 이름을 읽는다
+[root@ol7a ~]# nohup ping -i 0.2 -c 150 172.16.225.2 >/tmp/ping1.log 2>&1 </dev/null &
+[root@ol7a ~]# nohup bash -c 'sleep 25; ip link set $(cat /tmp/active0) up' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# ip link set $(cat /tmp/active0) down; sleep 2; grep -E 'Currently Active|^Slave Interface|^MII Status|Link Failure' /proc/net/bonding/bond0
+Currently Active Slave: ens32
+MII Status: up
+Slave Interface: ens33
+MII Status: down
+Link Failure Count: 1
+Slave Interface: ens32
+MII Status: up
+Link Failure Count: 0
+-- 2초 뒤 활성 슬레이브가 ens32 로 바뀌었다
+-- ens33 은 MII Status down, Link Failure Count 1
+-- 본드 자체(첫 MII Status)는 up 그대로다
+[root@ol7a ~]# journalctl -k --since '-1min' --no-pager | grep -i bond0 | tail -4 | cut -d' ' -f6-
+bond0: (slave ens32): Enslaving as a backup interface with a down link
+bond0: (slave ens32): link status definitely up, 1000 Mbps full duplex
+bond0: (slave ens33): link status definitely down, disabling slave
+bond0: (slave ens32): making interface the new active one
+-- cut -d' ' -f6- 로 날짜·호스트 이름을 잘랐다
+-- 위 두 줄은 [7] 에서 ens32 가 붙을 때, 아래 두 줄이 이번 전환이다
+-- definitely down 은 miimon 이 끊김을 확정했다는 뜻이다
+-- updelay·downdelay 가 0 이라 바로 확정했다
+[root@ol7a ~]# tail -2 /tmp/ping1.log; grep -E 'Currently Active' /proc/net/bonding/bond0; cat /sys/class/net/bond0/address
+150 packets transmitted, 149 received, 0% packet loss, time 30989ms
+rtt min/avg/max/mdev = 0.101/0.186/0.647/0.066 ms
+Currently Active Slave: ens32
+00:0c:29:ac:5e:a0
+-- 150개 가운데 149개를 받았다
+-- 하나를 잃었지만 ping 은 정수로 반올림하지 않고 버려 0% 로 찍는다
+-- 0.2초 간격이니 끊긴 시간은 0.2초 남짓이다
+-- 링크는 안전장치가 25초 뒤 되살렸다. 그래도 활성은 ens32 그대로다
+-- primary 가 없으면 돌아가지 않는다
+-- 본드 MAC 이 ens32 의 …5e:a0 으로 바뀌었다
+-- fail_over_mac=active 의 동작이다
+
+--------------------------------------------------------------------------------
+ [11] 링크가 돌아와도 되돌아가지 않는다 — primary
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# nmcli connection modify bond0 +bond.options primary=ens32; nmcli -g bond.options connection show bond0
+fail_over_mac=active,miimon=100,mode=active-backup,primary=ens32
+-- + 로 옵션 하나를 더했다. 기존 세 옵션은 그대로다
+[root@ol7a ~]# grep BONDING_OPTS /etc/sysconfig/network-scripts/ifcfg-bond0
+BONDING_OPTS="fail_over_mac=active miimon=100 mode=active-backup primary=ens32"
+[root@ol7a ~]# nmcli device reapply bond0; grep -E 'Primary Slave|Currently Active' /proc/net/bonding/bond0
+Connection successfully reapplied to device 'bond0'.
+Primary Slave: ens32 (primary_reselect always)
+Currently Active Slave: ens32
+-- reapply 로 primary 가 바로 적용됐다
+-- primary_reselect always 는 primary 링크가 돌아오면 늘 그쪽으로 옮긴다는 기본값이다
+-- 지금은 이미 ens32 가 활성이라 변화가 없다
+
+--------------------------------------------------------------------------------
+ [12] 두 번째 전환 — primary 가 있을 때의 되돌아오기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# nohup ping -i 0.2 -c 100 172.16.225.2 >/tmp/ping2.log 2>&1 </dev/null &
+[root@ol7a ~]# nohup bash -c 'sleep 10; ip link set ens32 up' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# ip link set ens32 down; sleep 2; grep -E 'Currently Active' /proc/net/bonding/bond0
+Currently Active Slave: ens33
+-- primary 인 ens32 를 내리자 ens33 으로 넘어갔다
+[root@ol7a ~]# grep -E 'Currently Active' /proc/net/bonding/bond0; tail -2 /tmp/ping2.log
+Currently Active Slave: ens32
+100 packets transmitted, 100 received, 0% packet loss, time 20588ms
+rtt min/avg/max/mdev = 0.098/0.205/0.540/0.077 ms
+-- 10초 뒤 ens32 링크가 돌아오자 활성이 다시 ens32 로 돌아왔다
+-- [10] 과 다른 점이다
+-- 두 번 전환(ens32→ens33→ens32)하는 동안 100개를 모두 받았다
+
+--------------------------------------------------------------------------------
+ [변형] 같은 이중화를 팀(teamd)으로
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# rpm -q teamd NetworkManager-team
+teamd-1.29-3.el7.x86_64
+NetworkManager-team-1.18.8-2.0.1.el7_9.x86_64
+-- 팀에 필요한 두 패키지가 기준 VM 에 이미 있다
+-- 없으면 yum install 뒤 NetworkManager 를 다시 시작해야 team 연결 종류가 생긴다
+-- 본드를 지우고 팀을 만든다
+-- 접속 주소가 다시 옮겨 가므로 같은 타이머 방식을 쓴다.
+[root@ol7a ~]# cat > /root/toteam.sh <<'EOF'
+-- 팀 연결은 team.runner 로 방식을 정한다
+-- activebackup 이 본딩의 active-backup 이다
+-- team.runner-hwaddr-policy by_active 는 본딩의 fail_over_mac=active 에 해당한다
+-- 포트 연결(team-slave)은 for 로 두 개를 만들고 바로 올린다
+#!/bin/bash
+for c in bond0-ens32 bond0-ens33 bond0; do nmcli connection delete $c; done
+nmcli connection add type team con-name team0 ifname team0 team.runner activebackup team.runner-hwaddr-policy by_active ipv4.method manual ipv4.addresses 172.16.225.61/24 ipv4.gateway 172.16.225.2 ipv4.dns 172.16.225.2
+for p in ens32 ens33; do nmcli connection add type team-slave con-name team0-$p ifname $p master team0; nmcli connection up team0-$p; done
+sleep 180; [ -f /root/team.ok ] || /root/tobase.sh
+-- 로그에서 성공 줄 수만 셌다
+-- 삭제 3(본드 연결) + 추가 3(팀·포트 둘) + 활성화 2 = 8
+EOF
+[root@ol7a ~]# chmod +x /root/toteam.sh; rm -f /root/team.ok; nohup /root/toteam.sh >/tmp/toteam.log 2>&1 </dev/null &
+[root@ol7a ~]# touch /root/team.ok; grep -cE 'successfully (added|activated|deleted)' /tmp/toteam.log
+8
+[root@ol7a ~]# ip -br addr; nmcli -f NAME,TYPE,DEVICE connection show --active
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens32            UP             
+ens33            UP             
+team0            UP             172.16.225.61/24 fe80::d07a:87df:4ed2:9e34/64 
+NAME         TYPE      DEVICE 
+team0        team      team0  
+team0-ens32  ethernet  ens32  
+team0-ens33  ethernet  ens33  
+-- bond0 은 사라지고 team0 에 172.16.225.61 이 걸렸다
+-- 포트 두 개가 team0-ens32·team0-ens33 으로 붙었다
+[root@ol7a ~]# grep -E '^(DEVICETYPE|TEAM_CONFIG|IPADDR)=' /etc/sysconfig/network-scripts/ifcfg-team0; grep -E '^(DEVICETYPE|TEAM_MASTER)=' /etc/sysconfig/network-scripts/ifcfg-team0-ens32
+TEAM_CONFIG="{\"runner\": {\"name\": \"activebackup\", \"hwaddr_policy\": \"by_active\"}}"
+IPADDR=172.16.225.61
+DEVICETYPE=Team
+TEAM_MASTER=team0
+DEVICETYPE=TeamPort
+-- 앞 세 줄이 ifcfg-team0,
+-- 뒤 두 줄이 ifcfg-team0-ens32 다
+-- 팀 설정은 JSON 한 줄로 TEAM_CONFIG 에 들어간다
+-- runner 이름과 hwaddr_policy 가 보인다
+-- 장치 종류 키는 DEVICETYPE=Team·TeamPort 다
+-- 본딩의 TYPE=Bond·MASTER=bond0 과 짝을 이룬다
+[root@ol7a ~]# teamdctl team0 state | grep -vE 'instance|name: ethtool'
+setup:
+  runner: activebackup
+ports:
+  ens32
+    link watches:
+      link summary: up
+        link: up
+        down count: 1
+  ens33
+    link watches:
+      link summary: up
+        link: up
+        down count: 1
+runner:
+  active port: ens32
+-- grep -vE 로 instance·name 줄을 뺐다
+-- setup 의 runner, ports 아래 포트마다 link watches(링크 감시)와 down count,
+-- 맨 아래 runner 의 active port 가 보인다
+-- down count 가 둘 다 1 이다. 팀이 생긴 뒤 포트마다 링크 down 이 한 번씩 세어졌다
+-- 본드에서 팀 포트로 넘어오는 동안의 기록이다
+-- 활성 포트는 ens32 다
+[root@ol7a ~]# teamnl team0 ports
+ 3: ens33: up 1000Mbit FD 
+ 2: ens32: up 1000Mbit FD 
+-- teamnl 은 팀 드라이버에게 직접 묻는다
+-- 포트 번호(ifindex), 링크, 속도, 듀플렉스
+[root@ol7a ~]# P=$(teamdctl team0 state | awk '/active port/{print $3}'); echo "active=$P"; echo $P > /tmp/tactive0
+active=ens32
+[root@ol7a ~]# nohup ping -i 0.2 -c 100 172.16.225.2 >/tmp/ping3.log 2>&1 </dev/null &
+[root@ol7a ~]# nohup bash -c 'sleep 12; ip link set $(cat /tmp/tactive0) up' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# ip link set $(cat /tmp/tactive0) down; sleep 2; teamdctl team0 state | grep -E 'active port|link:'
+        link: down
+        link: up
+  active port: ens33
+-- 활성 ens32 의 link 가 down,
+-- ens33 은 up 이고 active port 가 ens33 으로 바뀌었다
+[root@ol7a ~]# tail -2 /tmp/ping3.log | head -1; teamdctl team0 state | grep -E 'active port'
+100 packets transmitted, 100 received, 0% packet loss, time 20588ms
+  active port: ens33
+-- 100개 모두 받았다
+-- 12초 뒤 ens32 링크가 돌아와도 활성은 ens33 그대로다
+-- 팀의 activebackup 은 기본으로 되돌아가지 않는다
+-- 되돌리려면 포트 설정에 prio·sticky 를 준다(공식 문서 예제)
+
+--------------------------------------------------------------------------------
+ [되돌림]
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# nohup /root/tobase.sh >/tmp/tobase.log 2>&1 </dev/null &
+-- 원래대로 돌리는 것도 접속 장치를 바꾸는 일이다
+-- 같은 스크립트를 nohup 으로 돌리고 러너가 다시 붙는다
+[root@ol7a ~]# grep -cE 'successfully (activated|deleted)' /tmp/tobase.log; ip -br addr; nmcli connection show
+4
+-- 성공 줄 4개 = 팀 연결 삭제 3 + ens32 활성화 1
+-- 없는 본드 연결 삭제 오류는 버렸다
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens32            UP             172.16.225.61/24 fe80::87f4:d993:7b43:e0c1/64 
+ens33            UP             
+NAME   UUID                                  TYPE      DEVICE 
+ens32  987096e5-6a52-4e8e-bce9-5978c9bb9f51  ethernet  ens32  
+ens33  09e33476-a93c-4005-a933-74479920bb5b  ethernet  --     
+-- ens32 에 .61 이 돌아왔고 연결은 ens32·ens33 둘뿐이다. [0] 과 같다
+[root@ol7a ~]# md5sum /etc/sysconfig/network-scripts/ifcfg-ens3?; ls /etc/sysconfig/network-scripts/ifcfg-*
+f552067d2505b12131aa64d5d47de68c  /etc/sysconfig/network-scripts/ifcfg-ens32
+709a178c513f436914a04106c09e3303  /etc/sysconfig/network-scripts/ifcfg-ens33
+/etc/sysconfig/network-scripts/ifcfg-ens32
+/etc/sysconfig/network-scripts/ifcfg-ens33
+/etc/sysconfig/network-scripts/ifcfg-lo
+-- ifcfg 지문 둘이 [0] 과 같고,
+-- bond0·team0 파일은 남지 않았다
+[root@ol7a ~]# rmmod bonding; lsmod | grep -c '^bonding'; rm -f /root/tobase.sh /root/tobond.sh /root/toteam.sh /root/*.ok /root/ifcfg-ens3?
+0
+-- bonding 모듈도 내렸다. 임시 스크립트와 사본을 지웠다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목  시작 전  본딩 중  팀 중  되돌린 뒤
+--  172.16.225.61  ens32  bond0 (metric 300)  team0  ens32
+--  활성 슬레이브/포트  -  ens33 → ens32 → (primary) ens32  ens32 → ens33  -
+--  전환 중 손실  -  150개 중 1개, 100개 중 0개  100개 중 0개  -
+--  MAC  -  본드 MAC 이 활성 슬레이브를 따라감  by_active  -
+--  bonding 모듈  0  적재  적재  0
+--  ifcfg md5  f552067d / 709a178c  bond0·bond0-ens3? 추가  team0·team0-ens3? 추가  f552067d / 709a178c
+--
+--  본딩과 팀
+--  상태 확인  /proc/net/bonding/bond0  teamdctl team0 state, teamnl team0 ports
+--  방식 지정  bond.options mode=active-backup  team.runner activebackup
+--  MAC 정책  fail_over_mac=active  team.runner-hwaddr-policy by_active
+--  되돌아오기  primary=ens32  포트의 prio·sticky
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+--
+-- 1. fail_over_mac 를 none 으로 두고 콘솔에서 [10] 을 해 본다
+-- 확인: 세 장치의 MAC, 전환 뒤 ol7b 에서 .61 로 ping 이 되는가
+-- 2. miimon=0 으로 본드를 만들고 활성 슬레이브를 내린다
+-- 확인: Currently Active Slave 가 바뀌는가
+-- 3. 팀 포트 ens32 에 nmcli connection modify team0-ens32 team-port.prio 100 을 주고 [변형] 을 다시 한다
+--  확인: ens32 링크가 돌아왔을 때 active port 가 돌아오는가
+--
+-- [OL8/9] OL 9 에서 팀은 폐기 예정이다. 새 구성은 본딩으로 한다
+
+================================================================================
+ 실습 04 종료
+================================================================================

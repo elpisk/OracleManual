@@ -1,0 +1,555 @@
+================================================================================
+ 제14장 실습 04 — vsftpd 구성
+ 대상   : ol7a (FTP 서버), ol7b (FTP 클라이언트)
+ 목표   : vsftpd 를 설치하고 vsftpd.conf 의 익명·로컬 사용자·chroot 지시어를 바꿔
+          가며 ol7b 의 ftp·curl 로 접속해 결과를 본다. 21번 포트만 열었을 때
+          수동 모드 데이터 연결이 막히는 이유와, chroot 된 홈에 쓰기 권한이 있어
+          로그인이 거부되는 오류를 재현한다
+ 배경   : FTP 는 제어 연결(21)과 데이터 연결을 따로 쓴다. 수동(passive) 모드에서는
+          서버가 임의의 높은 포트를 열고 클라이언트가 그리로 붙는다. firewalld 의 ftp
+          서비스는 21 과 함께 conntrack 의 FTP 도우미를 걸어 그 포트를 자동으로
+          허용한다. vsftpd 는 chroot 한 루트 디렉터리에 쓰기 권한이 있으면 보안상
+          로그인을 거부한다 (본문 14.5)
+ 소요   : 약 35분
+ 선행   : ol7-base, ol7b-base 스냅샷
+ 계정   : root, ftpuser1 (실습 중 만들고 지움)
+ 주의   : FTP 는 비밀번호를 평문으로 보낸다. 실습 망 밖에서 쓰지 않는다
+ 되돌림 : vsftpd 정지·비활성, vsftpd.conf 원본 복원, ftpuser1 삭제, 방화벽 원복
+          → systemctl is-active vsftpd, md5sum vsftpd.conf, firewall-cmd --list-services
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# rpm -q vsftpd; firewall-cmd --list-services; ss -tln | grep -c ':21 '
+package vsftpd is not installed
+-- 서버에 vsftpd 가 없다. 21 을 듣는 소켓 0, 방화벽 기본
+-- 이 세 값이 [10] 의 비교 기준이다
+dhcpv6-client ssh
+0
+[root@ol7b ~]# rpm -q ftp curl
+package ftp is not installed
+curl-7.29.0-59.0.3.el7_9.2.x86_64
+-- 클라이언트: ftp 명령은 없고 curl 은 있다. curl 도 ftp:// 를 다룬다
+-- ftp 패키지는 기준 상태에 없어 [1] 에서 설치한다
+
+--------------------------------------------------------------------------------
+ [1] 설치
+--------------------------------------------------------------------------------
+[root@ol7a ~]# yum -y -q install vsftpd; rpm -q vsftpd
+vsftpd-3.0.2-29.el7_9.x86_64
+[root@ol7b ~]# yum -y -q install ftp; rpm -q ftp
+ftp-0.17-67.el7.x86_64
+-- vsftpd 3.0.2, ftp 클라이언트 0.17 (netkit ftp)
+-- yum -q 라 설치 과정 출력은 없다
+[root@ol7a ~]# rpm -ql vsftpd | grep -E '^/etc|/var/ftp'
+/etc/logrotate.d/vsftpd
+/etc/pam.d/vsftpd
+/etc/vsftpd
+/etc/vsftpd/ftpusers
+/etc/vsftpd/user_list
+/etc/vsftpd/vsftpd.conf
+/etc/vsftpd/vsftpd_conf_migrate.sh
+/var/ftp
+/var/ftp/pub
+-- 설정 세 개(vsftpd.conf, ftpusers, user_list), PAM 설정, 익명 루트 /var/ftp
+[root@ol7a ~]# md5sum /etc/vsftpd/vsftpd.conf; cp -p /etc/vsftpd/vsftpd.conf /root/vsftpd.conf.orig
+5ad8d37fc1b2bd9d8e8c8a7036d78930  /etc/vsftpd/vsftpd.conf
+-- 원본 md5. [10] 에서 되돌린 뒤 이 값과 비교한다
+-- 원본은 /root 에 사본을 남긴다. diff 의 기준이 된다
+
+--------------------------------------------------------------------------------
+ [2] 기본 vsftpd.conf 읽기
+--------------------------------------------------------------------------------
+-- 주석과 빈 줄을 뺀 지시어만 본다.
+-- 형식은 지시어=값, = 앞뒤에 공백을 넣으면 안 된다.
+[root@ol7a ~]# grep -vE '^\s*(#|$)' /etc/vsftpd/vsftpd.conf
+anonymous_enable=YES
+local_enable=YES
+write_enable=YES
+local_umask=022
+dirmessage_enable=YES
+xferlog_enable=YES
+connect_from_port_20=YES
+xferlog_std_format=YES
+listen=NO
+listen_ipv6=YES
+pam_service_name=vsftpd
+userlist_enable=YES
+tcp_wrappers=YES
+-- 지시어 13개가 살아 있다. 이 실습에서 볼 것
+--   anonymous_enable=YES  : 익명 로그인 허용(7.9 기본)
+--   local_enable=YES      : 시스템 계정 로그인
+--   write_enable=YES      : 올리기·삭제 같은 쓰기 명령 허용
+--   local_umask=022       : 올린 파일 권한 644
+--   xferlog_*             : 전송 기록
+--   listen=NO, listen_ipv6=YES : IPv6 소켓 하나로 IPv4 도 받음
+--   userlist_enable=YES   : user_list 에 있는 사용자 거부
+--   tcp_wrappers=YES      : /etc/hosts.allow·deny 도 본다([OL8/9] TCP Wrappers 는 8 에서 빠졌다)
+-- [OL8/9] OL8 의 기본 파일은 anonymous_enable=NO 다
+-- 로그인을 막는 두 파일. ftpusers 는 PAM 이, user_list 는 vsftpd 가 읽는다.
+[root@ol7a ~]# grep -v '^#' /etc/vsftpd/ftpusers | tr '\n' ' '; echo; grep -v '^#' /etc/vsftpd/user_list | tr '\n' ' '; echo
+root bin daemon adm lp sync shutdown halt mail news uucp operator games nobody 
+root bin daemon adm lp sync shutdown halt mail news uucp operator games nobody 
+-- 두 파일의 내용이 같다. 시스템 계정 14개
+-- 로그인 셸이 있는 root 를 막는 것이 핵심 목적이다.
+-- 나머지는 원래 로그인하지 않는 계정이다
+[root@ol7a ~]# grep -E 'pam_listfile|pam_shells' /etc/pam.d/vsftpd
+auth       required     pam_listfile.so item=user sense=deny file=/etc/vsftpd/ftpusers onerr=succeed
+auth       required     pam_shells.so
+-- pam_listfile : ftpusers 에 있으면 거부(sense=deny)
+-- pam_shells   : /etc/shells 에 있는 셸을 가진 계정만 허용
+
+--------------------------------------------------------------------------------
+ [3] 시작과 리스닝 확인
+--------------------------------------------------------------------------------
+[root@ol7a ~]# systemctl enable --now vsftpd; systemctl is-active vsftpd
+Created symlink from /etc/systemd/system/multi-user.target.wants/vsftpd.service to /usr/lib/systemd/system/vsftpd.service.
+active
+-- enable --now 로 등록과 시작을 함께 했다
+-- vsftpd 는 독립 실행(listen) 방식이라 서비스 하나가 21 을 듣는다
+-- listen=NO, listen_ipv6=YES : IPv6 소켓 하나로 IPv4 까지 받는다.
+-- 그래서 :::21 로 보인다.
+[root@ol7a ~]# ss -tlnp | grep ':21 '
+LISTEN 0      32                 *:21              *:*    users:(("vsftpd",pid=2210,fd=4))  
+-- *:21 하나. IPv6 소켓이 IPv4 도 받는다
+-- 익명 사용자의 루트는 ftp 사용자의 홈 /var/ftp 다.
+-- 받아 갈 파일을 하나 둔다.
+[root@ol7a ~]# getent passwd ftp; echo "public file" > /var/ftp/pub/notice.txt; ls -l /var/ftp /var/ftp/pub
+ftp:x:14:50:FTP User:/var/ftp:/sbin/nologin
+/var/ftp:
+total 0
+drwxr-xr-x. 2 root root 24 Nov 16 15:46 pub
+
+/var/ftp/pub:
+total 4
+-rw-r--r--. 1 root root 12 Nov 16 15:46 notice.txt
+-- ftp 사용자(UID 14)의 홈이 /var/ftp. 익명 사용자에게는 이곳이 / 로 보인다
+-- /var/ftp 와 pub 는 root 소유 755. 익명 사용자는 읽기만 한다
+
+--------------------------------------------------------------------------------
+ [4] 21번 포트만 열었을 때
+--------------------------------------------------------------------------------
+-- 서비스 정의 대신 포트만 연다. 실무에서 흔히 하는 방식이다.
+[root@ol7a ~]# firewall-cmd -q --add-port=21/tcp; firewall-cmd --list-ports
+21/tcp
+-- 서비스 정의가 아니라 포트 하나만 런타임에 열었다
+-- --permanent 를 주지 않아 reload 하면 사라진다
+-- ftp 클라이언트를 스크립트로 몬다.
+--   -i : mget 등에서 묻지 않음   -n : 자동 로그인 끔(user 명령으로 직접)
+--   -v : 서버 응답 코드를 보임    -p : 수동(passive) 모드
+[root@ol7b ~]# printf 'user anonymous x@\nls\nquit\n' | timeout 40 ftp -invp ol7a; echo "rc=$?"
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+230 Login successful.
+227 Entering Passive Mode (172,16,225,61,185,182).
+-- 227 의 여섯 숫자: IP 172.16.225.61, 포트 185*256+182 = 47542
+-- 응답 코드 읽기(첫 자리로 성격을 안다)
+--   220 : 서비스 준비. 괄호 안이 서버 이름과 버전(vsFTPd 3.0.2)
+--   331 : 사용자 이름을 받았고 비밀번호를 기다림
+--   230 : 로그인 성공
+--   227 : 수동 모드 진입. 데이터 연결 주소를 알려 줌
+--   150 : 데이터 연결을 연다 / 226 : 전송 끝 / 221 : 연결 종료
+--   2xx 성공, 3xx 추가 입력 필요, 4xx 일시 오류, 5xx 영구 오류
+ftp: connect: No route to host
+-- 증상   : 로그인(230)까지는 되고 ls 의 데이터 연결이 "ftp: connect: No route to host"
+-- rc=0 은 ftp 프로그램이 정상 종료했다는 뜻일 뿐이다
+221 Goodbye.
+rc=0
+-- 제어 연결(로그인)은 됐는데 목록이 오지 않았다.
+-- 227 응답의 숫자 여섯 개가 데이터 연결 주소다.
+-- 마지막 두 숫자 p1,p2 로 포트를 계산한다: p1*256+p2.
+-- 그 포트는 방화벽에 열려 있지 않다.
+-- curl 로도 본다. curl 은 EPSV(확장 수동 모드)를 먼저 쓴다.
+[root@ol7b ~]# timeout 40 curl -sS --connect-timeout 10 ftp://ol7a/pub/; echo "rc=$?"
+curl: (7) Failed connect to ol7a:21; No route to host
+rc=7
+-- curl 도 실패. 메시지에 ol7a:21 이라고 나오지만 21 은 열려 있다
+-- curl 7.29 는 데이터 연결 실패도 이렇게 적는다.
+-- 앞의 ftp 결과와 함께 읽는다
+-- 원인   : 수동 모드 데이터 포트(47542 같은 높은 포트)가 방화벽에 없다
+
+--------------------------------------------------------------------------------
+ [5] ftp 서비스로 연다 — conntrack 도우미
+--------------------------------------------------------------------------------
+[root@ol7a ~]# firewall-cmd --info-service=ftp
+ftp
+  ports: 21/tcp
+  protocols: 
+  source-ports: 
+  modules: ftp
+  destination: 
+-- ports 21/tcp 와 함께 modules: ftp. 이 줄이 conntrack FTP 도우미다
+-- 포트만 연 [4] 와의 차이는 이 modules 한 줄이다
+[root@ol7a ~]# firewall-cmd -q --remove-port=21/tcp; firewall-cmd -q --permanent --add-service=ftp; firewall-cmd -q --reload; firewall-cmd --list-services
+dhcpv6-client ftp ssh
+-- 조치   : 21 포트 규칙을 지우고 ftp 서비스를 영구 설정으로 열었다
+[root@ol7a ~]# lsmod | grep -E 'nf_conntrack_ftp|nf_nat_ftp'
+nf_nat_ftp             20480  0 
+nf_conntrack_ftp       24576  3 nf_nat_ftp
+nf_nat                 45056  3 ip6table_nat,nf_nat_ftp,iptable_nat
+nf_conntrack          147456  5 xt_conntrack,nf_nat,nf_nat_ftp,nf_conntrack_ftp,xt_CT
+-- nf_conntrack_ftp 가 올라왔다.
+-- 제어 연결의 227 응답을 읽어 그 포트를 잠시 허용한다
+[root@ol7b ~]# printf 'user anonymous x@\nls\ncd pub\nget notice.txt /tmp/notice.txt\nquit\n' | timeout 40 ftp -invp ol7a; cat /tmp/notice.txt
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+230 Login successful.
+227 Entering Passive Mode (172,16,225,61,103,253).
+150 Here comes the directory listing.
+-- 재확인 : 이번에는 227 다음에 150, 목록이 왔다
+drwxr-xr-x    2 0        0              24 Nov 16 06:46 pub
+226 Directory send OK.
+250 Directory successfully changed.
+local: /tmp/notice.txt remote: notice.txt
+227 Entering Passive Mode (172,16,225,61,78,76).
+-- 파일마다 새 데이터 포트(78*256+76 = 20044).
+-- 포트가 매번 바뀌어도 도우미가 따라간다
+150 Opening BINARY mode data connection for notice.txt (12 bytes).
+WARNING! 1 bare linefeeds received in ASCII mode
+File may not have transferred correctly.
+-- 경고는 ASCII 모드로 받아서 나온다.
+-- 텍스트 파일이라 내용은 그대로다(binary 명령으로 끈다)
+-- 12 bytes : notice.txt 의 크기
+-- 3.1e-05 secs : 0.000031초
+-- 실습 망 안이라 전송 시간은 의미가 없다
+226 Transfer complete.
+12 bytes received in 3.1e-05 secs (387.10 Kbytes/sec)
+221 Goodbye.
+public file
+-- 받아 온 파일 내용
+-- xferlog 에 이 전송이 남는다([9])
+-- 익명은 기본 설정에서 올리기가 꺼져 있다(anon_upload_enable 이 주석).
+[root@ol7b ~]# printf 'user anonymous x@\ncd pub\nput /etc/hostname h.txt\nquit\n' | timeout 40 ftp -invp ol7a
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+230 Login successful.
+250 Directory successfully changed.
+local: /etc/hostname remote: h.txt
+227 Entering Passive Mode (172,16,225,61,119,69).
+550 Permission denied.
+-- 익명 올리기는 550. anon_upload_enable 이 주석이고, /var/ftp/pub 도 root 755 다
+-- 익명 올리기를 열려면 SELinux 불리언과 디렉터리 권한까지 바꿔야 해 여기서는 다루지 않는다
+221 Goodbye.
+
+--------------------------------------------------------------------------------
+ [6] 로컬 사용자 로그인
+--------------------------------------------------------------------------------
+[root@ol7a ~]# useradd ftpuser1; echo 'Ftp#2026' | passwd --stdin ftpuser1; echo "home file" > /home/ftpuser1/hello.txt; chown ftpuser1: /home/ftpuser1/hello.txt
+Changing password for user ftpuser1.
+passwd: all authentication tokens updated successfully.
+-- passwd --stdin : 표준 입력으로 비밀번호를 준다(7.9 passwd 의 확장 옵션)
+-- local_enable=YES 라 시스템 계정 비밀번호로 들어간다.
+-- 홈 디렉터리에서 시작한다.
+[root@ol7b ~]# printf 'user ftpuser1 Ftp#2026\npwd\nls\nput /etc/hostname up.txt\nquit\n' | timeout 40 ftp -invp ol7a
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+230 Login successful.
+257 "/home/ftpuser1"
+-- 로컬 사용자는 홈 디렉터리에서 시작한다. pwd 가 실제 경로를 보여 준다
+227 Entering Passive Mode (172,16,225,61,214,36).
+150 Here comes the directory listing.
+-rw-r--r--    1 1001     1001           10 Nov 16 06:46 hello.txt
+226 Directory send OK.
+local: /etc/hostname remote: up.txt
+227 Entering Passive Mode (172,16,225,61,164,137).
+150 Ok to send data.
+226 Transfer complete.
+18 bytes sent in 1.4e-05 secs (1285.71 Kbytes/sec)
+-- put 이 150 → 226 으로 끝났다. write_enable=YES 라 로컬 사용자는 올릴 수 있다
+221 Goodbye.
+[root@ol7a ~]# ls -l /home/ftpuser1
+total 8
+-rw-r--r--. 1 ftpuser1 ftpuser1 10 Nov 16 15:46 hello.txt
+-rw-r--r--. 1 ftpuser1 ftpuser1 18 Nov 16 15:46 up.txt
+-- 올린 파일은 ftpuser1 소유, 644(local_umask=022)
+-- FTP 목록의 1001 은 ftpuser1 의 UID. 서버 ls 는 이름으로 보인다
+-- chroot 가 없으면 상위 디렉터리로 나갈 수 있다.
+[root@ol7b ~]# printf 'user ftpuser1 Ftp#2026\ncd /etc\npwd\nget passwd /tmp/p.txt\nquit\n' | timeout 40 ftp -invp ol7a; wc -l /tmp/p.txt
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+230 Login successful.
+250 Directory successfully changed.
+257 "/etc"
+local: /tmp/p.txt remote: passwd
+227 Entering Passive Mode (172,16,225,61,77,198).
+150 Opening BINARY mode data connection for passwd (1432 bytes).
+WARNING! 29 bare linefeeds received in ASCII mode
+File may not have transferred correctly.
+226 Transfer complete.
+1432 bytes received in 4.6e-05 secs (31130.43 Kbytes/sec)
+221 Goodbye.
+29 /tmp/p.txt
+-- chroot 가 없어 /etc 로 나가 passwd 를 받아 왔다(29 줄)
+-- 로컬 사용자는 파일 시스템 권한이 허락하는 한 어디든 읽는다
+-- /etc/passwd 는 644 라 누구나 읽을 수 있다
+-- 시스템 계정 목록이 FTP 로 새는 상황이다. [7] 에서 막는다
+-- root 는 ftpusers 와 user_list 둘 다에 있다.
+[root@ol7b ~]# printf 'user root oracle\nquit\n' | timeout 40 ftp -invp ol7a
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+530 Permission denied.
+-- root 는 비밀번호를 묻기 전에 530 Permission denied
+-- 331(비밀번호 요청) 이 없다 → user_list 단계에서 vsftpd 가 거부했다.
+-- ftpusers(PAM)까지 가지 않았다
+Login failed.
+221 Goodbye.
+
+--------------------------------------------------------------------------------
+ [7] chroot_local_user — 쓰기 가능한 홈은 거부된다
+--------------------------------------------------------------------------------
+-- 로컬 사용자를 홈 안에 가둔다. 주석 처리된 줄을 살린다.
+[root@ol7a ~]# sed -i 's/^#chroot_local_user=YES/chroot_local_user=YES/' /etc/vsftpd/vsftpd.conf; diff /root/vsftpd.conf.orig /etc/vsftpd/vsftpd.conf
+101c101
+< #chroot_local_user=YES
+---
+> chroot_local_user=YES
+-- 101번째 줄의 주석만 풀었다
+-- diff 의 101c101 : 101번째 줄이 바뀌었다(c=change)
+-- vsftpd 는 설정을 시작할 때 한 번 읽는다. 재시작해야 반영된다.
+[root@ol7a ~]# systemctl restart vsftpd
+[root@ol7b ~]# printf 'user ftpuser1 Ftp#2026\npwd\nls\nquit\n' | timeout 40 ftp -invp ol7a
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+500 OOPS: chroot
+Login failed.
+421 Service not available, remote server has closed connection
+Not connected.
+-- 증상   : 비밀번호 다음에 "500 OOPS: chroot", 연결이 끊긴다
+-- 예상한 "writable root" 메시지가 아니다. chroot 자체가 실패했다
+-- 원인을 좁힌다. 홈 퍼미션, SELinux 거부 기록,
+-- ftp 관련 SELinux 불리언을 함께 본다.
+[root@ol7a ~]# ls -ldZ /home/ftpuser1; ausearch -m avc -ts recent 2>&1 | grep -c 'denied'; getsebool ftpd_full_access ftp_home_dir 2>&1
+drwx------. ftpuser1 ftpuser1 unconfined_u:object_r:user_home_dir_t:s0 /home/ftpuser1
+2
+Error getting active value for ftp_home_dir
+ftpd_full_access --> off
+-- 홈은 drwx------(700). useradd 가 7.9 에서 만드는 기본 홈 권한이다
+-- 감사 로그의 denied 2건,
+-- ftp_home_dir 불리언은 7.9 정책에 없다(ftpd_full_access 는 off)
+-- SELinux 를 끄지 않고 퍼미션부터 바꿔 본다
+-- 홈이 700 이다. 다른 사용자 홈처럼 755 로 바꿔 다시 본다.
+[root@ol7a ~]# chmod 755 /home/ftpuser1; ls -ld /home/ftpuser1
+drwxr-xr-x. 2 ftpuser1 ftpuser1 93 Nov 16 15:46 /home/ftpuser1
+-- 755 로 바꿨다. 다른 계정도 홈에 들어갈 수 있게 된다
+-- 실무에서는 홈 권한을 넓히는 대신 FTP 전용 디렉터리를 local_root 로 주는 방법도 쓴다
+[root@ol7b ~]# printf 'user ftpuser1 Ftp#2026\npwd\nls\nquit\n' | timeout 40 ftp -invp ol7a
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+500 OOPS: vsftpd: refusing to run with writable root inside chroot()
+-- 이번에는 chroot 는 됐고 그다음 검사에서 거부됐다
+--   "refusing to run with writable root inside chroot()" : 루트(홈)에 사용자 쓰기 권한이 있다
+-- 원인   : (1) 700 홈은 vsftpd 의 chroot 단계가 들어가지 못했다. SELinux 설정은 그대로이고 퍼미션만 바꿔 넘어갔다
+--          (2) 쓰기 가능한 홈은 vsftpd 3.0 의 보안 검사에 걸린다
+Login failed.
+421 Service not available, remote server has closed connection
+Not connected.
+-- 고치는 방법은 둘이다.
+--   (가) 홈의 쓰기 권한을 없앤다 : 홈에 파일을 못 만든다. 셸 사용자에게는 불편하다
+--   (나) allow_writeable_chroot=YES : 쓰기 가능 루트 검사를 끈다(vsftpd 3.0 지시어)
+-- 여기서는 (나)를 쓴다.
+[root@ol7a ~]# echo 'allow_writeable_chroot=YES' >> /etc/vsftpd/vsftpd.conf; systemctl restart vsftpd
+[root@ol7b ~]# printf 'user ftpuser1 Ftp#2026\npwd\ncd /etc\npwd\nls\nquit\n' | timeout 40 ftp -invp ol7a
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+230 Login successful.
+257 "/"
+-- 조치   : allow_writeable_chroot=YES 를 넣고 재시작. 230 로그인 성공
+-- pwd 가 "/" 다. 사용자는 홈을 / 로 본다
+550 Failed to change directory.
+-- 재확인 : cd /etc 가 550. chroot 밖으로 못 나간다
+257 "/"
+227 Entering Passive Mode (172,16,225,61,206,29).
+150 Here comes the directory listing.
+-rw-r--r--    1 1001     1001           10 Nov 16 06:46 hello.txt
+-rw-r--r--    1 1001     1001           18 Nov 16 06:46 up.txt
+-- 목록의 시각이 06:46 인 것은 FTP 가 UTC 로 보여 주기 때문이다(서버는 KST 15:46)
+226 Directory send OK.
+221 Goodbye.
+-- 홈을 다시 700 으로 돌리면 allow_writeable_chroot 가 있어도 들어갈 수 있는지 본다.
+[root@ol7a ~]# chmod 700 /home/ftpuser1
+[root@ol7b ~]# printf 'user ftpuser1 Ftp#2026\npwd\nquit\n' | timeout 40 ftp -invp ol7a
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+500 OOPS: chroot
+Login failed.
+421 Service not available, remote server has closed connection
+-- 홈을 다시 700 으로 돌리면 allow_writeable_chroot 가 있어도 500 OOPS: chroot
+-- chroot 를 쓰는 사용자의 홈은 755 처럼 다른 사용자도 통과할 수 있어야 한다.
+-- 끝에 755 로 돌렸다
+[root@ol7a ~]# chmod 755 /home/ftpuser1
+
+--------------------------------------------------------------------------------
+ [8] 익명 접속 끄기와 수동 모드 포트 범위
+--------------------------------------------------------------------------------
+-- 7.9 의 vsftpd.conf 는 anonymous_enable=YES 로 나온다.
+-- [OL8/9] OL8 부터 기본 vsftpd.conf 는 anonymous_enable=NO 다.
+[root@ol7a ~]# sed -i 's/^anonymous_enable=YES/anonymous_enable=NO/' /etc/vsftpd/vsftpd.conf
+-- 수동 모드 포트를 좁은 범위로 고정한다.
+-- ftp 서비스(도우미)를 쓰지 않고 포트만 여는 방화벽에서 필요하다.
+[root@ol7a ~]# printf '%s\n' 'pasv_min_port=30000' 'pasv_max_port=30009' >> /etc/vsftpd/vsftpd.conf; systemctl restart vsftpd; diff /root/vsftpd.conf.orig /etc/vsftpd/vsftpd.conf
+12c12
+< anonymous_enable=YES
+---
+> anonymous_enable=NO
+101c101
+< #chroot_local_user=YES
+---
+> chroot_local_user=YES
+128a129,131
+> allow_writeable_chroot=YES
+> pasv_min_port=30000
+> pasv_max_port=30009
+-- 원본과의 차이 네 곳: 익명 끔, chroot,
+-- 쓰기 가능 루트 허용, 수동 포트 범위
+-- 128a129,131 : 원본 128번째 줄 뒤에 129~131 세 줄이 붙었다(a=add)
+[root@ol7b ~]# printf 'user anonymous x@\nquit\n' | timeout 40 ftp -invp ol7a
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+530 Login incorrect.
+-- 익명은 530 Login incorrect. 비밀번호까지 받은 뒤 거부한다
+-- 앞의 root(530 Permission denied)와 문구가 다르다.
+-- 거부 단계가 다르기 때문이다
+Login failed.
+221 Goodbye.
+-- 도우미 대신 포트 범위만 연 방화벽으로 바꿔 본다.
+[root@ol7a ~]# firewall-cmd -q --remove-service=ftp; firewall-cmd -q --add-port=21/tcp --add-port=30000-30009/tcp; firewall-cmd --list-ports
+21/tcp 30000-30009/tcp
+-- ftp 서비스(도우미)를 런타임에서 빼고 21 과 30000-30009 만 열었다
+[root@ol7b ~]# printf 'user ftpuser1 Ftp#2026\nls\nquit\n' | timeout 40 ftp -invp ol7a
+Connected to ol7a (172.16.225.61).
+220 (vsFTPd 3.0.2)
+331 Please specify the password.
+230 Login successful.
+227 Entering Passive Mode (172,16,225,61,117,52).
+-- 117*256+52 = 30004.
+-- 범위 안의 포트를 골랐고 그 포트가 열려 있어 목록이 왔다
+-- 도우미 없이 포트 범위만으로도 된다.
+-- 외부 방화벽 장비에 열어 줄 범위가 이것이다
+-- 범위를 열 개로 좁히면 동시에 데이터 연결을 여는 세션도 열 개 남짓으로 제한된다
+150 Here comes the directory listing.
+-rw-r--r--    1 1001     1001           10 Nov 16 06:46 hello.txt
+-rw-r--r--    1 1001     1001           18 Nov 16 06:46 up.txt
+226 Directory send OK.
+221 Goodbye.
+[root@ol7a ~]# firewall-cmd -q --reload; firewall-cmd --list-services; firewall-cmd --list-ports
+dhcpv6-client ftp ssh
+-- reload 로 런타임 변경을 버리고 영구 설정(ftp 서비스)으로 돌아왔다.
+-- --list-ports 는 빈 줄
+
+--------------------------------------------------------------------------------
+ [9] 전송 기록 — xferlog
+--------------------------------------------------------------------------------
+-- xferlog_enable=YES,
+-- xferlog_std_format=YES 라 wu-ftpd 형식으로 /var/log/xferlog 에 남는다.
+[root@ol7a ~]# cat /var/log/xferlog
+Mon Nov 16 15:46:12 2026 1 ::ffff:172.16.225.62 12 /pub/notice.txt a _ o a x@ ftp 0 * c
+Mon Nov 16 15:46:12 2026 1 ::ffff:172.16.225.62 18 /home/ftpuser1/up.txt a _ i r ftpuser1 ftp 0 * c
+Mon Nov 16 15:46:12 2026 1 ::ffff:172.16.225.62 1432 /etc/passwd a _ o r ftpuser1 ftp 0 * c
+-- xferlog 열(wu-ftpd 형식)
+--   시각, 전송 초(1), 원격 주소(::ffff: 는 IPv6 소켓에 들어온 IPv4), 바이트
+--   파일 경로, a(ASCII)/b, _ (가공 없음), o(받기)/i(올리기)
+--   a(익명)/r(실사용자), 사용자 이름(익명은 비밀번호로 준 x@), 서비스 ftp
+--   0(인증 없음), *, c(완료)/i(중단)
+-- 셋째 줄이 [6] 에서 /etc/passwd 를 받아 간 기록이다
+
+--------------------------------------------------------------------------------
+ [변형] curl 로 같은 작업
+--------------------------------------------------------------------------------
+-- curl 은 스크립트에 쓰기 좋다.
+-- -u 사용자:비밀번호, -T 올리기, -l 이름만 나열.
+[root@ol7b ~]# curl -sS -u 'ftpuser1:Ftp#2026' -l ftp://ol7a/
+hello.txt
+up.txt
+-- -l 은 이름만(NLST). chroot 상태라 홈 안의 두 파일만 보인다
+[root@ol7b ~]# curl -sS -u 'ftpuser1:Ftp#2026' -T /etc/os-release ftp://ol7a/os.txt; curl -sS -u 'ftpuser1:Ftp#2026' ftp://ol7a/os.txt | head -2
+NAME="Oracle Linux Server"
+VERSION="7.9"
+-- -T 로 os.txt 를 올리고 다시 받아 앞 두 줄을 보였다
+-- -v 로 제어 연결의 대화를 본다. EPSV 응답의 (|||포트|) 가 데이터 포트다.
+[root@ol7b ~]# curl -sv -u 'ftpuser1:Ftp#2026' -l ftp://ol7a/ 2>&1 | grep -E '^[<>] (USER|PASS|PWD|EPSV|LIST|NLST|2|3|5)' | head -14
+< 220 (vsFTPd 3.0.2)
+> USER ftpuser1
+< 331 Please specify the password.
+> PASS Ftp#2026
+< 230 Login successful.
+> PWD
+< 257 "/"
+> EPSV
+< 229 Entering Extended Passive Mode (|||30002|).
+< 200 Switching to ASCII mode.
+> NLST
+< 226 Directory send OK.
+-- 대화 순서: 220 인사 → USER → 331 → PASS → 230 → PWD → EPSV → 229 → NLST → 226
+-- > 는 클라이언트가 보낸 명령, < 는 서버 응답
+-- 200 Switching to ASCII mode 는 TYPE A 명령의 응답이다(grep 범위 밖이라 명령 줄은 안 보임)
+-- PASS Ftp#2026 이 평문으로 지나간다
+-- 망 중간에서 패킷을 보는 누구나 이 비밀번호를 읽을 수 있다
+-- EPSV 응답 (|||30002|) 는 포트만 알려 준다. 30002 는 pasv 범위 안이다
+[root@ol7b ~]# curl -sS ftp://ol7a/; echo "rc=$?"
+curl: (67) Access denied: 530
+rc=67
+-- 사용자 없이(익명) 붙으면 530, curl rc=67(로그인 거부)
+-- [8] 에서 anonymous_enable=NO 로 바꾼 결과가 curl 에서도 같다
+
+--------------------------------------------------------------------------------
+ [10] 되돌리기
+--------------------------------------------------------------------------------
+[root@ol7a ~]# systemctl disable --now vsftpd; cp -p /root/vsftpd.conf.orig /etc/vsftpd/vsftpd.conf; md5sum /etc/vsftpd/vsftpd.conf
+Removed symlink /etc/systemd/system/multi-user.target.wants/vsftpd.service.
+5ad8d37fc1b2bd9d8e8c8a7036d78930  /etc/vsftpd/vsftpd.conf
+-- md5 가 [1] 과 같다. 원본으로 돌아왔다
+[root@ol7a ~]# firewall-cmd -q --permanent --remove-service=ftp; firewall-cmd -q --reload; firewall-cmd --list-services; firewall-cmd --list-ports
+dhcpv6-client ssh
+-- 방화벽 기본값, 열린 포트 없음
+[root@ol7a ~]# userdel -r ftpuser1; rm -f /var/ftp/pub/notice.txt /root/vsftpd.conf.orig; id ftpuser1; systemctl is-active vsftpd
+id: ftpuser1: no such user
+unknown
+[root@ol7b ~]# rm -f /tmp/notice.txt /tmp/p.txt; ls /tmp/*.txt 2>&1
+ls: cannot access /tmp/*.txt: No such file or directory
+-- 서버: ftpuser1 삭제, vsftpd unknown(설치는 남음). 클라이언트 임시 파일 삭제
+-- 패키지는 스냅샷 되돌리기로 지운다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  상황                                결과
+--  21/tcp 만 열림                      로그인 230, ls 데이터 연결 No route to host
+--  ftp 서비스(도우미)                  목록·받기 성공, nf_conntrack_ftp 로드
+--  21 + 30000-30009 + pasv 범위        목록 성공(포트 30004·30002)
+--  익명 올리기                         550 Permission denied
+--  로컬 사용자, chroot 없음            /etc/passwd 받기 가능
+--  root 로그인                         530 Permission denied (user_list)
+--  chroot + 홈 700                     500 OOPS: chroot
+--  chroot + 홈 755                     500 OOPS: ... writable root inside chroot()
+--  + allow_writeable_chroot=YES        로그인, pwd "/", cd /etc 550
+--  anonymous_enable=NO                 530 Login incorrect
+--
+--  항목              시작 전           되돌린 뒤
+--  vsftpd            미설치            설치됨·inactive(스냅샷으로 제거)
+--  vsftpd.conf md5   5ad8d37f...       5ad8d37f...
+--  방화벽            dhcpv6-client ssh dhcpv6-client ssh
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. allow_writeable_chroot 대신 홈을 555 로 하고 쓰기용 하위 디렉터리 upload 를 만든다
+--    확인: 로그인 후 put 이 홈에서는 550, upload 안에서는 226 인지
+-- 2. user_list 에 ftpuser1 을 넣는다
+--    확인: 331 없이 530 Permission denied 가 나오는지
+-- 3. ftp 클라이언트에서 binary 를 친 뒤 같은 파일을 받는다
+--    확인: bare linefeeds 경고가 사라지는지
+
+================================================================================
+ 실습 04 종료 — 21 만 열면 데이터 연결 실패, 700 홈은 500 OOPS: chroot, 755 홈은 writable root 거부
+================================================================================

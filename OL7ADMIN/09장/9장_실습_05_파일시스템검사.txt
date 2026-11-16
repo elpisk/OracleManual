@@ -1,0 +1,578 @@
+================================================================================
+ 제9장 실습 05 — 파일 시스템 검사
+ 대상   : ol7a
+ 목표   : fsck 를 언마운트 상태에서 실행하고 다섯 단계 출력을 읽는다. debugfs 로
+          디렉터리 inode 를 지워 손상을 만든 뒤 복구하고, lost+found 에 생긴
+          파일을 해석한다. 주 슈퍼블록이 깨졌을 때 사본으로 복구한다
+ 배경   : fsck 는 파일 시스템별 검사기(fsck.ext4 = e2fsck, fsck.xfs)를 부르는
+          앞단이다. Ext4 검사는 마운트를 푼 상태에서만 안전하다. 연결이 끊긴
+          inode 는 버리지 않고 lost+found 에 "#inode번호" 이름으로 붙인다
+          (본문 9.7절)
+ 소요   : 약 20분
+ 선행   : storage-clean 스냅샷
+ 계정   : root
+ 주의   : debugfs -w 와 dd 로 sdb 의 파일 시스템을 일부러 손상시킨다
+ 되돌림 : 언마운트, wipefs, 마운트 지점 삭제.
+          확인 명령 lsblk -f /dev/sdb, findmnt /mnt/chk (출력 없음)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+-- 먼저 OS 디스크가 sda(HCTL 2:0:0:0, 40G)이고 sdb 가 빈 10G 인지 확인한다.
+[root@ol7a ~]# lsblk -d -o NAME,HCTL,SIZE /dev/sda /dev/sdb
+NAME HCTL       SIZE
+sda  2:0:0:0     40G
+sdb  2:0:1:0     10G
+-- sda 가 HCTL 2:0:0:0 의 40G(OS), sdb 가 2:0:1:0 의 10G.
+-- 이름과 슬롯이 맞으니 sdb 를 대상으로 쓴다
+-- 대상 디스크와 마운트 지점의 현재 상태
+-- 이 실습은 sdb 를 일부러 망가뜨린다.
+-- sda 를 지정하지 않도록 장치 이름을 매번 확인한다
+[root@ol7a ~]# lsblk -f /dev/sdb; findmnt /mnt/chk; echo rc=$?
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+rc=1
+-- sdb 는 비었고 /mnt/chk 마운트는 없다(rc=1)
+[root@ol7a ~]# echo /sbin/fsck*
+/sbin/fsck /sbin/fsck.btrfs /sbin/fsck.cramfs /sbin/fsck.ext2 /sbin/fsck.ext3 /sbin/fsck.ext4 /sbin/fsck.fat /sbin/fsck.minix /sbin/fsck.msdos /sbin/fsck.vfat /sbin/fsck.xfs
+-- fsck 앞단과 유형별 검사기
+-- fsck.ext2·3·4 는 같은 e2fsck 다(실습 05 [3] 의 -N)
+-- fsck.xfs 와 fsck.btrfs 는 짧은 셸 스크립트다([변형])
+
+--------------------------------------------------------------------------------
+ [1] 검사할 파일 시스템 준비
+--------------------------------------------------------------------------------
+[root@ol7a ~]# parted -s /dev/sdb mklabel msdos mkpart primary 1MiB 2049MiB; udevadm settle; mkfs.ext4 -q -L chk /dev/sdb1
+[root@ol7a ~]# mkdir -p /mnt/chk; mount /dev/sdb1 /mnt/chk
+-- 디렉터리 하나에 파일 세 개. 나중에 이 디렉터리를 망가뜨린다.
+[root@ol7a ~]# mkdir /mnt/chk/proj; for f in a b c; do echo "file $f" > /mnt/chk/proj/$f.txt; done; ls -li /mnt/chk /mnt/chk/proj
+/mnt/chk:
+total 20
+11 drwx------. 2 root root 16384 Nov 16 09:36 lost+found
+12 drwxr-xr-x. 2 root root  4096 Nov 16 09:36 proj
+
+/mnt/chk/proj:
+total 12
+13 -rw-r--r--. 1 root root 7 Nov 16 09:36 a.txt
+14 -rw-r--r--. 1 root root 7 Nov 16 09:36 b.txt
+15 -rw-r--r--. 1 root root 7 Nov 16 09:36 c.txt
+-- ls -li 첫 열이 inode 번호
+--   11 lost+found, 12 proj 디렉터리
+--   13·14·15 가 a·b·c.txt
+-- proj(12) 를 망가뜨리면 13~15 를 가리키는 이름이 사라진다
+
+--------------------------------------------------------------------------------
+ [2] 마운트된 채로 fsck
+--------------------------------------------------------------------------------
+-- 운영 중에 "검사나 한번 해 보자" 하고 거는 상황. -y 는 모든 질문에 yes 로 답하라는 뜻이다.
+[root@ol7a ~]# fsck -y /dev/sdb1; echo rc=$?
+fsck from util-linux 2.23.2
+e2fsck 1.45.4 (23-Sep-2019)
+/dev/sdb1 is mounted.
+e2fsck: Cannot continue, aborting.
+
+rc=8
+-- 증상   : "/dev/sdb1 is mounted." "e2fsck: Cannot continue, aborting." rc=8
+-- 원인   : 마운트된 파일 시스템에 고치기(-y)를 걸었다
+--          e2fsck 가 마운트 여부를 확인하고 중단했다
+-- 조치   : 언마운트한 뒤 검사한다([3])
+-- 재확인 : umount 뒤 fsck 가 rc=0 으로 끝난다
+-- 단말에서 직접 치면 WARNING!!! 문구와 함께 계속할지 묻는다
+-- 이 실습은 단말 없이 실행해 묻지 않고 중단했다
+-- 종료 코드 8 = 실행 오류(검사 자체를 못 함)
+-- -n 은 읽기만 하고 모든 질문에 no 로 답한다. 마운트 중이어도 실행은 되지만 결과를 믿을 수 없다.
+[root@ol7a ~]# fsck -n /dev/sdb1; echo rc=$?
+fsck from util-linux 2.23.2
+e2fsck 1.45.4 (23-Sep-2019)
+Warning!  /dev/sdb1 is mounted.
+Warning: skipping journal recovery because doing a read-only filesystem check.
+chk: clean, 11/131072 files, 25388/524288 blocks
+rc=0
+-- -n 은 읽기만이라 마운트돼 있어도 실행했다(경고 두 줄)
+-- 결과가 clean, 11/131072 files 다.
+-- 실제로는 파일이 15개다
+-- 방금 만든 디렉터리·파일이 아직 디스크에 다 쓰이지 않았다
+-- 마운트 중 검사 결과를 믿을 수 없는 이유다
+
+--------------------------------------------------------------------------------
+ [3] 언마운트 후 정상 검사
+--------------------------------------------------------------------------------
+[root@ol7a ~]# umount /mnt/chk
+-- -p(preen) 는 부팅 때 쓰는 자동 모드. 깨끗하다고 표시된 파일 시스템은 요약 한 줄로 지나간다.
+[root@ol7a ~]# fsck -p /dev/sdb1; echo rc=$?
+fsck from util-linux 2.23.2
+chk: clean, 15/131072 files, 25392/524288 blocks
+-- -p(preen): clean 표시라 요약 한 줄로 끝났다
+-- 언마운트하면서 디스크에 다 쓰여 15 files 로 맞다
+-- 15/131072 = 쓰는 inode/전체,
+-- 25392/524288 = 쓰는 블록/전체
+rc=0
+-- clean 이면 검사하지 않는다.
+-- 부팅 때도 이 방식이다
+-- -f 강제 검사. 다섯 단계(Pass 1~5)를 모두 돈다. -y 는 고칠 것이 있으면 묻지 않고 고친다.
+[root@ol7a ~]# fsck -f -y /dev/sdb1; echo rc=$?
+fsck from util-linux 2.23.2
+e2fsck 1.45.4 (23-Sep-2019)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+chk: 15/131072 files (0.0% non-contiguous), 25392/524288 blocks
+-- -f 로 다섯 단계를 모두 돌았다.
+-- 고칠 것이 없었다
+-- 2GiB 라 1초도 걸리지 않았다.
+-- 수 TB 볼륨은 Pass 1 에서 오래 걸린다
+--   Pass 1 inode·블록, 2 디렉터리 구조, 3 연결
+--   Pass 4 참조 횟수, 5 그룹 요약
+-- non-contiguous 0.0%: 조각난 파일 비율
+rc=0
+-- 오류 없음 rc=0
+-- e2fsck 종료 코드: 0 정상, 1 고침,
+-- 2 고쳤고 재부팅 필요, 4 오류 남음, 8 실행 오류
+-- 어떤 검사기를 부르는지 -N 으로 실행 없이 본다.
+[root@ol7a ~]# fsck -N /dev/sdb1
+fsck from util-linux 2.23.2
+[/sbin/fsck.ext4 (1) -- /dev/sdb1] fsck.ext4 /dev/sdb1 
+-- -N 은 실행하지 않고 부를 명령만 보인다.
+-- 유형 ext4 → fsck.ext4
+
+--------------------------------------------------------------------------------
+ [4] debugfs 로 디렉터리 inode 지우기
+--------------------------------------------------------------------------------
+-- proj 디렉터리의 inode 번호를 debugfs 로 읽는다. -R 은 명령 하나만 실행.
+[root@ol7a ~]# debugfs -R 'ls -l /' /dev/sdb1 2>/dev/null
+      2   40755 (2)      0      0    4096 16-Nov-2026 09:36 .
+      2   40755 (2)      0      0    4096 16-Nov-2026 09:36 ..
+     11   40700 (2)      0      0   16384 16-Nov-2026 09:36 lost+found
+     12   40755 (2)      0      0    4096 16-Nov-2026 09:36 proj
+-- debugfs 의 ls -l 열: inode,
+-- 모드(8진), 유형, uid, gid, 크기, 시각, 이름
+-- 40755 = 디렉터리(04)·권한 755.
+-- proj 의 inode 는 12
+[root@ol7a ~]# debugfs -R 'stat /proj' /dev/sdb1 2>/dev/null | head -4
+Inode: 12   Type: directory    Mode:  0755   Flags: 0x80000
+Generation: 1735365054    Version: 0x00000000:00000004
+User:     0   Group:     0   Project:     0   Size: 4096
+File ACL: 0
+-- stat 의 첫 줄: Inode 12,
+-- directory, 0755
+-- 이 inode 를 비운다
+-- -w 는 쓰기 모드. clri 는 inode 내용을 0 으로 지운다. 디렉터리 항목 "proj" 는 남고
+-- 그것이 가리키는 inode 만 비게 된다.
+[root@ol7a ~]# debugfs -w -R 'clri /proj' /dev/sdb1; echo rc=$?
+debugfs 1.45.4 (23-Sep-2019)
+rc=0
+-- clri 는 말없이 끝났다.
+-- 이름 proj 는 그대로, inode 12 는 빈 칸이다
+-- -w 없이 열면 읽기 전용이라 clri 가 거부된다
+-- debugfs 는 마운트되지 않은 장치에 쓴다.
+-- 마운트 중에 -w 로 쓰면 파일 시스템이 깨진다
+-- 실제 장애에서는 디스크 불량·전원 차단 중 쓰기 같은 원인이 같은 모양을 만든다
+-- 이 상태로 마운트하면 무엇이 보이나.
+[root@ol7a ~]# mount /dev/sdb1 /mnt/chk; ls -l /mnt/chk; ls /mnt/chk/proj; umount /mnt/chk
+ls: cannot access /mnt/chk/proj: Structure needs cleaning
+-- ls 가 proj 의 속성을 ?????????? 로 보인다
+-- 커널이 지워진 inode 를 가리키는 이름을 발견했다
+-- Structure needs cleaning(EUCLEAN) = fsck 가 필요하다는 뜻
+-- 커널은 마운트를 막지는 않는다.
+-- 쓰다가 오류를 만난다
+total 16
+drwx------. 2 root root 16384 Nov 16 09:36 lost+found
+d?????????? ? ?    ?        ?            ? proj
+ls: cannot access /mnt/chk/proj: Structure needs cleaning
+
+--------------------------------------------------------------------------------
+ [5] 손상 확인 (-n) 과 복구 (-y)
+--------------------------------------------------------------------------------
+-- 먼저 고치지 않고 무엇이 틀렸는지만 본다.
+[root@ol7a ~]# e2fsck -fn /dev/sdb1 | tr -s '*'; echo rc=${PIPESTATUS[0]}
+e2fsck 1.45.4 (23-Sep-2019)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Entry 'proj' in / (2) has deleted/unused inode 12.  Clear? no
+
+Entry 'proj' in / (2) has an incorrect filetype (was 2, should be 0).
+Fix? no
+
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Inode 2 ref count is 4, should be 3.  Fix? no
+
+Unattached inode 13
+Connect to /lost+found? no
+
+Unattached inode 14
+Connect to /lost+found? no
+
+Unattached inode 15
+Connect to /lost+found? no
+
+Pass 5: Checking group summary information
+Block bitmap differences:  -8359
+Fix? no
+
+Inode bitmap differences:  -12
+Fix? no
+
+Directories count wrong for group #0 (3, counted=2).
+Fix? no
+
+chk: * WARNING: Filesystem still has errors *
+
+chk: 15/131072 files (0.0% non-contiguous), 25392/524288 blocks
+rc=4
+-- 증상   : Entry 'proj' … has deleted/unused inode 12, Unattached inode 13~15, rc=4
+-- 원인   : clri 로 비운 inode 12 를 / 의 항목 proj 가 가리킨다
+--          13~15 는 이름을 잃은 채 남았다(Unattached)
+-- 조치   : e2fsck -fy 로 고친다(바로 아래)
+-- 재확인 : 다시 e2fsck -fn 이 메시지 없이 rc=0
+-- | tr -s '*' 는 요약 줄 앞뒤의 별표 열 개를 하나로 줄인다. 줄 내용은 그대로다
+-- rc 는 ${PIPESTATUS[0]} 로 e2fsck 의 종료 코드를 받았다(tr 의 코드가 아님)
+-- 질문마다 no 로 답했다.
+-- -n 은 아무것도 고치지 않는다
+-- 첫 메시지를 보고 먼저 판단한다
+--   Entry 'proj' in / (2): 루트 디렉터리(inode 2)의 항목 proj
+--   has deleted/unused inode 12: 가리키는 inode 가 비었다
+--   incorrect filetype (was 2, should be 0): 항목의 유형 표시도 맞지 않는다
+-- 단계별로 본 것
+--   Pass 2: 지워진 inode 를 가리키는 항목
+--   Pass 4: / 의 링크 수 4 → 3, 붙을 곳 없는 inode
+--   Pass 5: 비트맵·그룹 카운트 불일치
+-- rc=4 = 고치지 못한 오류가 남음
+-- -y 는 모든 질문에 yes. -f 강제.
+[root@ol7a ~]# e2fsck -fy /dev/sdb1 | tr -s '*'; echo rc=${PIPESTATUS[0]}
+e2fsck 1.45.4 (23-Sep-2019)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Entry 'proj' in / (2) has deleted/unused inode 12.  Clear? yes
+
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Inode 2 ref count is 4, should be 3.  Fix? yes
+
+Unattached inode 13
+Connect to /lost+found? yes
+
+Inode 13 ref count is 2, should be 1.  Fix? yes
+
+Unattached inode 14
+Connect to /lost+found? yes
+
+Inode 14 ref count is 2, should be 1.  Fix? yes
+
+Unattached inode 15
+Connect to /lost+found? yes
+
+Inode 15 ref count is 2, should be 1.  Fix? yes
+
+Pass 5: Checking group summary information
+Block bitmap differences:  -8359
+Fix? yes
+
+Free blocks count wrong for group #0 (24408, counted=24409).
+Fix? yes
+
+Free blocks count wrong (498896, counted=498897).
+Fix? yes
+
+Inode bitmap differences:  -12
+Fix? yes
+
+Free inodes count wrong for group #0 (8177, counted=8178).
+Fix? yes
+
+Directories count wrong for group #0 (3, counted=2).
+Fix? yes
+
+Free inodes count wrong (131057, counted=131058).
+Fix? yes
+
+chk: * FILE SYSTEM WAS MODIFIED *
+chk: 14/131072 files (0.0% non-contiguous), 25391/524288 blocks
+rc=1
+-- 같은 질문에 yes. 항목 proj 를 지우고 13~15 를 lost+found 에 붙였다
+-- 붙이면서 각 inode 의 링크 수도 2 → 1 로 맞췄다
+-- 그룹 카운트(여유 블록·inode·디렉터리 수)를 실제 값으로 고쳤다
+-- FILE SYSTEM WAS MODIFIED,
+-- rc=1 = 고쳤음
+-- files 15 → 14.
+-- 디렉터리 proj 하나가 없어졌다
+-- 고친 뒤 다시 검사하면 깨끗해야 한다. -n 으로 읽기만 한다.
+[root@ol7a ~]# e2fsck -fn /dev/sdb1 | tr -s '*'; echo rc=${PIPESTATUS[0]}
+e2fsck 1.45.4 (23-Sep-2019)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+chk: 14/131072 files (0.0% non-contiguous), 25391/524288 blocks
+rc=0
+-- 고친 뒤에는 다섯 Pass 가 메시지 없이 지나가고 rc=0
+-- -n → -y → -n 세 번이 손상 복구의 한 묶음이다
+
+--------------------------------------------------------------------------------
+ [6] lost+found 읽기
+--------------------------------------------------------------------------------
+[root@ol7a ~]# mount /dev/sdb1 /mnt/chk; ls -l /mnt/chk; ls -li /mnt/chk/lost+found
+total 16
+drwx------. 2 root root 16384 Nov 16 09:36 lost+found
+total 12
+13 -rw-r--r--. 1 root root 7 Nov 16 09:36 #13
+14 -rw-r--r--. 1 root root 7 Nov 16 09:36 #14
+15 -rw-r--r--. 1 root root 7 Nov 16 09:36 #15
+-- proj 는 없고 lost+found 에 #13·#14·#15
+-- 이름이 inode 번호다.
+-- 원래 이름은 디렉터리 proj 의 항목에 있었다
+-- inode 번호·권한·소유자·크기(7)·시각은 그대로 남았다
+-- 이름은 잃었지만 내용은 그대로인지 본다.
+[root@ol7a ~]# head /mnt/chk/lost+found/*
+==> /mnt/chk/lost+found/#13 <==
+file a
+==> /mnt/chk/lost+found/#14 <==
+file b
+==> /mnt/chk/lost+found/#15 <==
+file c
+-- 내용도 그대로다
+-- head 는 파일이 여럿이면 ==> 이름 <== 머리를 붙여 보여 준다
+-- 이름을 되찾는 방법은 내용으로 짐작해 다시 붙이는 것뿐이다.
+[root@ol7a ~]# mkdir /mnt/chk/proj; for f in /mnt/chk/lost+found/#*; do n=$(awk '{print $2}' $f); mv "$f" /mnt/chk/proj/$n.txt; done; ls -l /mnt/chk/proj
+total 12
+-rw-r--r--. 1 root root 7 Nov 16 09:36 a.txt
+-rw-r--r--. 1 root root 7 Nov 16 09:36 b.txt
+-rw-r--r--. 1 root root 7 Nov 16 09:36 c.txt
+-- 내용의 둘째 단어(a·b·c)로 이름을 다시 붙였다
+-- mv 로 옮기면 lost+found 는 다시 빈다
+-- 실제 서버에서는 file 명령·내용으로 짐작해야 한다
+-- 파일이 많으면 사실상 되찾을 수 없다.
+-- 백업이 답이다
+[root@ol7a ~]# umount /mnt/chk
+
+--------------------------------------------------------------------------------
+ [7] 주 슈퍼블록 손상
+--------------------------------------------------------------------------------
+-- 사본 위치를 먼저 적어 둔다. 손상된 뒤에는 dumpe2fs 로 읽을 수 없다.
+[root@ol7a ~]# dumpe2fs /dev/sdb1 2>/dev/null | grep -i 'superblock at' | head -3
+  Primary superblock at 0, Group descriptors at 1-1
+  Backup superblock at 32768, Group descriptors at 32769-32769
+  Backup superblock at 98304, Group descriptors at 98305-98305
+-- 주 슈퍼블록은 0번 블록, 첫 사본은 32768
+-- 2GiB 라 그룹이 16개,
+-- 사본은 1·3·5·7·9 그룹에 있다
+-- 주 슈퍼블록은 1024바이트 오프셋에 있다. 그 1KiB 를 0 으로 덮는다.
+[root@ol7a ~]# dd if=/dev/zero of=/dev/sdb1 bs=1024 seek=1 count=1; sync
+1+0 records in
+1+0 records out
+1024 bytes (1.0 kB) copied, 0.000589852 s, 1.7 MB/s
+-- 오프셋 1024 의 1KiB(주 슈퍼블록)를 0 으로 덮었다
+-- seek=1 은 bs 단위로 1블록(1024바이트) 건너뛰기
+[root@ol7a ~]# mount /dev/sdb1 /mnt/chk; echo rc=$?
+mount: wrong fs type, bad option, bad superblock on /dev/sdb1,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+rc=32
+-- 증상   : mount 가 "wrong fs type, bad option, bad superblock on /dev/sdb1" 로 rc=32
+-- 원인   : 주 슈퍼블록의 magic(0xEF53)이 사라져 ext4 로 알아보지 못한다
+-- 조치   : 사본 슈퍼블록으로 e2fsck -b 32768([8])
+-- 재확인 : blkid 에 TYPE="ext4" 가 돌아오고 마운트된다
+-- mount 메시지 중간의 빈 줄도 원문 그대로다
+[root@ol7a ~]# blkid -p /dev/sdb1; echo rc=$?
+rc=2
+-- blkid -p 도 아무것도 찾지 못했다(rc=2).
+-- 빈 디스크와 같은 반응이다
+-- lsblk -f 나 /dev/disk/by-uuid 에서도 이 볼륨이 사라진다
+-- fstab 에 UUID 로 등록된 볼륨이었다면 부팅 때 장치를 찾지 못한다(실습 04 [4])
+[root@ol7a ~]# e2fsck -n /dev/sdb1 >/tmp/e2.out 2>&1; echo rc=$?; head -4 /tmp/e2.out
+rc=4
+e2fsck 1.45.4 (23-Sep-2019)
+ext2fs_open2: Bad magic number in super-block
+e2fsck: Superblock invalid, trying backup blocks...
+chk was not cleanly unmounted, check forced.
+-- -n 이라 rc=4.
+-- 결과는 /tmp/e2.out 에서 앞 4줄만 봤다
+-- e2fsck 는 주 슈퍼블록이 깨진 것을 알고 스스로 사본으로 열었다
+--   Bad magic number in super-block
+--   Superblock invalid, trying backup blocks...
+-- 사본은 마지막 정상 상태라 not cleanly unmounted 로 강제 검사했다
+
+--------------------------------------------------------------------------------
+ [8] 사본 슈퍼블록으로 복구
+--------------------------------------------------------------------------------
+-- -b 로 사본 슈퍼블록을 지정해 복구한다. 4KiB 블록 파일 시스템의 첫 사본은 32768.
+[root@ol7a ~]# e2fsck -fy -b 32768 /dev/sdb1 >/tmp/e2b.out 2>&1; echo rc=$?; sed -n '1,6p;$p' /tmp/e2b.out; grep -c 'Fix? yes' /tmp/e2b.out
+rc=1
+e2fsck 1.45.4 (23-Sep-2019)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+chk: 15/131072 files (0.0% non-contiguous), 25392/524288 blocks
+8
+-- -b 32768 로 사본을 지정해 고쳤다.
+-- rc=1(고침)
+-- 출력은 파일에 받아 앞 6줄과 끝줄만 봤다
+-- Fix? yes 가 8번.
+-- 사본에 담긴 옛 카운트를 실제 값으로 맞춘 것이다
+-- 15/131072 files: lost+found 정리 뒤의 파일 수가 그대로다
+[root@ol7a ~]# blkid /dev/sdb1; mount /dev/sdb1 /mnt/chk; ls /mnt/chk/proj; umount /mnt/chk
+/dev/sdb1: LABEL="chk" UUID="e9373adf-fb00-4f3f-973d-8efaedf76e78" TYPE="ext4" 
+a.txt
+b.txt
+c.txt
+-- blkid 에 LABEL="chk" TYPE="ext4" 가 돌아왔고 proj 의 파일이 그대로다
+-- 사본 위치를 잊었을 때는 mke2fs -n 으로 "만든다면 어디에 둘지" 를 계산하게 한다.
+-- -n 은 실제로 쓰지 않는다. 처음 만들 때와 같은 옵션이어야 맞는 위치가 나온다.
+[root@ol7a ~]# mke2fs -n /dev/sdb1 | tail -4
+mke2fs 1.45.4 (23-Sep-2019)
+Filesystem UUID: 07b7905b-1967-4efd-b15d-1a3323dc41e7
+Superblock backups stored on blocks: 
+        32768, 98304, 163840, 229376, 294912
+-- -n 이라 아무것도 쓰지 않고 위치만 계산했다
+-- 32768, 98304 … 가 실제 사본 위치와 같다
+-- 처음과 같은 옵션(기본값)으로 만들었기 때문이다
+-- -n 을 빠뜨리면 파일 시스템을 새로 만든다
+
+--------------------------------------------------------------------------------
+ [9] 마운트 횟수와 부팅 시 검사
+--------------------------------------------------------------------------------
+-- 부팅 때 systemd-fsck 가 검사하는 대상은 fstab 여섯째 필드가 0 이 아닌 줄이다.
+[root@ol7a ~]# awk '$1 !~ /^#/ && NF==6 {print $2, $6}' /etc/fstab
+/ 0
+/boot 0
+swap 0
+-- 마운트 지점·여섯째 필드. 셋 다 0 이다
+-- 0 은 부팅 때 검사하지 않는다는 뜻
+-- 루트·/boot 는 xfs,
+-- 스왑은 검사 대상이 아니다
+-- 루트·/boot 가 xfs 라 6번째 필드가 0 이다. xfs 는 부팅 때 검사하지 않는다.
+[root@ol7a ~]# dumpe2fs -h /dev/sdb1 2>/dev/null | grep -iE 'mount count|last checked|check interval'
+Mount count:              1
+Maximum mount count:      -1
+Last checked:             Mon Nov 16 09:36:14 2026
+Check interval:           0 (<none>)
+-- 주기 검사 꺼짐(-1, 0).
+-- Mount count 는 [8] 의 마운트로 1
+-- Last checked 는 [8] 의 e2fsck 시각이다.
+-- 강제 검사(-f)도 이 값을 갱신한다
+-- 데이터 볼륨을 fstab 에 0 2 로 등록하면 systemd-fsck@ 가 마운트 전에 e2fsck -a 상당을 돈다
+-- 부팅 때 검사가 실제로 도는 것은 not clean 일 때뿐이다
+
+--------------------------------------------------------------------------------
+ [변형] 같은 손상 검사를 XFS 에서
+--------------------------------------------------------------------------------
+-- fsck 가 XFS 에서 무엇을 하는지 본다(XFS 복구는 11장 xfs_repair).
+[root@ol7a ~]# mkfs.xfs -q -f /dev/sdb1; fsck /dev/sdb1; echo rc=$?
+fsck from util-linux 2.23.2
+If you wish to check the consistency of an XFS filesystem or
+repair a damaged filesystem, see xfs_repair(8).
+rc=0
+-- xfs 에 fsck 를 걸면 fsck.xfs 가 안내 두 줄만 찍고 rc=0
+-- 부팅 때 xfs 검사가 아무 일도 하지 않는 이유다
+[root@ol7a ~]# fsck.xfs -f /dev/sdb1 2>&1 | tail -3; echo rc=${PIPESTATUS[0]}
+        - moving disconnected inodes to lost+found ...
+Phase 7 - verify and correct link counts...
+done
+rc=0
+-- 2>&1 로 표준 오류까지 파이프에 넣어 tail -3 으로 끝 세 줄만 봤다
+-- xfs_repair 의 진행 메시지는 표준 오류로 나온다.
+-- 2>&1 이 없으면 tail 이 걸러내지 못한다
+-- 끝 줄 done 과 Phase 7 은 고치는 모드(-n 없음)로 끝까지 돌았다는 표시
+-- 7.9 의 fsck.xfs 는 -f 를 주면 xfs_repair 를 실제로 돌린다
+-- xfs_repair 일곱 단계
+--   Phase 1 슈퍼블록 확인
+--   Phase 2 로그(저널) 확인·비우기, 여유 공간·inode 맵
+--   Phase 3 AG(할당 그룹)마다 inode 조사
+--   Phase 4 중복 블록 확인
+--   Phase 5 AG 헤더·트리 다시 만들기
+--   Phase 6 디렉터리 연결, 끊긴 inode 는 lost+found
+--   Phase 7 링크 수 확인·수정
+-- 2GiB xfs 는 AG 4개로 나뉜다.
+-- Phase 3·4 의 agno 줄이 AG 번호다(tail 로 잘림)
+-- AG 는 병렬로 처리돼 agno 순서가 섞여 찍히기도 한다
+-- Phase 5·6 에서 헤더와 연결을 다시 만든다(고치는 모드)
+-- rc=0 은 PIPESTATUS[0],
+-- 즉 fsck.xfs 의 종료 코드
+[root@ol7a ~]# grep -nE 'FORCE|xfs_repair|AUTO' /sbin/fsck.xfs | head -10
+13:     1)  echo "$NAME error: xfs_repair could not fix the filesystem." 1>&2
+18:                  "xfs_repair manual page." 1>&2
+24:             echo "$NAME error: xfs_repair was not found!" 1>&2
+27:     *)  echo "$NAME error: An unknown return code from xfs_repair '$1'" 1>&2
+28:             return 4 # something went wrong with xfs_repair
+32:AUTO=false
+33:FORCE=false
+37:     a|A|p|y)        AUTO=true;;
+38:     f)              FORCE=true;;
+51:# Invoking xfs_repair via fsck.xfs is only intended to happen via initscripts.
+-- grep 으로 뽑은 줄들
+--   13~28행: xfs_repair 종료 코드를 fsck 종료 코드로 바꾸는 부분
+--   32·33행: AUTO·FORCE 기본값 false
+--   37행: a·A·p·y 옵션(부팅 때 fsck 가 주는 것)은 AUTO
+-- 스크립트 안에서 f 옵션이 FORCE=true 가 된다(38행)
+-- FORCE 이고 부팅 중이 아니면 xfs_repair 를 부르는 구조다
+-- 51행 주석: 원래 initscripts(부팅)에서 쓰라는 경로다
+-- 수동 검사는 fsck.xfs 대신 xfs_repair 를 직접 쓴다(11장)
+[root@ol7a ~]# xfs_repair -n /dev/sdb1 2>&1 | grep -E '^Phase|No modify'; echo rc=${PIPESTATUS[0]}
+Phase 1 - find and verify superblock...
+Phase 2 - using internal log
+Phase 3 - for each AG...
+Phase 4 - check for duplicate blocks...
+No modify flag set, skipping phase 5
+Phase 6 - check inode connectivity...
+Phase 7 - verify link counts...
+No modify flag set, skipping filesystem flush and exiting.
+rc=0
+-- -n(no modify): 고치지 않고 검사만.
+-- skipping phase 5 가 그 표시
+-- grep 이 Phase 머리 줄과 No modify 줄만 남겼다.
+-- Phase 5 가 빠지고 No modify 줄이 그 자리를 알린다
+-- 여기서도 2>&1 을 줘서 표준 오류 출력까지 grep 이 걸렀다
+-- 문제가 없어 rc=0. 문제가 있으면 1
+
+--------------------------------------------------------------------------------
+ [10] 되돌리기
+--------------------------------------------------------------------------------
+[root@ol7a ~]# rmdir /mnt/chk; wipefs -a /dev/sdb1 >/dev/null; udevadm settle; wipefs -a /dev/sdb
+/dev/sdb: 2 bytes were erased at offset 0x000001fe (dos): 55 aa
+/dev/sdb: calling ioclt to re-read partition table: Success
+[root@ol7a ~]# lsblk -f /dev/sdb; findmnt /mnt/chk; echo rc=$?
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+rc=1
+-- sdb 가 비었고 /mnt/chk 도 없다.
+-- [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목             시작 전   변경 후                       되돌린 뒤
+--  마운트 중 -y     -         rc=8 Cannot continue          -
+--  마운트 중 -n     -         clean 11 files(실제 15)       -
+--  inode 12 clri    -         -n rc=4 → -y rc=1 → -n rc=0   -
+--  lost+found       비었음    #13 #14 #15 → 이름 복원       -
+--  주 슈퍼블록      정상      0 으로 덮음 → -b 32768 rc=1   -
+--  xfs 의 fsck      -         안내만 rc=0, -f 는 repair     -
+--  sdb              빈 디스크  ext4/xfs                     빈 디스크
+--
+-- 확인한 사실
+--   fsck 는 언마운트한 뒤 -n 으로 보고 -y 로 고친다
+--   이름 잃은 inode 는 lost+found 에 #번호로 붙는다
+--   주 슈퍼블록이 깨지면 사본(-b)으로 연다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. debugfs 로 파일 하나의 inode 만 clri 한다
+--    확인: e2fsck -fn 이 어느 Pass 에서 무엇을 말하는가
+-- 2. tune2fs -c 1 로 바꾸고 fstab 에 0 2 로 등록해 재부팅한다
+--    확인: journalctl -b | grep fsck 에 검사 기록이 남는가
+-- 3. 1KiB 블록(mkfs.ext4 -b 1024)으로 만들고 첫 사본 위치를 본다
+--    확인: dumpe2fs 의 Backup superblock 이 8193 인가
+-- 되돌린 뒤 확인: lsblk -f /dev/sdb 비어 있음,
+-- findmnt /mnt/chk rc=1
+================================================================================
+ 실습 05 종료 — 마운트 상태 fsck 거부, inode 손상과 lost+found, 사본 슈퍼블록 복구
+================================================================================

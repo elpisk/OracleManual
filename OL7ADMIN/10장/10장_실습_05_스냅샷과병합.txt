@@ -1,0 +1,450 @@
+================================================================================
+ 제10장 실습 05 — 스냅샷과 병합: COW 스냅샷으로 시점 보존하고 되돌리기
+ 대상   : ol7a
+ 목표   : 기존 방식(COW) 스냅샷을 만들고 원본을 바꿀 때 스냅샷 사용률(Data%)이
+          오르는 것을 본다. XFS 스냅샷을 원본과 함께 마운트하는 방법,
+          스냅샷 크기가 모자라 무효화되는 상황, lvconvert --merge 로 원본을
+          스냅샷 시점으로 되돌리는 절차를 확인한다
+ 배경   : COW 스냅샷은 만들 때 데이터를 복사하지 않는다. 원본의 블록이 처음
+          바뀌는 순간 옛 블록을 스냅샷 영역으로 옮겨 둔다. 그래서 스냅샷 크기는
+          "그 사이 바뀔 양"만큼만 있으면 되지만, 그 양을 넘으면 스냅샷 전체가
+          쓸모없어진다. 병합은 스냅샷이 보관한 옛 블록을 원본에 되써서
+          시점을 되돌린다 (본문 10.5)
+ 소요   : 약 30분
+ 선행   : storage-clean 스냅샷
+ 계정   : root
+ 주의   : sdb·sdc 의 내용을 지운다
+ 되돌림 : 스냅샷·LV·VG·PV 삭제. 확인은 pvs·lsblk
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- VG 목록과 쓸 디스크 두 개의 상태를 남긴다. [9] 에서 같은 명령으로 비교한다
+[root@ol7a ~]# vgs; lsblk -o NAME,SIZE,TYPE /dev/sdb /dev/sdc
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+NAME SIZE TYPE
+sdb   10G disk
+sdc   10G disk
+-- VG 는 ol 하나, sdb·sdc 는 아래에 아무것도 없다
+
+-- 스냅샷 자동 확장 설정 기본값을 먼저 본다.
+[root@ol7a ~]# lvmconfig --type default activation/snapshot_autoextend_threshold activation/snapshot_autoextend_percent
+snapshot_autoextend_threshold=100
+snapshot_autoextend_percent=20
+-- --type default : lvm.conf 에 적힌 값이 아니라 lvm2 의 기본값을 보여 준다
+-- 두 값의 뜻
+--   snapshot_autoextend_threshold=100 : 사용률이 이 값을 넘으면 늘린다. 100 은 "끔"
+--   snapshot_autoextend_percent=20    : 한 번에 늘리는 비율
+-- 기본 상태에서는 스냅샷이 차도 아무도 늘려 주지 않는다. [5] 가 그 결과다
+
+--------------------------------------------------------------------------------
+ [1] 원본 LV 준비 — XFS 2G
+--------------------------------------------------------------------------------
+
+-- 원본 2G 와 스냅샷 몇 개가 들어갈 VG 를 만든다
+[root@ol7a ~]# vgcreate vgdata /dev/sdb /dev/sdc
+  Physical volume "/dev/sdb" successfully created.
+  Physical volume "/dev/sdc" successfully created.
+  Volume group "vgdata" successfully created
+-- sdb·sdc 를 묶은 약 20G VG. 원본 2G 에 비해 넉넉하다
+
+-- 원본 LV 는 VG 의 일부만 쓴다.
+-- 스냅샷의 COW 영역도 같은 VG 에서 PE 를 받기 때문이다
+-- VG 에 빈 공간이 없으면 스냅샷을 만들 수 없다
+[root@ol7a ~]# lvcreate -L 2G -n lvorig vgdata; mkfs.xfs -q /dev/vgdata/lvorig
+  Logical volume "lvorig" created.
+
+-- mkfs.xfs -q 는 출력이 없다. 원본은 XFS 2G
+-- /data 는 원본, /snap 은 스냅샷을 올릴 자리
+[root@ol7a ~]# mkdir -p /data /snap; mount /dev/vgdata/lvorig /data
+
+-- 비교에 쓸 내용을 넣는다. app.conf 의 version 번호로 시점을 구분한다
+-- cp -a : 권한·소유자·시각을 그대로 복사
+[root@ol7a ~]# cp -a /etc/sysconfig /data/; echo "version 1" > /data/app.conf; ls /data
+-- 원본에 파일 하나와 디렉터리 하나. 스냅샷은 이 상태를 기억해야 한다
+app.conf
+sysconfig
+
+--------------------------------------------------------------------------------
+ [2] 스냅샷 만들기
+--------------------------------------------------------------------------------
+
+-- -s (--snapshot) : 스냅샷을 만든다. 원본은 VG/LV 로 준다
+-- -L 500M : 스냅샷이 옛 블록을 보관할 공간(COW 영역) 크기
+[root@ol7a ~]# lvcreate -s -L 500M -n snap1 vgdata/lvorig
+  Logical volume "snap1" created.
+-- 스냅샷 크기 정하는 기준
+--   보관 기간 동안 원본에서 "처음 바뀌는" 블록의 총량
+--   원본 크기와는 무관하다. 1T 원본도 하루 변경이 5G 면 5G 남짓이면 된다
+--   변경량을 모르면 원본의 20~30% 에서 시작해 Data% 를 지켜본다
+-- 만드는 데 1초도 걸리지 않는다. 데이터를 복사하지 않기 때문이다
+
+-- lvs 의 Origin 열과 Data% 열이 채워진다.
+-- COW 동작 원리
+--   만들 때 : 아무것도 복사하지 않는다. 빈 COW 영역과 매핑 표만 생긴다
+--   원본 쓰기 : 바뀔 블록의 옛 내용을 COW 영역에 먼저 복사하고 원본에 쓴다
+--   스냅샷 읽기 : COW 영역에 옛 블록이 있으면 그것을, 없으면 원본 블록을 읽는다
+-- 원본 쓰기 한 번이 "읽기 + 복사 쓰기 + 원래 쓰기" 로 늘어난다.
+-- 스냅샷이 있는 동안 원본이 느려진다
+[root@ol7a ~]# lvs vgdata
+  LV     VG     Attr       LSize   Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  lvorig vgdata owi-aos---   2.00g                                                    
+-- lvorig LSize 2.00g 는 그대로, Pool·Data% 칸은 빈칸이다.
+-- 사용률은 스냅샷 쪽에만 나온다
+  snap1  vgdata swi-a-s--- 500.00m      lvorig 0.00                                   
+-- Attr 첫 글자로 역할이 갈린다
+--   lvorig o : 스냅샷의 원본(origin). 6번째 o 는 마운트되어 열림
+--   snap1  s : 스냅샷. 7번째 s 는 대상 종류가 snapshot 이라는 표시
+-- snap1 의 LSize 500.00m 는 COW 영역 크기다.
+-- 원본 크기(2G)가 아니다
+-- Origin 열 lvorig, Data% 0.00 → 아직 옮겨 둔 블록이 없다
+
+-- 매퍼 장치가 넷 생긴다. 원본, 원본의 실체(-real), 스냅샷, 스냅샷의 COW 영역(-cow).
+-- 장치 매퍼 쪽에서 무엇이 생겼는지 본다
+[root@ol7a ~]# dmsetup ls | grep vgdata
+vgdata-snap1    (252:5)
+vgdata-snap1-cow        (252:4)
+vgdata-lvorig   (252:2)
+vgdata-lvorig-real      (252:3)
+
+-- 원래 dm-2 하나였던 lvorig 이 네 장치로 바뀌었다
+--   vgdata-lvorig-real : 실제 데이터를 든 장치(옛 lvorig 의 linear 표)
+--   vgdata-lvorig      : snapshot-origin 대상. 쓰기를 가로채 COW 를 일으킨다
+--   vgdata-snap1-cow   : 옛 블록을 보관하는 500M 영역
+--   vgdata-snap1       : -real 과 -cow 를 합쳐 "그때의 모습" 을 보여 준다
+-- 마운트 중인 /data 는 같은 252:2 를 쓰고 있어 끊김이 없다
+-- 같은 관계를 트리로 본다. lvorig 과 COW 영역은 모두 sdb 에 놓였다
+[root@ol7a ~]# lsblk /dev/sdb
+NAME                 MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+sdb                    8:16   0   10G  0 disk 
+├─vgdata-snap1-cow   252:4    0  500M  0 lvm  
+│ └─vgdata-snap1     252:5    0    2G  0 lvm  
+└─vgdata-lvorig-real 252:3    0    2G  0 lvm  
+  ├─vgdata-lvorig    252:2    0    2G  0 lvm  /data
+  └─vgdata-snap1     252:5    0    2G  0 lvm  
+-- 트리가 위 관계를 그대로 그린다
+--   snap1 은 -cow 와 -real 두 곳 아래에 매달려 있다(두 장치를 읽는다)
+--   snap1 의 SIZE 는 2G. 크기는 원본과 같게 보인다
+-- -cow 의 실제 크기는 500M 뿐이다
+
+--------------------------------------------------------------------------------
+ [3] XFS 스냅샷 마운트 — UUID 가 같다
+--------------------------------------------------------------------------------
+
+-- 원본이 /data 에 마운트된 채로 스냅샷을 그냥 마운트해 본다
+[root@ol7a ~]# mount /dev/vgdata/snap1 /snap
+mount: wrong fs type, bad option, bad superblock on /dev/mapper/vgdata-snap1,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+
+-- 증상   : mount /dev/vgdata/snap1 /snap 이 "wrong fs type, bad option, bad superblock" 으로 실패
+-- mount 의 안내대로 커널 메시지를 본다
+[root@ol7a ~]# dmesg | tail -2
+[   12.089293] xfs filesystem being mounted at /data supports timestamps until (%ptR?) (0x7fffffff)
+[   12.497781] XFS (dm-5): Filesystem has duplicate UUID 6b49fdca-96fa-40a6-891c-ece6f40ace73 - can't mount
+
+-- 원인   : dm-5(snap1) 의 XFS UUID 가 이미 마운트된 원본과 같다
+--          XFS 는 같은 UUID 두 개의 동시 마운트를 막는다(로그 복구 혼동 방지)
+-- 앞 줄은 /data 를 마운트할 때의 기록이다
+-- 두 장치의 파일 시스템 UUID 를 나란히 본다
+[root@ol7a ~]# blkid /dev/vgdata/lvorig /dev/vgdata/snap1
+/dev/vgdata/lvorig: UUID="6b49fdca-96fa-40a6-891c-ece6f40ace73" TYPE="xfs" 
+/dev/vgdata/snap1: UUID="6b49fdca-96fa-40a6-891c-ece6f40ace73" TYPE="xfs" 
+-- 블록 단위로 같은 내용이니 슈퍼블록의 UUID 도 같다
+-- fstab 에 UUID= 로 원본을 적어 둔 서버라면 스냅샷이 있는 동안 어느 쪽이 잡힐지 모호해진다
+
+-- -o nouuid : XFS 가 같은 UUID 를 가진 파일 시스템이 이미 마운트돼 있어도 마운트를 허용
+-- -o ro    : 읽기 전용. 스냅샷을 시점 보관용으로만 쓸 때
+[root@ol7a ~]# mount -o ro,nouuid /dev/vgdata/snap1 /snap
+
+-- 조치   : -o ro,nouuid 로 마운트. 출력이 없으면 성공
+-- 두 파일 시스템이 동시에 마운트되었는지 본다
+[root@ol7a ~]# df -hT /data /snap
+Filesystem                Type  Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvorig xfs   2.0G   33M  2.0G   2% /data
+/dev/mapper/vgdata-snap1  xfs   2.0G  652K  2.0G   1% /snap
+-- 이제부터 /data 와 /snap 은 같은 내용에서 출발해 갈라진다
+-- 재확인 : /snap 이 2.0G 로 마운트됨
+-- Used 가 33M 와 652K 로 다르다.
+-- 읽기 전용 마운트라 로그 영역을 쓰지 않아 다르게 셈한다
+-- Ext4 에는 같은 UUID 를 막는 규칙이 없다([더 해 보기] 2)
+
+--------------------------------------------------------------------------------
+ [4] 원본을 바꾸면 스냅샷이 찬다
+--------------------------------------------------------------------------------
+
+-- 원본만 바꾼다. 파일 하나 수정, 200M 새 파일. sync 로 디스크까지 내려보낸다
+[root@ol7a ~]# echo "version 2" > /data/app.conf; dd if=/dev/urandom of=/data/big bs=1M count=200 status=none; sync
+[root@ol7a ~]# lvs vgdata
+  LV     VG     Attr       LSize   Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  lvorig vgdata owi-aos---   2.00g                                                    
+  snap1  vgdata swi-aos--- 500.00m      lvorig 40.56                                  
+
+-- Data% 0.00 → 40.56. 500M × 40.56% ≈ 203M
+-- 200M 를 새로 썼을 뿐인데 스냅샷이 찼다. 새 파일이 차지한 블록도
+-- "그 자리에 원래 있던 것(빈 블록)" 을 먼저 COW 영역으로 옮겼기 때문이다
+-- 바뀐 양이 곧 스냅샷 사용량이다. 원본에 무엇이 쓰이든 마찬가지다
+-- snap1 Attr 6번째가 o → /snap 에 마운트되어 열림
+-- 원본과 스냅샷의 내용을 비교한다
+[root@ol7a ~]# cat /data/app.conf /snap/app.conf; ls /data /snap
+version 2
+version 1
+-- app.conf: 원본은 version 2, 스냅샷은 version 1
+/data:
+app.conf
+big
+sysconfig
+
+/snap:
+app.conf
+sysconfig
+-- /data 는 version 2 와 big,
+-- /snap 은 version 1 이고 big 이 없다
+-- 스냅샷은 만든 순간의 모습을 유지한다
+
+-- 읽기만 하는 것은 스냅샷을 채우지 않는다.
+-- 원본을 읽기만 하면 사용률이 오르는지 본다
+[root@ol7a ~]# cat /data/big > /dev/null; lvs -o lv_name,data_percent vgdata/snap1
+  LV    Data% 
+  snap1 40.56 
+-- 스냅샷이 있는 동안의 원본 쓰기 비용
+--   처음 바뀌는 블록마다 옛 블록 복사가 한 번 더 일어난다
+--   스냅샷이 둘이면 각각의 COW 영역에 복사한다. 스냅샷 수만큼 느려진다
+--   그래서 COW 스냅샷은 "잠깐 쓰고 지우는" 용도다
+-- 원본 200M 를 끝까지 읽었는데 Data% 그대로. 읽기는 COW 를 일으키지 않는다
+-- 같은 블록을 두 번째로 바꿀 때도 다시 옮기지 않는다. 처음 한 번만 옮긴다
+
+--------------------------------------------------------------------------------
+ [5] 스냅샷 크기가 모자라면
+--------------------------------------------------------------------------------
+
+-- snap1 은 마운트를 내리고 지운다. 100M 짜리 snap2 를 새로 만든 뒤 원본에 300M 를 쓴다.
+-- 스냅샷은 마운트를 내려야 지울 수 있다
+[root@ol7a ~]# umount /snap; lvremove -y vgdata/snap1
+  Logical volume "snap1" successfully removed
+[root@ol7a ~]# lvcreate -s -L 100M -n snap2 vgdata/lvorig
+  Logical volume "snap2" created.
+
+-- 100M 짜리. 원본에 300M 를 쓰면 모자란다는 것을 알고 만든 크기다
+-- 원본에 300M 를 쓴다. COW 영역 100M 를 넘는 양이다
+[root@ol7a ~]# dd if=/dev/urandom of=/data/big2 bs=1M count=300 status=none; sync
+[root@ol7a ~]# lvs vgdata
+  LV     VG     Attr       LSize   Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  lvorig vgdata owi-aos---   2.00g                                                    
+  snap2  vgdata swi-I-s--- 100.00m      lvorig 100.00                                 
+
+-- 증상   : snap2 의 Data% 100.00, Attr 다섯째 글자 I(Invalid)
+-- Attr 가 a(활성) 대신 I 로 바뀌었다.
+-- 활성 상태 글자 자리에 "무효" 가 들어간다
+-- 원본 lvorig 은 owi-aos--- 그대로. 원본 쓰기는 끝까지 성공했다
+-- 무효화 시점의 커널 메시지를 찾는다
+[root@ol7a ~]# dmesg | grep -i snapshot | tail -3
+[   16.635804] device-mapper: snapshots: Invalidating snapshot: Unable to allocate exception.
+
+-- 원인   : COW 영역에 옛 블록을 옮길 자리(exception)가 없어 커널이 스냅샷을 무효화
+-- 일부만 남지 않는다. 통째로 버려진다
+-- 무효가 된 스냅샷을 마운트해 본다
+[root@ol7a ~]# mount -o ro,nouuid /dev/vgdata/snap2 /snap
+mount: /dev/mapper/vgdata-snap2: can't read superblock
+-- 무효 스냅샷이 남아 있으면 lvs 를 칠 때마다 경고처럼 보이고 COW 영역 100M 도 묶여 있다
+-- 무효 스냅샷은 슈퍼블록조차 읽을 수 없다. 남은 보관 블록이 있어도 쓸 수 없다
+
+-- 무효화된 스냅샷은 지우는 것 말고는 할 일이 없다.
+[root@ol7a ~]# lvremove -y vgdata/snap2
+  Logical volume "snap2" successfully removed
+-- 무효 스냅샷을 지우면 COW 영역 100M 가 VG 로 돌아간다
+
+-- 조치   : 지우고, 바뀔 양보다 크게 다시 만든다. 운영에서는 자동 확장을 켠다
+--          (snapshot_autoextend_threshold 를 100 미만으로)
+-- 재확인 : 다음 [6] 에서 1G 스냅샷으로 Data% 가 여유 있게 유지되는 것을 본다
+-- 실험용 큰 파일을 지운다. 원본 쪽 정리일 뿐 스냅샷과 무관하다
+[root@ol7a ~]# rm -f /data/big /data/big2; sync
+
+--------------------------------------------------------------------------------
+ [6] 병합으로 되돌리기 — 원본이 마운트된 채로
+--------------------------------------------------------------------------------
+
+-- 작업(패치·설정 변경) 전에 스냅샷을 뜬다는 시나리오.
+-- big·big2 를 지운 뒤 기준 상태를 version 3 으로 정한다
+[root@ol7a ~]# echo "version 3" > /data/app.conf; sync
+
+-- 패치·설정 변경 직전에 뜨는 스냅샷이다
+[root@ol7a ~]# lvcreate -s -L 1G -n before_patch vgdata/lvorig
+  Logical volume "before_patch" created.
+-- 원본은 이 순간 version 3, sysconfig 디렉터리가 있는 상태다
+-- 이름에 목적을 담는다. 1G 는 원본의 절반. 작업 중 바뀔 양을 넉넉히 잡은 크기다
+
+-- 작업이 잘못됐다. 설정 디렉터리를 지우고 파일 내용도 바꿨다.
+-- 작업을 망친 상황을 만든다. 디렉터리를 지우고 설정 파일을 덮어쓴다
+[root@ol7a ~]# rm -rf /data/sysconfig; echo "broken" > /data/app.conf; sync; ls /data; lvs vgdata
+-- 병합이 예약된 동안에도 원본에 쓰는 내용은 받아들인다. 그러나 다음 활성화 때
+-- 스냅샷 시점으로 되돌려지므로 그 사이 쓴 내용은 사라진다
+-- 예약을 걸어 놓고 업무를 계속하면 안 되는 이유다
+app.conf
+  LV           VG     Attr       LSize Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  before_patch vgdata swi-a-s--- 1.00g      lvorig 0.01                                   
+  lvorig       vgdata owi-aos--- 2.00g                                                    
+-- 디렉터리를 지우고 파일 하나를 바꿨지만 Data% 0.01 뿐이다
+-- 지운 것은 메타데이터 몇 블록만 바꾼다. 데이터 블록 자체는 그대로 남는다
+-- 그래서 rm -rf 같은 사고에도 COW 스냅샷은 작게 버틴다
+
+-- --merge : 스냅샷을 원본에 합쳐 원본을 스냅샷 시점으로 돌린다. 끝나면 스냅샷은 사라진다.
+[root@ol7a ~]# lvconvert --merge vgdata/before_patch
+  Delaying merge since origin is open.
+  Merging of snapshot vgdata/before_patch will occur on next activation of vgdata/lvorig.
+
+-- 첫 줄 "Delaying merge since origin is open." → 원본이 마운트되어 열려 있다
+-- 둘째 줄 → 병합은 lvorig 이 다음에 활성화될 때 일어난다
+-- 오류가 아니다. 병합 예약이 걸렸다. 열린 파일 시스템 밑에서 블록을 바꿀 수 없어서다
+-- 병합 예약 상태를 숨은 LV 까지 포함해 본다
+[root@ol7a ~]# lvs -a vgdata
+  LV             VG     Attr       LSize Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  [before_patch] vgdata Swi-a-s--- 1.00g      lvorig 0.01                                   
+  lvorig         vgdata Owi-aos--- 2.00g                                                    
+
+-- lvs -a : 숨은 LV 까지 보인다
+-- before_patch 가 [ ] 로 숨겨졌고 Attr 첫 글자가 대문자 S
+-- lvorig 의 첫 글자도 대문자 O. 대문자는 "병합 중인" 스냅샷·원본이다
+-- 원본 내용이 돌아왔는지 본다
+[root@ol7a ~]# cat /data/app.conf
+broken
+-- 증상   : --merge 를 쳤는데 /data/app.conf 는 여전히 broken
+-- 원인   : 원본이 열려 있어 병합이 다음 활성화로 미뤄졌다
+
+--------------------------------------------------------------------------------
+ [7] 병합 마무리 — 원본을 다시 활성화
+--------------------------------------------------------------------------------
+
+-- 원본을 닫아야(마운트 해제) 병합이 시작된다. 비활성화 → 활성화로 계기를 준다.
+[root@ol7a ~]# umount /data
+
+-- 원본을 닫는다. 원본이 열려 있는 한 병합은 시작되지 않는다
+[root@ol7a ~]# lvchange -an vgdata/lvorig; lvchange -ay vgdata/lvorig
+
+-- 조치   : umount → lvchange -an → -ay. 활성화하는 순간 병합이 시작된다
+-- 루트 LV 처럼 마운트를 내릴 수 없는 원본은 재부팅이 이 계기가 된다
+-- 재활성화 뒤 스냅샷이 남았는지 본다
+[root@ol7a ~]# lvs -a vgdata
+  LV     VG     Attr       LSize Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  lvorig vgdata -wi-a----- 2.00g                                                    
+-- 원본 Attr 첫 글자가 o(스냅샷이 있는 원본) 에서 -(일반) 으로 돌아왔다
+-- 6번째 '-' 는 아직 마운트 전이라는 뜻
+-- 7번째 '-' 는 대상이 이제 snapshot-origin 이 아니라 linear 라는 뜻
+
+-- before_patch 가 사라지고 lvorig 은 일반 LV(-wi-a-----)로 돌아왔다
+-- 2G 원본에서 바뀐 블록만 되쓰는 것이라 금방 끝났다
+-- 다시 마운트해 내용을 확인한다
+[root@ol7a ~]# mount /dev/vgdata/lvorig /data; cat /data/app.conf; ls /data
+version 3
+app.conf
+sysconfig
+-- 재확인 : app.conf 가 version 3, 지웠던 sysconfig 도 돌아왔다
+-- 병합은 스냅샷을 소모한다. 다시 되돌릴 시점이 필요하면 새로 뜬다
+
+--------------------------------------------------------------------------------
+ [변형] 마운트 해제 상태에서 병합 — 바로 시작된다
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# lvcreate -s -L 500M -n snap3 vgdata/lvorig
+  Logical volume "snap3" created.
+
+-- [변형] 은 원본을 먼저 닫아 두고 병합하는 경우다
+-- 원본을 바꾼 뒤 이번에는 병합 전에 마운트를 먼저 내린다
+[root@ol7a ~]# echo "version 4" > /data/app.conf; sync; umount /data
+[root@ol7a ~]# lvconvert --merge -i 1 vgdata/snap3
+  Merging of volume vgdata/snap3 started.
+-- 병합은 백그라운드로 진행된다. 진행 중에도 원본을 활성화·마운트해 쓸 수 있다
+-- 읽기는 병합이 끝난 블록이든 아니든 스냅샷 시점의 내용을 돌려준다
+  vgdata/lvorig: Merged: 100.00%
+
+-- 이번에는 Delaying 없이 "Merging ... started" 가 바로 나왔다
+-- -i 1 : 1초마다 진행률. 바뀐 양이 작아 첫 보고가 100.00%
+[root@ol7a ~]# lvs -a vgdata
+  LV     VG     Attr       LSize Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  lvorig vgdata -wi-a----- 2.00g                                                    
+
+-- snap3 이 사라지고 lvorig 만 남았다
+-- 되돌아온 내용을 확인한다
+[root@ol7a ~]# mount /dev/vgdata/lvorig /data; cat /data/app.conf
+version 3
+-- version 4 로 바꾼 것이 version 3 으로 돌아왔다
+-- 원본이 닫혀 있으면 lvconvert 한 번으로 끝난다.
+-- 계획된 작업에서는 이쪽이 깔끔하다
+
+--------------------------------------------------------------------------------
+ [8] 되돌림
+--------------------------------------------------------------------------------
+
+-- 마운트를 내리고 두 마운트 지점을 지운다
+[root@ol7a ~]# umount /data; rmdir /data /snap
+[root@ol7a ~]# vgremove -y vgdata
+  Logical volume "lvorig" successfully removed
+-- vgremove -y 는 VG 안의 LV 를 먼저 지운다
+  Volume group "vgdata" successfully removed
+
+-- 남은 lvorig 을 지우며 VG 를 지웠다
+[root@ol7a ~]# pvremove /dev/sdb /dev/sdc
+  Labels on physical volume "/dev/sdb" successfully wiped.
+  Labels on physical volume "/dev/sdc" successfully wiped.
+-- 두 디스크의 LVM2 레이블까지 지워 [0] 의 상태로 돌아간다
+
+--------------------------------------------------------------------------------
+ [9] 시작 전과 비교
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# vgs; lsblk -o NAME,SIZE,TYPE /dev/sdb /dev/sdc
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+NAME SIZE TYPE
+sdb   10G disk
+sdc   10G disk
+
+-- [0] 과 같다
+-- -c : 일치하는 줄 수만 센다. 장치 매퍼에 찌꺼기가 남았는지 본다
+[root@ol7a ~]# dmsetup ls | grep -c vgdata
+0
+-- 매퍼 장치 가운데 vgdata 가 들어간 이름이 0 개.
+-- [0] 과 비교해 VG·디스크·매퍼 장치 모두 처음 상태다
+-- -real·-cow 가 남지 않았다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                 시작 전     작업 중                                 되돌린 뒤
+--  vgdata 매퍼 장치     -           lvorig 하나 → 넷(-real, -cow, snap1)    0
+--  snap1 Data% (500M)   -           0.00 → 40.56 (200M 쓰기 뒤, 읽기로 그대로) -
+--  snap2 (100M)         -           100.00, Attr swi-I-s---               -
+--  병합 (원본 열림)     -           Delaying merge → 재활성화 뒤 완료      -
+--  병합 (원본 닫힘)     -           즉시 Merged: 100.00%                    -
+--  app.conf             -           1 → 2 → 3 → broken → 3 → 4 → 3          -
+-- 오류 두 가지(+1)
+--   스냅샷 마운트 거부 : duplicate UUID → -o ro,nouuid
+--   스냅샷 무효화      : Unable to allocate exception → 크기 키우기·자동 확장
+--   병합 지연          : origin is open → 닫고 재활성화
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. lvm.conf 의 snapshot_autoextend_threshold 를 70, percent 를 50 으로 두고 [5] 를
+--    다시 해 본다. 확인: lvs 의 LSize 가 늘었는지, journalctl -u dm-event 메시지
+-- 2. Ext4 원본으로 [3] 을 다시 하면 nouuid 가 필요한지 확인한다.
+--    확인 방법: mkfs.ext4 로 만든 원본의 스냅샷을 -o ro 만 주고 마운트, 성공 여부와 dmesg
+-- 3. 스냅샷을 xfsdump 의 입력으로 써서 일관된 백업을 뜨는 절차를 11장과 연결해 써 본다.
+-- 4. snap1 을 만든 뒤 lvextend -L +200M vgdata/snap1 로 COW 영역만 늘려 본다
+--    확인 방법: lvs 의 LSize 와 Data% 가 함께 바뀌는지(같은 사용량, 낮아진 비율)
+-- 5. 원본 2G 를 통째로 다시 쓰는 작업이면 스냅샷이 얼마나 필요한지 계산해 본다
+--    확인 방법: dd 로 원본을 덮어쓴 양과 lvs 의 Data% 를 비교
+-- 6. 같은 원본에 스냅샷 두 개를 만들고 원본에 200M 를 써서 두 Data% 가 함께 오르는지 본다
+-- 7. 병합을 예약해 둔 채 재부팅하면 언제 병합되는지 본다
+--    확인 방법: 재부팅 뒤 lvs -a 에 [스냅샷] 이 남아 있는지, journalctl -b 의 lvm 메시지
+--    확인 방법: lvs -o lv_name,origin,data_percent vgdata
+
+================================================================================
+ 실습 05 종료 — COW 스냅샷 40.56% 사용, 100M 스냅샷 무효화, 병합 두 번으로 원본을 되돌림
+================================================================================

@@ -1,0 +1,480 @@
+================================================================================
+ 제3장 실습 07 — 오류 재현: 잘못된 유닛 파일
+ 대상   : ol7a
+ 목표   : 문법 오류, 상대 경로 ExecStart, 없는 실행 파일, 실행 권한 없음, 없는
+          Requires= 대상, 순서 순환을 하나씩 만든 유닛으로 재현하고
+          systemd-analyze verify, systemctl status, journalctl -u 가 각각을 어떻게
+          보여 주는지 비교한다
+ 배경   : systemd 는 유닛 파일을 읽을 때 모르는 키나 잘못된 값을 "무시하고"
+          계속 간다. 그래서 오류가 시작 시점이 아니라 로드 시점에 journal 에만
+          남는 경우가 많다. 실행 단계의 실패는 status 의 종료 코드(203/EXEC 등)로,
+          의존성 실패는 systemctl start 의 오류 메시지로 드러난다 (본문 3.7, 3.8)
+ 소요   : 약 30분
+ 선행   : ol7-base
+ 계정   : root
+ 주의   : 만든 유닛은 모두 bad- 로 시작한다. 마지막에 한꺼번에 지운다
+ 되돌림 : /etc/systemd/system/bad-*.service, /usr/local/bin/bad-*.sh 삭제,
+          reset-failed. 확인은 systemctl list-units 'bad-*' --all (0 loaded units)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 지금 실패 상태인 유닛이 있는지, bad- 로 시작하는 유닛이 없는지 본다.
+[root@ol7a ~]# systemctl --failed --no-pager
+0 loaded units listed. Pass --all to see loaded but inactive units, too.
+To show all installed unit files use 'systemctl list-unit-files'.
+-- 실패 유닛 0개. 깨끗한 상태에서 시작한다.
+[root@ol7a ~]# systemctl list-units 'bad-*' --all --no-pager; ls /etc/systemd/system/bad-* 2>&1
+0 loaded units listed.
+To show all installed unit files use 'systemctl list-unit-files'.
+ls: cannot access /etc/systemd/system/bad-*: No such file or directory
+-- bad- 유닛도, 파일도 없다.
+
+-- 실습에 쓸 정상 스크립트 하나를 만든다.
+-- 10초 기다렸다 끝난다.
+[root@ol7a ~]# printf '#!/bin/bash\necho "bad-demo start pid=$$"\nsleep 10\n' > /usr/local/bin/bad-demo.sh; chmod 755 /usr/local/bin/bad-demo.sh; cat /usr/local/bin/bad-demo.sh
+#!/bin/bash
+echo "bad-demo start pid=$$"
+sleep 10
+-- 시작 메시지 한 줄을 찍고 10초 뒤 끝나는 스크립트다.
+-- $$ 는 셸 자신의 PID. 실행 권한 755 를 줬다.
+
+--------------------------------------------------------------------------------
+ [1] 문법 오류 — 섹션 이름과 키 이름 오타
+--------------------------------------------------------------------------------
+
+-- 오타 두 개가 한 유닛에 있다.
+-- verify 가 둘 다 잡는지 본다.
+-- [Service] 를 [Servcie] 로, ExecStart 를 ExecStrat 로 잘못 쓴 유닛이다.
+[root@ol7a ~]# cat > /etc/systemd/system/bad-typo.service <<'EOS'
+[Unit]
+Description=bad typo demo
+
+[Servcie]
+ExecStrat=/usr/local/bin/bad-demo.sh
+EOS
+
+-- systemd-analyze verify : 유닛 파일을 로드해 보고 경고를 표준 오류로 낸다.
+-- 실행은 하지 않는다
+-- 먼저 verify.
+[root@ol7a ~]# systemd-analyze verify /etc/systemd/system/bad-typo.service; echo "rc=$?"
+[/etc/systemd/system/bad-typo.service:4] Unknown section 'Servcie'. Ignoring.
+bad-typo.service lacks both ExecStart= and ExecStop= setting. Refusing.
+Error: org.freedesktop.DBus.Error.InvalidArgs: Unit is not loaded properly: Invalid argument.
+Failed to create bad-typo.service/start: Invalid argument
+rc=1
+-- 첫 줄: 4번째 줄의 [Servcie] 를 모르는 섹션이라 통째로 무시했다.
+-- 그 안의 ExecStrat 도 함께 버려졌다.
+-- 키 오타 경고는 따로 나오지 않는다.
+-- 둘째 줄: 실행할 명령이 하나도 없는 서비스라 로드를 거부했다.
+-- 셋째·넷째 줄: verify 가 시험 삼아 start 작업을 만들려다 실패한 것이다.
+-- rc=1. 스크립트에서 verify 의 종료 코드로 걸러 낼 수 있다.
+
+--------------------------------------------------------------------------------
+ [2] 문법 오류 유닛을 실제로 띄워 보기
+--------------------------------------------------------------------------------
+
+-- verify 를 건너뛰고 바로 띄우면 어떻게 보이는지 본다.
+-- 실무에서 흔한 순서다: 파일 작성 → daemon-reload → start.
+-- daemon-reload 로 새 파일을 읽힌 뒤 start.
+[root@ol7a ~]# systemctl daemon-reload; systemctl start bad-typo; echo "rc=$?"
+Failed to start bad-typo.service: Unit is not loaded properly: Invalid argument.
+See system logs and 'systemctl status bad-typo.service' for details.
+rc=1
+-- daemon-reload 는 조용히 성공했다.
+-- 오타가 있어도 reload 단계에서는 멈추지 않는다.
+-- start 는 "Unit is not loaded properly: Invalid argument." 로 거부됐다.
+-- status 의 Loaded 줄과 Active 줄만 본다.
+-- 아래 로그는 앞의 verify·start 에서 이미 본 메시지가 반복된다.
+[root@ol7a ~]# systemctl status bad-typo --no-pager | head -3
+● bad-typo.service - bad typo demo
+   Loaded: error (Reason: Invalid argument)
+   Active: inactive (dead)
+-- Loaded: error (Reason: Invalid argument). 유닛 파일은 찾았지만 해석에 실패했다.
+-- Active 는 inactive(dead). 한 번도 실행되지 않았다.
+-- 같은 경고가 daemon-reload 때마다 journal 에 쌓인다.
+-- 개수만 센다.
+[root@ol7a ~]# journalctl -b --no-pager | grep -c 'bad-typo.service'
+4
+-- 경고 두 줄이 daemon-reload 와 start 에서 두 번씩, 모두 4줄.
+-- 고치지 않으면 reload 할 때마다 journal 에 계속 쌓인다.
+
+--------------------------------------------------------------------------------
+ [3] 오류 흐름 — ExecStart 에 상대 경로
+--------------------------------------------------------------------------------
+
+-- 셸에서는 PATH 로 찾아 주지만 유닛 파일은 그렇지 않다.
+-- 스크립트가 있는 디렉터리에서 테스트하던 습관대로 경로 없이 이름만 쓴 경우다.
+[root@ol7a ~]# cat > /etc/systemd/system/bad-relpath.service <<'EOS'
+[Unit]
+Description=bad relative path demo
+
+[Service]
+ExecStart=bad-demo.sh
+EOS
+-- verify 부터.
+[root@ol7a ~]# systemd-analyze verify /etc/systemd/system/bad-relpath.service; echo "rc=$?"
+[/etc/systemd/system/bad-relpath.service:5] Executable path is not absolute, ignoring: bad-demo.sh
+bad-relpath.service lacks both ExecStart= and ExecStop= setting. Refusing.
+Error: org.freedesktop.DBus.Error.InvalidArgs: Unit is not loaded properly: Invalid argument.
+Failed to create bad-relpath.service/start: Invalid argument
+rc=1
+-- 상대 경로를 "절대 경로가 아니다"며 무시했다.
+-- 결과는 오타와 같다.
+-- ExecStart 가 없는 유닛이 돼 로드가 거부됐다.
+-- 띄워 본다.
+[root@ol7a ~]# systemctl daemon-reload; systemctl start bad-relpath; echo "rc=$?"
+Failed to start bad-relpath.service: Unit is not loaded properly: Invalid argument.
+See system logs and 'systemctl status bad-relpath.service' for details.
+rc=1
+-- start 도 같은 문구로 실패. 메시지만 봐서는 오타와 상대 경로를 구분할 수 없다.
+-- 앞 세 줄만.
+[root@ol7a ~]# systemctl status bad-relpath --no-pager | head -3
+● bad-relpath.service - bad relative path demo
+   Loaded: error (Reason: Invalid argument)
+   Active: inactive (dead)
+-- 증상   : start 가 "Unit is not loaded properly: Invalid argument.", status 가 Loaded: error
+-- 원인   : ExecStart=bad-demo.sh 처럼 경로 없이 썼다. 7.9 의 systemd 는 PATH 를 찾지 않는다
+-- 조치   : ExecStart=/usr/local/bin/bad-demo.sh 로 고치고 daemon-reload
+-- 재확인 : status 의 Loaded: loaded, Active: active (running)
+
+-- 절대 경로로 고친다.
+[root@ol7a ~]# sed -i 's|^ExecStart=bad-demo.sh|ExecStart=/usr/local/bin/bad-demo.sh|' /etc/systemd/system/bad-relpath.service; grep ExecStart /etc/systemd/system/bad-relpath.service
+ExecStart=/usr/local/bin/bad-demo.sh
+-- sed 의 구분자를 | 로 써서 경로의 / 를 피했다.
+-- 고친 뒤 다시.
+[root@ol7a ~]# systemctl daemon-reload; systemctl start bad-relpath; sleep 1; systemctl status bad-relpath --no-pager | head -6
+● bad-relpath.service - bad relative path demo
+   Loaded: loaded (/etc/systemd/system/bad-relpath.service; static; vendor preset: disabled)
+   Active: active (running) since Thu 2026-11-12 20:05:28 KST; 1s ago
+ Main PID: 2307 (bad-demo.sh)
+   CGroup: /system.slice/bad-relpath.service
+           ├─2307 /bin/bash /usr/local/bin/bad-demo.sh
+-- 이제 loaded, active (running). Main PID 2307 이 bash 로 실행한 스크립트다.
+-- static : [Install] 이 없어 enable 대상이 아니다.
+-- 수동 start 로만 뜬다.
+-- CGroup 의 다음 줄(sleep)은 head -6 에서 잘렸다.
+
+--------------------------------------------------------------------------------
+ [4] 없는 실행 파일 — 203/EXEC
+--------------------------------------------------------------------------------
+
+-- 이번 유닛은 문법상 문제가 없다.
+-- 로드는 성공한다.
+-- 절대 경로는 맞게 썼지만 파일 이름이 틀린 경우다.
+-- verify 는 이것을 잡을까.
+[root@ol7a ~]# printf '[Unit]\nDescription=bad missing exec demo\n\n[Service]\nExecStart=/usr/local/bin/bad-demo-missing.sh\n' > /etc/systemd/system/bad-missing.service
+[root@ol7a ~]# systemd-analyze verify /etc/systemd/system/bad-missing.service; echo "rc=$?"
+bad-missing.service: command /usr/local/bin/bad-demo-missing.sh is not executable: No such file or directory
+rc=1
+-- verify 는 실행 파일이 없다는 것을 잡는다.
+-- "No such file or directory".
+-- verify 경고를 무시하고 띄워 본다.
+[root@ol7a ~]# systemctl daemon-reload; systemctl start bad-missing; echo "rc=$?"; sleep 1
+rc=0
+-- start 는 rc=0. 성공처럼 보인다.
+-- systemd 는 작업을 받고 프로세스를 띄운 뒤에야 실행 실패를 안다.
+-- 결과는 status 로.
+[root@ol7a ~]# systemctl status bad-missing --no-pager
+● bad-missing.service - bad missing exec demo
+   Loaded: loaded (/etc/systemd/system/bad-missing.service; static; vendor preset: disabled)
+   Active: failed (Result: exit-code) since Thu 2026-11-12 20:05:29 KST; 2s ago
+  Process: 2381 ExecStart=/usr/local/bin/bad-demo-missing.sh (code=exited, status=203/EXEC)
+ Main PID: 2381 (code=exited, status=203/EXEC)
+
+Nov 12 20:05:29 ol7a.example.com systemd[1]: Started bad missing exec demo.
+Nov 12 20:05:29 ol7a.example.com systemd[1]: bad-missing.service: main process exited, code=exited, status=203/EXEC
+Nov 12 20:05:29 ol7a.example.com systemd[1]: Unit bad-missing.service entered failed state.
+Nov 12 20:05:29 ol7a.example.com systemd[1]: bad-missing.service failed.
+-- Active: failed (Result: exit-code). 2초 전에 실패했다.
+-- Process 와 Main PID 줄: status=203/EXEC. systemd 가 exec 단계에서 실패했다는 고유 코드다.
+-- 로그는 Started → main process exited → entered failed state → failed 순서다.
+-- "Started" 가 먼저 찍혀 있어 로그만 훑으면 성공으로 오해하기 쉽다.
+
+--------------------------------------------------------------------------------
+ [5] 실행 권한 없음 — 같은 203/EXEC, 다른 원인
+--------------------------------------------------------------------------------
+
+-- 파일은 있지만 chmod 644 로 실행 비트를 뺐다.
+-- 스크립트를 scp·편집기로 새로 만들면 자주 생긴다.
+[root@ol7a ~]# cp /usr/local/bin/bad-demo.sh /usr/local/bin/bad-noexec.sh; chmod 644 /usr/local/bin/bad-noexec.sh; ls -l /usr/local/bin/bad-noexec.sh
+-rw-r--r--. 1 root root 50 Nov 12 20:05 /usr/local/bin/bad-noexec.sh
+-- 권한 644. 실행 비트가 없다.
+[root@ol7a ~]# printf '[Unit]\nDescription=bad noexec demo\n\n[Service]\nExecStart=/usr/local/bin/bad-noexec.sh\n' > /etc/systemd/system/bad-noexec.service
+-- 띄우고 1초 뒤 상태.
+[root@ol7a ~]# systemctl daemon-reload; systemctl start bad-noexec; sleep 1; systemctl status bad-noexec --no-pager
+● bad-noexec.service - bad noexec demo
+   Loaded: loaded (/etc/systemd/system/bad-noexec.service; static; vendor preset: disabled)
+   Active: failed (Result: exit-code) since Thu 2026-11-12 20:05:32 KST; 1s ago
+  Process: 2473 ExecStart=/usr/local/bin/bad-noexec.sh (code=exited, status=203/EXEC)
+ Main PID: 2473 (code=exited, status=203/EXEC)
+
+Nov 12 20:05:32 ol7a.example.com systemd[1]: Started bad noexec demo.
+Nov 12 20:05:32 ol7a.example.com systemd[1]: bad-noexec.service: main process exited, code=exited, status=203/EXEC
+Nov 12 20:05:32 ol7a.example.com systemd[1]: Unit bad-noexec.service entered failed state.
+Nov 12 20:05:32 ol7a.example.com systemd[1]: bad-noexec.service failed.
+-- [4] 와 같은 203/EXEC. status 화면은 두 경우가 똑같다.
+-- status 에는 두 경우가 똑같이 203/EXEC 로 보인다.
+-- 원인을 가르는 것은 verify 다.
+[root@ol7a ~]# systemd-analyze verify /etc/systemd/system/bad-noexec.service; echo "rc=$?"
+bad-noexec.service: command /usr/local/bin/bad-noexec.sh is not executable: Permission denied
+rc=1
+-- verify 가 차이를 보여 준다.
+-- 이번에는 "Permission denied".
+-- 같은 203/EXEC 라도 원인이 파일 없음인지 권한인지 verify 로 가른다.
+
+--------------------------------------------------------------------------------
+ [6] 오류 흐름 — 없는 유닛을 Requires= 로
+--------------------------------------------------------------------------------
+
+-- 대상 유닛 이름이 틀렸거나 그 패키지가 설치되지 않은 상황이다.
+-- Requires= 는 "이 유닛이 같이 떠야 하고, 실패하면 나도 실패"다.
+-- 이름이 틀린 경우를 만든다.
+[root@ol7a ~]# cat > /etc/systemd/system/bad-requires.service <<'EOS'
+[Unit]
+Description=bad requires demo
+Requires=bad-database.service
+After=bad-database.service
+-- sed 로 Requires 만 Wants 로 바꿨다. After 는 그대로다.
+
+[Service]
+ExecStart=/usr/local/bin/bad-demo.sh
+EOS
+-- verify.
+[root@ol7a ~]# systemd-analyze verify /etc/systemd/system/bad-requires.service; echo "rc=$?"
+Error: org.freedesktop.systemd1.NoSuchUnit: Unit not found.
+Failed to create bad-requires.service/start: No such file or directory
+rc=1
+-- verify 는 Requires 대상이 없다고 "Unit not found." 를 냈다.
+-- 어느 유닛이 없는지는 말하지 않는다.
+-- 유닛 파일의 Requires 줄을 직접 본다.
+-- start.
+[root@ol7a ~]# systemctl daemon-reload; systemctl start bad-requires; echo "rc=$?"
+Failed to start bad-requires.service: Unit not found.
+rc=5
+-- 증상   : systemctl start bad-requires 가 "Failed to start bad-requires.service: Unit not found." rc=5
+-- 원인   : Requires=bad-database.service 의 대상 유닛 파일이 없다. 메시지의 Unit 은 bad-requires 가 아니라 대상이다
+-- 조치   : 대상 이름을 바로잡거나, 꼭 필요하지 않으면 Wants= 로 바꾼다([7])
+-- 재확인 : start 의 rc=0, is-active 가 active
+-- rc=5 는 systemctl 의 "유닛 없음" 종료 코드다.
+-- 앞의 로드 오류는 1 이었다.
+-- 상태.
+[root@ol7a ~]# systemctl status bad-requires --no-pager
+● bad-requires.service - bad requires demo
+   Loaded: loaded (/etc/systemd/system/bad-requires.service; static; vendor preset: disabled)
+   Active: inactive (dead)
+-- 의존 트리 앞부분.
+[root@ol7a ~]# systemctl list-dependencies bad-requires --no-pager | head -4
+bad-requires.service
+● ├─bad-database.service
+● ├─system.slice
+● └─basic.target
+-- bad-requires 는 inactive(dead). 작업 자체가 만들어지지 않았다.
+-- 의존 트리 첫 항목에 bad-database.service 가 보인다(앞 4줄만).
+-- 이름 앞 ● 는 트리 표시다.
+-- 없는 유닛도 이름만으로 나온다.
+
+--------------------------------------------------------------------------------
+ [7] Requires= 대신 Wants= 이면
+--------------------------------------------------------------------------------
+
+-- 대상은 그대로 없는 상태로 둔다.
+-- Wants= 는 "같이 띄우되 실패해도 나는 간다"다.
+-- 같은 오타로 비교한다.
+[root@ol7a ~]# sed -i 's/^Requires=/Wants=/' /etc/systemd/system/bad-requires.service; grep -E '^(Wants|After)' /etc/systemd/system/bad-requires.service
+Wants=bad-database.service
+After=bad-database.service
+-- 다시 띄운다.
+[root@ol7a ~]# systemctl daemon-reload; systemctl start bad-requires; echo "rc=$?"; systemctl is-active bad-requires
+rc=0
+active
+-- Wants 이면 대상이 없어도 자신은 뜬다.
+-- After 는 대상이 없으니 기다릴 것도 없다.
+-- Requires 와 Wants 의 차이가 이 두 단계에서 rc=5 와 rc=0 으로 갈렸다.
+
+--------------------------------------------------------------------------------
+ [8] 순서 순환 — After= 가 서로를 가리킴
+--------------------------------------------------------------------------------
+
+-- 두 유닛을 만들고 verify, start, journal 순서로 본다.
+-- bad-cyca 는 bad-cycb 뒤에, bad-cycb 는 bad-cyca 뒤에 서겠다고 한다.
+-- 서로 Wants 로 끌어온다.
+[root@ol7a ~]# printf '[Unit]\nDescription=bad cycle A\nWants=bad-cycb.service\nAfter=bad-cycb.service\n\n[Service]\nExecStart=/usr/local/bin/bad-demo.sh\n' > /etc/systemd/system/bad-cyca.service
+[root@ol7a ~]# printf '[Unit]\nDescription=bad cycle B\nWants=bad-cyca.service\nAfter=bad-cyca.service\n\n[Service]\nExecStart=/usr/local/bin/bad-demo.sh\n' > /etc/systemd/system/bad-cycb.service
+-- A 만 verify.
+[root@ol7a ~]# systemd-analyze verify /etc/systemd/system/bad-cyca.service; echo "rc=$?"
+Found ordering cycle on bad-cycb.service/start
+Found dependency on bad-cyca.service/start
+Found dependency on bad-cycb.service/start
+Breaking ordering cycle by deleting job bad-cycb.service/start
+Job bad-cycb.service/start deleted to break ordering cycle starting with bad-cycb.service/start
+rc=0
+-- verify 는 순환을 찾아 bad-cycb 의 start 작업을 지워서 끊었다.
+-- 그래도 rc=0 이다.
+-- 순환은 오류가 아니라 경고로 처리된다.
+-- rc 만 보고 넘어가면 놓친다.
+[root@ol7a ~]# systemctl daemon-reload; systemctl start bad-cyca; echo "rc=$?"; sleep 1
+rc=0
+-- start 도 rc=0.
+-- 둘의 상태.
+[root@ol7a ~]# systemctl is-active bad-cyca bad-cycb
+active
+inactive
+-- A 는 떴고 B 는 inactive. Wants 로 끌어왔는데도 B 가 안 뜬 이유는 journal 에 있다.
+-- journal 에서 순환 메시지.
+[root@ol7a ~]# journalctl -b --no-pager | grep -E 'ordering cycle|bad-cyc' | tail -7 | cut -c17-
+ol7a.example.com systemd[1]: Found ordering cycle on bad-cyca.service/start
+ol7a.example.com systemd[1]: Found dependency on bad-cycb.service/start
+ol7a.example.com systemd[1]: Found dependency on bad-cyca.service/start
+ol7a.example.com systemd[1]: Breaking ordering cycle by deleting job bad-cycb.service/start
+ol7a.example.com systemd[1]: Job bad-cycb.service/start deleted to break ordering cycle starting with bad-cyca.service/start
+-- cut -c17- 로 앞의 날짜·시각을 잘랐다.
+-- 순환을 발견 → 고리의 두 유닛 → B 의 start 작업 삭제. A 만 남았다.
+-- 증상   : start bad-cyca 는 rc=0 인데 bad-cycb 가 inactive
+-- 원인   : bad-cyca·bad-cycb 가 서로 After= 로 가리켜 순서 순환. systemd 가 B 의 작업을 지워 끊었다
+-- 조치   : 한쪽의 After= 를 지우거나 Before= 로 방향을 정한다
+-- 재확인 : journalctl 에 "Found ordering cycle" 이 더 나오지 않고 둘 다 active
+
+--------------------------------------------------------------------------------
+ [9] 한눈에 — 실패 유닛 목록과 종료 코드
+--------------------------------------------------------------------------------
+
+-- 여러 유닛의 상태를 속성 세 개로 비교한다.
+-- Result         : 마지막 실행 결과
+-- ExecMainStatus : 주 프로세스의 종료 코드
+-- LoadState      : 유닛 파일 해석 결과
+-- 실패 유닛 목록.
+[root@ol7a ~]# systemctl --failed --no-pager --no-legend
+bad-missing.service loaded failed failed bad missing exec demo
+bad-noexec.service  loaded failed failed bad noexec demo
+-- 실행 단계에서 실패한 두 유닛만 failed 로 남았다.
+-- bad-typo·bad-relpath(고치기 전)처럼 로드 단계에서 실패한 유닛은 --failed 에 나오지 않는다.
+-- --no-legend 로 머리·꼬리 줄을 뺐다.
+[root@ol7a ~]# systemctl show -p Result -p ExecMainStatus -p LoadState bad-typo bad-missing bad-noexec
+Result=success
+ExecMainStatus=0
+LoadState=error
+
+Result=exit-code
+ExecMainStatus=203
+LoadState=loaded
+
+Result=exit-code
+ExecMainStatus=203
+LoadState=loaded
+-- 세 유닛 순서대로 묶어 읽는다.
+--   bad-typo    : LoadState=error, Result=success, ExecMainStatus=0 (실행된 적 없음)
+--   bad-missing : loaded, exit-code, 203
+--   bad-noexec  : loaded, exit-code, 203
+-- 로드 실패와 실행 실패는 LoadState 로 갈린다.
+
+--------------------------------------------------------------------------------
+ [10] 고쳐서 확인 — bad-typo
+--------------------------------------------------------------------------------
+
+-- 오타 두 개를 sed 로 고치고 verify 부터 다시 한다.
+-- 비교용 사본.
+[root@ol7a ~]# cp /etc/systemd/system/bad-typo.service /tmp/bad-typo.before
+[root@ol7a ~]# sed -i -e 's/^\[Servcie\]/[Service]/' -e 's/^ExecStrat=/ExecStart=/' /etc/systemd/system/bad-typo.service; diff /tmp/bad-typo.before /etc/systemd/system/bad-typo.service
+4,5c4,5
+< [Servcie]
+< ExecStrat=/usr/local/bin/bad-demo.sh
+---
+> [Service]
+> ExecStart=/usr/local/bin/bad-demo.sh
+-- 4·5번째 줄 두 개를 바로잡았다.
+-- 고친 뒤 verify.
+[root@ol7a ~]# systemd-analyze verify /etc/systemd/system/bad-typo.service; echo "rc=$?"
+rc=0
+-- 경고가 하나도 없다. rc=0.
+[root@ol7a ~]# systemctl daemon-reload; systemctl start bad-typo; sleep 1; systemctl status bad-typo --no-pager | head -5
+● bad-typo.service - bad typo demo
+   Loaded: loaded (/etc/systemd/system/bad-typo.service; static; vendor preset: disabled)
+   Active: active (running) since Thu 2026-11-12 20:05:35 KST; 1s ago
+ Main PID: 2912 (bad-demo.sh)
+   CGroup: /system.slice/bad-typo.service
+-- 고친 뒤에는 loaded, active (running).
+
+--------------------------------------------------------------------------------
+ [변형] 한 번에 검사 — 여러 유닛을 verify 에 같이
+--------------------------------------------------------------------------------
+
+-- 각 유닛의 문제를 이미 알고 있으니 무엇이 나와야 하는지 예측한 뒤 본다.
+-- verify 는 여러 파일을 한꺼번에 받는다.
+-- 남은 유닛을 모두 넣어 어느 문제를 잡고 어느 것을 놓치는지 정리한다.
+[root@ol7a ~]# systemd-analyze verify /etc/systemd/system/bad-*.service; echo "rc=$?"
+Found ordering cycle on bad-cycb.service/start
+Found dependency on bad-cyca.service/start
+Found dependency on bad-cycb.service/start
+Breaking ordering cycle by deleting job bad-cycb.service/start
+Job bad-cycb.service/start deleted to break ordering cycle starting with bad-cycb.service/start
+Found ordering cycle on bad-cycb.service/start
+Found dependency on bad-cyca.service/start
+Found dependency on bad-cycb.service/start
+Breaking ordering cycle by deleting job bad-cyca.service/start
+Job bad-cyca.service/start deleted to break ordering cycle starting with bad-cycb.service/start
+Found ordering cycle on bad-cycb.service/start
+Found dependency on bad-cyca.service/start
+Found dependency on bad-cycb.service/start
+Unable to break cycle
+Requested transaction contains an unfixable cyclic ordering dependency: Transaction order is cyclic. See system logs for details.
+Error: org.freedesktop.systemd1.TransactionOrderIsCyclic: Transaction order is cyclic. See system logs for details.
+Failed to create bad-cycb.service/start: Resource deadlock avoided
+bad-missing.service: command /usr/local/bin/bad-demo-missing.sh is not executable: No such file or directory
+bad-noexec.service: command /usr/local/bin/bad-noexec.sh is not executable: Permission denied
+Cannot add dependency job for unit bad-database.service, ignoring: Unit not found.
+rc=1
+-- 여러 파일을 한꺼번에 넣으니 순환 메시지가 세 번 되풀이되고 마지막에는 "Unable to break cycle" 이 나왔다.
+-- 한 트랜잭션에 두 유닛의 start 가 함께 들어가 어느 작업을 지워도 고리가 남았기 때문이다.
+-- 그 뒤로 203/EXEC 원인 두 가지와 Wants 대상 없음(무시됨)이 이어진다.
+-- 한 번에 검사하면 빠짐없이 나오지만 메시지가 섞인다.
+-- 문제 유닛을 하나씩 확인하는 편이 읽기 쉽다.
+
+--------------------------------------------------------------------------------
+ [되돌림]
+--------------------------------------------------------------------------------
+
+-- stop 'bad-*' 는 이름 패턴으로 한꺼번에 정지한다.
+-- reset-failed 가 failed 기록을 지운다.
+[root@ol7a ~]# systemctl stop 'bad-*' 2>/dev/null; rm -f /etc/systemd/system/bad-*.service /usr/local/bin/bad-*.sh /tmp/bad-typo.before
+[root@ol7a ~]# systemctl daemon-reload; systemctl reset-failed; systemctl list-units 'bad-*' --all --no-pager; systemctl --failed --no-pager
+0 loaded units listed.
+To show all installed unit files use 'systemctl list-unit-files'.
+0 loaded units listed. Pass --all to see loaded but inactive units, too.
+To show all installed unit files use 'systemctl list-unit-files'.
+-- bad- 유닛이 하나도 남지 않았고 실패 유닛도 0개다.
+-- [0] 과 같다.
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+--  잘못된 내용              verify                         start          status / journal
+--  섹션·키 오타             Unknown section, lacks both     실패 rc=1      Loaded: error
+--  ExecStart 상대 경로      path is not absolute           실패 rc=1      Loaded: error
+--  없는 실행 파일           No such file or directory      rc=0           failed 203/EXEC
+--  실행 권한 없음           Permission denied              rc=0           failed 203/EXEC
+--  없는 Requires=           Unit not found                 실패 rc=5      inactive
+--  After= 순환              ordering cycle(rc=0)           rc=0           B 의 작업 삭제
+--
+--  · 새 유닛은 첫 start 전에 systemd-analyze verify 를 친다
+--  · start 의 rc=0 은 "작업을 받았다"는 뜻일 뿐이다. 실행 실패는 status 로 본다
+--  · 203/EXEC 의 원인은 verify 가 가른다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. ExecStart=/usr/local/bin/bad-demo.sh --x 처럼 인자를 붙이고, 스크립트가 exit 3 으로 끝나게 바꿔
+--    status 의 status= 값이 어떻게 달라지는지 본다(203 과 3 의 차이).
+-- 2. Type=forking 으로 바꾸고 bad-demo.sh 를 띄워 본다.
+-- 포그라운드 스크립트를 forking 으로 두면
+--    start 가 어떻게 끝나는지 status 로 확인한다.
+-- 3. Requires= 를 After= 없이 쓰면 대상과 동시에 뜨는지 journal 의 시각으로 비교한다.
+-- 끝나면 [되돌림] 의 명령으로 bad- 유닛을 모두 지운다.
+
+================================================================================
+ 실습 07 종료 — verify 로 먼저, start 의 rc=0 은 믿지 말고 status 로
+================================================================================

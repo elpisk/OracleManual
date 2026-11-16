@@ -1,0 +1,479 @@
+================================================================================
+ 제18장 실습 07 — sosreport 만들기와 OSWatcher 설치·보관 파일
+ 대상   : ol7a
+ 목표   : sosreport 를 만들고(--batch, --case-id, --label, -o) 묶음을 풀어
+          구조를 확인한다. 대화형 확인과 임시 공간 부족을 겪어 본다.
+          OSWatcher 를 ol7_addons 저장소에서 설치해 서비스로 돌리고,
+          보관 파일의 형식과 수집 간격·보관 시간 설정을 바꿔 본다
+ 배경   : sosreport 는 플러그인 단위로 설정 파일·명령 출력·로그를 모아 한
+          tar.xz 로 묶는다. 모으는 동안 /var/tmp 아래에 풀린 사본을 먼저 만든다.
+          OSWatcher 는 vmstat·iostat·top·ps 등을 정해진 간격으로 돌려 시간별
+          파일로 남기는 셸 스크립트 묶음이다. 공식 문서는 MOS 문서 301137.1 의
+          tar 를 안내하지만 OL7 은 ol7_addons 에 RPM 도 있다(본문 18.8, 18.9)
+ 소요   : 약 30분
+ 선행   : ol7-base 스냅샷. 인터넷(yum.oracle.com)
+ 계정   : root
+ 주의   : sos 는 기준 상태에 이미 있다(지우지 않는다). oswatcher 는 설치했다가
+          끝에서 지운다. 작은 tmpfs 를 잠깐 마운트한다
+ 되돌림 : sosreport·풀린 디렉터리 삭제, tmpfs 해제, oswatcher 제거와 데이터 삭제.
+          확인은 ls /var/tmp · findmnt /mnt/small · rpm -q oswatcher
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# rpm -q sos oswatcher; ls /var/tmp; df -h /var/tmp
+sos-3.9-5.0.29.el7_9.10.noarch
+package oswatcher is not installed
+abrt
+systemd-private-e695e7f2a7b84a3bb95fac96a522d9f6-chronyd.service-JtJobG
+systemd-private-e695e7f2a7b84a3bb95fac96a522d9f6-systemd-hostnamed.service-wJ50OF
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/ol-root   36G  4.3G   31G  13% /
+-- sos 3.9 는 있고 oswatcher 는 없다. /var/tmp 에는 기준 상태의
+-- 디렉터리 셋뿐, 루트 여유 31G
+
+--------------------------------------------------------------------------------
+ [1] sos 와 플러그인
+--------------------------------------------------------------------------------
+-- 설치 날짜로 기준 상태를 만들 때 함께 들어온 것인지 본다.
+[root@ol7a ~]# rpm -qi sos | grep -E '^(Version|Release|Install Date)'; sosreport --help 2>&1 | sed -n 2p
+Version     : 3.9
+Release     : 5.0.29.el7_9.10
+Install Date: Wed 11 Nov 2026 08:15:36 PM KST
+sosreport (version 3.9)
+-- 설치 날짜 11월 11일 20:15. ol7-base 를 만들며 yum update 할 때
+-- 함께 들어왔다(설치 매체 기본 그룹에 포함)
+-- -l : 플러그인 목록. 앞의 숫자는 목록에 나온 플러그인·옵션 줄
+-- 수다.
+[root@ol7a ~]# sosreport -l 2>&1 | grep -c -E '^ [a-z0-9_]+ '; sosreport -l 2>&1 | grep -E '^ (kernel|memory|block|filesys|networking|process|logs|sar|lvm2|xfs) '
+288
+ block                Block device information
+ filesys              Local file systems
+ kernel               Linux kernel
+ logs                 System logs
+ lvm2                 LVM2 volume manager
+ memory               Memory configuration and use
+ networking           network and device configuration
+ process              process information
+ sar                  System Activity Reporter
+ xfs                  XFS filesystem
+-- 288 은 목록에 나온 플러그인·옵션 줄 수다. 이 중 켜진 것만
+-- 기본으로 돈다
+-- 플러그인은 관련 패키지·파일이 있을 때 켜진다. xfs·lvm2 가 켜진
+-- 것은 이 VM 의 루트가 LVM 위 XFS 라서다
+-- sar 플러그인이 /var/log/sa 의 파일을 묶음에 넣는다([5] 에서
+-- 확인)
+
+--------------------------------------------------------------------------------
+ [2] 대화형 확인 — --batch 를 빼면
+--------------------------------------------------------------------------------
+-- 자동화(cron·원격 명령)에서 그냥 sosreport 만 부르는 경우를 흉내
+-- 낸다. 표준 입력은 /dev/null.
+[root@ol7a ~]# sosreport -o kernel </dev/null 2>&1 | tail -4; echo "exit=${PIPESTATUS[0]}"; ls /var/tmp | grep -c sosreport
+Press ENTER to continue, or CTRL-C to quit.
+
+EOF when reading a line
+EOF when reading a line
+exit=1
+-- 증상   : sosreport 가 Press ENTER to continue, or CTRL-C to
+--          quit. 다음에
+--          EOF when reading a line 을 찍고 exit 1. 묶음은 만들어지지 않았다(마지막 0)
+-- 원인   : --batch 가 없으면 시작 전에 확인을 받는다. 입력이
+--          /dev/null 이라 읽을 줄이 없었다
+--          터미널에서 실행했다면 Enter 를 기다리며 그대로 멈춘다
+-- 조치   : 자동화·원격 실행에서는 늘 --batch 를 붙인다
+-- 재확인 : [3] 에서 --batch 로 묶음이 만들어졌다
+0
+
+--------------------------------------------------------------------------------
+ [3] sosreport 만들기 — 기본 플러그인 전부
+--------------------------------------------------------------------------------
+-- --batch : 확인 질문 없이 --case-id : SR 번호 --label : 이름
+-- 꼬리표. 안내문은 빼고 결과 줄만 고른다.
+[root@ol7a ~]# time sosreport --batch --case-id 12345678 --label lab18 >/tmp/sos.out 2>&1; grep -E '^  /var/tmp|Size|md5' /tmp/sos.out; grep -c 'skipped command' /tmp/sos.out
+
+real    0m24.405s
+user    0m19.052s
+sys     0m11.814s
+  /var/tmp/sosreport-ol7a-lab18-12345678-2026-11-16-tnvhizi.tar.xz
+ Size   9.74MiB
+ md5    c8e2302623c4b2c348c20305b8916cf7
+4
+-- real 24.405s : 기본 플러그인 전부를 모으는 데 25초 남짓. 서버가
+-- 크면 수 분이 걸린다
+-- 결과는
+-- /var/tmp/sosreport-호스트-꼬리표-케이스-날짜-임의문자.tar.xz,
+-- 압축 크기 9.74MiB, md5 함께 출력
+-- 4 : skipped command 가 4개. 아래 그 첫 줄을 본다
+[root@ol7a ~]# grep 'skipped command' /tmp/sos.out | head -1 | cut -c1-150; ls -l /var/tmp | grep sosreport
+[plugin:firewalld] skipped command 'nft list ruleset': required kmods missing: nfnetlink, nf_tables.  Use '--allow-system-changes' to enable collectio
+-rw-------. 1 root root 10217476 Nov 16 19:03 sosreport-ol7a-lab18-12345678-2026-11-16-tnvhizi.tar.xz
+-rw-r--r--. 1 root root       33 Nov 16 19:03 sosreport-ol7a-lab18-12345678-2026-11-16-tnvhizi.tar.xz.md5
+-- nft list ruleset 은 커널 모듈 nf_tables 가 없어 건너뛰었다. sos
+-- 는 수집하려고 모듈을 올리지 않는다
+-- --allow-system-changes 를 주면 올린다. 시스템을 바꾸는 것이니
+-- 지원 엔지니어가 요청할 때만 쓴다
+-- 묶음은 권한 0600(root 만 읽음). 옆의 .md5 는 전송 뒤 무결성
+-- 확인용이다
+
+--------------------------------------------------------------------------------
+ [4] 묶음 풀어 보기 — 구조
+--------------------------------------------------------------------------------
+[root@ol7a ~]# mkdir /var/tmp/sx; tar xJf /var/tmp/sosreport-*lab18*.tar.xz -C /var/tmp/sx; ls /var/tmp/sx
+sosreport-ol7a-lab18-12345678-2026-11-16-tnvhizi
+[root@ol7a ~]# cd /var/tmp/sx/sosreport-*; ls -F | column -c 100
+boot/           etc/            lib@            proc/           sos_logs/       usr/
+chkconfig@      free@           lsmod@          ps@             sos_reports/    var/
+date@           hostname@       lsof@           root/           sos_strings/    version.txt
+df@             installed-rpms@ lspci@          route@          sys/            vgdisplay@
+dmidecode@      ip_addr@        mount@          run/            uname@
+environment     last@           netstat@        sos_commands/   uptime@
+[root@ol7a ~]# cd /var/tmp/sx/sosreport-*; du -sh .; find . -type f | wc -l
+72M     .
+6292
+-- 서버의 / 를 흉내 낸 구조. etc·proc·sys·var·usr·boot 는 원래
+-- 경로 그대로 사본이다
+-- sos_commands/ : 플러그인별 명령 출력, sos_logs/ : sos 자체
+-- 로그, sos_reports/ : 요약(html·json·txt)
+-- @ 가 붙은 짧은 이름(df, free, uname, ps, netstat ...)은 심볼릭
+-- 링크다
+-- 압축 9.74MiB 가 풀면 72M, 파일 6292 개. 압축 전 크기만큼 임시
+-- 공간이 필요하다는 뜻이다
+
+--------------------------------------------------------------------------------
+ [5] 주요 파일 — 서버 상태를 다시 읽기
+--------------------------------------------------------------------------------
+-- 맨 위의 짧은 이름 파일은 sos_commands 안의 명령 출력으로 가는
+-- 심볼릭 링크다.
+[root@ol7a ~]# cd /var/tmp/sx/sosreport-*; ls -l uname free df | cut -c43-; cat uname; cat free
+ -> sos_commands/filesys/df_-al_-x_autofs
+ee -> sos_commands/memory/free
+ame -> sos_commands/kernel/uname_-a
+Linux ol7a.example.com 5.4.17-2136.338.4.2.el7uek.x86_64 #3 SMP Mon Dec 23 14:42:43 PST 2024 x86_64 x86_64 x86_64 GNU/Linux
+              total        used        free      shared  buff/cache   available
+Mem:        3716120      292300     2974852        8888      448968     3157056
+Swap:       4063228           0     4063228
+-- cut -c43- 로 ls -l 앞쪽을 잘랐더니 링크 이름 앞 글자가 함께
+-- 잘렸다(df, free, uname 순). 화살표 오른쪽이 실제 파일이다
+-- uname 은 기준 커널 5.4.17-2136.338.4.2.el7uek. free 는 KB 단위
+-- 원본 그대로
+-- 지원 엔지니어는 이 링크 파일들부터 연다. 서버에 접속하지 않고
+-- 같은 명령 결과를 본다
+[root@ol7a ~]# cd /var/tmp/sx/sosreport-*; ls sos_commands | wc -l; ls sos_commands/kernel | cut -c1-40; ls sos_commands/sar
+64
+dmesg
+dmesg_-T
+find_.lib.modules.3.10.0-1160.el7.x86_64
+ls_-lt_.sys.kernel.slab
+lsmod
+modinfo_ALL_MODULES
+sysctl_-a
+uname_-a
+sa11.xml
+sa16.xml
+sar11
+sar16
+-- sos_commands 아래 플러그인 디렉터리 64개. kernel 에는
+-- dmesg·lsmod·sysctl -a·uname 출력이 있다
+-- find_... 는 /lib/modules 아래 extra 모듈을 찾은 명령 이름을
+-- 파일 이름으로 쓴 것이다(40자에서 자름)
+-- sar 플러그인은 sa11·sa16 을 sar11·sar16 텍스트와 xml 로 바꿔
+-- 넣었다. 지원 쪽에서 sysstat 버전과 관계없이 읽는다
+[root@ol7a ~]# cd /var/tmp/sx/sosreport-*; ls sos_logs sos_reports; grep -i -E 'error|exception' sos_logs/sos.log | cut -c1-140
+sos_logs:
+sos.log
+ui.log
+
+sos_reports:
+sos.html
+sos.json
+sos.txt
+2026-11-16 19:03:21,385 INFO: [plugin:kernel] collecting path '/sys/kernel/debug/tracing/error_log'
+-- error 로 grep 한 결과는 이름에 error 가 든 경로를 모은 INFO 한
+-- 줄뿐이다. 실패한 수집은 없었다
+-- ui.log 는 화면에 나온 내용, sos.log 는 플러그인마다 무엇을
+-- 모았는지의 상세 기록이다
+
+--------------------------------------------------------------------------------
+ [6] -o — 필요한 플러그인만
+--------------------------------------------------------------------------------
+[root@ol7a ~]# time sosreport --batch --case-id 12345678 --label quick -o kernel,memory,block,filesys 2>&1 | grep -E '^  /var/tmp|Size'
+  /var/tmp/sosreport-ol7a-quick-12345678-2026-11-16-obeakww.tar.xz
+ Size   1.45MiB
+
+real    0m3.164s
+user    0m1.450s
+sys     0m1.129s
+[root@ol7a ~]# ls -l /var/tmp/*.tar.xz | cut -c25-
+10217476 Nov 16 19:03 /var/tmp/sosreport-ol7a-lab18-12345678-2026-11-16-tnvhizi.tar.xz
+ 1522204 Nov 16 19:03 /var/tmp/sosreport-ol7a-quick-12345678-2026-11-16-obeakww.tar.xz
+-- 네 플러그인만: 3.2초, 1.45MiB. 전체(24.4초, 9.74MiB)의 1/7 크기
+-- 업로드가 어렵거나 지원 쪽이 특정 플러그인을 요청할 때 쓴다. -n
+-- 은 반대로 빼고 싶은 것을 고른다
+
+--------------------------------------------------------------------------------
+ [7] 임시 공간이 모자라면
+--------------------------------------------------------------------------------
+-- 20MB tmpfs 를 --tmp-dir 로 준다. /var/tmp 가 거의 찬 서버를
+-- 흉내 낸다.
+[root@ol7a ~]# mkdir -p /mnt/small; mount -t tmpfs -o size=20m tmpfs /mnt/small; df -h /mnt/small | tail -1
+tmpfs            20M     0   20M   0% /mnt/small
+-- 20MB 짜리 tmpfs. 압축 전 72M 가 필요한 작업에는 모자란다
+[root@ol7a ~]# sosreport --batch --tmp-dir /mnt/small --label small 2>&1 | grep -v 'Running [0-9]*/' | tail -6; echo "exit=${PIPESTATUS[0]}"
+    self.stream.flush()
+IOError: [Errno 28] No space left on device
+Logged from file sosreport.py, line 1088
+
+ No space left on device while collecting plugin data
+
+exit=1
+-- 증상   : IOError: [Errno 28] No space left on device, 마지막 줄
+--          No space left on device while collecting plugin data, exit 1
+-- 원인   : --tmp-dir 로 준 /mnt/small(20M)에 풀린 사본을 만들다
+--          공간이 찼다. 압축 전 72M 가 필요하다
+--          파이썬 IOError 까지 찍혀 프로그램 오류처럼 보이지만 원인은 공간이다
+-- 조치   : df -h 로 여유를 보고 넉넉한 파일 시스템을 --tmp-dir 로
+--          준다. 아래 /root/sostmp
+-- 재확인 : /root/sostmp 에 bigtmp 묶음(1.41MiB)이 만들어졌다
+[root@ol7a ~]# df -h /mnt/small | tail -1; umount /mnt/small; mkdir -p /root/sostmp
+tmpfs            20M     0   20M   0% /mnt/small
+-- 실패한 뒤 Used 0. sos 가 실패하며 임시 디렉터리를 스스로
+-- 지웠다. 그래서 사후에 df 만 보면 원인이 안 보인다
+[root@ol7a ~]# sosreport --batch --tmp-dir /root/sostmp --label bigtmp -o kernel,memory 2>&1 | grep -E '^  /root|Size'
+  /root/sostmp/sosreport-ol7a-bigtmp-2026-11-16-wvyonby.tar.xz
+ Size   1.41MiB
+-- 결과 파일도 --tmp-dir 아래에 생긴다(/root/sostmp/...). 보낸 뒤
+-- 지운다
+
+--------------------------------------------------------------------------------
+ [8] OSWatcher 설치 — ol7_addons
+--------------------------------------------------------------------------------
+-- ol7_addons 는 정의돼 있지만 기본으로 꺼져 있다. --enablerepo 로
+-- 이번 명령에만 켠다.
+[root@ol7a ~]# yum repolist all 2>/dev/null | grep -E '^ol7_addons'
+ol7_addons/x86_64                 Oracle Linux 7Server Add ons ( disabled
+-- ol7_addons 는 저장소 정의 파일에 있지만 disabled. 기본 활성
+-- 저장소는 ol7_latest·ol7_UEKR6 둘이다
+[root@ol7a ~]# yum -y -q --enablerepo=ol7_addons install oswatcher 2>&1 | tail -2; rpm -q oswatcher
+oswatcher-9.0.0-5.el7.noarch
+[root@ol7a ~]# rpm -ql oswatcher | grep -E '^/etc|systemd|sbin'; rpm -ql oswatcher | grep -c libexec
+/etc/logrotate.d/oswatcher
+/etc/sysconfig/oswatcher
+/usr/lib/systemd/system/oswatcher.service
+/usr/sbin/OSWatcher
+23
+-- oswatcher-9.0.0-5.el7 설치. 공식 문서가 안내하는 MOS 301137.1
+-- 의 tar(oswbbVERS.tar) 대신 RPM 이다
+-- 구성: /etc/sysconfig/oswatcher(설정), oswatcher.service(유닛),
+-- /usr/sbin/OSWatcher(본체 셸 스크립트)
+--       /usr/libexec/oswatcher 아래 도구별 보조 스크립트 23개, logrotate 설정
+
+--------------------------------------------------------------------------------
+ [9] 설정 파일과 서비스
+--------------------------------------------------------------------------------
+[root@ol7a ~]# cat /etc/sysconfig/oswatcher
+# The directory where oswatcher logs should be kept
+DATADIR=/var/log/oswatcher
+# The interval (in seconds) between runs runs of statistics collections
+INTERVAL=30
+# The maximum age (in hours) of the various log files
+MAXAGE=48
+# An optional program used to compress the log files
+ZIP=gzip
+-- DATADIR 보관 위치, INTERVAL 수집 간격(초), MAXAGE 보관
+-- 시간(시간), ZIP 압축 도구
+-- 30초·48시간은 tar 판 startOSWbb.sh 의 기본값과 같다
+[root@ol7a ~]# systemctl cat oswatcher | grep -E '^(Type|EnvironmentFile|ExecStart|Restart)'
+Type=simple
+EnvironmentFile=/etc/sysconfig/oswatcher
+Restart=on-abort
+ExecStart=/usr/sbin/OSWatcher $INTERVAL $MAXAGE $ZIP $DATADIR
+-- EnvironmentFile 로 위 네 변수를 읽어 ExecStart 의 인자로
+-- 넘긴다. 상주하는 셸 스크립트라 Type=simple
+[root@ol7a ~]# systemctl is-enabled oswatcher; systemctl is-active oswatcher
+enabled
+inactive
+-- 설치 스크립트가 enable 은 했지만 start 는 하지 않았다. 지금은
+-- inactive, 다음 부팅부터 자동으로 돈다
+[root@ol7a ~]# systemctl start oswatcher; sleep 3; systemctl status oswatcher --no-pager | sed -n '3,7p'
+   Active: active (running) since Mon 2026-11-16 19:04:01 KST; 3s ago
+ Main PID: 10569 (OSWatcher)
+   CGroup: /system.slice/oswatcher.service
+           ├─10569 /bin/sh /usr/sbin/OSWatcher 30 48 gzip /var/log/oswatcher
+           └─10613 iostat -xk 1 3
+-- 메인 PID 10569 는 /bin/sh /usr/sbin/OSWatcher 30 48 gzip
+-- /var/log/oswatcher
+-- 자식으로 iostat -xk 1 3 이 돌고 있다. 30초마다
+-- vmstat·iostat·top·ps 등을 한 묶음씩 실행한다
+
+--------------------------------------------------------------------------------
+ [10] 보관 파일 — archive 아래 도구별 디렉터리
+--------------------------------------------------------------------------------
+[root@ol7a ~]# ls /var/log/oswatcher; ls /var/log/oswatcher/archive | column -c 100
+archive
+locks
+log
+tmp
+oswarp          oswiostat       oswnfsiostat    oswprvtnet      oswvmstat
+oswbuddyinfo    oswmeminfo      oswnumastat     oswps           oswxentop
+oswcpuinfo      oswmpstat       oswpagetype     oswslabinfo     oswzoneinfo
+oswifconfig     oswnetstat      oswpidstat      oswtop
+-- /var/log/oswatcher 아래 archive(결과), locks, log(OSWatcher
+-- 자체 로그), tmp
+-- archive 아래 도구별 디렉터리 19개. 공식 문서 표의
+-- oswvmstat·oswiostat·oswtop·oswps·oswnetstat 외에
+-- buddyinfo·numastat·pidstat 등 9.0 판에서 늘어난 것이 있다.
+-- oswprvtnet 은 RAC 사설망 점검용이다
+[root@ol7a ~]# ls -l /var/log/oswatcher/archive/oswvmstat /var/log/oswatcher/archive/oswtop | cut -c30-
+wtop:
+
+Nov 16 19:04 ol7a.example.com_top_26.11.16.1900.dat
+
+wvmstat:
+
+Nov 16 19:04 ol7a.example.com_vmstat_26.11.16.1900.dat
+-- cut 이 디렉터리 이름 앞 글자까지 잘라 wtop:·wvmstat: 로
+-- 보인다(oswtop, oswvmstat)
+-- 파일 이름: 호스트_도구_YY.MM.DD.HH00.dat. 한 시간에 파일 하나.
+-- 19시 파일이다
+-- 표본 시작 줄은 원래 zzz 뒤에 별표 세 개가 붙는다. sed 로 별표를
+-- 지워 읽기 쉽게 했다.
+[root@ol7a ~]# head -14 /var/log/oswatcher/archive/oswvmstat/*.dat | sed 's/^zzz \*\*\*/zzz /'
+Linux OSWbb v9.0 ol7a.example.com
+SNAP_INTERVAL 30
+CPU_CORES 2
+VCPUS 2
+OSWBB_ARCHIVE_DEST /var/log/oswatcher/archive
+zzz Mon Nov 16 19:04:17 KST 2026
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 4  0      0 2752340  11420 709756    0    0  4221   969 1126 2057 17 18 64  1  0
+ 0  0      0 2749404  11420 709884    0    0    84     4  356  594  2  3 96  0  0
+ 0  0      0 2750436  11420 709852    0    0     0     0  188  243  0  1 99  0  0
+zzz Mon Nov 16 19:04:47 KST 2026
+-- 머리 5줄: OSWbb v9.0, SNAP_INTERVAL 30, CPU_CORES 2, VCPUS 2,
+-- 보관 위치
+-- zzz 로 시작하는 시각 줄이 표본의 시작 표시다(원문은 zzz 뒤에
+-- 별표 셋). 그 아래가 vmstat 원문(1초 간격 3줄)이다
+-- 19:04:17 → 19:04:47 로 30초 간격. 첫 줄은 부팅 이후 평균이라
+-- 버리는 것은 vmstat 과 같다
+-- 분석 도구(OSWbba)는 이 zzz 줄을 기준으로 시각별로 자른다
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+[root@ol7a ~]# grep -c '^zzz' /var/log/oswatcher/archive/oswvmstat/*.dat; du -sh /var/log/oswatcher/archive
+2
+192K    /var/log/oswatcher/archive
+-- 1분 남짓 동안 표본 2개, archive 전체 192K. 하루면 수십 MB,
+-- 48시간 보관이면 그 두 배를 잡는다
+-- 시간이 지난 .dat 은 gzip 으로 압축되고 MAXAGE 를 넘으면
+-- 지워진다
+
+--------------------------------------------------------------------------------
+ [11] 간격·보관 시간 바꾸기 — 설정만 고치면
+--------------------------------------------------------------------------------
+-- 10초 간격, 1시간 보관으로 바꾼다.
+[root@ol7a ~]# cp -p /etc/sysconfig/oswatcher /root/oswatcher.orig; sed -i -e 's/^INTERVAL=.*/INTERVAL=10/' -e 's/^MAXAGE=.*/MAXAGE=1/' /etc/sysconfig/oswatcher; diff /root/oswatcher.orig /etc/sysconfig/oswatcher
+4c4
+< INTERVAL=30
+---
+> INTERVAL=10
+6c6
+< MAXAGE=48
+---
+> MAXAGE=1
+-- INTERVAL 30 → 10, MAXAGE 48 → 1. 원본은 /root/oswatcher.orig
+[root@ol7a ~]# ps -o pid,lstart,args -C OSWatcher | cut -c1-110
+  PID                  STARTED COMMAND
+10569 Mon Nov 16 19:04:00 2026 /bin/sh /usr/sbin/OSWatcher 30 48 gzip /var/log/oswatcher
+-- 증상   : 설정 파일은 INTERVAL=10, MAXAGE=1 인데 돌고 있는
+--          프로세스의 인자는 30 48 그대로
+-- 원인   : 설정은 ExecStart 의 인자로 시작할 때 한 번 넘어간다.
+--          실행 중인 스크립트는 파일을 다시 읽지 않는다
+-- 조치   : systemctl restart oswatcher
+-- 재확인 : 아래에서 새 PID 11060, 시작 19:05:09, 인자 10 1.
+--          vmstat 표본도 10초 간격이 됐다
+[root@ol7a ~]# systemctl restart oswatcher; sleep 3; ps -o pid,lstart,args -C OSWatcher | cut -c1-110
+  PID                  STARTED COMMAND
+11060 Mon Nov 16 19:05:09 2026 /bin/sh /usr/sbin/OSWatcher 10 1 gzip /var/log/oswatcher
+[root@ol7a ~]# tail -12 /var/log/oswatcher/archive/oswvmstat/*.dat | grep zzz | sed 's/^zzz \*\*\*/zzz /'
+zzz Mon Nov 16 19:05:26 KST 2026
+zzz Mon Nov 16 19:05:36 KST 2026
+-- 19:05:26 → 19:05:36 으로 10초 간격. 간격을 줄이면 파일이 그만큼
+-- 커지므로 장애 조사 기간에만 쓴다
+
+--------------------------------------------------------------------------------
+ [변형] 같은 순간을 sar 와 OSWatcher 로
+--------------------------------------------------------------------------------
+-- OSWatcher 의 oswtop 은 그 순간의 top 원문이다. sar 는 같은
+-- 시간대를 10분 평균 한 줄로 남긴다.
+[root@ol7a ~]# grep -m1 -A6 '^zzz' /var/log/oswatcher/archive/oswtop/*.dat | cut -c1-90 | sed 's/^zzz \*\*\*/zzz /'
+zzz Mon Nov 16 19:04:17 KST 2026
+top - 19:04:18 up 1 min,  0 users,  load average: 0.90, 0.34, 0.12
+Tasks: 176 total,   1 running, 101 sleeping,   0 stopped,   0 zombie
+%Cpu(s):  0.5 us,  0.5 sy,  0.0 ni, 98.5 id,  0.0 wa,  0.0 hi,  0.5 si,  0.0 st
+KiB Mem :  3716120 total,  2747636 free,   247120 used,   721364 buff/cache
+KiB Swap:  4063228 total,  4063228 free,        0 used.  3181856 avail Mem 
+-- oswtop 은 top 원문이다. 19:04:18 의 부하 평균·Tasks·%Cpu(s) 가
+-- 그대로 남는다. 아래쪽에는 프로세스 목록도 있다(잘랐음)
+-- 같은 시각의 sar 는 10분 간격 평균 한 줄뿐이다. "그 순간 무엇이
+-- 돌았나" 는 OSWatcher 의 top·ps 로 본다
+[root@ol7a ~]# ls /var/log/oswatcher/archive/oswps; grep -c '^zzz' /var/log/oswatcher/archive/oswps/*.dat
+ol7a.example.com_ps_26.11.16.1900.dat
+4
+-- oswps 는 ps 원문. 1분 남짓 사이에 표본 4개(30초 둘 + 10초 둘)
+[root@ol7a ~]# cat /etc/logrotate.d/oswatcher | head -4
+/var/log/oswatcher/log {
+        notifempty
+        missingok
+        daily
+-- OSWatcher 자체 로그(/var/log/oswatcher/log)는 logrotate 가 매일
+-- 돌려 3개를 남긴다. archive 는 MAXAGE 가 관리한다
+
+--------------------------------------------------------------------------------
+ [12] 되돌림
+--------------------------------------------------------------------------------
+[root@ol7a ~]# systemctl stop oswatcher; yum -y -q remove oswatcher 2>&1 | tail -2; rm -rf /var/log/oswatcher /root/oswatcher.orig; rpm -q oswatcher; ls /etc/sysconfig/oswatcher
+warning: /etc/sysconfig/oswatcher saved as /etc/sysconfig/oswatcher.rpmsave
+package oswatcher is not installed
+ls: cannot access /etc/sysconfig/oswatcher: No such file or directory
+-- 패키지를 지울 때 고친 설정 파일은
+-- /etc/sysconfig/oswatcher.rpmsave 로 남았다(warning 줄)
+-- 기준 상태로 완전히 되돌리려면 rpmsave 도 지운다. 이 실습은 다음
+-- 실습 전에 스냅샷으로 되돌린다
+[root@ol7a ~]# rm -rf /var/tmp/sx /var/tmp/sosreport-* /root/sostmp /mnt/small /tmp/sos.out; findmnt /mnt/small; echo "mnt=$?"; ls /var/tmp; rpm -q sos
+mnt=1
+abrt
+systemd-private-e695e7f2a7b84a3bb95fac96a522d9f6-chronyd.service-JtJobG
+sos-3.9-5.0.29.el7_9.10.noarch
+-- 묶음·풀린 디렉터리·tmpfs 마운트 지점 정리(findmnt 종료 코드 1 =
+-- 마운트 없음). sos 는 그대로 둔다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                       결과
+--  --batch 없음               EOF when reading a line, exit 1
+--  기본 플러그인 전부         24.4초, 9.74MiB(풀면 72M·파일 6292), skipped 4
+--  -o 네 개                   3.2초, 1.45MiB
+--  --tmp-dir 20MB tmpfs       IOError [Errno 28], 실패 뒤 Used 0
+--  --tmp-dir /root/sostmp     1.41MiB 생성
+--  oswatcher                  ol7_addons 9.0.0-5, enabled·inactive → start
+--  수집 간격·보관             30초·48시간 → 10초·1시간(restart 해야 반영)
+--  되돌린 뒤                  oswatcher 없음(rpmsave 남음), /var/tmp 원래대로, sos 그대로
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. sosreport -l 의 플러그인 옵션 가운데 logs.all_logs 를
+--    켜고(-k logs.all_logs=on) 크기를 비교한다
+--    확인: Size 줄과 var/log 아래 파일 수
+-- 2. OSWatcher 를 켜 둔 채 실습 01 의 루프를 1분 돌리고 oswtop
+--    에서 그 시각을 찾는다
+--    확인: zzz 줄 아래 top 목록에 sh 가 %CPU 99 근처로 있는지
+-- 3. MAXAGE=1 로 두고 두 시간 뒤 archive 의 .dat 수를 센다
+--    확인: 한 시간이 지난 파일이 .gz 로 바뀌고 오래된 것이 지워지는지
+
+================================================================================
+ 실습 07 종료 — sosreport 24.4초·9.74MiB(풀면 72M), 20MB 임시 공간은 Errno 28, OSWatcher 는 ol7_addons RPM 으로 30초 수집, 설정 변경은 재시작해야 반영
+================================================================================

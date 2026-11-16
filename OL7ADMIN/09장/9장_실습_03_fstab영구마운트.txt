@@ -1,0 +1,504 @@
+================================================================================
+ 제9장 실습 03 — fstab 영구 마운트
+ 대상   : ol7a
+ 목표   : 장치명·UUID·LABEL 세 방식으로 /etc/fstab 에 등록하고, 여섯 필드와
+          noatime·nofail 옵션의 효과를 확인한 뒤 mount -a 와 재부팅으로 검증
+ 배경   : mount 명령으로 붙인 파일 시스템은 재부팅하면 사라진다. 부팅 때마다
+          붙이려면 /etc/fstab 에 적는다. OL7 의 systemd 는 부팅과 daemon-reload
+          때 fstab 을 읽어 .mount 유닛을 만들고(systemd-fstab-generator), 한 줄이
+          틀리면 부팅이 emergency 모드에서 멈출 수 있다(실습 04)
+          (본문 9.6절)
+ 소요   : 약 30분 (재부팅 1회 포함)
+ 선행   : storage-clean 스냅샷
+ 계정   : root
+ 주의   : /etc/fstab 을 고친다. 시작할 때 원본을 /root/fstab.orig 로 복사해 둔다
+ 되돌림 : fstab 원본 복원(diff 출력 없음), 언마운트, wipefs, 마운트 지점 삭제.
+          확인 명령 diff /root/fstab.orig /etc/fstab, findmnt -s | grep data
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+-- 고치기 전 fstab 원문. 나중에 되돌릴 기준이 된다.
+[root@ol7a ~]# cat /etc/fstab
+
+#
+# /etc/fstab
+# Created by anaconda on Wed Nov 11 19:45:14 2026
+#
+# Accessible filesystems, by reference, are maintained under '/dev/disk'
+# See man pages fstab(5), findfs(8), mount(8) and/or blkid(8) for more info
+#
+/dev/mapper/ol-root     /                       xfs     defaults        0 0
+UUID=9e9b6650-ec84-4fa9-b7ec-e541592b4ecc /boot                   xfs     defaults        0 0
+/dev/mapper/ol-swap     swap                    swap    defaults        0 0
+-- 주석 7줄 + 설정 3줄. 설치 프로그램(anaconda)이 만들었다
+-- 루트·스왑은 LVM 이름(/dev/mapper/ol-*),
+-- /boot 는 UUID= 로 적혀 있다
+-- LVM 이름은 VG·LV 이름에서 나와 디스크 순서와 무관하다.
+-- 일반 파티션만 UUID 로 적은 이유다
+-- 원본을 복사하고 체크섬을 남긴다. -p 는 권한·시각 보존.
+[root@ol7a ~]# cp -p /etc/fstab /root/fstab.orig; md5sum /etc/fstab /root/fstab.orig
+ce225c529a1c469b473395e87371ca2d  /etc/fstab
+ce225c529a1c469b473395e87371ca2d  /root/fstab.orig
+-- 두 체크섬이 같다. 끝에서 md5sum 으로 다시 비교한다
+-- 지금 붙어 있는 파일 시스템 중 실제 디스크에서 온 것만 본다.
+-- -t 로 유형을 거른다(proc·sysfs·tmpfs 같은 가상 파일 시스템 제외).
+[root@ol7a ~]# findmnt -t xfs,ext4,swap
+TARGET  SOURCE              FSTYPE OPTIONS
+/       /dev/mapper/ol-root xfs    rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+└─/boot /dev/sda1           xfs    rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,noquota
+-- OPTIONS 의 rw,relatime 은 fstab 의 defaults 가 풀린 결과다.
+-- attr2 이후는 xfs 고유 옵션
+-- 스왑은 파일 시스템이 아니라 findmnt 에 나오지 않는다(-t swap 은 결과 없음)
+[root@ol7a ~]# lsblk -f /dev/sda /dev/sdb
+-- lsblk -f 는 FSTYPE·LABEL·UUID 를 함께 보여 준다. sdb 는 아직 비었다
+NAME        FSTYPE      LABEL UUID                                   MOUNTPOINT
+sda                                                                  
+├─sda2      LVM2_member       ULDbRp-NtXT-dFGI-omgJ-rwPg-dl2e-CwYyeF 
+│ ├─ol-swap swap              0779f04f-cbfc-42d5-b8c5-44173384aedf   [SWAP]
+│ └─ol-root xfs               d527e202-9baf-46ef-9423-ac690a91a6a9   /
+└─sda1      xfs               9e9b6650-ec84-4fa9-b7ec-e541592b4ecc   /boot
+sdb                                                                  
+
+--------------------------------------------------------------------------------
+ [1] 기존 fstab 한 줄을 여섯 필드로 읽기
+--------------------------------------------------------------------------------
+-- 주석을 빼고 열을 맞춰 본다. column -t 는 공백 구분 열을 정렬만 한다.
+[root@ol7a ~]# grep -v '^#' /etc/fstab | grep -v '^$' | column -t
+/dev/mapper/ol-root                        /      xfs   defaults  0  0
+UUID=9e9b6650-ec84-4fa9-b7ec-e541592b4ecc  /boot  xfs   defaults  0  0
+/dev/mapper/ol-swap                        swap   swap  defaults  0  0
+-- 여섯 필드: 장치 / 마운트 지점 / 유형 / 옵션 / dump / fsck 순서
+--   스왑은 둘째 필드가 swap(마운트 지점 없음)
+--   여섯째가 모두 0. xfs 는 부팅 때 검사할 것이 없고 스왑은 검사 대상이 아니다
+-- findmnt -s 는 fstab 을 읽어 표로 보여 준다(--fstab 과 같음)
+-- 실제 마운트 상태가 아니라 파일 내용을 표로 바꾼 것이다
+[root@ol7a ~]# findmnt -s
+TARGET SOURCE                                    FSTYPE OPTIONS
+/      /dev/mapper/ol-root                       xfs    defaults
+/boot  UUID=9e9b6650-ec84-4fa9-b7ec-e541592b4ecc xfs    defaults
+swap   /dev/mapper/ol-swap                       swap   defaults
+-- TARGET·SOURCE·FSTYPE·OPTIONS 가 fstab 의 1~4 필드와 같다.
+-- dump·fsck 필드는 나오지 않는다
+
+--------------------------------------------------------------------------------
+ [2] 파티션 세 개와 Ext4 준비
+--------------------------------------------------------------------------------
+-- 1G 주 파티션 세 개.
+[root@ol7a ~]# printf 'o\nn\np\n1\n\n+1G\nn\np\n2\n\n+1G\nn\np\n3\n\n+1G\nw\n' | fdisk /dev/sdb >/dev/null; lsblk /dev/sdb
+Device does not contain a recognized partition table
+Building a new DOS disklabel with disk identifier 0xe34c1248.
+Building a new DOS disklabel with disk identifier 0x7f300189.
+NAME   MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdb      8:16   0  10G  0 disk 
+├─sdb2   8:18   0   1G  0 part 
+├─sdb3   8:19   0   1G  0 part 
+└─sdb1   8:17   0   1G  0 part 
+-- fdisk 출력은 >/dev/null 로 버렸다. 남은 세 줄은 표준 오류로 나온 안내다
+-- 1G 파티션 셋이 생겼다(lsblk 의 줄 순서는 섞여 나온다)
+-- 실습을 다시 해도 같은 줄이 나오도록 sdb1·sdb2 의 UUID 를 -U 로 정해서 만든다.
+-- 평소에는 -U 를 쓰지 않는다(mkfs 가 무작위로 만든다). sdb3 에는 -L 로 레이블.
+-- -q 는 진행 출력을 줄인다(출력 해석은 실습 02).
+[root@ol7a ~]# mkfs.ext4 -q -U 7a1d3e5f-2b4c-4d6e-8f01-a2b3c4d5e6f7 /dev/sdb1
+[root@ol7a ~]# mkfs.ext4 -q -U 5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c51 /dev/sdb2
+[root@ol7a ~]# mkfs.ext4 -q -L arch /dev/sdb3
+
+--------------------------------------------------------------------------------
+ [3] 세 가지 식별자 확인
+--------------------------------------------------------------------------------
+[root@ol7a ~]# blkid /dev/sdb1 /dev/sdb2 /dev/sdb3
+/dev/sdb1: UUID="7a1d3e5f-2b4c-4d6e-8f01-a2b3c4d5e6f7" TYPE="ext4" 
+/dev/sdb2: UUID="5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c51" TYPE="ext4" 
+/dev/sdb3: LABEL="arch" UUID="f4833938-b1a0-4368-8b7e-aa0e9874c3e6" TYPE="ext4" 
+-- sdb1·sdb2 의 UUID 가 -U 로 준 값 그대로다.
+-- sdb3 은 무작위 UUID 와 LABEL="arch"
+-- TYPE="ext4" 는 셋 다 같다.
+-- 이 세 값 어느 것으로도 fstab 에 적을 수 있다
+-- udev 가 식별자마다 링크를 만들어 둔다. fstab 의 UUID= · LABEL= 은 결국 이 링크로 찾는다.
+[root@ol7a ~]# ls -l /dev/disk/by-uuid/ | grep sdb
+lrwxrwxrwx. 1 root root 10 Nov 13 19:49 5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c51 -> ../../sdb2
+lrwxrwxrwx. 1 root root 10 Nov 13 19:49 7a1d3e5f-2b4c-4d6e-8f01-a2b3c4d5e6f7 -> ../../sdb1
+-- 링크 이름이 UUID, 대상이 장치다.
+-- fstab 의 UUID=… 은 결국 이 링크를 따라간다
+lrwxrwxrwx. 1 root root 10 Nov 13 19:49 f4833938-b1a0-4368-8b7e-aa0e9874c3e6 -> ../../sdb3
+[root@ol7a ~]# ls -l /dev/disk/by-label/
+total 0
+lrwxrwxrwx. 1 root root 10 Nov 13 19:49 arch -> ../../sdb3
+lrwxrwxrwx. 1 root root  9 Nov 13 19:48 OL-7.9\x20Server.x86_64 -> ../../sr0
+-- arch → sdb3. 설치 ISO 의 레이블(공백은 \x20)도 보인다
+
+--------------------------------------------------------------------------------
+ [4] fstab 에 세 줄 추가
+--------------------------------------------------------------------------------
+-- 마운트 지점 두 개만 먼저 만든다(/data3 은 빠뜨린 상황).
+[root@ol7a ~]# mkdir /data1 /data2
+-- sdb1 은 장치명, sdb2 는 UUID(옮겨 적다 마지막 두 글자 51 을 15 로 바꿔 씀),
+-- sdb3 은 LABEL. 옵션
+--   defaults  rw,suid,dev,exec,auto,nouser,async 묶음
+--   noatime   읽을 때 접근 시각(atime)을 기록하지 않음
+--   nofail    장치가 없어도 부팅을 멈추지 않음
+-- 다섯째 필드 0 = dump 대상 아님, 여섯째 필드 2 = 루트 다음 순서로 fsck
+[root@ol7a ~]# cat >> /etc/fstab <<'EOF'
+/dev/sdb1                                 /data1  ext4  defaults          0 2
+UUID=5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c15 /data2  ext4  defaults,noatime  0 2
+LABEL=arch                                /data3  ext4  defaults,nofail   0 2
+EOF
+-- 무엇이 바뀌었는지 원본과 비교한다.
+[root@ol7a ~]# diff /root/fstab.orig /etc/fstab
+11a12,14
+> /dev/sdb1                                 /data1  ext4  defaults          0 2
+> UUID=5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c15 /data2  ext4  defaults,noatime  0 2
+> LABEL=arch                                /data3  ext4  defaults,nofail   0 2
+-- diff 의 11a12,14 = 원본 11번째 줄 뒤에 12~14번째 줄이 추가됐다. > 는 새 파일 쪽 줄
+
+--------------------------------------------------------------------------------
+ [5] mount -a 로 검증
+--------------------------------------------------------------------------------
+-- 재부팅 전에 fstab 을 시험하는 방법. -a 는 noauto 가 아닌 모든 줄을 마운트하고,
+-- 이미 붙은 것은 건너뛴다. 먼저 -f(실제로 붙이지 않음) -v(자세히)로 본다.
+[root@ol7a ~]# mount -fav
+mount: can't find UUID=5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c15
+/                        : ignored
+/boot                    : already mounted
+swap                     : ignored
+/data1                   : successfully mounted
+/data3                   : successfully mounted
+-- -f(fake) 라 실제로는 아무것도 붙지 않았다. 그런데도 결과가 다르게 나온다
+--   /data2 줄은 can't find UUID… 로 실패. 장치 찾기는 -f 에서도 한다
+--   /data3 은 successfully mounted. 마운트 지점이 없는 것은 -f 가 잡지 못한다
+--   / 와 swap 은 ignored(이미 붙었거나 swap 유형), /boot 는 already mounted
+-- 진짜로 붙인다.
+[root@ol7a ~]# mount -a; echo rc=$?
+mount: can't find UUID=5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c15
+mount: mount point /data3 does not exist
+rc=64
+-- 증상   : "mount: can't find UUID=5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c15", rc=64
+-- 원인   : 아래 두 줄 비교에서 보듯 실제 UUID 는 …4c51, fstab 에는 …4c15 로 적었다
+-- 조치   : sed 로 끝 두 글자를 바로잡는다
+-- 재확인 : mount -a 가 rc=0, findmnt 에 /data2 가 나온다
+-- 같은 실행에서 /data3 은 "mount point /data3 does not exist" 로 따로 실패했다
+-- 메시지만 봐도 장치 문제와 디렉터리 문제가 구분된다
+-- rc=64 는 mount(8) 의 "일부 성공" 코드다.
+-- /data1 은 붙었다(바로 아래)
+[root@ol7a ~]# findmnt /data1; findmnt /data2; findmnt /data3
+TARGET SOURCE    FSTYPE OPTIONS
+/data1 /dev/sdb1 ext4   rw,relatime,seclabel
+-- findmnt 세 번 중 /data1 만 출력이 있다.
+-- 실패한 줄 때문에 나머지가 막히지는 않는다
+-- UUID 링크 목록과 fstab 의 줄을 나란히 놓아 본다.
+[root@ol7a ~]# ls /dev/disk/by-uuid/ | grep ^5d2a; grep data2 /etc/fstab
+5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c51
+UUID=5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c15 /data2  ext4  defaults,noatime  0 2
+-- 두 줄의 마지막 두 글자 51 과 15.
+-- 긴 UUID 는 눈으로 옮겨 적지 말고 blkid -s UUID -o value 로 넣는다
+-- 고친다. sed 로 마지막 두 글자를 바로잡고, 빠뜨린 마운트 지점을 만든다.
+[root@ol7a ~]# sed -i 's/2e7f1a3b4c15/2e7f1a3b4c51/' /etc/fstab; mkdir /data3
+[root@ol7a ~]# mount -a; echo rc=$?
+rc=0
+[root@ol7a ~]# findmnt -t ext4
+TARGET SOURCE    FSTYPE OPTIONS
+/data1 /dev/sdb1 ext4   rw,relatime,seclabel
+/data2 /dev/sdb2 ext4   rw,noatime,seclabel
+/data3 /dev/sdb3 ext4   rw,relatime,seclabel
+-- 셋 다 붙었다. OPTIONS 를 보면 /data2 만 noatime,
+-- 나머지는 기본 relatime
+-- fstab 의 defaults 는 rw 로 풀렸고 suid·dev·exec·async 는 기본값이라 표시되지 않는다
+-- seclabel 은 SELinux 가 이 파일 시스템의 보안 레이블을 다룬다는 표시(설정 대상 아님)
+
+--------------------------------------------------------------------------------
+ [6] 마운트 결과 확인 — df 일곱 열
+--------------------------------------------------------------------------------
+[root@ol7a ~]# df -hT /data1 /data2 /data3
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdb1      ext4  975M   24K  908M   1% /data1
+/dev/sdb2      ext4  975M   24K  908M   1% /data2
+/dev/sdb3      ext4  975M   24K  908M   1% /data3
+-- df -hT 일곱 열: Filesystem·Type·Size·Used·Avail·Use%·Mounted on
+--   Size 975M: 1GiB 에서 inode 표·저널 같은 메타데이터를 뺀 크기
+--   Used 24K: 빈 파일 시스템도 루트 디렉터리와 lost+found 가 쓴다
+--   Avail 908M: Size−Used 보다 적다. 차이는 root 몫 예약 블록 5%(실습 02)
+--   이 실습에서 볼 열은 Mounted on: 세 장치가 의도한 지점에 붙었다
+
+--------------------------------------------------------------------------------
+ [7] systemd 는 바뀐 fstab 을 바로 아는가
+--------------------------------------------------------------------------------
+-- mount -a 는 fstab 을 직접 읽었다. systemd 쪽은 아직 예전 fstab 을 기준으로 한다.
+-- FragmentPath = 유닛 정의 파일 위치, SourcePath = 그 유닛을 만든 원본.
+[root@ol7a ~]# systemctl show -p FragmentPath -p SourcePath data2.mount
+FragmentPath=
+SourcePath=/proc/self/mountinfo
+-- FragmentPath 가 비었다.
+-- 유닛 정의 파일 없이 커널의 마운트 표에서 만든 임시 유닛이다
+-- 7.9 의 mount 는 fstab 과 systemd 가 어긋났다는 힌트를 주지 않는다
+-- [OL8/9] mount 가 "your fstab has been modified,
+-- but systemd still uses the old version" 을 출력한다
+-- daemon-reload 를 하면 generator 가 fstab 을 다시 읽어 유닛 파일을 만든다.
+[root@ol7a ~]# systemctl daemon-reload
+[root@ol7a ~]# systemctl show -p FragmentPath -p SourcePath data2.mount
+FragmentPath=/run/systemd/generator/data2.mount
+SourcePath=/etc/fstab
+-- daemon-reload 뒤에는 generator 가 만든 파일이 정의(FragmentPath)이고 출처가 /etc/fstab 이다
+[root@ol7a ~]# ls /run/systemd/generator/
+boot.mount
+data1.mount
+data2.mount
+data3.mount
+dev-mapper-ol\x2dswap.swap
+getty.target.wants
+local-fs.target.requires
+local-fs.target.wants
+-.mount
+swap.target.requires
+-- fstab 한 줄에 유닛 하나: -.mount(루트),
+-- boot.mount, data1~3.mount, 스왑의 .swap
+-- *.requires 는 필수 의존(nofail 없음),
+-- local-fs.target.wants 는 /data3(nofail) 용 디렉터리다
+[root@ol7a ~]# cat /run/systemd/generator/data2.mount
+# Automatically generated by systemd-fstab-generator
+
+[Unit]
+SourcePath=/etc/fstab
+Documentation=man:fstab(5) man:systemd-fstab-generator(8)
+Before=local-fs.target
+RequiresOverridable=systemd-fsck@dev-disk-by\x2duuid-5d2a7c1e\x2d8f43\x2d4b6a\x2d9c0d\x2d2e7f1a3b4c51.service
+After=systemd-fsck@dev-disk-by\x2duuid-5d2a7c1e\x2d8f43\x2d4b6a\x2d9c0d\x2d2e7f1a3b4c51.service
+
+[Mount]
+What=/dev/disk/by-uuid/5d2a7c1e-8f43-4b6a-9c0d-2e7f1a3b4c51
+Where=/data2
+Type=ext4
+Options=defaults,noatime
+-- generator 가 쓴 유닛 파일
+--   What  : UUID= 를 /dev/disk/by-uuid/… 경로로 바꿨다
+--   Before=local-fs.target : 로컬 파일 시스템 완료 전에 붙어야 한다
+--   RequiresOverridable·After=systemd-fsck@… : 마운트 전에 fsck(여섯째 필드 2)
+-- nofail 이 붙은 /data3 과 붙지 않은 /data2 는 local-fs.target 과의 관계가 다르다.
+[root@ol7a ~]# systemctl show -p RequiredBy -p WantedBy -p Before data2.mount
+RequiredBy=local-fs.target
+WantedBy=dev-disk-by\x2duuid-5d2a7c1e\x2d8f43\x2d4b6a\x2d9c0d\x2d2e7f1a3b4c51.device
+Before=local-fs.target umount.target
+-- /data2: RequiredBy=local-fs.target.
+-- 이 마운트가 실패하면 local-fs.target 도 실패한다
+[root@ol7a ~]# systemctl show -p RequiredBy -p WantedBy -p Before data3.mount
+RequiredBy=
+WantedBy=local-fs.target dev-disk-by\x2dlabel-arch.device
+Before=umount.target
+-- /data3(nofail): RequiredBy 가 비고 WantedBy=local-fs.target.
+-- Before 에서도 local-fs.target 이 빠졌다
+-- 실패해도 local-fs.target 은 성공하고, 부팅이 이 마운트를 기다리지 않는다
+-- 이 차이가 실습 04 의 부팅 결과를 가른다
+
+--------------------------------------------------------------------------------
+ [8] noatime 의 효과
+--------------------------------------------------------------------------------
+-- /data1(relatime 기본)과 /data2(noatime) 에 같은 파일을 두고, 1초 뒤 읽어서
+-- 접근 시각(%x)이 바뀌는지 본다.
+[root@ol7a ~]# for d in /data1 /data2; do echo hello > $d/t.txt; done; sleep 1; stat -c '%n %x' /data1/t.txt /data2/t.txt
+/data1/t.txt 2026-11-13 19:49:10.611816069 +0900
+/data2/t.txt 2026-11-13 19:49:10.611816069 +0900
+-- 방금 쓴 두 파일의 접근 시각(%x)이 같다(19:49:10.61…)
+[root@ol7a ~]# sleep 1; cat /data1/t.txt /data2/t.txt >/dev/null; stat -c '%n %x' /data1/t.txt /data2/t.txt
+/data1/t.txt 2026-11-13 19:49:12.638813445 +0900
+/data2/t.txt 2026-11-13 19:49:10.611816069 +0900
+-- 1초 뒤 읽었다. /data1(relatime) 은 접근 시각이 갱신됐고 /data2(noatime) 는 그대로다
+-- relatime 은 "수정 시각보다 오래된 atime 만" 갱신한다. 한 번 더 읽으면.
+[root@ol7a ~]# sleep 1; cat /data1/t.txt >/dev/null; stat -c '%n %x' /data1/t.txt
+/data1/t.txt 2026-11-13 19:49:12.638813445 +0900
+-- 한 번 더 읽었지만 /data1 도 그대로다
+-- relatime 은 atime 이 mtime 보다 오래됐거나 24시간이 지났을 때만 갱신한다
+-- 첫 읽기 때는 atime=mtime 이라 갱신됐고,
+-- 지금은 atime 이 더 새로워 건너뛰었다
+
+--------------------------------------------------------------------------------
+ [9] 재부팅으로 영구 마운트 확인
+--------------------------------------------------------------------------------
+-- 재부팅 전 부팅 시각
+[root@ol7a ~]# uptime -s
+2026-11-13 19:48:57
+-- 재부팅(systemctl reboot). 러너가 SSH 가 다시 열릴 때까지 기다린다.
+[root@ol7a ~]# uptime -s
+-- 부팅 시각이 바뀌었다. 재부팅됐다
+2026-11-13 19:49:22
+[root@ol7a ~]# findmnt -t ext4
+TARGET SOURCE    FSTYPE OPTIONS
+/data1 /dev/sdb1 ext4   rw,relatime,seclabel
+/data3 /dev/sdb3 ext4   rw,relatime,seclabel
+/data2 /dev/sdb2 ext4   rw,noatime,seclabel
+-- 세 볼륨이 fstab 으로 다시 붙었다. 옵션도 재부팅 전과 같다
+[root@ol7a ~]# systemctl list-units -t mount --no-pager | grep -E 'UNIT|data'
+UNIT                          LOAD   ACTIVE SUB     
+data1.mount                   loaded active mounted /data1
+data2.mount                   loaded active mounted /data2
+data3.mount                   loaded active mounted /data3
+-- LOAD loaded·ACTIVE active·SUB mounted.
+-- 유닛으로도 세 마운트가 확인된다
+-- 부팅 로그에서 세 마운트가 붙은 순서와 fsck 실행 기록.
+[root@ol7a ~]# journalctl -b --no-pager -o short-monotonic | grep -E 'data[123]|systemd-fsck@' | grep -v 'Reached' | head -12
+[    2.611681] ol7a.example.com systemd[1]: Mounting /data1...
+[    2.615257] ol7a.example.com systemd[1]: Mounting /data3...
+[    2.637475] ol7a.example.com systemd[1]: Mounting /data2...
+[    2.664880] ol7a.example.com systemd[1]: Mounted /data1.
+[    2.669994] ol7a.example.com systemd[1]: Mounted /data3.
+[    2.685312] ol7a.example.com systemd[1]: Mounted /data2.
+-- 부팅 2.6초대에 세 마운트가 거의 동시에 시작했다.
+-- systemd 는 서로 의존이 없는 마운트를 병렬로 처리한다
+-- fstab 의 줄 순서는 1·2·3 인데 1·3·2 순으로 시작했다.
+-- 줄 순서가 마운트 순서를 정하지 않는다
+-- 바로 위 findmnt 의 줄 순서(data1·data3·data2)도 붙은 순서다
+-- systemd-fsck@ 줄이 grep 에 걸리지 않았다.
+-- 검사할 것이 없는 clean 상태라 기록이 짧게 남았다
+
+--------------------------------------------------------------------------------
+ [10] 장치명으로 등록했을 때의 위험
+--------------------------------------------------------------------------------
+-- /data1 은 /dev/sdb1 이라는 이름으로 등록했다. 이 이름이 어디서 오는지 본다.
+-- 커널은 SCSI 장치를 발견한 순서대로 sda·sdb… 를 붙인다.
+[root@ol7a ~]# ls -l /dev/disk/by-path/ | grep -E 'scsi-0:0:[01]:0 '
+lrwxrwxrwx. 1 root root  9 Nov 13 19:49 pci-0000:00:10.0-scsi-0:0:0:0 -> ../../sda
+lrwxrwxrwx. 1 root root  9 Nov 13 19:49 pci-0000:00:10.0-scsi-0:0:1:0 -> ../../sdb
+-- /dev/sdb 는 SCSI 주소 0:0:1:0 의 디스크에 붙은 이름이다.
+-- 주소는 슬롯이고 이름은 발견 순서다
+-- 이 랩은 발견 순서를 고정하려고 부트 파라미터를 하나 넣어 두었다.
+[root@ol7a ~]# cat /proc/cmdline
+BOOT_IMAGE=/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol-root ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync
+-- console=tty0 console=ttyS0,115200 은 랩 콘솔 캡처용 설정이다
+-- scsi_mod.scan=sync 는 SCSI 스캔을 동기로 해 발견 순서를 슬롯 순서와 맞춘다
+-- 이 랩을 만들던 날 이 값 없이 부팅했더니 OS 디스크가 sdb 로 잡힌 일이 있었다
+-- 증상   : (재현하지 않고 랩 준비 때의 실측) 업데이트 뒤 첫 부팅에서 40G OS 디스크가 sdb
+-- 원인   : UEK 의 비동기 SCSI 스캔. 먼저 응답한 디스크가 sda 를 가져간다
+-- 조치   : 데이터 볼륨은 UUID·LABEL 로 등록한다. 이 랩은 추가로 scsi_mod.scan=sync
+-- 재확인 : lsblk -d -o NAME,HCTL 에서 이름과 Target 번호 순서가 같은지 본다
+-- /data1 처럼 장치명으로 등록했다면 그날 sdb1 은 OS 디스크의 /boot 파티션이었다
+
+--------------------------------------------------------------------------------
+ [변형] fstab 대신 systemd .mount 유닛으로 붙이기
+--------------------------------------------------------------------------------
+-- /data1 을 fstab 에서 빼고, generator 가 만들던 것과 같은 일을 하는 유닛 파일을
+-- /etc/systemd/system 에 직접 둔다. 유닛 이름은 마운트 경로에서 정해진다
+-- (/data1 → data1.mount, /var/lib/x → var-lib-x.mount).
+[root@ol7a ~]# umount /data1; sed -i '/^\/dev\/sdb1 /d' /etc/fstab; systemctl daemon-reload
+[root@ol7a ~]# cat > /etc/systemd/system/data1.mount <<'EOF'
+[Unit]
+Description=data1 (unit file)
+
+[Mount]
+What=/dev/disk/by-uuid/7a1d3e5f-2b4c-4d6e-8f01-a2b3c4d5e6f7
+Where=/data1
+Type=ext4
+Options=defaults
+
+[Install]
+WantedBy=local-fs.target
+EOF
+[root@ol7a ~]# systemctl daemon-reload; systemctl enable --now data1.mount
+Created symlink from /etc/systemd/system/local-fs.target.wants/data1.mount to /etc/systemd/system/data1.mount.
+-- enable 은 [Install] 의 WantedBy 대로 local-fs.target.wants 에 링크를 만든다. --now 로 바로 시작
+[root@ol7a ~]# systemctl status data1.mount --no-pager | head -5
+● data1.mount - data1 (unit file)
+   Loaded: loaded (/etc/systemd/system/data1.mount; enabled; vendor preset: disabled)
+   Active: active (mounted) since Fri 2026-11-13 19:49:39 KST; 24ms ago
+    Where: /data1
+     What: /dev/sdb1
+-- Loaded 줄의 경로가 /etc/systemd/system/data1.mount 다.
+-- generator 유닛은 /run 아래였다
+-- enabled 는 [Install] 링크가 있다는 뜻.
+-- What= 의 by-uuid 경로가 /dev/sdb1 로 풀려 보인다
+[root@ol7a ~]# findmnt /data1
+TARGET SOURCE    FSTYPE OPTIONS
+/data1 /dev/sdb1 ext4   rw,relatime,seclabel
+-- fstab 줄 없이 같은 결과. 마운트에 순서·조건(After=,
+-- Requires=)을 직접 걸어야 할 때 이 방식을 쓴다
+-- 유닛 이름과 경로가 맞지 않으면 어떻게 되나. 이름을 data-one.mount 로 바꿔 본다.
+[root@ol7a ~]# cp /etc/systemd/system/data1.mount /etc/systemd/system/data-one.mount; systemctl daemon-reload; systemctl start data-one.mount; echo rc=$?
+Failed to start data-one.mount: Unit is not loaded properly: Invalid argument.
+See system logs and 'systemctl status data-one.mount' for details.
+rc=1
+[root@ol7a ~]# journalctl --no-pager -n 20 | grep -i 'data-one' | tail -3
+Nov 13 19:49:39 ol7a.example.com systemd[1]: data-one.mount's Where= setting doesn't match unit name. Refusing.
+-- 증상   : "Failed to start data-one.mount: Unit is not loaded properly: Invalid argument." rc=1
+-- 원인   : 로그의 "data-one.mount's Where= setting doesn't match unit name. Refusing."
+-- 조치   : 파일 이름을 경로에서 나온 이름(data1.mount)으로 둔다. 잘못 만든 파일은 지운다(바로 아래)
+-- 재확인 : systemctl daemon-reload 뒤 systemctl list-units 에 data-one.mount 가 없다
+-- 유닛 이름은 경로에서 정해진다.
+-- /data1 의 유닛은 data1.mount 여야 하고 다른 이름은 거부된다
+-- 경로를 유닛 이름으로 바꿀 때는 systemd-escape -p --suffix=mount /var/lib/x 로 계산한다
+[root@ol7a ~]# rm -f /etc/systemd/system/data-one.mount; systemctl daemon-reload
+
+--------------------------------------------------------------------------------
+ [11] 되돌리기
+--------------------------------------------------------------------------------
+-- 작업 디렉터리가 /data2 인 셸에서 언마운트를 시도한다.
+[root@ol7a data2]# umount /data2
+umount: /data2: target is busy.
+        (In some cases useful info about processes that use
+         the device is found by lsof(8) or fuser(1))
+[root@ol7a data2]# ls -l /proc/[0-9]*/cwd 2>/dev/null | grep /data2
+lrwxrwxrwx. 1 root root 0 Nov 13 19:49 /proc/10515/cwd -> /data2
+lrwxrwxrwx. 1 root root 0 Nov 13 19:49 /proc/10516/cwd -> /data2
+-- 증상   : "umount: /data2: target is busy."
+-- 원인   : 현재 디렉터리가 /data2 인 프로세스가 있다. /proc/PID/cwd 링크로 찾았다
+--          (프롬프트가 [root@ol7a data2] 다. 이 실습의 셸 자신이 붙잡고 있다)
+-- 조치   : 그 디렉터리를 떠난다(cd). 다른 프로세스라면 그 프로세스를 끝낸다
+-- 재확인 : 바로 아래 umount 가 오류 없이 끝나고 findmnt -t ext4 출력이 없다
+-- fuser(psmisc)는 기준 상태에 설치돼 있지 않아 /proc 를 직접 봤다
+lrwxrwxrwx. 1 root root 0 Nov 13 19:49 /proc/10517/cwd -> /data2
+-- 셸이 그 디렉터리를 떠난 뒤에는 된다.
+[root@ol7a ~]# systemctl disable --now data1.mount; rm -f /etc/systemd/system/data1.mount
+Removed symlink /etc/systemd/system/local-fs.target.wants/data1.mount.
+[root@ol7a ~]# umount /data2 /data3; findmnt -t ext4; echo rc=$?
+rc=0
+-- findmnt -t ext4 출력이 없다. 세 볼륨 모두 내려왔다
+-- fstab 원본 복원. diff 출력이 없으면 같다.
+[root@ol7a ~]# cp -p /root/fstab.orig /etc/fstab; diff /root/fstab.orig /etc/fstab; echo rc=$?
+rc=0
+-- diff 출력이 없고 rc=0. 원본과 같다
+[root@ol7a ~]# systemctl daemon-reload; ls /run/systemd/generator/
+boot.mount
+dev-mapper-ol\x2dswap.swap
+getty.target.wants
+local-fs.target.requires
+-.mount
+swap.target.requires
+-- daemon-reload 뒤 data*.mount 와 local-fs.target.wants 가 사라졌다. [7] 의 목록과 비교
+[root@ol7a ~]# wipefs -a /dev/sdb3 /dev/sdb2 /dev/sdb1 /dev/sdb >/dev/null; partprobe /dev/sdb; rmdir /data1 /data2 /data3
+[root@ol7a ~]# findmnt -s | grep data; lsblk /dev/sdb; md5sum /etc/fstab
+NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdb    8:16   0  10G  0 disk 
+ce225c529a1c469b473395e87371ca2d  /etc/fstab
+-- findmnt -s 에 data 가 없고,
+-- sdb 는 자식이 없고, 체크섬이 [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                  시작 전             변경 후                         되돌린 뒤
+--  fstab 설정 줄         3                   6 (장치명·UUID·LABEL)           3
+--  fstab md5             ce225c52…           (변경)                          ce225c52…
+--  mount -a              -                   rc=64 → 고친 뒤 rc=0            -
+--  data2.mount 출처      없음                mountinfo → reload 뒤 fstab     없음
+--  /data1 atime          -                   첫 읽기만 갱신(relatime)        -
+--  /data2 atime          -                   갱신 안 됨(noatime)             -
+--  재부팅 뒤 마운트       -                   세 볼륨 모두 붙음               -
+--  generator 유닛        boot·swap·-         + data1~3.mount                  boot·swap·-
+--
+-- 확인한 사실
+--   mount -a 는 틀린 줄만 실패시키고 나머지는 붙인다. 메시지로 원인이 갈린다
+--   fstab 을 고친 뒤 systemd 는 daemon-reload 전까지 옛 정의를 쓴다
+--   nofail 은 RequiredBy 를 WantedBy 로 바꾸고 local-fs.target 의 Before 에서 빠진다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. /data2 줄의 여섯째 필드를 0 으로 바꾸고 daemon-reload 한 뒤 생성된 유닛을 다시 연다
+--    확인: cat /run/systemd/generator/data2.mount 에서 systemd-fsck@ 줄이 사라졌는가
+-- 2. 옵션에 noauto 를 넣고 mount -a,
+-- 그다음 mount /data2 를 친다
+--    확인: mount -a 는 건너뛰고, 지점만 주면 fstab 을 찾아 붙는다
+-- 3. /var/lib/test 를 마운트 지점으로 하는 유닛 파일을 직접 만든다
+--    확인: systemd-escape -p --suffix=mount /var/lib/test 의 결과와 파일 이름이 같아야 시작된다
+-- 되돌린 뒤 확인: diff /root/fstab.orig /etc/fstab 출력 없음,
+-- lsblk /dev/sdb 자식 없음
+================================================================================
+ 실습 03 종료 — 세 방식의 fstab 등록, mount -a 로 UUID 오타 잡기, 재부팅 확인
+================================================================================

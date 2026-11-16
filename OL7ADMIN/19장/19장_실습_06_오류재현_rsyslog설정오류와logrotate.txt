@@ -1,0 +1,501 @@
+================================================================================
+ 제19장 실습 06 — 오류 재현: rsyslog 설정 오류와 logrotate
+ 대상   : ol7a
+ 목표   : 규칙 파일의 오타·괄호 누락을 rsyslogd -N1 로 찾아 고친다. 새 로그 파일에
+          logrotate 규칙을 붙여 -d(시험)·-f(강제)로 돌려 보고, postrotate 를 빠뜨렸을 때
+          rsyslog 가 회전된 옛 파일에 계속 쓰는 것을 확인한다. 괄호 누락이 /dev/log 를 지우는 장애도 재현한다
+ 배경   : rsyslog 는 설정 오류가 있어도 대개 데몬을 띄운다. 틀린 줄만 버리고 나머지로
+          동작하므로 서비스 상태만 보면 오류를 놓친다. logrotate 는 파일 이름만 바꾸고,
+          파일을 열어 둔 rsyslog 에 알리는 일은 postrotate 의 HUP 이 한다. 7.9 에서는
+          cron.daily 가 logrotate·logwatch 를 하루 한 번 돌린다 (본문 19.2·19.7·19.8)
+ 소요   : 약 40분
+ 선행   : ol7-base 스냅샷
+ 계정   : root
+ 주의   : logwatch 패키지를 설치했다가 지운다(인터넷 저장소 사용). 만든 파일은 끝에서 지운다
+ 되돌림 : rsyslog.d·logrotate.d 원래 목록, logwatch 미설치 → ls, rpm -q logwatch
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 두 디렉터리와 logwatch 설치 여부
+[root@ol7a ~]# ls /etc/rsyslog.d/; ls /etc/logrotate.d/ | xargs; rpm -q logrotate logwatch
+listen.conf
+bootlog chrony firewalld psacct samba syslog up2date wpa_supplicant yum
+logrotate-3.8.6-19.el7.x86_64
+package logwatch is not installed
+-- rsyslog.d 는 listen.conf 하나, logrotate.d 규칙 아홉 개, logwatch 없음
+-- 손대지 않을 파일의 지문
+[root@ol7a ~]# md5sum /etc/rsyslog.conf /etc/logrotate.conf /etc/logrotate.d/syslog
+0dd94a0c285fb32f41fa5b226e83c26b  /etc/rsyslog.conf
+4b32bbe6d2d20a1f3150b0fb3918ae54  /etc/logrotate.conf
+79d4bbb4dc7a5b5ff0b1b1ebd06c2b0b  /etc/logrotate.d/syslog
+-- 세 파일의 지문. 되돌림에서 다시 찍는다
+
+--------------------------------------------------------------------------------
+ [1] 셀렉터 오타 — 한 줄만 버려진다
+--------------------------------------------------------------------------------
+
+-- 규칙 두 줄 중 하나의 priority 를 infoo 로 틀리게 쓴다.
+-- 두 줄짜리 규칙 파일
+[root@ol7a ~]# cat > /etc/rsyslog.d/40-labapp.conf <<'EOF'
+local4.infoo   /var/log/labapp.log
+local4.*       /var/log/labapp-all.log
+EOF
+-- 검사 레벨 1
+[root@ol7a ~]# rsyslogd -N1; echo "exit=$?"
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: unknown priority name "infoo" [v8.24.0-57.0.3.el7_9.3]
+exit=1
+-- 오류 문장에 줄 번호가 없다. 둘째 줄이 Bye. 가 아니면 문제다
+
+-- 오류가 있어도 재시작은 성공하나.
+-- 재시작 종료 코드도 본다
+[root@ol7a ~]# systemctl restart rsyslog; echo "restart exit=$?"; systemctl is-active rsyslog
+restart exit=0
+active
+-- 데몬이 남긴 기록
+[root@ol7a ~]# journalctl -u rsyslog --since "-1min" --no-pager | tail -3
+Nov 16 18:06:28 ol7a.example.com rsyslogd[2092]:  [origin software="rsyslogd" swVersion="8.24.0-57.0.3.el7_9.3" x-pid="2092" x-info="http://www.rsyslog.com"] start
+Nov 16 18:06:28 ol7a.example.com rsyslogd[2092]: unknown priority name "infoo" [v8.24.0-57.0.3.el7_9.3]
+Nov 16 18:06:28 ol7a.example.com systemd[1]: Started System Logging Service.
+-- 재시작 exit=0, active. journal 에 같은 오류 한 줄
+-- 두 파일 중 어느 쪽이 생기나
+[root@ol7a ~]# logger -t labapp -p local4.info "LAB19-01 after typo"; sleep 2; ls -l /var/log/labapp*.log
+-rw-------. 1 root root 49 Nov 16 18:06 /var/log/labapp-all.log
+-- labapp-all.log 만 생겼다. infoo 줄만 버려졌다
+--
+-- 증상   : rsyslogd -N1 이 unknown priority name "infoo", exit=1. restart 는 성공,
+--          labapp.log 가 생기지 않음(labapp-all.log 만 49바이트)
+-- 원인   : 셀렉터 priority 오타. rsyslog 는 그 규칙 한 줄만 버리고 나머지로 동작
+-- 조치   : sed 로 local4.info 로 고치고 -N1 → restart
+-- 재확인 : -N1 이 End of config validation run. Bye., labapp.log 생성(44바이트)
+
+--------------------------------------------------------------------------------
+ [2] 오타를 고친다
+--------------------------------------------------------------------------------
+
+-- 오타를 고치고 바로 검사
+[root@ol7a ~]# sed -i 's/^local4.infoo/local4.info/' /etc/rsyslog.d/40-labapp.conf; rsyslogd -N1; echo "exit=$?"
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: End of config validation run. Bye.
+exit=0
+-- 재시작 후 같은 시험
+[root@ol7a ~]# systemctl restart rsyslog; logger -t labapp -p local4.info "LAB19-02 fixed"; sleep 2; ls -l /var/log/labapp*.log
+-rw-------. 1 root root 93 Nov 16 18:06 /var/log/labapp-all.log
+-rw-------. 1 root root 44 Nov 16 18:06 /var/log/labapp.log
+-- 두 파일 모두 기록된다
+
+--------------------------------------------------------------------------------
+ [3] 괄호 누락 — 영향이 넓다
+--------------------------------------------------------------------------------
+
+-- RainerScript 블록의 닫는 괄호 하나를 빠뜨린다.
+-- if 블록 하나
+[root@ol7a ~]# cat > /etc/rsyslog.d/41-labapp-db.conf <<'EOF'
+if $programname == 'labdb' then {
+    action(type="omfile" file="/var/log/labdb.log"
+    stop
+}
+EOF
+-- 같은 검사
+[root@ol7a ~]# rsyslogd -N1; echo "exit=$?"
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: error during parsing file /etc/rsyslog.d/41-labapp-db.conf, on or before line 4: invalid character '}' in object definition - is there an invalid escape sequence somewhere? [v8.24.0-57.0.3.el7_9.3 try http://www.rsyslog.com/e/2207 ]
+rsyslogd: error during parsing file /etc/rsyslog.d/listen.conf, on or before line 1: invalid character '$' in object definition - is there an invalid escape sequence somewhere? [v8.24.0-57.0.3.el7_9.3 try http://www.rsyslog.com/e/2207 ]
+rsyslogd: error during parsing file /etc/rsyslog.d/listen.conf, on or before line 1: syntax error on token 'SystemLogSocketName' [v8.24.0-57.0.3.el7_9.3 try http://www.rsyslog.com/e/2207 ]
+rsyslogd: CONFIG ERROR: could not interpret master config file '/etc/rsyslog.conf'. [v8.24.0-57.0.3.el7_9.3 try http://www.rsyslog.com/e/2207 ]
+exit=1
+-- 41- 파일 4행 오류에 이어 listen.conf 의 $ 줄까지 오류로 잡혔다
+-- CONFIG ERROR: could not interpret master config file — 설정을 끝까지 못 읽었다
+
+-- 재시작하고 기본 규칙(messages)과 [2] 의 규칙이 아직 동작하는지 본다.
+-- 재시작 전 /dev/log 의 시각을 남긴다
+[root@ol7a ~]# ls -l /dev/log; systemctl restart rsyslog; systemctl is-active rsyslog
+srw-rw-rw-. 1 root root 0 Nov 16 18:06 /dev/log
+active
+-- 재시작 전 /dev/log 는 부팅 때의 journald 소켓. 재시작은 active
+-- 오류 상태로 뜬 rsyslog 가 /dev/log 를 어떻게 하는지 본다. ss -x 는 유닉스 소켓, -l 듣는 것, -p 프로세스.
+[root@ol7a ~]# ls -l /dev/log; ss -xlp | grep -w /dev/log | cut -c1-120
+srw-rw-rw-. 1 root root 0 Nov 16 18:06 /dev/log
+u_dgr UNCONN 0      0                              /dev/log 29201            * 0     users:(("rsyslogd",pid=2239,fd=3)) 
+u_dgr UNCONN 0      0                              /dev/log 12741            * 0     users:(("systemd-journal",pid=599,f
+-- /dev/log 의 시각이 바뀌었다. 같은 경로에 소켓이 둘이다
+--   rsyslogd 2239       새 소켓. /dev/log 이름이 이쪽을 가리킨다
+--   systemd-journal 599 원래 소켓. 이름을 잃었다
+-- 파싱이 멈춰 OmitLocalLogging on 이 빠졌고 imuxsock 이 /dev/log 를 열었다
+-- local4 와 기본 규칙 쪽으로 하나씩
+[root@ol7a ~]# logger -t labapp -p local4.info "LAB19-03 after paren"; logger -t lab19 "LAB19-03 to messages"; sleep 2
+-- 파일 쪽 결과
+[root@ol7a ~]# grep -c LAB19-03 /var/log/labapp.log /var/log/messages
+/var/log/labapp.log:1
+/var/log/messages:0
+-- 40- 규칙은 먼저 읽혀 살아 있고, RULES 는 읽히지 않아 messages 0건
+-- journal 쪽 결과
+[root@ol7a ~]# journalctl -t lab19 -n 1 --no-pager | tail -1
+-- No entries --
+-- journal 에도 없다. 메시지가 journald 를 거치지 않았다
+-- rsyslogd 의 start 줄도 남지 않았다
+[root@ol7a ~]# journalctl -u rsyslog --since "-1min" --no-pager | tail -2 | cut -c1-200
+Nov 16 18:06:45 ol7a.example.com systemd[1]: Starting System Logging Service...
+Nov 16 18:06:45 ol7a.example.com systemd[1]: Started System Logging Service.
+-- 데몬 기록에는 이상이 없다
+
+--------------------------------------------------------------------------------
+ [4] 괄호를 고친다
+--------------------------------------------------------------------------------
+
+-- 빠진 괄호를 넣는다
+[root@ol7a ~]# sed -i 's|file="/var/log/labdb.log"$|file="/var/log/labdb.log")|' /etc/rsyslog.d/41-labapp-db.conf; cat /etc/rsyslog.d/41-labapp-db.conf
+if $programname == 'labdb' then {
+    action(type="omfile" file="/var/log/labdb.log")
+    stop
+}
+-- 검사·재시작·상태를 한 번에
+[root@ol7a ~]# rsyslogd -N1; echo "exit=$?"; systemctl restart rsyslog; systemctl status rsyslog --no-pager | sed -n '3p'
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: End of config validation run. Bye.
+exit=0
+   Active: active (running) since Mon 2026-11-16 18:06:54 KST; 3ms ago
+-- 검사 통과, 재시작 성공, active
+-- labdb 와 기본 규칙 시험
+[root@ol7a ~]# logger -t labdb "LAB19-04 db ok"; logger -t lab19 "LAB19-04 to messages"; sleep 3; grep -H LAB19-04 /var/log/labdb.log /var/log/messages
+grep: /var/log/labdb.log: No such file or directory
+-- 그런데 labdb.log 가 없고 messages 에도 LAB19-04 가 없다
+
+-- 고친 설정으로 다시 띄웠는데도 남지 않는다. 메시지의 입구인 /dev/log 부터 본다.
+-- 입구 확인
+[root@ol7a ~]# ls -l /dev/log 2>&1; journalctl -t lab19 -n 1 --no-pager | tail -1
+ls: cannot access /dev/log: No such file or directory
+-- No entries --
+-- /dev/log 가 없다. 내려가는 rsyslog 가 자기 소켓 파일을 지웠다
+-- /dev/log 를 만드는 쪽은 systemd-journald.socket 이다. 소켓과 데몬을 다시 띄운다.
+[root@ol7a ~]# systemctl restart systemd-journald.socket systemd-journald; ls -l /dev/log; ss -xlp | grep -w /dev/log | cut -c1-120
+srw-rw-rw-. 1 root root 0 Nov 16 18:06 /dev/log
+u_dgr UNCONN 0      0                              /dev/log 29550            * 0     users:(("systemd-journal",pid=2451,
+-- /dev/log 가 다시 생기고 주인이 journald 다
+-- 다시 시험
+[root@ol7a ~]# logger -t labdb "LAB19-04 db after socket"; logger -t lab19 "LAB19-04 messages after socket"; sleep 3; grep -H "after socket" /var/log/labdb.log /var/log/messages
+/var/log/labdb.log:Nov 16 18:06:57 ol7a labdb: LAB19-04 db after socket
+/var/log/messages:Nov 16 18:06:57 ol7a lab19: LAB19-04 messages after socket
+-- 양쪽에 들어갔다. 설정은 맞았고 입구만 막혀 있었다
+-- 첫 실측에서 imjournal.state 를 지우는 것으로는 풀리지 않았다
+--
+-- 증상   : 괄호를 고치고 -N1 통과·restart 성공·active 인데 logger 메시지가 어디에도 없음.
+--          ls -l /dev/log → "No such file or directory", journalctl -t → "-- No entries --"
+-- 원인   : 파싱이 중간에 멈춘 rsyslog 가 OmitLocalLogging 없이 /dev/log 를 새로 만들었고,
+--          그 rsyslog 가 내려가며 /dev/log 를 지움
+-- 조치   : systemctl restart systemd-journald.socket systemd-journald
+-- 재확인 : ls -l /dev/log 가 소켓, ss -xlp 주인 systemd-journal, 시험 메시지가 labdb.log·messages 에 기록
+-- [OL8/9] 8/9 의 rsyslog.conf 도 imuxsock 에 SysSock.Use="off" 를 주는 같은 구조다. 파싱이 깨지면 같은 위험이 있다
+
+-- -f 로 검사할 설정 파일을 지정할 수 있다. 새 파일을 운영 파일로 옮기기 전에 쓴다.
+-- 설정 파일 지정 검사
+[root@ol7a ~]# rsyslogd -N1 -f /etc/rsyslog.conf 2>&1 | tail -1
+rsyslogd: End of config validation run. Bye.
+-- 다른 경로의 시험용 설정을 검사할 때 -f 를 쓴다
+
+--------------------------------------------------------------------------------
+ [5] logrotate 기본 설정 읽기
+--------------------------------------------------------------------------------
+
+-- 전역 설정. 주석·빈 줄을 빼고 앞 다섯 줄(전역 지시어)만 본다. 뒤는 wtmp·btmp 규칙이다.
+-- 전역 지시어
+[root@ol7a ~]# grep -Ev '^#|^$' /etc/logrotate.conf | head -5
+weekly
+rotate 4
+create
+dateext
+include /etc/logrotate.d
+-- 주 단위, 네 개 보관, 새 파일 생성, 이름에 날짜. 규칙 파일 값이 전역 값을 덮는다
+
+-- syslog 파일 묶음 규칙. postrotate 에서 rsyslog 에 HUP 을 보낸다.
+-- rsyslog 파일용 규칙
+[root@ol7a ~]# cat /etc/logrotate.d/syslog
+/var/log/cron
+/var/log/maillog
+/var/log/messages
+/var/log/secure
+/var/log/spooler
+{
+    missingok
+    sharedscripts
+    postrotate
+        /bin/kill -HUP `cat /var/run/syslogd.pid 2> /dev/null` 2> /dev/null || true
+    endscript
+}
+-- 다섯 파일 한 묶음, HUP 은 한 번(sharedscripts)
+
+-- 누가 언제 logrotate 를 부르나.
+-- 실행 주체와 시각
+[root@ol7a ~]# grep -v '^$' /etc/cron.daily/logrotate | head -3; grep -E 'RANDOM|START|cron.daily' /etc/anacrontab
+#!/bin/sh
+/usr/sbin/logrotate -s /var/lib/logrotate/logrotate.status /etc/logrotate.conf
+EXITVALUE=$?
+RANDOM_DELAY=45
+START_HOURS_RANGE=3-22
+1       5       cron.daily              nice run-parts /etc/cron.daily
+-- 상태 파일(-s)을 지정해 돌린다
+-- anacron: 3~22시, 5분 + 최대 45분 무작위 지연
+
+--------------------------------------------------------------------------------
+ [6] 새 파일에 규칙 붙이기 — postrotate 없이
+--------------------------------------------------------------------------------
+
+-- [2] 의 labapp.log 를 회전 대상으로 만든다. postrotate 를 일부러 넣지 않는다(오류 흐름 ②).
+--   size 1k      크기가 1KB 를 넘으면 회전 (daily 같은 주기 대신)
+--   rotate 3     옛 파일 3개까지 보관
+--   missingok    파일이 없어도 오류로 치지 않음
+--   notifempty   빈 파일은 회전하지 않음
+--   create 0600 root root   회전 직후 같은 이름의 빈 파일을 이 권한으로 만듦
+-- 규칙 파일 작성
+[root@ol7a ~]# cat > /etc/logrotate.d/labapp <<'EOF'
+/var/log/labapp.log {
+    size 1k
+    rotate 3
+    missingok
+    notifempty
+    create 0600 root root
+}
+EOF
+-- size 1k 와 rotate 3 만 준 최소 규칙. postrotate 가 없다
+
+-- 파일을 1KB 넘게 채운다.
+-- 30줄을 쓴다
+[root@ol7a ~]# for i in $(seq 1 30); do logger -t labapp -p local4.info "LAB19-06 fill line $i"; done; sleep 2; ls -l /var/log/labapp.log
+-rw-------. 1 root root 1708 Nov 16 18:07 /var/log/labapp.log
+-- 1,708 바이트. size 1k 를 넘었다
+
+-- -d 는 무엇을 할지만 출력하고 아무것도 바꾸지 않는다.
+-- 판단 줄만 고른다
+[root@ol7a ~]# logrotate -d /etc/logrotate.d/labapp 2>&1 | grep -E 'rotating pattern|considering|rotating|does not need'; ls -l /var/log/labapp*
+rotating pattern: /var/log/labapp.log  1024 bytes (3 rotations)
+considering log /var/log/labapp.log
+  log needs rotating
+rotating log /var/log/labapp.log, log->rotateCount is 3
+-rw-------. 1 root root 1757 Nov 16 18:07 /var/log/labapp-all.log
+-rw-------. 1 root root 1708 Nov 16 18:07 /var/log/labapp.log
+-- -d 의 판단: log needs rotating(1024 바이트 초과), rotateCount 3. 파일 크기는 그대로다
+
+--------------------------------------------------------------------------------
+ [7] 강제 회전 -f 와 증상
+--------------------------------------------------------------------------------
+
+-- -f 는 조건(size)을 무시하고 회전한다. -v 로 한 일을 출력한다.
+-- -i 는 inode 번호
+[root@ol7a ~]# ls -li /var/log/labapp.log; logrotate -v -f /etc/logrotate.d/labapp 2>&1 | grep -E '^renaming /var/log/labapp.log to|^creating|postrotate'
+67329434 -rw-------. 1 root root 1708 Nov 16 18:07 /var/log/labapp.log
+renaming /var/log/labapp.log to /var/log/labapp.log.1
+creating new /var/log/labapp.log mode = 0600 uid = 0 gid = 0
+-- 이름만 바꾸고 새 파일을 만들었다. postrotate 줄은 없다
+-- 회전 뒤 두 파일의 inode
+[root@ol7a ~]# ls -li /var/log/labapp.log*
+67329433 -rw-------. 1 root root    0 Nov 16 18:07 /var/log/labapp.log
+67329434 -rw-------. 1 root root 1708 Nov 16 18:07 /var/log/labapp.log.1
+-- .1 의 inode 가 회전 전 labapp.log 와 같다
+
+-- 회전 뒤에 메시지를 하나 더 보낸다. 어디에 쓰였나.
+-- 회전 뒤 한 건
+[root@ol7a ~]# logger -t labapp -p local4.info "LAB19-07 after rotate"; sleep 2
+-- 어느 파일에 들어갔나
+[root@ol7a ~]# ls -l /var/log/labapp.log*; grep -H LAB19-07 /var/log/labapp.log*
+-rw-------. 1 root root    0 Nov 16 18:07 /var/log/labapp.log
+-rw-------. 1 root root 1759 Nov 16 18:07 /var/log/labapp.log.1
+/var/log/labapp.log.1:Nov 16 18:07:02 ol7a labapp: LAB19-07 after rotate
+-- 새 메시지가 .1 에 들어갔다(1708 → 1759)
+
+-- rsyslog 가 열어 둔 파일 기술자를 직접 본다.
+[root@ol7a ~]# ls -l /proc/$(pidof rsyslogd)/fd | grep labapp
+l-wx------. 1 root root 64 Nov 16 18:06 7 -> /var/log/labapp.log.1
+l-wx------. 1 root root 64 Nov 16 18:06 8 -> /var/log/labapp-all.log
+-- fd 7 이 labapp.log.1 을 가리킨다
+--
+-- 증상   : logrotate -f 뒤 새 labapp.log 는 0 바이트, 새 메시지는 labapp.log.1 에 기록
+-- 원인   : 규칙에 postrotate 가 없어 rsyslog 가 회전 전 파일(같은 inode)을 계속 열고 있음.
+--          /proc/PID/fd 의 7 -> /var/log/labapp.log.1 로 확인
+-- 조치   : 규칙에 sharedscripts·postrotate kill -HUP 추가, 지금 상태는 kill -HUP 한 번
+-- 재확인 : 다시 회전 뒤 "with HUP" 이 labapp.log 에, fd 가 labapp.log 를 가리킴
+
+--------------------------------------------------------------------------------
+ [8] postrotate 를 넣는다
+--------------------------------------------------------------------------------
+
+-- syslog 규칙과 같은 HUP 을 붙인다.
+--   sharedscripts   패턴이 여러 파일에 맞아도 postrotate 를 한 번만 실행
+-- 원본을 남긴다
+[root@ol7a ~]# cp /etc/logrotate.d/labapp /root/labapp.v1
+-- sed 의 a\ 는 맞는 줄 뒤에 붙인다
+[root@ol7a ~]# sed -i '/create 0600 root root/a\    sharedscripts\n    postrotate\n        /bin/kill -HUP $(cat /var/run/syslogd.pid 2> /dev/null) 2> /dev/null || true\n    endscript' /etc/logrotate.d/labapp
+-- 바뀐 줄 확인
+[root@ol7a ~]# diff /root/labapp.v1 /etc/logrotate.d/labapp
+6a7,10
+>     sharedscripts
+>     postrotate
+>         /bin/kill -HUP $(cat /var/run/syslogd.pid 2> /dev/null) 2> /dev/null || true
+>     endscript
+-- create 다음에 네 줄. 백틱 대신 $( ) 를 썼다
+
+-- 지금 상태를 바로잡으려고 한 번 HUP 을 보낸 뒤 다시 채우고 강제 회전.
+[root@ol7a ~]# kill -HUP $(cat /var/run/syslogd.pid); for i in $(seq 1 30); do logger -t labapp -p local4.info "LAB19-08 fill $i"; done; sleep 2
+-- 다시 강제 회전
+[root@ol7a ~]# logrotate -v -f /etc/logrotate.d/labapp 2>&1 | grep -E '^renaming /var/log/labapp.log to|^creating|postrotate|does not need'
+renaming /var/log/labapp.log to /var/log/labapp.log.1
+creating new /var/log/labapp.log mode = 0600 uid = 0 gid = 0
+running postrotate script
+-- 이번에는 running postrotate script 가 나온다
+-- 회전 뒤 한 건
+[root@ol7a ~]# logger -t labapp -p local4.info "LAB19-08 after rotate with HUP"; sleep 2
+-- 이번에는 어디에
+[root@ol7a ~]# ls -l /var/log/labapp.log*; grep -H "with HUP" /var/log/labapp.log*
+-rw-------. 1 root root   60 Nov 16 18:07 /var/log/labapp.log
+-rw-------. 1 root root 1371 Nov 16 18:07 /var/log/labapp.log.1
+-rw-------. 1 root root 1759 Nov 16 18:07 /var/log/labapp.log.2
+/var/log/labapp.log:Nov 16 18:07:07 ol7a labapp: LAB19-08 after rotate with HUP
+-- 새 labapp.log 에 기록됐다. .2 는 [7] 의 .1 이 밀린 것
+-- 열린 파일 다시 확인
+[root@ol7a ~]# ls -l /proc/$(pidof rsyslogd)/fd | grep labapp
+l-wx------. 1 root root 64 Nov 16 18:06 6 -> /var/log/labapp.log
+l-wx------. 1 root root 64 Nov 16 18:06 7 -> /var/log/labapp-all.log
+-- fd 6 이 labapp.log 를 가리킨다
+
+--------------------------------------------------------------------------------
+ [9] 상태 파일과 compress
+--------------------------------------------------------------------------------
+
+-- logrotate 는 마지막으로 회전한 날짜를 상태 파일에 적는다. 주기(daily·weekly) 판단의 근거다.
+-- 상태 파일의 labapp 줄
+[root@ol7a ~]# grep labapp /var/lib/logrotate/logrotate.status
+"/var/log/labapp.log" 2026-11-16-18:7:7
+-- 마지막 회전 시각. weekly 면 7일 뒤
+
+-- compress·delaycompress 를 더한다. 가장 최근 옛 파일(.1)은 다음 회전 때 압축된다.
+-- 압축 두 줄 추가
+[root@ol7a ~]# sed -i 's/^    sharedscripts/    compress\n    delaycompress\n    sharedscripts/' /etc/logrotate.d/labapp; grep -n compress /etc/logrotate.d/labapp
+7:    compress
+8:    delaycompress
+-- 채우고 회전을 두 번
+[root@ol7a ~]# for n in 1 2; do for i in $(seq 1 30); do logger -t labapp -p local4.info "LAB19-09 round $n line $i"; done; sleep 2; logrotate -f /etc/logrotate.d/labapp; done; ls -l /var/log/labapp.log*
+-rw-------. 1 root root    0 Nov 16 18:07 /var/log/labapp.log
+-rw-------. 1 root root 1611 Nov 16 18:07 /var/log/labapp.log.1
+-rw-------. 1 root root 1759 Nov 16 18:07 /var/log/labapp.log.2
+-rw-------. 1 root root  182 Nov 16 18:07 /var/log/labapp.log.2.gz
+-rw-------. 1 root root  146 Nov 16 18:07 /var/log/labapp.log.3.gz
+-- .1 은 평문(delaycompress), 그 뒤는 .gz
+-- 평문 .2 는 압축 전 규칙의 잔재다. compress 뒤에는 .N.gz 만 민다
+
+--------------------------------------------------------------------------------
+ [10] Logwatch 설치와 요약
+--------------------------------------------------------------------------------
+
+-- Logwatch 는 로그 파일을 읽어 서비스별 요약 보고서를 만드는 Perl 스크립트다. 기본 설치에는 없다.
+-- ol7_latest 저장소에서 설치
+[root@ol7a ~]# yum -y -q install logwatch; rpm -q logwatch
+logwatch-7.4.0-35.20130522svn140.el7_5.noarch
+-- -q 로 설치 출력을 숨겼다
+-- cron.daily 와 logwatch 스크립트
+[root@ol7a ~]# ls /etc/cron.daily/ | xargs; grep -Ev '^#|^$' /etc/cron.daily/0logwatch
+0logwatch logrotate man-db.cron mlocate
+LOGWATCH_SCRIPT="/usr/sbin/logwatch"
+OPTIONS="--output mail"
+$LOGWATCH_SCRIPT $OPTIONS
+exit 0
+-- 0logwatch 는 이름 순서상 logrotate 보다 먼저 돈다. 매일 메일 보고
+
+-- 기본값은 /usr/share/logwatch/default.conf 에, 바꿀 값은 /etc/logwatch/conf/logwatch.conf 에 둔다.
+-- 주요 기본값만 고른다
+[root@ol7a ~]# grep -E '^(LogDir|Output|MailTo|Range|Detail|Service = All)' /usr/share/logwatch/default.conf/logwatch.conf
+LogDir = /var/log
+Output = stdout
+MailTo = root
+Range = yesterday
+Detail = Low
+Service = All
+-- 범위 yesterday, 상세 Low, 모든 서비스, 받는 사람 root
+-- 덮어쓸 값 파일
+[root@ol7a ~]# grep -Ev '^#|^$' /etc/logwatch/conf/logwatch.conf; echo "lines=$(grep -Evc '^#|^$' /etc/logwatch/conf/logwatch.conf)"
+lines=0
+-- 덮어쓸 값 파일은 비어 있다
+
+-- 메일로 보내는 대신 화면에 찍는다. sshd 서비스, 오늘 범위.
+-- sshd 절만 잘라 본다
+[root@ol7a ~]# logwatch --output stdout --range today --service sshd --detail low | sed -n '/SSHD Begin/,/SSHD End/p' | grep -v '^ *$'
+ --------------------- SSHD Begin ------------------------ 
+ SSHD Started: 2 Time(s)
+ Users logging in through sshd:
+    root:
+       172.16.225.1: 1 time
+ ---------------------- SSHD End ------------------------- 
+-- 데몬 시작 2회, root 가 172.16.225.1(러너가 접속한 호스트)에서 1회
+
+-- 서비스를 가리지 않으면 어떤 서비스 절이 나오는지 이름만 뽑는다.
+[root@ol7a ~]# logwatch --output stdout --range today --detail low | grep -E '^ -+ .* Begin' | sed 's/ -* Begin -*//; s/^ -* //' | paste -sd ','
+Kernel Audit Begin ------------------------ ,Cron Begin ------------------------ ,Kernel Begin ------------------------ ,Postfix Begin ------------------------ ,Connections (secure-log) Begin ------------------------ ,Smartd Begin ------------------------ ,SSHD Begin ------------------------ ,yum Begin ------------------------ ,Disk Space Begin ------------------------ 
+
+--------------------------------------------------------------------------------
+ [변형] copytruncate — 신호 없이 회전
+--------------------------------------------------------------------------------
+
+-- HUP 을 받을 수 없는 프로그램(로그 파일을 계속 열어 두는 셸 스크립트 등)에 쓰는 방법.
+-- 파일을 복사한 뒤 원본을 0 바이트로 자른다. inode 가 그대로라 쓰던 프로그램이 모른다.
+-- 시험 규칙 파일
+[root@ol7a ~]# printf '/var/log/labcopy.log {\n    copytruncate\n    rotate 2\n    missingok\n}\n' > /etc/logrotate.d/labcopy; cat /etc/logrotate.d/labcopy
+/var/log/labcopy.log {
+    copytruncate
+    rotate 2
+    missingok
+}
+-- 500줄 파일을 회전
+[root@ol7a ~]# seq 1 500 > /var/log/labcopy.log; ls -li /var/log/labcopy.log; logrotate -f /etc/logrotate.d/labcopy; ls -li /var/log/labcopy.log*
+67602767 -rw-r--r--. 1 root root 1892 Nov 16 18:07 /var/log/labcopy.log
+67602767 -rw-r--r--. 1 root root    0 Nov 16 18:07 /var/log/labcopy.log
+67602768 -rw-r--r--. 1 root root 1892 Nov 16 18:07 /var/log/labcopy.log.1
+-- 원본 inode 가 그대로, 크기만 0. 사본 .1 은 새 inode
+-- 복사와 자르기 사이에 쓰인 줄은 잃을 수 있다
+
+--------------------------------------------------------------------------------
+ 되돌림
+--------------------------------------------------------------------------------
+
+-- 만든 규칙·로그 삭제
+[root@ol7a ~]# rm -f /etc/rsyslog.d/40-labapp.conf /etc/rsyslog.d/41-labapp-db.conf /etc/logrotate.d/labapp /etc/logrotate.d/labcopy /root/labapp.v1 /var/log/labapp* /var/log/labdb.log /var/log/labcopy.log*
+-- logwatch 제거, rsyslog 재시작
+[root@ol7a ~]# yum -y -q remove logwatch; rpm -q logwatch; systemctl restart rsyslog; rsyslogd -N1
+package logwatch is not installed
+rsyslogd: version 8.24.0-57.0.3.el7_9.3, config validation run (level 1), master config /etc/rsyslog.conf
+rsyslogd: End of config validation run. Bye.
+-- 시작 전과 비교
+[root@ol7a ~]# ls /etc/rsyslog.d/; ls /etc/logrotate.d/ | xargs; md5sum /etc/rsyslog.conf /etc/logrotate.conf /etc/logrotate.d/syslog
+listen.conf
+bootlog chrony firewalld psacct samba syslog up2date wpa_supplicant yum
+0dd94a0c285fb32f41fa5b226e83c26b  /etc/rsyslog.conf
+4b32bbe6d2d20a1f3150b0fb3918ae54  /etc/logrotate.conf
+79d4bbb4dc7a5b5ff0b1b1ebd06c2b0b  /etc/logrotate.d/syslog
+-- 목록과 md5 세 값이 [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  시험                         -N1                       restart   결과
+--  local4.infoo 오타            unknown priority, exit 1  성공      그 줄만 무시
+--  괄호 누락                    CONFIG ERROR, exit 1      성공      RULES 빠짐, rsyslog 가 /dev/log 차지
+--  괄호 고친 뒤                 통과                      성공      /dev/log 없음 → logger 메시지 소실
+--  journald 소켓 재시작         —                         —         정상
+--
+--  logrotate 규칙               회전 뒤 쓰기 대상          fd
+--  postrotate 없음              labapp.log.1               7 -> labapp.log.1
+--  postrotate kill -HUP         labapp.log                 6 -> labapp.log
+--  copytruncate                 원본 그대로(inode 같음)    —
+--
+--  되돌린 뒤: rsyslog.d·logrotate.d 목록과 md5 세 값이 시작 전과 같음, logwatch 미설치
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. [3] 상태에서 journald 소켓을 먼저 재시작하면 어떻게 되는지 ss -xlp 로 본다
+-- 2. logrotate -d /etc/logrotate.conf 로 전체 규칙을 시험해 각 파일의 판단을 읽는다
+-- 3. /etc/logwatch/conf/logwatch.conf 에 Detail = Med 를 넣고 sshd 출력이 어떻게 늘어나는지 본다
+
+================================================================================
+ 실습 06 종료 — 검사 통과·active 도 믿지 말고 /dev/log 와 열린 파일(fd)까지 본다
+================================================================================

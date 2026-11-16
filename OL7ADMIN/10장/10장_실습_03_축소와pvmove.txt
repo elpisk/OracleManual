@@ -1,0 +1,451 @@
+================================================================================
+ 제10장 실습 03 — 축소와 pvmove: 줄이는 순서, XFS 의 한계, 디스크 비우기
+ 대상   : ol7a
+ 목표   : Ext4 LV 를 언마운트 → e2fsck → resize2fs → lvreduce 순서로 줄인다.
+          순서를 틀려 LV 를 먼저 줄이면 무엇이 깨지는지 보고 되살린다.
+          XFS 는 줄일 수 없음을 확인한다. pvmove 로 마운트된 LV 를 다른
+          디스크로 옮겨 디스크 하나를 VG 에서 빼낸다
+ 배경   : 늘릴 때는 LV → 파일 시스템, 줄일 때는 파일 시스템 → LV 순서다.
+          LV 를 먼저 줄이면 파일 시스템 끝부분이 LV 밖으로 잘려 나간다.
+          XFS 는 설계상 축소가 없다. pvmove 는 PE 를 다른 PV 로 복사하면서
+          LV 를 쓰는 중에도 동작한다 (본문 10.2, 10.3)
+ 소요   : 약 30분
+ 선행   : storage-clean 스냅샷
+ 계정   : root
+ 주의   : [3] 은 일부러 파일 시스템을 망가뜨린다. sdb·sdc·sdd 의 내용을 지운다
+ 되돌림 : 마운트 해제, LV·VG·PV 삭제. 확인은 pvs·lsblk
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 세 디스크가 비어 있는지 본다. sdd 는 [5] 에서 pvmove 대상으로 쓴다
+[root@ol7a ~]# lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT /dev/sdb /dev/sdc /dev/sdd
+NAME SIZE TYPE FSTYPE MOUNTPOINT
+sdb   10G disk        
+sdc   10G disk        
+sdd   10G disk        
+[root@ol7a ~]# vgs
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+-- VG 는 ol 하나. [9] 에서 같은 두 명령으로 비교한다
+
+--------------------------------------------------------------------------------
+ [1] 준비 — Ext4 4G, XFS 2G
+--------------------------------------------------------------------------------
+
+-- 디스크 두 개로 VG 를 만든다. sdc 는 [7] 에서 "빈 PV 빼기" 에 쓴다
+[root@ol7a ~]# vgcreate vgdata /dev/sdb /dev/sdc
+  Physical volume "/dev/sdb" successfully created.
+  Physical volume "/dev/sdc" successfully created.
+  Volume group "vgdata" successfully created
+[root@ol7a ~]# lvcreate -L 4G -n lvext vgdata; lvcreate -L 2G -n lvxfs vgdata
+  Logical volume "lvext" created.
+  Logical volume "lvxfs" created.
+-- lvext 4G(1024 PE)가 sdb 앞쪽,
+-- lvxfs 2G 가 그 뒤에 놓인다([5] 에서 확인)
+-- sdc 는 VG 에 있지만 아무것도 놓이지 않는다
+-- lvext 는 Ext4(줄일 수 있음), lvxfs 는 XFS(줄일 수 없음)
+[root@ol7a ~]# mkfs.ext4 -q /dev/vgdata/lvext; mkfs.xfs -q /dev/vgdata/lvxfs
+[root@ol7a ~]# mkdir -p /data/ext /data/xfs; mount /dev/vgdata/lvext /data/ext; mount /dev/vgdata/lvxfs /data/xfs
+
+-- 파일 시스템 앞쪽에 데이터를 둔다. 크기는 줄인 뒤 크기(2G)보다 작아야 한다.
+[root@ol7a ~]# cp -a /usr/share/doc /data/ext/; dd if=/dev/urandom of=/data/ext/f1 bs=1M count=300 status=none
+-- du -sh : 디렉터리 전체 사용량. tee : 화면에 찍으면서 파일로도 저장
+[root@ol7a ~]# du -sh /data/ext; md5sum /data/ext/f1 | tee /root/f1.md5
+355M    /data/ext
+47b73a37b94cf1a8ded5e7821d59cd67  /data/ext/f1
+-- 사용량 355M(문서 디렉터리 + 300M 파일).
+-- 체크섬은 /root/f1.md5 에 저장
+-- 체크섬 파일을 LV 밖(/root)에 둔다. LV 가 깨져도 비교 기준이 남는다
+-- 줄이기 전 크기를 남긴다
+[root@ol7a ~]# df -hT /data/ext /data/xfs
+Filesystem               Type  Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvext ext4  3.9G  355M  3.4G  10% /data/ext
+/dev/mapper/vgdata-lvxfs xfs   2.0G   33M  2.0G   2% /data/xfs
+-- ext4 Size 3.9G, Used 355M. 2G 로 줄여도 들어갈 양이다
+
+--------------------------------------------------------------------------------
+ [2] 올바른 순서로 Ext4 를 4G → 2G
+--------------------------------------------------------------------------------
+
+-- ① 언마운트. Ext4 는 온라인 축소를 지원하지 않는다.
+[root@ol7a ~]# umount /data/ext
+-- 출력이 없으면 성공. 사용 중이면 "target is busy" 가 나온다
+
+-- ② 강제 검사. resize2fs 는 최근 검사 기록이 없으면 축소를 거부한다.
+-- -f : 깨끗해 보여도 검사, -y : 질문에 모두 예(이번에는 질문이 없어야 정상)
+[root@ol7a ~]# e2fsck -f -y /dev/vgdata/lvext
+e2fsck 1.45.4 (23-Sep-2019)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+-- Pass 1 아이노드·블록 크기, 2 디렉터리 구조, 3 디렉터리 연결
+-- Pass 4 참조 횟수, 5 그룹 요약(빈 블록·아이노드 수)
+/dev/vgdata/lvext: 3332/262144 files (0.0% non-contiguous), 125558/1048576 blocks
+-- 다섯 단계(Pass 1~5)를 모두 지나고 오류 없음
+--   3332/262144 files   : 사용 아이노드 / 전체 아이노드
+--   125558/1048576 blocks : 사용 블록 / 전체 블록(4KiB × 1048576 = 4GiB)
+-- 이 검사 기록이 resize2fs 의 전제 조건이다
+
+-- ③ 파일 시스템을 먼저 2G 로
+[root@ol7a ~]# resize2fs /dev/vgdata/lvext 2G
+resize2fs 1.45.4 (23-Sep-2019)
+Resizing the filesystem on /dev/vgdata/lvext to 524288 (4k) blocks.
+-- 줄일 때 resize2fs 는 뒤쪽 블록의 데이터를 앞쪽으로 옮긴 다음 크기를 바꾼다
+The filesystem on /dev/vgdata/lvext is now 524288 (4k) blocks long.
+-- 524288 블록 × 4KiB = 2GiB.
+-- 파일 시스템이 LV 앞쪽 2GiB 안으로 들어왔다
+-- 크기 인자 2G 는 resize2fs 가 블록 수로 바꿔 계산한다
+
+-- ④ 그 다음 LV 를 같은 크기로. -f 는 확인 질문을 건너뛴다.
+[root@ol7a ~]# lvreduce -f -L 2G vgdata/lvext
+  WARNING: Reducing active logical volume to 2.00 GiB.
+  THIS MAY DESTROY YOUR DATA (filesystem etc.)
+  Size of logical volume vgdata/lvext changed from 4.00 GiB (1024 extents) to 2.00 GiB (512 extents).
+  Logical volume vgdata/lvext successfully resized.
+-- lvreduce 는 내용과 상관없이 경고를 낸다.
+-- THIS MAY DESTROY YOUR DATA
+-- 1024 → 512 extents. 파일 시스템(2GiB)과 LV(2GiB)가 같아졌다
+-- -f 없이 치면 "Do you really want to reduce ...? [y/n]" 질문이 나온다
+
+-- ⑤ 다시 마운트하고 확인
+[root@ol7a ~]# mount /dev/vgdata/lvext /data/ext; df -hT /data/ext; md5sum -c /root/f1.md5
+Filesystem               Type  Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvext ext4  2.0G  355M  1.5G  20% /data/ext
+-- Avail 1.5G 는 2.0G 에서 Used 355M 과 예약 블록 5%(약 100M)를 뺀 값
+/data/ext/f1: OK
+-- df Size 2.0G, Used 355M 그대로, 체크섬 OK. 올바른 순서의 결과다
+
+--------------------------------------------------------------------------------
+ [3] 순서를 틀리면 — LV 를 먼저 줄인다
+--------------------------------------------------------------------------------
+
+-- 지금 lvext 는 LV 2G, 파일 시스템 2G 다. 파일 시스템은 두고 LV 만 1G 로 줄인다.
+-- 현장에서 "lvreduce 하면 알아서 되겠지" 하고 치는 실수다.
+[root@ol7a ~]# umount /data/ext
+[root@ol7a ~]# lvreduce -f -L 1G vgdata/lvext
+-- lvreduce 는 LV 위에 무엇이 있는지 보지 않는다.
+-- -r 없이 치면 PE 만 떼어 낸다
+  WARNING: Reducing active logical volume to 1.00 GiB.
+  THIS MAY DESTROY YOUR DATA (filesystem etc.)
+  Size of logical volume vgdata/lvext changed from 2.00 GiB (512 extents) to 1.00 GiB (256 extents).
+  Logical volume vgdata/lvext successfully resized.
+-- 경고 문구는 [2] 와 똑같다. lvreduce 는 순서가 맞는지 확인하지 않는다
+[root@ol7a ~]# mount /dev/vgdata/lvext /data/ext
+mount: wrong fs type, bad option, bad superblock on /dev/mapper/vgdata-lvext,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+-- 증상   : mount 가 "wrong fs type, bad option, bad superblock on /dev/mapper/vgdata-lvext" 로 실패
+-- 메시지 자체는 원인을 말하지 않는다. 안내대로 dmesg 를 본다
+[root@ol7a ~]# dmesg | tail -3
+[   12.481275] xfs filesystem being mounted at /data/xfs supports timestamps until (%ptR?) (0x7fffffff)
+[   47.042618] EXT4-fs (dm-2): mounted filesystem with ordered data mode. Opts: (null)
+[   48.229935] EXT4-fs (dm-2): bad geometry: block count 524288 exceeds size of device (262144 blocks)
+-- 마지막 줄이 원인이다
+--   block count 524288 : 슈퍼블록에 적힌 크기(2GiB)
+--   size of device 262144 : 지금 LV 크기(1GiB)
+-- 커널이 크기 불일치를 보고 마운트를 막았다. 막지 않았다면 뒤쪽 블록 쓰기에서 깨진다
+-- 앞의 두 줄은 이전 마운트 기록(12초·47초 시점)이다
+
+-- e2fsck 를 -n(읽기만, 고치지 않음)으로 돌려 본다. -y 로 고치게 하면 진짜로 데이터가 사라진다.
+[root@ol7a ~]# e2fsck -fn /dev/vgdata/lvext 2>&1 | head -6
+e2fsck 1.45.4 (23-Sep-2019)
+Error reading block 491520 (Invalid argument).  Ignore error? no
+
+/dev/vgdata/lvext: Invalid argument while reading block 491520
+
+/dev/vgdata/lvext: Invalid argument reading journal superblock
+-- -n 은 읽기만 하고 모든 질문에 no 로 답한다
+-- 491520 번 블록(1.875GiB 지점)을 읽지 못했다.
+-- 1GiB 뒤쪽이 LV 밖이라서다
+-- 저널도 그 뒤쪽에 있어 읽지 못했다
+-- 여기서 e2fsck -y 로 "고치면" 잘린 영역의 파일이 실제로 지워진다
+-- 원인   : 파일 시스템(2GiB)보다 LV(1GiB)를 먼저 줄여 끝 1GiB 가 잘려 나갔다
+
+-- 살리는 방법: lvreduce 는 LV 의 PE 목록에서 끝 512개를 떼어 냈을 뿐 디스크 내용은 지우지 않았다.
+-- 떼어 낸 PE 가 아직 다른 LV 에 쓰이지 않았다면 같은 크기로 늘려 그 PE 를 다시 붙인다.
+-- 살릴 수 있는지 판단하려면 떼어 낸 PE 가 아직 비어 있는지부터 본다
+[root@ol7a ~]# lvs -o lv_name,lv_size,devices --segments vgdata
+  LV    LSize Devices       
+  lvext 1.00g /dev/sdb(0)   
+-- lvext 가 1.00g 로 줄었다
+  lvxfs 2.00g /dev/sdb(1024)
+-- lvext 는 sdb(0) 부터 1G. 떼어 낸 PE 256~511 은 아직 빈 공간이다
+-- lvxfs 는 PE 1024 부터라 그 자리를 건드리지 않았다
+[root@ol7a ~]# lvextend -L 2G vgdata/lvext
+  Size of logical volume vgdata/lvext changed from 1.00 GiB (256 extents) to 2.00 GiB (512 extents).
+  Logical volume vgdata/lvext successfully resized.
+-- 조치   : lvextend -L 2G vgdata/lvext 로 원래 크기로 되돌림
+[root@ol7a ~]# lvs -o lv_name,lv_size,devices --segments vgdata
+  LV    LSize Devices       
+  lvext 2.00g /dev/sdb(0)   
+  lvxfs 2.00g /dev/sdb(1024)
+-- lvext 가 다시 sdb(0) 부터 2G 한 조각이다.
+-- 떼어 낸 PE 256~511 이 같은 자리로 돌아왔다
+-- 다른 LV 가 그 PE 를 먼저 가져갔다면 이 방법으로 살릴 수 없다
+-- LV 를 되돌린 뒤에는 검사로 파일 시스템이 온전한지 확인한다
+-- 이번에는 -y 를 써도 된다. 잘린 영역이 돌아왔으므로 고칠 것이 없어야 정상이다
+[root@ol7a ~]# e2fsck -f -y /dev/vgdata/lvext
+e2fsck 1.45.4 (23-Sep-2019)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+/dev/vgdata/lvext: 3332/131072 files (0.0% non-contiguous), 116821/524288 blocks
+-- 오류 없이 다섯 단계 통과. 블록 수 524288 = LV 크기와 맞음
+-- [2] 의 125558 블록보다 사용 블록이 줄어든 것은 축소로 아이노드 표가 절반이 된 몫
+[root@ol7a ~]# mount /dev/vgdata/lvext /data/ext; md5sum -c /root/f1.md5
+/data/ext/f1: OK
+-- 재확인 : 마운트 성공, 체크섬 OK. 잘린 PE 를 되찾아 데이터가 그대로다
+
+--------------------------------------------------------------------------------
+ [4] XFS 는 줄일 수 없다
+--------------------------------------------------------------------------------
+
+-- -r 로 fsadm 에게 맡겨 본다.
+[root@ol7a ~]# lvreduce -r -L 1G vgdata/lvxfs
+fsadm: Xfs filesystem shrinking is unsupported.
+  /usr/sbin/fsadm failed: 1
+  Filesystem resize failed.
+-- 증상   : "fsadm: Xfs filesystem shrinking is unsupported." → Filesystem resize failed.
+-- 원인   : XFS 에는 축소 기능이 없다. fsadm 이 파일 시스템 단계에서 멈췄고
+--          그래서 LV 도 줄이지 않았다. -r 은 앞 단계가 실패하면 뒤 단계를 하지 않는다
+
+-- xfs_growfs 로 더 작은 크기를 줘 본다. -D 는 블록(4KiB) 개수다. 262144 블록 = 1GiB
+[root@ol7a ~]# xfs_growfs -D 262144 /data/xfs
+data size 262144 too small, old size is 524288
+-- xfs_growfs 도 거부한다. 요청 262144 블록 < 현재 524288 블록
+-- 이어서 나오는 구성 출력은 xfs_growfs 의 기본 동작(현재 구성 표시)이다
+meta-data=/dev/mapper/vgdata-lvxfs isize=256    agcount=4, agsize=131072 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=0        finobt=0, sparse=0, rmapbt=0
+         =                       reflink=0
+data     =                       bsize=4096   blocks=524288, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=2560, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+
+-- 크기는 처음 그대로다.
+-- 두 번 거부된 뒤 크기가 정말 그대로인지 LV·파일 시스템 양쪽을 본다
+[root@ol7a ~]# lvs vgdata/lvxfs; df -h /data/xfs | tail -1
+  LV    VG     Attr       LSize Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  lvxfs vgdata -wi-ao---- 2.00g                                                    
+-- Attr 'o' → 아직 마운트되어 열려 있다. 거부되는 동안에도 계속 쓸 수 있었다
+/dev/mapper/vgdata-lvxfs  2.0G   33M  2.0G   2% /data/xfs
+-- 조치   : 줄이지 않는다. 줄여야 하면 작은 LV 를 새로 만들어 xfsdump | xfsrestore 로 옮긴다(11장)
+-- 재확인 : lvs 2.00g, df 2.0G 그대로.
+-- 두 번의 시도가 아무것도 바꾸지 않았다
+
+--------------------------------------------------------------------------------
+ [5] pvmove 준비 — 어느 LV 가 어느 디스크에
+--------------------------------------------------------------------------------
+
+-- 시나리오: sdb 를 교체하려고 VG 에서 빼야 한다. 그 위의 LV 는 계속 써야 한다.
+-- -o 로 열을 고른다. pv_used 는 기본 출력에 없는 열이다
+[root@ol7a ~]# pvs -o pv_name,vg_name,pv_size,pv_used,pv_free
+  PV         VG     PSize   Used   PFree  
+  /dev/sda2  ol     <39.00g 38.99g   4.00m
+  /dev/sdb   vgdata <10.00g  4.00g  <6.00g
+  /dev/sdc   vgdata <10.00g     0  <10.00g
+-- 열 해설: PV, VG, PSize, Used(쓴 양), PFree(남은 양)
+-- sdb 가 4.00g 를 쓰고 sdc 는 0. 두 LV 모두 sdb 에 있다
+-- devices 열의 괄호 안 숫자가 그 PV 에서의 시작 PE 다
+[root@ol7a ~]# lvs -o lv_name,lv_size,devices vgdata
+  LV    LSize Devices       
+  lvext 2.00g /dev/sdb(0)   
+  lvxfs 2.00g /dev/sdb(1024)
+-- 두 LV 를 sdb 에서 꺼내야 sdb 를 VG 에서 뺄 수 있다
+
+-- 옮겨 갈 자리를 만든다. sdd 를 VG 에 넣는다.
+[root@ol7a ~]# vgextend vgdata /dev/sdd
+  Physical volume "/dev/sdd" successfully created.
+  Volume group "vgdata" successfully extended
+-- sdd 를 새 PV 로 넣었다. 실무의 "새 디스크를 먼저 붙인다" 단계
+
+--------------------------------------------------------------------------------
+ [6] pvmove — 마운트된 채로 옮기기
+--------------------------------------------------------------------------------
+
+-- 옮기는 동안 쓰기가 계속 들어오는 상황을 만들려고 백그라운드로 파일을 쓴다.
+[root@ol7a ~]# nohup dd if=/dev/zero of=/data/ext/busy bs=1M count=400 oflag=direct >/tmp/dd.log 2>&1 </dev/null &
+-- oflag=direct : 페이지 캐시를 거치지 않고 장치에 바로 쓴다.
+-- pvmove 와 실제로 겹친다
+
+-- pvmove 원본PV [대상PV] : 원본의 사용 중인 PE 를 모두 옮긴다. 대상을 생략하면 VG 안의 빈 곳으로.
+-- -i 5 : 5초마다 진행률
+[root@ol7a ~]# pvmove -i 5 /dev/sdb /dev/sdd
+-- 원본 sdb, 대상 sdd. 대상을 적어 두어야 빈 sdc 로 가지 않는다
+  /dev/sdb: Moved: 3.52%
+  /dev/sdb: Moved: 12.40%
+  /dev/sdb: Moved: 12.40%
+  /dev/sdb: Moved: 21.19%
+  /dev/sdb: Moved: 50.00%
+  /dev/sdb: Moved: 60.35%
+  /dev/sdb: Moved: 60.55%
+  /dev/sdb: Moved: 80.27%
+  /dev/sdb: Moved: 92.77%
+  /dev/sdb: Moved: 96.29%
+  /dev/sdb: Moved: 100.00%
+-- 5초마다 진행률. 12.40% 와 60.55% 근처에서 멈칫한 것은 dd 의 쓰기와 겹친 구간
+-- 50.00% 에서 한 번에 뛴 것은 LV 하나(lvext)를 마치고 다음 LV 로 넘어간 지점
+-- pvmove 는 속으로 임시 미러 LV(pvmove0)를 만들어 양쪽에 쓰고,
+-- 끝나면 매핑을 sdd 로 바꾼다
+-- 백그라운드 dd 가 끝날 때까지 기다린 뒤 결과를 본다
+-- pgrep -x : 이름이 정확히 dd 인 프로세스만
+[root@ol7a ~]# while pgrep -x dd >/dev/null; do sleep 1; done; cat /tmp/dd.log
+400+0 records in
+400+0 records out
+419430400 bytes (419 MB) copied, 15.9505 s, 26.3 MB/s
+-- dd 도 오류 없이 400 레코드를 다 썼다. 옮기는 동안 쓰기가 멈추지 않았다
+[root@ol7a ~]# pvs -o pv_name,vg_name,pv_size,pv_used,pv_free
+  PV         VG     PSize   Used   PFree  
+  /dev/sda2  ol     <39.00g 38.99g   4.00m
+  /dev/sdb   vgdata <10.00g     0  <10.00g
+  /dev/sdc   vgdata <10.00g     0  <10.00g
+  /dev/sdd   vgdata <10.00g  4.00g  <6.00g
+-- sdb Used 4.00g → 0, sdd 0 → 4.00g. 사용량이 그대로 넘어갔다
+[root@ol7a ~]# lvs -o lv_name,lv_size,devices vgdata
+  LV    LSize Devices      
+  lvext 2.00g /dev/sdd(0)  
+  lvxfs 2.00g /dev/sdd(512)
+-- PE 번호가 바뀌었다. sdb 에서는 lvext 0~ , lvxfs 1024~ 였는데
+-- sdd 에서는 0~ , 512~ 로 빈틈 없이 붙었다(lvext 가 2G 로 줄어 있었기 때문)
+-- -c : 저장해 둔 체크섬 목록과 비교. 맞으면 OK, 다르면 FAILED
+[root@ol7a ~]# md5sum -c /root/f1.md5
+/data/ext/f1: OK
+-- 체크섬 그대로. 마운트를 한 번도 내리지 않았다
+
+--------------------------------------------------------------------------------
+ [7] 빈 PV 를 VG 에서 빼기
+--------------------------------------------------------------------------------
+
+-- vgreduce VG PV : 비어 있는 PV 를 VG 에서 뺀다. 쓰이는 PE 가 있으면 거부한다.
+[root@ol7a ~]# vgreduce vgdata /dev/sdc
+  Removed "/dev/sdc" from volume group "vgdata"
+-- sdc 는 처음부터 빈 PV 라 바로 빠졌다
+[root@ol7a ~]# vgreduce vgdata /dev/sdb
+  Removed "/dev/sdb" from volume group "vgdata"
+-- sdb 도 pvmove 로 비워 두어 거부 없이 빠졌다
+-- 비우지 않은 PV 를 빼려 하면 vgreduce 는 "still in use" 로 거부한다(이 실습에서는 시도하지 않음)
+-- VG 에서 뺀 디스크의 레이블을 지운다. 반납하거나 다른 용도로 쓰기 전 단계
+[root@ol7a ~]# pvremove /dev/sdb
+  Labels on physical volume "/dev/sdb" successfully wiped.
+-- 기본 열로 전체 PV 를 본다
+[root@ol7a ~]# pvs
+  PV         VG     Fmt  Attr PSize   PFree 
+  /dev/sda2  ol     lvm2 a--  <39.00g  4.00m
+  /dev/sdc          lvm2 ---   10.00g 10.00g
+-- sdc 의 PSize 10.00g: VG 를 빠지면 다시 메타데이터 몫이 빠지지 않은 크기로 보인다
+  /dev/sdd   vgdata lvm2 a--  <10.00g <6.00g
+-- sdb 는 목록에서 사라짐(레이블 삭제),
+-- sdc 는 VG 없는 PV 로 남음(Attr ---)
+-- 디스크 교체 순서: vgextend(새) → pvmove(옛) → vgreduce(옛) → pvremove(옛)
+
+--------------------------------------------------------------------------------
+ [변형] lvreduce -r 로 한 번에 (마운트 해제 상태)
+--------------------------------------------------------------------------------
+
+-- [2] 의 다섯 단계를 lvreduce -r 이 대신하는지 본다. 마운트를 먼저 내린다.
+-- -y : lvreduce 의 확인 질문에 예
+[root@ol7a ~]# umount /data/ext
+[root@ol7a ~]# lvreduce -y -r -L 1500M vgdata/lvext
+fsck from util-linux 2.23.2
+-- fsadm 은 마운트가 내려진 Ext4 에 먼저 fsck 를 돌린다.
+-- -f 가 없는 일반 검사라 clean 이면 넘어간다
+/dev/mapper/vgdata-lvext: clean, 3333/131072 files, 219222/524288 blocks
+-- 파일 수 3332 → 3333 (busy 하나), 사용 블록 219222.
+-- [6] 의 400M 가 더해진 값이다
+resize2fs 1.45.4 (23-Sep-2019)
+resize2fs: New size smaller than minimum (384113)
+
+fsadm: ext4 resize failed.
+  /usr/sbin/fsadm failed: 1
+  Filesystem resize failed.
+-- 증상   : resize2fs: New size smaller than minimum (384113) → fsadm: ext4 resize failed.
+-- fsadm 이 한 일: fsck(clean) → resize2fs 1500M → 실패 → 중단
+-- 원인   : [6] 에서 400M 짜리 busy 파일이 더해져 사용량이 755M 이 되었다
+--          resize2fs 가 계산한 최소 크기는 384113 블록(약 1.47GiB)
+--          메타데이터·저널 몫까지 넣으면 1500M 로는 모자라다
+-- -r 이 실패하면 LV 는 줄지 않는다.
+-- lvreduce 만 했다면 [3] 의 상황이 됐다
+[root@ol7a ~]# mount /dev/vgdata/lvext /data/ext; df -hT /data/ext; md5sum -c /root/f1.md5
+Filesystem               Type  Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvext ext4  2.0G  755M  1.1G  42% /data/ext
+/data/ext/f1: OK
+-- 조치   : 줄이지 않고 다시 마운트. 줄이려면 busy 를 지우거나 최소값보다 크게 준다
+-- 재확인 : df 2.0G(그대로), Used 755M, 체크섬 OK
+-- -r 을 쓰면 크기 계산을 resize2fs 가 대신 확인해 준다.
+-- [3] 같은 실수가 원천적으로 막힌다
+
+--------------------------------------------------------------------------------
+ [8] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /data/ext /data/xfs; rm -rf /data /root/f1.md5 /tmp/dd.log
+-- 남은 LV 둘(lvext·lvxfs)과 VG 를 함께 지운다
+[root@ol7a ~]# vgremove -y vgdata
+  Logical volume "lvext" successfully removed
+  Logical volume "lvxfs" successfully removed
+  Volume group "vgdata" successfully removed
+-- 남은 LV 둘을 지우고 VG 를 지웠다. sdb 는 [7] 에서 이미 레이블을 지웠다
+-- sdb 는 [7] 에서 이미 지웠으니 나머지 둘만
+[root@ol7a ~]# pvremove /dev/sdc /dev/sdd
+  Labels on physical volume "/dev/sdc" successfully wiped.
+  Labels on physical volume "/dev/sdd" successfully wiped.
+
+--------------------------------------------------------------------------------
+ [9] 시작 전과 비교
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT /dev/sdb /dev/sdc /dev/sdd
+NAME SIZE TYPE FSTYPE MOUNTPOINT
+sdb   10G disk        
+sdc   10G disk        
+sdd   10G disk        
+[root@ol7a ~]# vgs
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+-- [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                시작 전        작업 중                            되돌린 뒤
+--  lvext LV / FS       -              4G/4G → 2G/2G → 1G/2G → 2G/2G      -
+--  lvxfs               -              2G (축소 두 번 거부)               -
+--  lvext·lvxfs 위치    -              sdb(0)·sdb(1024) → sdd(0)·sdd(512) -
+--  vgdata PV           -              sdb,sdc → +sdd → sdd 하나          -
+--  f1 체크섬           -              47b73a37... (끝까지 OK)            -
+--  /data/ext 사용량    -              355M → 755M (busy 400M)            -
+-- 오류 세 가지
+--   LV 먼저 축소   : bad geometry → 같은 크기로 lvextend, e2fsck
+--   XFS 축소       : shrinking is unsupported → 줄이지 않음
+--   최소 크기 미만 : New size smaller than minimum (384113) → 크기 다시 계산
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. pvmove -n lvxfs /dev/sdc /dev/sdd 처럼 LV 하나만 골라 옮겨 보고
+--    lvs -o +devices 로 다른 LV 는 그대로인지 확인한다.
+-- 2. XFS LV 를 줄여야 할 때의 대안(새 LV 에 xfsdump | xfsrestore)을 11장과 연결해 절차로 써 본다.
+-- 3. pvmove 도중 서버가 재부팅되면 어떻게 되는지 pvmove(8) 의 "--abort" 와 재개 설명을 읽는다.
+-- 4. lvext 의 resize2fs 최소 크기를 미리 알아보는 방법을 찾는다
+-- 5. sdc 에 lvxfs 를 일부러 걸쳐 둔 뒤 vgreduce vgdata /dev/sdc 의 거부 메시지를 확인한다
+--    확인 방법: pvmove -n lvxfs /dev/sdb /dev/sdc 로 옮긴 뒤 vgreduce, 이어서 pvs
+-- 6. pvmove 중 다른 터미널에서 lvs -a 로 숨은 LV [pvmove0] 를 찾아본다
+--    확인 방법: lvs -a -o lv_name,copy_percent,devices vgdata
+--    확인 방법: resize2fs -P /dev/vgdata/lvext 의 "Estimated minimum size"
+
+================================================================================
+ 실습 03 종료 — Ext4 4G→2G 축소, 잘못된 축소 복구, XFS 축소 거부, pvmove 로 sdb 비우기
+================================================================================

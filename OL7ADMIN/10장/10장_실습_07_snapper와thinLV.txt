@@ -1,0 +1,461 @@
+================================================================================
+ 제10장 실습 07 — snapper 와 thin LV: 변경 전후 스냅샷을 비교하고 되돌리기
+ 대상   : ol7a
+ 목표   : snapper 를 설치해 thin LV 위 XFS 에 구성(create-config)을 만들고
+          구성 파일·권한(ALLOW_USERS)·timeline 설정을 읽는다. thin 이 아닌 LV 의
+          거부와, 7.9 기본 상태(SELinux enforcing)에서 스냅샷 생성이 막히는
+          원인을 로그로 찾는다. snapper 가 하려던 일(thin 스냅샷·비교·되돌리기)을
+          LVM 명령으로 직접 해 보다가 읽기 전용 XFS 스냅샷 마운트에서 막히는 지점을 본다
+ 배경   : snapper 는 thin 스냅샷(또는 Btrfs 서브볼륨 스냅샷)을 번호로 관리하는
+          도구다. 스냅샷 자체는 LVM 이 만들고, snapper 는 그것을 .snapshots
+          아래 info.xml 에 번호·설명을 적고 파일 단위로 비교·복원한다. 설정 변경
+          앞뒤로 pre·post 를 찍어 두는 용도에 맞다 (본문 10.7)
+ 소요   : 약 25분
+ 선행   : storage-clean 스냅샷, 인터넷(yum.oracle.com)
+ 계정   : root, student
+ 주의   : snapper 패키지를 설치한다(스냅샷 복귀로 사라짐). sdb 의 내용을 지운다
+ 되돌림 : snapper delete-config, LV·VG·PV 삭제, yum remove snapper.
+          확인은 snapper list-configs, vgs, rpm -q snapper
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 설치 여부, VG, 쓸 디스크를 한 번에 남긴다. [12] 에서 같은 명령으로 비교한다
+[root@ol7a ~]# rpm -q snapper; vgs; lsblk -o NAME,SIZE,TYPE /dev/sdb
+package snapper is not installed
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+NAME SIZE TYPE
+sdb   10G disk
+-- snapper 는 없고 VG 는 ol 하나, sdb 는 비어 있다
+
+--------------------------------------------------------------------------------
+ [1] snapper 설치
+--------------------------------------------------------------------------------
+
+-- ol7_latest 저장소에 있다. 의존 패키지(snapper-libs 등)를 함께 받는다.
+[root@ol7a ~]# yum install -y snapper 2>&1 | grep -E '^ (snapper|libsnapper)|Installed|Dependency Installed|Complete'
+ snapper                  x86_64      0.2.8-4.el7         ol7_latest      319 k
+ snapper-libs             x86_64      0.2.8-4.el7         ol7_latest      235 k
+Installed size: 3.9 M
+Installed:
+Dependency Installed:
+Complete!
+
+-- 받은 패키지 둘
+--   snapper 0.2.8-4.el7       : 명령과 snapperd 데몬
+--   snapper-libs 0.2.8-4.el7  : 라이브러리(libsnapper)
+-- 저장소 열이 ol7_latest. 배포판 기본 저장소에서 바로 받았다
+-- rpm -ql : 패키지가 깐 파일 목록. 설정·cron·dbus 관련만 고른다
+[root@ol7a ~]# rpm -q snapper; rpm -ql snapper | grep -E 'cron|dbus-1/system.d|sysconfig|/etc/snapper'
+snapper-0.2.8-4.el7.x86_64
+/etc/cron.daily/snapper
+/etc/cron.hourly/snapper
+/etc/dbus-1/system.d/org.opensuse.Snapper.conf
+-- 패키지가 넣은 파일 셋
+--   /etc/cron.daily/snapper  : 매일 정리(cleanup)
+--   /etc/cron.hourly/snapper : 매시간 timeline 스냅샷
+--   dbus 설정 : snapper 명령은 D-Bus 로 snapperd 에게 일을 시킨다
+-- 명령을 치는 쪽과 실제로 일하는 쪽(snapperd)이 다르다.
+-- [6] 의 오류를 읽을 때 중요하다
+
+--------------------------------------------------------------------------------
+ [2] 준비 — thin LV 와 일반 LV
+--------------------------------------------------------------------------------
+
+-- snapper 의 LVM 백엔드는 thin LV 가 필요하다. thin 풀부터 만든다
+[root@ol7a ~]# vgcreate vgdata /dev/sdb
+  Physical volume "/dev/sdb" successfully created.
+  Volume group "vgdata" successfully created
+[root@ol7a ~]# lvcreate -L 3G -T vgdata/tpool; lvcreate -V 4G -T vgdata/tpool -n lvthin
+  Thin pool volume with chunk size 64.00 KiB can address at most 15.81 TiB of data.
+  Logical volume "tpool" created.
+  WARNING: Sum of all thin volume sizes (4.00 GiB) exceeds the size of thin pool vgdata/tpool (3.00 GiB).
+  WARNING: You have not turned on protection against thin pools running out of space.
+  WARNING: Set activation/thin_pool_autoextend_threshold below 100 to trigger automatic extension of thin pools before they get full.
+  Logical volume "lvthin" created.
+
+-- 3G 풀 위에 4G thin LV. 초과 할당 경고 세 줄은 실습 06 과 같다
+-- 비교용 일반 LV. [3] 에서 snapper 가 이것을 받는지 본다
+[root@ol7a ~]# lvcreate -L 1G -n lvplain vgdata
+  WARNING: Sum of all thin volume sizes (4.00 GiB) exceeds the size of thin pools (3.00 GiB).
+  WARNING: You have not turned on protection against thin pools running out of space.
+  WARNING: Set activation/thin_pool_autoextend_threshold below 100 to trigger automatic extension of thin pools before they get full.
+  Logical volume "lvplain" created.
+
+-- 일반 LV 1G. 이 VG 에 thin 이 있어 일반 LV 를 만들 때도 같은 경고가 나온다
+[root@ol7a ~]# mkfs.xfs -q /dev/vgdata/lvthin; mkfs.xfs -q /dev/vgdata/lvplain
+[root@ol7a ~]# mkdir -p /data/app /data/plain; mount /dev/vgdata/lvthin /data/app; mount /dev/vgdata/lvplain /data/plain
+
+-- Attr 첫 글자로 thin 여부를 가른다
+[root@ol7a ~]# lvs -o lv_name,lv_attr,lv_size,pool_lv vgdata
+  LV      Attr       LSize Pool 
+  lvplain -wi-ao---- 1.00g      
+  lvthin  Vwi-aotz-- 4.00g tpool
+  tpool   twi-aotz-- 3.00g      
+-- lvthin 은 V(thin LV), lvplain 은 -(일반 LV).
+-- 둘 다 XFS 로 마운트됐다
+
+--------------------------------------------------------------------------------
+ [3] thin 이 아닌 LV 에 구성하면
+--------------------------------------------------------------------------------
+
+-- -c 이름 : 구성 이름. create-config -f "lvm(xfs)" 마운트지점 : LVM 백엔드, XFS
+[root@ol7a ~]# snapper -c plain create-config -f "lvm(xfs)" /data/plain
+Creating config failed (invalid filesystem type).
+
+-- 증상   : "Creating config failed (invalid filesystem type)."
+-- 원인   : lvm(xfs) 백엔드는 thin LV 의 스냅샷을 쓴다. lvplain 은 thin 이 아니다
+--          메시지는 파일 시스템 종류를 탓하지만 XFS 는 맞다. LV 종류가 문제다
+-- 구성이 만들어졌는지 목록으로 본다
+[root@ol7a ~]# snapper list-configs
+Config | Subvolume
+-------+----------
+-- 구성 없이 스냅샷을 만들어 본다. -d : 설명
+[root@ol7a ~]# snapper -c plain create -d test
+Unknown config.
+-- list-configs 에 plain 이 없다. 구성이 아예 만들어지지 않았다
+-- 그래서 -c plain 으로 무엇을 해도 Unknown config. 이다
+-- 조치   : thin LV(lvthin)의 마운트 지점에 구성을 만든다([4])
+
+--------------------------------------------------------------------------------
+ [4] thin LV 에 구성 만들기
+--------------------------------------------------------------------------------
+
+-- 같은 형식으로 thin LV 의 마운트 지점에 구성을 만든다
+[root@ol7a ~]# snapper -c app create-config -f "lvm(xfs)" /data/app
+[root@ol7a ~]# snapper list-configs
+Config | Subvolume
+-------+----------
+app    | /data/app
+-- 재확인 : 출력 없이 끝났고 list-configs 에 app | /data/app 이 생겼다
+
+-- 구성 파일과 전역 목록이 생겼다. 주석을 빼고 본다.
+[root@ol7a ~]# grep -v '^#' /etc/snapper/configs/app | grep -v '^$'
+SUBVOLUME="/data/app"
+FSTYPE="lvm(xfs)"
+ALLOW_USERS=""
+ALLOW_GROUPS=""
+SYNC_ACL="no"
+BACKGROUND_COMPARISON="yes"
+NUMBER_CLEANUP="yes"
+NUMBER_MIN_AGE="1800"
+NUMBER_LIMIT="50"
+NUMBER_LIMIT_IMPORTANT="10"
+TIMELINE_CREATE="yes"
+TIMELINE_CLEANUP="yes"
+TIMELINE_MIN_AGE="1800"
+TIMELINE_LIMIT_HOURLY="10"
+TIMELINE_LIMIT_DAILY="10"
+TIMELINE_LIMIT_WEEKLY="0"
+TIMELINE_LIMIT_MONTHLY="10"
+TIMELINE_LIMIT_YEARLY="10"
+EMPTY_PRE_POST_CLEANUP="yes"
+EMPTY_PRE_POST_MIN_AGE="1800"
+
+-- 구성 파일 필드(주석 뺀 20줄)
+--   SUBVOLUME, FSTYPE : 대상과 백엔드 lvm(xfs)
+--   ALLOW_USERS, ALLOW_GROUPS : 조회·생성을 허용할 일반 사용자(비어 있음)
+--   NUMBER_* : 번호 기준 정리. 최대 50개, 중요 표시 10개
+--   TIMELINE_CREATE="yes" : 매시간 자동 스냅샷
+--   TIMELINE_LIMIT_* : 시간·일·주·월·년 단위 보관 개수
+--   EMPTY_PRE_POST_CLEANUP : 바뀐 것이 없는 pre·post 쌍은 지운다
+--   *_MIN_AGE 1800 : 30분이 지나야 정리 대상
+[root@ol7a ~]# cat /etc/sysconfig/snapper | grep -v '^#' | grep -v '^$'
+SNAPPER_CONFIGS="app"
+
+-- 전역 목록에 app 이 들어갔다. cron 스크립트가 이 목록을 돈다
+-- 마운트 지점 아래에 무엇이 생겼는지 본다
+[root@ol7a ~]# ls -la /data/app
+total 0
+drwxr-xr-x. 3 root root 24 Nov 13 19:56 .
+drwxr-xr-x. 4 root root 30 Nov 13 19:56 ..
+drwxr-x---. 2 root root  6 Nov 13 19:56 .snapshots
+-- 마운트 지점 아래에 .snapshots 디렉터리가 생겼다. 권한 750, root 소유
+-- 스냅샷 번호마다 하위 디렉터리와 info.xml 이 여기에 생긴다
+
+--------------------------------------------------------------------------------
+ [5] pre 스냅샷 만들기 — IO Error
+--------------------------------------------------------------------------------
+
+-- 먼저 "운영 중인" 파일을 몇 개 둔다.
+[root@ol7a ~]# mkdir /data/app/conf; echo "port=1521" > /data/app/conf/listener.ora; echo "sga=2G" > /data/app/conf/init.ora; cp /etc/hosts /data/app/conf/
+
+-- create -t pre : 변경 전 스냅샷. -p : 만든 번호를 출력. -d : 설명
+[root@ol7a ~]# snapper -c app create -t pre -p -d "before change"
+IO Error.
+
+-- 증상   : "IO Error." 한 줄. 번호가 출력되지 않았다
+-- 목록으로 결과를 본다
+[root@ol7a ~]# snapper -c app list
+Type   | # | Pre # | Date | User | Cleanup | Description | Userdata
+-------+---+-------+------+------+---------+-------------+---------
+single | 0 |       |      | root |         | current     |         
+-- 목록에는 0 번(current, 지금 파일 시스템)만 있다. 스냅샷이 만들어지지 않았다
+
+--------------------------------------------------------------------------------
+ [6] 원인 찾기 — snapper 로그와 감사 로그
+--------------------------------------------------------------------------------
+
+-- snapper 가 실제로 친 LVM 명령은 /var/log/snapper.log 에 남는다. 명령 줄만 고른다.
+[root@ol7a ~]# grep -E 'SystemCmd Executing' /var/log/snapper.log | tail -3 | cut -c1-150
+2026-11-13 19:56:54 MIL libsnapper(2318) SystemCmd.cc(execute):82 - SystemCmd Executing:"/sbin/lvs --noheadings -o lv_attr,segtype 'vgdata/lvthin'"
+2026-11-13 19:56:54 MIL libsnapper(2318) SystemCmd.cc(execute):82 - SystemCmd Executing:"/sbin/lvcreate --permission r --snapshot --name 'lvthin-snaps
+2026-11-13 19:56:54 MIL libsnapper(2318) SystemCmd.cc(execute):82 - SystemCmd Executing:"/sbin/lvremove --force 'vgdata/lvthin-snapshot1'"
+
+-- snapperd 가 친 LVM 명령 셋(150자에서 잘랐다)
+--   1) lvs -o lv_attr,segtype : 대상이 thin 인지 확인
+--   2) lvcreate --permission r --snapshot --name 'lvthin-snapshot1' : 스냅샷 생성
+--   3) lvremove --force : 방금 만든 스냅샷 삭제
+-- 만들기는 성공했다. 그 뒤 어떤 단계가 실패해 되돌렸다
+-- snapper 가 만든 스냅샷 LV 가 남았는지 본다
+[root@ol7a ~]# lvs -o lv_name,lv_attr,origin vgdata
+  LV      Attr       Origin
+  lvplain -wi-ao----       
+  lvthin  Vwi-aotz--       
+  tpool   twi-aotz--       
+-- lvthin-snapshot1 은 남아 있지 않다
+
+-- 스냅샷 LV 는 만들어졌다가 지워졌다. 그 사이에 무엇이 실패했는지 커널 감사 로그를 본다.
+[root@ol7a ~]# ausearch -m avc -ts recent 2>&1 | grep -o 'avc: .*' | tail -2 | cut -c1-200
+avc:  denied  { create } for  pid=2318 comm="snapperd" name="info.xml.tmp-CLJp3T" scontext=system_u:system_r:snapperd_t:s0-s0:c0.c1023 tcontext=system_u:object_r:default_t:s0 tclass=file permissive=0
+
+-- 감사 로그의 한 줄
+--   denied { create }   : 파일 생성 거부
+--   comm="snapperd"     : 거부된 주체는 데몬
+--   name="info.xml.tmp-…" : 스냅샷 기록 파일의 임시 이름
+--   tcontext ...default_t : 만들려던 곳(.snapshots/1)의 형식
+--   permissive=0        : 실제로 막았다
+-- -Z : SELinux 보안 문맥(사용자:역할:형식:수준).
+-- getenforce : 현재 모드
+[root@ol7a ~]# ls -Zd /data/app/.snapshots; getenforce
+drwxr-x---. root root system_u:object_r:default_t:s0   /data/app/.snapshots
+Enforcing
+-- .snapshots 의 형식이 default_t,
+-- SELinux 는 Enforcing(7.9 설치 기본값)
+-- 원인   : 새로 만든 마운트 지점(/data/app) 아래는 snapperd 가 쓸 수 있는 형식이 아니다
+--          snapperd 가 info.xml 을 쓰지 못해 스냅샷을 지우고 IO Error 를 냈다
+-- 이 과정은 SELinux 설정을 다루지 않는다.
+-- 우회(setenforce 0)도 하지 않는다
+-- 조치   : snapper 대신 같은 일을 LVM 명령으로 직접 한다([9])
+
+-- 번호가 매겨지지 않았으니 비교·되돌리기 명령도 할 대상이 없다.
+[root@ol7a ~]# snapper -c app status 1..2
+Illegal Snapshot.
+-- 1·2 번 스냅샷이 없으니 status 는 Illegal Snapshot.
+-- 이다. diff·undochange 도 같다
+
+--------------------------------------------------------------------------------
+ [7] 일반 사용자로 조회 — ALLOW_USERS
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ snapper -c app list
+No permissions.
+-- 증상   : student 가 snapper -c app list 를 치자 "No permissions."
+-- 원인   : ALLOW_USERS 가 비어 있어 root 만 쓸 수 있다
+-- 조치   : set-config ALLOW_USERS=student
+
+-- set-config 키=값 : 구성 파일 값을 바꾼다
+[root@ol7a ~]# snapper -c app set-config ALLOW_USERS=student
+[root@ol7a ~]# grep ALLOW_USERS /etc/snapper/configs/app
+ALLOW_USERS="student"
+# sync users and groups from ALLOW_USERS and ALLOW_GROUPS to .snapshots
+-- 파일의 ALLOW_USERS 값이 바뀌었다. 둘째 줄은 같은 낱말이 든 주석 줄이다
+[student@ol7a ~]$ snapper -c app list
+Type   | # | Pre # | Date | User | Cleanup | Description | Userdata
+-------+---+-------+------+------+---------+-------------+---------
+single | 0 |       |      | root |         | current     |         
+-- 재확인 : student 도 목록을 본다. 재시작 없이 바로 반영됐다
+
+--------------------------------------------------------------------------------
+ [8] 자동 생성(timeline) 설정
+--------------------------------------------------------------------------------
+
+-- 구성을 만들면 기본으로 매시간 timeline 스냅샷을 찍으려 한다. 끈다.
+[root@ol7a ~]# grep -E 'TIMELINE_(CREATE|CLEANUP)|NUMBER_LIMIT=' /etc/snapper/configs/app
+NUMBER_LIMIT="50"
+TIMELINE_CREATE="yes"
+TIMELINE_CLEANUP="yes"
+
+-- 기본값 : NUMBER_LIMIT 50,
+-- TIMELINE_CREATE yes, TIMELINE_CLEANUP yes
+-- 풀이 작은 thin 환경에서는 매시간 스냅샷이 풀을 채운다. 끄는 것이 안전하다
+[root@ol7a ~]# snapper -c app set-config TIMELINE_CREATE=no; grep TIMELINE_CREATE /etc/snapper/configs/app
+TIMELINE_CREATE="no"
+
+-- set-config 로 바꾸면 파일이 바로 고쳐진다. vi 로 고쳐도 결과는 같다
+[root@ol7a ~]# ls /etc/cron.hourly/ /etc/cron.daily/ | grep snapper; grep -v '^#' /etc/cron.hourly/snapper | grep -v '^$' | head -6
+snapper
+snapper
+umask 022
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+export PATH
+if [ -f /etc/sysconfig/snapper ] ; then
+-- cron.hourly 와 cron.daily 에 snapper 가 하나씩(6장에서 본 run-parts 가 돌린다)
+-- 스크립트는 /etc/sysconfig/snapper 를 읽어 구성마다 timeline 을 만든다
+-- TIMELINE_CREATE=no 인 구성은 건너뛴다.
+-- 이 VM 에서는 어차피 [5] 와 같은 이유로 실패한다
+    . /etc/sysconfig/snapper
+fi
+
+--------------------------------------------------------------------------------
+ [9] snapper 가 하려던 일을 LVM 으로 — pre 스냅샷
+--------------------------------------------------------------------------------
+
+-- thin LV 의 스냅샷은 크기 없이 만든다. --permission r : 읽기 전용(snapper 도 이 옵션을 쓴다)
+[root@ol7a ~]# lvcreate -s --permission r -n lvthin-pre vgdata/lvthin
+  WARNING: Sum of all thin volume sizes (8.00 GiB) exceeds the size of thin pool vgdata/tpool and the amount of free space in volume group (<5.99 GiB).
+  WARNING: You have not turned on protection against thin pools running out of space.
+  WARNING: Set activation/thin_pool_autoextend_threshold below 100 to trigger automatic extension of thin pools before they get full.
+  Logical volume "lvthin-pre" created.
+
+-- lvcreate 는 성공했다. snapper 가 [6] 에서 친 명령과 같은 모양이다
+-- 스냅샷이 어떤 속성으로 만들어졌는지 본다
+[root@ol7a ~]# lvs -o lv_name,lv_attr,origin,pool_lv vgdata
+  LV         Attr       Origin Pool 
+  lvplain    -wi-ao----             
+  lvthin     Vwi-aotz--        tpool
+  lvthin-pre Vri---tz-k lvthin tpool
+  tpool      twi-aotz--             
+-- lvthin-pre 의 Attr Vri---tz-k
+--   V : thin LV, r : 읽기 전용(--permission r)
+--   다섯째 '-' : 비활성, 열째 k : 활성화 건너뛰기
+-- Origin lvthin, Pool tpool. 같은 풀에서 블록을 공유한다
+
+-- 변경: 파일 하나 수정, 하나 삭제, 하나 추가
+-- 이 시점부터 lvthin 과 lvthin-pre 가 갈라진다
+[root@ol7a ~]# echo "port=1522" > /data/app/conf/listener.ora; rm /data/app/conf/init.ora; echo "new" > /data/app/conf/added.txt
+
+--------------------------------------------------------------------------------
+ [10] 스냅샷 마운트 — 읽기 전용 XFS 에서 막힌다
+--------------------------------------------------------------------------------
+
+-- k 표시 때문에 -K 로 활성화하고, XFS 라 nouuid 를 붙여 읽기 전용(ro)으로 마운트한다.
+[root@ol7a ~]# lvchange -ay -K vgdata/lvthin-pre; mkdir -p /mnt/pre; mount -o ro,nouuid /dev/vgdata/lvthin-pre /mnt/pre
+mount: cannot mount /dev/mapper/vgdata-lvthin--pre read-only
+-- 증상   : "cannot mount /dev/mapper/vgdata-lvthin--pre read-only"
+-- 매퍼 이름에서 LV 이름의 하이픈이 두 개(--)로 바뀌었다
+-- 원인   : 스냅샷은 마운트된 XFS 를 그대로 떴다. XFS 는 마운트할 때 로그를 재생하려 하는데
+--          LV 가 읽기 전용(r)이라 쓸 수 없어 거부했다. -o ro 만으로는 피하지 못한다
+-- 실습 05 의 COW 스냅샷은 쓰기 가능한 LV 라 ro,nouuid 로 마운트됐다. 여기와 다른 점이 그것이다
+
+-- diff -rq : 다른 파일 목록(snapper status 에 해당). 마운트가 실패한 채로 이어 친 명령이다
+[root@ol7a ~]# diff -rq /mnt/pre/conf /data/app/conf
+diff: /mnt/pre/conf: No such file or directory
+
+-- /mnt/pre 가 비어 있어 비교할 것이 없다
+-- diff -u : 내용 차이(snapper diff 에 해당)
+[root@ol7a ~]# diff -u /mnt/pre/conf/listener.ora /data/app/conf/listener.ora
+diff: /mnt/pre/conf/listener.ora: No such file or directory
+
+-- 되돌리기(snapper undochange 에 해당): 지운 파일 복사, 바뀐 파일 복사, 추가된 파일 삭제
+[root@ol7a ~]# cp -a /mnt/pre/conf/init.ora /mnt/pre/conf/listener.ora /data/app/conf/; rm /data/app/conf/added.txt
+cp: cannot stat ‘/mnt/pre/conf/init.ora’: No such file or directory
+cp: cannot stat ‘/mnt/pre/conf/listener.ora’: No such file or directory
+
+-- 되돌리기도 할 수 없다. rm 만 실행돼 added.txt 는 지워졌다
+[root@ol7a ~]# diff -rq /mnt/pre/conf /data/app/conf; echo "diff 종료 코드 $?"
+diff: /mnt/pre/conf: No such file or directory
+diff 종료 코드 2
+-- 종료 코드 2 = 비교 자체가 실패. (0 은 같음, 1 은 다름)
+-- 이 단계는 끝내지 못했다. 고치는 방법은 [더 해 보기] 4·5 에 남긴다
+
+--------------------------------------------------------------------------------
+ [변형] 구성 지우기와 스냅샷 정리
+--------------------------------------------------------------------------------
+
+-- 손으로 만든 스냅샷을 정리한다
+[root@ol7a ~]# umount /mnt/pre; lvremove -y vgdata/lvthin-pre
+umount: /mnt/pre: not mounted
+  Logical volume "lvthin-pre" successfully removed
+
+-- 마운트된 적이 없어 umount 는 not mounted. 스냅샷 LV 는 지워졌다
+-- delete-config : 구성 파일, 전역 목록 항목, .snapshots 를 지운다
+[root@ol7a ~]# snapper -c app delete-config; snapper -c plain delete-config; snapper list-configs
+Unknown config.
+Config | Subvolume
+-------+----------
+-- 지운 뒤 마운트 지점과 전역 목록을 본다
+[root@ol7a ~]# ls -la /data/app; cat /etc/sysconfig/snapper | grep -v '^#' | grep -v '^$'
+total 0
+drwxr-xr-x. 3 root root 18 Nov 13 19:56 .
+drwxr-xr-x. 4 root root 30 Nov 13 19:56 ..
+drwxr-xr-x. 2 root root 39 Nov 13 19:56 conf
+SNAPPER_CONFIGS=""
+-- app 은 출력 없이 지워졌고 plain 은 처음부터 없어 Unknown config.
+-- delete-config 는 .snapshots 디렉터리를 지우고 전역 목록에서 이름을 뺐다
+-- 데이터(conf)는 그대로 남는다. 구성을 지워도 파일 시스템은 건드리지 않는다
+
+--------------------------------------------------------------------------------
+ [11] 되돌림
+--------------------------------------------------------------------------------
+
+-- 마운트를 내리고 디렉터리를 지운다
+[root@ol7a ~]# umount /data/app /data/plain; rm -rf /data /mnt/pre
+
+-- thin 풀·thin LV·일반 LV 를 VG 와 함께 지운다
+[root@ol7a ~]# vgremove -y vgdata; pvremove /dev/sdb
+  Logical volume "lvthin" successfully removed
+  Logical volume "tpool" successfully removed
+  Logical volume "lvplain" successfully removed
+  Volume group "vgdata" successfully removed
+  Labels on physical volume "/dev/sdb" successfully wiped.
+
+-- 설치한 두 패키지를 지운다. 출력은 패키지 줄과 결과 줄만 고른다
+[root@ol7a ~]# yum remove -y snapper snapper-libs 2>&1 | grep -E '^ (snapper|libsnapper)|Removed|Complete'
+ snapper             x86_64        0.2.8-4.el7         @ol7_latest        1.3 M
+ snapper-libs        x86_64        0.2.8-4.el7         @ol7_latest        803 k
+Removed:
+Complete!
+-- 패키지를 지우면 cron 스크립트·dbus 설정도 함께 사라진다
+
+--------------------------------------------------------------------------------
+ [12] 시작 전과 비교
+--------------------------------------------------------------------------------
+
+-- [0] 과 같은 명령
+[root@ol7a ~]# rpm -q snapper; vgs; lsblk -o NAME,SIZE,TYPE /dev/sdb
+package snapper is not installed
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+NAME SIZE TYPE
+sdb   10G disk
+-- [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                시작 전        작업 중                                   되돌린 뒤
+--  snapper             없음           0.2.8-4.el7                               없음
+--  구성                -              plain 거부(invalid filesystem type), app  없음
+--  pre 스냅샷          -              IO Error (avc denied, default_t)          -
+--  ALLOW_USERS         -              "" → "student" (No permissions → 조회됨)  -
+--  TIMELINE_CREATE     -              yes → no                                  -
+--  lvthin-pre          -              Vri---tz-k, ro 마운트 실패                -
+--  .snapshots          -              생성 → delete-config 로 삭제              -
+-- 오류
+--   thin 이 아닌 LV   : invalid filesystem type → thin LV 에 구성
+--   스냅샷 생성       : IO Error → SELinux 거부, LVM 으로 대신
+--   일반 사용자       : No permissions → ALLOW_USERS
+--   읽기 전용 스냅샷  : cannot mount read-only → 해결은 [더 해 보기] 4·5
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. 마운트 지점을 /data/app 대신 다른 경로로 바꿔도 같은 오류가 나는지 본다.
+--    확인 방법: ls -Zd 마운트지점/.snapshots 와 ausearch -m avc 의 tcontext
+-- 2. [9]~[10] 의 손 작업을 스크립트 하나로 묶어 pre 스냅샷 → 작업 → 비교까지 한 번에 돌려 본다.
+--    확인 방법: 스크립트 끝에서 diff -rq 결과
+-- 3. snapper -c app create --command "명령" 이 무엇을 하려는지 snapper(8) 에서 찾아 읽는다.
+-- 4. [10] 을 mount -o ro,nouuid,norecovery 로 다시 해 본다.
+-- norecovery 는 로그 재생을 건너뛴다
+--    확인 방법: ls /mnt/pre/conf 에 init.ora 가 보이는지, 이어서 diff -rq 결과
+-- 5. lvcreate 에 --permission r 을 빼고 스냅샷을 만들어 ro,nouuid 마운트가 되는지 비교한다
+--    확인 방법: lvs 의 Attr 둘째 글자(w/r)와 mount 결과
+
+================================================================================
+ 실습 07 종료 — snapper 구성까지 됨, 스냅샷 생성은 SELinux 거부로 IO Error, 손 작업은 ro 마운트에서 멈춤
+================================================================================

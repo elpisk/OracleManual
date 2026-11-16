@@ -1,0 +1,462 @@
+================================================================================
+ 제20장 실습 03 — GRUB 손상과 rescue 모드
+ 대상   : ol7a (직렬 콘솔 ttyS0 으로 진행)
+ 목표   : 반쯤 지워진 grub.cfg 로 GRUB 셸에 떨어진 상태에서 linux16·initrd16·boot 로
+          손수 부팅하고 grub2-mkconfig 로 되살린다. 기본 커널의 initramfs 가 사라져
+          패닉이 나는 서버를 rescue 커널 항목으로 살려 dracut 으로 고친다
+ 배경   : BIOS 의 GRUB 2 는 MBR → core.img → /boot/grub2 의 모듈과 grub.cfg 순서로
+          올라온다. grub.cfg 에 부팅 항목이 없으면 grub> 셸을 준다. 셸에서 쓰는 경로는
+          GRUB 의 root 장치(/boot 파티션) 기준이라 /boot 접두어가 없다. 7.9 는 설치 때
+          어느 하드웨어에서나 뜨는 rescue 커널 항목(0-rescue)을 만들어 둔다. 디스크로
+          아무것도 안 뜨면 설치 매체의 rescue 모드(/mnt/sysimage)를 쓴다 (본문 20.5)
+ 소요   : 약 40분
+ 선행   : pre-break 스냅샷
+ 계정   : root
+ 주의   : /boot 의 파일 이름을 바꾼다. 전원을 강제로 끄는 단계가 있다
+ 되돌림 : grub.cfg 가 원본과 같음, 기본 커널 initramfs 복구, UEK 로 부팅
+          → diff /root/grub.cfg.orig /boot/grub2/grub.cfg (출력 없음), uname -r
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# grep -c '^menuentry' /boot/grub2/grub.cfg; md5sum /boot/grub2/grub.cfg; cp -p /boot/grub2/grub.cfg /root/grub.cfg.orig
+5
+34397b75a9be877e4c88e8a928d9b2dc  /boot/grub2/grub.cfg
+-- 부팅 항목(menuentry) 5개.
+-- md5sum 은 내용이 한 글자라도 바뀌면 달라진다.
+-- 되돌림 확인용이다.
+-- 원본 사본은 /root/grub.cfg.orig.
+[root@ol7a ~]# ls /boot | grep -E '^(vmlinuz|initramfs)'
+initramfs-0-rescue-b8658360b45f49fe8174bcd0b610ae6e.img
+initramfs-3.10.0-1160.119.1.0.5.el7.x86_64.img
+initramfs-3.10.0-1160.el7.x86_64.img
+initramfs-5.4.17-2102.201.3.el7uek.x86_64.img
+initramfs-5.4.17-2102.201.3.el7uek.x86_64kdump.img
+initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img
+initramfs-5.4.17-2136.338.4.2.el7uek.x86_64kdump.img
+vmlinuz-0-rescue-b8658360b45f49fe8174bcd0b610ae6e
+vmlinuz-3.10.0-1160.119.1.0.5.el7.x86_64
+vmlinuz-3.10.0-1160.el7.x86_64
+vmlinuz-5.4.17-2102.201.3.el7uek.x86_64
+vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+-- 커널(vmlinuz) 5개와 짝이 되는 initramfs.
+-- 0-rescue 는 설치 때 만든 rescue 항목,
+-- kdump.img 는 덤프용 커널이 쓰는 것이다.
+-- 기본 커널은 UEK 5.4.17-2136.338.4.2.
+-- BOOT_IMAGE 는 GRUB 이 커널에 넘긴 커널 파일 경로다.
+-- /boot 파티션 기준이라 /boot 가 없다.
+[root@ol7a ~]# cat /proc/cmdline; findmnt -n -o SOURCE,TARGET /boot
+BOOT_IMAGE=/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol-root ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync
+/dev/sda1 /boot
+-- /boot 는 sda1 이라는 별도 파티션이다.
+-- GRUB 셸에서 경로를 쓸 때 이 사실이 중요하다([4]).
+-- console= 두 개와 GRUB 직렬 터미널은 랩 콘솔 캡처용 설정이다.
+
+--------------------------------------------------------------------------------
+ [1] 손상 1 — 부팅 항목이 잘려 나간 grub.cfg
+--------------------------------------------------------------------------------
+
+-- grub2-mkconfig 가 도중에 멈춰 파일이 반만 써진 상황이다.
+-- sed 로 10_linux 부분부터 끝까지 지운다.
+[root@ol7a ~]# sed -i '/^### BEGIN \/etc\/grub.d\/10_linux/,$d' /boot/grub2/grub.cfg; grep -c '^menuentry' /boot/grub2/grub.cfg; tail -3 /boot/grub2/grub.cfg
+0
+fi
+### END /etc/grub.d/01_users ###
+-- menuentry 0개. 파일 끝이 01_users 부분이다.
+-- 10_linux 가 부팅 항목을 만드는 스크립트다.
+-- 남은 머리 부분에 직렬 터미널 설정이 있다.
+-- 이 줄들까지 사라지면 grub> 가 VGA 화면에만 뜬다(시험에서 확인).
+[root@ol7a ~]# grep -E '^(serial|terminal)' /boot/grub2/grub.cfg
+serial --speed=115200 --unit=0 --word=8 --parity=no --stop=1
+terminal_input console serial
+terminal_output console serial
+-- serial 은 직렬 포트 속도,
+-- terminal_input·output 은 입출력을 화면과 직렬 둘 다로.
+-- /etc/default/grub 의 GRUB_TERMINAL="console serial" 이 만든 줄이다.
+
+--------------------------------------------------------------------------------
+ [2] 부팅 — grub> 셸
+--------------------------------------------------------------------------------
+-- 전원을 껐다 켰다.
+-- 콘솔에 메뉴 없이 grub> 프롬프트가 떴다.
+-- 러너가 기다린 글자는 제어 문자와 섞여 와서 이 칸에는 빈 줄만 남았다.
+-- 다음 단계의 출력이 그 프롬프트에서 친 결과다.
+
+
+
+--------------------------------------------------------------------------------
+ [3] GRUB 셸에서 둘러보기
+--------------------------------------------------------------------------------
+
+ls
+
+(hd0) (hd0,msdos2) (hd0,msdos1) (hd1) (hd2) (hd3) (hd4) 
+-- ls : GRUB 이 보는 디스크와 파티션.
+-- hd0 은 BIOS 가 첫 번째로 넘긴 디스크(sda), 파티션 둘.
+-- hd1~hd4 는 빈 실습 디스크 sdb~sde 다.
+-- 파티션이 없다.
+
+grub> 
+echo root=$root prefix=$prefix
+
+root=hd0,msdos1 prefix=(hd0,msdos1)/grub2
+-- root : 파일을 찾는 기본 장치. hd0 의 첫 파티션, 즉 /boot 파티션이다.
+-- prefix : 모듈과 grub.cfg 를 읽는 경로.
+-- 리눅스에서 /boot/grub2 인 곳이 GRUB 에서는 /grub2 다.
+
+grub> 
+ls /grub2/
+
+device.map i386-pc/ locale/ fonts/ grubenv grub.cfg grub.cfg.1794395718.rpmsave
+-- ls /grub2/ 가 바로 보인다.
+-- /boot 파티션의 / 가 리눅스의 /boot 다.
+-- i386-pc/ 는 BIOS 용 GRUB 모듈,
+-- grubenv 는 saved_entry 를 담는 파일.
+
+
+grub> 
+-- 설치 ISO(CD)를 GRUB 이 볼 수 있으면 매체의 rescue 커널을 여기서 올릴 수 있다.
+-- ata 모듈을 올리고 search 로 ISO 의 커널 파일을 찾는다.
+insmod ata
+
+grub> 
+search --no-floppy --file --set=cd /isolinux/vmlinuz
+
+error: no such device: /isolinux/vmlinuz.
+-- 찾지 못했다.
+-- 이 VM 에서는 GRUB 이 CD 를 보지 못한다.
+-- 그래서 이 실습은 설치 매체 대신 디스크의 rescue 항목을 쓴다([8]).
+-- 실서버는 원격 콘솔의 가상 미디어로 부팅해 Troubleshooting → Rescue 를 고른다.
+
+grub> 
+
+--------------------------------------------------------------------------------
+ [4] 오류 흐름 — linux16 경로를 /boot 부터 씀
+--------------------------------------------------------------------------------
+
+-- 콘솔 한 줄이 80자를 넘으면 GRUB 의 줄 편집기가 줄을 접어 화면이 어지러워진다.
+-- 커널 버전을 변수 k 에 담아 짧게 친다.
+set k=5.4.17-2136.338.4.2.el7uek.x86_64
+
+grub> 
+linux16 /boot/vmlinuz-$k root=/dev/mapper/ol-root ro
+
+error: file `/boot/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64' not found.
+-- 리눅스에서 쓰던 대로 /boot 를 붙였더니 파일이 없다.
+-- GRUB 의 root 가 이미 /boot 파티션이라 /boot/vmlinuz… 는 /boot/boot/vmlinuz… 를 찾은 셈이다.
+-- $k 는 오류 메시지에서 실제 버전으로 펼쳐져 보인다.
+-- 증상   : linux16 /boot/vmlinuz-$k … → "error: file … not found."
+-- 원인   : /boot 가 별도 파티션이고 GRUB 의 root=hd0,msdos1 이 그 파티션이라 경로에 /boot 가 없어야 한다
+-- 조치   : linux16 /vmlinuz-$k root=/dev/mapper/ol-root ro
+-- 재확인 : 오류 없이 grub> 로 돌아오고, boot 뒤 /proc/cmdline 의 BOOT_IMAGE=/vmlinuz-…
+
+grub> 
+
+--------------------------------------------------------------------------------
+ [5] 손으로 부팅 — linux16 · initrd16 · boot
+--------------------------------------------------------------------------------
+
+-- rd.lvm.lv 를 빼면 dracut 은 찾은 LV 를 모두 켠다.
+-- console= 을 넣지 않았으니 이번 부팅의 메시지는 직렬 콘솔이 아니라 VGA 화면에만 나간다.
+-- 부팅 결과는 SSH 로 확인한다.
+linux16 /vmlinuz-$k root=/dev/mapper/ol-root ro
+
+grub> 
+-- 오류 없이 프롬프트로 돌아왔다.
+-- 커널이 메모리에 올라갔다.
+initrd16 /initramfs-$k.img
+
+grub> 
+-- initramfs 도 올라갔다.
+boot
+-- boot 로 커널을 실행한다.
+-- console= 이 없어 직렬 콘솔에는 더 찍히지 않았다.
+-- 러너가 SSH 가 열리기를 기다렸다가 접속했다.
+
+[root@ol7a ~]# cat /proc/cmdline; uptime
+BOOT_IMAGE=/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol-root ro
+ 22:00:43 up 1 min,  0 users,  load average: 0.00, 0.00, 0.00
+-- BOOT_IMAGE 뒤가 직접 친 파라미터 그대로다.
+-- rhgb quiet, crashkernel,
+-- rd.lvm.lv, console= 이 모두 빠졌다.
+-- crashkernel 이 없으니 이번 부팅에서는 kdump 가 동작하지 않는다.
+[root@ol7a ~]# swapon --show; lvs --noheadings -o lv_name,lv_active ol
+NAME      TYPE      SIZE USED PRIO
+/dev/dm-0 partition 3.9G   0B   -2
+  root active
+  swap active
+-- swapon : 스왑 장치 dm-0(ol-swap) 3.9G, 사용 0B.
+-- lvs : root·swap 모두 active.
+-- rd.lvm.lv 를 빼도 dracut 이 VG 의 LV 를 다 켰다.
+
+--------------------------------------------------------------------------------
+ [6] grub2-mkconfig 로 되살리기
+--------------------------------------------------------------------------------
+
+-- grub2-mkconfig 는 /etc/default/grub 과 /etc/grub.d/ 스크립트로 grub.cfg 를 새로 쓴다.
+-- -o 를 빼면 표준 출력에만 찍고 파일은 그대로다.
+[root@ol7a ~]# grub2-mkconfig -o /boot/grub2/grub.cfg
+Generating grub configuration file ...
+Found linux image: /boot/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+Found initrd image: /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img
+Found linux image: /boot/vmlinuz-5.4.17-2102.201.3.el7uek.x86_64
+Found initrd image: /boot/initramfs-5.4.17-2102.201.3.el7uek.x86_64.img
+Found linux image: /boot/vmlinuz-3.10.0-1160.119.1.0.5.el7.x86_64
+Found initrd image: /boot/initramfs-3.10.0-1160.119.1.0.5.el7.x86_64.img
+Found linux image: /boot/vmlinuz-3.10.0-1160.el7.x86_64
+Found initrd image: /boot/initramfs-3.10.0-1160.el7.x86_64.img
+Found linux image: /boot/vmlinuz-0-rescue-b8658360b45f49fe8174bcd0b610ae6e
+Found initrd image: /boot/initramfs-0-rescue-b8658360b45f49fe8174bcd0b610ae6e.img
+done
+-- 커널과 initramfs 를 짝으로 찾았다.
+-- 다섯 쌍 모두 Found.
+-- kdump.img 는 짝으로 세지 않는다.
+-- 순서는 버전 정렬 순서다.
+-- 0-rescue 가 마지막이다.
+[root@ol7a ~]# grep -c '^menuentry' /boot/grub2/grub.cfg; diff /root/grub.cfg.orig /boot/grub2/grub.cfg | head -6; diff /root/grub.cfg.orig /boot/grub2/grub.cfg | grep -c '^<'
+5
+96c96
+<       set root='hd1,msdos1'
+---
+>       set root='hd0,msdos1'
+98c98
+<         search --no-floppy --fs-uuid --set=root --hint-bios=hd1,msdos1 --hint-efi=hd1,msdos1 --hint-baremetal=ahci1,msdos1  9e9b6650-ec84-4fa9-b7ec-e541592b4ecc
+10
+-- 항목 수 5, 원본과 같다.
+-- 그러나 diff 의 < 줄이 10개다.
+-- 첫 두 차이만 보였다(head -6).
+-- 원본은 set root='hd1,msdos1', 새 파일은 hd0.
+-- --hint-bios=hd1 → hd0,
+-- 새 파일에는 --hint='hd0,msdos1' 이 더 붙었다.
+-- 원본은 OS 디스크가 두 번째 디스크로 잡혔던 때 만들어졌다.
+-- 다섯 항목에 두 줄씩 10곳.
+-- 둘 다 search --fs-uuid 가 UUID 로 /boot 를 찾으므로 부팅에는 문제가 없다.
+
+--------------------------------------------------------------------------------
+ [7] 손상 2 — 기본 커널의 initramfs 가 사라짐
+--------------------------------------------------------------------------------
+
+-- 손상 2. /boot 가 찼다며 누군가 기본 커널의 initramfs 를 옮겨 버린 상황이다.
+[root@ol7a ~]# mv /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img /root/; ls /boot | grep -E '^initramfs'
+initramfs-0-rescue-b8658360b45f49fe8174bcd0b610ae6e.img
+initramfs-3.10.0-1160.119.1.0.5.el7.x86_64.img
+initramfs-3.10.0-1160.el7.x86_64.img
+initramfs-5.4.17-2102.201.3.el7uek.x86_64.img
+initramfs-5.4.17-2102.201.3.el7uek.x86_64kdump.img
+initramfs-5.4.17-2136.338.4.2.el7uek.x86_64kdump.img
+-- 기본 커널의 initramfs 만 없다.
+-- kdump.img 는 남았다.
+-- 재부팅하면 메뉴의 첫 항목(기본)으로 부팅한다.
+-- 콘솔 출력의 마지막 8줄.
+[    0.674705]  prepare_namespace+0x141/0x17d
+[    0.675431]  kernel_init_freeable+0x27c/0x2a7
+[    0.676112]  ? loglevel+0x5d/0x5d
+[    0.676637]  ? rest_init+0xb0/0xb0
+[    0.677181]  kernel_init+0xe/0x123
+[    0.677719]  ret_from_fork+0x24/0x36
+[    0.678351] Kernel Offset: 0x32c00000 from 0xffffffff81000000 (relocation range: 0xffffffff80000000-0xffffffffbfffffff)
+[    0.680003] ---[ end Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0) ]---
+-- 마지막 줄이 이유다.
+-- VFS: Unable to mount root fs on unknown-block(0,0).
+-- 0.68초 만에 패닉했다.
+-- 루트 장치를 열 initramfs 가 없었다.
+-- 위의 함수 목록은 Call Trace 의 끝부분이다.
+-- prepare_namespace 에서 루트를 찾다 멈췄다.
+-- Kernel Offset 은 커널을 메모리에 올린 위치(KASLR)다.
+-- 부팅마다 다르다.
+-- 증상   : "Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)"
+-- 원인   : 기본 커널의 initramfs-5.4.17-2136….img 가 /boot 에 없다
+-- 조치   : 0-rescue 항목으로 부팅해 dracut 으로 다시 만든다([8]~[10])
+-- 재확인 : 기본 UEK 로 재부팅, uname -r 이 5.4.17-2136.338.4.2.el7uek.x86_64
+
+--------------------------------------------------------------------------------
+ [8] rescue 커널 항목으로 부팅
+--------------------------------------------------------------------------------
+
+-- 패닉 뒤에는 응답이 없다.
+-- 전원을 강제로 끈다 (vmrun stop hard).
+-- 메뉴의 다섯 번째 항목이 rescue 커널이다.
+-- 아래 화살표 네 번 후 Enter.
+
+
+
+      Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.>
+      Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2102.>
+      Oracle Linux Server 7.9, with Linux 3.10.0-1160.119.1.0.5.el7.x86_64
+      Oracle Linux Server 7.9, with Linux 3.10.0-1160.el7.x86_64
+      Oracle Linux Server 7.9, with Linux 0-rescue-b8658360b45f49fe8174bcd0b61>
+-- GRUB 메뉴 다섯 항목.
+-- 화면 폭에서 잘린 제목은 > 로 끝난다.
+-- 직렬 화면 재구성이라 선택 막대(반전 표시)는 보이지 않는다.
+Oracle Linux Server 7.9
+Kernel 3.10.0-1160.el7.x86_64 on an x86_64
+ol7a login:
+-- 3.10.0-1160.el7 커널로 로그인 프롬프트까지 왔다.
+[root@ol7a ~]# uname -r; cat /proc/cmdline | cut -c1-80
+3.10.0-1160.el7.x86_64
+BOOT_IMAGE=/vmlinuz-0-rescue-b8658360b45f49fe8174bcd0b610ae6e root=/dev/mapper/o
+-- 실행 중인 커널 이름은 3.10.0-1160.el7.x86_64.
+-- 부팅한 파일은 vmlinuz-0-rescue-….
+-- 80자에서 잘랐다.
+[root@ol7a ~]# ls -l /boot/vmlinuz-0-rescue-* /boot/vmlinuz-3.10.0-1160.el7.x86_64 | cut -c24-; cmp /boot/vmlinuz-0-rescue-* /boot/vmlinuz-3.10.0-1160.el7.x86_64 && echo same
+ 6771656 Nov 11 19:47 /boot/vmlinuz-0-rescue-b8658360b45f49fe8174bcd0b610ae6e
+ 6771656 Oct  2  2020 /boot/vmlinuz-3.10.0-1160.el7.x86_64
+same
+-- 두 파일 크기 6771656 으로 같고 cmp 도 같다고 한다.
+-- rescue 커널은 설치 매체의 3.10.0-1160 커널을 복사한 것이다.
+-- initramfs 는 모든 드라이버를 담은 범용판이라 어느 하드웨어에서도 뜬다(68MB).
+
+--------------------------------------------------------------------------------
+ [9] 오류 흐름 — 버전 없이 dracut -f
+--------------------------------------------------------------------------------
+
+-- initramfs 를 다시 만든다.
+-- 인자 없이 쓰면 어느 커널 것을 만들까.
+-- 먼저 3.10.0-1160 의 initramfs 크기와 시각을 남긴다.
+[root@ol7a ~]# ls -l --time-style=+%H:%M /boot/initramfs-3.10.0-1160.el7.x86_64.img | cut -c24-
+ 21617694 19:50 /boot/initramfs-3.10.0-1160.el7.x86_64.img
+-- 21617694 바이트, 19:50(설치 날).
+[root@ol7a ~]# time dracut -f; echo "rc=$?"
+
+real    0m17.602s
+user    0m11.913s
+sys     0m6.675s
+rc=0
+-- 17.6초 걸려 성공(rc=0).
+[root@ol7a ~]# ls -l --time-style=+%H:%M /boot/initramfs-3.10.0-1160.el7.x86_64.img | cut -c24-; ls /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img; echo "rc=$?"
+ 21586072 22:03 /boot/initramfs-3.10.0-1160.el7.x86_64.img
+ls: cannot access /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img: No such file or directory
+rc=2
+-- 3.10.0-1160 의 initramfs 가 22:03 에 새로 쓰였다(21586072 바이트).
+-- 기본 UEK 의 initramfs 는 여전히 없다.
+-- dracut -f 는 지금 실행 중인 커널(uname -r) 것을 만든다.
+-- 증상   : dracut -f 가 rc=0 인데 "/boot/initramfs-5.4.17-2136….img: No such file or directory"
+-- 원인   : 인자 없는 dracut 은 실행 중인 rescue 커널(3.10.0-1160) 것을 다시 만든다
+-- 조치   : dracut -f /boot/initramfs-버전.img 버전 으로 이미지와 버전을 지정
+-- 재확인 : ls -l 로 새 파일, lsinitrd 로 lvm·xfs 포함 확인
+
+--------------------------------------------------------------------------------
+ [10] 기본 커널의 initramfs 만들기
+--------------------------------------------------------------------------------
+
+-- 이미지 경로와 커널 버전을 둘 다 준다.
+-- 실행 중인 커널과 다른 버전이어도 /lib/modules/버전 이 있으면 만들 수 있다.
+[root@ol7a ~]# time dracut -f /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img 5.4.17-2136.338.4.2.el7uek.x86_64; echo "rc=$?"
+
+real    0m19.425s
+user    0m14.390s
+sys     0m9.873s
+rc=0
+-- 19.4초, rc=0.
+[root@ol7a ~]# ls -l /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img /root/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img | cut -c24-
+ 23874682 Nov 16 22:04 /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img
+ 22668216 Nov 11 20:17 /root/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img
+-- 새 파일 23874682 바이트,
+-- 옮겨 둔 원본은 22668216 바이트.
+-- 새 파일이 1.2MB 쯤 크다.
+-- 지금 하드웨어에 맞춰 넣은 것이 조금 다르다.
+-- 안에 LVM 과 xfs 모듈이 들어 있는지 lsinitrd 로 본다.
+[root@ol7a ~]# lsinitrd /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img | grep -E 'Arguments|^dracut modules|lvm$|xfs' | head -6
+Arguments: -f
+dracut modules:
+lvm
+drwxr-xr-x   2 root     root            0 Nov 16 22:04 etc/lvm
+drwxr-xr-x   2 root     root            0 Nov 16 22:04 usr/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/xfs
+-rw-r--r--   1 root     root       540044 Dec 24  2024 usr/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/xfs/xfs.ko.xz
+-- Arguments: -f : 만들 때 준 옵션이 기록돼 있다.
+-- dracut 모듈 목록에 lvm,
+-- 파일 목록에 etc/lvm 과 xfs.ko.xz.
+-- 루트(ol-root, xfs)를 열 준비가 돼 있다.
+
+--------------------------------------------------------------------------------
+ [변형] 원래 파일로 되돌리기와 비교
+--------------------------------------------------------------------------------
+
+-- 옮겨 둔 원본이 남아 있으면 되돌리는 쪽이 빠르다.
+-- 두 파일에 든 항목 수(파일·디렉터리·링크)를 센다.
+[root@ol7a ~]# lsinitrd /root/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img | grep -c '^-\|^d\|^l'; lsinitrd /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img | grep -c '^-\|^d\|^l'
+1649
+1709
+-- 원본 1649개, 새로 만든 것 1709개.
+-- 같은 버전이라도 만드는 환경에 따라 다르다.
+-- 원래 잘 부팅되던 파일이 있으면 그것을 되돌리는 쪽이 안전하다.
+[root@ol7a ~]# mv -f /root/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img /boot/; ls -l /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img | cut -c24-
+ 22668216 Nov 11 20:17 /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img
+-- mv -f 로 덮어썼다.
+-- 크기·시각이 원본(Nov 11 20:17)이다.
+
+--------------------------------------------------------------------------------
+ [11] 기본 커널로 재부팅
+--------------------------------------------------------------------------------
+
+-- 재부팅. saved_entry 가 기본 UEK 를 가리키므로 따로 고르지 않아도 된다.
+[root@ol7a ~]# grub2-editenv list
+saved_entry=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.338.4.2.el7uek.x86_64
+-- grubenv 의 saved_entry 는 [6] 의 mkconfig 뒤에도 그대로다.
+[root@ol7a ~]# uname -r; uptime
+5.4.17-2136.338.4.2.el7uek.x86_64
+ 22:04:44 up 0 min,  0 users,  load average: 0.07, 0.02, 0.00
+-- 기본 UEK 로 부팅됐다.
+
+--------------------------------------------------------------------------------
+ [12] 되돌림 확인
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# grep -c '^menuentry' /boot/grub2/grub.cfg; diff /root/grub.cfg.orig /boot/grub2/grub.cfg | head -6; diff /root/grub.cfg.orig /boot/grub2/grub.cfg | grep -c '^<'
+5
+96c96
+<       set root='hd1,msdos1'
+---
+>       set root='hd0,msdos1'
+98c98
+<         search --no-floppy --fs-uuid --set=root --hint-bios=hd1,msdos1 --hint-efi=hd1,msdos1 --hint-baremetal=ahci1,msdos1  9e9b6650-ec84-4fa9-b7ec-e541592b4ecc
+10
+-- 항목 수 5.
+-- 차이는 [6] 과 같은 hd1 → hd0 10곳뿐이다.
+-- 원본 사본과 바이트 단위로 같지는 않지만 내용은 같은 다섯 항목이다.
+[root@ol7a ~]# ls /boot | grep -E '^initramfs'; systemctl is-system-running
+initramfs-0-rescue-b8658360b45f49fe8174bcd0b610ae6e.img
+initramfs-3.10.0-1160.119.1.0.5.el7.x86_64.img
+initramfs-3.10.0-1160.el7.x86_64.img
+initramfs-3.10.0-1160.el7.x86_64kdump.img
+initramfs-5.4.17-2102.201.3.el7uek.x86_64.img
+initramfs-5.4.17-2102.201.3.el7uek.x86_64kdump.img
+initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img
+initramfs-5.4.17-2136.338.4.2.el7uek.x86_64kdump.img
+running
+-- initramfs 목록이 [0] 과 같다.
+-- 3.10.0-1160.el7.x86_64kdump.img 가 하나 늘었다.
+-- rescue 커널로 부팅한 동안 kdump 서비스가 그 커널용 덤프 initramfs 를 만든 것이다.
+-- 시스템 running.
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                     시작 전        손상 중                      되돌린 뒤
+--  grub.cfg menuentry       5              0 (10_linux 이하 삭제)       5
+--  grub.cfg 의 root 힌트    hd1,msdos1     -                            hd0,msdos1
+--  기본 initramfs           있음           없음(/root 로 옮김)          원본 복귀
+--  실행 커널                5.4.17-2136    3.10.0-1160(0-rescue)        5.4.17-2136
+--
+--  상황                     보인 것                                  길
+--  항목 없는 grub.cfg       grub> 프롬프트                           linux16 → initrd16 → boot
+--  /boot 붙인 경로          error: file … not found                  /vmlinuz-$k
+--  initramfs 없음           Kernel panic … unknown-block(0,0)        0-rescue → dracut 버전 지정
+--  인자 없는 dracut -f      실행 중인 3.10 것만 다시 만듦            이미지·버전 지정
+--  GRUB 에서 CD 찾기        error: no such device                    매체 부팅(실서버)
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. grub.cfg 를 아예 지우고 부팅해 VGA 화면(vnc 캡처)에서 grub> 를 확인한다.
+--    직렬 콘솔에는 왜 아무것도 안 뜨는지 설명한다.
+-- 2. grub> 셸에서 configfile (hd0,msdos1)/grub2/grub.cfg.1794395718.rpmsave 로
+--    다른 설정 파일을 읽어 메뉴를 띄워 본다.
+-- 3. grub2-mkconfig 뒤 /etc/default/grub 의 GRUB_TIMEOUT 을 바꿔 다시 만들고
+--    diff 로 어느 줄이 바뀌는지 확인한다.
+
+================================================================================
+ 실습 03 종료 — grub> 셸 수동 부팅과 0-rescue·dracut 으로 GRUB·initramfs 손상을 복구
+================================================================================

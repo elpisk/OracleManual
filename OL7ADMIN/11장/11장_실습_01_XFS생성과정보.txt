@@ -1,0 +1,560 @@
+================================================================================
+ 제11장 실습 01 — XFS 생성과 정보 조회
+ 대상   : ol7a
+ 목표   : mkfs.xfs 출력의 각 줄(agcount·agsize·bsize·log)을 읽고, 같은 값을
+          xfs_info·xfs_db 로 다시 확인한다. xfs_admin 으로 레이블·UUID 를 바꾸고,
+          LVM 스냅샷을 원본과 함께 마운트할 때 생기는 UUID 충돌을 겪어 본다
+ 배경   : XFS 는 파일 시스템을 할당 그룹(AG) 여러 개로 나눠 각 AG 가 inode 와
+          빈 공간을 따로 관리한다. 메타데이터 변경은 먼저 저널(log)에 쓴다.
+          생성 시 정한 블록 크기·inode 크기·AG 수는 나중에 바꿀 수 없고,
+          레이블·UUID 는 언마운트 상태에서 xfs_admin 으로 바꾼다 (본문 11.1~11.3)
+ 소요   : 약 25분
+ 선행   : storage-clean 스냅샷 (sdb~sde 10G 비어 있음)
+ 계정   : root
+ 주의   : mkfs.xfs -f 는 장치의 기존 파일 시스템을 묻지 않고 지운다.
+          sda(OS 디스크, VG ol)에는 어떤 명령도 내리지 않는다
+ 되돌림 : 마운트 해제 후 wipefs 로 서명 삭제, VG 제거.
+          lsblk -f /dev/sd[b-e] 에서 FSTYPE 이 모두 비어 있으면 끝
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 실습 디스크 네 개가 비어 있는지부터 본다. -f 는 파일 시스템 정보 열
+-- (FSTYPE·LABEL·UUID)을 더한다. 여기서 sda 쪽은 보기만 한다.
+[root@ol7a ~]# lsblk -f /dev/sda /dev/sdb /dev/sdc /dev/sdd /dev/sde
+NAME        FSTYPE      LABEL UUID                                   MOUNTPOINT
+sda                                                                  
+├─sda2      LVM2_member       ULDbRp-NtXT-dFGI-omgJ-rwPg-dl2e-CwYyeF 
+│ ├─ol-swap swap              0779f04f-cbfc-42d5-b8c5-44173384aedf   [SWAP]
+│ └─ol-root xfs               d527e202-9baf-46ef-9423-ac690a91a6a9   /
+└─sda1      xfs               9e9b6650-ec84-4fa9-b7ec-e541592b4ecc   /boot
+sdb                                                                  
+sdc                                                                  
+sdd                                                                  
+sde                                                                  
+-- 열: NAME·FSTYPE·LABEL·UUID·MOUNTPOINT
+--   sda 만 파티션·LVM·XFS 를 품고 있다(OS)
+--   sdb~sde 는 FSTYPE·UUID 가 비어 있다
+-- 실습은 이 넷에만 명령을 낸다
+
+-- 커널과 xfsprogs 버전. mkfs.xfs 의 기본값(crc, finobt 등)은
+-- xfsprogs 버전에 따라 달라지므로 실습 기준을 남겨 둔다.
+[root@ol7a ~]# uname -r; rpm -q xfsprogs; mkfs.xfs -V
+5.4.17-2136.338.4.2.el7uek.x86_64
+xfsprogs-5.4.0-1.0.1.el7.x86_64
+mkfs.xfs version 5.4.0
+-- 커널은 BASE 기준 UEK R6 그대로다
+-- xfsprogs 가 5.4.0-1.0.1.el7 이다
+--   RHEL 7.9 의 4.5.0 이 아니다
+--   UEK R6 에 맞춘 Oracle 빌드다
+-- 이 실습의 동작은 모두 5.4.0 기준이다
+
+-- 현재 마운트된 XFS 목록. 루트와 /boot 가 이미 XFS 다.
+[root@ol7a ~]# df -hT -t xfs
+Filesystem          Type  Size  Used Avail Use% Mounted on
+/dev/mapper/ol-root xfs    36G  4.3G   31G  13% /
+/dev/sda1           xfs  1014M  283M  731M  28% /boot
+-- 일곱 열: 장치·종류·크기·사용·남음·사용률·마운트 지점
+-- 루트 36G, /boot 1014M 모두 Type 이 xfs
+-- 이 두 줄은 되돌림 단계에서 다시 비교한다
+
+--------------------------------------------------------------------------------
+ [1] 기존 파일 시스템이 있는 장치에 mkfs.xfs — 오류 ①
+--------------------------------------------------------------------------------
+
+-- 실무에서 흔한 상황을 만든다. 예전에 Ext4 로 쓰던 디스크를 XFS 로 다시 만드는 경우다.
+-- 먼저 sdb 에 Ext4 를 만든다. -q 는 진행 출력을 줄인다.
+[root@ol7a ~]# mkfs.ext4 -q /dev/sdb; blkid /dev/sdb
+/dev/sdb: UUID="904cbad0-cdc5-4ba3-9f9e-302bef7b7e18" TYPE="ext4" 
+-- blkid 가 TYPE="ext4" 를 돌려준다
+-- 디스크 전체(sdb)에 파티션 없이 만들었다
+
+-- 이 상태에서 옵션 없이 mkfs.xfs 를 친다.
+[root@ol7a ~]# mkfs.xfs /dev/sdb; echo "rc=$?"
+mkfs.xfs: /dev/sdb appears to contain an existing filesystem (ext4).
+mkfs.xfs: Use the -f option to force overwrite.
+rc=1
+-- 증상   : mkfs.xfs: /dev/sdb appears to contain an existing filesystem (ext4).
+-- 원인   : mkfs.xfs 가 기존 ext4 서명을 찾고 멈췄다(rc=1)
+-- 조치   : 덮어써도 되는 장치인지 lsblk -f 로 보고 -f 를 붙인다
+-- 재확인 : [2] 의 mkfs.xfs -f 출력과 blkid 의 TYPE="xfs"
+-- mke2fs 는 -F, mkfs.xfs 는 소문자 -f 다
+
+--------------------------------------------------------------------------------
+ [2] mkfs.xfs 출력 한 줄씩 읽기
+--------------------------------------------------------------------------------
+
+-- -f  기존 서명이 있어도 덮어쓴다
+-- -L  레이블(최대 12자). 마운트·fstab 에서 LABEL= 으로 쓸 수 있다
+[root@ol7a ~]# mkfs.xfs -f -L xfsdata /dev/sdb
+meta-data=/dev/sdb               isize=256    agcount=4, agsize=655360 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=0        finobt=0, sparse=0, rmapbt=0
+         =                       reflink=0
+data     =                       bsize=4096   blocks=2621440, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=2560, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+-- 다섯 줄을 위에서부터 읽는다
+-- meta-data
+--   isize=256      inode 크기. v4 기본값
+--   agcount=4      AG 네 개
+--   agsize=655360  AG 하나의 블록 수
+--   crc=0          v4 형식. 체크섬 없음
+--   finobt=0       빈 inode B+tree 없음
+--   reflink=0      공유 extent 없음
+-- data
+--   bsize=4096     블록 4KB
+--   blocks=2621440 = 4 x 655360
+--   2621440 x 4096 = 10GiB
+--   imaxpct=25     inode 몫 상한 25%
+--   sunit·swidth=0 RAID 정렬 없음
+-- naming : 디렉터리 v2, ftype=1
+-- log    : 내부 저널 2560 블록 = 10MiB
+--   lazy-count=1   lazy counter 켜짐
+-- realtime : 쓰지 않음
+-- xfsprogs 5.4 인데 crc=0 이 기본이다
+--   [7] 의 xfs_db version 에서 V4 로 확인
+
+--------------------------------------------------------------------------------
+ [3] 마운트하고 xfs_info 로 같은 값 다시 보기
+--------------------------------------------------------------------------------
+
+-- xfs_info 는 마운트된 파일 시스템의 기하 구조를 보여 준다.
+-- 인자는 마운트 지점이다.
+[root@ol7a ~]# mkdir -p /xfs1; mount /dev/sdb /xfs1; df -hT /xfs1
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdb       xfs    10G   33M   10G   1% /xfs1
+[root@ol7a ~]# xfs_info /xfs1
+meta-data=/dev/sdb               isize=256    agcount=4, agsize=655360 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=0        finobt=0, sparse=0, rmapbt=0
+         =                       reflink=0
+data     =                       bsize=4096   blocks=2621440, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=2560, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+-- mkfs 출력과 한 글자도 다르지 않다
+-- 차이는 meta-data= 뒤의 장치 이름뿐이다
+
+-- 마운트 옵션도 본다. 아무 옵션을 주지 않았을 때 커널이 붙이는 기본값이다.
+[root@ol7a ~]# grep /xfs1 /proc/mounts
+/dev/sdb /xfs1 xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+-- /proc/mounts 의 여섯 칸 중 넷째가 옵션
+--   seclabel      SELinux 레이블 지원
+--   relatime      atime 을 줄여 갱신
+--   attr2         확장 속성 v2
+--   inode64       inode 를 어디에나 둔다
+--   logbufs=8, logbsize=32k  로그 버퍼
+--   noquota       할당량 꺼짐(실습 03)
+
+-- 옛 문서(RHCK 3.10 기준)는 배터리 캐시가 있는 저장 장치에 nobarrier 옵션을 권했다.
+-- UEK R6 에서 이 옵션이 받아들여지는지 직접 넣어 본다.
+[root@ol7a ~]# umount /xfs1; mount -o nobarrier /dev/sdb /xfs1; echo "rc=$?"; dmesg | tail -2
+mount: wrong fs type, bad option, bad superblock on /dev/sdb,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+rc=32
+[   12.334937] XFS (sdb): Unmounting Filesystem
+[   12.338873] XFS (sdb): unknown mount option [nobarrier].
+-- mount 는 일반 문구만 내고 rc=32
+-- 이유는 dmesg 에 있다
+--   unknown mount option [nobarrier].
+-- UEK R6 은 nobarrier 를 받지 않는다
+-- 옛 fstab 에 남아 있으면 마운트 실패다
+-- [OL8/9] 8/9 커널에서도 같은 옵션은 없다
+[root@ol7a ~]# mount /dev/sdb /xfs1; findmnt -n -o SOURCE,FSTYPE /xfs1
+/dev/sdb xfs
+-- 옵션 없이 다시 마운트했다
+
+--------------------------------------------------------------------------------
+ [4] 생성 직후 공간은 어디에 쓰였나
+--------------------------------------------------------------------------------
+
+-- 빈 파일 시스템인데도 Used 가 0 이 아니다. 저널과 AG 헤더, inode 를 위한 공간이다.
+-- df 의 블록 수와 inode 수를 함께 본다.
+[root@ol7a ~]# df /xfs1; df -i /xfs1
+Filesystem     1K-blocks  Used Available Use% Mounted on
+/dev/sdb        10475520 32976  10442544   1% /xfs1
+Filesystem       Inodes IUsed    IFree IUse% Mounted on
+/dev/sdb       10485760     3 10485757    1% /xfs1
+-- 1K 블록 10475520 중 32976 사용
+--   저널 10MiB + AG 헤더 몫이다
+-- Inodes 10485760 은 상한 계산값이다
+--   imaxpct=25 와 크기에서 나온 숫자
+-- IUsed 3: 루트 디렉터리와 할당량 inode 등
+
+-- inode 는 미리 만들어 두지 않는다. 처음에는 루트 디렉터리 등 몇 개뿐이고,
+-- 파일을 만들면 64개 묶음(chunk)으로 그때그때 할당된다.
+[root@ol7a ~]# for i in $(seq 1 100); do touch /xfs1/f$i; done; df -i /xfs1; ls -i /xfs1 | sort -n | head -3
+Filesystem       Inodes IUsed    IFree IUse% Mounted on
+/dev/sdb       10485760   103 10485657    1% /xfs1
+131 f1
+132 f2
+133 f3
+-- IUsed 3 → 103. 파일 100개만큼 늘었다
+-- 첫 inode 번호가 131 부터다
+-- inode 는 묶음 단위로 그때 할당된다
+
+--------------------------------------------------------------------------------
+ [5] 옵션을 바꿔 다시 만들기 — AG 수·블록 크기·inode 크기
+--------------------------------------------------------------------------------
+
+-- 생성 시 정한 기하 구조는 바꿀 수 없다. 바꾸려면 다시 만든다.
+-- sdc 에 옵션을 준 파일 시스템을 만들어 sdb 와 비교한다.
+--   -d agcount=8   AG 를 8개로(기본은 크기에 따라 자동)
+--   -b size=1024   블록 크기 1KB(기본 4KB). 작은 파일이 아주 많을 때 고려
+--   -i size=512    inode 크기 512바이트(crc=1 이면 기본값이 이미 512)
+[root@ol7a ~]# mkfs.xfs -f -d agcount=8 -b size=1024 -i size=512 -L xfssmall /dev/sdc
+meta-data=/dev/sdc               isize=512    agcount=8, agsize=1310720 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=0        finobt=0, sparse=0, rmapbt=0
+         =                       reflink=0
+data     =                       bsize=1024   blocks=10485760, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=1024   blocks=10240, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+-- [2] 와 다른 값만 짚는다
+--   isize=512      지정한 대로
+--   agcount=8      AG 여덟 개
+--   agsize=1310720 1KB 블록 기준
+--   bsize=1024, blocks=10485760
+--     블록이 1/4 크기라 개수가 4배
+--   log blocks=10240 x 1KB = 10MiB
+-- naming 줄의 bsize=4096 은 그대로다
+--   디렉터리 블록 크기는 따로 정한다
+
+-- 블록 크기가 페이지 크기(4KB)보다 크면 마운트할 수 없다는 제약도 있다. -b size=8192 로 확인한다.
+[root@ol7a ~]# mkfs.xfs -f -b size=8192 /dev/sdd >/dev/null; mkdir -p /xfs3; mount /dev/sdd /xfs3; echo "rc=$?"; dmesg | tail -2
+mount: mount /dev/sdd on /xfs3 failed: Function not implemented
+rc=32
+[   12.875144] XFS (sdd): File system with blocksize 8192 bytes. Only pagesize (4096) or less will currently work.
+[   12.875149] XFS (sdd): SB validate failed with error -38.
+-- mkfs 는 성공했고 마운트가 실패했다
+--   Function not implemented, rc=32
+--   dmesg: Only pagesize (4096) or less
+-- error -38 = ENOSYS
+[root@ol7a ~]# getconf PAGESIZE
+4096
+-- x86_64 페이지는 4096 바이트다
+-- 8KB 블록 XFS 는 이 서버에서 못 쓴다
+
+--------------------------------------------------------------------------------
+ [6] xfs_admin — 레이블과 UUID
+--------------------------------------------------------------------------------
+
+-- FS 문서는 마운트된 XFS 는 고칠 수 없다고 적었다. 마운트된 채로 레이블을 바꿔 본다.
+[root@ol7a ~]# xfs_admin -L newlabel /dev/sdb; echo "rc=$?"
+label = "newlabel"
+rc=0
+-- 마운트된 채로 바뀌었다(rc=0)
+-- xfsprogs 5.4 는 마운트된 XFS 의 레이블을
+--   커널 ioctl 로 바꾼다
+-- FS 문서 문장은 4.5 시절 기준이다
+-- UUID 변경은 여전히 언마운트가 필요하다
+
+-- 언마운트하고 다시 한다.
+--   -l  레이블 보기    -u  UUID 보기
+--   -L  레이블 바꾸기  -U  UUID 바꾸기(generate 는 새로 만들기)
+[root@ol7a ~]# umount /xfs1; xfs_admin -l -u /dev/sdb
+label = "newlabel"
+UUID = d4625599-d325-456e-b77f-7a3690e85006
+-- -l·-u 를 한 번에 주면 두 줄이 나온다
+-- 레이블은 앞에서 바꾼 newlabel
+[root@ol7a ~]# xfs_admin -L xfsdata1 /dev/sdb; xfs_admin -U generate /dev/sdb
+writing all SBs
+new label = "xfsdata1"
+Clearing log and setting UUID
+writing all SBs
+new UUID = 72343256-e53a-417b-8576-26897ee78a79
+-- 레이블: writing all SBs → AG 마다 사본
+-- UUID: Clearing log and setting UUID
+--   로그를 비우고 모든 슈퍼블록에 쓴다
+[root@ol7a ~]# blkid /dev/sdb
+/dev/sdb: LABEL="xfsdata1" UUID="72343256-e53a-417b-8576-26897ee78a79" TYPE="xfs" 
+-- blkid 가 새 LABEL 과 UUID 를 보여 준다
+
+-- 레이블은 12자까지다. 15자를 넣어 본다.
+[root@ol7a ~]# xfs_admin -L verylonglabel13 /dev/sdb; echo "rc=$?"
+writing all SBs
+xfs_admin: truncating label length from 15 to 12
+new label = "verylonglabe"
+rc=0
+-- 오류가 아니라 잘라서 저장했다
+--   truncating label length from 15 to 12
+--   new label = "verylonglabe"
+-- 레이블이 바뀐 것을 잊기 쉽다
+
+-- 레이블로 마운트한다. udev 가 /dev/disk/by-label 에 링크를 만들어 둔다.
+[root@ol7a ~]# ls -l /dev/disk/by-label/; mount LABEL=xfsdata1 /xfs1; df -h /xfs1
+total 0
+lrwxrwxrwx. 1 root root 9 Nov 16 11:04 OL-7.9\x20Server.x86_64 -> ../../sr0
+lrwxrwxrwx. 1 root root 9 Nov 16 11:04 verylonglabe -> ../../sdb
+lrwxrwxrwx. 1 root root 9 Nov 16 11:04 xfssmall -> ../../sdc
+mount: can't find LABEL=xfsdata1
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/ol-root   36G  4.3G   31G  13% /
+-- 증상   : mount: can't find LABEL=xfsdata1
+-- 원인   : 바로 앞 단계에서 레이블이 verylonglabe 로 바뀌었다
+--          by-label 목록에 xfsdata1 이 없다
+-- 조치   : ls -l /dev/disk/by-label 로 실제 이름을 보고 마운트
+-- 재확인 : findmnt /xfs1 에 /dev/sdb 가 나오는지
+-- df -h /xfs1 은 마운트 실패라 / 를 보였다
+-- 이 랩에서는 다음 단계로 넘어간다
+
+--------------------------------------------------------------------------------
+ [7] xfs_admin -c — lazy counter 끄고 켜기
+--------------------------------------------------------------------------------
+
+-- lazy-count=1 이면 빈 공간·inode 카운터를 슈퍼블록이 아니라 각 AG 헤더에 두고,
+-- 슈퍼블록 값은 마운트·언마운트 때 합산한다. 메타데이터가 많은 작업에서 슈퍼블록
+-- 경합이 줄어든다. FS 문서의 xfs_admin -c 0 을 그대로 친다.
+[root@ol7a ~]# umount /xfs1; xfs_db -r -c 'version' /dev/sdb; xfs_admin -c 0 /dev/sdb; echo "rc=$?"
+umount: /xfs1: not mounted
+versionnum [0xb4b4+0x28a] = V4,NLINK,DIRV2,ATTR,ALIGN,LOGV2,EXTFLG,MOREBITS,ATTR2,LAZYSBCOUNT,PROJID32BIT,FTYPE
+Disabling lazy-counters
+rc=0
+-- umount 메시지는 [6] 마운트 실패의 결과다
+-- versionnum 의 첫 항목이 V4 다
+--   LAZYSBCOUNT 가 lazy counter 표시
+-- v4 라서 Disabling lazy-counters 성공
+-- v5(crc=1) 에서는 lazy counter 를 끄지 못한다
+
+--------------------------------------------------------------------------------
+ [8] 외부 저널(external log)
+--------------------------------------------------------------------------------
+
+-- 저널을 다른 장치에 두면 메타데이터 동기 쓰기가 데이터 쓰기와 경합하지 않는다.
+-- sde 에 64MB 파티션을 만들어 저널 장치로 쓴다.
+[root@ol7a ~]# parted -s /dev/sde mklabel gpt mkpart logpart 1MiB 65MiB; lsblk /dev/sde
+NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sde    8:64   0  10G  0 disk 
+-- 파티션 sde1 이 아직 안 보인다
+--   parted 직후 커널 갱신 전에 lsblk 가 돌았다
+--   dmesg 의 sde: sde1 이 다음 단계에 찍힌다
+
+-- -l logdev=장치,size=크기  저널을 그 장치에 둔다
+[root@ol7a ~]# mkfs.xfs -f -l logdev=/dev/sde1,size=10m -L xfsext /dev/sdd
+meta-data=/dev/sdd               isize=256    agcount=4, agsize=655360 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=0        finobt=0, sparse=0, rmapbt=0
+         =                       reflink=0
+data     =                       bsize=4096   blocks=2621440, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =/dev/sde1              bsize=4096   blocks=2560, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+-- log 줄이 internal log 가 아니라 /dev/sde1
+-- 저널 2560 블록은 외부 장치에 있다
+
+-- 외부 저널 파일 시스템을 logdev 옵션 없이 마운트해 본다.
+[root@ol7a ~]# mount /dev/sdd /xfs3; echo "rc=$?"; dmesg | tail -3
+mount: wrong fs type, bad option, bad superblock on /dev/sdd,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+rc=32
+[   13.446537]  sde: sde1
+[   13.573224] XFS (sdd): filesystem is marked as having an external log; specify logdev on the mount command line.
+[   13.573228] XFS (sdd): SB validate failed with error -22.
+-- 증상   : 같은 wrong fs type 일반 문구, rc=32
+-- 원인   : dmesg 의 specify logdev on the mount command line.
+-- 조치   : mount -o logdev=/dev/sde1 로 다시 마운트
+-- 재확인 : /proc/mounts 의 logdev=/dev/sde1
+
+-- logdev 를 함께 준다.
+[root@ol7a ~]# mount -o logdev=/dev/sde1 /dev/sdd /xfs3; xfs_info /xfs3 | grep -E '^log|^naming'; grep xfs3 /proc/mounts
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =/dev/sde1              bsize=4096   blocks=2560, version=2
+/dev/sdd /xfs3 xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,logdev=/dev/sde1,noquota 0 0
+-- 옵션 칸에 logdev 가 들어갔다
+-- fstab 에도 이 옵션을 그대로 적는다
+
+--------------------------------------------------------------------------------
+ [9] LVM 스냅샷과 UUID 충돌 — 오류 ②
+--------------------------------------------------------------------------------
+
+-- XFS 는 같은 UUID 를 가진 파일 시스템 두 개를 동시에 마운트하지 않는다.
+-- LVM 스냅샷은 원본을 블록 단위로 복제하므로 UUID 까지 같다.
+-- LVM 은 10장에서 다뤘다. 여기서는 PV·VG·LV 를 최소한으로 만든다.
+[root@ol7a ~]# umount /xfs3; wipefs -a /dev/sdd >/dev/null; pvcreate -q /dev/sdd; vgcreate -q vgsnap /dev/sdd; lvcreate -q -L 2G -n lvorig vgsnap
+  Physical volume "/dev/sdd" successfully created.
+  Volume group "vgsnap" successfully created
+  Logical volume "lvorig" created.
+-- -q 로 확인 메시지 외의 출력을 줄였다
+[root@ol7a ~]# mkfs.xfs -q /dev/vgsnap/lvorig; mkdir -p /orig /snap; mount /dev/vgsnap/lvorig /orig; cp -a /etc/hosts /etc/fstab /orig/; ls /orig
+-- 원본에 표본 파일 두 개를 넣었다
+fstab
+hosts
+
+-- 원본이 마운트된 상태에서 스냅샷을 뜬다. -s 스냅샷, -L 변경분을 담을 크기.
+[root@ol7a ~]# lvcreate -s -L 500M -n lvsnap /dev/vgsnap/lvorig; lvs vgsnap
+  Logical volume "lvsnap" created.
+  LV     VG     Attr       LSize   Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  lvorig vgsnap owi-aos---   2.00g                                                    
+  lvsnap vgsnap swi-a-s--- 500.00m      lvorig 0.00                                   
+-- Attr 첫 글자 o = 원본, s = 스냅샷
+-- 원본의 o 다음 a·o 는 활성·열림(마운트)
+-- Data% 0.00: 아직 바뀐 블록이 없다
+[root@ol7a ~]# blkid /dev/vgsnap/lvorig /dev/vgsnap/lvsnap
+/dev/vgsnap/lvorig: UUID="aa8b43d7-332b-48b1-a1d9-bd93c5d1ab66" TYPE="xfs" 
+/dev/vgsnap/lvsnap: UUID="aa8b43d7-332b-48b1-a1d9-bd93c5d1ab66" TYPE="xfs" 
+-- 두 장치의 UUID 가 똑같다
+
+-- 스냅샷을 그대로 마운트한다.
+[root@ol7a ~]# mount /dev/vgsnap/lvsnap /snap; echo "rc=$?"; dmesg | tail -2
+mount: wrong fs type, bad option, bad superblock on /dev/mapper/vgsnap-lvsnap,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+rc=32
+[   13.885476] xfs filesystem being mounted at /orig supports timestamps until (%ptR?) (0x7fffffff)
+[   14.255201] XFS (dm-5): Filesystem has duplicate UUID aa8b43d7-332b-48b1-a1d9-bd93c5d1ab66 - can't mount
+-- 증상   : Filesystem has duplicate UUID ... - can't mount
+-- 원인   : 스냅샷은 원본 블록 복제라 UUID 가 같다
+--          XFS 는 같은 UUID 를 두 번 마운트하지 않는다
+-- 조치   : mount -o nouuid, 또는 xfs_admin -U generate
+-- 재확인 : 아래 ls /snap 과 df 두 줄
+-- timestamps until 줄은 v4 의 2038 년 한계 알림
+
+-- nouuid 옵션은 이번 마운트에서만 UUID 검사를 건너뛴다.
+[root@ol7a ~]# mount -o nouuid /dev/vgsnap/lvsnap /snap; ls /snap; df -h /orig /snap
+fstab
+hosts
+Filesystem                 Size  Used Avail Use% Mounted on
+/dev/mapper/vgsnap-lvorig  2.0G   33M  2.0G   2% /orig
+/dev/mapper/vgsnap-lvsnap  2.0G   33M  2.0G   2% /snap
+-- 두 장치가 함께 마운트됐다
+-- 스냅샷에도 fstab·hosts 가 그대로 있다
+
+-- 다른 길은 스냅샷 쪽 UUID 를 바꾸는 것이다. 스냅샷을 내리고 xfs_admin -U 를 쳐 본다.
+[root@ol7a ~]# umount /snap; xfs_admin -U generate /dev/vgsnap/lvsnap; echo "rc=$?"
+Clearing log and setting UUID
+writing all SBs
+new UUID = d17dd4ef-8190-4901-b1b6-5e4822849e7e
+rc=0
+-- 스냅샷 쪽 UUID 만 바뀌었다
+-- 원본 UUID aa8b43d7... 는 그대로다
+-- 이제 nouuid 없이도 함께 마운트된다
+
+--------------------------------------------------------------------------------
+ [10] 언마운트 상태의 정보 — xfs_db
+--------------------------------------------------------------------------------
+
+-- xfs_info 는 마운트된 파일 시스템용이다. 언마운트 장치는 xfs_db -r(읽기 전용)로
+-- 슈퍼블록 0번을 직접 읽는다. 필드 이름이 mkfs 출력과 조금 다르다.
+[root@ol7a ~]# xfs_db -r -c 'sb 0' -c 'print blocksize agcount agblocks dblocks logblocks inodesize fname uuid' /dev/sdb
+blocksize = 4096
+agcount = 4
+agblocks = 655360
+dblocks = 2621440
+logblocks = 2560
+inodesize = 256
+fname = "verylonglabe"
+uuid = 72343256-e53a-417b-8576-26897ee78a79
+-- 필드 대응
+--   blocksize=bsize, agblocks=agsize
+--   dblocks=data blocks, logblocks=log
+--   fname=레이블. 잘린 verylonglabe
+-- 마운트하지 않고도 기하 구조를 읽었다
+
+--------------------------------------------------------------------------------
+ [변형] mkfs -t xfs 와 parted 파티션 위의 XFS
+--------------------------------------------------------------------------------
+
+-- 같은 일을 다른 경로로 해 본다. mkfs -t xfs 는 mkfs.xfs 를 찾아 실행하는 앞단이다.
+-- 장치 전체가 아니라 파티션 위에 만들어 정렬과 크기 차이를 본다.
+[root@ol7a ~]# wipefs -a /dev/sde >/dev/null; parted -s /dev/sde mklabel gpt mkpart xfspart 1MiB 100%; mkfs -t xfs -f /dev/sde1
+meta-data=/dev/sde1              isize=256    agcount=4, agsize=655232 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=0        finobt=0, sparse=0, rmapbt=0
+         =                       reflink=0
+data     =                       bsize=4096   blocks=2620928, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=2560, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+-- [2] 와 다른 값
+--   agsize 655232, blocks 2620928
+-- GPT 앞 1MiB 와 뒤 백업 헤더 몫만 작다
+-- mkfs -t xfs 는 mkfs.xfs 를 그대로 불렀다
+
+[root@ol7a ~]# blkid /dev/sde1; lsblk -f /dev/sde
+/dev/sde1: UUID="5850565c-1145-4bb6-ac95-1f896c6d9f20" TYPE="xfs" PARTLABEL="xfspart" PARTUUID="e73d5e73-a77f-4fd6-b5cf-efca0768f7cc" 
+NAME   FSTYPE LABEL UUID                                 MOUNTPOINT
+sde                                                      
+└─sde1 xfs          5850565c-1145-4bb6-ac95-1f896c6d9f20 
+-- PARTLABEL="xfspart" 는 GPT 파티션 이름
+-- LABEL 이 비어 있다. -L 을 주지 않았다
+
+--------------------------------------------------------------------------------
+ [11] 되돌림
+--------------------------------------------------------------------------------
+
+-- 마운트를 모두 내리고, LV·VG·PV 를 지우고, 디스크 서명을 지운다.
+-- wipefs -a 는 장치 앞뒤의 파일 시스템·파티션 테이블 서명을 지운다.
+[root@ol7a ~]# umount /orig /xfs1 2>/dev/null; lvremove -qy vgsnap; vgremove -q vgsnap; pvremove -q /dev/sdd
+  Logical volume "lvsnap" successfully removed
+  Logical volume "lvorig" successfully removed
+  Volume group "vgsnap" successfully removed
+  Labels on physical volume "/dev/sdd" successfully wiped.
+-- 스냅샷 → 원본 → VG → PV 순으로 지워졌다
+[root@ol7a ~]# wipefs -a /dev/sdb /dev/sdc /dev/sdd /dev/sde >/dev/null; rmdir /xfs1 /xfs3 /orig /snap
+[root@ol7a ~]# lsblk -f /dev/sdb /dev/sdc /dev/sdd /dev/sde; df -hT -t xfs
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+sdd                    
+sde                    
+Filesystem          Type  Size  Used Avail Use% Mounted on
+/dev/mapper/ol-root xfs    36G  4.3G   31G  13% /
+/dev/sda1           xfs  1014M  283M  731M  28% /boot
+-- 네 디스크 모두 FSTYPE 이 비었다
+-- 루트·/boot 두 줄은 [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                 시작 전     변경 후              되돌린 뒤
+--  sdb FSTYPE           (없음)      xfs (v4, crc=0)      (없음)
+--  sdb 레이블           -           verylonglabe         -
+--  sdc 기하             -           agcount=8, bsize=1024 -
+--  sdd 저널             -           /dev/sde1 (외부)     -
+--  vgsnap               없음        lvorig + lvsnap      없음
+--  스냅샷 UUID          -           원본과 같음 → 새로   -
+--  mkfs 기본값          -           isize=256, agcount=4 -
+-- 문서와 다른 실측
+--   마운트 중 레이블 변경 성공(5.4)
+--   15자 레이블은 거부가 아니라 12자로 잘림
+--   nobarrier 는 UEK R6 에서 거부
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. mkfs.xfs -N 은 실제로 쓰지 않고 출력만 보여 준다. 10G 장치에 agcount 를
+--    바꿔 가며 -N 으로 agsize 가 어떻게 바뀌는지 표로 만들어 본다.
+--    확인: 출력 첫 줄의 agcount·agsize 곱이 data 줄 blocks 와 같은지
+-- 2. -m crc=0 으로 v4 형식 XFS 를 만들고 xfs_admin -U generate 를 다시 시도해
+--    v5(crc=1) 와 결과가 어떻게 다른지 본다.
+--    확인: xfs_db -r -c version 출력의 V5 유무
+-- 3. /etc/fstab 에 LABEL=xfsdata1 로 항목을 넣고 mount -a 로 검증한다.
+--    확인: findmnt /xfs1 의 SOURCE 열
+
+================================================================================
+ 실습 01 종료 — 기본값은 v4(crc=0), 스냅샷 UUID 충돌은 nouuid 로 해결
+================================================================================

@@ -1,0 +1,450 @@
+================================================================================
+ 제9장 실습 07 — 파티션과 Ext4 확장
+ 대상   : ol7a
+ 목표   : Ext4 파티션의 끝을 parted resizepart 로 늘리고 resize2fs 로 파일
+          시스템을 온라인 확장한다. 뒤에 다른 파티션이 있으면 늘릴 수 없는 것과
+          줄이기의 조건을 확인하고, 이미지 파일·루프 장치·kpartx 로 같은 일을 한다
+ 배경   : 파일 시스템 확장은 두 단계다. 그릇(파티션·LV·이미지 파일)을 먼저
+          키우고, 그 안의 파일 시스템을 그릇 크기에 맞춘다. 앞 단계만 하면
+          df 의 크기는 그대로다. Ext4 는 마운트된 채로 늘릴 수 있고 줄이려면
+          언마운트가 필요하다 (본문 9.3·9.5·9.6절)
+ 소요   : 약 25분
+ 선행   : storage-clean 스냅샷
+ 계정   : root
+ 주의   : sdb·sdc 를 덮어쓴다
+ 되돌림 : 언마운트, 루프 장치 해제, 이미지 파일 삭제, wipefs.
+          확인 명령 lsblk /dev/sdb /dev/sdc, losetup -a (출력 없음)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+-- 쓸 디스크 둘이 비었는지,
+-- 연결된 루프 장치가 없는지 본다
+[root@ol7a ~]# lsblk /dev/sdb /dev/sdc; losetup -a; echo rc=$?
+NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdb    8:16   0  10G  0 disk 
+sdc    8:32   0  10G  0 disk 
+rc=0
+
+-- sdb·sdc 모두 자식 없는 10G.
+-- losetup -a 는 출력이 없고 rc=0(연결된 루프 없음)
+[root@ol7a ~]# parted -v | head -1; rpm -q cloud-utils-growpart; echo rc=$?
+parted (GNU parted) 3.1
+package cloud-utils-growpart is not installed
+rc=1
+
+-- parted 3.1. growpart(파티션을 늘리는 cloud-utils 도구)는 설치돼 있지 않다
+-- [OL8/9] 클라우드 이미지에는 growpart 가 흔히 들어 있다.
+-- 이 실습은 parted·fdisk 로 한다
+
+--------------------------------------------------------------------------------
+ [1] 2GiB 파티션에 Ext4 를 만들고 데이터 넣기
+--------------------------------------------------------------------------------
+[root@ol7a ~]# parted -s /dev/sdb mklabel gpt mkpart data ext4 1MiB 2GiB; mkfs.ext4 -q -L grow /dev/sdb1
+[root@ol7a ~]# mkdir -p /mnt/grow; mount /dev/sdb1 /mnt/grow; cp -r /etc /mnt/grow/; du -sh /mnt/grow/etc
+52M     /mnt/grow/etc
+
+-- 2GiB GPT 파티션에 ext4.
+-- /etc 를 복사해 52M 의 실제 데이터를 넣었다
+-- 확장 중에도 데이터가 그대로인지 비교할 기준.
+[root@ol7a ~]# (cd /mnt/grow && find etc -type f | sort | xargs md5sum | md5sum)
+e5bc6a08f5d49bc55a3454a4ce2fac40  -
+
+-- 모든 파일의 md5 를 다시 md5 로 묶은 값.
+-- 확장·축소 뒤 이 값과 비교한다
+[root@ol7a ~]# df -h /mnt/grow; parted -s /dev/sdb unit MiB print | tail -3
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb1       2.0G   52M  1.8G   3% /mnt/grow
+Number  Start    End      Size     File system  Name  Flags
+ 1      1.00MiB  2048MiB  2047MiB  ext4         data
+
+-- df: Size 2.0G, Used 52M.
+-- parted: 1번이 1MiB~2048MiB, File system 열에 ext4 가 보인다
+-- GPT 라 Name 열에 data(mkpart 둘째 인자)가 있다
+
+--------------------------------------------------------------------------------
+ [2] 파티션 끝 늘리기 — parted resizepart
+--------------------------------------------------------------------------------
+-- 끝을 2GiB 에서 5GiB 로. 먼저 마운트된 채로 시도한다.
+-- -s 는 확인 질문 없이 실행(스크립트 모드). resizepart 번호 새끝.
+[root@ol7a ~]# parted -s /dev/sdb resizepart 1 5GiB; echo rc=$?
+Error: Partition /dev/sdb1 is being used. You must unmount it before you modify it with Parted.
+rc=1
+
+-- 증상   : "Error: Partition /dev/sdb1 is being used. You must unmount it before you modify it with Parted." rc=1
+-- 원인   : 7.9 의 parted 3.1 은 마운트된 파티션의 크기 변경을 거부한다
+-- 조치   : 잠깐 언마운트하고 resizepart 한다(바로 아래). 언마운트할 수 없으면 [변형] 의 fdisk + partx -u
+-- 재확인 : print 에서 1번 끝이 5120MiB 로 바뀐다
+-- [OL8/9] parted 3.2 이상은 확인 질문을 하고 사용 중인 파티션도 늘릴 수 있다
+-- 언마운트하고 다시 한다. 파일 시스템 안의 데이터는 건드리지 않는다.
+[root@ol7a ~]# umount /mnt/grow; parted -s /dev/sdb resizepart 1 5GiB; echo rc=$?
+rc=0
+
+[root@ol7a ~]# parted -s /dev/sdb unit MiB print | tail -3
+Number  Start    End      Size     File system  Name  Flags
+ 1      1.00MiB  5120MiB  5119MiB  ext4         data
+
+-- 끝이 2048 → 5120MiB. 시작 1.00MiB 는 그대로다.
+-- 시작이 같아야 안의 데이터가 그대로 읽힌다
+-- resizepart 는 테이블의 끝 값만 바꾼다.
+-- 파일 시스템은 건드리지 않는다
+
+--------------------------------------------------------------------------------
+ [3] 파티션만 늘어난 상태
+--------------------------------------------------------------------------------
+-- 다시 마운트하고, 커널이 아는 파티션 크기와 파일 시스템이 아는 크기를 따로 본다.
+[root@ol7a ~]# mount /dev/sdb1 /mnt/grow; lsblk /dev/sdb; grep sdb /proc/partitions
+NAME   MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdb      8:16   0  10G  0 disk 
+└─sdb1   8:17   0   5G  0 part /mnt/grow
+   8       16   10485760 sdb
+   8       17    5241856 sdb1
+
+-- 커널 쪽: lsblk 5G, /proc/partitions 5241856KiB.
+-- parted 가 커널에 바로 알렸다
+[root@ol7a ~]# df -h /mnt/grow
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb1       2.0G   52M  1.8G   3% /mnt/grow
+
+-- 파일 시스템 쪽: df 는 여전히 2.0G
+[root@ol7a ~]# dumpe2fs -h /dev/sdb1 2>/dev/null | grep -E '^Block count|^Block size'
+Block count:              524032
+Block size:               4096
+
+-- 슈퍼블록의 Block count 524032 × 4KiB ≈ 2GiB.
+-- 그릇만 커지고 내용은 그대로다
+-- 증상   : 파티션을 5GiB 로 늘렸는데 df 의 Size 가 2.0G 그대로다
+-- 원인   : 파일 시스템 크기는 슈퍼블록에 적힌 Block count 다. 파티션 크기와 따로 논다
+-- 조치   : resize2fs /dev/sdb1(바로 아래)
+-- 재확인 : df 4.9G,
+-- Block count 1310464
+
+--------------------------------------------------------------------------------
+ [4] resize2fs 로 온라인 확장
+--------------------------------------------------------------------------------
+-- 크기를 주지 않으면 장치 끝까지 늘린다. 마운트된 채로 한다.
+[root@ol7a ~]# time resize2fs /dev/sdb1
+resize2fs 1.45.4 (23-Sep-2019)
+Filesystem at /dev/sdb1 is mounted on /mnt/grow; on-line resizing required
+old_desc_blocks = 1, new_desc_blocks = 1
+The filesystem on /dev/sdb1 is now 1310464 (4k) blocks long.
+
+real    0m0.007s
+user    0m0.000s
+sys     0m0.003s
+
+-- 마운트된 채로 on-line resizing required → 1310464 (4k) blocks. 0.007초
+-- 크기를 주지 않아 장치 끝까지 늘었다.
+-- old/new_desc_blocks 는 그룹 설명자 블록 수(1 그대로)
+[root@ol7a ~]# df -h /mnt/grow
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb1       4.9G   52M  4.6G   2% /mnt/grow
+
+-- df 4.9G. Used 52M 그대로
+[root@ol7a ~]# dumpe2fs -h /dev/sdb1 2>/dev/null | grep -E '^Block count|^Reserved block count|^Inode count'
+Inode count:              327680
+Block count:              1310464
+Reserved block count:     57647
+
+-- Block count 1310464. Inode count 327680: 2GiB 일 때의 131072 에서 그룹 수에 비례해 늘었다
+-- 예약 블록 57647 은 새 크기의 5%(65523)보다 적다.
+-- 정확히 맞추려면 tune2fs -m 5 를 다시 준다
+[root@ol7a ~]# (cd /mnt/grow && find etc -type f | sort | xargs md5sum | md5sum)
+e5bc6a08f5d49bc55a3454a4ce2fac40  -
+
+-- [1] 의 값과 같다. 확장 중에 데이터가 바뀌지 않았다
+[root@ol7a ~]# dmesg | tail -1
+[   13.084114] EXT4-fs (sdb1): resized filesystem to 1310464
+
+-- 커널 로그에도 온라인 확장이 남았다
+
+--------------------------------------------------------------------------------
+ [5] 뒤에 다른 파티션이 있으면
+--------------------------------------------------------------------------------
+-- 5GiB 바로 뒤에 2번 파티션을 만든다.
+[root@ol7a ~]# parted -s /dev/sdb mkpart data2 5GiB 7GiB; parted -s /dev/sdb unit MiB print | tail -3
+Error: You requested a partition from 5369MB to 7516MB (sectors 10485760..14680063).
+The closest location we can manage is 5369MB to 7516MB (sectors 10485761..14680063).
+Number  Start    End      Size     File system  Name  Flags
+ 1      1.00MiB  5120MiB  5119MiB  ext4         data
+
+-- 증상   : "Error: You requested a partition from 5369MB to 7516MB (sectors 10485760..14680063)."
+--          "The closest location we can manage is … (sectors 10485761..14680063)." data2 가 생기지 않았다
+-- 원인   : 1번의 끝 5GiB 는 섹터 10485760 까지 포함한다. 같은 섹터에서 2번을 시작하려 했다
+--          -s 모드라 "가장 가까운 위치로 할까" 질문에 답할 수 없어 오류로 끝났다
+-- 조치   : 2번 시작을 한 칸 뒤(예: 5121MiB)로 준다. parted 의 끝 값은 포함 범위다
+-- 재확인 : print 에 2번 data2 가 나온다(이 실행에서는 확인하지 못했다)
+-- 의도는 "뒤에 파티션이 있어 늘릴 수 없는 상태" 를 만드는 것이었다.
+-- 2번이 없으니 아래는 반대 경우가 된다
+-- 1번을 6GiB 까지 늘려 본다(언마운트 상태).
+[root@ol7a ~]# umount /mnt/grow; parted -s /dev/sdb resizepart 1 6GiB; echo rc=$?
+rc=0
+-- 뒤가 비어 있어 1번이 6GiB 까지 늘었다(rc=0).
+-- 마운트는 앞 명령으로 내린 상태다
+-- 2번이 있었다면 Error: Can't have overlapping partitions. 로 거부된다(본문 9.5.4)
+-- 빈 공간이 어디에 있는지 free 로 본다.
+[root@ol7a ~]# parted -s /dev/sdb unit MiB print free | tail -5
+Number  Start    End       Size     File system  Name  Flags
+        0.02MiB  1.00MiB   0.98MiB  Free Space
+ 1      1.00MiB  6144MiB   6143MiB  ext4         data
+        6144MiB  10240MiB  4096MiB  Free Space
+-- print free 로 빈 공간을 본다
+--   0.02~1.00MiB: GPT 헤더 뒤 정렬 여백
+--   6144MiB~끝: 4096MiB 빈 공간. 1번은 이 범위까지만 늘릴 수 있다
+-- 늘리기 전에 이 표에서 파티션 바로 뒤가 Free Space 인지 먼저 본다
+
+--------------------------------------------------------------------------------
+ [6] 줄이기
+--------------------------------------------------------------------------------
+-- 마운트된 채로 4G 로 줄여 본다.
+[root@ol7a ~]# mount /dev/sdb1 /mnt/grow; resize2fs /dev/sdb1 4G; echo rc=$?
+resize2fs 1.45.4 (23-Sep-2019)
+resize2fs: On-line shrinking not supported
+Filesystem at /dev/sdb1 is mounted on /mnt/grow; on-line resizing required
+rc=1
+-- 마운트된 상태에서 줄이기: resize2fs: On-line shrinking not supported. Ext4 는 늘리기만 온라인이다
+-- 언마운트해도 검사 전에는 거부된다.
+[root@ol7a ~]# umount /mnt/grow; resize2fs /dev/sdb1 4G; echo rc=$?
+resize2fs 1.45.4 (23-Sep-2019)
+Please run 'e2fsck -f /dev/sdb1' first.
+
+rc=1
+-- 언마운트했지만 Please run 'e2fsck -f /dev/sdb1' first. 검사를 먼저 요구한다
+-- 줄이기는 데이터 블록을 옮겨야 해서 깨끗하다고 확인된 상태에서만 한다
+-- 검사 후에는 된다. 파일 시스템을 먼저 줄이고, 파티션을 줄이는 것은 그 다음이다.
+[root@ol7a ~]# e2fsck -fy /dev/sdb1 >/dev/null 2>&1; resize2fs /dev/sdb1 4G; echo rc=$?
+resize2fs 1.45.4 (23-Sep-2019)
+Resizing the filesystem on /dev/sdb1 to 1048576 (4k) blocks.
+The filesystem on /dev/sdb1 is now 1048576 (4k) blocks long.
+
+rc=0
+-- e2fsck -f 뒤에는 1048576(4k) blocks = 4GiB 로 줄었다
+-- 순서: 파일 시스템을 먼저 줄이고, 그다음 파티션을 줄인다.
+-- 반대로 하면 끝부분 데이터가 잘린다
+-- xfs 는 이 줄이기 명령 자체가 없다(11장)
+-- 다시 끝까지 늘려 둔다.
+[root@ol7a ~]# resize2fs /dev/sdb1 >/dev/null 2>&1; mount /dev/sdb1 /mnt/grow; df -h /mnt/grow; (cd /mnt/grow && find etc -type f | sort | xargs md5sum | md5sum)
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb1       5.9G   52M  5.6G   1% /mnt/grow
+e5bc6a08f5d49bc55a3454a4ce2fac40  -
+-- 다시 끝(6GiB)까지 늘려 5.9G.
+-- 체크섬이 [1] 과 같다. 줄였다 늘려도 데이터는 그대로다
+
+--------------------------------------------------------------------------------
+ [7] 이미지 파일을 루프 장치로 마운트
+--------------------------------------------------------------------------------
+-- 파일 하나를 블록 장치처럼 쓴다. 디스크를 더 붙이지 않고 시험할 때 쓴다.
+[root@ol7a ~]# fallocate -l 512M /var/tmp/disk.img; mkfs.ext4 -q -F -L img /var/tmp/disk.img
+[root@ol7a ~]# mkdir -p /mnt/img; mount -o loop /var/tmp/disk.img /mnt/img
+[root@ol7a ~]# losetup -a; findmnt /mnt/img; df -h /mnt/img
+/dev/loop0: [64512]:349 (/var/tmp/disk.img)
+-- mount -o loop 가 빈 루프 장치(/dev/loop0)를 골라 파일을 연결하고 그 장치를 마운트했다
+-- losetup -a 의 [64512]:349 는 원본 파일이 있는 장치 번호와 inode 번호
+TARGET   SOURCE     FSTYPE OPTIONS
+/mnt/img /dev/loop0 ext4   rw,relatime,seclabel
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/loop0      488M   24K  452M   1% /mnt/img
+-- 512M 이미지에 ext4. SOURCE 가 /dev/loop0 이다.
+-- 디스크를 더 붙이지 않고 시험할 때 쓴다
+
+--------------------------------------------------------------------------------
+ [8] 이미지 파일 늘리기
+--------------------------------------------------------------------------------
+-- 그릇(이미지 파일)을 512M 더 키우고, 루프 장치에 크기가 바뀐 것을 알린다(-c).
+[root@ol7a ~]# truncate -s +512M /var/tmp/disk.img; ls -lh /var/tmp/disk.img
+-rw-r--r--. 1 root root 1.0G Nov 13 20:02 /var/tmp/disk.img
+-- truncate +512M 로 파일만 1.0G 로 키웠다(늘린 부분은 구멍. 루프 장치는 상관없다)
+[root@ol7a ~]# lsblk /dev/loop0; losetup -c /dev/loop0; lsblk /dev/loop0
+NAME  MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+loop0   7:0    0  512M  0 loop /mnt/img
+NAME  MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+loop0   7:0    0   1G  0 loop /mnt/img
+-- 첫 lsblk 는 512M, losetup -c(--set-capacity) 뒤 1G.
+-- 루프 장치는 크기를 다시 읽으라고 알려야 안다
+[root@ol7a ~]# resize2fs /dev/loop0; df -h /mnt/img
+resize2fs 1.45.4 (23-Sep-2019)
+Filesystem at /dev/loop0 is mounted on /mnt/img; on-line resizing required
+old_desc_blocks = 1, new_desc_blocks = 1
+The filesystem on /dev/loop0 is now 262144 (4k) blocks long.
+
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/loop0      992M   24K  935M   1% /mnt/img
+-- resize2fs 로 마운트된 채 262144 블록(1GiB)이 됐다. df 992M
+-- 파티션 확장과 같은 세 단계: 그릇 키우기 → 장치에 알리기 → 파일 시스템 늘리기
+
+--------------------------------------------------------------------------------
+ [9] 파티션 테이블이 든 이미지 — kpartx
+--------------------------------------------------------------------------------
+-- 이미지 안에 파티션 테이블이 있으면 mount -o loop 만으로는 안쪽 파티션을 못 붙인다.
+[root@ol7a ~]# fallocate -l 256M /var/tmp/part.img; parted -s /var/tmp/part.img mklabel msdos mkpart primary 1MiB 100%
+-- 그 상태로 루프 마운트를 시도해 본다.
+[root@ol7a ~]# mkdir -p /mnt/kp; mount -o loop /var/tmp/part.img /mnt/kp; echo rc=$?
+mount: wrong fs type, bad option, bad superblock on /dev/loop1,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+rc=32
+-- 증상   : mount -o loop 가 "wrong fs type, bad option, bad superblock on /dev/loop1" 로 rc=32
+-- 원인   : 이미지 맨 앞은 파일 시스템이 아니라 MBR 이다. 파일 시스템은 1MiB 뒤 파티션 안에 있다
+-- 조치   : kpartx 로 이미지 안 파티션마다 장치를 만든다(바로 아래)
+-- 재확인 : /dev/mapper/loop1p1 이 생기고 마운트된다
+-- 실패한 mount 가 잡았던 /dev/loop1 은 자동으로 풀렸다
+-- kpartx 는 기본 설치에 없을 수 있다. 없으면 설치한다.
+[root@ol7a ~]# rpm -q kpartx || yum -y -q install kpartx; rpm -q kpartx
+kpartx-0.4.9-136.0.5.el7_9.x86_64
+kpartx-0.4.9-136.0.5.el7_9.x86_64
+-- 이미 설치돼 있었다. rpm -q 가 두 번 성공해 같은 줄이 두 번 찍혔다(|| 뒤는 실행되지 않음)
+[root@ol7a ~]# kpartx -l /var/tmp/part.img
+loop1p1 : 0 522240 /dev/loop1 2048
+loop deleted : /dev/loop1
+-- -l: 만들 장치 목록만 본다.
+-- loop1p1 은 /dev/loop1 의 2048 섹터부터 522240 섹터
+-- 목록을 보려고 잠깐 연결한 loop1 은 끝나며 지웠다
+[root@ol7a ~]# kpartx -av /var/tmp/part.img
+add map loop1p1 (252:2): 0 522240 linear /dev/loop1 2048
+-- -a: 실제로 만든다. device-mapper 의 linear 장치(252:2)로 파티션 범위를 잘라 보여 준다
+[root@ol7a ~]# ls -l /dev/mapper/ | grep loop
+lrwxrwxrwx. 1 root root       7 Nov 13 20:02 loop1p1 -> ../dm-2
+-- /dev/mapper/loop1p1 → dm-2.
+-- LVM 과 같은 device-mapper 장치다
+[root@ol7a ~]# mkfs.ext4 -q /dev/mapper/loop*p1; mount /dev/mapper/loop*p1 /mnt/kp; df -h /mnt/kp
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/loop1p1  241M   14K  225M   1% /mnt/kp
+-- 안쪽 파티션에 ext4 를 만들고 마운트했다
+[root@ol7a ~]# umount /mnt/kp; kpartx -dv /var/tmp/part.img; losetup -a
+del devmap : loop1p1
+loop deleted : /dev/loop1
+/dev/loop0: [64512]:349 (/var/tmp/disk.img)
+-- -d 로 장치와 루프를 지웠다.
+-- 남은 루프는 [7] 의 loop0 하나
+
+--------------------------------------------------------------------------------
+ [변형] fdisk 로 지우고 다시 만들어 늘리기 (sdc)
+--------------------------------------------------------------------------------
+-- parted resizepart 가 없던 시절의 방법. 시작 섹터를 그대로 두고 파티션을 지운 뒤
+-- 더 크게 다시 만든다. 데이터 블록은 건드리지 않는다.
+[root@ol7a ~]# printf 'o\nn\np\n1\n\n+1G\nw\n' | fdisk /dev/sdc >/dev/null; mkfs.ext4 -q /dev/sdc1
+Device does not contain a recognized partition table
+Building a new DOS disklabel with disk identifier 0xcc5fb90f.
+Building a new DOS disklabel with disk identifier 0xd909ed81.
+[root@ol7a ~]# mkdir -p /mnt/fd; mount /dev/sdc1 /mnt/fd; echo keep > /mnt/fd/keep.txt; fdisk -l /dev/sdc | grep '^/dev'
+/dev/sdc1            2048     2099199     1048576   83  Linux
+-- 1GiB 파티션에 keep.txt 를 쓰고 마운트해 둔 채 시작한다. 시작 섹터 2048
+-- d 1 → n p 1 (첫 섹터 기본 2048 = 원래와 같음) +3G → w
+[root@ol7a ~]# printf 'd\nn\np\n1\n\n+3G\nw\n' | fdisk /dev/sdc
+Welcome to fdisk (util-linux 2.23.2).
+
+Changes will remain in memory only, until you decide to write them.
+Be careful before using the write command.
+
+Command (m for help): Selected partition 1
+Partition 1 is deleted
+
+Command (m for help): Partition type:
+   p   primary (0 primary, 0 extended, 4 free)
+   e   extended
+Select (default p): Partition number (1-4, default 1): First sector (2048-20971519, default 2048): Using default value 2048
+Last sector, +sectors or +size{K,M,G} (2048-20971519, default 20971519): Partition 1 of type Linux and of size 3 GiB is set
+
+Command (m for help): The partition table has been altered!
+
+Calling ioctl() to re-read partition table.
+
+WARNING: Re-reading the partition table failed with error 16: Device or resource busy.
+The kernel still uses the old table. The new table will be used at
+the next reboot or after you run partprobe(8) or kpartx(8)
+Syncing disks.
+-- d → n p 1 → 첫 섹터 기본 2048(원래와 같음) → +3G → w
+-- 지운 뒤 같은 시작으로 다시 만들었다.
+-- 데이터 블록은 건드리지 않는다
+-- 증상   : "WARNING: Re-reading the partition table failed with error 16: Device or resource busy."
+-- 원인   : sdc1 이 마운트돼 있어 커널이 테이블 전체 다시 읽기를 거부했다
+-- 조치   : partx -u /dev/sdc 로 바뀐 크기만 알린다
+-- 재확인 : /proc/partitions 의 sdc1 이 3145728 이 된다
+[root@ol7a ~]# fdisk -l /dev/sdc | grep '^/dev'; grep sdc /proc/partitions
+/dev/sdc1            2048     6293503     3145728   83  Linux
+   8       32   10485760 sdc
+   8       33    1048576 sdc1
+-- 디스크(fdisk -l)는 3145728, 커널(/proc/partitions)은 1048576.
+-- 실습 01 [6] 과 같은 어긋남이다
+-- 커널에 알린다. partx -u 는 바뀐 파티션 크기를 갱신한다.
+[root@ol7a ~]# partx -u /dev/sdc; echo rc=$?; grep sdc /proc/partitions
+rc=0
+   8       32   10485760 sdc
+   8       33    3145728 sdc1
+-- partx -u(update) 가 rc=0.
+-- 커널의 sdc1 이 3GiB 가 됐다. 마운트된 채로 됐다
+[root@ol7a ~]# resize2fs /dev/sdc1; df -h /mnt/fd; cat /mnt/fd/keep.txt
+-- resize2fs 온라인 확장으로 3.0G,
+-- keep.txt 가 그대로다
+-- parted 3.1 이 거부한 "마운트된 채 파티션 늘리기" 를 fdisk + partx 로 해냈다
+-- 시작 섹터를 틀리게 주면 파일 시스템을 잃는다.
+-- 다시 만들기 전에 Start 를 적어 둔다
+resize2fs 1.45.4 (23-Sep-2019)
+Filesystem at /dev/sdc1 is mounted on /mnt/fd; on-line resizing required
+old_desc_blocks = 1, new_desc_blocks = 1
+The filesystem on /dev/sdc1 is now 786432 (4k) blocks long.
+
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdc1       3.0G   28K  2.8G   1% /mnt/fd
+keep
+
+--------------------------------------------------------------------------------
+ [10] 되돌리기
+--------------------------------------------------------------------------------
+[root@ol7a ~]# umount /mnt/grow /mnt/img /mnt/fd; losetup -D; losetup -a
+[root@ol7a ~]# rm -f /var/tmp/disk.img /var/tmp/part.img; rmdir /mnt/grow /mnt/img /mnt/kp /mnt/fd
+-- 언마운트, losetup -D(모든 루프 해제),
+-- 이미지·디렉터리 삭제. 출력이 없으면 모두 성공
+[root@ol7a ~]# wipefs -a /dev/sdb1 /dev/sdb2 /dev/sdc1 >/dev/null; udevadm settle; wipefs -a /dev/sdb /dev/sdc
+wipefs: error: /dev/sdb2: probing initialization failed: No such file or directory
+-- sdb2 는 [5] 에서 만들어지지 않았다.
+-- 없는 장치라 wipefs 가 오류를 냈다
+/dev/sdb: 8 bytes were erased at offset 0x00000200 (gpt): 45 46 49 20 50 41 52 54
+/dev/sdb: 8 bytes were erased at offset 0x27ffffe00 (gpt): 45 46 49 20 50 41 52 54
+/dev/sdb: 2 bytes were erased at offset 0x000001fe (PMBR): 55 aa
+/dev/sdb: calling ioclt to re-read partition table: Success
+/dev/sdc: 2 bytes were erased at offset 0x000001fe (dos): 55 aa
+/dev/sdc: calling ioclt to re-read partition table: Success
+[root@ol7a ~]# lsblk /dev/sdb /dev/sdc
+NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdb    8:16   0  10G  0 disk 
+sdc    8:32   0  10G  0 disk 
+-- 두 디스크의 테이블 서명을 지웠다(GPT 는 앞뒤 두 곳과 PMBR).
+-- 자식이 없다. [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                 시작 전   변경 후                                되돌린 뒤
+--  sdb1 파티션 끝       -         2048 → 5120 → 6144MiB                  없음
+--  sdb1 파일 시스템     -         2.0G → 4.9G → 4G → 5.9G                -
+--  마운트 중 resizepart -         parted 3.1 거부                        -
+--  mkpart 5GiB 시작     -         closest location 오류                  -
+--  마운트 중 축소       -         On-line shrinking not supported        -
+--  disk.img             -         512M → 1G (losetup -c, resize2fs)      삭제
+--  part.img             -         loop 마운트 실패 → kpartx 로 마운트    삭제
+--  sdc1 (fdisk+partx)   -         1G → 3G, 마운트 유지                   없음
+--  데이터 체크섬        e5bc6a…   e5bc6a… (확장·축소 뒤에도 같음)        -
+--
+-- 확인한 사실
+--   그릇을 먼저 키우고 resize2fs 로 내용을 맞춘다. 늘리기는 마운트된 채로 된다
+--   줄이기는 언마운트·e2fsck -f 뒤에만 되고, 파일 시스템이 먼저 줄어야 한다
+--   이미지 파일도 같은 순서. 안에 파티션 테이블이 있으면 kpartx 가 필요하다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. [5] 를 mkpart data2 5121MiB 7GiB 로 다시 해 2번을 만든 뒤 1번을 6GiB 로 늘려 본다
+--    확인: parted 의 오류 문구, print free 에서 1번 뒤의 Free Space 크기
+-- 2. losetup -f --show /var/tmp/disk.img 로 직접 연결하고 mount /dev/loopN 으로 붙인다
+--    확인: losetup -a 와 findmnt 의 SOURCE
+-- 3. [변형] 에서 일부러 시작 섹터를 4096 으로 주고 다시 만든다(실험용 디스크에서만)
+--    확인: mount 와 blkid 가 파일 시스템을 찾는가. 원래 2048 로 되돌리면 다시 보이는가
+-- 되돌린 뒤 확인: lsblk /dev/sdb /dev/sdc 자식 없음,
+-- losetup -a 출력 없음
+================================================================================
+ 실습 07 종료 — 파티션·이미지 확장과 resize2fs, 축소 조건, kpartx, fdisk+partx 온라인 확장
+================================================================================

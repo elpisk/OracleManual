@@ -1,0 +1,453 @@
+================================================================================
+ 제12장 실습 03 — 스냅샷으로 되돌리기와 send/receive
+ 대상   : ol7a (추가 디스크 sdb = 원본, sdc = 백업)
+ 목표   : 스냅샷에서 파일 하나를 되살리고, 서브볼륨 전체를 스냅샷 시점으로 바꿔 끼운다.
+          send/receive 로 다른 Btrfs 에 전체·증분 전송을 하고 크기를 비교한다
+ 배경   : 읽기 전용 스냅샷은 그 시점의 변하지 않는 사본이다. send 는 읽기 전용
+          스냅샷 하나(전체) 또는 둘의 차이(증분, -p)를 스트림으로 내보내고, receive 는
+          그 스트림으로 상대편 Btrfs 에 같은 스냅샷을 다시 만든다. 증분은 받는 쪽에
+          부모 스냅샷이 있어야 풀린다(본문 12.5·12.7절)
+ 소요   : 약 25분
+ 선행   : storage-clean 스냅샷, UEK R6 로 부팅
+ 계정   : root
+ 주의   : 없음(빈 디스크 sdb·sdc 만 씀)
+ 되돌림 : 마운트 해제, wipefs. 확인 lsblk -f /dev/sdb /dev/sdc
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 흐름: 원본(sdb)·백업(sdc) 준비 → 스냅샷으로 파일 하나·서브볼륨 전체 되살리기 →
+--   쓰기 가능 스냅샷 send(오류) → 전체 전송 → 증분 전송 → 부모 없음(오류) → 부모 다시 맞추기 →
+--   원본 디스크를 새로 만들고 백업에서 복원 → [변형] 복원한 쪽에서 증분 잇기
+[root@ol7a ~]# uname -r; lsblk -f /dev/sdb /dev/sdc
+5.4.17-2136.338.4.2.el7uek.x86_64
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+-- UEK 커널, 두 디스크 모두 서명 없음. sdb 를 원본, sdc 를 백업으로 쓴다
+-- 백업을 다른 장치에 두는 이유: 같은 Btrfs 안의 스냅샷은 그 장치가 죽으면 함께 사라진다
+[root@ol7a ~]# rpm -q btrfs-progs
+btrfs-progs-5.12.1-1.el7.x86_64
+-- send·receive 는 btrfs 명령의 하위 명령이다.
+-- 보내는 쪽과 받는 쪽 모두 btrfs-progs 가 필요하다
+-- 받는 쪽 커널이 스트림 형식을 알아야 한다. 같은 서버 안이라 문제없다
+
+--------------------------------------------------------------------------------
+ [1] 원본과 백업 파일 시스템 준비
+--------------------------------------------------------------------------------
+
+-- -f 없이도 빈 장치라 바로 만들어진다. 출력은 레이블·UUID 줄만 남긴다.
+[root@ol7a ~]# mkfs.btrfs -L src /dev/sdb | grep -E 'Label|UUID'; mkfs.btrfs -L bak /dev/sdc | grep -E 'Label|UUID'
+Label:              src
+UUID:               f052eec4-9205-4276-b103-f33942bf72b7
+Label:              bak
+UUID:               c28e61f2-e612-4fe7-96db-33bf7bd75e28
+-- 두 파일 시스템의 UUID 가 다르다.
+-- send/receive 는 서로 다른 파일 시스템 사이에서 쓴다
+-- 둘 다 단일 장치(Data single, Metadata DUP).
+-- grep 으로 Label·UUID 만 남겼다
+[root@ol7a ~]# mkdir -p /src /bak; mount /dev/sdb /src; mount /dev/sdc /bak
+[root@ol7a ~]# btrfs subvolume create /src/app; mkdir /src/.snap
+Create subvolume '/src/app'
+-- app 은 서브볼륨, .snap 은 일반 디렉터리.
+-- 스냅샷을 모아 둘 자리라 서브볼륨일 필요가 없다
+-- 스냅샷을 app 안에 두지 않는 이유: app 을 스냅샷할 때 하위 서브볼륨은 빈 자리로 남아 섞인다
+-- 운영에서는 스냅샷 이름에 날짜·시각을 넣는다(app_20261116_1224). 여기서는 번호로 줄였다
+[root@ol7a ~]# for i in 1 2 3; do echo "row $i" > /src/app/t$i.dat; done; cp -a /etc/yum.repos.d /src/app/; sync
+[root@ol7a ~]# ls /src/app; du -sh /src/app
+t1.dat
+t2.dat
+t3.dat
+yum.repos.d
+28K     /src/app
+-- 행 파일 셋과 /etc/yum.repos.d 사본. 합계 28K
+-- yum.repos.d 는 심볼릭 링크가 없는 디렉터리라 diff -r 비교에 알맞다
+
+--------------------------------------------------------------------------------
+ [2] 기준 스냅샷 — 읽기 전용
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# btrfs subvolume snapshot -r /src/app /src/.snap/app_0
+Create a readonly snapshot of '/src/app' in '/src/.snap/app_0'
+[root@ol7a ~]# sync; btrfs subvolume list -s /src
+ID 258 gen 8 cgen 8 top level 5 otime 2026-11-16 12:24:16 path .snap/app_0
+-- -r 읽기 전용 스냅샷 app_0, ID 258. 문서 절차대로 스냅샷 뒤 sync
+-- list -s 의 otime 12:24:16 이 기준 시점이다
+-- gen 8·cgen 8 : 이 스냅샷을 만든 트랜잭션 세대.
+-- 이후 변경은 더 큰 gen 으로 기록된다
+
+--------------------------------------------------------------------------------
+ [3] 파일 하나 되살리기
+--------------------------------------------------------------------------------
+
+-- 실수로 지운 상황을 만든다.
+[root@ol7a ~]# rm -f /src/app/t2.dat; ls /src/app
+t1.dat
+t3.dat
+yum.repos.d
+-- t2.dat 이 지워졌다. 사고 상황
+-- 스냅샷은 그냥 디렉터리처럼 읽힌다. 일반 cp 로 꺼낸다.
+[root@ol7a ~]# cp -a /src/.snap/app_0/t2.dat /src/app/; cat /src/app/t2.dat
+row 2
+-- 스냅샷은 읽기 전용 디렉터리처럼 읽힌다. cp -a 로 꺼냈다(-a: 권한·시각 보존)
+-- 파일 몇 개를 되살릴 때는 이 방법이 가장 빠르다. 원본의 다른 변경은 건드리지 않는다
+-- 스냅샷이 읽기 전용이라 실수로 스냅샷 쪽을 고칠 염려도 없다
+[root@ol7a ~]# diff -r /src/.snap/app_0 /src/app && echo "same as app_0"
+same as app_0
+-- diff -r 이 아무것도 출력하지 않아 && 뒤가 실행됐다. 스냅샷 시점과 완전히 같다
+
+--------------------------------------------------------------------------------
+ [4] 서브볼륨 전체를 스냅샷 시점으로 — 바꿔 끼우기
+--------------------------------------------------------------------------------
+
+-- 이번에는 여러 파일이 망가진 상황이다.
+[root@ol7a ~]# echo broken > /src/app/t1.dat; rm -rf /src/app/yum.repos.d; ls /src/app
+t1.dat
+t2.dat
+t3.dat
+-- t1.dat 내용을 망가뜨리고 yum.repos.d 를 통째로 지웠다.
+-- 파일 하나씩 꺼내기에는 많다
+-- 망가진 서브볼륨은 이름만 바꿔 두고, 읽기 전용 스냅샷에서 쓰기 가능한 스냅샷을 새로 떠 그 자리에 둔다.
+[root@ol7a ~]# mv /src/app /src/app.broken
+-- 서브볼륨도 mv 로 이름을 바꿀 수 있다. 같은 파일 시스템 안이면 즉시 끝난다
+-- 망가진 것을 바로 지우지 않는다. 되살린 뒤 비교할 일이 생길 수 있다
+-- 서브볼륨이 마운트돼 있거나 응용이 파일을 열고 있으면 먼저 멈춘다.
+-- 열린 파일은 옛 서브볼륨을 계속 본다
+[root@ol7a ~]# btrfs subvolume snapshot /src/.snap/app_0 /src/app
+Create a snapshot of '/src/.snap/app_0' in '/src/app'
+-- 읽기 전용 스냅샷의 스냅샷(-r 없음)은 쓰기 가능하다. 원래 이름 app 자리에 놓았다
+[root@ol7a ~]# cat /src/app/t1.dat; ls /src/app | head -3; btrfs property get /src/app ro
+row 1
+t1.dat
+t2.dat
+t3.dat
+ro=false
+-- t1.dat 이 row 1 로 돌아왔다.
+-- ls 를 head -3 으로 잘라 t1~t3 만 보였다
+-- ro=false : 새 app 은 쓰기 가능. 응용 프로그램이 바로 쓸 수 있다
+[root@ol7a ~]# btrfs subvolume list /src
+ID 256 gen 9 top level 5 path app.broken
+ID 258 gen 9 top level 5 path .snap/app_0
+ID 259 gen 9 top level 5 path app
+-- app.broken 은 ID 256(원래 app), 새 app 은 ID 259.
+-- 경로 이름은 같아도 다른 서브볼륨이다
+--   응용이 subvolid= 로 마운트하고 있었다면 새 ID 로 바꿔야 한다. subvol=app 은 그대로 맞는다
+[root@ol7a ~]# btrfs subvolume delete /src/app.broken
+Delete subvolume (no-commit): '/src/app.broken'
+-- 확인이 끝나 망가진 쪽을 지웠다
+-- 이 방식은 파일 수와 관계없이 즉시 끝난다.
+-- 블록을 복사하지 않고 트리 루트만 새로 만든다
+
+--------------------------------------------------------------------------------
+ [5] send 로 전체 전송 — 쓰기 가능한 스냅샷을 보내면
+--------------------------------------------------------------------------------
+
+-- 쓰기 가능한 스냅샷을 하나 떠서 그대로 보내 본다.
+[root@ol7a ~]# btrfs subvolume snapshot /src/app /src/.snap/app_rw; btrfs send /src/.snap/app_rw | btrfs receive /bak; echo "rc=$?"
+Create a snapshot of '/src/app' in '/src/.snap/app_rw'
+ERROR: subvolume /src/.snap/app_rw is not read-only
+ERROR: empty stream is not considered valid
+rc=1
+-- 증상   : btrfs send /src/.snap/app_rw | btrfs receive /bak 이
+--          'ERROR: subvolume /src/.snap/app_rw is not read-only' 와
+--          'ERROR: empty stream is not considered valid', rc=1
+-- 원인   : send 는 읽기 전용 스냅샷만 받는다. 보내는 동안 바뀌면 스트림이 일관되지 않는다.
+--          둘째 줄은 send 가 아무것도 내보내지 않아 receive 가 빈 스트림을 받았다
+-- 조치   : 쓰기 가능 스냅샷을 지우고 snapshot -r 로 만든 app_0 을 보낸다([6])
+--          (이미 있는 스냅샷은 btrfs property set 경로 ro true 로 바꿀 수도 있다)
+-- 재확인 : send 가 'At subvol /src/.snap/app_0',
+-- receive 가 'At subvol app_0' 출력
+-- rc=1 은 파이프 마지막 명령(receive)의 종료 코드다
+
+--------------------------------------------------------------------------------
+ [6] 읽기 전용 스냅샷 전체 전송
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# btrfs subvolume delete /src/.snap/app_rw
+Delete subvolume (no-commit): '/src/.snap/app_rw'
+-- 실패한 쓰기 가능 스냅샷을 지운다
+-- 스트림을 파일로도 받아 크기를 본다(-f). 그다음 파이프로 receive 에 넘긴다.
+[root@ol7a ~]# btrfs send -f /tmp/full_0.stream /src/.snap/app_0; ls -l /tmp/full_0.stream
+-- -f 로 스트림을 파일에 썼다. 전체 스트림 10742 바이트
+--   데이터 28K 보다 작다. 작은 파일은 메타데이터 안에 인라인으로 실리고, 스트림은 실제 내용만 담는다
+-- 이 파일은 다른 서버로 옮겨 btrfs receive -f 로 풀 수 있다([변형])
+-- 권한 -rw------- : root 만 읽는다.
+-- 스트림에는 파일 내용이 그대로 들어 있어 보호해야 한다
+-- 옮긴 스트림이 깨졌는지는 receive 때에야 드러난다.
+-- 옮긴 뒤 md5sum 으로 미리 대조한다
+At subvol /src/.snap/app_0
+-rw-------. 1 root root 10742 Nov 16 12:24 /tmp/full_0.stream
+[root@ol7a ~]# time (btrfs send /src/.snap/app_0 | btrfs receive /bak)
+At subvol /src/.snap/app_0
+At subvol app_0
+
+real    0m0.004s
+user    0m0.000s
+sys     0m0.003s
+-- 같은 스냅샷을 파이프로 보냈다. send 는 'At subvol 원본경로',
+-- receive 는 'At subvol 이름'
+-- 0.004초. 28K 라 즉시 끝났다
+[root@ol7a ~]# btrfs subvolume list /bak; btrfs subvolume show /bak/app_0 | grep -E 'Name|UUID|Flags|Received'
+ID 257 gen 8 top level 5 path app_0
+        Name:                   app_0
+        UUID:                   2693ac8b-e455-924e-9a51-2c8958f8232d
+        Parent UUID:            -
+        Received UUID:          dea18dab-7290-bf4f-b3e0-d51401ba64cc
+        Flags:                  readonly
+-- 받은 쪽 app_0(ID 257)
+--   UUID 2693ac8b-... : 받은 쪽이 새로 붙인 UUID
+--   Received UUID dea18dab-... : 보낸 스냅샷의 UUID. 아래 원본 show 와 대조한다
+--   Flags readonly : 받은 스냅샷도 읽기 전용이다
+[root@ol7a ~]# btrfs subvolume show /src/.snap/app_0 | grep -E 'Name|UUID|Flags'
+        Name:                   app_0
+        UUID:                   dea18dab-7290-bf4f-b3e0-d51401ba64cc
+        Parent UUID:            22c8116d-4d91-4d47-9a0d-422177c9e0d1
+        Received UUID:          -
+        Flags:                  readonly
+-- 원본 app_0 의 UUID dea18dab-...
+-- 가 위 Received UUID 와 같다. 이 짝이 증분 전송의 기준이다
+-- 원본 쪽 Received UUID 는 - 다.
+-- 원본은 받은 것이 아니라 직접 만든 스냅샷이다
+-- Parent UUID 22c8116d-...
+-- 는 원본 서브볼륨 app(ID 256, 지금은 지워진 app.broken)의 UUID
+[root@ol7a ~]# diff -r /src/.snap/app_0 /bak/app_0 && echo "identical"
+identical
+-- 백업 쪽 내용이 원본 스냅샷과 같다
+
+--------------------------------------------------------------------------------
+ [7] 변경 후 두 번째 스냅샷과 증분 전송
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# echo "row 4" > /src/app/t4.dat; echo "row 1 updated" > /src/app/t1.dat; dd if=/dev/urandom of=/src/app/big.bin bs=1M count=50 status=none; sync
+-- 변경 셋: 새 파일 t4.dat,
+-- t1.dat 내용 변경, 50MiB 난수 파일 big.bin
+--   난수는 압축이 안 돼 스트림 크기를 그대로 보여 준다
+[root@ol7a ~]# btrfs subvolume snapshot -r /src/app /src/.snap/app_1; sync
+Create a readonly snapshot of '/src/app' in '/src/.snap/app_1'
+-- 두 번째 읽기 전용 스냅샷 app_1
+-- -p 부모 스냅샷. 부모와 다른 블록만 스트림에 실린다.
+[root@ol7a ~]# btrfs send -p /src/.snap/app_0 -f /tmp/incr_1.stream /src/.snap/app_1; ls -l /tmp/full_0.stream /tmp/incr_1.stream
+At subvol /src/.snap/app_1
+-rw-------. 1 root root    10742 Nov 16 12:24 /tmp/full_0.stream
+-rw-------. 1 root root 52469326 Nov 16 12:24 /tmp/incr_1.stream
+-- 증분 스트림 52469326 바이트 ≈ big.bin 50MiB(52428800) + 41KB
+--   전체 스트림(10742)보다 크지만 바뀐 것만 실렸다. 변경이 큰 파일 하나라 증분도 컸다
+--   바뀌지 않은 yum.repos.d·t2·t3 는 실리지 않았다
+[root@ol7a ~]# btrfs send -p /src/.snap/app_0 /src/.snap/app_1 | btrfs receive /bak
+At subvol /src/.snap/app_1
+At snapshot app_1
+-- receive 의 출력이 'At snapshot app_1' 이다.
+-- 전체 전송의 'At subvol' 과 다르다
+--   받는 쪽이 부모(app_0)의 스냅샷을 먼저 만들고 그 위에 차이를 적용했다는 뜻
+[root@ol7a ~]# btrfs subvolume list /bak; cat /bak/app_1/t1.dat; ls /bak/app_1
+ID 257 gen 11 top level 5 path app_0
+ID 258 gen 12 top level 5 path app_1
+row 1 updated
+big.bin
+t1.dat
+t2.dat
+t3.dat
+t4.dat
+yum.repos.d
+-- 받은 쪽 app_1 에 t1.dat 의 새 내용, t4.dat, big.bin 이 있다.
+-- app_0 은 그대로 남아 있다
+-- app_1 의 ID 258, gen 12.
+-- app_0 의 gen 이 8 에서 11 로 오른 것은 부모로 쓰이며 갱신된 기록이다
+
+--------------------------------------------------------------------------------
+ [8] 받는 쪽에 부모가 없으면
+--------------------------------------------------------------------------------
+
+-- 세 번째 스냅샷을 만들고, 받는 쪽에서 부모 app_1 을 지운 뒤 증분을 보낸다.
+[root@ol7a ~]# echo "row 5" > /src/app/t5.dat; btrfs subvolume snapshot -r /src/app /src/.snap/app_2; sync
+Create a readonly snapshot of '/src/app' in '/src/.snap/app_2'
+-- 세 번째 스냅샷 app_2(t5.dat 추가)
+[root@ol7a ~]# btrfs subvolume delete /bak/app_1
+Delete subvolume (no-commit): '/bak/app_1'
+-- 백업 쪽 공간 정리를 흉내 내 app_1 을 지웠다. 원본에는 app_1 이 남아 있다
+-- 운영에서는 백업 보존 기간 스크립트가 오래된 스냅샷을 지우다 이렇게 된다
+[root@ol7a ~]# btrfs send -p /src/.snap/app_1 /src/.snap/app_2 | btrfs receive /bak; echo "rc=${PIPESTATUS[*]}"
+At subvol /src/.snap/app_2
+ERROR: cannot find parent subvolume
+At snapshot app_2
+rc=141 1
+[root@ol7a ~]# btrfs subvolume list /bak
+ID 257 gen 11 top level 5 path app_0
+-- 증상   : btrfs send -p /src/.snap/app_1 /src/.snap/app_2 | btrfs receive /bak 에서
+--          'ERROR: cannot find parent subvolume', PIPESTATUS 'rc=141 1'
+-- 원인   : 증분 스트림은 "부모 app_1 에서 이렇게 바꿔라"는 명령이다. 받는 쪽은 Received UUID 로
+--          부모를 찾는데 /bak/app_1 을 지워 찾지 못했다. list 에 app_0 만 남았다
+-- 조치   : 양쪽에 모두 있는 공통 스냅샷 app_0 을 부모로 다시 보낸다([9])
+-- 재확인 : rc=0 0, list 에 app_2, diff -r 결과 identical
+-- PIPESTATUS 141 은 send 가 SIGPIPE(128+13)로 끝났다는 뜻.
+-- receive 가 먼저 죽어 파이프가 닫혔다
+-- 1 은 receive 의 종료 코드.
+-- 앞의 'At snapshot app_2' 는 오류 전에 찍힌 진행 표시다
+
+--------------------------------------------------------------------------------
+ [9] 부모를 다시 맞추고 증분 재전송
+--------------------------------------------------------------------------------
+
+-- 받는 쪽에 남아 있는 app_0 을 부모로 삼아 app_2 를 보낸다.
+[root@ol7a ~]# btrfs send -p /src/.snap/app_0 /src/.snap/app_2 | btrfs receive /bak; echo "rc=${PIPESTATUS[*]}"
+At subvol /src/.snap/app_2
+At snapshot app_2
+rc=0 0
+-- 부모를 app_0 으로 바꾸자 send·receive 모두 0
+-- 이 증분에는 app_0 → app_2 의 변경(t1·t4·t5·big.bin)이 모두 실렸다. 부모가 멀수록 증분이 커진다
+-- 공통 스냅샷이 하나도 없으면 전체 전송(-p 없이)으로 다시 시작해야 한다
+[root@ol7a ~]# btrfs subvolume list /bak; ls /bak/app_2
+ID 257 gen 15 top level 5 path app_0
+ID 260 gen 16 top level 5 path app_2
+big.bin
+t1.dat
+t2.dat
+t3.dat
+t4.dat
+t5.dat
+yum.repos.d
+-- 받은 쪽에 app_0·app_2. app_2 의 ID 는 260.
+-- 지운 app_1 의 258 은 다시 쓰지 않았다
+[root@ol7a ~]# diff -r /src/.snap/app_2 /bak/app_2 && echo "identical"
+identical
+-- 원본 app_2 와 백업 app_2 의 내용이 같다
+
+--------------------------------------------------------------------------------
+ [10] 백업 쪽에서 복원
+--------------------------------------------------------------------------------
+
+-- 원본 디스크가 통째로 사라졌다고 보고, 백업 쪽 app_2 에서 원본에 다시 보낸다.
+[root@ol7a ~]# umount /src; wipefs -a /dev/sdb >/dev/null; mkfs.btrfs -f -L src2 /dev/sdb | grep -E 'Label'; mount /dev/sdb /src
+Label:              src2
+-- 원본 디스크 고장을 흉내 냈다. umount → wipefs → mkfs.btrfs -f 로 sdb 를 새 파일 시스템으로
+-- -f 는 기존 서명을 덮어쓴다. wipefs 로 이미 지웠지만 습관적으로 붙인다
+[root@ol7a ~]# btrfs send /bak/app_2 | btrfs receive /src
+At subvol /bak/app_2
+At subvol app_2
+-- 백업 쪽 app_2 를 원본 쪽으로 전체 전송했다.
+-- 받은 스냅샷이라도 읽기 전용이라 다시 보낼 수 있다
+-- 새 디스크에는 공통 부모가 없어 증분이 아니라 전체 전송이다
+[root@ol7a ~]# btrfs subvolume snapshot /src/app_2 /src/app; ls /src/app; btrfs property get /src/app ro
+Create a snapshot of '/src/app_2' in '/src/app'
+big.bin
+t1.dat
+t2.dat
+t3.dat
+t4.dat
+t5.dat
+yum.repos.d
+ro=false
+-- 받은 app_2 는 읽기 전용이다.
+-- 그 스냅샷(-r 없음)으로 쓰기 가능한 app 을 만들어 서비스에 쓴다
+-- 내용은 마지막 백업 시점(t5.dat 까지)
+-- 마지막 백업 뒤의 변경은 잃는다. 백업 주기가 곧 데이터 손실 한도(RPO)다
+
+--------------------------------------------------------------------------------
+ [변형] 스트림 파일로 보내고 받기 — 복원한 쪽에서 증분 잇기
+--------------------------------------------------------------------------------
+
+-- [10] 에서 복원한 /src 의 app 을 고치고, 받은 스냅샷 app_2 를 부모로 증분을 만든다.
+-- 이번에는 파이프 대신 스트림 파일(-f)로 보내고, receive 도 파일에서 읽는다.
+[root@ol7a ~]# echo "row 6" > /src/app/t6.dat; mkdir -p /src/.snap; btrfs subvolume snapshot -r /src/app /src/.snap/app_3; sync
+Create a readonly snapshot of '/src/app' in '/src/.snap/app_3'
+-- 복원한 app 에 t6.dat 을 더하고 app_3 을 떴다.
+-- mkfs 로 .snap 이 사라져 mkdir -p 로 다시 만들었다
+[root@ol7a ~]# btrfs send -p /src/app_2 -f /tmp/incr_3.stream /src/.snap/app_3; ls -l /tmp/incr_3.stream
+At subvol /src/.snap/app_3
+-rw-------. 1 root root 569 Nov 16 12:24 /tmp/incr_3.stream
+-- 부모를 복원된 /src/app_2 로 줬다.
+-- 원본 쪽에서 새로 만든 스냅샷이 아니라 받은 스냅샷이다
+-- 증분 스트림 569 바이트. t6.dat 한 줄(6바이트)과 메타데이터 명령
+-- --dump 는 스트림을 풀지 않고 명령 목록으로 보인다.
+[root@ol7a ~]# btrfs receive --dump -f /tmp/incr_3.stream | cut -c1-110 | head -8
+snapshot        ./app_3                         uuid=5ca056ba-01ae-444f-96df-0e480e9fec47 transid=10 parent_uu
+utimes          ./app_3/                        atime=2026-11-16T12:24:19+0900 mtime=2026-11-16T12:24:19+0900 
+mkfile          ./app_3/o267-10-0
+rename          ./app_3/o267-10-0               dest=./app_3/t6.dat
+utimes          ./app_3/                        atime=2026-11-16T12:24:19+0900 mtime=2026-11-16T12:24:19+0900 
+set_xattr       ./app_3/t6.dat                  name=security.selinux data=unconfined_u:object_r:unlabeled_t:s
+write           ./app_3/t6.dat                  offset=0 len=6
+chown           ./app_3/t6.dat                  gid=0 uid=0
+-- --dump 는 스트림을 적용하지 않고 명령을 한 줄씩 보인다.
+-- 110자로 자르고 8줄만 보였다
+--   snapshot : 부모를 찾아 app_3 를 스냅샷으로 만든다(uuid 는 보낸 app_3, parent_uuid 가 부모)
+--   mkfile → rename : 임시 이름 o267-10-0 으로 만든 뒤 t6.dat 으로 바꾼다
+--   set_xattr : SELinux 레이블도 확장 속성으로 함께 실린다
+--   write offset=0 len=6 : "row 6\n" 6바이트
+--   chown·utimes : 소유자·시각
+[root@ol7a ~]# btrfs receive -f /tmp/incr_3.stream /bak; btrfs subvolume list /bak
+At snapshot app_3
+ID 257 gen 15 top level 5 path app_0
+ID 260 gen 19 top level 5 path app_2
+ID 261 gen 20 top level 5 path app_3
+-- 파일에서 읽어 풀었다(-f). 'At snapshot app_3' → 증분으로 풀렸다
+-- /bak 에 app_0·app_2·app_3. 파이프와 파일은 결과가 같다
+[root@ol7a ~]# cat /bak/app_3/t6.dat; btrfs subvolume show /bak/app_3 | grep -E 'Name|Parent UUID|Received UUID'
+row 6
+        Name:                   app_3
+        Parent UUID:            780f9971-f277-444f-b13d-76b39b08c90e
+        Received UUID:          5ca056ba-01ae-444f-96df-0e480e9fec47
+-- 받은 app_3 의 Parent UUID 780f9971-...
+-- 는 /bak/app_2 의 UUID(아래)다
+-- Received UUID 5ca056ba-...
+-- 는 --dump 첫 줄의 uuid 와 같다
+[root@ol7a ~]# btrfs subvolume show /src/app_2 | grep -E 'Name|^\s+UUID|Received UUID'; btrfs subvolume show /bak/app_2 | grep -E 'Name|^\s+UUID|Received UUID'
+        Name:                   app_2
+        UUID:                   8a351c71-7b0f-e94c-a741-a5e58f56f750
+        Received UUID:          6adeca06-3278-b246-b138-8746bac92a62
+        Name:                   app_2
+        UUID:                   780f9971-f277-444f-b13d-76b39b08c90e
+        Received UUID:          6adeca06-3278-b246-b138-8746bac92a62
+-- /src/app_2(UUID 8a351c71-...)와 /bak/app_2(UUID 780f9971-...)는 UUID 가 다르다
+-- 그런데 Received UUID 가 둘 다 6adeca06-...
+-- 다. 둘 다 원래 원본 app_2 에서 온 사본이라는 표시
+-- 받는 쪽은 이 Received UUID 로 부모를 찾았다.
+-- 그래서 원본 디스크를 새로 만든 뒤에도
+-- 증분 백업을 처음부터 다시 하지 않고 이어 갈 수 있었다
+
+--------------------------------------------------------------------------------
+ [11] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /src /bak; rmdir /src /bak; rm -f /tmp/*.stream
+-- 두 마운트 해제, 마운트 지점 삭제, 스트림 파일 삭제
+[root@ol7a ~]# wipefs -a /dev/sdb /dev/sdc >/dev/null; udevadm settle; lsblk -f /dev/sdb /dev/sdc; ls /tmp/*.stream 2>&1
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+ls: cannot access /tmp/*.stream: No such file or directory
+-- udevadm settle 뒤 lsblk 가 두 장치 모두 빈 칸.
+-- 스트림 파일도 남지 않았다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                       시작 전     변경 후                                되돌린 뒤
+--  sdb / sdc                  없음        btrfs src → src2 / btrfs bak           없음
+--  /bak 의 스냅샷             -           app_0, app_2, app_3 (app_1 은 지움)    -
+--  전체 스트림 app_0          -           10742 바이트                           삭제
+--  증분 스트림 app_0→app_1    -           52469326 바이트 (big.bin 50MiB)         삭제
+--  증분 스트림 app_2→app_3    -           569 바이트                             삭제
+--  쓰기 가능 스냅샷 send      -           is not read-only, rc=1                 -
+--  부모 없는 증분             -           cannot find parent subvolume, rc=141 1 -
+--
+-- 확인한 사실
+--   파일 하나는 스냅샷에서 cp, 서브볼륨 전체는 스냅샷의 스냅샷으로 바꿔 끼운다
+--   send 는 읽기 전용만. 증분은 받는 쪽에서 Received UUID 로 부모를 찾는다
+--   복원한 쪽의 받은 스냅샷도 다음 증분의 부모가 된다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. btrfs send -c 로 clone source 를 주어 부모 없이 공유 블록을 줄이는 전송을 해 본다
+--    확인: -c 를 준 스트림과 안 준 스트림의 크기
+-- 2. 받은 스냅샷 /bak/app_2 를 btrfs property set ro false 로 바꾼 뒤 증분을 받아 본다
+--    확인: receive 의 오류 문구, btrfs subvolume show 의 Received UUID 가 남는지
+-- 3. ssh 로 다른 서버에 보낸다(btrfs send 스냅샷 | ssh 대상 btrfs receive /경로)
+--    확인: 받은 쪽 btrfs subvolume list
+
+================================================================================
+ 실습 03 종료 — 스냅샷 되살리기, 전체·증분 send/receive, 부모 오류와 복원 뒤 증분 잇기 확인
+================================================================================

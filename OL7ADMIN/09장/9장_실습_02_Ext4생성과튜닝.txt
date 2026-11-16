@@ -1,0 +1,460 @@
+================================================================================
+ 제9장 실습 02 — Ext4 생성과 튜닝
+ 대상   : ol7a
+ 목표   : mkfs.ext4 출력을 줄 단위로 읽고, dumpe2fs -h·tune2fs 로 레이블·예약
+          블록·검사 주기를 확인하고 바꾼다
+ 배경   : Ext4 는 블록 그룹 단위로 inode 표·비트맵을 나눠 두고 슈퍼블록 사본을
+          여러 그룹에 흩어 저장한다. 만들 때 정한 inode 수는 나중에 늘릴 수 없고,
+          예약 블록·레이블·검사 주기 같은 값은 tune2fs 로 언제든 바꾼다
+          (본문 9.4~9.5절)
+ 소요   : 약 20분
+ 선행   : storage-clean 스냅샷
+ 계정   : root, student
+ 주의   : sdb 를 덮어쓴다
+ 되돌림 : 언마운트, wipefs 로 sdb 를 비우고 마운트 지점 삭제.
+          확인 명령 lsblk /dev/sdb, findmnt /mnt/data (출력 없음)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+-- 대상 디스크가 비어 있고 마운트 지점이 없는지 본다
+[root@ol7a ~]# lsblk /dev/sdb; findmnt /mnt/data; echo rc=$?
+NAME MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdb    8:16   0  10G  0 disk 
+rc=1
+-- sdb 는 자식 없는 10G disk.
+-- findmnt 는 출력 없이 rc=1(그런 마운트 없음)
+[root@ol7a ~]# rpm -q e2fsprogs; echo /sbin/mkfs.*
+e2fsprogs-1.45.4-3.0.7.el7.x86_64
+/sbin/mkfs.btrfs /sbin/mkfs.cramfs /sbin/mkfs.ext2 /sbin/mkfs.ext3 /sbin/mkfs.ext4 /sbin/mkfs.fat /sbin/mkfs.minix /sbin/mkfs.msdos /sbin/mkfs.vfat /sbin/mkfs.xfs /sbin/mkfs.xmem
+-- e2fsprogs 1.45.4.
+-- 7.9 의 기본 설치판이 옛 1.42 가 아니다. 출력 형식이 그 판 기준이다
+-- mkfs.<유형> 이 파일 시스템마다 하나씩 있다.
+-- mkfs -t ext4 는 mkfs.ext4 를 부른다
+-- 7.9 기준 상태에 btrfs·xfs·ext2/3/4·fat(vfat·msdos)·minix·cramfs 용이 있다
+
+--------------------------------------------------------------------------------
+ [1] 파티션 두 개 준비
+--------------------------------------------------------------------------------
+-- sdb1 5GiB 는 본 실습용, sdb2 300MiB 는 예약 블록 실험용.
+[root@ol7a ~]# parted -s /dev/sdb mklabel msdos mkpart primary 1MiB 5121MiB mkpart primary 5121MiB 5421MiB
+[root@ol7a ~]# lsblk /dev/sdb
+NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+sdb      8:16   0   10G  0 disk 
+├─sdb2   8:18   0  300M  0 part 
+└─sdb1   8:17   0    5G  0 part 
+-- sdb1 5G, sdb2 300M.
+-- lsblk 의 줄 순서는 번호순이 아니다
+
+--------------------------------------------------------------------------------
+ [2] mkfs.ext4 출력 읽기
+--------------------------------------------------------------------------------
+-- 옵션 없이 기본값으로 만든다. 기본값은 /etc/mke2fs.conf 의 [defaults]·[fs_types] 에서 온다.
+[root@ol7a ~]# mkfs.ext4 /dev/sdb1
+mke2fs 1.45.4 (23-Sep-2019)
+Creating filesystem with 1310720 4k blocks and 327680 inodes
+Filesystem UUID: 363470d5-5ae9-4741-8f49-527ceede9d1a
+Superblock backups stored on blocks: 
+        32768, 98304, 163840, 229376, 294912, 819200, 884736
+
+Allocating group tables:  0/40     done                            
+Writing inode tables:  0/40     done                            
+Creating journal (16384 blocks): done
+Writing superblocks and filesystem accounting information:  0/40     done
+-- 줄 단위로 읽는다
+--   Creating filesystem with 1310720 4k blocks and 327680 inodes
+--     블록 4KiB × 1310720 = 5GiB. inode 327680개 = 5GiB ÷ 16384바이트
+--   Filesystem UUID: 이 값이 /dev/disk/by-uuid 링크와 fstab 의 UUID= 가 된다
+--   Superblock backups stored on blocks: 32768, 98304 … 슈퍼블록 사본 7개의 위치
+--     0·1 과 3·5·7 의 거듭제곱 번째 그룹(1,3,5,7,9,25,27)에만 둔다(sparse_super)
+--   Allocating group tables: 0/40 → 블록 그룹이 40개. 그룹 하나 32768블록 = 128MiB
+--   Creating journal (16384 blocks): 저널 64MiB
+-- 0/40 과 done 사이에는 진행률을 지우는 백스페이스 문자가 섞여 있다(단말이 아닌 곳에 찍은 흔적)
+-- 옛 1.42 출력에 있던 예약 블록·블록 그룹 수 줄이 없다.
+-- 그 값은 [3] 에서 읽는다
+[root@ol7a ~]# sed -n '/^\[defaults\]/,/^$/p;/[[:space:]]ext4 = {/,/}/p' /etc/mke2fs.conf
+[defaults]
+        base_features = sparse_super,filetype,resize_inode,dir_index,ext_attr
+        default_mntopts = acl,user_xattr
+        enable_periodic_fsck = 0
+        blocksize = 4096
+        inode_size = 256
+        inode_ratio = 16384
+
+        ext4 = {
+                features = has_journal,extent,huge_file,flex_bg,uninit_bg,dir_nlink,extra_isize
+                auto_64-bit_support=1
+                inode_size = 256
+        }
+-- [defaults] 의 blocksize 4096,
+-- inode_ratio 16384, inode_size 256 이 위 숫자의 출처다
+-- enable_periodic_fsck = 0: 마운트 횟수·기간에 따른 강제 검사를 끈 채 만든다([6])
+-- ext4 = { features … }: has_journal(저널)·extent·flex_bg 등 ext4 기능 묶음
+-- 같은 파일에 rhel6_ext4·rhel7_ext4·ol7_ext4·ol8_ext4 프로필도 있다(sed 로 잘라 생략)
+-- mkfs.ext4 -T ol8_ext4 처럼 고르면 그 판과 호환되는 기능 조합으로 만든다
+
+--------------------------------------------------------------------------------
+ [3] dumpe2fs -h 로 슈퍼블록 보기
+--------------------------------------------------------------------------------
+-- -h 는 슈퍼블록만(블록 그룹 상세 제외). 전체 출력은 그룹마다 몇 줄씩이라 수백 줄이다.
+[root@ol7a ~]# dumpe2fs -h /dev/sdb1 2>/dev/null | head -36
+Filesystem volume name:   <none>
+Last mounted on:          <not available>
+Filesystem UUID:          363470d5-5ae9-4741-8f49-527ceede9d1a
+Filesystem magic number:  0xEF53
+Filesystem revision #:    1 (dynamic)
+Filesystem features:      has_journal ext_attr resize_inode dir_index filetype extent flex_bg sparse_super large_file huge_file uninit_bg dir_nlink extra_isize
+Filesystem flags:         signed_directory_hash 
+Default mount options:    user_xattr acl
+Filesystem state:         clean
+Errors behavior:          Continue
+Filesystem OS type:       Linux
+Inode count:              327680
+Block count:              1310720
+Reserved block count:     65536
+Free blocks:              1271202
+Free inodes:              327669
+First block:              0
+Block size:               4096
+Fragment size:            4096
+Reserved GDT blocks:      319
+Blocks per group:         32768
+Fragments per group:      32768
+Inodes per group:         8192
+Inode blocks per group:   512
+Flex block group size:    16
+Filesystem created:       Fri Nov 13 19:48:40 2026
+Last mount time:          n/a
+Last write time:          Fri Nov 13 19:48:40 2026
+Mount count:              0
+Maximum mount count:      -1
+Last checked:             Fri Nov 13 19:48:40 2026
+Check interval:           0 (<none>)
+Lifetime writes:          1309 kB
+Reserved blocks uid:      0 (user root)
+Reserved blocks gid:      0 (group root)
+First inode:              11
+-- head -36 으로 앞 36줄만 봤다(뒤는 inode 크기·해시·저널 정보)
+-- 이 실습에서 볼 필드
+--   Filesystem volume name <none>: 레이블 없음([5] 에서 붙인다)
+--   Filesystem features: mke2fs.conf 의 기능이 그대로 들어갔다. 64bit 는 없다
+--   Filesystem state clean: 정상적으로 닫혔다. fsck 가 건너뛰는 기준
+--   Errors behavior Continue: 오류를 만나도 계속 동작(remount-ro·panic 도 가능)
+--   Inode count 327680 / Block count 1310720: [2] 의 숫자와 같다
+--   Reserved block count 65536: 1310720 의 5%. root 몫([9])
+--   Blocks per group 32768 / Inodes per group 8192: 그룹마다 128MiB, inode 8192개
+--   Maximum mount count -1, Check interval 0 (<none>): 주기 검사 꺼짐
+--   Reserved blocks uid 0 (user root): 예약 블록을 쓸 수 있는 사용자
+-- First inode 11: 1~10 번은 예약 inode.
+-- 11 번이 lost+found 다
+-- 블록 그룹 상세는 앞 두 그룹만 본다(전체 40개 그룹 중 0·1번, sed 로 범위를 자름).
+[root@ol7a ~]# dumpe2fs /dev/sdb1 2>/dev/null | sed -n '/^Group 0:/,/^Group 2:/p' | head -10
+Group 0: (Blocks 0-32767) csum 0x1ff9
+  Primary superblock at 0, Group descriptors at 1-1
+  Reserved GDT blocks at 2-320
+  Block bitmap at 321 (+321)
+  Inode bitmap at 337 (+337)
+  Inode table at 353-864 (+353)
+  24217 free blocks, 8181 free inodes, 2 directories, 8181 unused inodes
+  Free blocks: 8551-32767
+  Free inodes: 12-8192
+Group 1: (Blocks 32768-65535) csum 0xa8d9 [INODE_UNINIT, BLOCK_UNINIT]
+-- 그룹 0 은 주 슈퍼블록(0번 블록)과 그룹 설명자,
+-- 비트맵, inode 표(353-864)를 가진다
+-- 24217 free blocks: 그룹 0 에 저널·메타데이터가 몰려 빈 블록이 적다
+-- 그룹 1 은 INODE_UNINIT·BLOCK_UNINIT: 아직 초기화하지 않은 그룹(만들기를 빠르게 하는 기능)
+-- 슈퍼블록 사본 위치만 모아 본다.
+[root@ol7a ~]# dumpe2fs /dev/sdb1 2>/dev/null | grep -i 'superblock at'
+  Primary superblock at 0, Group descriptors at 1-1
+  Backup superblock at 32768, Group descriptors at 32769-32769
+  Backup superblock at 98304, Group descriptors at 98305-98305
+  Backup superblock at 163840, Group descriptors at 163841-163841
+  Backup superblock at 229376, Group descriptors at 229377-229377
+  Backup superblock at 294912, Group descriptors at 294913-294913
+  Backup superblock at 819200, Group descriptors at 819201-819201
+  Backup superblock at 884736, Group descriptors at 884737-884737
+-- 사본 7개. 주 슈퍼블록이 깨지면 이 번호를 e2fsck -b 에 준다(실습 05)
+
+--------------------------------------------------------------------------------
+ [4] 마운트하고 df 로 확인
+--------------------------------------------------------------------------------
+[root@ol7a ~]# mkdir -p /mnt/data; mount /dev/sdb1 /mnt/data
+[root@ol7a ~]# df -hT /mnt/data
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdb1      ext4  4.9G   24K  4.6G   1% /mnt/data
+-- df -hT 일곱 열
+--   Filesystem /dev/sdb1, Type ext4, Size 4.9G(메타데이터를 뺀 크기), Used 24K
+--   Avail 4.6G: Size−Used(4.9G) 보다 0.3G 적다. 예약 블록 65536×4KiB = 256MiB 몫
+--   Use% 1%, Mounted on /mnt/data
+[root@ol7a ~]# df -i /mnt/data
+Filesystem     Inodes IUsed  IFree IUse% Mounted on
+/dev/sdb1      327680    11 327669    1% /mnt/data
+-- df -i 는 inode 기준. Inodes 327680 = Inode count.
+-- 이미 11개(예약 10 + lost+found) 사용
+-- 빈 파일 시스템인데 Used 가 0 이 아니다. 무엇이 쓰고 있나.
+[root@ol7a ~]# ls -la /mnt/data
+total 20
+drwxr-xr-x. 3 root root  4096 Nov 13 19:48 .
+drwxr-xr-x. 4 root root    30 Nov 13 19:48 ..
+drwx------. 2 root root 16384 Nov 13 19:48 lost+found
+-- lost+found 가 16384바이트(4블록)로 미리 만들어져 있다.
+-- Used 24K 의 대부분이 이것이다
+-- fsck 가 이름 잃은 파일을 붙일 때 새 블록을 할당하지 않아도 되게 미리 크게 만든다
+
+--------------------------------------------------------------------------------
+ [5] 레이블 붙이기
+--------------------------------------------------------------------------------
+-- 마운트된 상태에서 바꿔도 된다. -L 은 최대 16바이트.
+[root@ol7a ~]# tune2fs -L appdata /dev/sdb1
+tune2fs 1.45.4 (23-Sep-2019)
+-- tune2fs 는 버전 줄만 찍고 끝났다. 성공하면 말이 없다
+[root@ol7a ~]# e2label /dev/sdb1; blkid /dev/sdb1
+appdata
+/dev/sdb1: LABEL="appdata" UUID="363470d5-5ae9-4741-8f49-527ceede9d1a" TYPE="ext4" 
+[root@ol7a ~]# ls -l /dev/disk/by-label/
+total 0
+lrwxrwxrwx. 1 root root 10 Nov 13 19:48 appdata -> ../../sdb1
+lrwxrwxrwx. 1 root root  9 Nov 13 19:48 OL-7.9\x20Server.x86_64 -> ../../sr0
+-- e2label 과 blkid 모두 appdata.
+-- by-label 링크가 바로 생겼다(udev 가 변경을 감지)
+-- 마운트 중에도 레이블을 바꿀 수 있다.
+-- fstab 에 LABEL=appdata 로 적을 수 있게 됐다
+
+--------------------------------------------------------------------------------
+ [6] 검사 주기 바꾸기
+--------------------------------------------------------------------------------
+-- -c 최대 마운트 횟수, -i 최대 검사 간격(d·w·m). 둘 중 먼저 닿는 쪽에서 검사.
+[root@ol7a ~]# dumpe2fs -h /dev/sdb1 2>/dev/null | grep -iE 'mount count|check'
+Mount count:              1
+Maximum mount count:      -1
+Last checked:             Fri Nov 13 19:48:40 2026
+Check interval:           0 (<none>)
+-- Mount count 1: 방금 [4] 에서 한 번 마운트했다.
+-- 최대 -1 이라 검사로 이어지지 않는다
+[root@ol7a ~]# tune2fs -c 30 -i 3m /dev/sdb1
+tune2fs 1.45.4 (23-Sep-2019)
+Setting maximal mount count to 30
+Setting interval between checks to 7776000 seconds
+-- 3m = 3개월 = 90일 = 7776000초
+[root@ol7a ~]# dumpe2fs -h /dev/sdb1 2>/dev/null | grep -iE 'mount count|check'
+Mount count:              1
+Maximum mount count:      30
+Last checked:             Fri Nov 13 19:48:40 2026
+Check interval:           7776000 (3 months)
+Next check after:         Thu Feb 11 19:48:40 2027
+-- Maximum mount count 30, Check interval 3 months.
+-- Next check after 줄이 새로 생겼다
+-- 즉시 반영된다. 다음 부팅 때 systemd-fsck 가 이 값으로 검사 여부를 정한다
+-- -C 로 현재 마운트 횟수를 강제로 올리면 다음 마운트 때 무슨 일이 생기나.
+[root@ol7a ~]# umount /mnt/data; tune2fs -C 31 /dev/sdb1
+tune2fs 1.45.4 (23-Sep-2019)
+Setting current mount count to 31
+-- -C 로 현재 횟수를 31 로 올려 최대값 30 을 넘긴 상태를 흉내 냈다
+[root@ol7a ~]# mount /dev/sdb1 /mnt/data; dmesg | tail -3
+[   12.313407] EXT4-fs (sdb1): mounted filesystem with ordered data mode. Opts: (null)
+[   12.900789] EXT4-fs (sdb1): warning: maximal mount count reached, running e2fsck is recommended
+-- 커널이 경고만 남기고 마운트는 했다
+-- "maximal mount count reached,
+-- running e2fsck is recommended"
+-- 검사는 마운트가 아니라 부팅 때 systemd-fsck(fstab 여섯째 필드가 0 이 아닌 줄)가 한다
+-- 첫 줄은 [4] 의 마운트 기록이다
+[   12.900919] EXT4-fs (sdb1): mounted filesystem with ordered data mode. Opts: (null)
+-- 다시 기본값(검사 끔)으로 돌린다. 0 또는 -1 이 끔.
+[root@ol7a ~]# tune2fs -c -1 -i 0 /dev/sdb1
+tune2fs 1.45.4 (23-Sep-2019)
+Setting maximal mount count to -1
+Setting interval between checks to 0 seconds
+-- -c -1 -i 0 으로 다시 끔. OL7 기본과 같은 상태로 돌렸다
+
+--------------------------------------------------------------------------------
+ [7] tune2fs -l 과 dumpe2fs -h 는 같은 것을 보나
+--------------------------------------------------------------------------------
+[root@ol7a ~]# diff <(tune2fs -l /dev/sdb1) <(dumpe2fs -h /dev/sdb1 2>/dev/null); echo rc=$?
+1d0
+< tune2fs 1.45.4 (23-Sep-2019)
+44a44,49
+> Journal features:         (none)
+> Journal size:             64M
+> Journal length:           16384
+> Journal sequence:         0x00000004
+> Journal start:            0
+> 
+rc=1
+-- diff 결과
+--   1d0: tune2fs -l 의 첫 줄(버전)이 dumpe2fs 에는 없다
+--   44a44,49: dumpe2fs -h 에는 Journal features·size·length·sequence·start 다섯 줄이 더 있다
+-- 나머지 43줄은 같다. 같은 슈퍼블록을 읽는다
+
+--------------------------------------------------------------------------------
+ [8] 마운트된 장치에 mkfs
+--------------------------------------------------------------------------------
+-- 실수로 쓰는 장치에 mkfs 를 거는 상황.
+[root@ol7a ~]# mkfs.ext4 /dev/sdb1; echo rc=$?
+mke2fs 1.45.4 (23-Sep-2019)
+/dev/sdb1 is mounted; will not make a filesystem here!
+rc=1
+[root@ol7a ~]# mkfs.ext4 -F /dev/sdb1 </dev/null; echo rc=$?
+mke2fs 1.45.4 (23-Sep-2019)
+/dev/sdb1 is mounted; will not make a filesystem here!
+-- 증상   : "/dev/sdb1 is mounted; will not make a filesystem here!" rc=1
+-- 원인   : mke2fs 가 /proc/mounts 를 확인해 마운트된 장치를 거부했다. -F 하나로도 같다
+--          (1.45.4 는 -F 를 두 번 줘야 강제한다. 마운트된 장치에 그렇게 하면 파일 시스템이 깨진다)
+-- 조치   : 대상 장치가 맞는지 findmnt·lsblk 로 다시 본다. 정말 다시 만들 거라면 언마운트 후 mkfs
+-- 재확인 : 아래 [변형] 에서 umount 뒤 mkfs.ext4 가 조용히 끝난다
+rc=1
+
+--------------------------------------------------------------------------------
+ [9] 예약 블록 때문에 일반 사용자만 "공간 없음"
+--------------------------------------------------------------------------------
+-- 300MiB 짜리 sdb2 를 기본값으로 만들고 누구나 쓰게 연다.
+[root@ol7a ~]# mkfs.ext4 -q /dev/sdb2; mkdir -p /mnt/small; mount /dev/sdb2 /mnt/small; chmod 1777 /mnt/small
+[root@ol7a ~]# dumpe2fs -h /dev/sdb2 2>/dev/null | grep -E 'Block count|Reserved block count|Block size'
+Block count:              307200
+Reserved block count:     15360
+Block size:               1024
+-- 300MiB 라 블록 크기가 1KiB 로 정해졌다(작은 파일 시스템 유형 small)
+-- Reserved block count 15360 = 307200 의 5%
+[root@ol7a ~]# df -h /mnt/small
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb2       281M   14K  262M   1% /mnt/small
+-- Size 281M, Avail 262M.
+-- 그 차이 약 19M 가 예약 몫(15360 × 1KiB = 15MiB)과 반올림이다
+-- student 로 꽉 찰 때까지 쓴다.
+[student@ol7a ~]$ dd if=/dev/zero of=/mnt/small/fill.student bs=1M 2>&1 | tail -2
+261+0 records out
+274198528 bytes (274 MB) copied, 0.960121 s, 286 MB/s
+-- tail -2 로 끝 두 줄만 봤다. 앞 줄의 오류 메시지는 잘렸다
+-- bs=1M 에 count 가 없어 공간이 끝날 때까지 썼다.
+-- 261 블록(274MB)에서 멈췄다
+[root@ol7a ~]# df -h /mnt/small
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb2       281M  262M  1.0K 100% /mnt/small
+-- Used 262M, Avail 1.0K, Use% 100%.
+-- 일반 사용자에게는 꽉 찼다
+-- 같은 순간 root 는 쓸 수 있나.
+[root@ol7a ~]# dd if=/dev/zero of=/mnt/small/fill.root bs=1M 2>&1 | tail -2
+15+0 records out
+15728640 bytes (16 MB) copied, 0.0736363 s, 214 MB/s
+-- 같은 순간 root 는 16MB 를 더 썼다(15 블록)
+[root@ol7a ~]# df -h /mnt/small; ls -l /mnt/small
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb2       281M  277M     0 100% /mnt/small
+total 283148
+-rw-r--r--. 1 root    root     15728640 Nov 13 19:48 fill.root
+-rw-rw-r--. 1 student student 274198528 Nov 13 19:48 fill.student
+drwx------. 2 root    root        12288 Nov 13 19:48 lost+found
+-- 증상   : student 의 dd 가 274MB 에서 멈추고 df 가 Avail 1.0K, Use% 100% 를 보인다
+-- 원인   : Avail 은 예약 블록(5%)을 뺀 값이다. 예약 몫은 root(Reserved blocks uid 0)만 쓴다
+--          root 의 dd 는 그 몫 16MB 를 마저 써 Avail 0 이 됐다
+-- 조치   : 데이터 전용 볼륨이면 tune2fs -m 1(또는 -m 0)로 예약을 줄인다
+-- 재확인 : df 의 Avail 이 늘고 student 가 더 쓸 수 있다(바로 아래)
+-- ls -l 에서 fill.student 는 student 소유 274198528,
+-- fill.root 는 root 소유 15728640
+-- 예약 비율을 1% 로 낮추면 student 의 몫이 늘어난다(root 파일은 먼저 지움).
+[root@ol7a ~]# rm -f /mnt/small/fill.root; tune2fs -m 1 /dev/sdb2
+tune2fs 1.45.4 (23-Sep-2019)
+Setting reserved blocks percentage to 1% (3072 blocks)
+-- 예약 1% = 3072블록. 마운트된 채로 바로 바뀐다
+[root@ol7a ~]# df -h /mnt/small
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb2       281M  262M   13M  96% /mnt/small
+-- root 파일을 지웠고 예약이 줄어 Avail 13M
+[student@ol7a ~]$ dd if=/dev/zero of=/mnt/small/fill2.student bs=1M 2>&1 | tail -2
+12+0 records out
+12582912 bytes (13 MB) copied, 0.0153143 s, 822 MB/s
+-- student 가 12MB 를 더 썼다
+[root@ol7a ~]# df -h /mnt/small
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb2       281M  274M     0 100% /mnt/small
+-- 다시 Avail 0. 남은 3072블록(약 3MiB)은 root 몫이다
+
+--------------------------------------------------------------------------------
+ [변형] -T largefile 과 -m 0 으로 다시 만들기
+--------------------------------------------------------------------------------
+-- 같은 5GiB 에서 inode 를 덜 만들면 무엇이 달라지나. 큰 파일만 두는 볼륨(DB 데이터 파일,
+-- 백업 조각)에서 쓰는 방법이다. -T largefile 은 inode 하나당 1MiB.
+[root@ol7a ~]# umount /mnt/data; mkfs.ext4 -q -T largefile -L appdata /dev/sdb1
+[root@ol7a ~]# dumpe2fs -h /dev/sdb1 2>/dev/null | grep -E 'Inode count|Inodes per group|Inode size'
+Inode count:              5120
+Inodes per group:         128
+Inode size:               256
+-- -T largefile 은 inode 하나를 1MiB 에 하나씩 만든다.
+-- 5GiB ÷ 1MiB = 5120
+-- 그룹당 inode 가 8192 → 128 로 줄었다
+[root@ol7a ~]# mount /dev/sdb1 /mnt/data; df -hT /mnt/data; df -i /mnt/data
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdb1      ext4  5.0G   24K  4.7G   1% /mnt/data
+Filesystem     Inodes IUsed IFree IUse% Mounted on
+/dev/sdb1        5120    11  5109    1% /mnt/data
+-- Size 가 4.9G → 5.0G, Avail 4.6G → 4.7G.
+-- inode 표가 줄어든 만큼 공간이 늘었다
+-- 대신 파일은 최대 5109개만 더 만들 수 있다.
+-- 작은 파일이 많은 볼륨에는 쓰지 않는다
+-- -m 0 은 예약 블록을 아예 두지 않는다(루트 파일 시스템에는 쓰지 않는다).
+[root@ol7a ~]# umount /mnt/data; mkfs.ext4 -q -m 0 -L appdata /dev/sdb1
+[root@ol7a ~]# dumpe2fs -h /dev/sdb1 2>/dev/null | grep -E 'Reserved block count|Inode count'
+Inode count:              327680
+Reserved block count:     0
+-- -m 0: 예약 블록 0.
+-- inode 수는 기본값(327680)으로 돌아왔다
+-- 만들 때 정한 inode 수는 tune2fs 로 바꿀 수 없다.
+-- 예약 비율은 언제든 바꾼다
+
+--------------------------------------------------------------------------------
+ [10] 되돌리기
+--------------------------------------------------------------------------------
+[root@ol7a ~]# umount /mnt/small; rmdir /mnt/small /mnt/data
+[root@ol7a ~]# wipefs -a /dev/sdb1 /dev/sdb2 /dev/sdb; partprobe /dev/sdb
+/dev/sdb1: 2 bytes were erased at offset 0x00000438 (ext4): 53 ef
+/dev/sdb2: 2 bytes were erased at offset 0x00000438 (ext4): 53 ef
+/dev/sdb: 2 bytes were erased at offset 0x000001fe (dos): 55 aa
+/dev/sdb: calling ioclt to re-read partition table: Device or resource busy
+-- wipefs 가 sdb1·sdb2 의 ext4 서명(0x438 의 53 ef)과 sdb 의 MBR 서명(55 aa)을 지웠다
+-- 마지막 줄: 디스크 다시 읽기가 busy 로 실패했다.
+-- 방금 서명을 지운 sdb1·sdb2 를
+-- udev 가 다시 조사하느라 잠시 열어 둔 것으로 보인다.
+-- ioclt 는 원문의 오타다
+[root@ol7a ~]# lsblk /dev/sdb; findmnt /mnt/data; echo rc=$?
+NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+sdb      8:16   0   10G  0 disk 
+├─sdb2   8:18   0  300M  0 part 
+└─sdb1   8:17   0    5G  0 part 
+rc=1
+-- 디스크의 테이블은 지워졌지만 커널은 sdb1·sdb2 를 아직 들고 있다(실습 01 [6] 과 같은 상황)
+-- partprobe 도 서명 없는 디스크라 아무것도 하지 않았다
+-- 이 실습은 다음 실습이 스냅샷으로 되돌리므로 여기서 멈췄다
+-- 정리하려면 udevadm settle 로 udev 작업이 끝나길 기다린 뒤 blockdev --rereadpt /dev/sdb
+-- 실습 04·05·06 의 되돌리기는 이 순서(wipefs 파티션 → udevadm settle → wipefs 디스크)로 했다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                  시작 전   변경 후                              되돌린 뒤
+--  sdb1 (5GiB)           없음      ext4, inode 327680, 예약 65536        서명 지움
+--  레이블                -         appdata (tune2fs -L)                  -
+--  검사 주기             -         30회·3개월 → -1·0 으로 복귀           -
+--  마운트된 장치 mkfs    -         거부(-F 하나로도 거부)                -
+--  sdb2 예약 5%          -         student 100% 에서 멈춤, root 16MB 더  -
+--  sdb2 예약 1%          -         student 12MB 더                       -
+--  -T largefile          -         inode 5120                            -
+--  커널의 파티션 목록    sdb       sdb·sdb1·sdb2                         sdb1·sdb2 남음(busy)
+--
+-- 확인한 사실
+--   inode 수는 만들 때 정해진다. 예약 비율·레이블·검사 주기는 tune2fs 로 바로 바뀐다
+--   df 의 Avail 은 예약 블록을 뺀 값이다. 예약 몫은 root 만 쓴다
+--   7.9 의 mke2fs 는 주기 검사를 끈 채 만든다. -c·-i 로 켤 수 있다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. mkfs.ext4 -N 1000 으로 inode 를 1000개만 만들고 작은 파일을 계속 만들어 본다
+--    확인: df -i 의 IFree 가 0 이 될 때 메시지가 무엇인지, df -h 는 얼마나 남았는지
+-- 2. tune2fs -e remount-ro 로 오류 동작을 바꾸고 dumpe2fs -h 로 확인한다
+--    확인: Errors behavior 줄. 끝나면 continue 로 되돌린다
+-- 3. mkfs.ext4 -T ol8_ext4 로 만든 뒤 Filesystem features 를 [3] 과 비교한다
+--    확인: metadata_csum·64bit 가 들어갔는가
+-- 되돌린 뒤 확인: lsblk /dev/sdb 에 자식이 없을 때까지 udevadm settle; blockdev --rereadpt /dev/sdb
+================================================================================
+ 실습 02 종료 — mkfs.ext4 출력과 슈퍼블록 읽기, tune2fs 조정, 예약 블록과 일반 사용자
+================================================================================

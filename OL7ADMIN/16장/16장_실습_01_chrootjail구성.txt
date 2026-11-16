@@ -1,0 +1,547 @@
+================================================================================
+ 제16장 실습 01 — chroot jail 구성
+ 대상   : ol7a
+ 목표   : 빈 디렉터리에 bash·ls·cat·id 와 그 라이브러리만 넣어 최소 jail 을 만들고,
+          chroot 로 들어간 셸이 jail 밖을 보지 못하는 것을 확인한다. 라이브러리와
+          /dev 장치 파일이 빠졌을 때 어떤 메시지가 나오는지 보고, sshd 의
+          ChrootDirectory 로 같은 원리를 SFTP 전용 계정에 적용한다
+ 배경   : chroot(2) 는 프로세스의 루트 디렉터리를 바꾼다. 그 프로세스와 자식은 새
+          루트 위쪽의 경로를 이름으로 가리킬 수 없다. 동적 링크된 프로그램은 실행
+          순간 /lib64/ld-linux-x86-64.so.2 와 공유 라이브러리를 새 루트 기준으로
+          찾으므로, jail 안에 그 파일이 없으면 프로그램이 뜨지 않는다(본문 16.2)
+ 소요   : 약 25분
+ 선행   : ol7-base 스냅샷
+ 계정   : root, student
+ 주의   : sshd_config 를 고친다. 고치기 전에 사본을 두고 sshd -t 로 검사한 뒤
+          reload 한다. 기존 SSH 세션은 reload 로 끊기지 않는다
+ 되돌림 : /srv/jail·/srv/sftpjail 삭제, sftpjail 계정 삭제, sshd_config 원본 복원.
+          확인: ls /srv, diff 로 sshd_config 비교, id sftpjail 실패
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- chroot 명령은 coreutils 에 들어 있다. 패키지와 버전을 먼저 남긴다
+[root@ol7a ~]# which chroot; rpm -qf $(which chroot)
+/usr/sbin/chroot
+coreutils-8.22-24.0.1.el7_9.2.x86_64
+-- chroot 는 /usr/sbin 에 있다. 일반 사용자의 PATH 에는 sbin 이 없어 [9] 에서 전체 경로로 친다
+-- coreutils 8.22 는 7.9 의 기본 판. --userspec·--groups 옵션이 있다
+
+-- /srv 는 FHS 상 "이 서버가 제공하는 데이터" 자리다. 실습 jail 을 여기에 만든다
+[root@ol7a ~]# ls -la /srv
+total 4
+drwxr-xr-x.  2 root root    6 Apr 11  2018 .
+dr-xr-xr-x. 17 root root 4096 Nov 11 19:49 ..
+-- /srv 는 비어 있다(크기 6 = 빈 디렉터리). 실습이 만든 것은 [11] 에서 지운다
+
+-- 나중에 원본과 비교할 sshd_config 의 지문과 마지막 몇 줄
+[root@ol7a ~]# md5sum /etc/ssh/sshd_config; tail -4 /etc/ssh/sshd_config
+40d961cd3154f0439fcac1a50bd77b96  /etc/ssh/sshd_config
+#       X11Forwarding no
+#       AllowTcpForwarding no
+#       PermitTTY no
+#       ForceCommand cvs server
+-- md5 40d961cd… 는 [11] 에서 대조할 값. 끝 네 줄은 주석 처리된 Match 예시
+-- 기준 상태의 sshd_config 에는 Match 블록이 없다
+-- [변형] 에서 끝에 네 줄을 붙인다
+
+-- OL7 은 /bin·/lib64 가 /usr 아래로 가는 심볼릭 링크다(usrmove). jail 안에서는 실제 디렉터리로 만든다
+[root@ol7a ~]# ls -ld /bin /lib64
+lrwxrwxrwx. 1 root root 7 Nov 11 19:45 /bin -> usr/bin
+lrwxrwxrwx. 1 root root 9 Nov 11 19:45 /lib64 -> usr/lib64
+-- /bin → usr/bin, /lib64 → usr/lib64. OL7 의 usrmove 구조
+-- ldd 는 /lib64 경로로 보여 주지만 실제 파일은 /usr/lib64 에 있다
+-- jail 에는 링크 대신 실제 디렉터리 bin·lib64 를 만든다. 같은 상대 경로만 맞으면 된다
+
+--------------------------------------------------------------------------------
+ [1] jail 골격 만들기
+--------------------------------------------------------------------------------
+
+-- 최소 디렉터리만 만든다. -p : 상위 디렉터리까지, 이미 있어도 오류 없음
+[root@ol7a ~]# mkdir -p /srv/jail/{bin,lib64,etc,dev}; ls /srv/jail
+bin
+dev
+etc
+lib64
+-- 네 디렉터리. 중괄호 확장 {bin,lib64,etc,dev} 는 bash 가 펼친다
+-- 아직 모두 비어 있다
+
+-- bash 한 파일만 복사해 본다. 라이브러리는 일부러 아직 넣지 않는다
+[root@ol7a ~]# cp -v /bin/bash /srv/jail/bin/
+‘/bin/bash’ -> ‘/srv/jail/bin/bash’
+-- -v : 복사한 경로를 보인다. /bin/bash 는 링크 디렉터리를 거쳐 /usr/bin/bash 를 읽었다
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 ① — 라이브러리 없이 chroot
+--------------------------------------------------------------------------------
+
+-- chroot 새루트 명령 : 새 루트로 바꾼 뒤 그 안의 경로로 명령을 찾는다
+[root@ol7a ~]# chroot /srv/jail /bin/bash -c 'echo inside'; echo "rc=$?"
+chroot: failed to run command ‘/bin/bash’: No such file or directory
+rc=127
+-- 증상   : chroot: failed to run command ‘/bin/bash’: No such file or directory, rc=127
+-- 원인   : jail 안에 bash 는 있지만 bash 가 실행될 때 커널이 여는 동적 로더가 없다(아래 ldd)
+-- 조치   : [3] 에서 ldd 가 보인 /lib64 경로를 모두 복사
+-- 재확인 : 같은 chroot 가 inside 를 출력하고 rc=0
+-- rc 127 은 "실행할 명령을 찾지 못함". chroot 자체는 성공했다
+-- 7.9 의 coreutils 는 ‘ ’ 따옴표로 경로를 감싼다
+
+-- bash 파일은 분명히 있다. 그런데 "없다"고 한다. 무엇이 없는지 ldd 로 본다
+[root@ol7a ~]# ls -l /srv/jail/bin/bash; ldd /bin/bash
+-rwxr-xr-x. 1 root root 964536 Nov 16 15:55 /srv/jail/bin/bash
+        linux-vdso.so.1 =>  (0x00007fffa379a000)
+        libtinfo.so.5 => /lib64/libtinfo.so.5 (0x00007fe2a75e1000)
+        libdl.so.2 => /lib64/libdl.so.2 (0x00007fe2a73dd000)
+        libc.so.6 => /lib64/libc.so.6 (0x00007fe2a700f000)
+        /lib64/ld-linux-x86-64.so.2 (0x00007fe2a780b000)
+-- jail 의 bash 는 964536 바이트, 실행 권한도 있다
+-- ldd 다섯 줄
+--   linux-vdso.so.1  커널이 넣는 가상 라이브러리. 파일이 없다
+--   libtinfo·libdl·libc  공유 라이브러리 셋. => 오른쪽이 실제 경로
+--   ld-linux-x86-64.so.2  동적 로더. 없으면 동적 프로그램이 뜨지 않는다
+-- 괄호 안 주소는 매핑 위치라 실행마다 바뀐다
+
+-- 마지막 줄 /lib64/ld-linux-x86-64.so.2 가 동적 로더다. 커널이 이 경로를 새 루트 기준으로 연다
+[root@ol7a ~]# ls -l /lib64/ld-linux-x86-64.so.2 /srv/jail/lib64/
+lrwxrwxrwx. 1 root root 10 Nov 11 20:15 /lib64/ld-linux-x86-64.so.2 -> ld-2.17.so
+
+/srv/jail/lib64/:
+total 0
+-- 호스트의 로더는 ld-2.17.so 를 가리키는 링크다(glibc 2.17)
+-- jail 의 lib64 는 비어 있다(total 0). 메시지의 "없는 파일" 은 이것이다
+-- 메시지가 가리킨 bash 는 죄가 없다
+
+--------------------------------------------------------------------------------
+ [3] 라이브러리 복사와 재확인
+--------------------------------------------------------------------------------
+
+-- ldd 출력에서 /lib64 경로만 뽑아 복사한다. cp 는 심볼릭 링크를 따라가 실제 내용을 복사한다
+[root@ol7a ~]# cp -v $(ldd /bin/bash | grep -o '/lib64/[^ ]*') /srv/jail/lib64/
+‘/lib64/libtinfo.so.5’ -> ‘/srv/jail/lib64/libtinfo.so.5’
+‘/lib64/libdl.so.2’ -> ‘/srv/jail/lib64/libdl.so.2’
+‘/lib64/libc.so.6’ -> ‘/srv/jail/lib64/libc.so.6’
+‘/lib64/ld-linux-x86-64.so.2’ -> ‘/srv/jail/lib64/ld-linux-x86-64.so.2’
+-- grep -o '/lib64/[^ ]*' 로 경로만 뽑았다. vdso 는 경로가 없어 자연히 빠졌다
+-- 링크를 따라가 실제 내용이 복사됐다. jail 안의 libc.so.6 은 링크가 아니라 파일이다
+-- 네 파일, 약 3MB
+
+[root@ol7a ~]# chroot /srv/jail /bin/bash -c 'echo inside; pwd; echo /*'; echo "rc=$?"
+inside
+/
+/bin /dev /etc /lib64
+rc=0
+-- bash 가 떴다. pwd 는 /, echo /* 는 jail 의 네 디렉터리
+-- echo 와 pwd 는 bash 내장 명령이라 따로 파일이 필요 없다
+-- 로더가 들어가자 바로 해결됐다
+
+-- echo /* 는 bash 의 경로명 확장이라 ls 없이도 루트 목록을 보여 준다. ls 는 아직 없다
+[root@ol7a ~]# chroot /srv/jail /bin/bash -c 'ls /'; echo "rc=$?"
+/bin/bash: ls: command not found
+rc=127
+-- ls 는 외부 명령이다. jail 에 /bin/ls 가 없어 command not found
+-- 보안 가이드의 예시(bash-4.2# ls → command not found)와 같은 결과다
+-- 외부 명령은 하나씩 넣어야 한다
+
+--------------------------------------------------------------------------------
+ [4] 바이너리와 라이브러리를 함께 넣는 도우미
+--------------------------------------------------------------------------------
+
+-- 명령을 넣을 때마다 ldd 를 손으로 따라가기 번거롭다. 짧은 스크립트로 묶는다
+-- [ -e ] 검사 : 이미 복사한 라이브러리는 건너뛴다
+[root@ol7a ~]# cat > /root/jailcp.sh <<'EOF'
+#!/bin/bash
+J=/srv/jail
+for b in "$@"; do
+  cp "$b" "$J$b" && echo "bin $b"
+  for l in $(ldd "$b" | grep -o '/lib64/[^ ]*'); do
+    [ -e "$J$l" ] || { cp "$l" "$J$l" && echo "  lib $l"; }
+  done
+done
+EOF
+[root@ol7a ~]# chmod 700 /root/jailcp.sh; /root/jailcp.sh /bin/ls /bin/cat /bin/id /bin/sleep
+bin /bin/ls
+  lib /lib64/libselinux.so.1
+  lib /lib64/libcap.so.2
+  lib /lib64/libacl.so.1
+  lib /lib64/libpcre.so.1
+  lib /lib64/libattr.so.1
+  lib /lib64/libpthread.so.0
+bin /bin/cat
+bin /bin/id
+bin /bin/sleep
+-- ls 가 끌고 온 라이브러리 여섯 개(selinux·cap·acl·pcre·attr·pthread)
+-- cat·id·sleep 은 새 라이브러리가 없다. 이미 복사한 libc 로 충분하다
+-- 스크립트의 [ -e ] 검사로 중복 복사를 건너뛰었다
+-- 바이너리는 같은 경로(/bin/…)로 복사됐다
+
+-- 지금 jail 의 크기와 파일 수
+[root@ol7a ~]# du -sh /srv/jail; find /srv/jail -type f | wc -l
+4.4M    /srv/jail
+15
+-- 4.4M, 일반 파일 15 개(바이너리 5 + 라이브러리 10)
+-- 그중 대부분은 libc(약 2MB)와 bash(약 1MB)다
+
+--------------------------------------------------------------------------------
+ [5] jail 안에서 바라본 파일 시스템
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# chroot /srv/jail /bin/ls -la /
+total 4
+drwxr-xr-x. 6 0 0   52 Nov 16 06:55 .
+drwxr-xr-x. 6 0 0   52 Nov 16 06:55 ..
+drwxr-xr-x. 2 0 0   62 Nov 16 06:55 bin
+drwxr-xr-x. 2 0 0    6 Nov 16 06:55 dev
+drwxr-xr-x. 2 0 0    6 Nov 16 06:55 etc
+drwxr-xr-x. 2 0 0 4096 Nov 16 06:55 lib64
+-- . 과 .. 가 같다. 루트의 부모는 자기 자신
+-- 소유자 0 0 : jail 에 passwd 가 없다([8])
+-- 시각 06:55 는 UTC. jail 에 /etc/localtime 이 없다(호스트 15:55 KST)
+
+-- 루트 위로 올라가 본다. cd .. 를 여러 번 해도 새 루트에서 멈춘다
+[root@ol7a ~]# chroot /srv/jail /bin/bash -c 'cd ../../..; pwd; ls'
+/
+/bin/bash: ls: command not found
+-- cd ../../.. 를 해도 pwd 는 /. 새 루트 위로는 올라가지 않는다
+-- ls 는 [4] 에서 /bin/ls 로 넣었는데 command not found 다. 이번에는 PATH 때문이다
+-- 러너 셸의 PATH 는 /usr/sbin·/usr/bin 계열이다. jail 에는 /usr/bin 이 없고 /bin 만 있다
+-- 그래서 이 실습은 jail 안 명령을 /bin/ls 처럼 전체 경로로 부른다
+
+-- 호스트의 /etc/passwd 는 jail 안에서 보이지 않는다
+[root@ol7a ~]# chroot /srv/jail /bin/cat /etc/passwd; echo "rc=$?"
+/bin/cat: /etc/passwd: No such file or directory
+rc=1
+-- /etc/passwd 가 없다. 호스트의 /etc/passwd 는 jail 안에서 이름으로 가리킬 수 없다
+-- cat 은 /bin/cat 으로 전체 경로를 줬다
+
+-- jail 의 루트 아이노드와 /srv/jail 의 아이노드를 비교한다. -d : 디렉터리 자체, -i : 아이노드 번호
+[root@ol7a ~]# ls -di /srv/jail; chroot /srv/jail /bin/ls -di /
+201374145 /srv/jail
+-- 같은 아이노드 201374145. jail 의 / 는 호스트의 /srv/jail 그 자체다
+-- 복사본이 아니라 같은 디렉터리
+201374145 /
+
+--------------------------------------------------------------------------------
+ [6] 밖에서 본 chroot 프로세스
+--------------------------------------------------------------------------------
+
+-- jail 안에서 sleep 을 띄워 두고 밖에서 /proc/PID/root 를 본다
+[root@ol7a ~]# nohup chroot /srv/jail /bin/sleep 120 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# sleep 1; P=$(pgrep -x sleep -n); echo "PID=$P"; ls -l /proc/$P/root /proc/1/root
+PID=2416
+lrwxrwxrwx. 1 root root 0 Nov 16 15:55 /proc/1/root -> /
+lrwxrwxrwx. 1 root root 0 Nov 16 15:55 /proc/2416/root -> /srv/jail
+-- PID 1(systemd)의 root 는 /, jail 안 sleep 의 root 는 /srv/jail
+-- pgrep -n : 가장 최근 sleep
+-- 운영 서버에서 어떤 프로세스가 jail 안에 있는지 이 링크로 찾는다
+
+-- 프로세스 목록에는 평범한 root 프로세스로 보인다. jail 은 권한을 줄이지 않는다
+[root@ol7a ~]# ps -o pid,user,cmd -C sleep
+  PID USER     CMD
+ 2416 root     /bin/sleep 120
+-- ps 에는 평범한 root 프로세스로 보인다. jail 표시가 따로 없다
+-- 권한은 줄지 않았다. jail 안의 root 는 여전히 root 다
+-- sleep 은 120초 뒤 끝나거나 pkill 로 내린다
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 ② — /dev 장치 파일 없음
+--------------------------------------------------------------------------------
+
+-- 셸 스크립트가 흔히 쓰는 /dev/null 리다이렉트를 jail 안에서 해 본다. 먼저 권한을 내려놓은 student 로
+[root@ol7a ~]# chroot --userspec=student:student /srv/jail /bin/bash -c 'echo test > /dev/null && echo ok'; echo "rc=$?"
+chroot: invalid user
+rc=125
+-- student 로 들어가려 했더니 chroot: invalid user, rc=125
+-- 8.22 의 chroot 는 jail 안에서 사용자 이름을 찾는다. 아직 passwd 가 없다
+-- 이름 해석은 [8] 에서 다룬다. 여기서는 root 로 계속한다
+
+-- 같은 명령을 root 로
+[root@ol7a ~]# chroot /srv/jail /bin/bash -c 'echo test > /dev/null && echo ok'; echo "rc=$?"
+ok
+rc=0
+-- root 로는 ok, rc=0. 성공한 것처럼 보인다
+[root@ol7a ~]# ls -la /srv/jail/dev; cat /srv/jail/dev/null
+total 4
+drwxr-xr-x. 2 root root 18 Nov 16 15:55 .
+drwxr-xr-x. 6 root root 52 Nov 16 15:55 ..
+-rw-r--r--. 1 root root  5 Nov 16 15:55 null
+test
+-- 증상   : 버린 출력이 jail 의 일반 파일 dev/null(5B)에 test 로 쌓였다
+-- 원인   : 장치 null 이 없어 root 의 리다이렉트가 일반 파일을 만들었다
+-- 조치   : 일반 파일을 지우고 mknod 로 문자 장치를 만든다
+-- 재확인 : jail 안 ls -l /dev 첫 글자가 c, 주·부 번호 1, 3
+-- root 가 아니면 Permission denied 로 실패한다([9])
+-- 메시지 없이 파일이 커지는 쪽이 더 위험하다
+
+-- 호스트의 장치 번호를 확인하고 같은 번호로 만든다. c = 문자 장치, 주 번호·부 번호
+[root@ol7a ~]# ls -l /dev/null /dev/zero /dev/urandom
+crw-rw-rw-. 1 root root 1, 3 Nov 16 15:55 /dev/null
+crw-rw-rw-. 1 root root 1, 9 Nov 16 15:55 /dev/urandom
+crw-rw-rw-. 1 root root 1, 5 Nov 16 15:55 /dev/zero
+-- 첫 글자 c = 문자 장치. 크기 자리의 "1, 3" 이 주·부 번호
+-- 장치 파일은 번호만 맞으면 어디에 있든 같은 장치다
+-- null 1,3 · zero 1,5 · urandom 1,9. 이 번호가 커널 드라이버를 고른다
+
+-- 일반 파일이 된 null 을 지우고 mknod -m 모드 이름 c 주 부
+[root@ol7a ~]# rm -f /srv/jail/dev/null; mknod -m 666 /srv/jail/dev/null c 1 3; mknod -m 666 /srv/jail/dev/zero c 1 5; mknod -m 444 /srv/jail/dev/urandom c 1 9; ls -l /srv/jail/dev
+total 0
+crw-rw-rw-. 1 root root 1, 3 Nov 16 15:55 null
+cr--r--r--. 1 root root 1, 9 Nov 16 15:55 urandom
+crw-rw-rw-. 1 root root 1, 5 Nov 16 15:55 zero
+-- jail 안에 같은 번호로 세 장치를 만들었다. urandom 은 444 로 읽기만
+-- rm 으로 일반 파일 null 을 먼저 지웠다
+-- mknod 는 root 만 할 수 있다(CAP_MKNOD)
+
+[root@ol7a ~]# chroot --userspec=student:student /srv/jail /bin/bash -c 'echo test > /dev/null && echo ok; /bin/cat /dev/null | /bin/cat; echo rc=$?'
+chroot: invalid user
+-- 이 줄도 아직 passwd 가 없어 invalid user. student 시험은 [9] 로 미룬다
+-- 재확인은 아래 ls 로
+[root@ol7a ~]# chroot /srv/jail /bin/ls -l /dev
+total 0
+crw-rw-rw-. 1 0 0 1, 3 Nov 16 06:55 null
+cr--r--r--. 1 0 0 1, 9 Nov 16 06:55 urandom
+crw-rw-rw-. 1 0 0 1, 5 Nov 16 06:55 zero
+-- jail 안에서도 문자 장치로 보인다. 이제 /dev/null 로 쓰면 버려진다
+
+--------------------------------------------------------------------------------
+ [8] 사용자 이름 해석 — ldd 에 안 나오는 라이브러리
+--------------------------------------------------------------------------------
+
+-- 숫자 UID 는 커널이 안다. 이름은 /etc/passwd 를 읽어야 안다
+[root@ol7a ~]# chroot /srv/jail /bin/id
+uid=0 gid=0 groups=0
+-- 커널이 아는 숫자 UID·GID 만 나온다. 이름은 /etc/passwd 를 읽어야 안다
+-- 오류는 없다. 이름만 비었다
+
+-- jail 에 최소 passwd·group 을 넣는다. root 와 student 두 줄만
+[root@ol7a ~]# grep -E '^(root|student):' /etc/passwd > /srv/jail/etc/passwd; grep -E '^(root|student):' /etc/group > /srv/jail/etc/group; cat /srv/jail/etc/passwd
+root:x:0:0:root:/root:/bin/bash
+student:x:1000:1000:lab student:/home/student:/bin/bash
+-- root 와 student 두 줄만 넣었다. 암호 해시가 든 shadow 는 넣지 않는다
+-- group 도 같은 두 줄
+
+[root@ol7a ~]# chroot /srv/jail /bin/id
+uid=0 gid=0 groups=0
+-- 파일을 넣었는데도 숫자만 나온다
+-- 무엇이 빠졌는지 메시지가 없다
+
+-- 파일을 넣었는데 이름이 안 나온다면, 이름 해석을 맡는 NSS 모듈이 없는 것이다
+-- glibc 는 libnss_files.so.2 를 실행 중에 dlopen 으로 연다. 그래서 ldd 목록에 안 나온다
+[root@ol7a ~]# ls -l /lib64/libnss_files.so.2; ldd /bin/id | grep -c nss
+lrwxrwxrwx. 1 root root 20 Nov 11 20:15 /lib64/libnss_files.so.2 -> libnss_files-2.17.so
+0
+-- 호스트의 libnss_files.so.2 는 libnss_files-2.17.so 로 가는 링크
+-- ldd /bin/id 에 nss 가 0 줄. id 는 이 모듈을 링크하지 않는다
+-- glibc 가 실행 중에 dlopen 으로 연다. 그래서 ldd 에 없다
+
+[root@ol7a ~]# cp -v /lib64/libnss_files.so.2 /srv/jail/lib64/; printf 'passwd: files\ngroup: files\n' > /srv/jail/etc/nsswitch.conf; chroot /srv/jail /bin/id
+‘/lib64/libnss_files.so.2’ -> ‘/srv/jail/lib64/libnss_files.so.2’
+uid=0(root) gid=0(root) groups=0(root)
+-- libnss_files 와 nsswitch.conf(passwd: files) 를 넣자 이름이 나왔다
+-- 실패 메시지가 없는 함정이다
+-- DNS 가 필요하면 libnss_dns·resolv.conf 도 넣는다
+
+--------------------------------------------------------------------------------
+ [9] 일반 사용자와 --userspec
+--------------------------------------------------------------------------------
+
+-- chroot(2) 는 CAP_SYS_CHROOT 가 필요하다. 일반 사용자는 들어가지 못한다
+[student@ol7a ~]$ /usr/sbin/chroot /srv/jail /bin/bash; echo "rc=$?"
+/usr/sbin/chroot: cannot change root directory to /srv/jail: Operation not permitted
+rc=125
+-- 일반 사용자는 chroot(2) 를 호출할 수 없다(CAP_SYS_CHROOT 필요). rc 125 는 chroot 자체의 실패
+-- 그래서 jail 진입은 root 나 데몬이 맡는다
+
+-- root 가 들어가면서 권한을 내려놓는 방법. --userspec=사용자:그룹
+[root@ol7a ~]# chroot --userspec=student:student /srv/jail /bin/id
+uid=1000(student) gid=1000(student) groups=1000(student),0(root)
+-- root 가 들어가며 student 로 바꿨다. 이제 jail 에 passwd·NSS 가 있어 이름을 찾았다
+-- groups 끝의 0(root) 가 문제다. root 의 보조 그룹이 그대로 남았다
+
+-- groups 끝의 0(root) 는 root 의 보조 그룹이 그대로 남은 것이다. --groups 로 보조 그룹도 지정한다
+[root@ol7a ~]# chroot --userspec=student:student --groups=student /srv/jail /bin/id
+uid=1000(student) gid=1000(student) groups=1000(student)
+-- --groups 로 보조 그룹을 지정하자 0(root) 가 사라졌다
+-- 권한을 내려놓을 때는 --userspec 과 --groups 를 함께 쓴다
+-- 보조 그룹이 남으면 root 그룹 파일을 읽는다
+
+-- 권한을 내려놓은 student 는 jail 의 /dev 에 새 장치를 만들 수 없다
+[root@ol7a ~]# chroot --userspec=student:student /srv/jail /bin/bash -c 'echo x > /dev/newfile'; echo "rc=$?"
+/bin/bash: /dev/newfile: Permission denied
+rc=1
+-- student 는 jail 의 /dev(root 소유 755)에 새 파일을 만들 수 없다
+-- [7] 의 일반 파일 null 도 이 권한이면 안 생겼다
+
+--------------------------------------------------------------------------------
+ [10] jail 정리 전 점검
+--------------------------------------------------------------------------------
+
+-- jail 안 파일 목록 전체(일반 파일과 문자 장치). 앞의 /srv/jail 은 떼고 한 줄로 보인다
+[root@ol7a ~]# find /srv/jail \( -type f -o -type c \) | sed 's|^/srv/jail||' | sort | xargs echo
+/bin/bash /bin/cat /bin/id /bin/ls /bin/sleep /dev/null /dev/urandom /dev/zero /etc/group /etc/nsswitch.conf /etc/passwd /lib64/ld-linux-x86-64.so.2 /lib64/libacl.so.1 /lib64/libattr.so.1 /lib64/libcap.so.2 /lib64/libc.so.6 /lib64/libdl.so.2 /lib64/libnss_files.so.2 /lib64/libpcre.so.1 /lib64/libpthread.so.0 /lib64/libselinux.so.1 /lib64/libtinfo.so.5
+-- 일반 파일 19 개와 문자 장치 3 개. 이것으로 bash·ls·cat·id·sleep 이 돈다
+-- setuid 파일은 없다(보안 가이드의 조건)
+[root@ol7a ~]# du -sh /srv/jail
+4.4M    /srv/jail
+-- 크기는 [4] 와 같은 4.4M. 장치와 설정 파일은 거의 공간을 쓰지 않는다
+-- 실습용 jail 은 여기까지
+
+--------------------------------------------------------------------------------
+ [변형] sshd ChrootDirectory 로 SFTP 전용 jail
+--------------------------------------------------------------------------------
+
+-- 같은 원리를 sshd 가 대신 해 준다. internal-sftp 는 sshd 안에 든 SFTP 서버라
+-- jail 안에 바이너리·라이브러리를 넣을 필요가 없다
+[root@ol7a ~]# useradd -m sftpjail; id sftpjail
+uid=1001(sftpjail) gid=1001(sftpjail) groups=1001(sftpjail)
+-- SFTP 전용 계정. 셸은 기본(/bin/bash)이지만 ForceCommand 가 셸을 쓰지 못하게 한다
+
+-- 일부러 jail 루트를 사용자 소유로 만든다(흔한 실수)
+[root@ol7a ~]# mkdir -p /srv/sftpjail/upload; chown sftpjail:sftpjail /srv/sftpjail /srv/sftpjail/upload; ls -ld /srv/sftpjail /srv/sftpjail/upload
+drwxr-xr-x. 3 sftpjail sftpjail 20 Nov 16 15:55 /srv/sftpjail
+drwxr-xr-x. 2 sftpjail sftpjail  6 Nov 16 15:55 /srv/sftpjail/upload
+-- jail 루트와 upload 를 모두 사용자 소유로 만들었다. 직관적이지만 틀린 설정이다
+
+[root@ol7a ~]# cp -p /etc/ssh/sshd_config /root/sshd_config.orig
+[root@ol7a ~]# cat >> /etc/ssh/sshd_config <<'EOF'
+Match User sftpjail
+    ChrootDirectory /srv/sftpjail
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+EOF
+[root@ol7a ~]# diff /root/sshd_config.orig /etc/ssh/sshd_config
+139a140,143
+> Match User sftpjail
+>     ChrootDirectory /srv/sftpjail
+>     ForceCommand internal-sftp
+>     AllowTcpForwarding no
+-- Match 블록은 파일 끝에. 아래 줄은 그 조건에만 적용
+-- 139a140,143 : 원본 139 줄 뒤에 네 줄 추가
+
+-- -t : 문법 검사만. 출력이 없고 rc=0 이면 통과. 통과해야 reload 한다
+[root@ol7a ~]# sshd -t; echo "rc=$?"; systemctl reload sshd; systemctl is-active sshd
+rc=0
+active
+-- sshd -t 는 출력 없이 rc=0. reload 뒤에도 active. 러너의 SSH 세션은 끊기지 않았다
+
+-- 키 인증으로 접속한다. root 의 ~/.ssh 는 기준 상태에 없으니 만든다
+[root@ol7a ~]# install -d -m 700 /root/.ssh; ssh-keygen -q -t rsa -N '' -f /root/.ssh/jail_key; ls -l /root/.ssh
+total 8
+-rw-------. 1 root root 1675 Nov 16 15:55 jail_key
+-rw-r--r--. 1 root root  403 Nov 16 15:55 jail_key.pub
+-- -q 조용히, -N '' 암호문 없음, -f 파일 이름. 개인 키 600, 공개 키 644
+[root@ol7a ~]# install -d -m 700 -o sftpjail -g sftpjail /home/sftpjail/.ssh; install -m 600 -o sftpjail -g sftpjail /root/.ssh/jail_key.pub /home/sftpjail/.ssh/authorized_keys; ls -la /home/sftpjail/.ssh
+total 4
+drwx------. 2 sftpjail sftpjail  29 Nov 16 15:55 .
+drwx------. 3 sftpjail sftpjail  74 Nov 16 15:55 ..
+-rw-------. 1 sftpjail sftpjail 403 Nov 16 15:55 authorized_keys
+-- .ssh 700, authorized_keys 600, 소유자 sftpjail. sshd 의 권한 검사 조건을 맞췄다(15장)
+-- 키는 jail 밖 실제 홈에 둔다. 인증이 chroot 전이다
+
+[root@ol7a ~]# printf 'pwd\nls -la /\nput /etc/hostname /upload/h.txt\nls -l /upload\n' > /root/sftp.batch; cat /root/sftp.batch
+pwd
+ls -la /
+put /etc/hostname /upload/h.txt
+ls -l /upload
+-- 배치 파일 네 줄: 현재 위치, 루트 목록, 파일 하나 올리기, 결과 확인
+
+-- -b : 배치 파일, -i : 개인 키, StrictHostKeyChecking=no : 첫 접속 지문 질문 생략
+[root@ol7a ~]# sftp -b /root/sftp.batch -i /root/.ssh/jail_key -o StrictHostKeyChecking=no sftpjail@localhost; echo "rc=$?"
+Warning: Permanently added 'localhost' (ECDSA) to the list of known hosts.
+packet_write_wait: Connection to ::1 port 22: Broken pipe
+Couldn't read packet: Connection reset by peer
+rc=255
+-- 증상   : packet_write_wait … Broken pipe, Couldn't read packet: Connection reset by peer, rc=255
+-- 원인   : 아래 secure 로그. jail 루트가 사용자 소유라 sshd 가 세션을 거부했다
+-- 조치   : chown root:root /srv/sftpjail; chmod 755 /srv/sftpjail
+-- 재확인 : 같은 배치가 rc=0, pwd 가 /
+-- localhost 가 ::1 로 풀려 IPv6 로 접속했다. Warning 줄은 첫 접속의 known_hosts 등록
+
+-- 클라이언트 쪽 메시지만으로는 원인을 모른다. 서버 쪽 로그를 본다
+[root@ol7a ~]# grep sftpjail /var/log/secure | tail -3
+Nov 16 15:55:39 ol7a sshd[3029]: pam_unix(sshd:session): session opened for user sftpjail by (uid=0)
+Nov 16 15:55:39 ol7a sshd[3029]: fatal: bad ownership or modes for chroot directory "/srv/sftpjail" [postauth]
+Nov 16 15:55:39 ol7a sshd[3029]: pam_unix(sshd:session): session closed for user sftpjail
+-- 인증 성공 → 세션 열림 → chroot 직전 검사 fatal → 세션 닫힘
+-- [postauth] : 인증 뒤 오류. 클라이언트는 이 문장을 못 받는다
+
+-- jail 루트는 root 소유, 그룹·기타 쓰기 금지여야 한다. 쓰기는 하위 디렉터리에 준다
+[root@ol7a ~]# chown root:root /srv/sftpjail; chmod 755 /srv/sftpjail; ls -ld /srv/sftpjail /srv/sftpjail/upload
+drwxr-xr-x. 3 root     root     20 Nov 16 15:55 /srv/sftpjail
+drwxr-xr-x. 2 sftpjail sftpjail  6 Nov 16 15:55 /srv/sftpjail/upload
+-- 루트는 root 소유 755, 쓰기는 하위 upload 에만. ChrootDirectory 의 표준 구성이다
+-- 경로의 모든 상위(/srv 포함)도 root 소유여야 한다
+-- 고친 뒤 sshd 재시작은 필요 없다. 다음 접속부터 검사
+
+[root@ol7a ~]# sftp -b /root/sftp.batch -i /root/.ssh/jail_key sftpjail@localhost; echo "rc=$?"
+sftp> pwd
+Remote working directory: /
+sftp> ls -la /
+drwxr-xr-x    3 0        0              20 Nov 16 06:55 .
+drwxr-xr-x    3 0        0              20 Nov 16 06:55 ..
+drwxr-xr-x    2 1001     1001            6 Nov 16 06:55 upload
+sftp> put /etc/hostname /upload/h.txt
+sftp> ls -l /upload
+-rw-r--r--    1 1001     1001           17 Nov 16 06:55 h.txt
+rc=0
+-- pwd 는 /. 사용자에게 jail 루트가 / 로 보인다
+-- 소유자가 숫자 1001 인 것은 jail 에 이름 파일이 없어서다
+-- h.txt 17B = ol7a.example.com + 줄바꿈
+-- internal-sftp 라 jail 에 바이너리를 넣지 않았다
+
+-- 올린 파일은 밖에서 /srv/sftpjail/upload 아래에 있다
+[root@ol7a ~]# ls -l /srv/sftpjail/upload
+total 4
+-rw-r--r--. 1 sftpjail sftpjail 17 Nov 16 15:55 h.txt
+-- 밖에서 보면 /srv/sftpjail/upload/h.txt 다
+-- 소유자는 sftpjail
+
+-- 셸 접속은 ForceCommand 때문에 막힌다
+[root@ol7a ~]# ssh -i /root/.ssh/jail_key -o BatchMode=yes sftpjail@localhost id; echo "rc=$?"
+This service allows sftp connections only.
+rc=1
+-- ForceCommand 때문에 셸 명령이 거절됐다
+-- 원문: This service allows sftp connections only.
+
+--------------------------------------------------------------------------------
+ [11] 되돌리기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cp -p /root/sshd_config.orig /etc/ssh/sshd_config; sshd -t && systemctl reload sshd; md5sum /etc/ssh/sshd_config
+40d961cd3154f0439fcac1a50bd77b96  /etc/ssh/sshd_config
+-- md5 가 [0] 과 같다. 원본으로 돌아왔다
+-- reload 로 적용했다
+-- Match 블록이 사라졌다
+[root@ol7a ~]# userdel -r sftpjail; rm -rf /srv/jail /srv/sftpjail /root/jailcp.sh /root/sftp.batch /root/sshd_config.orig /root/.ssh; ls -la /srv; id sftpjail; echo "rc=$?"
+total 4
+drwxr-xr-x.  2 root root    6 Nov 16 15:55 .
+dr-xr-xr-x. 17 root root 4096 Nov 11 19:49 ..
+id: sftpjail: no such user
+rc=1
+-- /srv 비었음, sftpjail 없음, root 의 ~/.ssh 도 지웠다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목               시작 전   작업 중                                  되돌린 뒤
+--  /srv/jail          없음      파일 19 + 장치 3, 4.4M                   없음
+--  chroot bash        -         로더 없음 rc=127 → 복사 후 rc=0          -
+--  jail /dev/null     -         일반 파일(test) → 문자 장치 1,3          -
+--  jail 안 id         -         숫자 → passwd 후 숫자 → NSS 후 이름      -
+--  --userspec         -         0(root) 남음 → --groups 로 제거          -
+--  sshd_config md5    40d961cd  Match 4 줄 추가                          40d961cd
+--  sftpjail SFTP      -         소유권 오류 rc=255 → root 소유 후 rc=0   계정 없음
+-- 오류 세 가지: 로더 없음(ldd 경로 복사), /dev/null 일반 파일(mknod), jail 루트 소유권(secure 로그)
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. jail 에 /etc/localtime 을 넣고 ls -l 시각이 KST 로 바뀌는지 본다
+-- 2. strace -f -e trace=open 으로 실제로 여는 파일을 ldd 와 비교한다
+--    확인 방법: dlopen 되는 libnss_files 가 strace 에는 나오는지 본다
+-- 3. ChrootDirectory %h 로 사용자별 jail 을 주고 홈 소유권 조건을 시험한다
+
+================================================================================
+ 실습 01 종료 — ldd 로 라이브러리를 맞춘 jail 에서 bash 가 돌고, 장치 파일·NSS 모듈·ChrootDirectory 소유권이 각각 다른 함정임을 확인함
+================================================================================

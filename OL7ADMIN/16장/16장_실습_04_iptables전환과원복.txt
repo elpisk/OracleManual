@@ -1,0 +1,536 @@
+================================================================================
+ 제16장 실습 04 — firewalld 에서 iptables 서비스로 전환과 원복
+ 대상   : ol7a(방화벽), ol7b(접속 시험)
+ 목표   : iptables-services 를 설치해 firewalld 대신 쓰는 절차를 밟고, 규칙을 조회·
+          삽입·삭제·저장한다. 규칙 위치(-I 와 -A)가 결과를 어떻게 바꾸는지, 저장하지
+          않은 규칙이 재시작에서 사라지는지, 재부팅 뒤에 무엇이 남는지 확인하고
+          firewalld 로 되돌린다
+ 배경   : firewalld 와 iptables 서비스는 같은 netfilter 표를 쓴다. 둘 다 켜면 나중에
+          규칙을 쓰는 쪽이 앞의 것을 지운다. firewalld.service 에는 iptables.service
+          와의 Conflicts= 가 있어 한쪽을 켜면 다른 쪽이 내려간다. iptables 서비스는
+          /etc/sysconfig/iptables 를 읽어 규칙을 올리고, 명령으로 바꾼 규칙은
+          service iptables save 를 해야 그 파일에 남는다(본문 16.3·16.6)
+ 소요   : 약 30분 (재부팅 포함)
+ 선행   : ol7-base, ol7b-base 스냅샷. 끝나면 다음 실습이 스냅샷으로 되돌린다
+ 계정   : root
+ 주의   : 전환 중 잠시 방화벽 규칙이 비는 순간이 있다. 기본 /etc/sysconfig/iptables 가
+          22/tcp 를 허용하므로 SSH 는 끊기지 않는다. 다른 규칙 파일을 쓰기 전에 22 줄을 확인
+ 되돌림 : iptables 비활성·firewalld 활성(enabled, running), public 영역 [0] 과 같음.
+          확인: systemctl is-enabled firewalld iptables, firewall-cmd --list-all
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# systemctl is-enabled firewalld; systemctl is-active firewalld; rpm -q iptables iptables-services
+enabled
+active
+iptables-1.4.21-35.0.3.el7.x86_64
+package iptables-services is not installed
+-- firewalld 는 enabled·active. iptables 명령(iptables 패키지)은 이미 있다
+-- 없는 것은 서비스 쪽(iptables-services). 명령과 서비스는 다른 패키지다
+-- iptables 명령은 firewalld 도 내부에서 쓴다
+
+-- firewalld 가 올린 규칙의 양. -S : 규칙을 iptables 명령 형태로 출력
+[root@ol7a ~]# iptables -S | wc -l; iptables -S INPUT
+60
+-P INPUT ACCEPT
+-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -j INPUT_direct
+-A INPUT -j INPUT_ZONES_SOURCE
+-A INPUT -j INPUT_ZONES
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+-A INPUT -j REJECT --reject-with icmp-host-prohibited
+-- firewalld 가 만든 규칙 60 줄. INPUT 은 7 줄로 영역 체인에 넘긴다
+-- 이 60 이 [10] 원복 뒤에 다시 나와야 한다
+-- INPUT 끝은 INVALID 버림과 REJECT
+
+--------------------------------------------------------------------------------
+ [1] iptables-services 설치
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# yum -y -q install iptables-services; rpm -q iptables-services
+iptables-services-1.4.21-35.0.3.el7.x86_64
+-- iptables 와 같은 1.4.21 판. yum.oracle.com 의 ol7_latest 에서 받았다
+[root@ol7a ~]# rpm -ql iptables-services | grep -E 'sysconfig|systemd|libexec'
+/etc/sysconfig/ip6tables
+/etc/sysconfig/iptables
+/usr/lib/systemd/system/ip6tables.service
+/usr/lib/systemd/system/iptables.service
+/usr/libexec/initscripts/legacy-actions/ip6tables
+/usr/libexec/initscripts/legacy-actions/ip6tables/panic
+/usr/libexec/initscripts/legacy-actions/ip6tables/save
+/usr/libexec/initscripts/legacy-actions/iptables
+/usr/libexec/initscripts/legacy-actions/iptables/panic
+/usr/libexec/initscripts/legacy-actions/iptables/save
+/usr/libexec/iptables
+/usr/libexec/iptables/ip6tables.init
+/usr/libexec/iptables/iptables.init
+-- 규칙 파일 두 개(IPv4 iptables, IPv6 ip6tables), 유닛 두 개
+-- legacy-actions : service iptables save 같은 옛 명령용
+-- iptables.init 이 실제로 규칙을 올리고 저장하는 스크립트다
+-- grep 으로 문서·man 파일은 뺐다
+
+-- 서비스가 처음 읽을 규칙 파일. iptables-save 형식이다
+[root@ol7a ~]# cat /etc/sysconfig/iptables
+# sample configuration for iptables service
+# you can edit this manually or use system-config-firewall
+# please do not ask us to add additional ports/services to this default configuration
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p icmp -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+-A INPUT -j REJECT --reject-with icmp-host-prohibited
+-A FORWARD -j REJECT --reject-with icmp-host-prohibited
+COMMIT
+-- iptables-save 형식. *filter 로 테이블을 열고 COMMIT 으로 닫는다
+-- :INPUT ACCEPT [0:0] 는 체인 정책과 카운터(패킷:바이트)
+-- 규칙 다섯 줄: ESTABLISHED, ICMP, lo, 22/tcp 새 연결 허용, 나머지 REJECT
+-- 22 줄 덕분에 전환 중에도 SSH 가 산다
+-- FORWARD 도 REJECT. 라우터 역할을 하지 않는 서버의 기본값
+-- -m state 는 옛 표기. firewalld 는 -m conntrack 을 쓴다
+-- 두 표기는 같은 연결 추적을 본다
+
+-- 서비스 동작을 바꾸는 설정 파일. 저장 관련 두 줄만 본다
+[root@ol7a ~]# grep -E '^IPTABLES_SAVE_ON_(STOP|RESTART)' /etc/sysconfig/iptables-config
+IPTABLES_SAVE_ON_STOP="no"
+IPTABLES_SAVE_ON_RESTART="no"
+-- 둘 다 no. 멈추거나 재시작할 때 지금 규칙을 파일에 쓰지 않는다
+-- 그래서 명령으로 바꾼 규칙은 재시작에 사라진다([7])
+-- 이 파일은 [11] 까지 바꾸지 않는다
+
+-- ol7b 쪽 시험 도구와 ol7a 쪽 리스너 두 개(8080, 8081)
+[root@ol7b ~]# yum -y -q install nmap-ncat; rpm -q nmap-ncat
+nmap-ncat-6.40-19.el7.x86_64
+[root@ol7a ~]# yum -y -q install nmap-ncat; rpm -q nmap-ncat
+nmap-ncat-6.40-19.el7.x86_64
+[root@ol7a ~]# nohup ncat -lk 8080 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# nohup ncat -lk 8081 >/dev/null 2>&1 </dev/null &
+-- 시험용 리스너 8080·8081. 방화벽만 막지 않으면 접속된다
+-- 두 리스너는 [9] 재부팅에서 사라진다
+
+--------------------------------------------------------------------------------
+ [2] 오류 재현 ① — 두 서비스를 함께 켬
+--------------------------------------------------------------------------------
+
+-- firewalld 가 켜진 채로 iptables 를 시작한다
+[root@ol7a ~]# systemctl start iptables; systemctl is-active firewalld iptables
+deactivating
+active
+
+-- 왜 firewalld 가 내려갔는가. 유닛 정의의 Conflicts 를 본다
+-- iptables 를 start 한 직후 firewalld 는 deactivating(멈추는 중), iptables 는 active
+-- 증상   : systemctl start iptables 만 했는데 firewalld 가 deactivating
+-- 원인   : firewalld.service 의 Conflicts= 에 iptables.service 가 있다(아래)
+-- 조치   : 둘 중 하나만 쓴다. 전환은 [3] 의 순서(stop → disable → mask → enable → start)
+-- 재확인 : [3] 끝에서 firewalld masked·unknown, iptables enabled·active
+[root@ol7a ~]# systemctl show -p Conflicts firewalld; grep Conflicts /usr/lib/systemd/system/firewalld.service
+Conflicts=ebtables.service ipset.service iptables.service shutdown.target ip6tables.service
+Conflicts=iptables.service ip6tables.service ebtables.service ipset.service
+-- 첫 줄은 systemd 가 합친 값, 둘째 줄은 유닛 파일 원문
+-- Conflicts 는 양방향이다. iptables.service 쪽에 적혀 있지 않아도 서로 내려간다
+-- ebtables·ipset 도 같은 이유로 충돌 목록에 있다
+[root@ol7a ~]# journalctl -u firewalld --no-pager -n 3 | cut -c 17-
+ Mon 2026-11-16 12:46:33 KST, end at Mon 2026-11-16 12:47:24 KST. --
+ol7a.example.com systemd[1]: Started firewalld - dynamic firewall daemon.
+ol7a.example.com firewalld[1032]: WARNING: AllowZoneDrifting is enabled. This is considered an insecure configuration option. It will be removed in a future release. Please consider disabling it now.
+ol7a.example.com systemd[1]: Stopping firewalld - dynamic firewall daemon...
+-- cut -c 17- 로 날짜 앞부분을 잘랐다(첫 줄은 머리말)
+-- Started → 경고 → Stopping. 경고는 AllowZoneDrifting is enabled(실습 03 [변형] 과 이어짐)
+-- 0.6.3 에도 이 설정이 들어와 있고 기본값이 켜짐이다. 8 에서는 기본 꺼짐
+
+-- 거꾸로 firewalld 를 다시 켜면 iptables 가 내려간다
+[root@ol7a ~]# systemctl start firewalld; systemctl is-active firewalld iptables
+active
+inactive
+-- 거꾸로 firewalld 를 켜자 iptables 가 inactive. 마지막에 켠 쪽만 남는다
+-- 둘 다 enabled 인 채로 재부팅하면 어느 쪽이 남을지 장담할 수 없다
+
+-- 부팅 때는 둘 다 enable 이면 순서에 따라 어느 쪽이 남을지 알 수 없다. 그래서 한쪽을 mask 한다
+
+--------------------------------------------------------------------------------
+ [3] 정식 전환 — firewalld 정지·mask, iptables 활성
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# systemctl stop firewalld; systemctl disable firewalld; systemctl mask firewalld
+Removed symlink /etc/systemd/system/multi-user.target.wants/firewalld.service.
+Removed symlink /etc/systemd/system/dbus-org.fedoraproject.FirewallD1.service.
+Created symlink from /etc/systemd/system/firewalld.service to /dev/null.
+-- disable 은 링크 두 개(multi-user.target.wants, dbus 별칭)를 지웠다
+-- mask 는 /etc/systemd/system/firewalld.service 를 /dev/null 로 가리키게 했다
+-- /etc 쪽 파일이 /usr/lib 의 원본을 가린다(3장 유닛 우선순위)
+[root@ol7a ~]# systemctl enable iptables; systemctl start iptables
+Created symlink from /etc/systemd/system/basic.target.wants/iptables.service to /usr/lib/systemd/system/iptables.service.
+-- iptables 는 basic.target 에 걸린다. 네트워크가 올라오기 전, 일찍 규칙을 넣는다
+-- enable 과 start 를 따로 쳤다. enable --now 로 한 번에 해도 된다
+[root@ol7a ~]# systemctl is-enabled firewalld iptables; systemctl is-active firewalld iptables
+masked
+enabled
+unknown
+active
+-- is-enabled: masked, enabled / is-active: unknown, active
+-- unknown 은 mask 된 유닛의 상태. inactive 가 아니라 unknown 으로 나온다
+-- 스크립트에서 inactive 만 검사하면 이 경우를 놓친다
+
+-- mask 는 유닛 파일을 /dev/null 로 가리켜 수동 start 도 막는다
+[root@ol7a ~]# ls -l /etc/systemd/system/firewalld.service; systemctl start firewalld; echo "rc=$?"
+lrwxrwxrwx. 1 root root 9 Nov 16 12:47 /etc/systemd/system/firewalld.service -> /dev/null
+Failed to start firewalld.service: Unit is masked.
+rc=1
+-- 원문: Failed to start firewalld.service: Unit is masked.
+-- mask 는 수동 start 와 다른 유닛의 의존성에 의한 시작까지 막는다
+-- 되돌릴 때 unmask 를 잊으면 firewalld 가 시작되지 않는다([10])
+
+--------------------------------------------------------------------------------
+ [4] 규칙 조회
+--------------------------------------------------------------------------------
+
+-- -L : 목록, -n : 이름 해석 안 함, -v : 패킷·바이트 수, --line-numbers : 규칙 번호
+[root@ol7a ~]# iptables -L INPUT -n -v --line-numbers
+Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+num   pkts bytes target     prot opt in     out     source               destination         
+1       38  4336 ACCEPT     all  --  *      *       0.0.0.0/0            0.0.0.0/0            state RELATED,ESTABLISHED
+2        0     0 ACCEPT     icmp --  *      *       0.0.0.0/0            0.0.0.0/0           
+3        0     0 ACCEPT     all  --  lo     *       0.0.0.0/0            0.0.0.0/0           
+4        0     0 ACCEPT     tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            state NEW tcp dpt:22
+5        0     0 REJECT     all  --  *      *       0.0.0.0/0            0.0.0.0/0            reject-with icmp-host-prohibited
+-- 열을 짚는다
+--   num        규칙 번호. -I·-D 에 쓴다
+--   pkts bytes 이 규칙에 걸린 패킷·바이트. 1번에 38 패킷 = 러너의 SSH 세션
+--   target     동작. prot 프로토콜, opt 옵션(-- 는 없음)
+--   in out     인터페이스. 3번은 in=lo
+--   source destination  0.0.0.0/0 = 아무 주소
+--   맨 끝      조건(state, dpt:22)과 REJECT 의 응답 종류
+-- 정책은 ACCEPT 지만 5번 REJECT 가 사실상 기본 거부 역할을 한다
+-- 정책을 DROP 으로 두는 방식도 있다
+
+-- 규칙이 iptables -S 로는 이렇게 보인다
+[root@ol7a ~]# iptables -S INPUT
+-P INPUT ACCEPT
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p icmp -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+-A INPUT -j REJECT --reject-with icmp-host-prohibited
+-- -S 는 같은 규칙을 명령 형태로. /etc/sysconfig/iptables 의 줄과 같다
+-- 다른 서버에 옮길 때는 -S 출력을 복사한다
+
+[root@ol7b ~]# echo hi | ncat -w 3 ol7a 8080; echo "rc=$?"
+Ncat: No route to host.
+rc=1
+-- 8080 리스너가 있지만 5번 REJECT 에 걸렸다. firewalld 때와 같은 No route to host
+-- 클라이언트에서는 firewalld 인지 iptables 인지 구별되지 않는다
+
+--------------------------------------------------------------------------------
+ [5] 규칙 삽입 — -I 와 -A
+--------------------------------------------------------------------------------
+
+-- -I INPUT 5 : 5번 자리에 넣는다(지금 5번인 REJECT 가 6번으로 밀림). -s : 출발지
+[root@ol7a ~]# iptables -I INPUT 5 -p tcp -s 172.16.225.62 --dport 8080 -m state --state NEW -j ACCEPT
+-- -A : 맨 끝에 덧붙인다
+[root@ol7a ~]# iptables -A INPUT -p tcp --dport 8081 -m state --state NEW -j ACCEPT
+[root@ol7a ~]# iptables -L INPUT -n --line-numbers
+Chain INPUT (policy ACCEPT)
+num  target     prot opt source               destination         
+1    ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0            state RELATED,ESTABLISHED
+2    ACCEPT     icmp --  0.0.0.0/0            0.0.0.0/0           
+3    ACCEPT     all  --  0.0.0.0/0            0.0.0.0/0           
+4    ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            state NEW tcp dpt:22
+5    ACCEPT     tcp  --  172.16.225.62        0.0.0.0/0            tcp dpt:8080 state NEW
+6    REJECT     all  --  0.0.0.0/0            0.0.0.0/0            reject-with icmp-host-prohibited
+7    ACCEPT     tcp  --  0.0.0.0/0            0.0.0.0/0            tcp dpt:8081 state NEW
+-- -I INPUT 5 로 넣은 8080 은 5번, 원래 REJECT 는 6번으로 밀렸다
+-- -A 로 붙인 8081 은 7번. REJECT 뒤다
+-- -s 172.16.225.62 : 출발지 조건. source 열에 보인다
+-- -m state --state NEW : 새 연결만. 응답은 1번이 받는다
+-- 규칙은 커널에만 들어갔다. 파일은 그대로다
+
+[root@ol7b ~]# echo hi | ncat -w 3 ol7a 8080; echo "rc=$?"
+rc=0
+-- 8080 은 통과
+-- 5번이 REJECT 보다 앞이라 먼저 맞았다
+[root@ol7b ~]# echo hi | ncat -w 3 ol7a 8081; echo "rc=$?"
+Ncat: No route to host.
+rc=1
+-- 증상   : 8081 허용 규칙이 목록에 있는데 ol7b 는 No route to host
+-- 원인   : -A 로 REJECT(6번) 뒤에 붙었다. 위에서부터 첫 일치에서 멈추니 7번에 닿지 않는다
+-- 조치   : [6] 에서 지우고 -I INPUT 6 으로 REJECT 앞에 다시 넣는다
+-- 재확인 : 아래 카운터와 [6] 의 rc=0
+
+-- 카운터로 어느 규칙이 패킷을 받았는지 본다
+[root@ol7a ~]# iptables -L INPUT -n -v --line-numbers | sed -n '1,2p;7,9p'
+Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+num   pkts bytes target     prot opt in     out     source               destination         
+5        1    60 ACCEPT     tcp  --  *      *       172.16.225.62        0.0.0.0/0            tcp dpt:8080 state NEW
+6        2   120 REJECT     all  --  *      *       0.0.0.0/0            0.0.0.0/0            reject-with icmp-host-prohibited
+7        0     0 ACCEPT     tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp dpt:8081 state NEW
+-- 머리 두 줄과 5~7번만 잘랐다(sed -n '1,2p;7,9p')
+-- 5번 8080 허용 pkts 1, 6번 REJECT pkts 2, 7번 8081 허용 pkts 0
+-- REJECT 의 2 는 [4] 의 8080 시도와 방금의 8081 시도다. 7번은 한 번도 일하지 않았다
+-- 카운터는 -Z 로 0 으로 되돌릴 수 있다
+-- -Z 후 한 번 시도하면 판정한 규칙이 바로 보인다
+
+--------------------------------------------------------------------------------
+ [6] 규칙 삭제 — 번호로, 내용으로
+--------------------------------------------------------------------------------
+
+-- -D INPUT 7 : 7번 규칙 삭제
+[root@ol7a ~]# iptables -D INPUT 7; iptables -L INPUT -n --line-numbers | tail -2
+5    ACCEPT     tcp  --  172.16.225.62        0.0.0.0/0            tcp dpt:8080 state NEW
+6    REJECT     all  --  0.0.0.0/0            0.0.0.0/0            reject-with icmp-host-prohibited
+-- 7번이 지워졌다. 남은 끝 두 줄
+-- 앞 규칙을 지우면 뒤 번호가 당겨진다
+
+-- 8081 을 제대로 열려면 REJECT 앞에 넣는다
+[root@ol7a ~]# iptables -I INPUT 6 -p tcp --dport 8081 -m state --state NEW -j ACCEPT
+[root@ol7b ~]# echo hi | ncat -w 3 ol7a 8081; echo "rc=$?"
+rc=0
+-- REJECT 앞에 넣자 8081 도 통과
+-- 같은 규칙이 위치만 바뀌었다
+-- 6번이 8081, 7번이 REJECT
+-- 순서가 곧 결과
+-- -I 는 번호 생략 시 1번
+
+-- 내용으로 지우기 : 넣을 때와 같은 조건을 -D 뒤에 그대로 쓴다
+[root@ol7a ~]# iptables -D INPUT -p tcp --dport 8081 -m state --state NEW -j ACCEPT; iptables -S INPUT
+-P INPUT ACCEPT
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p icmp -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+-A INPUT -s 172.16.225.62/32 -p tcp -m tcp --dport 8080 -m state --state NEW -j ACCEPT
+-A INPUT -j REJECT --reject-with icmp-host-prohibited
+-- 조건을 그대로 써서 지웠다. -S 에는 iptables 가 보충한 -m tcp 가 붙어 보인다
+-- 8080 허용(-s 172.16.225.62/32)만 남았다. 번호 대신 -S 로 보면 조건이 다 보인다
+-- 같은 조건의 규칙이 둘이면 -D 는 첫 번째 하나만 지운다
+
+--------------------------------------------------------------------------------
+ [7] 오류 재현 ② — 저장하지 않고 재시작
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# systemctl restart iptables; iptables -S INPUT | grep -c 8080
+0
+-- restart 뒤 8080 규칙 0 개
+-- 파일의 다섯 줄만 다시 올라왔다
+-- 저장한 적이 없다
+[root@ol7b ~]# echo hi | ncat -w 3 ol7a 8080; echo "rc=$?"
+Ncat: No route to host.
+rc=1
+-- 증상   : 방금 통과하던 8080 이 restart 뒤 No route to host
+-- 원인   : 규칙은 커널에만 있었다. restart 가 /etc/sysconfig/iptables(8080 없음)를 다시 읽었다
+-- 조치   : 규칙을 다시 넣고 service iptables save
+-- 재확인 : 아래 diff 에 8080 줄, restart 뒤 grep 8080 과 ol7b 의 rc=0
+-- 비교용으로 기본 파일 사본을 먼저 떴다
+
+-- 조치 : 규칙을 다시 넣고 저장한다
+[root@ol7a ~]# cp -p /etc/sysconfig/iptables /root/iptables.default
+[root@ol7a ~]# iptables -I INPUT 5 -p tcp -s 172.16.225.62 --dport 8080 -m state --state NEW -j ACCEPT
+[root@ol7a ~]# service iptables save
+iptables: Saving firewall rules to /etc/sysconfig/iptables: [  OK  ]
+-- service 명령은 legacy-actions 를 거쳐 iptables.init save 를 부른다
+-- [OL8/9] iptables-services 는 남아 있지만 nftables 서비스가 권장이다
+-- [  OK  ] 는 init 스크립트 형식의 결과 표시
+[root@ol7a ~]# diff /root/iptables.default /etc/sysconfig/iptables
+1,3c1
+< # sample configuration for iptables service
+< # you can edit this manually or use system-config-firewall
+< # please do not ask us to add additional ports/services to this default configuration
+---
+> # Generated by iptables-save v1.4.21 on Mon Nov 16 12:47:26 2026
+7c5
+< :OUTPUT ACCEPT [0:0]
+---
+> :OUTPUT ACCEPT [15:1864]
+11a10
+> -A INPUT -s 172.16.225.62/32 -p tcp -m tcp --dport 8080 -m state --state NEW -j ACCEPT
+14a14
+> # Completed on Mon Nov 16 12:47:26 2026
+-- 저장하면 파일이 iptables-save 출력으로 통째로 바뀐다
+--   원래 주석 세 줄 → Generated by 한 줄
+--   OUTPUT 카운터 [15:1864] 가 함께 저장됐다
+--   8080 허용 한 줄이 늘었다(11a10)
+-- 손으로 단 주석은 저장할 때 사라진다. 설명은 다른 문서에 남긴다
+-- 저장 전에 iptables -S 로 규칙을 한 번 더 본다. 잘못된 규칙도 그대로 저장된다
+
+[root@ol7a ~]# systemctl restart iptables; iptables -S INPUT | grep 8080
+-A INPUT -s 172.16.225.62/32 -p tcp -m tcp --dport 8080 -m state --state NEW -j ACCEPT
+-- restart 뒤에도 8080 규칙이 남았다
+-- 파일에서 읽어 온 규칙이다
+-- 번호는 5번 그대로
+[root@ol7b ~]# echo hi | ncat -w 3 ol7a 8080; echo "rc=$?"
+rc=0
+-- ol7b 도 통과
+
+--------------------------------------------------------------------------------
+ [8] iptables-save 와 iptables-restore
+--------------------------------------------------------------------------------
+
+-- iptables-save 는 지금 커널 규칙을 표준 출력으로 낸다. service save 가 내부에서 쓰는 명령
+[root@ol7a ~]# iptables-save -t filter | grep -v '^#'
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [20:2140]
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -p icmp -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT
+-A INPUT -s 172.16.225.62/32 -p tcp -m tcp --dport 8080 -m state --state NEW -j ACCEPT
+-A INPUT -j REJECT --reject-with icmp-host-prohibited
+-A FORWARD -j REJECT --reject-with icmp-host-prohibited
+COMMIT
+-- -t filter 만, # 주석 줄은 뺐다. 저장 파일과 같은 형식이다
+-- OUTPUT 카운터는 [20:2140] 로 계속 늘고 있다
+-- 백업은 iptables-save > 파일, 복원은 iptables-restore < 파일
+
+-- 파일에서 규칙을 되살린다. --test : 적용하지 않고 문법만 검사
+[root@ol7a ~]# iptables-save > /root/rules.v4; iptables -F INPUT; iptables -S INPUT
+-P INPUT ACCEPT
+-- -F INPUT 으로 INPUT 을 비웠다. 정책 ACCEPT 만 남아 모든 패킷이 통과하는 상태
+-- -F 는 정책을 바꾸지 않는다. 정책이 DROP 인 서버에서 -F 를 치면 SSH 가 끊긴다
+-- 실습에서는 바로 다음 줄에서 되살렸다
+[root@ol7a ~]# iptables-restore --test < /root/rules.v4; echo "rc=$?"; iptables-restore < /root/rules.v4; iptables -S INPUT | grep -c ACCEPT
+rc=0
+6
+-- --test 는 rc=0. 실제 restore 뒤 ACCEPT 규칙 6 개(정책 줄 포함)가 돌아왔다
+-- restore 는 파일의 테이블을 통째로 바꾼다. 일부만 더하려면 --noflush
+-- --test 는 파일을 넣기 전에 문법만 본다. 원격 서버에서는 먼저 친다
+
+--------------------------------------------------------------------------------
+ [9] 재부팅 뒤에도 남는가
+--------------------------------------------------------------------------------
+
+-- 재부팅
+-- 재부팅 완료. 아래는 새로 붙은 세션
+-- 러너가 재부팅 뒤 SSH 가 열릴 때까지 기다렸다. 22 허용이 파일에 있어 접속됐다
+[root@ol7a ~]# systemctl is-active firewalld iptables; iptables -S INPUT | grep 8080
+unknown
+active
+-A INPUT -s 172.16.225.62/32 -p tcp -m tcp --dport 8080 -m state --state NEW -j ACCEPT
+[root@ol7b ~]# echo hi | ncat -w 3 ol7a 8080; echo "rc=$?"
+Ncat: Connection refused.
+rc=1
+-- 재부팅 뒤 firewalld unknown(masked), iptables active, 8080 규칙 남음
+-- ol7b 는 Connection refused. 방화벽은 통과했고 ncat 리스너가 재부팅으로 없어졌다
+-- [4] 의 No route to host 와 메시지가 다르다. 메시지로 단계를 가른다(실습 06)
+-- 리스너를 다시 띄우면 rc=0 이 나온다. 규칙은 확인했으니 생략했다
+
+-- 재부팅으로 ncat 리스너가 없어진 상태라 연결은 거부된다. 규칙이 살아 있는 것은 위 grep 으로 확인됐다
+
+--------------------------------------------------------------------------------
+ [10] firewalld 로 원복
+--------------------------------------------------------------------------------
+
+-- 순서 : iptables 끄고 비활성 → firewalld unmask → enable·start
+[root@ol7a ~]# systemctl stop iptables; systemctl disable iptables; iptables -S | wc -l
+Removed symlink /etc/systemd/system/basic.target.wants/iptables.service.
+3
+-- stop 하자 규칙이 3 줄(정책 세 개)만 남았다. 서비스를 멈추면 규칙을 비우고 정책을 ACCEPT 로
+-- 이 순간 방화벽이 없다. 원복은 짧게 끝낸다
+-- 원격에서는 한 줄에 이어 쳐 빈틈을 줄인다
+[root@ol7a ~]# systemctl unmask firewalld; systemctl enable firewalld; systemctl start firewalld
+Removed symlink /etc/systemd/system/firewalld.service.
+Created symlink from /etc/systemd/system/dbus-org.fedoraproject.FirewallD1.service to /usr/lib/systemd/system/firewalld.service.
+Created symlink from /etc/systemd/system/multi-user.target.wants/firewalld.service to /usr/lib/systemd/system/firewalld.service.
+[root@ol7a ~]# systemctl is-enabled firewalld iptables; systemctl is-active firewalld iptables; firewall-cmd --state
+enabled
+disabled
+active
+inactive
+running
+-- firewalld enabled·active·running, iptables disabled·inactive
+-- unmask 가 /dev/null 링크를 지웠고 enable 이 링크 두 개를 다시 만들었다
+-- start 뒤 firewalld 가 permanent 구성으로 규칙을 다시 만들었다
+[root@ol7a ~]# iptables -S | wc -l; iptables -S INPUT | head -3
+60
+-P INPUT ACCEPT
+-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-- 규칙 60 줄로 [0] 과 같다. INPUT 앞부분도 firewalld 의 conntrack 형식
+-- iptables 서비스가 남긴 규칙은 없다. stop 에서 비웠기 때문이다
+
+--------------------------------------------------------------------------------
+ [변형] firewalld 안에서 iptables 문법 쓰기 — direct 규칙
+--------------------------------------------------------------------------------
+
+-- firewalld 를 끄지 않고 iptables 형식 규칙을 넣는 통로. 0 : 같은 체인 안 우선순위
+[root@ol7a ~]# nohup ncat -lk 8080 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# firewall-cmd --direct --add-rule ipv4 filter INPUT 0 -p tcp -s 172.16.225.62 --dport 8080 -j ACCEPT
+success
+[root@ol7a ~]# firewall-cmd --direct --get-all-rules; iptables -S INPUT_direct
+ipv4 filter INPUT 0 -p tcp -s 172.16.225.62 --dport 8080 -j ACCEPT
+-N INPUT_direct
+-A INPUT_direct -s 172.16.225.62/32 -p tcp -m tcp --dport 8080 -j ACCEPT
+-- direct 규칙은 INPUT_direct 체인에 들어갔다. INPUT 세 번째 줄에서 점프하는 곳
+-- 영역 체인보다 앞이라 영역 규칙과 상관없이 먼저 판정된다
+-- 0 은 같은 체인 안 우선순위. 작을수록 먼저
+-- runtime 에만 넣었다. 영구로 하려면 --permanent --direct
+[root@ol7b ~]# echo hi | ncat -w 3 ol7a 8080; echo "rc=$?"
+rc=0
+-- firewalld 를 켠 채로 8080 이 열렸다
+-- 리스너는 [변형] 처음에 다시 띄웠다
+
+-- direct 규칙은 --list-all 에 나오지 않는다
+[root@ol7a ~]# firewall-cmd --list-all | grep -c 8080
+0
+-- --list-all 에 8080 이 없다. direct 규칙은 --direct --get-all-rules 로만 보인다
+-- 놓치기 쉬워 가능하면 rich rule 로 쓴다
+-- [OL8/9] direct 인터페이스는 폐기 예정. policy 와 rich rule 이 대신한다
+
+[root@ol7a ~]# firewall-cmd --direct --remove-rule ipv4 filter INPUT 0 -p tcp -s 172.16.225.62 --dport 8080 -j ACCEPT; firewall-cmd --direct --get-all-rules | wc -l
+success
+0
+-- 지운 뒤 direct 규칙 0 개
+-- 지울 때도 넣을 때와 같은 인자를 쓴다
+-- INPUT_direct 는 빈 체인이 된다
+
+--------------------------------------------------------------------------------
+ [11] 되돌리기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# pkill -x ncat; rm -f /root/rules.v4; cp -p /root/iptables.default /etc/sysconfig/iptables; rm -f /root/iptables.default
+[root@ol7a ~]# yum -y -q remove iptables-services; rpm -q iptables-services
+package iptables-services is not installed
+-- iptables-services 를 지웠다. 규칙 파일도 기본 내용으로 돌려놓은 뒤 지웠다
+-- nmap-ncat 은 남았다. 다음 실습이 스냅샷으로 되돌린다
+[root@ol7a ~]# systemctl is-enabled firewalld; firewall-cmd --list-all | sed -n '1,7p'
+enabled
+public (active)
+  target: default
+  icmp-block-inversion: no
+  interfaces: ens32
+  sources: 
+  services: dhcpv6-client ssh
+  ports: 
+-- firewalld enabled, public 의 services·ports 가 [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                    시작 전          작업 중                     되돌린 뒤
+--  firewalld               enabled/active   masked/unknown              enabled/active
+--  iptables 서비스         미설치           enabled/active              미설치
+--  iptables -S 줄 수       60               7(기본 파일)+8080           60
+--  8080 (ol7b)             거부             -I 로 허용, save 로 유지    리스너 내림
+--  8081 (ol7b)             거부             -A 는 거부, -I 6 은 허용    -
+--  재부팅 뒤 8080 규칙     -                남음(저장했기 때문)         -
+-- 오류 두 가지
+--   두 서비스 동시 start   : Conflicts 로 한쪽이 내려감 → mask
+--   저장 없이 restart     : 규칙 소실 → service iptables save
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. iptables -R INPUT 5 ... 로 8080 규칙의 출발지를 바꾸고 -S 로 번호가 그대로인지 본다
+-- 2. iptables-config 의 IPTABLES_SAVE_ON_STOP 을 yes 로 바꾸고 stop·start 후 파일이 바뀌는지 diff 로 본다
+-- 3. ip6tables -S 로 IPv6 규칙을 보고, IPv4 만 막은 서버가 IPv6 로는 열려 있지 않은지 확인한다
+
+================================================================================
+ 실습 04 종료 — iptables 는 위치가 결과를 정하고 save 해야 남으며, firewalld 와는 Conflicts 로 하나만 돈다
+================================================================================

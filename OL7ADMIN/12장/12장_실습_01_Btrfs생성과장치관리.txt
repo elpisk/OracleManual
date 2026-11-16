@@ -1,0 +1,516 @@
+================================================================================
+ 제12장 실습 01 — Btrfs 생성과 장치 관리
+ 대상   : ol7a (추가 디스크 sdb·sdc·sdd 사용)
+ 목표   : 두 장치로 RAID1 Btrfs 를 만들고, show·df·usage 세 화면을 읽는다.
+          장치 추가·제거·교체와 balance 로 데이터가 장치 사이를 옮겨 가는 것을 본다
+ 배경   : Btrfs 는 볼륨 관리(LVM·RAID 역할)를 파일 시스템 안에 품는다. 데이터와
+          메타데이터를 따로 chunk 로 나눠 할당하고, 각 chunk 의 복제 방식(프로파일)을
+          single·dup·raid0·raid1·raid10 중에서 고른다. 그래서 df 한 줄로는 남은
+          공간을 다 설명하지 못한다(본문 12.2·12.3절)
+ 소요   : 약 25분
+ 선행   : storage-clean 스냅샷(sdb~sde 10G 비어 있음), UEK R6 로 부팅
+ 계정   : root
+ 주의   : mkfs.btrfs·wipefs 는 장치 내용을 지운다. [0] 의 lsblk 로 sdb~sde 가 빈 디스크인지 확인
+ 되돌림 : 마운트 해제, wipefs 로 서명 삭제, fstab 원래대로.
+          확인 lsblk -f /dev/sd[b-e], grep btrfs /etc/fstab
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 실행 중인 커널부터 본다. 이 장의 모든 실습은 UEK 에서 한다.
+[root@ol7a ~]# uname -r
+5.4.17-2136.338.4.2.el7uek.x86_64
+-- el7uek 로 끝난다. UEK R6. 기준 상태의 기본 커널이다
+-- 추가 디스크 네 개의 상태. -f 는 파일 시스템 종류·레이블·UUID 열을 붙인다.
+[root@ol7a ~]# lsblk -f /dev/sdb /dev/sdc /dev/sdd /dev/sde
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+sdd                    
+sde                    
+-- 네 장치 모두 FSTYPE·LABEL·UUID·MOUNTPOINT 가 비었다.
+-- 파티션 줄(sdb1 등)도 없다
+-- 랩 VM 은 부팅에 따라 OS 디스크가 sdb 로 잡힌 적이 있다. 그러면 sdb 아래에
+-- sdb1·sdb2 와 ol-root 가 보인다. 그때는 진행하지 않는다
+-- 커널이 지금 아는 파일 시스템 목록에 btrfs 가 있는지, 모듈이 올라와 있는지.
+[root@ol7a ~]# grep -c . /proc/filesystems; grep btrfs /proc/filesystems; lsmod | grep -c btrfs
+27
+0
+-- /proc/filesystems 27줄에 btrfs 가 없다. lsmod 도 0
+-- 모듈은 디스크에 있지만 아직 적재 전이다. 첫 마운트 때 커널이 스스로 올린다([3])
+[root@ol7a ~]# cp /etc/fstab /root/fstab.before; grep -v '^#' /etc/fstab | grep -v '^$'
+/dev/mapper/ol-root     /                       xfs     defaults        0 0
+UUID=9e9b6650-ec84-4fa9-b7ec-e541592b4ecc /boot                   xfs     defaults        0 0
+/dev/mapper/ol-swap     swap                    swap    defaults        0 0
+-- 주석·빈 줄을 뺀 fstab 세 줄.
+-- 루트·/boot 는 XFS, 스왑은 LV. [12] 에서 이 사본과 비교한다
+
+--------------------------------------------------------------------------------
+ [1] btrfs-progs 확인
+--------------------------------------------------------------------------------
+
+-- 커널 쪽 지원(btrfs.ko)과 사용자 공간 도구(btrfs-progs)는 따로 온다.
+-- 도구가 없으면 mkfs.btrfs 자체가 없다.
+[root@ol7a ~]# rpm -q btrfs-progs; yum list installed btrfs-progs 2>/dev/null | tail -1
+btrfs-progs-5.12.1-1.el7.x86_64
+btrfs-progs.x86_64                    5.12.1-1.el7                    @ol7_UEKR6
+-- 이미 설치돼 있다. 마지막 열 @ol7_UEKR6 은 설치해 온 저장소(앞의 @ 가 "설치됨" 표시)
+-- 같은 이름의 패키지가 저장소 두 곳에 있다. --showduplicates 는 모든 판을 보인다.
+[root@ol7a ~]# yum --showduplicates list available btrfs-progs 2>/dev/null | grep btrfs-progs | tail -4
+btrfs-progs.x86_64                  4.9.1-1.0.2.el7                   ol7_latest
+btrfs-progs.x86_64                  5.4.0-1.el7                       ol7_UEKR6 
+btrfs-progs.i686                    5.12.1-1.el7                      ol7_UEKR6 
+btrfs-progs.x86_64                  5.12.1-1.el7                      ol7_UEKR6 
+-- 같은 패키지가 두 저장소에 있다
+--   ol7_latest : 4.9.1-1.0.2.el7 (배포판 기본 저장소)
+--   ol7_UEKR6  : 5.4.0, 5.12.1 (UEK R6 와 함께 오는 저장소)
+-- yum 은 가장 높은 판을 고르므로 두 저장소가 켜져 있으면 5.12.1 이 깔린다
+-- OL7 문서의 출력 예와 명령 모양이 다르면 도구 판부터 확인한다
+[root@ol7a ~]# rpm -qi btrfs-progs | grep -E '^(Version|Release|Install Date|Build Date|Vendor)'
+Version     : 5.12.1
+Release     : 1.el7
+Install Date: Wed 11 Nov 2026 08:16:37 PM KST
+Build Date  : Thu 01 Jul 2021 08:49:09 AM KST
+Vendor      : Oracle America
+-- Install Date 11-11 20:16 은 기준 스냅샷을 뜨기 전에 깔린 날짜.
+-- Build Date 2021-07-01
+[root@ol7a ~]# btrfs --version; ls -l /usr/sbin/mkfs.btrfs /usr/sbin/btrfs-convert
+-- btrfs --version 끝의 공백까지 출력 원문이다.
+-- mkfs.btrfs·btrfs-convert 둘 다 이 패키지 파일
+btrfs-progs v5.12.1 
+-rwxr-xr-x. 1 root root 536248 Jul  1  2021 /usr/sbin/btrfs-convert
+-rwxr-xr-x. 1 root root 523600 Jul  1  2021 /usr/sbin/mkfs.btrfs
+-- 모듈 파일이 어느 커널 디렉터리에 있는지도 본다.
+[root@ol7a ~]# modinfo -n btrfs; modinfo btrfs | grep -E '^(license|vermagic|depends)'
+/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/btrfs/btrfs.ko.xz
+license:        GPL
+depends:        libcrc32c,zstd_compress,zstd_decompress,raid6_pq,xor
+vermagic:       5.4.17-2136.338.4.2.el7uek.x86_64 SMP mod_unload modversions 
+-- 모듈은 /lib/modules/<UEK 판>/kernel/fs/btrfs/btrfs.ko.xz. 커널 패키지에 들어 있다
+--   depends : crc32c(체크섬), zstd(압축), raid6_pq·xor(RAID 계산)
+--   vermagic : 이 커널 전용으로 빌드됐다는 표시. RHCK 에는 다른 모듈이 있다(실습 05)
+
+--------------------------------------------------------------------------------
+ [2] 두 장치로 RAID1 Btrfs 만들기
+--------------------------------------------------------------------------------
+
+-- -L  레이블
+-- -d  데이터 프로파일(raid1 = 장치 두 개에 같은 데이터를 한 벌씩)
+-- -m  메타데이터 프로파일. 장치가 둘 이상이면 기본값이 raid1 이지만 명시한다
+-- 장치를 두 개 주면 하나의 파일 시스템이 두 장치에 걸쳐 만들어진다.
+[root@ol7a ~]# mkfs.btrfs -L data1 -d raid1 -m raid1 /dev/sdb /dev/sdc
+btrfs-progs v5.12.1 
+-- mkfs.btrfs 출력의 필드
+See http://btrfs.wiki.kernel.org for more information.
+
+Label:              data1
+UUID:               7ed1d358-be5f-4964-9297-f87e3580be7b
+Node size:          16384
+Sector size:        4096
+Filesystem size:    20.00GiB
+--   Node size 16384 : 메타데이터 B-tree 노드 크기. Sector size 4096 : 데이터 블록
+--   Filesystem size 20.00GiB : 장치 둘의 합. 쓸 수 있는 양이 아니다([5])
+Block group profiles:
+  Data:             RAID1             1.00GiB
+  Metadata:         RAID1           256.00MiB
+  System:           RAID1             8.00MiB
+--   Block group profiles : Data·Metadata·System 이 모두 RAID1. 처음 떼어 둔 chunk 크기
+SSD detected:       no
+Zoned device:       no
+Incompat features:  extref, skinny-metadata
+Runtime features:   
+Checksum:           crc32c
+--   SSD detected no : 회전 디스크로 판단. Zoned device no
+--   Incompat features extref, skinny-metadata : 이 기능을 모르는 커널은 마운트 못 함
+--   Checksum crc32c : 데이터·메타데이터 체크섬 방식
+Number of devices:  2
+Devices:
+   ID        SIZE  PATH
+    1    10.00GiB  /dev/sdb
+    2    10.00GiB  /dev/sdc
+--   Devices : devid 1 = sdb, devid 2 = sdc. 이후 명령의 devid 는 이 번호를 쓴다
+
+--------------------------------------------------------------------------------
+ [3] 마운트와 첫 확인
+--------------------------------------------------------------------------------
+
+-- 장치 둘 중 아무 하나로 마운트한다. 커널은 같은 UUID 의 다른 장치를 스스로 찾는다.
+[root@ol7a ~]# mkdir -p /btrfs1; mount /dev/sdb /btrfs1
+-- 장치 하나(sdb)만 줬다. 출력이 없으면 성공
+[root@ol7a ~]# lsmod | grep -E '^(btrfs|raid6_pq|xor)'
+btrfs                1286144  1 
+xor                    24576  1 btrfs
+raid6_pq              114688  1 btrfs
+-- 마운트가 btrfs 모듈을 올렸고, 의존 모듈 xor·raid6_pq 가 함께 올라왔다
+[root@ol7a ~]# findmnt /btrfs1
+TARGET  SOURCE   FSTYPE OPTIONS
+/btrfs1 /dev/sdb btrfs  rw,relatime,seclabel,space_cache,subvolid=5,subvol=/
+-- SOURCE 는 /dev/sdb 하나만 보인다.
+-- sdc 도 함께 쓰이지만 findmnt 에는 나오지 않는다
+-- subvolid=5,subvol=/ : 최상위 서브볼륨이 마운트됐다(실습 02)
+[root@ol7a ~]# df -hT /btrfs1
+Filesystem     Type   Size  Used Avail Use% Mounted on
+/dev/sdb       btrfs   10G  3.4M  9.8G   1% /btrfs1
+-- 장치 합계 20G 인데 Size 10G.
+-- raid1 은 모든 데이터를 두 벌 쓰므로 df 가 반으로 보인다
+-- blkid 로 두 장치의 서명을 비교한다.
+[root@ol7a ~]# blkid /dev/sdb /dev/sdc
+/dev/sdb: LABEL="data1" UUID="7ed1d358-be5f-4964-9297-f87e3580be7b" UUID_SUB="f6c11d3e-bf60-47a4-87be-ad3409cb6aa6" TYPE="btrfs" 
+/dev/sdc: LABEL="data1" UUID="7ed1d358-be5f-4964-9297-f87e3580be7b" UUID_SUB="547426cb-a5e7-4774-8dbd-95b9fb67e788" TYPE="btrfs" 
+-- 두 장치의 LABEL·UUID 가 같다. UUID_SUB 만 다르다
+--   UUID     : 파일 시스템 하나(fstab 에 쓰는 값)
+--   UUID_SUB : 장치 하나(장치마다 따로). [10] 의 replace 에서 이 값이 옮겨 간다
+
+--------------------------------------------------------------------------------
+ [4] btrfs filesystem show — 장치 구성
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# btrfs filesystem show /btrfs1
+Label: 'data1'  uuid: 7ed1d358-be5f-4964-9297-f87e3580be7b
+        Total devices 2 FS bytes used 128.00KiB
+        devid    1 size 10.00GiB used 1.26GiB path /dev/sdb
+        devid    2 size 10.00GiB used 1.26GiB path /dev/sdc
+-- show 의 필드
+--   Total devices 2, FS bytes used 128.00KiB : 실제 데이터·메타데이터 사용량
+--   devid size : 장치 크기 10.00GiB
+--   devid used : 그 장치에 떼어 준 chunk 합. 1.26GiB = Data 1GiB + Metadata 256MiB + System 8MiB
+-- 아무것도 안 썼는데 used 가 1.26GiB.
+-- 장치 used 는 "할당"이지 "사용"이 아니다
+
+--------------------------------------------------------------------------------
+ [5] 데이터를 쓰고 df 와 btrfs filesystem usage 비교
+--------------------------------------------------------------------------------
+
+-- 1GiB 파일 하나를 쓴다. raid1 이라 장치에는 2GiB 가 쓰여야 한다.
+[root@ol7a ~]# dd if=/dev/urandom of=/btrfs1/file1g bs=1M count=1024 status=none; sync
+-- 출력 없음. 1GiB 를 쓰고 sync
+[root@ol7a ~]# df -hT /btrfs1
+Filesystem     Type   Size  Used Avail Use% Mounted on
+/dev/sdb       btrfs   10G  1.1G  8.8G  11% /btrfs1
+-- df : Size 10G, Used 1.1G, Avail 8.8G. 파일 크기만큼 늘었다
+[root@ol7a ~]# btrfs filesystem df /btrfs1
+Data, RAID1: total=2.00GiB, used=1.00GiB
+System, RAID1: total=8.00MiB, used=16.00KiB
+Metadata, RAID1: total=256.00MiB, used=1.12MiB
+GlobalReserve, single: total=3.25MiB, used=0.00B
+-- filesystem df 는 chunk 종류별 total(할당)·used(사용)
+--   Data RAID1 total 2.00GiB used 1.00GiB : 데이터 1GiB, Data chunk 가 1GiB 에서 2GiB 로 늘었다
+--   System·Metadata RAID1 : 거의 비었다
+--   GlobalReserve : 메타데이터 안에 남겨 두는 비상 공간. 공간이 바닥날 때 삭제용
+-- 여기 숫자는 사본 한 벌 기준이다
+[root@ol7a ~]# btrfs filesystem usage /btrfs1
+Overall:
+    Device size:                  20.00GiB
+    Device allocated:              4.52GiB
+    Device unallocated:           15.48GiB
+    Device missing:                  0.00B
+    Used:                          2.00GiB
+    Free (estimated):              8.74GiB      (min: 8.74GiB)
+    Free (statfs, df):             8.74GiB
+    Data ratio:                       2.00
+    Metadata ratio:                   2.00
+    Global reserve:                3.25MiB      (used: 0.00B)
+    Multiple profiles:                  no
+-- usage 위 블록(Overall)은 장치 기준
+--   Device size 20.00GiB, Device allocated 4.52GiB = (2GiB+256MiB+8MiB) × 2 벌
+--   Device unallocated 15.48GiB : 아직 chunk 로 떼지 않은 장치 공간
+--   Used 2.00GiB : 1GiB 파일의 사본 두 벌
+--   Data ratio 2.00·Metadata ratio 2.00 : 사본 수
+--   Free (estimated) 8.74GiB : 남은 공간을 ratio 로 나눈 추정. df 의 Avail 과 같은 값
+
+Data,RAID1: Size:2.00GiB, Used:1.00GiB (50.03%)
+   /dev/sdb        2.00GiB
+   /dev/sdc        2.00GiB
+
+Metadata,RAID1: Size:256.00MiB, Used:1.12MiB (0.44%)
+   /dev/sdb      256.00MiB
+   /dev/sdc      256.00MiB
+
+System,RAID1: Size:8.00MiB, Used:16.00KiB (0.20%)
+   /dev/sdb        8.00MiB
+   /dev/sdc        8.00MiB
+
+Unallocated:
+   /dev/sdb        7.74GiB
+   /dev/sdc        7.74GiB
+-- 아래 블록은 chunk 종류별·장치별.
+-- Data,RAID1 은 Size 2GiB 를 sdb·sdc 에 2GiB 씩
+-- Unallocated 7.74GiB 가 장치마다 남았다
+--
+-- 증상   : 1GiB 를 쓴 뒤 df 는 Used 1.1G, usage 는 Used 2.00GiB, Device allocated 4.52GiB.
+--          세 숫자가 달라 사용량 경보 기준을 무엇으로 잡을지 혼란
+-- 원인   : df 는 사본 한 벌 기준, usage 의 Used 는 장치 기준(Data ratio 2.00).
+--          allocated 는 chunk 단위로 미리 떼어 둔 양이라 실제 사용보다 크다
+-- 조치   : Btrfs 용량 판단은 btrfs filesystem usage 의 Free (estimated) 와
+--          Device unallocated 로 한다. 메타데이터 고갈도 이 화면에서만 보인다
+-- 재확인 : Used 2.00GiB = df Used 1.1G 의 약 2배,
+-- Free (estimated) 8.74GiB = df Avail 8.8G
+
+--------------------------------------------------------------------------------
+ [6] 장치 추가 — btrfs device add
+--------------------------------------------------------------------------------
+
+-- 마운트된 상태에서 세 번째 장치를 넣는다. 언마운트가 필요 없다.
+[root@ol7a ~]# btrfs device add /dev/sdd /btrfs1
+-- 출력 없이 끝났다
+[root@ol7a ~]# btrfs filesystem show /btrfs1
+Label: 'data1'  uuid: 7ed1d358-be5f-4964-9297-f87e3580be7b
+        Total devices 3 FS bytes used 1.00GiB
+        devid    1 size 10.00GiB used 2.26GiB path /dev/sdb
+        devid    2 size 10.00GiB used 2.26GiB path /dev/sdc
+        devid    3 size 10.00GiB used 0.00B path /dev/sdd
+-- devid 3 으로 sdd 가 들어왔다. used 0.00B.
+-- 기존 chunk 는 그대로 sdb·sdc 에 있다
+-- sdb·sdc 의 used 가 1.26 → 2.26GiB 인 것은 [5] 에서 Data chunk 가 1GiB 늘어난 몫
+[root@ol7a ~]# df -h /btrfs1
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb         15G  1.1G  8.8G  11% /btrfs1
+-- Size 가 10G → 15G 로 바로 늘었다(30G ÷ 2).
+-- 그런데 Avail 은 8.8G 그대로
+-- Avail 은 "지금 할당 가능한 raid1 공간" 추정이라 balance 전까지 바뀌지 않았다
+
+--------------------------------------------------------------------------------
+ [7] balance — 이미 있는 chunk 를 새 장치로 나누기
+--------------------------------------------------------------------------------
+
+-- device add 는 빈 장치를 붙일 뿐 기존 chunk 를 옮기지 않는다.
+-- balance 는 chunk 를 다시 써서 장치 사이에 고르게 놓는다.
+[root@ol7a ~]# time btrfs balance start --full-balance /btrfs1
+Done, had to relocate 4 out of 4 chunks
+-- chunk 4개(Data 2·Metadata 1·System 1)를 모두 다시 썼다
+
+real    0m35.183s
+user    0m0.000s
+sys     0m2.171s
+-- 데이터 1GiB 에 35초. 운영 볼륨에서는 시간과 I/O 를 먼저 따진다
+-- --full-balance : 필터 없이 전부.
+-- 실무에서는 -dusage=50 처럼 사용률 필터로 일부만
+[root@ol7a ~]# btrfs filesystem show /btrfs1
+Label: 'data1'  uuid: 7ed1d358-be5f-4964-9297-f87e3580be7b
+        Total devices 3 FS bytes used 1.00GiB
+        devid    1 size 10.00GiB used 1.28GiB path /dev/sdb
+        devid    2 size 10.00GiB used 1.28GiB path /dev/sdc
+        devid    3 size 10.00GiB used 2.00GiB path /dev/sdd
+-- used 가 sdb·sdc 1.28GiB, sdd 2.00GiB.
+-- Data 사본이 세 장치에 흩어졌다
+-- 장치가 셋이어도 raid1 은 chunk 마다 사본 둘이다. "세 장치 미러"가 아니다
+[root@ol7a ~]# btrfs device usage /btrfs1
+/dev/sdb, ID: 1
+   Device size:            10.00GiB
+   Device slack:              0.00B
+   Data,RAID1:              1.00GiB
+   Metadata,RAID1:        256.00MiB
+   System,RAID1:           32.00MiB
+   Unallocated:             8.72GiB
+
+/dev/sdc, ID: 2
+   Device size:            10.00GiB
+   Device slack:              0.00B
+   Data,RAID1:              1.00GiB
+   Metadata,RAID1:        256.00MiB
+   System,RAID1:           32.00MiB
+   Unallocated:             8.72GiB
+
+/dev/sdd, ID: 3
+   Device size:            10.00GiB
+   Device slack:              0.00B
+   Data,RAID1:              2.00GiB
+   Unallocated:             8.00GiB
+-- device usage 는 장치별 내역
+--   sdb·sdc : Data 1GiB + Metadata 256MiB + System 32MiB(balance 로 8→32MiB)
+--   sdd     : Data 2GiB 만. 메타데이터 사본은 sdb·sdc 에 남았다
+--   Device slack 0 : 장치에서 파일 시스템이 안 쓰는 끝부분. resize 로 줄이면 생긴다
+
+--------------------------------------------------------------------------------
+ [8] 장치 제거 — btrfs device delete
+--------------------------------------------------------------------------------
+
+-- 세 장치에서 하나를 빼면 raid1 최소 장치 수(2)는 지켜진다.
+-- delete 는 그 장치의 chunk 를 남은 장치로 옮긴 뒤 뺀다.
+[root@ol7a ~]# time btrfs device delete /dev/sdd /btrfs1
+
+real    0m30.318s
+user    0m0.000s
+sys     0m0.764s
+-- 출력 없이 30초. sdd 의 chunk 를 sdb·sdc 로 옮긴 시간이다
+-- 5.12 의 btrfs 에서 delete 는 remove 의 별칭이다
+[root@ol7a ~]# btrfs filesystem show /btrfs1
+Label: 'data1'  uuid: 7ed1d358-be5f-4964-9297-f87e3580be7b
+        Total devices 2 FS bytes used 1.00GiB
+        devid    1 size 10.00GiB used 2.28GiB path /dev/sdb
+        devid    2 size 10.00GiB used 2.28GiB path /dev/sdc
+-- 장치 둘로 돌아왔다. used 2.28GiB = Data 2GiB + Metadata 256MiB + System 32MiB
+
+--------------------------------------------------------------------------------
+ [9] 장치가 두 개일 때 하나를 더 빼려 하면
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# btrfs device delete /dev/sdc /btrfs1; echo "rc=$?"
+ERROR: error removing device '/dev/sdc': unable to go below two devices on raid1
+rc=1
+[root@ol7a ~]# dmesg | grep -i btrfs | tail -3
+[  191.802195] BTRFS info (device sdb): found 7 extents
+[  191.808034] BTRFS info (device sdb): found 7 extents
+[  191.823239] BTRFS info (device sdb): device deleted: /dev/sdd
+-- dmesg 의 btrfs 줄 셋은 [8] 의 sdd 제거 기록.
+-- 거부된 sdc 제거는 커널 메시지를 남기지 않았다
+-- 거부는 btrfs 명령의 오류로만 보인다
+--
+-- 증상   : btrfs device delete /dev/sdc /btrfs1 이
+--          'ERROR: error removing device '/dev/sdc': unable to go below two devices on raid1', rc=1
+-- 원인   : raid1 은 chunk 사본 둘을 서로 다른 장치에 둔다. 장치가 하나 남으면 둘 곳이 없다.
+--          [8] 처럼 장치가 셋일 때는 남은 둘로 옮길 수 있어 성공했다
+-- 조치   : 바꿀 장치를 먼저 넣고 빼거나([변형]), btrfs replace 로 한 번에 바꾼다([10])
+-- 재확인 : replace 뒤 show 에 Total devices 2, sdc 대신 sde
+
+--------------------------------------------------------------------------------
+ [10] 장치 교체 — btrfs replace
+--------------------------------------------------------------------------------
+
+-- replace 는 원본 장치를 읽어 새 장치로 그대로 옮긴다. 마운트 중에 한다.
+-- -B 는 끝날 때까지 기다리게 한다(기본은 백그라운드).
+[root@ol7a ~]# btrfs replace start -B /dev/sdc /dev/sde /btrfs1
+-- -B 라 끝날 때까지 기다렸고 출력은 없다
+[root@ol7a ~]# btrfs replace status /btrfs1
+Started on 16.Nov 10:32:02, finished on 16.Nov 10:32:17, 0 write errs, 0 uncorr. read errs
+-- 10:32:02 시작, 10:32:17 끝.
+-- 15초. 쓰기 오류·고칠 수 없는 읽기 오류 모두 0
+-- delete(30초)보다 빠르다.
+-- chunk 를 하나씩 옮기지 않고 장치를 통째로 복사한다
+[root@ol7a ~]# btrfs filesystem show /btrfs1
+Label: 'data1'  uuid: 7ed1d358-be5f-4964-9297-f87e3580be7b
+        Total devices 2 FS bytes used 1.00GiB
+        devid    1 size 10.00GiB used 2.28GiB path /dev/sdb
+        devid    2 size 10.00GiB used 2.28GiB path /dev/sde
+-- devid 2 는 그대로이고 path 만 sde 로 바뀌었다
+[root@ol7a ~]# blkid /dev/sdc /dev/sde
+/dev/sde: LABEL="data1" UUID="7ed1d358-be5f-4964-9297-f87e3580be7b" UUID_SUB="547426cb-a5e7-4774-8dbd-95b9fb67e788" TYPE="btrfs" 
+-- sdc 줄이 없다. replace 가 끝나면 원본의 서명을 지운다
+-- sde 의 UUID_SUB 547426cb...
+-- 는 [3] 에서 sdc 가 갖던 값이다. 장치 정체성이 그대로 옮겨 갔다
+
+--------------------------------------------------------------------------------
+ [11] scrub — 체크섬으로 두 벌을 대조
+--------------------------------------------------------------------------------
+
+-- scrub 은 모든 블록을 읽어 체크섬을 확인하고, raid1 이면 틀린 쪽을 맞는 쪽으로 고친다.
+[root@ol7a ~]# btrfs scrub start -B /btrfs1
+scrub done for 7ed1d358-be5f-4964-9297-f87e3580be7b
+Scrub started:    Mon Nov 16 10:32:17 2026
+Status:           finished
+Duration:         0:00:02
+Total to scrub:   4.56GiB
+Rate:             1.00GiB/s
+Error summary:    no errors found
+-- scrub start -B 의 결과.
+-- 2초에 4.56GiB(장치 기준 사본 모두), 오류 없음
+[root@ol7a ~]# btrfs scrub status /btrfs1
+UUID:             7ed1d358-be5f-4964-9297-f87e3580be7b
+Scrub started:    Mon Nov 16 10:32:17 2026
+Status:           finished
+Duration:         0:00:02
+Total to scrub:   2.00GiB
+Rate:             1.00GiB/s
+Error summary:    no errors found
+-- status 는 마지막 scrub 기록을 다시 보인다.
+-- Total to scrub 이 2.00GiB 로 start 출력과 다르다.
+-- 5.12 의 status 는 사본 한 벌 기준으로 센다
+-- 체크섬 오류가 있으면 Error summary 에 csum=N,
+-- Corrected·Uncorrectable 이 나온다
+
+--------------------------------------------------------------------------------
+ [12] /etc/fstab 으로 영구 마운트
+--------------------------------------------------------------------------------
+
+-- 다중 장치 Btrfs 는 장치 이름 대신 UUID 로 적는다. 어느 장치 이름이 먼저 잡혀도 같다.
+[root@ol7a ~]# UUID=$(blkid -s UUID -o value /dev/sdb); echo "UUID=$UUID /btrfs1 btrfs defaults 0 0" >> /etc/fstab; tail -1 /etc/fstab
+UUID=7ed1d358-be5f-4964-9297-f87e3580be7b /btrfs1 btrfs defaults 0 0
+-- fsck 순서 0. Btrfs 는 부팅 때 fsck 를 돌리지 않는다(fsck.btrfs 는 아무것도 안 하는 스크립트)
+[root@ol7a ~]# umount /btrfs1; mount -a; findmnt /btrfs1
+TARGET  SOURCE   FSTYPE OPTIONS
+/btrfs1 /dev/sdb btrfs  rw,relatime,seclabel,space_cache,subvolid=5,subvol=/
+-- mount -a 가 UUID 로 찾아 다시 마운트했다.
+-- SOURCE 는 devid 1 인 sdb
+[root@ol7a ~]# diff /root/fstab.before /etc/fstab
+11a12
+> UUID=7ed1d358-be5f-4964-9297-f87e3580be7b /btrfs1 btrfs defaults 0 0
+-- 바뀐 것은 12번째 줄 하나
+
+--------------------------------------------------------------------------------
+ [변형] 장치 교체를 add + delete 로
+--------------------------------------------------------------------------------
+
+-- [10] 의 replace 대신 add 와 delete 두 단계로 같은 결과를 낸다(sde → sdd).
+[root@ol7a ~]# time btrfs device add /dev/sdd /btrfs1
+
+real    0m0.012s
+user    0m0.000s
+sys     0m0.007s
+-- add 는 0.012초. 장치를 붙이기만 한다
+[root@ol7a ~]# time btrfs device delete /dev/sde /btrfs1
+
+real    0m41.166s
+user    0m0.000s
+sys     0m0.881s
+-- delete 는 41초. sde 의 chunk 를 sdd 로 옮겼다.
+-- replace 의 15초와 비교된다
+[root@ol7a ~]# btrfs filesystem show /btrfs1
+Label: 'data1'  uuid: 7ed1d358-be5f-4964-9297-f87e3580be7b
+        Total devices 2 FS bytes used 1.00GiB
+        devid    1 size 10.00GiB used 2.28GiB path /dev/sdb
+        devid    3 size 10.00GiB used 2.28GiB path /dev/sdd
+-- 결과는 replace 와 같다. 차이는 devid 다.
+-- 새 장치는 3, replace 는 원래 번호 2 를 이어받았다
+-- 장치 교체는 replace 가 빠르고 번호도 유지된다.
+-- add + delete 는 장치 수를 잠시 늘릴 때 쓴다
+
+--------------------------------------------------------------------------------
+ [13] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /btrfs1; cp /root/fstab.before /etc/fstab; rmdir /btrfs1
+-- 출력 없음. 마운트 해제, fstab 복원, 마운트 지점 삭제
+[root@ol7a ~]# wipefs -a /dev/sdb /dev/sdc /dev/sdd /dev/sde
+/dev/sdb: 8 bytes were erased at offset 0x00010040 (btrfs): 5f 42 48 52 66 53 5f 4d
+/dev/sdd: 8 bytes were erased at offset 0x00010040 (btrfs): 5f 42 48 52 66 53 5f 4d
+-- sdb·sdd 만 지워졌다. sdc 는 [10] replace 가,
+-- sde 는 [변형] delete 가 이미 서명을 지웠다
+[root@ol7a ~]# lsblk -f /dev/sdb /dev/sdc /dev/sdd /dev/sde; grep -c btrfs /etc/fstab
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+sdd                    
+sde                    
+0
+-- 네 장치가 [0] 과 같이 비었고 fstab 에 btrfs 줄 0
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                    시작 전        변경 후                          되돌린 뒤
+--  btrfs 모듈              미적재         적재(xor·raid6_pq 함께)          적재된 채
+--  장치 구성               빈 디스크 4    sdb+sdc → +sdd → sdb+sde → sdb+sdd 빈 디스크 4
+--  df Size (/btrfs1)       -              10G → 장치 셋 15G                -
+--  balance (1GiB, 장치 3)  -              35초, chunk 4/4                  -
+--  delete / replace        -              30·41초 / 15초                   -
+--  /etc/fstab              11줄           12줄 (UUID, 0 0)                 11줄
+--
+-- 확인한 사실
+--   show 의 used·usage 의 allocated 는 chunk 할당량, df 는 사본 한 벌 기준
+--   add 는 기존 chunk 를 옮기지 않는다. balance 뒤 세 장치에 퍼짐
+--   raid1 은 장치 2개 아래로 못 줄인다. replace 는 devid·UUID_SUB 를 이어받는다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. -dusage=50 필터로 balance 를 돌려 relocate 한 chunk 수를 --full-balance 와 비교
+--    확인: Done, had to relocate N out of M chunks 의 N
+-- 2. raid1 을 장치 셋으로 만든 뒤 -dconvert=raid0 으로 바꿔 df Size 변화를 본다
+--    확인: btrfs filesystem df 의 Data, RAID0 줄과 df -h
+-- 3. replace 를 -B 없이 시작하고 btrfs replace status 로 진행률을 본다
+
+================================================================================
+ 실습 01 종료 — raid1 생성, chunk 할당 읽기, add·balance·delete·replace·scrub 확인
+================================================================================

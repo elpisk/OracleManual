@@ -1,0 +1,529 @@
+================================================================================
+ 제16장 실습 03 — rich rule 과 출발지 제한
+ 대상   : ol7a(방화벽), ol7b(접속 시험, 보조 주소 172.16.225.63 추가)
+ 목표   : 출발지 주소별로 허용·거부·로그를 거는 rich rule 을 만들고, firewalld 0.6.3
+          이 rich rule 을 어떤 순서로 평가하는지 iptables 체인으로 확인한다. 이미
+          연결된 세션은 새 거부 규칙에 걸리지 않는 것, 출발지를 다른 영역에 묶으면
+          public 영역의 규칙이 적용되지 않는 것을 실제 접속으로 본다
+ 배경   : rich rule 은 출발지·목적지·서비스·포트·로그·동작을 한 줄에 쓰는 규칙이다.
+          firewalld 는 영역마다 _log → _deny → _allow 체인을 두고 rich rule 을
+          동작 종류에 따라 나눠 넣는다. 출발지 주소가 묶인 영역은 인터페이스 영역보다
+          먼저 평가된다(본문 16.4)
+ 소요   : 약 30분
+ 선행   : ol7-base, ol7b-base 스냅샷. 172.16.225.63 을 다른 장비가 쓰지 않을 것
+ 계정   : root
+ 주의   : 규칙은 8080/tcp 와 ICMP 에만 건다. 22/tcp 와 강사 PC(172.16.225.1)는 손대지 않는다
+ 되돌림 : rich rule 0개, trusted·internal 영역에 출발지·인터페이스 없음, ol7b 의
+          보조 주소 삭제. 확인: firewall-cmd --list-all, ip -4 addr show ens32(ol7b)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# firewall-cmd --list-rich-rules | wc -l; firewall-cmd --get-active-zones
+1
+public
+  interfaces: ens32
+-- rich rule 목록 1 줄은 빈 줄 하나다. 규칙은 0 개
+-- 활성 영역은 public 하나, ens32 가 묶여 있다
+-- 이 실습은 public 과 trusted·internal·appsrc 네 영역을 오간다
+-- 시험 포트는 8080 하나
+-- 22 는 건드리지 않는다
+-- ICMP 는 [8] 에서만
+[root@ol7a ~]# firewall-cmd --zone=trusted --list-all | grep -E 'sources|interfaces'
+  interfaces: 
+  sources: 
+-- trusted 에는 아무것도 묶여 있지 않다
+[root@ol7b ~]# ip -4 -o addr show ens32
+2: ens32    inet 172.16.225.62/24 brd 172.16.225.255 scope global noprefixroute ens32\       valid_lft forever preferred_lft forever
+-- ol7b 의 주소는 .62 하나. -o 는 한 줄 출력, 줄 안의 \ 는 줄바꿈 자리
+
+--------------------------------------------------------------------------------
+ [1] 출발지를 하나 더 만들기
+--------------------------------------------------------------------------------
+
+-- ol7b 한 대로 두 출발지를 흉내 낸다. 먼저 .63 이 비어 있는지 ARP 로 확인한다
+-- arping -D : 중복 주소 검사, 응답이 없으면 rc=0
+-- Received 0 response(s), rc=0. .63 을 쓰는 장비가 없다
+-- from 0.0.0.0 : 검사용 ARP 는 출발지 주소를 비워 보낸다
+-- -D 는 응답이 오면 rc=1 을 준다. 남의 주소를 빼앗지 않으려는 확인
+[root@ol7b ~]# arping -D -c 2 -I ens32 172.16.225.63; echo "rc=$?"
+ARPING 172.16.225.63 from 0.0.0.0 ens32
+Sent 2 probes (2 broadcast(s))
+Received 0 response(s)
+rc=0
+
+-- ip addr add 는 runtime 전용 주소다. 재부팅하면 사라진다
+[root@ol7b ~]# ip addr add 172.16.225.63/24 dev ens32; ip -4 -o addr show ens32
+2: ens32    inet 172.16.225.62/24 brd 172.16.225.255 scope global noprefixroute ens32\       valid_lft forever preferred_lft forever
+2: ens32    inet 172.16.225.63/24 scope global secondary ens32\       valid_lft forever preferred_lft forever
+-- secondary 가 붙은 두 번째 주소. noprefixroute 는 NetworkManager 가 붙인 것
+-- 이 주소는 runtime 전용이라 [11] 에서 지우거나 재부팅하면 사라진다
+
+-- 접속 시험 도구 ncat 을 두 노드에 설치한다(-q : 조용히)
+[root@ol7a ~]# yum -y -q install nmap-ncat; rpm -q nmap-ncat
+nmap-ncat-6.40-19.el7.x86_64
+[root@ol7b ~]# yum -y -q install nmap-ncat; rpm -q nmap-ncat
+nmap-ncat-6.40-19.el7.x86_64
+-- 두 노드 모두 ncat 6.40. 6.40 에는 -z(포트 검사만) 가 없어 echo 로 한 줄 보낸다
+-- 설치는 yum.oracle.com 의 ol7_latest 에서 받았다. -q 라 진행 줄이 없다
+
+-- ol7a 에 8080 리스너. -l : 대기, -k : 연결이 끝나도 계속 대기. 받은 내용은 /tmp/recv.log
+[root@ol7a ~]# nohup ncat -lk 8080 >/tmp/recv.log 2>&1 </dev/null &
+[root@ol7a ~]# sleep 1; ss -ltn | grep ':8080 '
+LISTEN 0      10           0.0.0.0:8080      0.0.0.0:*          
+LISTEN 0      10              [::]:8080         [::]:*          
+-- IPv4 0.0.0.0 과 IPv6 [::] 두 소켓. ncat 은 둘 다 연다
+-- Send-Q 10 은 대기 큐 한도
+-- 방화벽 규칙과 무관하게 리스너는 모든 주소에서 받는다. 거르는 것은 방화벽 몫이다
+
+--------------------------------------------------------------------------------
+ [2] 출발지 한 곳만 허용
+--------------------------------------------------------------------------------
+
+-- 8080 은 public 에 열려 있지 않다. .62 만 허용하는 rich rule
+[root@ol7a ~]# firewall-cmd --add-rich-rule='rule family="ipv4" source address="172.16.225.62/32" port port="8080" protocol="tcp" accept'
+-- rich rule 은 넣은 문자열 그대로 목록에 나온다. 지울 때도 같은 문자열을 쓴다
+-- 속성 순서를 바꿔 쓰면 다른 규칙으로 본다. 지울 때는 목록에서 복사해 쓴다
+success
+[root@ol7a ~]# firewall-cmd --list-rich-rules
+rule family="ipv4" source address="172.16.225.62/32" port port="8080" protocol="tcp" accept
+
+-- -s : 보낼 때 쓸 출발지 주소. -w 3 : 연결 3초 제한
+[root@ol7b ~]# echo "from62" | ncat -w 3 ol7a 8080; echo "rc=$?"
+rc=0
+-- .62 는 통과. ncat 은 보낼 것을 다 보내고 rc=0 으로 끝난다
+-- -s 를 주지 않으면 ol7b 는 기본 주소 .62 로 나간다
+[root@ol7b ~]# echo "from63" | ncat -s 172.16.225.63 -w 3 ol7a 8080; echo "rc=$?"
+Ncat: No route to host.
+rc=1
+-- .63 은 규칙에 맞지 않아 public 의 기본 거부. No route to host
+-- 같은 ol7b, 같은 포트인데 출발지 주소 하나로 결과가 갈렸다
+-- rc=1 은 ncat 의 연결 실패
+-- 즉시 돌아왔다
+[root@ol7a ~]# cat /tmp/recv.log
+from62
+-- 리스너가 받은 것은 from62 한 줄뿐이다
+-- rich rule 형식: rule family="ipv4" source address="주소" port port="번호" protocol="tcp" 동작
+-- 거부된 from63 은 커널이 SYN 단계에서 막아 ncat 리스너까지 오지 않았다
+
+--------------------------------------------------------------------------------
+ [3] 넓게 허용하고 좁게 거부
+--------------------------------------------------------------------------------
+
+-- 대역 전체 허용을 먼저, .63 거부를 나중에 넣는다. iptables 처럼 "먼저 넣은 것이 이긴다"면 .63 도 통과해야 한다
+[root@ol7a ~]# firewall-cmd --add-rich-rule='rule family="ipv4" source address="172.16.225.0/24" port port="8080" protocol="tcp" accept'
+success
+[root@ol7a ~]# firewall-cmd --add-rich-rule='rule family="ipv4" source address="172.16.225.63/32" port port="8080" protocol="tcp" reject'
+success
+[root@ol7b ~]# echo "from63-b" | ncat -s 172.16.225.63 -w 3 ol7a 8080; echo "rc=$?"
+Ncat: Connection refused.
+-- .63 이 거부됐다. 넣은 순서로는 /24 허용이 먼저였다
+-- 메시지가 No route to host 가 아니라 Connection refused 다
+-- rich rule 의 reject 기본 응답이 icmp-port-unreachable 이기 때문이다(아래 체인)
+rc=1
+
+-- 순서를 정하는 것은 넣은 순서가 아니라 동작 종류다. 체인 셋을 본다
+[root@ol7a ~]# iptables -S IN_public
+-N IN_public
+-A IN_public -j IN_public_log
+-A IN_public -j IN_public_deny
+-A IN_public -j IN_public_allow
+-A IN_public -p icmp -j ACCEPT
+-- IN_public 은 _log → _deny → _allow 순서로 점프한다
+-- 마지막 줄 -p icmp ACCEPT 는 세 체인에서 결정되지 않은 ICMP 를 허용한다
+-- 순서가 고정이라 거부 rich rule 은 언제나 허용보다 먼저 본다
+[root@ol7a ~]# iptables -S IN_public_deny; iptables -S IN_public_allow | grep 8080
+-N IN_public_deny
+-A IN_public_deny -s 172.16.225.63/32 -p tcp -m tcp --dport 8080 -m conntrack --ctstate NEW,UNTRACKED -j REJECT --reject-with icmp-port-unreachable
+-A IN_public_allow -s 172.16.225.62/32 -p tcp -m tcp --dport 8080 -m conntrack --ctstate NEW,UNTRACKED -j ACCEPT
+-A IN_public_allow -s 172.16.225.0/24 -p tcp -m tcp --dport 8080 -m conntrack --ctstate NEW,UNTRACKED -j ACCEPT
+-- _deny 에 .63 거부, _allow 에 .62·/24 허용
+-- 같은 _allow 안에서는 넣은 순서(.62 → /24)다
+-- reject-with icmp-port-unreachable : 리스너가 없는 것과 같은 응답이라 클라이언트는 구별 못 한다
+-- 구별이 필요하면 reject type="icmp-host-prohibited" 를 준다
+-- 여기서 /24 허용이 .63 을 덮지 않은 것은 _deny 가 _allow 보다 앞이기 때문이다
+-- iptables 서비스였다면 먼저 넣은 /24 허용이 이겼을 것이다(실습 04 [5] 의 위치 규칙)
+
+-- 0.6.3 에는 rich rule 의 priority 속성이 없다
+[root@ol7a ~]# firewall-cmd --add-rich-rule='rule priority="-10" family="ipv4" source address="172.16.225.63/32" port port="8080" protocol="tcp" accept'; echo "rc=$?"
+Error: INVALID_RULE: bad attribute 'priority'
+rc=122
+-- 원문: Error: INVALID_RULE: bad attribute 'priority'
+-- [OL8/9] firewalld 0.9 이후는 rule priority 를 받는다. 7.9 에서는 순서를 바꿀 방법이 없다
+-- 우회가 필요하면 허용할 주소를 거부 규칙의 source 에서 빼는 식으로 규칙 자체를 다시 짠다
+
+--------------------------------------------------------------------------------
+ [4] 오류 재현 ① — 거부 규칙을 넣었는데 연결이 계속 들어옴
+--------------------------------------------------------------------------------
+
+-- 거부 규칙을 잠시 빼고, .63 에서 1초마다 한 줄씩 30초 동안 보내는 연결을 띄운다
+[root@ol7a ~]# firewall-cmd --remove-rich-rule='rule family="ipv4" source address="172.16.225.63/32" port port="8080" protocol="tcp" reject'
+success
+-- 거부 규칙을 잠시 뺐다
+-- 지울 때 넣을 때와 같은 문자열을 썼다. success
+-- 지금 .63 은 /24 허용에 걸린다
+[root@ol7b ~]# nohup sh -c 'for i in $(seq 1 30); do echo "stream $i"; sleep 1; done | ncat -s 172.16.225.63 ol7a 8080' >/tmp/send.log 2>&1 </dev/null &
+-- 연결이 맺어진 뒤 거부 규칙을 다시 넣는다
+[root@ol7a ~]# firewall-cmd --add-rich-rule='rule family="ipv4" source address="172.16.225.63/32" port port="8080" protocol="tcp" reject'; date +%T
+success
+12:32:51
+-- nohup 으로 띄운 송신은 1초에 한 줄, 30 줄을 보낸다
+-- 5초 뒤 12:32:51 에 거부 규칙을 다시 넣었다
+-- 이 시점에 리스너는 이미 몇 줄을 받고 있다
+-- date 는 시각 대조용
+
+-- 새 연결은 막힌다
+[root@ol7b ~]# echo "new63" | ncat -s 172.16.225.63 -w 3 ol7a 8080; echo "rc=$?"
+Ncat: Connection refused.
+rc=1
+-- 같은 순간 새 연결은 Connection refused 로 막혔다
+-- 규칙은 즉시 적용됐다. 새 연결의 SYN 은 NEW 상태라 _deny 에 걸린다
+-- 그런데 기존 연결은 계속 들어온다
+[root@ol7a ~]# date +%T; grep -c stream /tmp/recv.log; tail -2 /tmp/recv.log
+12:33:01
+16
+stream 15
+stream 16
+-- 10초 뒤 받은 줄은 16. 규칙을 넣은 뒤에도 기존 연결의 줄이 계속 들어왔다
+-- 증상   : 거부 rich rule 을 넣었는데 .63 의 stream 줄이 계속 도착(16 → 30)
+-- 원인   : 아래 INPUT 첫 줄이 ESTABLISHED 패킷을 영역 규칙보다 먼저 받아 준다
+-- 조치   : 기존 연결은 그 연결을 쓰는 프로세스를 정리해 끊는다
+-- 재확인 : 새 연결은 즉시 Connection refused, 기존 연결은 송신 측이 끝낼 때까지 유지
+
+-- INPUT 체인 첫 줄이 이미 맺어진 연결(ESTABLISHED)을 영역 규칙보다 먼저 받아 준다
+[root@ol7a ~]# iptables -S INPUT | head -4
+-P INPUT ACCEPT
+-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -j INPUT_direct
+-- 1 : RELATED,ESTABLISHED 허용  2 : lo 허용  3 : direct 규칙
+-- 그 뒤에 출발지 영역, 인터페이스 영역이 온다(실습 02 [10])
+-- -P INPUT ACCEPT 는 체인 정책. firewalld 는 정책 대신 마지막 REJECT 로 거부한다
+
+-- 연결 추적 표에서 그 연결을 본다
+[root@ol7a ~]# grep 'dport=8080' /proc/net/nf_conntrack | grep -o 'tcp .* ESTABLISHED src=[0-9.]* dst=[0-9.]* sport=[0-9]* dport=8080'
+tcp      6 431999 ESTABLISHED src=172.16.225.63 dst=172.16.225.61 sport=35397 dport=8080
+-- 연결 추적 표의 한 줄. 6 은 TCP 프로토콜 번호, 431999 는 남은 초(약 5일)
+-- src .63 → dst .61:8080 이 ESTABLISHED 로 기록돼 있다
+-- 이 기록이 있는 동안 그 연결의 패킷은 INPUT 첫 줄에서 통과한다
+-- grep -o 로 필요한 필드만 잘랐다. 원래 줄에는 응답 방향 주소와 표시값이 더 붙는다
+[root@ol7a ~]# grep -c stream /tmp/recv.log; tail -1 /tmp/recv.log
+30
+stream 30
+-- 30 줄이 모두 도착했다. 거부 규칙은 기존 연결에 끝까지 닿지 않았다
+-- 송신은 30초 뒤 스스로 끝났다
+-- 침입자를 막으려고 주소를 거부했다면 이미 들어온 세션은 ss -tn 으로 찾아 따로 끊는다
+-- reload 도 연결 추적을 지우지 않는다. 기존 연결을 끊는 수단이 아니다
+
+--------------------------------------------------------------------------------
+ [5] 로그를 남기는 rich rule
+--------------------------------------------------------------------------------
+
+-- .63 거부를 로그 포함 규칙으로 바꾼다. limit : 분당 5건까지만 기록
+[root@ol7a ~]# firewall-cmd --remove-rich-rule='rule family="ipv4" source address="172.16.225.63/32" port port="8080" protocol="tcp" reject'
+success
+[root@ol7a ~]# firewall-cmd --add-rich-rule='rule family="ipv4" source address="172.16.225.63/32" port port="8080" protocol="tcp" log prefix="R63 " level="info" limit value="5/m" reject'
+success
+[root@ol7b ~]# echo "log63" | ncat -s 172.16.225.63 -w 3 ol7a 8080; echo "rc=$?"
+Ncat: Connection refused.
+rc=1
+-- 로그 규칙으로 바꾼 뒤에도 결과는 같은 Connection refused
+-- log 는 동작이 아니라 부가 요소다. 동작은 끝의 reject 가 정한다
+
+-- 커널 로그로 남는다. journalctl -k : 커널 메시지만
+[root@ol7a ~]# journalctl -k --no-pager | grep 'R63 ' | tail -1
+Nov 16 12:33:20 ol7a.example.com kernel: 'R63 'IN=ens32 OUT= MAC=00:0c:29:ac:5e:a0:00:0c:29:7c:e4:df:08:00 SRC=172.16.225.63 DST=172.16.225.61 LEN=60 TOS=0x00 PREC=0x00 TTL=64 ID=44072 DF PROTO=TCP SPT=42695 DPT=8080 WINDOW=64240 RES=0x00 SYN URGP=0 
+-- 커널 로그 한 줄. 필드를 짚는다
+--   'R63 '      prefix. firewalld 가 작은따옴표까지 붙여 넣었다(0.6.3 의 표시 방식)
+--   IN=ens32 OUT=  들어온 장치, 나가는 장치는 없음(로컬 수신)
+--   MAC=        목적지 MAC + 출발지 MAC + 08:00(IPv4)
+--   SRC·DST     172.16.225.63 → .61
+--   PROTO=TCP SPT=42695 DPT=8080  출발지 포트·목적지 포트
+--   SYN         새 연결 시작 패킷. NEW 만 기록하므로 연결 하나에 한 줄
+-- 이 줄은 rsyslog 를 거쳐 /var/log/messages 에도 남는다(19장)
+
+-- 규칙은 _log 체인과 _deny 체인 두 곳에 들어갔다
+[root@ol7a ~]# iptables -S IN_public_log; iptables -S IN_public_deny
+-N IN_public_log
+-A IN_public_log -s 172.16.225.63/32 -p tcp -m tcp --dport 8080 -m conntrack --ctstate NEW,UNTRACKED -m limit --limit 5/min -j LOG --log-prefix "\'R63 \'" --log-level 6
+-N IN_public_deny
+-A IN_public_deny -s 172.16.225.63/32 -p tcp -m tcp --dport 8080 -m conntrack --ctstate NEW,UNTRACKED -j REJECT --reject-with icmp-port-unreachable
+-- 로그 요소는 _log 체인에, reject 는 _deny 체인에 따로 들어갔다
+-- -m limit --limit 5/min : 분당 5건. 공격이 몰려도 로그가 넘치지 않는다
+-- --log-level 6 = info
+-- 0.6.3 에서는 작은따옴표까지 prefix 에 들어갔다. grep 은 R63 으로 찾는다
+
+--------------------------------------------------------------------------------
+ [6] 오류 재현 ② — 출발지를 다른 영역에 넣음
+--------------------------------------------------------------------------------
+
+-- 다른 관리자가 ".63 은 믿을 만한 서버"라며 trusted 영역에 넣었다
+[root@ol7a ~]# firewall-cmd --zone=trusted --add-source=172.16.225.63/32
+success
+[root@ol7a ~]# firewall-cmd --get-active-zones
+public
+  interfaces: ens32
+trusted
+  sources: 172.16.225.63/32
+-- trusted 가 sources 172.16.225.63/32 로 활성 영역이 됐다
+-- 출발지가 묶인 영역도 "활성" 이다. 인터페이스가 없어도 목록에 나온다
+
+[root@ol7b ~]# echo "trusted63" | ncat -s 172.16.225.63 -w 3 ol7a 8080; echo "rc=$?"
+rc=0
+[root@ol7a ~]# tail -1 /tmp/recv.log
+trusted63
+-- 증상   : public 에 .63 거부 rich rule 이 있는데 .63 의 trusted63 이 도착(rc=0)
+-- 원인   : .63 은 출발지 영역 trusted(target ACCEPT)로 먼저 판정된다. public 규칙에 닿지 않는다
+-- 조치   : firewall-cmd --zone=trusted --remove-source=172.16.225.63/32
+-- 재확인 : 아래에서 back63 이 다시 Connection refused
+
+-- 출발지 영역 체인이 인터페이스 영역보다 앞에 있다
+[root@ol7a ~]# iptables -S INPUT_ZONES_SOURCE; iptables -S INPUT_ZONES
+-N INPUT_ZONES_SOURCE
+-A INPUT_ZONES_SOURCE -s 172.16.225.63/32 -g IN_trusted
+-N INPUT_ZONES
+-A INPUT_ZONES -i ens32 -g IN_public
+-A INPUT_ZONES -g IN_public
+-- INPUT_ZONES_SOURCE 의 .63 → IN_trusted 점프가 INPUT_ZONES 보다 앞이다(INPUT 순서 4번째와 5번째)
+-- -g 는 goto. 돌아오지 않으니 public 은 보지 않는다
+-- trusted 의 target ACCEPT 라 zone drifting 과 무관하게 여기서 끝난다
+
+-- 출발지가 묶인 영역을 찾는 명령
+[root@ol7a ~]# firewall-cmd --get-zone-of-source=172.16.225.63/32
+trusted
+-- 어느 영역에 묶였는지 주소로 묻는 명령. public 만 보고 원인을 못 찾을 때 쓴다
+-- 대역으로 묶였으면 그 대역 문자열 그대로 물어야 한다(172.16.225.0/24 등)
+-- 묶인 곳이 없으면 no zone
+
+[root@ol7a ~]# firewall-cmd --zone=trusted --remove-source=172.16.225.63/32
+success
+[root@ol7b ~]# echo "back63" | ncat -s 172.16.225.63 -w 3 ol7a 8080; echo "rc=$?"
+Ncat: Connection refused.
+rc=1
+-- 출발지를 빼자 public 의 거부가 다시 적용됐다
+-- runtime 에서만 넣고 뺐으니 파일에는 흔적이 없다
+-- 활성 영역도 public 하나로 돌아갔다
+
+--------------------------------------------------------------------------------
+ [7] 인터페이스를 영역에 묶기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# firewall-cmd --get-zone-of-interface=ens32; firewall-cmd --get-zone-of-interface=ens33; echo "rc=$?"
+public
+no zone
+rc=2
+-- ens33 은 no zone, rc=2. 활성 연결이 없는 장치는 어느 영역에도 없다
+
+-- 주소 없는 ens33 을 internal 에 묶는다. 강사 PC 가 들어오는 ens32 는 건드리지 않는다
+[root@ol7a ~]# firewall-cmd --zone=internal --add-interface=ens33; firewall-cmd --get-active-zones
+success
+internal
+  interfaces: ens33
+public
+  interfaces: ens32
+-- internal 이 활성 영역으로 생겼다. runtime 변경이다
+-- internal 의 기본 서비스에는 ssh 가 있다. ens32 를 옮겼어도 SSH 는 살았겠지만 일부러 피했다
+
+-- runtime 변경이다. NetworkManager 관리 장치는 ifcfg 의 ZONE= 이 영구 설정 자리다
+[root@ol7a ~]# grep -i zone /etc/sysconfig/network-scripts/ifcfg-ens33; echo "rc=$?"
+rc=1
+-- ifcfg-ens33 에 ZONE= 줄이 없다. 영구로 하려면 ZONE=internal 을 넣거나 nmcli 로 connection.zone 을 바꾼다
+-- [OL8/9] ifcfg 대신 NetworkManager 키 파일을 쓰는 경우가 늘었다. nmcli 방식이 공통이다
+[root@ol7a ~]# firewall-cmd --zone=internal --remove-interface=ens33
+success
+
+--------------------------------------------------------------------------------
+ [8] ICMP 차단
+--------------------------------------------------------------------------------
+
+[root@ol7b ~]# ping -c 1 -W 2 ol7a | sed -n 2p
+64 bytes from ol7a.example.com (172.16.225.61): icmp_seq=1 ttl=64 time=0.171 ms
+-- ping 은 기본으로 허용(IN_public 의 -p icmp ACCEPT)
+-- sed -n 2p : 응답 줄 하나만 남겼다. 통계 줄은 잘랐다
+
+[root@ol7a ~]# firewall-cmd --get-icmptypes | wc -w; firewall-cmd --add-icmp-block=echo-request
+42
+success
+-- ICMP 종류 42 개. echo-request 를 막았다
+-- icmp-block 은 rich rule 이 아니라 영역 속성이다. --list-all 의 icmp-blocks 줄에 나온다
+[root@ol7b ~]# ping -c 1 -W 2 ol7a | sed -n 2p
+From ol7a.example.com (172.16.225.61) icmp_seq=1 Destination Host Prohibited
+-- 요청이 거부됐고 ol7a 가 host-prohibited 응답을 돌려보냈다
+-- 조용히 버리게 하려면 drop 영역이나 rich rule 의 drop 을 쓴다
+-- ping 을 막아도 TCP 서비스에는 영향이 없다. 장애 확인용 ping 이 안 되니 운영 팀과 먼저 맞춘다
+[root@ol7a ~]# firewall-cmd --remove-icmp-block=echo-request
+success
+
+--------------------------------------------------------------------------------
+ [9] 포트 포워딩 rich rule
+--------------------------------------------------------------------------------
+
+-- 8081 로 들어온 연결을 같은 서버의 8080 으로 넘긴다
+[root@ol7a ~]# firewall-cmd --add-rich-rule='rule family="ipv4" source address="172.16.225.62/32" forward-port port="8081" protocol="tcp" to-port="8080"'
+success
+[root@ol7b ~]# echo "via8081" | ncat -w 3 ol7a 8081; echo "rc=$?"
+rc=0
+[root@ol7a ~]# tail -1 /tmp/recv.log
+via8081
+-- 8081 로 보낸 via8081 이 8080 리스너에 도착했다. 8081 은 아무도 듣지 않는다
+
+-- nat 테이블에 DNAT 가 들어갔다
+[root@ol7a ~]# iptables -t nat -S PRE_public_allow
+-N PRE_public_allow
+-A PRE_public_allow -p tcp -m mark --mark 0x64 -j DNAT --to-destination :8080
+-- nat 테이블 PRE_public_allow 의 DNAT. mangle 에서 표시(0x64)한 패킷만 8080 으로 바꾼다
+-- 출발지 조건은 mangle 표시 단계에 들어 있어 이 줄에는 안 보인다
+-- 포트를 다른 서버로 넘기려면 to-addr 를 주고 masquerade 를 켠다. 여기서는 같은 서버
+
+--------------------------------------------------------------------------------
+ [10] permanent 로 옮기고 XML 확인
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# firewall-cmd --list-rich-rules
+rule family="ipv4" source address="172.16.225.62/32" port port="8080" protocol="tcp" accept
+rule family="ipv4" source address="172.16.225.0/24" port port="8080" protocol="tcp" accept
+rule family="ipv4" source address="172.16.225.63/32" port port="8080" protocol="tcp" log prefix="R63 " level="info" limit value="5/m" reject
+rule family="ipv4" source address="172.16.225.62/32" forward-port port="8081" protocol="tcp" to-port="8080"
+-- runtime 의 rich rule 4 개. 넣은 순서대로 보인다
+-- 이 네 개를 저장하지 않으면 reload 한 번에 모두 사라진다(실습 02 [5])
+[root@ol7a ~]# firewall-cmd --runtime-to-permanent; grep -c '<rule' /etc/firewalld/zones/public.xml
+success
+4
+-- runtime-to-permanent 뒤 public.xml 의 <rule 4 개
+[root@ol7a ~]# sed -n '/<rule/,/<\/rule>/p' /etc/firewalld/zones/public.xml | head -12
+  <rule family="ipv4">
+    <source address="172.16.225.62/32"/>
+    <port protocol="tcp" port="8080"/>
+    <accept/>
+  </rule>
+  <rule family="ipv4">
+    <source address="172.16.225.0/24"/>
+    <port protocol="tcp" port="8080"/>
+    <accept/>
+  </rule>
+  <rule family="ipv4">
+    <source address="172.16.225.63/32"/>
+-- XML 에서는 rule 이 블록으로 풀린다. 처음 12 줄만 잘랐다
+-- 남은 두 rule(log+reject, forward-port)도 같은 모양으로 이어진다
+
+--------------------------------------------------------------------------------
+ [변형] rich rule 대신 출발지 영역으로 같은 제한
+--------------------------------------------------------------------------------
+
+-- 같은 "8080 은 .62 만" 을 영역으로 만든다. 새 영역은 permanent 로만 만들 수 있다
+[root@ol7a ~]# firewall-cmd --permanent --remove-rich-rule='rule family="ipv4" source address="172.16.225.0/24" port port="8080" protocol="tcp" accept'
+success
+[root@ol7a ~]# firewall-cmd --permanent --remove-rich-rule='rule family="ipv4" source address="172.16.225.62/32" port port="8080" protocol="tcp" accept'
+success
+-- permanent 에서 accept 두 규칙을 뺐다. 로그·거부·포워딩은 남겨 둔다
+-- runtime 에는 아직 네 개가 있다. 아래 reload 에서 permanent 기준으로 바뀐다
+[root@ol7a ~]# firewall-cmd --permanent --new-zone=appsrc; firewall-cmd --permanent --zone=appsrc --add-source=172.16.225.62/32; firewall-cmd --permanent --zone=appsrc --add-port=8080/tcp
+success
+success
+success
+-- 새 영역 appsrc 를 만들고 출발지 .62 와 8080 을 넣었다. --new-zone 은 --permanent 전용
+-- 영역 이름은 짧은 영문으로. 파일은 /etc/firewalld/zones/appsrc.xml 로 생긴다
+[root@ol7a ~]# firewall-cmd --reload; firewall-cmd --get-active-zones; firewall-cmd --zone=appsrc --list-all
+success
+appsrc
+  sources: 172.16.225.62/32
+public
+  interfaces: ens32
+appsrc (active)
+  target: default
+  icmp-block-inversion: no
+  interfaces: 
+  sources: 172.16.225.62/32
+-- appsrc 는 target default, services 는 비었고 ports 8080/tcp 하나
+-- reload 뒤라 runtime 에도 바로 있다. get-active-zones 에서 sources 로 활성
+  services: 
+  ports: 8080/tcp
+  protocols: 
+  masquerade: no
+  forward-ports: 
+  source-ports: 
+  icmp-blocks: 
+  rich rules: 
+        
+[root@ol7b ~]# echo "zone62" | ncat -w 3 ol7a 8080; echo "rc=$?"
+rc=0
+-- .62 는 appsrc 의 8080 으로 통과
+-- public 에는 8080 허용이 없다. .62 의 통과는 appsrc 덕분이다
+[root@ol7b ~]# echo "zone63" | ncat -s 172.16.225.63 -w 3 ol7a 8080; echo "rc=$?"
+Ncat: Connection refused.
+rc=1
+-- .63 은 appsrc 가 아니라 public 으로 가고, public 의 .63 거부에 걸렸다
+
+-- .62 의 ssh 는? appsrc 영역에는 ssh 서비스가 없다
+[root@ol7b ~]# ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 ol7a true; echo "rc=$?"
+Warning: Permanently added 'ol7a,172.16.225.61' (ECDSA) to the list of known hosts.
+Permission denied (publickey,gssapi-keyex,gssapi-with-mic,password).
+rc=255
+-- appsrc 에는 ssh 가 없는데 .62 의 ssh 가 sshd 까지 갔다(Permission denied 는 인증 단계)
+-- 7.9 의 firewalld 는 출발지 영역에서 결정 안 된 패킷을 인터페이스 영역(public)으로 넘긴다
+-- 이것을 zone drifting 이라 부른다. 실습 04 [2] 의 로그에 AllowZoneDrifting is enabled 경고가 남았다
+-- [OL8/9] 8 이후 기본은 AllowZoneDrifting=no. 같은 설계에서 .62 의 ssh 가 막힌다
+
+--------------------------------------------------------------------------------
+ [11] 되돌리기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# firewall-cmd --permanent --delete-zone=appsrc; rm -f /etc/firewalld/zones/public.xml* /etc/firewalld/zones/appsrc.xml*; firewall-cmd --reload
+success
+success
+-- appsrc 를 지우고 public.xml 도 지운 뒤 reload
+-- --delete-zone 도 --permanent 전용. 지운 뒤 reload 해야 runtime 에서 빠진다
+[root@ol7a ~]# firewall-cmd --list-all; firewall-cmd --get-active-zones
+public (active)
+  target: default
+  icmp-block-inversion: no
+  interfaces: ens32
+  sources: 
+  services: dhcpv6-client ssh
+  ports: 
+  protocols: 
+  masquerade: no
+  forward-ports: 
+  source-ports: 
+  icmp-blocks: 
+  rich rules: 
+        
+public
+  interfaces: ens32
+-- list-all 은 [0] 과 같다. 활성 영역도 public 하나
+-- public.xml 을 지웠으니 public 은 /usr/lib 의 기본 정의를 다시 쓴다
+-- ncat 리스너와 /tmp/recv.log 도 지웠다
+[root@ol7a ~]# pkill -x ncat; rm -f /tmp/recv.log; ls /etc/firewalld/zones/
+[root@ol7b ~]# ip addr del 172.16.225.63/24 dev ens32; ip -4 -o addr show ens32; rm -f /tmp/send.log
+2: ens32    inet 172.16.225.62/24 brd 172.16.225.255 scope global noprefixroute ens32\       valid_lft forever preferred_lft forever
+-- ol7b 의 보조 주소 .63 이 사라졌다. [0] 과 같은 한 줄
+-- ol7b 는 이 실습 끝에서 전원을 끈다
+-- ncat 패키지는 남는다. 스냅샷이 지운다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                 시작 전     작업 중                              되돌린 뒤
+--  rich rules           0           accept 2, log+reject 1, forward 1    0
+--  .63 → 8080 새 연결   거부(host)  Connection refused(port-unreach)     -
+--  .63 기존 연결        -           거부 규칙 뒤에도 30 줄 모두 도착     -
+--  trusted sources      없음        172.16.225.63/32                     없음
+--  appsrc 영역          없음        .62 + 8080/tcp                       없음
+--  ol7b 보조 주소       없음        172.16.225.63                        없음
+-- 오류 두 가지
+--   기존 연결이 안 막힘    : ESTABLISHED 가 먼저 → 연결을 따로 정리
+--   trusted 출발지        : 출발지 영역이 먼저 → --remove-source
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. reject type="icmp-host-prohibited" 로 바꿔 .63 의 메시지가 No route to host 로 바뀌는지 본다
+-- 2. source address 에 invert="true" 를 붙여 ".62 가 아닌 모든 주소 거부" 를 만들고 iptables -S IN_public_deny 로 ! -s 를 확인한다
+-- 3. /etc/firewalld/firewalld.conf 의 AllowZoneDrifting 을 no 로 바꾸고 [변형] 의 ssh 결과를 비교한다
+--    확인 방법: 바꾸기 전에 강사 PC 주소가 출발지 영역에 묶이지 않았는지 본다
+
+================================================================================
+ 실습 03 종료 — rich rule 은 log·deny·allow 체인 순서로 평가되고, 기존 연결과 출발지 영역은 public 의 거부를 피해 감
+================================================================================

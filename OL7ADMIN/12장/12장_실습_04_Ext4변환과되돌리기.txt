@@ -1,0 +1,451 @@
+================================================================================
+ 제12장 실습 04 — Ext4 변환과 되돌리기
+ 대상   : ol7a (추가 디스크 sdb 사용)
+ 목표   : Ext4 파일 시스템을 btrfs-convert 로 제자리 변환하고, 원래 메타데이터가
+          ext2_saved 서브볼륨에 보존되는 것을 본다. -r 로 Ext4 로 되돌리고,
+          ext2_saved 를 지운 뒤에는 되돌릴 수 없음을 확인한다
+ 배경   : btrfs-convert 는 Ext 의 빈 블록에 Btrfs 메타데이터를 새로 쓰고, 데이터
+          블록은 옮기지 않은 채 가리키기만 한다. 원래 Ext 메타데이터는 ext2_saved
+          서브볼륨 안의 이미지 파일로 남는다. 그래서 변환 뒤에 쓴 내용이 있어도
+          되돌릴 수 있다. 루트와 /boot 는 변환할 수 없다(본문 12.9절)
+ 소요   : 약 20분
+ 선행   : storage-clean 스냅샷, UEK R6 로 부팅
+ 계정   : root
+ 주의   : 변환 전 백업이 원칙이다. 이 실습은 빈 디스크 sdb 에 만든 Ext4 로 하고, sdc 를 [변형] 에 쓴다
+ 되돌림 : 마운트 해제, wipefs, fstab 원래대로. 확인 lsblk -f /dev/sdb /dev/sdc, diff fstab
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 실행 커널, 대상 디스크, fstab 사본.
+-- 마지막 단계에서 fstab 을 이 사본과 diff 한다
+-- 이 실습의 흐름: Ext4 만들기 → 마운트된 채 변환 시도(오류) → 변환 → fstab 오류 →
+--   ext2_saved 확인 → 되돌리기 → 다시 변환하고 ext2_saved 삭제 → 되돌리기 실패 → balance
+[root@ol7a ~]# uname -r; lsblk -f /dev/sdb; cp /etc/fstab /root/fstab.before
+5.4.17-2136.338.4.2.el7uek.x86_64
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+-- el7uek 커널. sdb 는 서명이 없는 빈 디스크(파티션 줄도 없음)
+[root@ol7a ~]# rpm -q btrfs-progs e2fsprogs; ls -l /usr/sbin/btrfs-convert
+-- btrfs-convert 는 btrfs-progs 5.12.1 에 들어 있다.
+-- Ext 를 읽는 데 e2fsprogs 라이브러리를 쓴다
+--   e2fsprogs-1.45.4 는 OL 7.9 판. 문서의 fsck.ext4 단계도 이 패키지다
+-- 문서(Managing File Systems 4장)의 절차는 다섯 단계다
+--   umount → fsck.extN -f → btrfs-convert → fstab 형식 수정 → mount
+-- 이 실습은 그 순서를 일부러 어겨 가며 각 단계가 왜 필요한지 본다
+btrfs-progs-5.12.1-1.el7.x86_64
+e2fsprogs-1.45.4-3.0.7.el7.x86_64
+-rwxr-xr-x. 1 root root 536248 Jul  1  2021 /usr/sbin/btrfs-convert
+
+--------------------------------------------------------------------------------
+ [1] 변환할 Ext4 만들기
+--------------------------------------------------------------------------------
+
+-- 실무에서 변환 대상이 되는 것은 대개 이미 쓰던 Ext4 다. 그 상황을 흉내 낸다.
+[root@ol7a ~]# mkfs.ext4 -q -L legacy /dev/sdb; mkdir -p /legacy; mount /dev/sdb /legacy
+-- -q 는 mkfs 진행 출력을 끈다. -L legacy 레이블은 fstab 에서 쓴다
+-- 레이블은 변환 뒤에도 그대로 남아 fstab 의 LABEL= 이 계속 맞는다([4] blkid)
+-- 운영에서는 이미 데이터가 있는 Ext4 를 변환하므로 이 단계 대신 기존 볼륨을 쓴다
+[root@ol7a ~]# cp -a /etc /legacy/; dd if=/dev/urandom of=/legacy/data.bin bs=1M count=300 status=none; echo "ext4 era" > /legacy/note.txt; sync
+-- /etc 전체 사본(작은 파일 수천 개)과 300MiB 난수 파일, 텍스트 한 줄
+--   작은 파일은 inode 변환을, 큰 파일은 데이터 블록을 옮기지 않는 것을 보려는 재료다
+[root@ol7a ~]# df -hT /legacy; du -sh /legacy/etc
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdb       ext4  9.8G  352M  8.9G   4% /legacy
+52M     /legacy/etc
+-- df 의 일곱 열: Filesystem·Type(ext4)·Size 9.8G·Used 352M·Avail 8.9G·Use% 4%·Mounted on
+--   Size 가 10G 가 아니라 9.8G 인 것은 Ext4 의 inode 테이블·저널 몫
+-- 변환 전후를 비교할 지문을 남긴다. 파일 목록 전체의 md5 를 하나로 묶는다.
+[root@ol7a ~]# cd /legacy && find . -type f ! -path './lost+found/*' -exec md5sum {} + | sort -k2 | md5sum; cd /
+cad09efc9d683d5fc4e7f0b89372c169  -
+-- 파일 전체의 md5 를 이름순으로 모아 다시 md5 한 지문.
+-- lost+found 는 뺐다
+-- 변환 뒤([5])와 되돌린 뒤([9])에 같은 명령으로 비교한다
+--   find -type f : 일반 파일만. -exec md5sum {} + : 여러 파일을 한 번에 넘긴다
+--   sort -k2 : 둘째 필드(경로) 기준 정렬. 순서가 같아야 지문이 같다
+--   cd /legacy && ... ; cd / : 상대 경로로 세야 마운트 지점이 바뀌어도 같은 값이 나온다
+[root@ol7a ~]# echo "LABEL=legacy /legacy ext4 defaults 0 2" >> /etc/fstab; tail -1 /etc/fstab
+-- 운영 서버처럼 fstab 에 등록했다.
+-- 여섯 번째 필드 2 는 부팅 때 루트 다음 순서로 fsck
+--   첫 필드 LABEL=legacy : 장치 이름 대신 레이블로 찾는다
+LABEL=legacy /legacy ext4 defaults 0 2
+[root@ol7a ~]# dumpe2fs -h /dev/sdb 2>/dev/null | grep -E 'Filesystem UUID|Block size|Block count|Free blocks|Inode count|features'
+Filesystem UUID:          2ca3555d-03fd-44fc-a5b0-615752777275
+Filesystem features:      has_journal ext_attr resize_inode dir_index filetype needs_recovery extent flex_bg sparse_super large_file huge_file uninit_bg dir_nlink extra_isize
+Inode count:              655360
+Block count:              2621440
+Free blocks:              2558161
+Block size:               4096
+Journal features:         (none)
+-- 변환 전 Ext4 의 지문
+--   Filesystem UUID : 2ca3555d-... 되돌린 뒤 같은 UUID 로 돌아오는지 본다([8])
+--   features 에 has_journal·extent·flex_bg 등. needs_recovery 는 마운트 중이라 붙은 표시
+--   Inode count 655360, Block count 2621440(4096 × 10GiB), Free blocks 2558161
+--   Block size 4096 : 변환 뒤 Btrfs 의 sectorsize 도 이 값을 따른다
+--     Ext 블록 크기와 시스템 페이지 크기(x86_64 4KiB)가 다르면 변환본을 마운트하지 못한다
+--     7.9 릴리스 노트의 aarch64(64KiB 페이지) 알려진 문제도 이 조건에서 생긴다
+
+--------------------------------------------------------------------------------
+ [2] 마운트된 채로 변환하려 하면
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# btrfs-convert /dev/sdb; echo "rc=$?"
+ERROR: /dev/sdb is mounted
+rc=1
+-- 증상   : 마운트된 채 btrfs-convert /dev/sdb → 'ERROR: /dev/sdb is mounted', rc=1
+-- 원인   : 변환기는 장치의 메타데이터를 직접 고친다. 마운트 중이면 커널 캐시와 디스크
+--          내용이 어긋나므로 시작 전에 마운트 여부를 검사해 거부한다
+-- 조치   : umount /legacy 뒤 fsck.ext4 -f 로 검사하고 변환([3])
+-- 재확인 : 변환이 'conversion complete' 로 끝남
+-- 아무것도 바뀌지 않았다. 거부가 디스크에 쓰기 전에 일어난다
+-- /legacy 는 아직 ext4 로 마운트돼 있고 내용도 그대로다
+
+--------------------------------------------------------------------------------
+ [3] 언마운트, fsck, 변환
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /legacy
+-- 문서 절차대로 -f 로 강제 검사부터 한다. 변환기는 깨끗한 Ext 만 다룬다.
+[root@ol7a ~]# fsck.ext4 -f -y /dev/sdb
+e2fsck 1.45.4 (23-Sep-2019)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+legacy: 2626/655360 files (0.2% non-contiguous), 153367/2621440 blocks
+-- 다섯 단계 Pass 1~5 가 오류 없이 지나갔다
+--   2626 개 inode 사용, 블록 153367 개 사용. 이 2626 이 변환기의 copy inodes 개수와 같다
+-- -f 는 깨끗해 보여도 강제로 전체 검사, -y 는 고칠 것이 있으면 묻지 않고 고친다
+-- 변환기는 오류가 있는 Ext 를 만나면 중간에 멈출 수 있어 문서가 이 단계를 요구한다
+[root@ol7a ~]# time btrfs-convert /dev/sdb
+WARNING: create btrfs filesystem:
+        blocksize: 4096
+        nodesize:  16384
+        features:  extref, skinny-metadata (default)
+        checksum:  crc32c
+free space report:
+        total:     10737418240
+        free:      9875685376 (91.97%)
+-- 변환기가 정한 새 Btrfs 의 값.
+-- blocksize 4096·nodesize 16384·features 는 mkfs 기본과 같다
+-- free 91.97% : Btrfs 메타데이터를 쓸 Ext4 의 빈 공간
+--   total 10737418240 은 장치 크기(바이트). 빈 공간이 부족하면 변환이 시작되지 않는다
+--   Ext 가 거의 찬 상태에서는 변환 전에 공간을 비운다
+creating ext2 image file
+creating btrfs metadata
+copy inodes [o] [         0/      2626]
+-- creating ext2 image file : 원래 Ext 메타데이터를 담을 image 파일을 만든다
+-- copy inodes 2626 : fsck 의 inode 수와 같다.
+-- 줄 끝의 extended inode 경고는 Ext4 의 256바이트
+--   inode 에 든 나노초 시각을 이 판의 e2fsprogs 가 읽지 못한다는 뜻. 초 단위 시각은 옮겨진다
+extended inode (size 256) found but e2fsprogs don't support reading extra timespec
+
+conversion complete
+
+real    0m1.411s
+user    0m0.088s
+sys     0m1.306s
+-- 10GiB 장치, 352M 데이터 변환이 1.4초. 데이터 블록을 복사하지 않기 때문이다
+-- 시간은 데이터 양보다 inode 수에 비례한다.
+-- 파일 수가 수백만이면 수십 분이 걸릴 수 있다
+-- real·user·sys : 경과 시간, 사용자 공간 CPU, 커널 CPU.
+-- sys 가 대부분이다(디스크 쓰기)
+
+--------------------------------------------------------------------------------
+ [4] 변환 결과 확인
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# blkid /dev/sdb
+/dev/sdb: LABEL="legacy" UUID="8ea9efd6-5c69-4ff0-87c1-8256f224b64d" UUID_SUB="4fb17251-8d83-472e-9da3-3bc0952dd328" TYPE="btrfs" 
+-- 레이블 legacy 는 그대로, TYPE 이 btrfs.
+-- UUID 는 새로 받았다(8ea9efd6-...)
+--   UUID_SUB 가 생긴 것도 Btrfs 라는 표시다. 단일 장치라도 장치 UUID 를 따로 둔다
+--   fstab 이 UUID= 였다면 이 값으로 바꿔야 했다. LABEL= 이라 그대로 맞는다
+--   운영 fstab 이 UUID 를 쓰면 변환 직후 blkid 로 새 UUID 를 확인한다
+-- 변환 전 Ext4 UUID 2ca3555d-... 는 image 안에 남아 있다
+-- fstab 은 아직 ext4 라고 적혀 있다. 그대로 mount -a 를 하면.
+[root@ol7a ~]# mount -a; echo "rc=$?"; findmnt /legacy
+mount: wrong fs type, bad option, bad superblock on /dev/sdb,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+rc=32
+-- 증상   : mount -a 가 'mount: wrong fs type, bad option, bad superblock on /dev/sdb,' rc=32
+-- 원인   : fstab 세 번째 필드가 ext4 인데 장치는 이미 btrfs 다(blkid TYPE="btrfs").
+--          mount 는 ext4 드라이버로 열다가 슈퍼블록을 알아보지 못했다
+-- 조치   : fstab 줄을 LABEL=legacy /legacy btrfs defaults 0 0 으로 고친다([5])
+-- 재확인 : mount -a 뒤 findmnt 의 FSTYPE 이 btrfs
+-- 부팅 때 이 상태면 local-fs.target 이 실패해 emergency 모드로 떨어진다(9장 실습 04)
+-- findmnt /legacy 는 출력이 없다. 마운트되지 않았다
+-- 메시지가 "bad superblock" 이라 디스크 손상으로 오해하기 쉽다.
+-- 먼저 blkid 의 TYPE 과 fstab 을 대조한다
+
+--------------------------------------------------------------------------------
+ [5] fstab 고치고 마운트
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# sed -i 's#^LABEL=legacy /legacy ext4 defaults 0 2#LABEL=legacy /legacy btrfs defaults 0 0#' /etc/fstab; diff /root/fstab.before /etc/fstab
+11a12
+> LABEL=legacy /legacy btrfs defaults 0 0
+-- 원본 대비 12번째 줄 추가. 형식 btrfs,
+-- 여섯 번째 필드 0(Btrfs 는 부팅 fsck 를 하지 않는다)
+-- sed 는 줄 전체를 바꿨다.
+-- diff 는 원본(11줄)과 비교해 추가된 줄 하나로 보인다
+[root@ol7a ~]# mount -a; findmnt /legacy; df -hT /legacy
+TARGET  SOURCE   FSTYPE OPTIONS
+/legacy /dev/sdb btrfs  rw,relatime,seclabel,space_cache,subvolid=5,subvol=/
+Filesystem     Type   Size  Used Avail Use% Mounted on
+/dev/sdb       btrfs   10G  607M  9.4G   6% /legacy
+-- 형식이 btrfs, Size 10G(장치 전체).
+-- Used 607M 은 Ext4 때 352M 보다 크다
+--   ext2_saved 의 image 가 원래 메타데이터 블록을 들고 있기 때문이다([6])
+[root@ol7a ~]# cd /legacy && find . -type f ! -path './lost+found/*' ! -path './ext2_saved/*' -exec md5sum {} + | sort -k2 | md5sum; cd /
+cad09efc9d683d5fc4e7f0b89372c169  -
+-- 지문이 [1] 과 같다. ext2_saved 는 빼고 셌다.
+-- 변환은 파일 내용을 하나도 바꾸지 않았다
+
+--------------------------------------------------------------------------------
+ [6] ext2_saved 서브볼륨
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# btrfs subvolume list /legacy
+ID 256 gen 3 top level 5 path ext2_saved
+-- 변환기가 만든 서브볼륨 하나. ID 256, 최상위 바로 아래
+-- 변환된 파일들(etc, data.bin,
+-- note.txt)은 최상위(ID 5)에 그대로 있다
+-- ext2_saved 는 일반 서브볼륨이라 btrfs subvolume delete 로 지울 수 있다([10])
+[root@ol7a ~]# ls -l /legacy/ext2_saved
+total 613468
+-r--------. 1 root root 10737418240 Nov 16 11:53 image
+-- image 의 논리 크기 10737418240 = 장치 크기 10GiB.
+-- 원래 Ext 장치 전체를 보이는 파일이다
+-- total 613468(KiB) 이 실제 차지한 블록.
+-- 데이터 블록은 일반 파일과 공유하고 있다
+-- 권한 -r-------- : root 만 읽기. 이 파일을 고치면 되돌리기가 깨진다
+[root@ol7a ~]# btrfs filesystem df /legacy
+Data, single: total=828.66MiB, used=599.09MiB
+System, single: total=4.00MiB, used=16.00KiB
+Metadata, single: total=32.00MiB, used=3.72MiB
+GlobalReserve, single: total=3.25MiB, used=0.00B
+-- 변환한 Btrfs 의 프로파일은 모두 single.
+-- mkfs 로 만든 단일 장치(Metadata DUP)와 다르다
+--   Data total 828.66 / used 599.09MiB : image 가 가리키는 블록까지 포함한 양
+--   Metadata total 32MiB : mkfs 기본 256MiB 보다 작다. Ext 의 빈 블록 그룹에 맞춰 잡았다
+-- Data total 828.66MiB 처럼 chunk 크기가 들쭉날쭉하다.
+-- Ext 블록 그룹 경계를 따라 잡았다
+
+--------------------------------------------------------------------------------
+ [7] 변환 뒤에 내용을 바꾼다
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# echo "btrfs era" > /legacy/after.txt; echo "changed" >> /legacy/note.txt; sync; ls /legacy; cat /legacy/note.txt
+after.txt
+data.bin
+etc
+ext2_saved
+lost+found
+note.txt
+ext4 era
+changed
+-- after.txt 를 새로 만들고 note.txt 에 한 줄을 붙였다.
+-- 둘 다 Btrfs 에서 일어난 변경이다
+-- ls 에 ext2_saved 가 보인다. 사용자에게 보이는 디렉터리라 실수로 지우기 쉽다
+-- 이 변경이 되돌린 뒤 어떻게 되는지 [9] 에서 본다
+
+--------------------------------------------------------------------------------
+ [8] -r 로 Ext4 되돌리기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /legacy
+[root@ol7a ~]# time btrfs-convert -r /dev/sdb
+rollback succeeded
+
+real    0m0.004s
+user    0m0.000s
+sys     0m0.003s
+-- 0.004초. image 에 있던 Ext 메타데이터 자리를 되돌리기만 한다
+-- 되돌리기 순서: 언마운트 → btrfs-convert -r → blkid 로 TYPE 확인 → fstab 을 ext4 로 → mount
+-- -r 은 마운트된 장치에서는 거부된다. 변환과 같은 검사가 있다
+[root@ol7a ~]# blkid /dev/sdb; fsck.ext4 -f -n /dev/sdb | tail -2
+/dev/sdb: LABEL="legacy" UUID="2ca3555d-03fd-44fc-a5b0-615752777275" TYPE="ext4" 
+e2fsck 1.45.4 (23-Sep-2019)
+Pass 5: Checking group summary information
+legacy: 2626/655360 files (0.2% non-contiguous), 153367/2621440 blocks
+-- UUID 가 변환 전 2ca3555d-... 로 돌아왔다. TYPE="ext4"
+-- fsck -n(읽기만) 의 마지막 줄이 [3] 과 숫자까지 같다.
+-- 2626 files, 153367 blocks
+
+--------------------------------------------------------------------------------
+ [9] 되돌린 Ext4 확인
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cp /root/fstab.before /etc/fstab; echo "LABEL=legacy /legacy ext4 defaults 0 2" >> /etc/fstab; mount -a; findmnt /legacy
+TARGET  SOURCE   FSTYPE OPTIONS
+/legacy /dev/sdb ext4   rw,relatime,seclabel
+-- fstab 을 ext4 defaults 0 2 로 되돌리고 mount -a. FSTYPE ext4
+[root@ol7a ~]# ls /legacy; cat /legacy/note.txt
+data.bin
+etc
+lost+found
+note.txt
+ext4 era
+-- after.txt 가 없고 note.txt 에 changed 가 없다.
+-- 변환 뒤 Btrfs 에서 쓴 내용은 사라졌다
+[root@ol7a ~]# cd /legacy && find . -type f ! -path './lost+found/*' -exec md5sum {} + | sort -k2 | md5sum; cd /
+cad09efc9d683d5fc4e7f0b89372c169  -
+-- 지문이 [1] 과 같다. 파일 내용까지 변환 직전 상태다
+-- 되돌리기가 데이터 블록을 건드리지 않았다는 증거다. 메타데이터만 바뀌었다
+
+--------------------------------------------------------------------------------
+ [10] 다시 변환하고 ext2_saved 를 지우면
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /legacy; fsck.ext4 -f -y /dev/sdb >/dev/null; btrfs-convert /dev/sdb | tail -2
+e2fsck 1.45.4 (23-Sep-2019)
+WARNING: extended inode (size 256) found but e2fsprogs don't support reading extra timespec
+copy inodes [o] [         0/      2626]
+conversion complete
+-- 다시 fsck 후 변환. tail -2 로 끝 두 줄만 보였다
+-- [8] 에서 되돌린 Ext4 를 다시 변환한다. 같은 Ext4 를 여러 번 오가도 된다
+-- 첫 줄 e2fsck 1.45.4 는 fsck 출력의 stderr 가 >/dev/null 로 막히지 않아 남았다
+[root@ol7a ~]# mount -t btrfs /dev/sdb /legacy; btrfs subvolume delete /legacy/ext2_saved; btrfs filesystem sync /legacy
+Delete subvolume (no-commit): '/legacy/ext2_saved'
+-- 되돌리기의 근거인 ext2_saved 를 지웠다.
+-- filesystem sync 로 삭제를 커밋했다
+[root@ol7a ~]# btrfs filesystem df /legacy | head -2
+Data, single: total=820.66MiB, used=599.09MiB
+System, single: total=4.00MiB, used=16.00KiB
+[root@ol7a ~]# umount /legacy; btrfs-convert -r /dev/sdb; echo "rc=$?"
+ERROR: unable to find source fs image subvolume, is it deleted?
+ERROR: rollback failed
+rc=1
+-- 증상   : btrfs-convert -r /dev/sdb 가
+--          'ERROR: unable to find source fs image subvolume, is it deleted?' 'ERROR: rollback failed', rc=1
+-- 원인   : -r 은 ext2_saved/image 의 원래 메타데이터로 되돌린다. 그 서브볼륨을 지웠다
+-- 조치   : 되돌릴 방법이 없다. 변환 전 백업에서 복원하거나 Btrfs 로 계속 쓴다
+-- 재확인 : mount -t btrfs 로 데이터가 그대로인지 확인([11])
+-- ext2_saved 삭제는 "Ext4 로 돌아갈 일이 없다"는 결정이다.
+-- 검증이 끝나기 전에는 지우지 않는다
+
+--------------------------------------------------------------------------------
+ [11] 공간 회수 — balance
+--------------------------------------------------------------------------------
+
+-- ext2_saved 를 지웠으니 이제 이 파일 시스템은 Btrfs 로만 쓴다.
+-- 변환된 Btrfs 는 Ext 블록 그룹 경계에 맞춘 작은 chunk 가 많다. balance 로 다시 정리한다.
+[root@ol7a ~]# mount -t btrfs /dev/sdb /legacy; btrfs filesystem df /legacy
+Data, single: total=400.00MiB, used=354.41MiB
+System, single: total=4.00MiB, used=16.00KiB
+Metadata, single: total=32.00MiB, used=3.41MiB
+GlobalReserve, single: total=3.25MiB, used=0.00B
+-- Data used 599 → 354MiB.
+-- image 가 들고 있던 원래 메타데이터 블록이 풀렸다
+-- 354MiB ≈ data.bin 300MiB + etc 52MiB.
+-- 이제 사용량이 Ext4 때 Used 352M 와 비슷하다
+-- Data total 400MiB : 빈 chunk 가 회수되며 할당도 줄었다
+[root@ol7a ~]# time btrfs balance start --full-balance /legacy
+Done, had to relocate 4 out of 4 chunks
+
+real    0m0.493s
+user    0m0.000s
+sys     0m0.273s
+-- 0.5초에 chunk 4개 재배치
+-- 데이터가 354MiB 뿐이라 빨랐다.
+-- 데이터가 많으면 balance 는 변환보다 훨씬 오래 걸린다
+[root@ol7a ~]# btrfs filesystem df /legacy
+Data, single: total=1.00GiB, used=354.72MiB
+System, single: total=32.00MiB, used=16.00KiB
+Metadata, single: total=256.00MiB, used=3.33MiB
+GlobalReserve, single: total=3.25MiB, used=0.00B
+-- balance 뒤 Data total 1.00GiB,
+-- Metadata 256MiB, System 32MiB. 표준 chunk 크기로 정리됐다
+-- 프로파일은 여전히 single.
+-- DUP 로 바꾸려면 balance -mconvert=dup
+-- 변환본을 오래 쓸 것이면 이 정리를 한 번 한다.
+-- 그 전에 ext2_saved 를 지워야 의미가 있다
+--   ext2_saved 가 남아 있으면 image 가 공유하는 블록은 옮겨도 풀리지 않는다
+
+--------------------------------------------------------------------------------
+ [변형] mkfs 로 새로 만든 Btrfs 와 비교
+--------------------------------------------------------------------------------
+
+-- 같은 크기의 빈 장치 sdc 에 새로 만든 Btrfs 의 초기 상태를 본다.
+[root@ol7a ~]# mkfs.btrfs -q -L fresh /dev/sdc; mkdir -p /fresh; mount /dev/sdc /fresh
+[root@ol7a ~]# btrfs filesystem df /fresh
+Data, single: total=8.00MiB, used=0.00B
+System, DUP: total=8.00MiB, used=16.00KiB
+Metadata, DUP: total=256.00MiB, used=112.00KiB
+GlobalReserve, single: total=3.25MiB, used=0.00B
+-- mkfs 로 새로 만든 sdc : Data single 8MiB, System·Metadata DUP.
+-- 변환본과 메타데이터 프로파일이 다르다
+--   -q 로 mkfs 출력을 껐다. 장치 하나, 회전 디스크라 Metadata 기본값이 DUP
+--   변환본은 Metadata 사본이 하나라 메타데이터 블록이 깨지면 고칠 사본이 없다
+[root@ol7a ~]# btrfs inspect-internal dump-super /dev/sdb | grep -E '^(nodesize|sectorsize|incompat_flags)'
+sectorsize              4096
+nodesize                16384
+incompat_flags          0x141
+[root@ol7a ~]# btrfs inspect-internal dump-super /dev/sdc | grep -E '^(nodesize|sectorsize|incompat_flags)'
+sectorsize              4096
+nodesize                16384
+incompat_flags          0x141
+-- dump-super 로 슈퍼블록을 직접 읽었다.
+-- 변환본(sdb)과 새것(sdc)이 sectorsize 4096·nodesize 16384,
+-- incompat_flags 0x141 로 같다. 0x141 = MIXED_BACKREF(0x1) + EXTENDED_IREF(0x40) + SKINNY_METADATA(0x100)
+-- 형식은 같고 다른 것은 chunk 배치와 프로파일이다
+-- 변환본도 mkfs 로 만든 Btrfs 와 같은 기능을 모두 쓴다.
+-- 서브볼륨·스냅샷·send 모두 된다
+-- 남는 차이(single 메타데이터)는 balance 로 바꾼다
+
+--------------------------------------------------------------------------------
+ [12] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /legacy /fresh; rmdir /legacy /fresh; cp /root/fstab.before /etc/fstab
+-- 출력 없음. 두 마운트 해제, 마운트 지점 삭제, fstab 원본 복사
+[root@ol7a ~]# wipefs -a /dev/sdb /dev/sdc >/dev/null; udevadm settle; lsblk -f /dev/sdb /dev/sdc; diff /root/fstab.before /etc/fstab && echo "fstab restored"
+-- udevadm settle 로 udev 처리를 기다린 뒤 lsblk 를 봤다.
+-- 두 장치 모두 빈 칸, fstab 은 원본과 같다
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+fstab restored
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                  시작 전         변경 후                            되돌린 뒤
+--  sdb 형식 (blkid)      없음            ext4 → btrfs → ext4(-r) → btrfs    없음
+--  Ext4 UUID             -               2ca3555d-... (-r 뒤 같은 값)       -
+--  파일 지문 (md5)       -               cad09efc... 변환·되돌림 모두 같음  -
+--  변환 시간             -               1.4초 (2626 inode)                 -
+--  ext2_saved            -               image 10GiB(실제 약 600MiB)        삭제 후 -r 실패
+--  Data used             -               599MiB → 삭제 후 354MiB            -
+--  /etc/fstab            11줄            12줄 (ext4 → btrfs 0 0)            11줄
+--  rollback 시간         -               0.004초                            -
+--  balance (354MiB)      -               0.5초, chunk 4/4                   -
+--
+-- 확인한 사실
+--   마운트된 장치는 변환 거부, 변환 뒤 fstab 형식을 안 고치면 mount -a 실패(rc=32)
+--   -r 은 변환 뒤 쓴 내용을 버리고 Ext4 를 UUID·지문까지 되살린다. ext2_saved 가 없으면 불가
+--   변환본은 single 프로파일과 불규칙한 chunk. balance 로 정리된다
+--   btrfs-convert 의 extended inode 경고는 나노초 시각이 빠진다는 뜻이다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. 변환 뒤 Btrfs 에서 data.bin 을 고친 다음 -r 로 되돌려 data.bin 의 md5 가 원래대로인지 본다
+--    확인: 변환 전 md5sum /legacy/data.bin 값과 비교
+-- 2. 변환본에 balance -mconvert=dup 을 걸어 Metadata 프로파일을 바꾼다
+--    확인: btrfs filesystem df 의 Metadata, DUP 줄
+-- 3. ext2_saved 를 지우지 않은 채 balance 를 돌린 뒤 -r 이 되는지 본다
+--    확인: btrfs-convert -r 의 출력과 rc
+-- 4. Ext3 로 만든 장치(mkfs.ext3)를 변환해 ext2_saved 이름이 같은지 본다
+--    확인: btrfs subvolume list 의 path
+
+================================================================================
+ 실습 04 종료 — btrfs-convert 변환·되돌림과 ext2_saved 삭제 후 되돌리기 불가 확인
+================================================================================

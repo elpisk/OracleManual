@@ -1,0 +1,486 @@
+================================================================================
+ 제18장 실습 06 — 소켓 상태와 tcpdump 로 ol7a ↔ ol7b 통신 보기
+ 대상   : ol7a, ol7b
+ 목표   : ss -tanp·ss -s·netstat -s 로 소켓과 TCP 카운터를 읽고, ol7a 에서
+          ol7b 로 가는 연결을 tcpdump 로 캡처해(-i, -nn, 호스트·포트 필터,
+          -w/-r) 3-way handshake·데이터·종료 패킷의 플래그를 읽는다. 방화벽에
+          막힌 연결이 패킷으로 어떻게 보이는지도 본다
+ 배경   : ss 는 커널의 소켓 표를 netlink 로 바로 읽고 netstat 은 /proc/net 파일을
+          읽는다. 7.9 에는 둘 다 있다. tcpdump 는 한 인터페이스의 패킷을 BPF 필터로
+          골라 찍는다. -i 를 빼면 첫 번째 인터페이스 하나만 보고, -n 을 빼면 주소마다
+          이름 조회를 한다. TCP 연결은 SYN → SYN-ACK → ACK 로 열리고 FIN 으로
+          닫힌다(본문 18.5)
+ 소요   : 약 30분
+ 선행   : ol7-base, ol7b-base 스냅샷. ol7b 를 켠다
+ 계정   : root (두 노드)
+ 주의   : ol7b 의 firewalld 에 런타임 규칙을 하나 더한다(재시작하면 사라짐).
+          두 노드에 nmap-ncat 을 설치하고 끝에서 지운다
+ 되돌림 : ol7b 런타임 규칙 제거, ncat 프로세스 0개, nmap-ncat 제거, 캡처 파일 삭제.
+          확인은 firewall-cmd --list-ports(빈 줄) · rpm -q nmap-ncat
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# ip -br addr show; rpm -q tcpdump net-tools iproute nmap-ncat
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens32            UP             172.16.225.61/24 fe80::87f4:d993:7b43:e0c1/64 
+ens33            UP             
+tcpdump-4.9.2-4.0.1.el7_7.1.x86_64
+net-tools-2.0-0.25.20131004git.el7.x86_64
+iproute-5.15.0-1.0.3.el7.x86_64
+package nmap-ncat is not installed
+-- ens32 172.16.225.61/24 UP, ens33 은 UP 이지만 주소 없음(13장
+-- 본딩용 두 번째 NIC)
+-- tcpdump 4.9.2, net-tools(netstat), iproute 5.15(ss·ip) 는 있고
+-- nmap-ncat 은 없다
+[root@ol7b ~]# ip -br addr show; firewall-cmd --get-default-zone; firewall-cmd --list-services; firewall-cmd --list-ports
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens32            UP             172.16.225.62/24 fe80::20c:29ff:fe7c:e4df/64 
+public
+dhcpv6-client ssh
+-- ol7b: 기본 영역 public, 허용 서비스 dhcpv6-client·ssh, 열린
+-- 포트는 없음(빈 줄)
+-- 시험용 수신기·송신기로 ncat 을 쓴다. 기본 설치에 없어 두 노드에
+-- 넣는다(ol7_latest).
+[root@ol7a ~]# yum -y -q install nmap-ncat 2>&1 | tail -2; rpm -q nmap-ncat
+nmap-ncat-6.40-19.el7.x86_64
+[root@ol7b ~]# yum -y -q install nmap-ncat 2>&1 | tail -2; rpm -q nmap-ncat
+nmap-ncat-6.40-19.el7.x86_64
+-- 두 노드 모두 nmap-ncat 6.40 이 설치됐다(-q 라 yum 진행 줄은
+-- 없다)
+-- 끝에서 비교하려고 TCP 카운터를 떠 둔다.
+[root@ol7a ~]# netstat -s -t > /tmp/ns0.txt; wc -l /tmp/ns0.txt
+27 /tmp/ns0.txt
+-- netstat -s -t : TCP 쪽(그리고 관련 ICMP·IP 확장) 카운터만.
+-- 27줄을 떠 두었다
+
+--------------------------------------------------------------------------------
+ [1] ss -tanp — 지금 열린 TCP 소켓
+--------------------------------------------------------------------------------
+-- -t TCP -a 대기(LISTEN) 포함 전부 -n 이름 대신 숫자 -p 소켓을
+-- 가진 프로세스
+[root@ol7a ~]# ss -tanp
+State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process                           
+LISTEN 0      128          0.0.0.0:111       0.0.0.0:*     users:(("rpcbind",pid=999,fd=8)) 
+LISTEN 0      128          0.0.0.0:22        0.0.0.0:*     users:(("sshd",pid=1412,fd=3))   
+LISTEN 0      100        127.0.0.1:25        0.0.0.0:*     users:(("master",pid=1742,fd=13))
+ESTAB  0      0      172.16.225.61:22   172.16.225.1:63389 users:(("sshd",pid=1984,fd=3))   
+LISTEN 0      128             [::]:111          [::]:*     users:(("rpcbind",pid=999,fd=11))
+LISTEN 0      128             [::]:22           [::]:*     users:(("sshd",pid=1412,fd=4))   
+LISTEN 0      100            [::1]:25           [::]:*     users:(("master",pid=1742,fd=14))
+-- 열 해설
+--   State   : LISTEN(연결 대기), ESTAB(연결됨), TIME-WAIT(닫힌 뒤 대기) 등
+--   Recv-Q  : ESTAB 에서는 받았지만 프로그램이 아직 안 읽은 바이트, LISTEN 에서는 대기 중인 연결 수
+--   Send-Q  : ESTAB 에서는 보냈지만 상대가 확인 안 한 바이트, LISTEN 에서는 백로그 크기(128·100)
+--   Local·Peer Address:Port, Process : 소켓을 가진 프로세스 이름·PID·fd
+-- 대기 중: rpcbind 111, sshd 22, postfix master 25(127.0.0.1 만).
+-- IPv4·IPv6 가 따로 한 줄씩
+-- ESTAB 한 줄은 이 러너의 접속(호스트 172.16.225.1 → 22, sshd
+-- 1984)이다
+-- 대기 소켓만: -l. 줄 하나가 "이 주소·포트로 들어오는 연결을 받는
+-- 프로그램" 이다.
+[root@ol7a ~]# ss -tlnp
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess                           
+LISTEN 0      128          0.0.0.0:111       0.0.0.0:*    users:(("rpcbind",pid=999,fd=8)) 
+LISTEN 0      128          0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=1412,fd=3))   
+LISTEN 0      100        127.0.0.1:25        0.0.0.0:*    users:(("master",pid=1742,fd=13))
+LISTEN 0      128             [::]:111          [::]:*    users:(("rpcbind",pid=999,fd=11))
+LISTEN 0      128             [::]:22           [::]:*    users:(("sshd",pid=1412,fd=4))   
+LISTEN 0      100            [::1]:25           [::]:*    users:(("master",pid=1742,fd=14))
+-- -l 로 대기 소켓만. "이 서버에 밖에서 무엇으로 들어올 수 있나"
+-- 를 볼 때 쓴다
+
+--------------------------------------------------------------------------------
+ [2] ss -s 와 netstat -s — 요약과 누적 카운터
+--------------------------------------------------------------------------------
+[root@ol7a ~]# ss -s
+Total: 198
+TCP:   7 (estab 1, closed 0, orphaned 0, timewait 0)
+
+Transport Total     IP        IPv6
+RAW       1         0         1        
+UDP       6         3         3        
+TCP       7         4         3        
+INET      14        7         7        
+FRAG      0         0         0        
+-- TCP 7 = 대기 6 + 연결 1(estab 1). timewait 0. UDP 6, RAW 1
+[root@ol7a ~]# sed -n '1,14p' /tmp/ns0.txt
+IcmpMsg:
+    InType3: 3
+    OutType3: 3
+Tcp:
+    2 active connections openings
+    1 passive connection openings
+    0 failed connection attempts
+    0 connection resets received
+    1 connections established
+    137 segments received
+    160 segments send out
+    0 segments retransmited
+    0 bad segments received.
+    1 resets sent
+-- 누적 카운터. active 2(내가 연 연결), passive 1(받은 연결),
+-- failed 0, segments 137·160, 재전송 0
+-- IcmpMsg InType3·OutType3 : ICMP 형식 3(Destination
+-- Unreachable)을 받은·보낸 수. [8] 에서 다시 본다
+
+--------------------------------------------------------------------------------
+ [3] tcpdump 인터페이스 — -i 를 빼면
+--------------------------------------------------------------------------------
+-- -D : tcpdump 가 캡처할 수 있는 장치 목록. 번호 순서가 기본 선택
+-- 순서다.
+[root@ol7a ~]# tcpdump -D
+1.nflog (Linux netfilter log (NFLOG) interface)
+2.nfqueue (Linux netfilter queue (NFQUEUE) interface)
+3.ens32
+4.ens33
+5.any (Pseudo-device that captures on all interfaces)
+6.lo [Loopback]
+-- 목록 1·2 번이 nflog·nfqueue 다. 이 버전의 tcpdump 는 -i 가
+-- 없으면 이 목록의 1번을 고른다
+-- 자기 자신(127.0.0.1:7000)에 연결하는 프로그램의 패킷을 잡으려
+-- 한다. -i 없이.
+[root@ol7a ~]# nohup timeout 90 ncat -lk 127.0.0.1 7000 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# nohup timeout 8 tcpdump -nn -c 6 port 7000 >/tmp/td1.log 2>&1 </dev/null &
+[root@ol7a ~]# sleep 1; echo hi | ncat --send-only 127.0.0.1 7000; sleep 8; cat /tmp/td1.log
+tcpdump: NFLOG link-layer type filtering not implemented
+-- 증상   : tcpdump -nn -c 6 port 7000 이 패킷 하나 없이 "tcpdump:
+--          NFLOG
+--          link-layer type filtering not implemented" 를 찍고 끝났다
+-- 원인   : -i 를 주지 않아 tcpdump -D 의 첫 장치 nflog 를 골랐고,
+--          그 장치에는 BPF 필터를 걸 수 없다
+--          설령 ens32 를 골랐어도 127.0.0.1 통신은 lo 에만 있어 잡히지 않는다
+-- 조치   : 인터페이스를 늘 명시한다. 루프백 통신은 -i lo, 외부
+--          통신은 -i ens32
+-- 재확인 : 아래 -i lo 로 다시 하자 6 packets captured
+-- -i lo 로 다시
+[root@ol7a ~]# nohup timeout 8 tcpdump -i lo -nn -c 6 port 7000 >/tmp/td2.log 2>&1 </dev/null &
+[root@ol7a ~]# sleep 1; echo hi | ncat --send-only 127.0.0.1 7000; sleep 3; cat /tmp/td2.log
+tcpdump: verbose output suppressed, use -v or -vv for full protocol decode
+listening on lo, link-type EN10MB (Ethernet), capture size 262144 bytes
+17:39:10.012132 IP 127.0.0.1.41660 > 127.0.0.1.7000: Flags [S], seq 3276350682, win 65495, options [mss 65495,sackOK,TS val 3629549399 ecr 0,nop,wscale 7], length 0
+17:39:10.012143 IP 127.0.0.1.7000 > 127.0.0.1.41660: Flags [S.], seq 617763027, ack 3276350683, win 65483, options [mss 65495,sackOK,TS val 3629549399 ecr 3629549399,nop,wscale 7], length 0
+17:39:10.012151 IP 127.0.0.1.41660 > 127.0.0.1.7000: Flags [.], ack 1, win 512, options [nop,nop,TS val 3629549399 ecr 3629549399], length 0
+17:39:10.012195 IP 127.0.0.1.41660 > 127.0.0.1.7000: Flags [P.], seq 1:4, ack 1, win 512, options [nop,nop,TS val 3629549399 ecr 3629549399], length 3
+17:39:10.012207 IP 127.0.0.1.7000 > 127.0.0.1.41660: Flags [.], ack 4, win 512, options [nop,nop,TS val 3629549399 ecr 3629549399], length 0
+17:39:10.012215 IP 127.0.0.1.41660 > 127.0.0.1.7000: Flags [F.], seq 4, ack 1, win 512, options [nop,nop,TS val 3629549399 ecr 3629549399], length 0
+6 packets captured
+16 packets received by filter
+0 packets dropped by kernel
+-- 줄 형식: 시각 IP 출발.포트 > 도착.포트: Flags [플래그], seq,
+-- ack, win, options, length
+-- [S] → [S.] → [.] : 3-way handshake. [P.] length 3 : "hi\n" 세
+-- 바이트. [F.] : 보낸 쪽이 닫음
+-- -c 6 이라 여섯 개에서 멈췄다. received by filter 16 은 커널이
+-- 필터를 통과시킨 전체 수
+
+--------------------------------------------------------------------------------
+ [4] ol7b 로 연결 — 방화벽에 막히면 패킷이 어떻게 보이나
+--------------------------------------------------------------------------------
+-- ol7b 에 5555 포트 수신기를 띄운다. -k 는 연결이 끝나도 계속
+-- 받는다.
+[root@ol7b ~]# nohup timeout 600 ncat -lk 5555 >/tmp/recv.txt 2>&1 </dev/null &
+[root@ol7b ~]# ss -tlnp | grep 5555
+LISTEN 0      10           0.0.0.0:5555      0.0.0.0:*    users:(("ncat",pid=10175,fd=4))  
+LISTEN 0      10              [::]:5555         [::]:*    users:(("ncat",pid=10175,fd=3))  
+-- ol7b 의 ncat(PID 10175)이 IPv4·IPv6 5555 에서 기다린다. 백로그
+-- 10
+-- ol7a 에서 캡처를 걸고 보낸다.
+--   -i ens32 : 인터페이스  -nn : 주소·포트 모두 숫자  -w : 해석하지 않고 파일로  host·port : BPF 필터
+[root@ol7a ~]# nohup timeout 10 tcpdump -i ens32 -nn -w /tmp/fw.pcap host 172.16.225.62 and port 5555 >/tmp/td3.log 2>&1 </dev/null &
+[root@ol7a ~]# sleep 1; echo hello | ncat --send-only ol7b 5555; echo "ncat exit=$?"
+Ncat: No route to host.
+ncat exit=1
+-- 증상   : ol7a → ol7b 5555 연결에서 Ncat: No route to host.,
+--          exit 1
+-- 원인   : 경로 문제가 아니다. 같은 서브넷이고 ping·ssh 는 된다.
+--          ol7b 의 firewalld(public 영역)가
+--          5555 를 허용하지 않아 SYN 을 버리고 ICMP host-prohibited(형식 3)로 거부했다.
+--          커널이 그 ICMP 를 EHOSTUNREACH 로 바꾸고, ncat 은 그것을 No route to host 로 찍는다
+-- 조치   : ol7b 에서 firewall-cmd --add-port=5555/tcp (런타임)
+-- 재확인 : [5] 에서 같은 명령이 exit 0, ol7b 의 recv.txt 에 hello
+[root@ol7a ~]# sleep 10; cat /tmp/td3.log; tcpdump -nn -r /tmp/fw.pcap
+tcpdump: listening on ens32, link-type EN10MB (Ethernet), capture size 262144 bytes
+1 packet captured
+1 packet received by filter
+0 packets dropped by kernel
+reading from file /tmp/fw.pcap, link-type EN10MB (Ethernet)
+17:39:14.158486 IP 172.16.225.61.37654 > 172.16.225.62.5555: Flags [S], seq 2754682205, win 64240, options [mss 1460,sackOK,TS val 2414490428 ecr 0,nop,wscale 7], length 0
+-- 잡힌 것은 나가는 SYN 하나뿐(1 packet captured). SYN-ACK 가 없다
+-- 거부 응답은 ICMP 패킷이라 TCP 포트가 없다. port 5555 필터에
+-- 걸리지 않아 캡처에서 빠졌다
+-- 거부 응답(ICMP)이 이 캡처에 들어 있는지 icmp 만 따로 걸러 본다.
+[root@ol7a ~]# tcpdump -nn -v -r /tmp/fw.pcap icmp 2>/dev/null | head -4
+-- 출력 없음. 이 파일에는 ICMP 가 없다. 거부를 보려면 필터를 'host
+-- 172.16.225.62 and (port 5555 or icmp)' 로 짠다
+-- 대신 [8] 의 netstat -s 차이에서 InType3 3 → 4 로 ICMP 수신 한
+-- 건이 확인된다
+-- ol7b 에 런타임 규칙만 더한다(--permanent 없음 → 재시작하면
+-- 사라짐).
+[root@ol7b ~]# firewall-cmd --add-port=5555/tcp; firewall-cmd --list-ports
+-- success 와 함께 5555/tcp 가 목록에 생겼다. --permanent 가 없어
+-- firewalld 재시작·재부팅 때 사라진다
+success
+5555/tcp
+
+--------------------------------------------------------------------------------
+ [5] 3-way handshake 부터 종료까지
+--------------------------------------------------------------------------------
+[root@ol7a ~]# nohup timeout 10 tcpdump -i ens32 -nn -w /tmp/hs.pcap host 172.16.225.62 and port 5555 >/tmp/td4.log 2>&1 </dev/null &
+[root@ol7a ~]# sleep 1; echo hello | ncat --send-only ol7b 5555; echo "ncat exit=$?"
+ncat exit=0
+[root@ol7a ~]# sleep 10; cat /tmp/td4.log; tcpdump -nn -r /tmp/hs.pcap
+tcpdump: listening on ens32, link-type EN10MB (Ethernet), capture size 262144 bytes
+9 packets captured
+9 packets received by filter
+0 packets dropped by kernel
+reading from file /tmp/hs.pcap, link-type EN10MB (Ethernet)
+17:39:25.589114 IP 172.16.225.61.54418 > 172.16.225.62.5555: Flags [S], seq 1274461419, win 64240, options [mss 1460,sackOK,TS val 2414501859 ecr 0,nop,wscale 7], length 0
+17:39:25.589286 IP 172.16.225.62.5555 > 172.16.225.61.54418: Flags [S.], seq 1255449521, ack 1274461420, win 65160, options [mss 1460,sackOK,TS val 3307701422 ecr 2414501859,nop,wscale 7], length 0
+17:39:25.589320 IP 172.16.225.61.54418 > 172.16.225.62.5555: Flags [.], ack 1, win 502, options [nop,nop,TS val 2414501859 ecr 3307701422], length 0
+17:39:25.589350 IP 172.16.225.61.54418 > 172.16.225.62.5555: Flags [P.], seq 1:7, ack 1, win 502, options [nop,nop,TS val 2414501859 ecr 3307701422], length 6
+17:39:25.589379 IP 172.16.225.61.54418 > 172.16.225.62.5555: Flags [F.], seq 7, ack 1, win 502, options [nop,nop,TS val 2414501859 ecr 3307701422], length 0
+17:39:25.589451 IP 172.16.225.62.5555 > 172.16.225.61.54418: Flags [.], ack 7, win 510, options [nop,nop,TS val 3307701422 ecr 2414501859], length 0
+17:39:25.589702 IP 172.16.225.62.5555 > 172.16.225.61.54418: Flags [F.], seq 1, ack 7, win 510, options [nop,nop,TS val 3307701422 ecr 2414501859], length 0
+17:39:25.589709 IP 172.16.225.61.54418 > 172.16.225.62.5555: Flags [.], ack 2, win 502, options [nop,nop,TS val 2414501860 ecr 3307701422], length 0
+17:39:25.589763 IP 172.16.225.62.5555 > 172.16.225.61.54418: Flags [.], ack 8, win 510, options [nop,nop,TS val 3307701422 ecr 2414501859], length 0
+-- 9 packets captured. 한 연결의 전부다
+--   1 [S]  ol7a → ol7b  seq 1274461419  연결 요청, mss 1460
+--   2 [S.] ol7b → ol7a  ack 1274461420  요청 수락(seq+1 을 확인)
+--   3 [.]  ol7a → ol7b  ack 1           handshake 끝. 이후 seq·ack 는 상대 번호(-S 없으면)로 줄여 찍힌다
+--   4 [P.] ol7a → ol7b  seq 1:7 length 6  "hello\n" 6바이트
+--   5 [F.] ol7a → ol7b  seq 7           --send-only 라 보내고 바로 닫음
+--   6 [.]  ol7b → ol7a  ack 7           데이터 받음
+--   7 [F.] ol7b → ol7a                  ol7b 도 닫음
+--   8 [.]  ol7a → ol7b  ack 2           ol7b 의 FIN 확인
+--   9 [.]  ol7b → ol7a  ack 8           ol7a 의 FIN 확인
+-- 전체가 0.6ms 안에 끝났다. 같은 VMnet 안이라 왕복 시간이 아주
+-- 짧다
+[root@ol7b ~]# cat /tmp/recv.txt
+hello
+-- ol7b 의 수신기가 받은 내용 hello
+
+--------------------------------------------------------------------------------
+ [6] 내용까지 보기 — -A, 플래그 필터
+--------------------------------------------------------------------------------
+-- -A : 페이로드를 ASCII 로. 'tcp[tcpflags] & tcp-push != 0' : PSH
+-- 플래그가 선 패킷만
+[root@ol7a ~]# tcpdump -nn -A -r /tmp/hs.pcap 'tcp[tcpflags] & tcp-push != 0'
+reading from file /tmp/hs.pcap, link-type EN10MB (Ethernet)
+17:39:25.589350 IP 172.16.225.61.54418 > 172.16.225.62.5555: Flags [P.], seq 1274461420:1274461426, ack 1255449522, win 502, options [nop,nop,TS val 2414501859 ecr 3307701422], length 6
+E..:3.@.@......=...>....K...J..............
+.._..'..hello
+-- -A 는 IP 헤더부터 ASCII 로 찍어 앞부분은 알아볼 수 없는 문자다.
+-- 끝에 hello 가 보인다
+-- SYN 만 고르기. 연결 시도 횟수를 셀 때 쓴다.
+[root@ol7a ~]# tcpdump -nn -r /tmp/hs.pcap 'tcp[tcpflags] & tcp-syn != 0'
+reading from file /tmp/hs.pcap, link-type EN10MB (Ethernet)
+17:39:25.589114 IP 172.16.225.61.54418 > 172.16.225.62.5555: Flags [S], seq 1274461419, win 64240, options [mss 1460,sackOK,TS val 2414501859 ecr 0,nop,wscale 7], length 0
+17:39:25.589286 IP 172.16.225.62.5555 > 172.16.225.61.54418: Flags [S.], seq 1255449521, ack 1274461420, win 65160, options [mss 1460,sackOK,TS val 3307701422 ecr 2414501859,nop,wscale 7], length 0
+-- SYN 이 선 패킷은 [S] 와 [S.] 둘. SYN 만 세려면 'tcp[tcpflags]
+-- == tcp-syn' 처럼 ACK 없는 것으로 좁힌다
+
+--------------------------------------------------------------------------------
+ [7] 연결이 살아 있을 때 ss
+--------------------------------------------------------------------------------
+-- 받기만 하는 연결을 40초 동안 열어 둔다.
+[root@ol7a ~]# nohup timeout 40 ncat --recv-only ol7b 5555 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# sleep 2; ss -tanp dst 172.16.225.62
+State     Recv-Q Send-Q Local Address:Port   Peer Address:PortProcess
+TIME-WAIT 0      0      172.16.225.61:54418 172.16.225.62:5555       
+ESTAB     0      0      172.16.225.61:46416 172.16.225.62:5555 users:(("ncat",pid=2460,fd=3))
+-- 새 연결 46416 이 ESTAB, ncat(2460). 앞 연결 54418 은 TIME-WAIT
+-- 으로 남아 있다(먼저 닫은 쪽이 갖는 상태)
+[root@ol7b ~]# ss -tanp sport = :5555
+State     Recv-Q Send-Q Local Address:Port  Peer Address:Port Process                         
+LISTEN    0      10           0.0.0.0:5555       0.0.0.0:*     users:(("ncat",pid=10175,fd=4))
+ESTAB     0      0      172.16.225.62:5555 172.16.225.61:46416 users:(("ncat",pid=10175,fd=5))
+TIME-WAIT 0      0      172.16.225.62:5555 172.16.225.61:54418                                
+LISTEN    0      10              [::]:5555          [::]:*     users:(("ncat",pid=10175,fd=3))
+-- ol7b 쪽에서 같은 연결이 거울처럼 보인다. 수신기는 fd 4 로 대기,
+-- fd 5 로 연결 하나를 받았다
+-- sport = :5555 : 출발 포트(로컬 포트)가 5555 인 소켓만. 필터
+-- 표현식은 따옴표 없이 썼다
+-- -i : 연결별 내부 정보(rtt, cwnd, mss). -o : 타이머
+[root@ol7a ~]# ss -tnio dst 172.16.225.62
+State Recv-Q Send-Q Local Address:Port   Peer Address:PortProcess
+ESTAB 0      0      172.16.225.61:46416 172.16.225.62:5555
+         ts sack cubic wscale:7,7 rto:200 rtt:0.208/0.104 mss:1448 pmtu:1500 rcvmss:536 advmss:1448 cwnd:10 bytes_acked:1 segs_out:2 segs_in:1 send 556923077bps lastsnd:2097 lastrcv:2097 lastack:2097 pacing_rate 1113846152bps delivered:1 app_limited rcv_space:14480 rcv_ssthresh:64088 minrtt:0.208
+-- rtt 0.208 ms, mss 1448, cwnd 10(혼잡 창), 혼잡 제어 cubic, rto
+-- 200 ms
+-- bytes_acked 1, segs_out 2 : 데이터는 아직 오가지
+-- 않았다(--recv-only 로 기다리는 중)
+
+--------------------------------------------------------------------------------
+ [8] netstat -s — 카운터가 바뀐 곳
+--------------------------------------------------------------------------------
+[root@ol7a ~]# netstat -s -t > /tmp/ns1.txt; diff /tmp/ns0.txt /tmp/ns1.txt
+2c2
+<     InType3: 3
+---
+>     InType3: 4
+5,7c5,7
+<     2 active connections openings
+<     1 passive connection openings
+<     0 failed connection attempts
+---
+>     7 active connections openings
+>     3 passive connection openings
+>     1 failed connection attempts
+9,11c9,11
+<     1 connections established
+<     137 segments received
+<     160 segments send out
+---
+>     2 connections established
+>     440 segments received
+>     617 segments send out
+17,20c17,21
+<     3 delayed acks sent
+<     92 packet headers predicted
+<     9 acknowledgments not containing data payload received
+<     26 predicted acknowledgments
+---
+>     24 delayed acks sent
+>     259 packet headers predicted
+>     40 acknowledgments not containing data payload received
+>     145 predicted acknowledgments
+>     TCPRcvCoalesce: 1
+22,23c23,24
+<     TCPOrigDataSent: 55
+<     TCPDelivered: 57
+---
+>     TCPOrigDataSent: 314
+>     TCPDelivered: 320
+25,27c26,28
+<     InOctets: 237846
+<     OutOctets: 16697
+<     InNoECTPkts: 256
+---
+>     InOctets: 272166
+>     OutOctets: 69769
+>     InNoECTPkts: 564
+-- 바뀐 것
+--   InType3 3 → 4               : ICMP Destination Unreachable 한 건 수신. [4] 의 방화벽 거부다
+--   active openings 2 → 7       : ol7a 가 연 연결 5개(거부 1 + 성공 2 + curl 2)
+--   passive openings 1 → 3      : 받은 연결 2개(127.0.0.1:7000 두 번)
+--   failed connection attempts 0 → 1 : 거부된 그 연결
+--   connections established 1 → 2 : 지금 열린 연결(ssh + ncat --recv-only)
+-- segments retransmited 은 바뀌지 않았다. 이 실습 동안 재전송은 0
+-- 이다
+
+--------------------------------------------------------------------------------
+ [9] 이름 해석 — -n 을 빼면
+--------------------------------------------------------------------------------
+-- ens32 의 SSH(이 러너의 접속)를 빼고 30개를 캡처한다. -n 없음.
+-- 그동안 yum.oracle.com 에 접속한다.
+[root@ol7a ~]# nohup timeout 20 tcpdump -i ens32 -c 30 not port 22 >/tmp/td5.log 2>&1 </dev/null &
+[root@ol7a ~]# sleep 1; curl -s -o /dev/null -w '%{http_code}\n' https://yum.oracle.com/; sleep 6
+200
+[root@ol7a ~]# grep -c 'PTR?' /tmp/td5.log; grep -m3 'PTR?' /tmp/td5.log | cut -c1-120; grep -m2 'https' /tmp/td5.log | cut -c1-120
+0
+17:39:39.100691 IP ol7a.example.com.50268 > a2-18-101-231.deploy.static.akamaitechnologies.com.https: Flags [S], seq 398
+17:39:39.242471 IP a2-18-101-231.deploy.static.akamaitechnologies.com.https > ol7a.example.com.50268: Flags [S.], seq 67
+-- 주소 대신 이름(ol7a.example.com,
+-- a2-18-101-231.deploy.static.akamaitechnologies.com), 포트 대신
+-- https 가 찍혔다
+-- ol7a 는 /etc/hosts, akamai 쪽은 DNS 역방향 조회(PTR)로 얻은
+-- 이름이다
+-- 설계와 달리 이번 30개 안에는 PTR? 질의 줄이 잡히지 않았다(grep
+-- -c 0). 30개가 TLS 패킷으로 먼저 찼다
+-- 이름 조회는 패킷을 찍을 때마다 일어난다. DNS 가 느린 환경에서는
+-- 출력이 늦게 나오고 그 질의가
+-- 다른 캡처에 섞인다. 이 VM 의 DNS(VMware NAT)는 빨라 지연이
+-- 드러나지 않았다
+-- 같은 캡처를 -nn 으로
+[root@ol7a ~]# nohup timeout 20 tcpdump -i ens32 -nn -c 30 not port 22 >/tmp/td6.log 2>&1 </dev/null &
+[root@ol7a ~]# sleep 1; curl -s -o /dev/null -w '%{http_code}\n' https://yum.oracle.com/; sleep 6
+200
+[root@ol7a ~]# grep -c 'PTR?' /tmp/td6.log; grep -m2 '\.443' /tmp/td6.log | cut -c1-120
+0
+17:39:47.380610 IP 172.16.225.61.57038 > 2.18.101.231.443: Flags [S], seq 3519121346, win 64240, options [mss 1460,sackO
+17:39:47.518950 IP 2.18.101.231.443 > 172.16.225.61.57038: Flags [S.], seq 1002390949, ack 3519121347, win 64240, option
+-- -nn 은 2.18.101.231.443 처럼 숫자만. 조회가 없으니 캡처 결과가
+-- DNS 상태에 좌우되지 않는다
+-- 운영에서는 -nn 으로 캡처하고, 필요한 주소만 나중에 host
+-- 명령으로 찾는다
+
+--------------------------------------------------------------------------------
+ [변형] netstat 으로 같은 것 보기
+--------------------------------------------------------------------------------
+-- netstat -tanp 는 ss -tanp 와 같은 질문에 답한다. 열 이름과
+-- 순서가 다르다.
+[root@ol7a ~]# netstat -tanp | grep -E 'Proto|5555|:22 '
+Proto Recv-Q Send-Q Local Address           Foreign Address         State       PID/Program name    
+tcp        0      0 0.0.0.0:22              0.0.0.0:*               LISTEN      1412/sshd           
+tcp        0      0 172.16.225.61:54418     172.16.225.62:5555      TIME_WAIT   -                   
+tcp        0      0 172.16.225.61:46416     172.16.225.62:5555      ESTABLISHED 2460/ncat           
+tcp        0      0 172.16.225.61:22        172.16.225.1:63389      ESTABLISHED 1984/sshd: root@not 
+tcp6       0      0 :::22                   :::*                    LISTEN      1412/sshd           
+-- netstat -tanp 열: Proto, Recv-Q, Send-Q, Local Address, Foreign
+-- Address, State, PID/Program name
+-- 상태 이름이 TIME_WAIT·ESTABLISHED 처럼 밑줄·전체 이름이다(ss 는
+-- TIME-WAIT·ESTAB)
+-- PID/Program 열이 20자에서 잘린다(sshd: root@not). ss 는 잘리지
+-- 않는다
+-- 인터페이스 통계: netstat -i 와 ip -s link
+[root@ol7a ~]# netstat -i; ip -s link show ens32 | sed -n '1,6p'
+Kernel Interface table
+Iface             MTU    RX-OK RX-ERR RX-DRP RX-OVR    TX-OK TX-ERR TX-DRP TX-OVR Flg
+ens32            1500      780      0      0 0           861      0      0      0 BMRU
+ens33            1500       18      0      0 0             0      0      0      0 BMRU
+lo              65536       29      0      0 0            29      0      0      0 LRU
+2: ens32: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000
+    link/ether 00:0c:29:ac:5e:a0 brd ff:ff:ff:ff:ff:ff
+    RX:  bytes packets errors dropped  missed   mcast           
+        445201     780      0       0       0       0 
+    TX:  bytes packets errors dropped carrier collsns           
+        105573     862      0       0       0       0 
+-- netstat -i : 인터페이스별 RX·TX 패킷과 ERR·DRP·OVR. 모두 0 이면
+-- 링크 수준 문제는 없다
+-- ip -s link : 같은 값을 바이트까지(RX 445201 바이트 780 패킷).
+-- dropped·missed 가 늘면 수신 처리 포화다
+
+--------------------------------------------------------------------------------
+ [10] 되돌림
+--------------------------------------------------------------------------------
+[root@ol7b ~]# firewall-cmd --remove-port=5555/tcp; firewall-cmd --list-ports; pkill -x ncat; rm -f /tmp/recv.txt; yum -y -q remove nmap-ncat; rpm -q nmap-ncat
+success
+
+package nmap-ncat is not installed
+-- ol7b: 런타임 규칙 제거(success, --list-ports 빈 줄), ncat 종료,
+-- nmap-ncat 제거
+[root@ol7a ~]# pkill -x ncat; pkill -x tcpdump; rm -f /tmp/*.pcap /tmp/td?.log /tmp/ns0.txt /tmp/ns1.txt; yum -y -q remove nmap-ncat; rpm -q nmap-ncat; ss -tanp | grep -c ncat
+package nmap-ncat is not installed
+0
+-- ol7a: ncat·tcpdump 종료, 캡처 파일 삭제, nmap-ncat 제거, ncat
+-- 소켓 0개. ol7b 는 이 실습 뒤 전원을 끈다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                       시작 전        실습 중                    되돌린 뒤
+--  ol7b firewalld 포트        (없음)         5555/tcp (런타임)          (없음)
+--  nmap-ncat(두 노드)         없음           6.40-19.el7               없음
+--  tcpdump -i 생략            -              nflog 선택, 필터 불가       -
+--  막힌 연결                  -              SYN 1개, No route to host   -
+--  열린 연결                  -              9패킷, hello 6바이트        -
+--  TCP failed attempts        0              1                          -
+--  ICMP InType3               3              4                          -
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. 필터를 'host 172.16.225.62 and (port 5555 or icmp)' 로 바꿔
+--    [4] 를 다시 한다
+--    확인: SYN 다음에 ICMP host 172.16.225.62 unreachable - admin prohibited 줄이 잡히는지
+-- 2. ol7b 에서 ncat 을 끄고(수신기 없음) 방화벽만 연 상태로
+--    연결한다
+--    확인: ncat 메시지가 Connection refused 로 바뀌고 캡처에 [R.] 가 보이는지
+-- 3. -w 로 저장한 pcap 을 호스트 PC 로 옮겨 Wireshark 로 연다
+--    확인: Statistics → Flow Graph 에 [5] 의 9패킷이 같은 순서로 나오는지
+
+================================================================================
+ 실습 06 종료 — -i 생략은 nflog 를 골라 실패, 방화벽 거부는 No route to host(InType3 +1), 연결 하나는 9패킷
+================================================================================

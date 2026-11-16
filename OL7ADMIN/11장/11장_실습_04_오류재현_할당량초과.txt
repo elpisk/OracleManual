@@ -1,0 +1,451 @@
+================================================================================
+ 제11장 실습 04 — 오류 재현: 할당량 초과
+ 대상   : ol7a
+ 목표   : soft·hard 한도와 유예 기간(grace)이 실제 쓰기에서 어떻게 작동하는지
+          확인한다. hard 를 넘는 쓰기가 어느 지점에서 실패하는지, 유예 기간이 지난
+          soft 한도가 hard 처럼 막는지 본다. 프로젝트 할당량은 root 도 막는다.
+          Ext4 의 quota·setquota·repquota 와 비교한다
+ 배경   : soft 한도는 넘을 수 있지만 그 순간부터 유예 타이머가 돈다. 타이머가
+          끝나면 soft 를 넘은 상태의 새 할당이 거부된다. hard 한도는 언제나
+          즉시 막는다. XFS 는 한도와 타이머를 파일 시스템 안에 두고, Ext4 는
+          aquota.user 파일과 quotaon 이 따로 필요하다 (본문 11.6)
+ 소요   : 약 25분
+ 선행   : storage-clean 스냅샷. 실습 03 의 마운트 옵션을 알고 있어야 한다
+ 계정   : root, student
+ 주의   : 한도와 타이머를 아주 짧게 잡는다. 운영 값이 아니다
+ 되돌림 : 마운트 해제, wipefs. lsblk -f /dev/sdb /dev/sdc 가 비어 있으면 끝
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# lsblk -f /dev/sdb /dev/sdc; id student
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+uid=1000(student) gid=1000(student) groups=1000(student),10(wheel)
+-- 쓸 디스크 둘이 비어 있다
+-- lsblk -f 열: NAME·FSTYPE·LABEL·UUID·MOUNTPOINT
+--   sdb : XFS 할당량
+--   sdc : Ext4 비교([변형])
+-- student UID 1000 이 한도 대상이다
+[root@ol7a ~]# rpm -q xfsprogs quota || yum -y -q install quota; rpm -q quota
+xfsprogs-5.4.0-1.0.1.el7.x86_64
+quota-4.01-19.el7.x86_64
+quota-4.01-19.el7.x86_64
+-- xfsprogs 5.4.0, quota 4.01 이 이미 있다
+-- quota 패키지는 사용자용 quota 명령과
+--   Ext 용 quotacheck·setquota·repquota 를 준다
+
+--------------------------------------------------------------------------------
+ [1] 할당량을 켠 XFS 준비
+--------------------------------------------------------------------------------
+
+-- 사용자와 프로젝트 할당량을 켠다. 쓰기 공간 /xfsq/pub 는 누구나 쓸 수 있게
+-- 1777(sticky)로 연다.
+[root@ol7a ~]# mkfs.xfs -q /dev/sdb; mkdir -p /xfsq; mount -o uquota,pquota /dev/sdb /xfsq; mkdir /xfsq/pub; chmod 1777 /xfsq/pub
+-- 출력이 없으면 성공이다
+-- mkfs.xfs 기본값(v4)이라 그룹은 켜지 않았다
+--   uquota + pquota 조합은 v4 에서도 된다
+--   막히는 것은 gquota + pquota 다(실습 03)
+-- /xfsq/pub 를 1777 로 연 이유
+--   student 가 쓸 수 있어야 한다
+--   sticky 비트로 남의 파일은 못 지운다
+-- 이 실습의 쓰기는 모두 수십 MB 이내다
+--   델타 디스크가 커지지 않게 작게 잡았다
+[root@ol7a ~]# xfs_quota -x -c state /xfsq | grep -E 'quota state|Accounting|Enforcement'
+User quota state on /xfsq (/dev/sdb)
+  Accounting: ON
+  Enforcement: ON
+Group quota state on /xfsq (/dev/sdb)
+  Accounting: OFF
+  Enforcement: OFF
+Project quota state on /xfsq (/dev/sdb)
+  Accounting: ON
+  Enforcement: ON
+-- 사용자·프로젝트는 ON/ON
+-- 그룹은 OFF/OFF. 옵션을 주지 않았다
+-- Accounting 만 ON 이면 noenforce 옵션이다
+-- grep 으로 Inode·grace 줄은 뺐다
+
+--------------------------------------------------------------------------------
+ [2] 한도와 기본 유예 기간
+--------------------------------------------------------------------------------
+
+-- student 에게 블록 soft 20MB·hard 30MB, inode soft 10·hard 15 를 준다.
+[root@ol7a ~]# xfs_quota -x -c 'limit bsoft=20m bhard=30m isoft=10 ihard=15 student' /xfsq
+[root@ol7a ~]# xfs_quota -x -c 'report -u -bih' /xfsq
+User quota on /xfsq (/dev/sdb)
+                        Blocks                            Inodes              
+User ID      Used   Soft   Hard Warn/Grace     Used   Soft   Hard Warn/Grace  
+---------- --------------------------------- --------------------------------- 
+root            0      0      0  00 [------]      4      0      0  00 [------]
+student         0    20M    30M  00 [------]      0     10     15  00 [------]
+-- 블록 soft 20M · hard 30M
+-- inode soft 10 · hard 15
+-- 아직 쓴 것이 없어 Used 0
+--   limit 은 성공하면 아무것도 출력하지 않는다
+--   그래서 바로 report 로 확인한다
+-- 단위 m 은 MiB. 20m = 20480 KiB
+-- root 줄은 한도 0 = 제한 없음
+
+-- 유예 기간은 state 의 아랫부분에 나온다.
+[root@ol7a ~]# xfs_quota -x -c state /xfsq | grep -i grace
+Blocks grace time: [7 days]
+Inodes grace time: [7 days]
+Realtime Blocks grace time: [7 days]
+-- 기본 유예 기간 7일
+-- 블록·inode·실시간 블록이 따로 있다
+-- 한도가 사용자마다라면 유예 기간은 종류마다 하나다
+
+--------------------------------------------------------------------------------
+ [3] soft 아래에서 쓰기
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ dd if=/dev/zero of=/xfsq/pub/a.dat bs=1M count=15 2>&1 | tail -1
+15728640 bytes (16 MB) copied, 0.00998767 s, 1.6 GB/s
+[root@ol7a ~]# xfs_quota -x -c 'report -u -bh' /xfsq | grep -E 'User ID|student'
+User ID      Used   Soft   Hard Warn/Grace   
+student       15M    20M    30M  00 [------]
+-- 15M: soft 20M 아래
+-- Warn/Grace [------]: 시계가 돌지 않는다
+-- 한도 안이면 아무 일도 없다
+-- dd 출력 15728640 bytes = 15 x 1048576
+--   (16 MB) 는 10진 MB 로 반올림한 표시
+-- 1.6 GB/s 는 페이지 캐시에 쓴 속도다
+--   디스크에 내려가기 전에 dd 가 끝났다
+
+--------------------------------------------------------------------------------
+ [4] soft 를 넘기기 — 쓰기는 성공한다
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ dd if=/dev/zero of=/xfsq/pub/b.dat bs=1M count=10 2>&1 | tail -1; echo "rc=$?"
+10485760 bytes (10 MB) copied, 0.0226656 s, 463 MB/s
+rc=0
+-- 25M 까지 썼다. soft 를 넘겼지만 성공
+-- rc 는 tail 의 종료 코드다
+--   dd 의 결과는 출력 줄로 본다
+[root@ol7a ~]# xfs_quota -x -c 'report -u -bh' /xfsq | grep -E 'User ID|student'
+User ID      Used   Soft   Hard Warn/Grace   
+student       25M    20M    30M  00 [------]
+-- Used 25M > Soft 20M
+-- 그런데 Grace 가 [------] 다
+--   7일짜리 시계가 돌기 시작했지만
+--   이 형식은 하루 미만 남은 시간이 아니면 보이지 않는다
+--   [6] 에서는 [7 days] 로 나온다
+
+-- 사용자 쪽에서 보면 quota 의 grace 열에 남은 시간이 나온다.
+[student@ol7a ~]$ quota -s
+Disk quotas for user student (uid 1000): 
+     Filesystem   space   quota   limit   grace   files   quota   limit   grace
+       /dev/sdb  25600K* 20480K  30720K               2      10      15        
+-- space 25600K 뒤의 * 가 soft 초과 표시
+-- quota 20480K = 20M, limit 30720K = 30M
+-- files 2: a.dat, b.dat
+-- grace 열이 비었다. 사용자 도구는 이 값을 못 읽었다
+
+--------------------------------------------------------------------------------
+ [5] hard 를 넘기기 — 오류 ①
+--------------------------------------------------------------------------------
+
+-- 지금 25MB 를 썼다. 10MB 를 더 쓰면 30MB hard 를 넘는다.
+[student@ol7a ~]$ dd if=/dev/zero of=/xfsq/pub/c.dat bs=1M count=10; echo "rc=$?"
+dd: error writing ‘/xfsq/pub/c.dat’: Disk quota exceeded
+6+0 records in
+5+0 records out
+5242880 bytes (5.2 MB) copied, 0.0166408 s, 315 MB/s
+rc=1
+-- 증상   : dd: error writing '/xfsq/pub/c.dat': Disk quota exceeded
+-- 원인   : 25M + 10M 가 hard 30M 를 넘는다
+--          6 블록 읽고 5 블록만 쓴 지점에서 멈췄다
+-- 조치   : 불필요한 파일을 지우거나 hard 를 올린다
+-- 재확인 : report 의 Used 가 Hard 아래, dd rc=0
+-- 오류 번호는 EDQUOT. rc=1
+[student@ol7a ~]$ ls -l /xfsq/pub/
+total 30720
+-rw-rw-r--. 1 student student 15728640 Nov 16 12:45 a.dat
+-rw-rw-r--. 1 student student 10485760 Nov 16 12:45 b.dat
+-rw-rw-r--. 1 student student  5242880 Nov 16 12:45 c.dat
+-- c.dat 는 5MB 만 남았다(5242880)
+-- 권한 -rw-rw-r--: student 의 umask 002
+-- 소유자·그룹 모두 student
+-- 실패한 쓰기도 앞부분은 파일에 남는다
+--   응용 프로그램은 잘린 파일을 직접 정리해야 한다
+-- total 30720 = hard 30M 에 딱 맞다
+
+[root@ol7a ~]# xfs_quota -x -c 'report -u -bh' /xfsq | grep -E 'User ID|student'
+User ID      Used   Soft   Hard Warn/Grace   
+student       30M    20M    30M  00 [------]
+-- Used 30M = Hard 30M
+
+-- cp 처럼 다른 도구로 써도 같은 오류다.
+[student@ol7a ~]$ cp /usr/bin/bash /xfsq/pub/bash.copy; echo "rc=$?"
+cp: cannot create regular file ‘/xfsq/pub/bash.copy’: Disk quota exceeded
+rc=1
+-- 새 파일 생성 단계에서 막혔다
+--   cannot create regular file
+-- dd 는 쓰는 도중, cp 는 만드는 순간 실패했다
+-- 블록이 하나도 남지 않아 inode 할당도 실패
+
+--------------------------------------------------------------------------------
+ [6] inode 한도
+--------------------------------------------------------------------------------
+
+-- 공간을 비우고 이번에는 파일 개수로 막혀 본다. ihard 15 다.
+[student@ol7a ~]$ rm -f /xfsq/pub/*; for i in $(seq 1 20); do touch /xfsq/pub/n$i || break; done; ls /xfsq/pub | wc -l
+touch: cannot touch ‘/xfsq/pub/n16’: Disk quota exceeded
+15
+
+-- n1~n15 까지 만들고 n16 에서 실패
+-- ihard 15 에 정확히 걸렸다
+-- 메시지는 블록과 같은 Disk quota exceeded
+--   블록인지 inode 인지는 report 로 가린다
+[root@ol7a ~]# xfs_quota -x -c 'report -u -ih' /xfsq | grep -E 'User ID|student'
+User ID      Used   Soft   Hard Warn/Grace  
+student        15     10     15  00 [7 days]
+-- inode Used 15 = Hard 15
+-- soft 10 을 넘어 유예 시계가 돈다
+--   [7 days] 가 남은 시간
+-- [4] 의 블록 시계와 달리 보인다
+
+--------------------------------------------------------------------------------
+ [7] 유예 기간을 짧게 바꾸기
+--------------------------------------------------------------------------------
+
+-- timer 로 유예 기간을 바꾼다.
+--   -b 블록, -i inode, -u 사용자(기본)
+-- 타이머는 soft 를 넘는 순간 그때의 유예 기간으로 시작한다. 이미 돌고 있는 타이머는
+-- 바뀌지 않으므로 먼저 사용량을 soft 아래로 내린다.
+[student@ol7a ~]$ rm -f /xfsq/pub/*
+[root@ol7a ~]# xfs_quota -x -c 'timer -u -b 30s' /xfsq; xfs_quota -x -c 'timer -u -i 30s' /xfsq; xfs_quota -x -c state /xfsq | grep -i grace
+Blocks grace time: [--------]
+Inodes grace time: [--------]
+Realtime Blocks grace time: [7 days]
+-- 블록·inode 유예가 [--------] 로 바뀌었다
+--   30초는 하루 미만이라 칸이 빈다
+--   실시간 블록은 그대로 7 days
+-- 바뀐 값은 다음 soft 초과부터 쓰인다
+-- timer 문법: timer [-b|-i|-r] [-u|-g|-p] 값
+--   값 30s 는 30초. m·h·d·w 단위도 받는다
+-- 출력이 없으면 성공. state 로 확인했다
+
+--------------------------------------------------------------------------------
+ [8] 유예 기간이 지난 soft 한도 — 오류 ②
+--------------------------------------------------------------------------------
+
+-- 22MB 를 써서 soft(20MB)만 살짝 넘긴다. hard(30MB)까지는 8MB 가 남아 있다.
+[student@ol7a ~]$ dd if=/dev/zero of=/xfsq/pub/g1.dat bs=1M count=22 2>&1 | tail -1
+23068672 bytes (23 MB) copied, 0.0170369 s, 1.4 GB/s
+[root@ol7a ~]# xfs_quota -x -c 'report -u -bh' /xfsq | grep -E 'User ID|student'
+User ID      Used   Soft   Hard Warn/Grace   
+student       22M    20M    30M  00 [------]
+-- 22M > 20M. 시계가 막 시작됐다
+-- 남은 시간이 하루 미만이라 [------]
+-- hard 까지 8M 가 남아 있다
+-- 운영에서 soft 를 넘기면 사용자는 아무 경고도 못 받는다
+--   셸 로그인 때 quota 를 보여 주는 설정이 없으면
+--   막히는 날에야 안다
+
+-- 30초가 지나도록 기다린다.
+[root@ol7a ~]# xfs_quota -x -c 'report -u -bh' /xfsq | grep -E 'User ID|student'
+User ID      Used   Soft   Hard Warn/Grace   
+student       22M    20M    30M  00 [0 days]
+-- 30초가 지나 [0 days] 로 바뀌었다
+-- 하루 단위 표시라 0 days 가 만료를 뜻한다
+-- 랩은 @sleep 35 로 기다렸다(트랜스크립트에는 주석만)
+-- 사용량은 그대로 22M
+[student@ol7a ~]$ dd if=/dev/zero of=/xfsq/pub/g2.dat bs=1M count=1; echo "rc=$?"
+dd: failed to open ‘/xfsq/pub/g2.dat’: Disk quota exceeded
+rc=1
+-- 증상   : dd: failed to open '/xfsq/pub/g2.dat': Disk quota exceeded
+-- 원인   : 유예 기간이 끝나 soft 20M 가 hard 처럼 동작한다
+--          hard 30M 까지 8M 가 남아 있어도 막힌다
+-- 조치   : 사용량을 soft 아래로 내린다(아래 rm)
+-- 재확인 : 같은 사용자의 dd rc=0, report 의 [------]
+-- 이번에는 파일 열기 단계에서 막혔다(failed to open)
+
+-- soft 아래로 내리면 타이머가 풀린다.
+[student@ol7a ~]$ rm -f /xfsq/pub/g1.dat; dd if=/dev/zero of=/xfsq/pub/g3.dat bs=1M count=5 2>&1 | tail -1; echo "rc=$?"
+5242880 bytes (5.2 MB) copied, 0.00159465 s, 3.3 GB/s
+rc=0
+-- g1.dat(22M)을 지우고 5MB 쓰기가 성공
+[root@ol7a ~]# xfs_quota -x -c 'report -u -bh' /xfsq | grep -E 'User ID|student'
+User ID      Used   Soft   Hard Warn/Grace   
+student        5M    20M    30M  00 [------]
+-- 5M < 20M. 시계가 풀렸다
+-- soft 아래로 내려가는 순간 타이머가 없어진다
+
+--------------------------------------------------------------------------------
+ [9] 프로젝트 할당량은 root 도 막는다
+--------------------------------------------------------------------------------
+
+-- 사용자 할당량은 root(UID 0)에 적용되지 않는다. 프로젝트 할당량은 디렉터리 기준이라
+-- 누가 쓰든 막는다. 로그 디렉터리가 파일 시스템을 채우지 못하게 할 때 쓰는 방식이다.
+[root@ol7a ~]# mkdir /xfsq/logs; echo '60:/xfsq/logs' > /etc/projects; echo 'logs:60' > /etc/projid
+[root@ol7a ~]# xfs_quota -x -c 'project -s logs' /xfsq >/dev/null; xfs_quota -x -c 'limit -p bhard=50m logs' /xfsq
+[root@ol7a ~]# dd if=/dev/zero of=/xfsq/logs/big.log bs=1M count=80; echo "rc=$?"; ls -l /xfsq/logs; df -h /xfsq/logs
+dd: error writing ‘/xfsq/logs/big.log’: No space left on device
+51+0 records in
+50+0 records out
+52428800 bytes (52 MB) copied, 0.132218 s, 397 MB/s
+rc=1
+total 51200
+-rw-r--r--. 1 root root 52428800 Nov 16 12:46 big.log
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb         50M   50M     0 100% /xfsq
+-- 증상   : dd: error writing '/xfsq/logs/big.log': No space left on device
+-- 원인   : 프로젝트 logs 의 hard 50M. root 도 걸린다
+--          오류가 EDQUOT 이 아니라 ENOSPC 로 온다
+--          응용 프로그램에는 디스크가 꽉 찬 것으로 보인다
+-- 조치   : 프로젝트 한도를 올리거나 로그를 정리한다
+-- 재확인 : df -h /xfsq/logs 의 Avail
+-- df 도 Size 50M, Avail 0 으로 보인다
+-- big.log 는 정확히 52428800 = 50MiB
+-- projects 에 60:/xfsq/logs, projid 에 logs:60
+-- project -s 출력은 /dev/null 로 버렸다
+-- limit -p bhard=50m logs : 프로젝트 한도
+
+-- 같은 root 가 프로젝트 밖(/xfsq 바로 아래)에는 막힘 없이 쓴다.
+[root@ol7a ~]# dd if=/dev/zero of=/xfsq/outside.dat bs=1M count=80 2>&1 | tail -1; xfs_quota -x -c 'report -p -h' /xfsq
+83886080 bytes (84 MB) copied, 0.230206 s, 364 MB/s
+Project quota on /xfsq (/dev/sdb)
+                        Blocks              
+Project ID   Used   Soft   Hard Warn/Grace   
+---------- --------------------------------- 
+#0            85M      0      0  00 [------]
+logs          50M      0    50M  00 [------]
+-- 프로젝트 밖은 #0 으로 센다. 85M
+-- dd 를 쓰는 root 에게 사용자 한도는 없다
+-- 막는 것은 오직 그 디렉터리의 프로젝트 한도다
+--   outside.dat 80M + pub 의 g3.dat 5M
+-- #0 에는 한도가 없어 root 가 80M 를 썼다
+
+-- 프로젝트 안의 파일을 mv 로 밖에 꺼내려 하면 어떻게 되는가. 반대 방향도 본다.
+[root@ol7a ~]# mv /xfsq/outside.dat /xfsq/logs/; echo "rc=$?"; ls /xfsq
+mv: cannot create regular file ‘/xfsq/logs/outside.dat’: Disk quota exceeded
+rc=1
+logs
+outside.dat
+pub
+-- rename 이 거부되고 mv 는 복사로 바꿨다
+--   복사는 logs 한도에 걸려 실패
+--   여기서는 EDQUOT(Disk quota exceeded)
+-- outside.dat 는 원래 자리에 남았다
+-- 다른 프로젝트로의 mv 는 복사 + 삭제다
+--   큰 파일은 시간이 걸리고 한도에 걸릴 수 있다
+
+--------------------------------------------------------------------------------
+ [변형] 같은 초과를 Ext4 에서 — quotacheck·quotaon·setquota
+--------------------------------------------------------------------------------
+
+-- Ext4 는 마운트 옵션 말고도 할당량 파일 생성과 켜기 단계가 따로 있다.
+--   quotacheck -c 파일 생성, -u 사용자, -m 마운트된 채로 검사
+--   quotaon    강제를 켠다
+[root@ol7a ~]# mkfs.ext4 -q /dev/sdc; mkdir -p /extq; mount -o usrquota /dev/sdc /extq; chmod 1777 /extq
+[root@ol7a ~]# quotacheck -cum /extq; ls -l /extq/aquota.user; quotaon -v /extq
+-rw-------. 1 root root 6144 Nov 16 12:46 /extq/aquota.user
+/dev/sdc [/extq]: user quotas turned on
+-- XFS 에 없던 두 단계
+--   quotacheck -cum → aquota.user 6144 바이트
+--   quotaon -v     → user quotas turned on
+-- 할당량 정보가 파일 시스템 안의 일반 파일이다
+--   mkfs.ext4 -q 는 진행 출력을 줄였다
+--   usrquota 는 XFS 의 uquota 와 같은 뜻
+--   chmod 1777 은 student 가 쓰게 하려는 것
+-- 마운트 옵션만으로는 Ext4 할당량이 강제되지 않는다
+--   quotaon 을 빼면 setquota 는 되지만 막지 않는다
+
+-- 한도는 setquota 로 KB 단위로 준다. XFS 와 같은 20MB·30MB 다.
+[root@ol7a ~]# setquota -u student 20480 30720 0 0 /extq; repquota -s /extq | grep -E 'User|student'
+User            used    soft    hard  grace    used  soft  hard  grace
+-- 머리 줄만 나왔다
+--   student 는 아직 쓴 것이 없어 목록에 없다
+--   repquota 는 기본으로 사용량 있는 사용자만 보인다
+[student@ol7a ~]$ dd if=/dev/zero of=/extq/x.dat bs=1M count=40; echo "rc=$?"; ls -l /extq/x.dat
+-- Ext4 에서도 같은 Disk quota exceeded
+-- 30MB(31457280)까지 쓰고 멈췄다
+-- 응용 프로그램이 받는 오류는 XFS 와 같다
+-- setquota -u student 20480 30720 0 0
+--   블록 soft·hard(KB), inode soft·hard(0=없음)
+-- XFS 의 limit bsoft=20m bhard=30m 과 같은 값
+-- 31+0 in, 30+0 out: 31번째 블록에서 실패
+dd: error writing ‘/extq/x.dat’: Disk quota exceeded
+31+0 records in
+30+0 records out
+31457280 bytes (31 MB) copied, 0.0872789 s, 360 MB/s
+rc=1
+-rw-rw-r--. 1 student student 31457280 Nov 16 12:46 /extq/x.dat
+
+-- 유예 기간을 보는 명령도 다르다. Ext 는 edquota -t / setquota -t 다.
+[root@ol7a ~]# repquota -s /extq | grep -E 'grace|student'; quotaoff -v /extq
+Block grace time: 7days; Inode grace time: 7days
+User            used    soft    hard  grace    used  soft  hard  grace
+student   --      0K  20480K  30720K              1     0     0       
+/dev/sdc [/extq]: user quotas turned off
+-- 유예 7days 는 XFS 와 같은 기본값
+-- student used 0K, files 1 로 나왔다
+--   30MB 가 있는데 0K 다
+--   지연 할당 블록이 아직 디스크에 내려가기 전에
+--   본 값으로 보인다. 측정 시점 차이
+-- quotaoff 로 강제를 끈다
+--   XFS 는 끄려면 옵션 없이 다시 마운트한다
+
+--------------------------------------------------------------------------------
+ [10] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# umount /xfsq /extq; rm -f /etc/projects /etc/projid; wipefs -a /dev/sdb /dev/sdc >/dev/null; rmdir /xfsq /extq
+[root@ol7a ~]# lsblk -f /dev/sdb /dev/sdc; ls /etc/projects /etc/projid 2>&1
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+sdc                    
+ls: cannot access /etc/projects: No such file or directory
+ls: cannot access /etc/projid: No such file or directory
+-- 두 디스크가 비었고 프로젝트 파일도 없다
+-- umount 두 개, 프로젝트 파일 삭제, wipefs 순서
+-- /etc/projects 는 파일 시스템 밖에 있어
+--   디스크를 지워도 따로 지워야 한다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                  한도        결과                     오류
+--  블록 soft 초과        20M         25M 쓰기 성공            없음
+--  블록 hard 초과        30M         5M 만 쓰고 실패          Disk quota exceeded
+--  inode hard            15          n16 에서 실패            Disk quota exceeded
+--  유예 만료 soft        20M(30s)    1M 도 실패               Disk quota exceeded
+--  프로젝트 hard(root)   50M         50M 에서 실패            No space left on device
+--  Ext4 hard             30M         30M 에서 실패            Disk quota exceeded
+--
+--  항목                  시작 전     변경 후                  되돌린 뒤
+--  sdb                   (없음)      xfs, uquota·pquota       (없음)
+--  sdc                   (없음)      ext4, usrquota           (없음)
+--  /etc/projects·projid  없음        60:/xfsq/logs, logs:60   없음
+--
+-- 같은 '못 쓴다' 도 세 갈래로 온다
+--   Disk quota exceeded      사용자·그룹 한도, 프로젝트로의 mv
+--   No space left on device  프로젝트 한도에서 쓰기
+--   failed to open / cannot create  새 파일 할당 단계
+-- 응용 로그의 ENOSPC 를 보면 df 와 함께
+--   xfs_quota -x -c 'report -p' 도 본다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. 유예 기간을 30s 로 둔 채 inode soft(10)를 넘겨 12개를 만들고 35초 뒤 하나 더
+--    만들어 본다. 블록과 같은 방식으로 막히는지 본다.
+--    확인: report -u -ih 의 Warn/Grace 열과 touch 의 오류
+-- 2. xfs_quota -x -c 'limit bhard=30m -d' 처럼 -d 로 기본 한도를 걸면 한도를 따로
+--    받지 않은 사용자 모두에게 적용되는지 확인한다(새 사용자를 만들어 시험).
+--    확인: report 에 새 사용자 줄이 생기는지, 30MB 에서 막히는지
+-- 3. Ext4 쪽에서 setquota -t 로 유예 기간을 30초로 바꾸고 같은 오류 ② 를 재현한다.
+--    확인: repquota -s 의 grace 열
+-- 4. Ext4 [변형] 에서 used 가 0K 로 나온 이유를 확인한다
+--    sync 를 친 뒤 repquota -s /extq 를 다시 본다
+--    확인: used 열이 30720K 근처로 바뀌는지
+
+================================================================================
+ 실습 04 종료 — hard 는 즉시, soft 는 유예 만료 뒤, 프로젝트는 root 도 ENOSPC
+================================================================================

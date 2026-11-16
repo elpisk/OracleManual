@@ -1,0 +1,587 @@
+================================================================================
+ 제17장 실습 01 — preinstall 전후 비교: oracle-database-preinstall-19c 가 바꾸는 것
+ 대상   : ol7a
+ 목표   : 설치 전 커널 파라미터·셸 한도·사용자·그룹·부트 파라미터를 파일로
+          저장하고, oracle-database-preinstall-19c 를 설치한 뒤 diff 로 무엇이
+          바뀌었는지 하나씩 확인한다. 바로 반영되는 것과 재부팅해야 반영되는
+          것을 나눈다
+ 배경   : preinstall RPM 은 19c 설치 가이드의 OS 요건을 한 번에 맞춰 주는 패키지다.
+          의존 패키지를 끌어오고, 설치 스크립트가 oracle 사용자와 그룹을 만들고
+          sysctl·limits 값을 쓰며 부트 파라미터를 고친다. 원래 파일은
+          /var/log/oracle-database-preinstall-19c/backup 에 남긴다(본문 17.2·17.3)
+ 소요   : 약 25분
+ 선행   : ol7-base 스냅샷, 인터넷(yum.oracle.com)
+ 계정   : root
+ 주의   : 패키지를 지워도 사용자·sysctl·부트 파라미터는 남는다. 끝은 스냅샷 복귀
+ 되돌림 : ol7-base 스냅샷으로 복귀. 확인은 id oracle(없음), sysctl kernel.sem
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 비교 기준을 파일로 남긴다. 한 디렉터리에 모아 두면 diff 하기 쉽다.
+[root@ol7a ~]# mkdir -p /root/pre && cd /root/pre && pwd
+/root/pre
+-- 이후 프롬프트의 pre 는 작업 디렉터리 /root/pre
+-- 파일 이름은 항목.before / 항목.after 로 맞춘다
+
+-- sysctl -a : 커널 파라미터 전부. 2>/dev/null 은 읽기 권한 없는 항목의 경고를 버린다
+[root@ol7a pre]# sysctl -a 2>/dev/null | sort > sysctl.before; wc -l sysctl.before
+1120 sysctl.before
+-- 커널 파라미터 1120 개. sort 로 정렬해 두어야
+--   diff 가 줄 단위로 맞는다
+[root@ol7a pre]# getent passwd > passwd.before; getent group > group.before; wc -l passwd.before group.before
+  28 passwd.before
+  51 group.before
+  79 total
+-- 사용자 28 개, 그룹 51 개. 기준
+--   상태(ol7-base)의 수다
+-- getent 는 /etc/passwd·group 을
+--   nsswitch 를 거쳐 읽는다
+[root@ol7a pre]# cat /proc/cmdline > cmdline.before; grubby --info=ALL | grep ^args > grubby.before; wc -l grubby.before; cut -d' ' -f4- cmdline.before
+5 grubby.before
+crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync
+-- grubby.before 는 커널 항목 5 개(UEK 2개,
+--   RHCK 2개, rescue)의 args 줄
+-- cut -f4- 로
+--   BOOT_IMAGE·root·ro 를 뺀 나머지만 봤다
+-- console=·scsi_mod.scan=sync 는 랩 콘솔
+--   캡처와 장치 순서 고정용 설정이다
+[root@ol7a pre]# ls -l /etc/security/limits.d/; grep -v '^#' /etc/sysctl.conf | grep -c .
+total 4
+-rw-r--r--. 1 root root 191 Apr 10  2024 20-nproc.conf
+0
+-- limits.d 에는 기본 20-nproc.conf
+--   하나, /etc/sysctl.conf 는 주석뿐(값 0 줄)
+[root@ol7a pre]# rpm -qa | wc -l; rpm -qa | sort > rpm.before
+565
+-- 패키지 565 개. 설치 뒤 개수와 비교한다
+-- rpm -qa | sort 로 이름 목록도 남겼다
+
+-- 19c 설치 가이드가 값을 정해 둔 항목들. 지금은 커널 기본값이다
+[root@ol7a pre]# sysctl kernel.shmmax kernel.shmall kernel.shmmni kernel.sem fs.file-max fs.aio-max-nr net.ipv4.ip_local_port_range net.core.rmem_default net.core.rmem_max net.core.wmem_default net.core.wmem_max kernel.panic_on_oops
+kernel.shmmax = 18446744073692774399
+kernel.shmall = 18446744073692774399
+kernel.shmmni = 4096
+kernel.sem = 32000      1024000000      500     32000
+fs.file-max = 368255
+fs.aio-max-nr = 65536
+net.ipv4.ip_local_port_range = 32768    60999
+net.core.rmem_default = 212992
+net.core.rmem_max = 212992
+net.core.wmem_default = 212992
+net.core.wmem_max = 212992
+kernel.panic_on_oops = 1
+-- 커널 기본값. 19c 권고와 다른 것:
+--   shmmax·shmall 18446744073692774399 : 사실상 무제한이라 이미 충분
+--   kernel.sem 32000 1024000000 500 32000 : UEK 기본값이 권고보다 크다
+--   fs.file-max 368255 : 메모리로 정해진 값. 권고 6815744 보다 작다
+--   fs.aio-max-nr 65536, 포트 32768~60999, 소켓 버퍼 212992 : 권고보다 작다
+-- panic_on_oops 는 이미 1 이다
+
+--------------------------------------------------------------------------------
+ [1] 패키지가 어디에 있나
+--------------------------------------------------------------------------------
+
+[root@ol7a pre]# yum repolist enabled 2>/dev/null | sed -n '/repo id/,$p'
+repo id            repo name                                              status
+!ol7_UEKR6/x86_64  Latest Unbreakable Enterprise Kernel Release 6 for Ora  1,401
+!ol7_latest/x86_64 Oracle Linux 7Server Latest (x86_64)                   27,429
+repolist: 28,830
+-- 기본 활성 저장소 둘. 앞의 ! 는 메타데이터
+--   캐시가 만료됐다는 표시다
+-- status 열은 저장소의 패키지 수다
+[root@ol7a pre]# yum list available oracle-database-preinstall-19c 2>&1 | tail -3
+Loaded plugins: langpacks, ulninfo
+Available Packages
+oracle-database-preinstall-19c.x86_64            1.0-3.el7            ol7_latest
+-- 1.0-3.el7 이 ol7_latest 에 있다. 이 패키지는
+--   UEKR6 저장소에는 없다
+-- tail -3 으로 플러그인 줄을 빼고 결과만 봤다
+
+-- ol7_latest 를 끈 상태를 일부러 만든다. 저장소가 비활성인 서버를 흉내 낸 것이다
+-- --disablerepo= : 이 명령 한 번에만 해당 저장소를 끈다(파일은 그대로)
+[root@ol7a pre]# yum --disablerepo=ol7_latest list available oracle-database-preinstall-19c; echo "exit=$?"
+Loaded plugins: langpacks, ulninfo
+Error: No matching Packages to list
+exit=1
+-- 증상   : "Error: No matching Packages
+--          to list", 종료 코드 1
+-- 원인과 조치는 아래 install 시도까지 본 뒤 적는다
+[root@ol7a pre]# yum --disablerepo=ol7_latest install -y oracle-database-preinstall-19c 2>&1 | tail -4
+Loaded plugins: langpacks, ulninfo
+No package oracle-database-preinstall-19c available.
+Error: Nothing to do
+-- install 은 "No package
+--   oracle-database-preinstall-19c
+--   available."
+-- 이 두 메시지는 이름을 틀렸을 때와 똑같다
+-- 원인   : 패키지가 있는 ol7_latest 가 이
+--          명령에서 꺼져 있었다
+--          사내 미러가 이 채널을 빼먹었을 때도 같다
+
+-- 저장소 파일에서 enabled 값을 확인한다
+[root@ol7a pre]# grep -A6 '^\[ol7_latest\]' /etc/yum.repos.d/oracle-linux-ol7.repo
+[ol7_latest]
+name=Oracle Linux $releasever Latest ($basearch)
+baseurl=https://yum$ociregion.$ocidomain/repo/OracleLinux/OL7/latest/$basearch/
+gpgkey=file:///etc/pki/rpm-gpg/RPM-GPG-KEY-oracle
+gpgcheck=1
+enabled=1
+-- 파일에는 enabled=1. 끈 것은 명령행의
+--   --disablerepo 다
+-- gpgcheck=1 : 패키지 서명을 검사한다
+-- $releasever·$basearch 는 yum 이
+--   7Server·x86_64 로 채운다
+-- 조치   : --enablerepo=ol7_latest 로 그
+--          명령에서 켠다(또는 파일의 enabled=1)
+[root@ol7a pre]# yum --disablerepo=ol7_latest --enablerepo=ol7_latest list available oracle-database-preinstall-19c 2>&1 | tail -2
+Available Packages
+oracle-database-preinstall-19c.x86_64            1.0-3.el7            ol7_latest
+-- 재확인 : 같은 --disablerepo 뒤에
+--         --enablerepo 를 붙이자 패키지가 보였다
+-- 옵션은 왼쪽부터 적용되어 마지막 --enablerepo 가 이겼다
+
+--------------------------------------------------------------------------------
+ [2] 설치 전에 패키지 내용 보기
+--------------------------------------------------------------------------------
+
+[root@ol7a pre]# yum info oracle-database-preinstall-19c 2>/dev/null | sed -n '/^Name/,/^Summary/p'
+Name        : oracle-database-preinstall-19c
+Arch        : x86_64
+Version     : 1.0
+Release     : 3.el7
+Size        : 27 k
+Repo        : ol7_latest/x86_64
+Summary     : Oracle Database Preinstallation RPM
+-- Size 27 k. 패키지 자체는 스크립트 몇 개뿐이다
+-- yum info 의 Repo 줄이 패키지가 있는 저장소를 알려 준다
+-- deplist : 이 패키지가 요구하는 것. provider 줄은 빼고 이름만 센다
+[root@ol7a pre]# yum deplist oracle-database-preinstall-19c 2>/dev/null | grep -c 'dependency:'
+32
+-- 의존성 32 개(같은 이름이 여러 줄일 수 있다)
+-- deplist 는 설치하지 않고 의존성만 보여 준다
+[root@ol7a pre]# yum deplist oracle-database-preinstall-19c 2>/dev/null | grep 'dependency:' | awk '{print $2}' | sort -u | tr '\n' ' '; echo
+bc /bin/bash bind-utils /bin/sh binutils compat-libcap1 /etc/redhat-release ethtool glibc glibc-devel initscripts ksh libaio libaio-devel libgcc libstdc++ libstdc++-devel make module-init-tools net-tools nfs-utils openssh-clients pam procps psmisc smartmontools sysstat tar unzip util-linux-ng xorg-x11-utils xorg-x11-xauth 
+-- 19c 설치 가이드의 필수 패키지 목록과 겹친다
+-- 줄 끝이 잘린 것은 이름 목록이 한 줄로 길어서다
+--   ksh, libaio-devel, sysstat, smartmontools, compat-libcap1 …
+-- 그래서 preinstall 하나로 패키지 요건이 끝난다
+
+--------------------------------------------------------------------------------
+ [3] 설치
+--------------------------------------------------------------------------------
+
+-- 출력이 길어 파일로 받고 요약만 본다
+[root@ol7a pre]# yum install -y oracle-database-preinstall-19c > yum.install.log 2>&1; echo "exit=$?"; wc -l yum.install.log
+exit=0
+220 yum.install.log
+-- exit=0, 로그 220 줄. 아래에서 요약만 뽑는다
+-- 인터넷에서 받으니 수십 초~몇 분 걸린다
+[root@ol7a pre]# sed -n '/^Dependency Installed:/,/^Complete/p' yum.install.log | grep -c 'x86_64\|noarch'; sed -n '/^Dependency Installed:/,$p' yum.install.log | awk 'NR>1{print $1}' | cut -d. -f1 | grep . | head -30 | xargs
+29
+compat-libcap1 glibc-devel glibc-headers kernel-headers ksh libICE libSM libX11 libX11-common libXau libXext libXi libXinerama libXmu libXrandr libXrender libXt libXtst libXv libXxf86dga libXxf86misc libXxf86vm libaio-devel libdmx libstdc++-devel libxcb psmisc xorg-x11-utils xorg-x11-xauth Complete!
+-- 의존 패키지 29 개. 앞 30 개 이름만 xargs 로 한 줄에
+-- glibc-devel·kernel-headers 는
+--   컴파일(relink)용이다
+-- libX* 가 많은 것은 runInstaller 의
+--   GUI(Java) 때문이다
+[root@ol7a pre]# rpm -qa | wc -l; rpm -qa | sort > rpm.after; diff rpm.before rpm.after | grep -c '^>'
+595
+30
+-- 565 → 595. 늘어난 30 개 = 의존 29 +
+--   preinstall 1
+-- diff 의 > 줄 = 새로 생긴 이름
+
+--------------------------------------------------------------------------------
+ [4] 패키지가 놓은 파일
+--------------------------------------------------------------------------------
+
+[root@ol7a pre]# rpm -ql oracle-database-preinstall-19c
+/etc/rc.d/init.d/oracle-database-preinstall-19c-firstboot
+/etc/security/limits.d/oracle-database-preinstall-19c.conf
+/etc/sysconfig/oracle-database-preinstall-19c
+/etc/sysconfig/oracle-database-preinstall-19c/oracle-database-preinstall-19c-verify
+/etc/sysconfig/oracle-database-preinstall-19c/oracle-database-preinstall-19c.param
+/usr/bin/oracle-database-preinstall-19c-verify
+/usr/share/licenses/oracle-database-preinstall-19c-1.0
+/usr/share/licenses/oracle-database-preinstall-19c-1.0/LICENSE
+/var/log/oracle-database-preinstall-19c
+/var/log/oracle-database-preinstall-19c/results
+-- 놓는 파일:
+-- rpm -ql : 패키지가 가진 파일 목록
+--   limits.d/…-19c.conf : 셸 한도
+--   /usr/bin/…-verify   : 실제 설정을 하는 스크립트
+--   …-firstboot         : 첫 부팅 때 다시 확인하는 init 스크립트
+--   /var/log/…/results  : 결과 로그 자리
+-- sysctl.conf 와 grub 은 패키지 파일이
+--   아니라 스크립트가 고친다
+[root@ol7a pre]# rpm -q --scripts oracle-database-preinstall-19c | grep -E 'scriptlet|verify'
+preinstall scriptlet (using /bin/sh):
+preuninstall scriptlet (using /bin/sh):
+ if [ -x /usr/bin/oracle-database-preinstall-19c-verify ]; then 
+   /usr/bin/oracle-database-preinstall-19c-verify -u 2> /dev/null 1>&2; 
+postuninstall scriptlet (using /bin/sh):
+posttrans scriptlet (using /bin/sh):
+/usr/bin/oracle-database-preinstall-19c-verify 2>/dev/null 1>&2; 
+-- posttrans(설치 끝)에서 verify 를,
+--   preuninstall 에서 verify -u 를 부른다
+-- preinstall 단계는 지난 설정 파일을 치운다
+-- -u 는 되돌리기. [11] 에서 무엇을 되돌리는지 본다
+[root@ol7a pre]# ls /var/log/oracle-database-preinstall-19c/backup/*/; grep -ciE 'error|fail' /var/log/oracle-database-preinstall-19c/results/orakernel.log; grep -iE 'numa|transparent|RemoveIPC' /var/log/oracle-database-preinstall-19c/results/orakernel.log | cut -c1-100 | head -6
+grub
+grub.cfg
+grubenv.16-11-26-11-15-06
+orakernel.log
+sysctl.conf
+0
+new boot params: "crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 conso
+old boot params: "crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 conso
+new boot params: "crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 conso
+Disabling Transparent Hugepages. 
+-- backup 아래 시각 디렉터리에
+--   grub·grub.cfg·grubenv·sysctl.conf 원본
+-- 문제가 생기면 이 원본으로 직접 되돌린다
+-- orakernel.log 에 error·fail 0 줄. 부트
+--   파라미터 old/new 와 THP 끄기 기록
+
+--------------------------------------------------------------------------------
+ [5] 사용자와 그룹
+--------------------------------------------------------------------------------
+
+[root@ol7a pre]# getent passwd > passwd.after; getent group > group.after
+[root@ol7a pre]# diff passwd.before passwd.after; diff group.before group.after
+28a29
+> oracle:x:54321:54321::/home/oracle:/bin/bash
+51a52,58
+> oinstall:x:54321:oracle
+> dba:x:54322:oracle
+> oper:x:54323:oracle
+> backupdba:x:54324:oracle
+> dgdba:x:54325:oracle
+> kmdba:x:54326:oracle
+> racdba:x:54330:oracle
+-- passwd 에 oracle 한 줄,
+--   group 에 일곱 줄이 생겼다
+-- diff 의 28a29 : 28 번 줄 뒤에 29 번 줄 추가
+-- 번호 54321~54326, 54330. 54327~54329 는
+--   ASM 그룹 몫으로 비어 있다
+[root@ol7a pre]# id oracle
+uid=54321(oracle) gid=54321(oinstall) groups=54321(oinstall),54322(dba),54323(oper),54324(backupdba),54325(dgdba),54326(kmdba),54330(racdba)
+-- 기본 그룹 oinstall, 보조 그룹 여섯. 본문
+--   17.2 의 표와 같다
+[root@ol7a pre]# grep ^oracle: /etc/shadow | cut -d: -f1-2
+oracle:!!
+-- !! : 비밀번호가 없어 잠긴 상태. 로그인하려면
+--   passwd oracle
+-- su - oracle 은 root 라 비밀번호 없이 된다
+
+--------------------------------------------------------------------------------
+ [6] 커널 파라미터 — diff
+--------------------------------------------------------------------------------
+
+[root@ol7a pre]# sysctl -a 2>/dev/null | sort > sysctl.after; wc -l sysctl.after
+1120 sysctl.after
+-- 줄 수는 그대로 1120. 새 키는 없고 값만 바뀌었다
+-- 매번 바뀌는 통계 값(dentry·inode 수, random 등)은 빼고 비교한다
+[root@ol7a pre]# X='^(fs\.(dentry|inode|file-nr)|kernel\.random|kernel\.ns_last_pid|kernel\.sched_domain|fs\.quota|net\.netfilter\.nf_conntrack_count)'; diff <(grep -vE "$X" sysctl.before) <(grep -vE "$X" sysctl.after)
+42c42
+< fs.aio-max-nr = 65536
+---
+> fs.aio-max-nr = 1048576
+47c47
+< fs.file-max = 368255
+---
+> fs.file-max = 6815744
+183c183
+< kernel.sem = 32000    1024000000      500     32000
+---
+> kernel.sem = 250      32000   100     128
+185,186c185,186
+< kernel.shmall = 18446744073692774399
+< kernel.shmmax = 18446744073692774399
+---
+> kernel.shmall = 1073741824
+> kernel.shmmax = 4398046511104
+236,237c236,237
+< net.core.rmem_default = 212992
+< net.core.rmem_max = 212992
+---
+> net.core.rmem_default = 262144
+> net.core.rmem_max = 4194304
+242,243c242,243
+< net.core.wmem_default = 212992
+< net.core.wmem_max = 212992
+---
+> net.core.wmem_default = 262144
+> net.core.wmem_max = 1048576
+278c278
+< net.ipv4.conf.all.rp_filter = 1
+---
+> net.ipv4.conf.all.rp_filter = 2
+310c310
+< net.ipv4.conf.default.rp_filter = 1
+---
+> net.ipv4.conf.default.rp_filter = 2
+442c442
+< net.ipv4.ip_local_port_range = 32768  60999
+---
+> net.ipv4.ip_local_port_range = 9000   65500
+-- 바뀐 것 열세 줄. < 가 설치 전, > 가 설치 후
+-- 숫자 사이가 탭이라 < > 줄의 간격이 다르다
+--   aio-max-nr 65536 → 1048576, file-max 368255 → 6815744
+--   sem → 250 32000 100 128 (UEK 기본보다 오히려 작다)
+--   shmall 1073741824, shmmax 4398046511104 (4TiB)
+--   소켓 버퍼 4개, rp_filter 1 → 2, 포트 9000~65500
+-- shmmni 4096·panic_on_oops 1 은 기본값과
+--   같아 diff 에 없다
+-- sched_domain 줄은 실행마다 바뀌는
+--   통계라 X 에 넣어 뺐다
+[root@ol7a pre]# grep -v '^#' /etc/sysctl.conf | grep .
+fs.file-max = 6815744
+kernel.sem = 250 32000 100 128
+kernel.shmmni = 4096
+kernel.shmall = 1073741824
+kernel.shmmax = 4398046511104
+kernel.panic_on_oops = 1
+net.core.rmem_default = 262144
+net.core.rmem_max = 4194304
+net.core.wmem_default = 262144
+net.core.wmem_max = 1048576
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+fs.aio-max-nr = 1048576
+net.ipv4.ip_local_port_range = 9000 65500
+-- 저장 위치는 /etc/sysctl.conf. 열네 줄이다
+-- 키 순서는 설치 가이드 표 순서와 거의 같다
+[root@ol7a pre]# ls /etc/sysctl.d/
+99-initial-sysctl.conf
+99-oracle-database-preinstall-19c-sysctl.conf
+99-sysctl.conf
+-- sysctl.d 에도
+--   99-oracle-database-preinstall-19c-sysctl.conf 가 생겼다
+-- 두 곳에 같은 값이 있어 어느 한쪽을 고칠 때 주의한다
+-- 99-sysctl.conf 는 /etc/sysctl.conf 로 가는 링크다
+
+--------------------------------------------------------------------------------
+ [7] 셸 한도 — limits.d
+--------------------------------------------------------------------------------
+
+[root@ol7a pre]# ls -l /etc/security/limits.d/
+total 8
+-rw-r--r--. 1 root root  191 Apr 10  2024 20-nproc.conf
+-rw-r--r--. 1 root root 1205 Nov 16 11:15 oracle-database-preinstall-19c.conf
+-- limits.d 에 1205 바이트 파일 하나가 늘었다
+-- 주석 줄이 많아 크기에 비해 값은 열 줄이다
+[root@ol7a pre]# grep -v '^#' /etc/security/limits.d/oracle-database-preinstall-19c.conf | grep .
+oracle   soft   nofile    1024
+oracle   hard   nofile    65536
+oracle   soft   nproc    16384
+oracle   hard   nproc    16384
+oracle   soft   stack    10240
+oracle   hard   stack    32768
+oracle   hard   memlock    134217728
+oracle   soft   memlock    134217728
+oracle   soft   data    unlimited
+oracle   hard   data    unlimited
+-- nofile 1024/65536, nproc
+--   16384/16384, stack 10240/32768 KB
+-- memlock 134217728 KB(128GiB),
+--   data unlimited
+-- 설치 가이드의 nproc soft 2047 보다
+--   큰 16384 를 쓴다
+[oracle@ol7a ~]$ echo "nofile $(ulimit -Sn)/$(ulimit -Hn) nproc $(ulimit -Su)/$(ulimit -Hu) stack $(ulimit -Ss)/$(ulimit -Hs) memlock $(ulimit -Sl)/$(ulimit -Hl)"
+nofile 1024/65536 nproc 16384/16384 stack 10240/32768 memlock 134217728/134217728
+-- su - oracle 로 연 새 세션에 바로
+--   적용됐다(soft/hard)
+-- 한 줄에 네 항목을 soft/hard 로 찍었다
+
+--------------------------------------------------------------------------------
+ [8] 부트 파라미터와 그 밖의 파일
+--------------------------------------------------------------------------------
+
+[root@ol7a pre]# grubby --info=ALL | grep ^args > grubby.after; diff <(xargs -n1 < grubby.before | sort -u) <(xargs -n1 < grubby.after | sort -u); grep -c 'numa=off transparent_hugepage=never' grubby.after
+1c1
+< args=ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync 
+---
+> args=ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync numa=off transparent_hugepage=never
+5
+-- args 를 단어로 쪼개 비교하니 다섯 항목이
+--   같은 한 줄로 합쳐졌다
+-- xargs -n1 : 단어 하나씩 한 줄로
+-- 늘어난 단어는 numa=off,
+--   transparent_hugepage=never 두 개
+-- grep -c 5 : 커널 항목 다섯 개 모두에 들어갔다
+[root@ol7a pre]# grep -o 'scsi_mod.scan=sync.*' /etc/default/grub
+scsi_mod.scan=sync numa=off transparent_hugepage=never"
+-- /etc/default/grub 에도 넣었다. 앞으로
+--   설치될 커널에도 붙는다
+-- grub.cfg 는 grubby 가 직접 고쳤다
+[root@ol7a pre]# diff cmdline.before /proc/cmdline && echo "cmdline unchanged"
+cmdline unchanged
+-- diff 가 0 으로 끝나 "cmdline unchanged".
+--   실행 중인 커널은 그대로다
+[root@ol7a pre]# grep -i zeroconf /etc/sysconfig/network
+# oracle-database-preinstall-19c : Add NOZEROCONF=yes
+NOZEROCONF=yes
+-- 169.254.0.0/16 링크 로컬 경로를 만들지 않게 하는 설정
+-- 주석 줄이 preinstall 이 넣었다는 표시다
+[root@ol7a pre]# grep -n 'RemoveIPC' /etc/systemd/logind.conf
+33:#RemoveIPC=no
+36:RemoveIPC=no
+-- logind.conf 는 바뀌지 않았다. 7.9 기본의
+--   36 번 줄 그대로다
+[root@ol7a pre]# cat /sys/kernel/mm/transparent_hugepage/enabled
+always madvise [never]
+-- THP 는 재부팅 전인데 이미 never. verify 가
+--   sysfs 에도 썼다
+-- 기준 상태는 [always] 였다(실습 05 [0])
+
+--------------------------------------------------------------------------------
+ [9] 즉시 반영된 것과 아닌 것
+--------------------------------------------------------------------------------
+
+-- 실행 중인 커널 값과 파일 값을 항목마다 나란히 본다
+[root@ol7a pre]# for k in kernel.sem kernel.shmmax fs.file-max net.ipv4.ip_local_port_range; do printf '%-29s run=%-22s file=%s\n' $k "$(sysctl -n $k | tr '\t' ' ')" "$(grep "^$k" /etc/sysctl.conf | cut -d= -f2 | xargs)"; done
+kernel.sem                    run=250 32000 100 128      file=250 32000 100 128
+kernel.shmmax                 run=4398046511104          file=4398046511104
+fs.file-max                   run=6815744                file=6815744
+net.ipv4.ip_local_port_range  run=9000 65500             file=9000 65500
+-- run(실행 중) 과 file(sysctl.conf) 이 모두
+--   같다. 설치 즉시 반영됐다
+-- tr '\t' ' ' 로 탭을 공백으로 바꿔 비교했다
+[root@ol7a pre]# grep -o 'numa=off\|transparent_hugepage=[a-z]*' /proc/cmdline; echo "exit=$?"
+exit=1
+-- 부트 파라미터는 아직 /proc/cmdline 에
+--   없다(grep 종료 코드 1)
+-- 증상   : grub 에는 numa=off·THP 가 있는데
+--          실행 중인 커널에는 없다
+-- 원인   : 부트 파라미터는 커널이 뜰 때만 읽는다
+-- 조치   : 재부팅
+
+-- 재부팅(@reboot a)
+[root@ol7a pre]# uptime; cut -d' ' -f6- /proc/cmdline
+ 11:15:35 up 0 min,  0 users,  load average: 0.07, 0.02, 0.00
+rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync numa=off transparent_hugepage=never
+[root@ol7a pre]# grep -o 'numa=off\|transparent_hugepage=[a-z]*' /proc/cmdline; cat /sys/kernel/mm/transparent_hugepage/enabled
+numa=off
+transparent_hugepage=never
+always madvise [never]
+-- 재확인 : /proc/cmdline 에 numa=off,
+--         transparent_hugepage=never
+-- numa=off : 이 VM 은 NUMA 노드가
+--   하나라 실제 차이는 없다
+-- 큰 NUMA 서버에서는 메모리 배치가 달라진다
+[root@ol7a pre]# sysctl kernel.sem kernel.shmmax fs.aio-max-nr
+kernel.sem = 250        32000   100     128
+kernel.shmmax = 4398046511104
+fs.aio-max-nr = 1048576
+-- sysctl 값도 재부팅 뒤 그대로.
+--   sysctl.conf 에서 다시 읽혔다
+-- systemd-sysctl 이 부팅 때 적용했다
+
+--------------------------------------------------------------------------------
+ [10] 19c 최소값과 대조
+--------------------------------------------------------------------------------
+
+-- 설치 가이드 최소값을 파일로 두고 실제 값과 비교한다(값이 같거나 크면 OK)
+[root@ol7a pre]# printf '%s\n' 'kernel.shmmni 4096' 'fs.file-max 6815744' 'fs.aio-max-nr 1048576' 'net.core.rmem_default 262144' 'net.core.rmem_max 4194304' 'net.core.wmem_default 262144' 'net.core.wmem_max 1048576' > min19c.txt
+-- 한 줄에 "키 최소값". read k v 로 둘로 나눠 읽는다
+-- min19c.txt 는 설치 가이드 표를 옮긴 것이다
+-- [ "$c" -ge "$v" ] : 정수 비교. 같거나 크면 OK
+[root@ol7a pre]# while read k v; do c=$(sysctl -n $k); [ "$c" -ge "$v" ] && r=OK || r=LOW; printf '%-22s min=%-8s cur=%-8s %s\n' $k $v $c $r; done < min19c.txt
+kernel.shmmni          min=4096     cur=4096     OK
+fs.file-max            min=6815744  cur=6815744  OK
+fs.aio-max-nr          min=1048576  cur=1048576  OK
+net.core.rmem_default  min=262144   cur=262144   OK
+net.core.rmem_max      min=4194304  cur=4194304  OK
+net.core.wmem_default  min=262144   cur=262144   OK
+net.core.wmem_max      min=1048576  cur=1048576  OK
+-- 일곱 항목 모두 OK. 다른 서버에서도 같은 파일로 점검할 수 있다
+[root@ol7a pre]# sysctl -n kernel.sem | awk '{printf "semmsl=%s semmns=%s semopm=%s semmni=%s\n",$1,$2,$3,$4}'
+semmsl=250 semmns=32000 semopm=100 semmni=128
+-- kernel.sem 은 네 값이라 따로 나눠 찍었다
+-- awk 로 $1~$4 를 이름 붙여 찍었다
+
+--------------------------------------------------------------------------------
+ [변형] verify 스크립트를 다시 돌리면
+--------------------------------------------------------------------------------
+
+[root@ol7a pre]# cp -p /etc/sysctl.conf sysctl.conf.1st; ls /var/log/oracle-database-preinstall-19c/backup/
+Nov-16-2026-11-15-05
+-- 첫 설치 때의 backup 디렉터리 하나
+[root@ol7a pre]# /usr/bin/oracle-database-preinstall-19c-verify > verify2.log 2>&1; echo "exit=$?"; wc -l verify2.log
+exit=0
+8 verify2.log
+-- 스크립트를 다시 돌려도 exit=0
+-- 출력은 verify2.log 로 받았다
+[root@ol7a pre]# diff sysctl.conf.1st /etc/sysctl.conf && echo "sysctl.conf same"; ls /var/log/oracle-database-preinstall-19c/backup/
+sysctl.conf same
+Nov-16-2026-11-15-05
+Nov-16-2026-11-15-35
+-- sysctl.conf 는 그대로, backup
+--   디렉터리는 하나 늘었다
+-- 이미 맞는 값은 다시 쓰지 않고 원본만 또 남긴다
+[root@ol7a pre]# grubby --info=DEFAULT | grep ^args
+args="ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync numa=off transparent_hugepage=never"
+-- 부트 파라미터도 두 번 붙지 않았다
+-- 여러 번 돌려도 결과가 같다
+
+--------------------------------------------------------------------------------
+ [11] 패키지를 지우면
+--------------------------------------------------------------------------------
+
+[root@ol7a pre]# yum remove -y oracle-database-preinstall-19c > yum.remove.log 2>&1; echo "exit=$?"; grep -A2 '^Removed' yum.remove.log
+exit=0
+Removed:
+  oracle-database-preinstall-19c.x86_64 0:1.0-3.el7                             
+-- 의존 패키지 29 개는 지우지 않고 preinstall 만 지웠다
+-- yum remove 는 의존 패키지를 자동으로 지우지 않는다
+[root@ol7a pre]# id oracle; sysctl kernel.sem; ls /etc/security/limits.d/
+uid=54321(oracle) gid=54321(oinstall) groups=54321(oinstall),54322(dba),54323(oper),54324(backupdba),54325(dgdba),54326(kmdba),54330(racdba)
+kernel.sem = 250        32000   100     128
+20-nproc.conf
+-- 남은 것: oracle 사용자·그룹,
+--   kernel.sem 등 sysctl 값
+-- 사라진 것: limits.d 의 preinstall
+--   파일(패키지 파일이라)
+[root@ol7a pre]# grubby --info=DEFAULT | grep ^args
+args="ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync"
+-- 부트 파라미터는 verify -u 가 빼 놓았다
+-- 실행 중인 커널은 여전히 numa=off 로 떠 있다.
+--   다음 부팅부터 빠진다
+-- 원래대로 돌리려면 backup 의 sysctl.conf 와
+--   userdel 이 필요하다. 여기서는 스냅샷으로 돌린다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+--  항목                 설치 전            설치 직후          재부팅 뒤         패키지 제거 뒤
+--  rpm -qa              565                595                595               -
+--  id oracle            없음               54321(oinstall)    같음              남음
+--  kernel.sem           32000 1024000000…  250 32000 100 128  같음              남음
+--  fs.aio-max-nr        65536              1048576            같음              남음
+--  fs.file-max          368255             6815744            같음              남음
+--  limits.d 파일        20-nproc           + preinstall       같음              20-nproc
+--  /proc/cmdline        (랩 설정)          그대로             + numa·THP        (재부팅 전 그대로)
+--  grubby args          (랩 설정)          + numa·THP (5개)   같음              빠짐
+--  THP enabled          [always]           [never]            [never]           -
+--
+--  · 반영 시점: sysctl·사용자·THP sysfs 는 즉시, limits 는 새 세션, 부트 파라미터는 재부팅
+--  · 제거해도 사용자·sysctl 은 남는다. 되돌림은 스냅샷(ol7-base)
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. /etc/sysconfig/oracle-database-preinstall-19c/*.param 을 읽고 값 하나를 바꾼 뒤 verify 를 다시 돌린다
+--    확인: diff 로 sysctl.conf 변화, backup 디렉터리 수
+-- 2. ol7_latest 를 enabled=0 으로 바꾸고 설치를
+--   시도해 메시지를 비교한다
+-- 3. RHCK 로 부팅해 /proc/cmdline 과 THP 값을 본다
+
+================================================================================
+ 실습 01 종료 — preinstall 이 바꾼 것을 diff 로 확인했다. 부트 파라미터만 재부팅 뒤 반영됐다
+================================================================================

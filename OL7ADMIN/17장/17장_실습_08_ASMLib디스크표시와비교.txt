@@ -1,0 +1,451 @@
+================================================================================
+ 제17장 실습 08 — ASMLib 로 디스크 표시하기와 udev 방식 비교
+ 대상   : ol7a
+ 목표   : oracleasm-support 를 설치해 드라이버를 구성하고, createdisk·listdisks·
+          querydisk·scandisks 로 ASM 디스크 레이블을 다룬다. 레이블이 디스크
+          머리에 어떻게 기록되는지 보고, 파티션 없이 디스크 전체를 줄 때와
+          RHCK 로 부팅해 커널 드라이버가 없을 때 무엇이 나오는지 확인한다
+ 배경   : ASMLib 는 디스크 머리에 레이블을 써 두고, oracleasm 커널 드라이버가
+          /dev/oracleasm/disks/레이블 이라는 장치를 만든다. 장치 이름이 바뀌어도
+          레이블로 찾으므로 udev 규칙이 필요 없다. 드라이버는 UEK R6 에 들어
+          있고, RHCK 에서는 kmod-redhat-oracleasm 을 따로 깔아야 한다(본문 17.10)
+ 소요   : 약 30분 (재부팅 두 번)
+ 선행   : ol7-base 스냅샷(sdb~sde 비어 있음), 인터넷
+ 계정   : root
+ 주의   : sdc·sdd 머리에 레이블을 쓴다. 대상이 빈 디스크인지 HCTL 로 먼저 확인
+ 되돌림 : deletedisk, 파티션 지움, 패키지 제거. 확인은 lsblk, rpm -q oracleasm-support
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 지금 커널과, 레이블을 쓸 두 디스크가 비어 있는지부터 본다
+-- 이 실습은 sdc·sdd 만 쓴다
+-- lsblk -o : 열 지정. HCTL 은 Host:Channel:Target:LUN 으로 VMware SCSI 슬롯 위치다
+[root@ol7a ~]# uname -r; lsblk -o NAME,HCTL,SIZE,TYPE,FSTYPE /dev/sdc /dev/sdd
+5.4.17-2136.338.4.2.el7uek.x86_64
+NAME HCTL       SIZE TYPE FSTYPE
+sdc  2:0:2:0     10G disk 
+sdd  2:0:3:0     10G disk 
+-- UEK R6 5.4.17-2136.338.4.2 로 부팅돼 있다. ASMLib 드라이버가 들어 있는 커널이다
+-- sdc(2:0:2:0)·sdd(2:0:3:0) 모두 FSTYPE 이 비어 있다. 파티션도 서명도 없는 빈 디스크
+[root@ol7a ~]# rpm -qa 'oracleasm*' 'kmod*oracleasm*'; echo "exit=$?"
+exit=0
+-- rpm -qa 패턴 : 설치된 패키지 중 이름이 맞는 것. 아무것도 없어 빈 출력, 종료 코드 0
+-- 깨끗한 시작 상태다
+[root@ol7a ~]# lsmod | grep oracleasm; echo "exit=$?"
+exit=1
+-- grep 이 아무것도 찾지 못하면 종료 코드 1. 드라이버가 아직 적재되지 않았다
+
+--------------------------------------------------------------------------------
+ [1] 커널 드라이버 — UEK 에 들어 있나
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# modinfo oracleasm | grep -E '^(filename|description|version|vermagic|license)'
+filename:       /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/block/oracleasm/oracleasm.ko.xz
+description:    Kernel driver backing the Generic Linux ASM Library.
+version:        2.0.8
+license:        GPL
+vermagic:       5.4.17-2136.338.4.2.el7uek.x86_64 SMP mod_unload modversions 
+-- 패키지를 깔기 전인데 modinfo 가 모듈을 찾는다. 커널 패키지에 이미 들어 있다
+--   filename    : /lib/modules/<커널>/kernel/drivers/block/oracleasm/oracleasm.ko.xz (xz 압축 모듈)
+--   description : Kernel driver backing the Generic Linux ASM Library.
+--   version     : 2.0.8, vermagic : 이 커널용으로 빌드됐다는 표시
+[root@ol7a ~]# rpm -qf $(modinfo -n oracleasm)
+kernel-uek-5.4.17-2136.338.4.2.el7uek.x86_64
+-- rpm -qf 파일 : 그 파일을 설치한 패키지. 드라이버의 주인은 kernel-uek 자체다
+-- 커널을 업데이트하면 드라이버도 함께 바뀌니 따로 챙길 것이 없다
+-- 같은 질문을 RHCK 모듈 디렉터리에 한다. 0 이면 RHCK 에는 드라이버가 없다
+-- -R : 하위 디렉터리까지 나열
+[root@ol7a ~]# ls /lib/modules/3.10.0-1160.119.1.0.5.el7.x86_64/ -R 2>/dev/null | grep -c oracleasm
+0
+
+--------------------------------------------------------------------------------
+ [2] 패키지 설치
+--------------------------------------------------------------------------------
+
+-- 공개 저장소에서 받을 수 있는 ASMLib 관련 패키지
+-- 'oracleasm*' 는 따옴표로 셸 확장을 막는다
+[root@ol7a ~]# yum list available 'oracleasm*' 'kmod*oracleasm*' 2>&1 | sed -n '/Available/,$p'
+Available Packages
+kmod-oracleasm.x86_64                  2.0.8-28.0.1.el7               ol7_latest
+oracleasm-support.x86_64               2.1.11-2.el7                   ol7_latest
+-- kmod-oracleasm 2.0.8-28.0.1 : RHCK 용 드라이버. 문서가 말하는 kmod-redhat-oracleasm 과 이름이 다르다
+-- oracleasm-support 2.1.11 : 관리 명령(oracleasm)과 systemd 서비스
+-- oracleasmlib 은 목록에 없다. DB 가 디스크를 열 때 쓰는 라이브러리로 OTN 에서 따로 받는다
+[root@ol7a ~]# yum install -y oracleasm-support > /tmp/asm.yum.log 2>&1; echo "exit=$?"; grep -A3 '^Installed' /tmp/asm.yum.log
+exit=0
+Installed size: 266 k
+Downloading packages:
+Running transaction check
+Running transaction test
+--
+Installed:
+  oracleasm-support.x86_64 0:2.1.11-2.el7                                       
+
+Complete!
+-- 의존 패키지 없이 oracleasm-support 하나만 설치됐다(Installed size 266 k)
+-- grep -A3 '^Installed' 가 Installed size 줄과 Installed: 줄을 둘 다 잡아 두 덩어리로 보인다
+-- 설치 로그 전체는 /tmp/asm.yum.log 에 남겼다
+[root@ol7a ~]# yum install -y oracleasmlib 2>&1 | tail -2
+No package oracleasmlib available.
+Error: Nothing to do
+-- 저장소에 없는 이름이라 "No package oracleasmlib available." 이 이 실습에서 레이블 작업에는 지장이 없다
+-- 레이블 쓰기·장치 만들기는 support 패키지와 커널 드라이버가 하고, oracleasmlib 은 DB 의 디스크 검색(ORCL:)에 쓰인다
+[root@ol7a ~]# rpm -ql oracleasm-support | grep -E 'bin/|systemd|sysconfig|udev'
+/etc/sysconfig/oracleasm
+/usr/lib/systemd/system/oracleasm.service
+/usr/sbin/asmscan
+/usr/sbin/asmtool
+/usr/sbin/oracleasm
+/usr/sbin/oracleasm.init
+-- /etc/sysconfig/oracleasm         : 설정 파일(configure 가 쓴다)
+-- oracleasm.service                : 부팅 때 드라이버 적재·디스크 스캔
+-- oracleasm, oracleasm.init        : 관리 명령과 서비스가 부르는 스크립트
+-- asmtool·asmscan                  : 헤더를 쓰고 읽는 하위 도구
+
+--------------------------------------------------------------------------------
+ [3] 구성 — oracleasm configure -i
+--------------------------------------------------------------------------------
+
+-- Grid 소유자 grid 와 asmadmin 을 만든다. /dev/oracleasm 아래 장치를 이 둘이 소유하게 된다
+-- 소유자는 configure 에서 정한다
+[root@ol7a ~]# groupadd -g 54321 oinstall; groupadd -g 54329 asmadmin; useradd -u 54331 -g oinstall -G asmadmin grid; id grid
+uid=54331(grid) gid=54321(oinstall) groups=54321(oinstall),54329(asmadmin)
+-- 번호는 설치 가이드 예제(grid 54331, asmadmin 54329)와 같게 했다
+-- 운영에서는 asmdba(54327)·asmoper(54328)도 만들고 oracle 을 asmdba 에 넣는다. 여기서는 레이블만 다루므로 생략
+-- configure 가 사용자·그룹 이름을 받으니 이 둘이 먼저 있어야 한다
+[root@ol7a ~]# oracleasm configure
+ORACLEASM_ENABLED=false
+ORACLEASM_UID=
+ORACLEASM_GID=
+ORACLEASM_SCANBOOT=true
+ORACLEASM_SCANORDER=""
+ORACLEASM_SCANEXCLUDE=""
+ORACLEASM_SCAN_DIRECTORIES=""
+ORACLEASM_USE_LOGICAL_BLOCK_SIZE="false"
+-- 인자 없는 configure 는 현재 설정을 보여 준다. 처음이라 UID·GID 가 비어 있고 ENABLED=false
+-- SCANBOOT=true : 부팅 때 디스크를 스캔, SCANORDER·SCANEXCLUDE : 스캔할·뺄 장치 이름 접두사
+--   multipath 를 쓰는 서버는 SCANORDER="dm", SCANEXCLUDE="sd" 로 경로 장치 대신 dm 장치를 잡게 한다
+--   그렇지 않으면 같은 LUN 의 sd 경로 하나를 먼저 잡아 다중 경로의 이점을 잃는다
+-- USE_LOGICAL_BLOCK_SIZE=false : 물리 블록 크기로 I/O 한다. 4K 섹터 디스크에서 의미가 있다
+-- -i 는 대화형. 질문 네 개의 답을 printf 로 차례대로 넣는다(소유자, 그룹, 부팅 시 적재, 부팅 시 스캔)
+[root@ol7a ~]# printf 'grid\nasmadmin\ny\ny\n' | oracleasm configure -i
+Configuring the Oracle ASM library driver.
+
+This will configure the on-boot properties of the Oracle ASM library
+driver.  The following questions will determine whether the driver is
+loaded on boot and what permissions it will have.  The current values
+will be shown in brackets ('[]').  Hitting <ENTER> without typing an
+answer will keep that current value.  Ctrl-C will abort.
+
+Default user to own the driver interface []: Default group to own the driver interface []: Start Oracle ASM library driver on boot (y/n) [n]: Scan for Oracle ASM disks on boot (y/n) [y]: Writing Oracle ASM library driver configuration: done
+-- 질문과 답이 한 줄로 이어져 보이는 것은 입력이 파이프라 줄바꿈 에코가 없어서다
+-- 맨 끝 "Writing Oracle ASM library driver configuration: done" 이 설정을 저장했다는 표시다
+-- 답을 하나 덜 주면 마지막 질문에서 입력이 끝나 기본값([y])이 들어간다. 순서를 맞춰 넣는다
+[root@ol7a ~]# grep -v '^#' /etc/sysconfig/oracleasm | grep .
+ORACLEASM_ENABLED=true
+ORACLEASM_UID=grid
+ORACLEASM_GID=asmadmin
+ORACLEASM_SCANBOOT=true
+ORACLEASM_SCANORDER=""
+ORACLEASM_SCANEXCLUDE=""
+ORACLEASM_SCAN_DIRECTORIES=""
+ORACLEASM_USE_LOGICAL_BLOCK_SIZE=false
+-- ENABLED=true, UID=grid, GID=asmadmin 으로 바뀌었다. 파일은 직접 고치지 말고 configure 로 바꾼다(ASMLIB 문서 3장)
+
+--------------------------------------------------------------------------------
+ [4] 드라이버 올리기 — init 과 status
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# oracleasm status; echo "exit=$?"
+Checking if ASM is loaded: no
+Checking if /dev/oracleasm is mounted: no
+exit=1
+-- 설정만 했고 드라이버는 아직 올라가지 않았다. status 의 두 검사가 모두 no, 종료 코드 1
+-- configure 는 파일만 쓴다
+[root@ol7a ~]# oracleasm init
+Creating /dev/oracleasm mount point: /dev/oracleasm
+Loading module "oracleasm": oracleasm
+Configuring "oracleasm" to use device physical block size
+Mounting ASMlib driver filesystem: /dev/oracleasm
+-- init 은 네 가지를 한다: 마운트 지점 생성, 모듈 적재, 블록 크기 설정, oracleasmfs 마운트
+-- 블록 크기 설정은 USE_LOGICAL_BLOCK_SIZE=false 에 따른 것이다(physical block size)
+[root@ol7a ~]# oracleasm status; lsmod | grep oracleasm; mount | grep oracleasm
+Checking if ASM is loaded: yes
+Checking if /dev/oracleasm is mounted: yes
+oracleasm              61440  1 
+oracleasmfs on /dev/oracleasm type oracleasmfs (rw,relatime)
+-- lsmod 의 oracleasm 61440 1 : 크기와 사용 수(마운트 하나가 쓰는 중)
+-- mount 줄의 rw,relatime 은 기본 옵션이다
+-- /dev/oracleasm 은 일반 디렉터리가 아니라 oracleasmfs 라는 전용 파일 시스템이다
+[root@ol7a ~]# ls -l /dev/oracleasm/
+total 0
+drwxr-xr-x. 1 root root     0 Nov 16 10:54 disks
+drwxrwx---. 1 grid asmadmin 0 Nov 16 10:54 iid
+-- disks : 레이블 이름의 장치 노드가 생길 곳. iid : 인스턴스가 드라이버와 통신하는 곳으로 grid:asmadmin 소유
+-- disks 는 아직 비어 있다. root 소유 디렉터리지만 그 안의 장치 노드는 grid:asmadmin 으로 만들어진다
+[root@ol7a ~]# systemctl enable oracleasm 2>&1; systemctl is-enabled oracleasm
+enabled
+-- 부팅 때 oracleasm.service 가 init 과 scandisks 를 대신한다. [변형] 에서 재부팅으로 확인한다
+-- 7.9 의 oracleasm-support 2.1.11 은 systemd unit 을 쓴다. 옛 문서의 /etc/init.d/oracleasm 대신 systemctl 로 다룬다
+
+--------------------------------------------------------------------------------
+ [5] 파티션 없이 디스크 전체에 레이블
+--------------------------------------------------------------------------------
+
+-- 레이블을 쓰기 전에 대상이 맞는지 확인한다. 이름(sdc)만 믿지 않고 슬롯 위치와 빈 디스크인지를 함께 본다
+-- && 로 이어 조건이 거짓이면 멈춘다
+[root@ol7a ~]# [ "$(lsblk -dno HCTL /dev/sdc | xargs)" = "2:0:2:0" ] && [ -z "$(lsblk -no FSTYPE /dev/sdc | xargs)" ] && echo "sdc empty 2:0:2:0"
+sdc empty 2:0:2:0
+[root@ol7a ~]# oracleasm createdisk DATA1 /dev/sdc; echo "exit=$?"
+Device "/dev/sdc" is not a partition
+exit=1
+-- 증상   : "Device "/dev/sdc" is not a partition", 종료 코드 1
+-- 원인   : oracleasm createdisk 는 파티션을 기대한다. 디스크 전체를 주면 쓰기 전에 거부한다
+--          파티션 테이블이 있어야 다른 도구(fdisk, parted)가 "빈 디스크"로 오인해 덮어쓰는 일을 줄인다
+-- 조치   : [6] 에서 디스크마다 1MiB 부터 끝까지 파티션 하나를 만들고 그 파티션에 레이블을 쓴다
+[root@ol7a ~]# oracleasm listdisks; oracleasm querydisk -p DATA1 2>&1 | head -4
+Disk "DATA1" does not exist or is not instantiated
+-- listdisks 는 빈 출력. 레이블이 아무 데도 쓰이지 않았다
+-- querydisk -p 도 같은 메시지. 디스크 전체에 대한 시도는 흔적을 남기지 않았다
+-- LUN 을 통째로 ASM 에 주고 싶다면 ASMLib 대신 udev 규칙(실습 07)이나 AFD 를 쓴다
+
+--------------------------------------------------------------------------------
+ [6] 파티션을 만들고 레이블
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# oracleasm deletedisk DATA1 2>&1; wipefs -a /dev/sdc 2>&1 | head -3
+Disk "DATA1" does not exist or is not instantiated
+-- deletedisk 도 같은 메시지. wipefs 는 지울 서명이 없어 아무것도 출력하지 않았다
+-- parted -s : 질문 없이. mklabel msdos : MBR 파티션 테이블, mkpart primary 1MiB 100% : 정렬된 시작점부터 끝까지
+[root@ol7a ~]# [ "$(lsblk -dno HCTL /dev/sdd | xargs)" = "2:0:3:0" ] && parted -s /dev/sdc mklabel msdos mkpart primary 1MiB 100% && parted -s /dev/sdd mklabel msdos mkpart primary 1MiB 100%; lsblk -o NAME,SIZE,TYPE /dev/sdc /dev/sdd
+NAME   SIZE TYPE
+sdc     10G disk
+└─sdc1  10G part
+sdd     10G disk
+-- sdd 아래 sdd1 이 아직 보이지 않는다. lsblk 가 udev 의 처리보다 먼저 읽은 것이다
+-- 바로 다음 createdisk 가 /dev/sdd1 을 찾으니 커널에는 이미 파티션이 있다
+[root@ol7a ~]# oracleasm createdisk DATA1 /dev/sdc1; oracleasm createdisk DATA2 /dev/sdd1
+Writing disk header: done
+Instantiating disk: done
+Writing disk header: done
+Instantiating disk: done
+-- 디스크마다 두 단계: 헤더 쓰기(Writing disk header), /dev/oracleasm/disks 에 장치 만들기(Instantiating)
+-- 레이블은 대문자로 바뀌어 저장된다
+-- 재확인 : 파티션(sdc1)을 주자 DATA1 이 만들어졌다
+[root@ol7a ~]# oracleasm listdisks; ls -l /dev/oracleasm/disks/
+DATA1
+DATA2
+total 0
+brw-rw----. 1 grid asmadmin 8, 33 Nov 16 10:54 DATA1
+brw-rw----. 1 grid asmadmin 8, 49 Nov 16 10:54 DATA2
+-- 블록 장치(b), grid:asmadmin, 0660. configure 에서 정한 소유자·그룹이 그대로 붙었다
+-- 8, 33 은 sdc1, 8, 49 는 sdd1 의 장치 번호다. 이름만 다르고 같은 장치를 가리킨다
+[root@ol7a ~]# oracleasm querydisk -p DATA1; oracleasm querydisk /dev/sdd1
+Disk "DATA1" is a valid ASM disk
+/dev/sdc1: LABEL="DATA1" TYPE="oracleasm" 
+Device "/dev/sdd1" is marked an ASM disk with the label "DATA2"
+-- querydisk 는 두 방향으로 묻는다. 레이블 이름으로("DATA1" is a valid ASM disk), 장치로(/dev/sdd1 → DATA2)
+-- -p 를 주면 그 레이블이 있는 장치를 blkid 형식으로 함께 보여 준다(/dev/sdc1: LABEL="DATA1")
+-- querydisk 의 종료 코드로 스크립트에서 레이블 유무를 판단할 수 있다
+
+--------------------------------------------------------------------------------
+ [7] 레이블은 디스크 어디에
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# blkid /dev/sdc1 /dev/sdd1
+/dev/sdc1: LABEL="DATA1" TYPE="oracleasm" 
+/dev/sdd1: LABEL="DATA2" TYPE="oracleasm" 
+-- blkid 는 oracleasm 을 따로 묻지 않고 디스크 머리의 서명을 읽어 TYPE="oracleasm" 으로 알아본다
+-- LABEL= 값이 곧 ASMLib 레이블이다
+-- 그래서 mkfs·pvcreate 같은 도구도 이 디스크에 무엇이 있는지 경고할 수 있다
+[root@ol7a ~]# dd if=/dev/sdc1 bs=512 count=1 status=none | od -A d -c | sed -n '1,6p'
+0000000  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0   u   A   T   A
+0000016  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0
+0000032   O   R   C   L   D   I   S   K   D   A   T   A   1  \0  \0  \0
+0000048  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0  \0
+*
+0000512
+-- 첫 섹터 512 바이트를 덤프했다. od -A d : 왼쪽 주소를 10진수로, -c : 글자로
+-- 32 번째 바이트부터 ORCLDISK, 이어서 레이블 DATA1. 이것이 ASMLib 가 디스크를 알아보는 표지다
+-- 레이블은 파티션의 첫 섹터에 쓰였다. 디스크의 첫 섹터(MBR)는 건드리지 않았다
+-- 디스크그룹을 만들면 ASM 이 이 영역에 자기 디스크 헤더를 쓰고, ORCLDISK 표지는 그 안에 유지된다
+-- 12 번째 바이트의 uATA 는 헤더의 다른 필드다. * 는 앞줄과 같은 내용이 반복돼 생략했다는 od 의 표시
+[root@ol7a ~]# ls -l /dev/sdc1; stat -c '%t:%T %n' /dev/sdc1 /dev/oracleasm/disks/DATA1
+brw-rw----. 1 root disk 8, 33 Nov 16 10:54 /dev/sdc1
+8:21 /dev/sdc1
+8:21 /dev/oracleasm/disks/DATA1
+-- %t:%T 는 장치 번호를 16진수로 찍는다. 8:21(16진) = 8:33(10진) = sdc1
+-- /dev/sdc1 은 root:disk, DATA1 은 grid:asmadmin. 같은 장치를 서로 다른 권한의 두 노드로 연다
+-- ASM_DISKSTRING 을 ORCL:* 로 두면 ASM 은 oracleasmlib 을 통해 레이블로 디스크를 찾는다
+-- oracleasmlib 없이 /dev/oracleasm/disks/* 로 두면 일반 블록 장치처럼 연다
+-- udev 규칙(실습 07)은 sdc1 노드 자체의 소유자를 바꾸고, ASMLib 는 별도 노드를 만든다
+
+--------------------------------------------------------------------------------
+ [8] scandisks — 레이블로 다시 찾기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# oracleasm scandisks; oracleasm listdisks
+Reloading disk partitions: done
+Cleaning any stale ASM disks...
+Scanning system for ASM disks...
+DATA1
+DATA2
+-- scandisks : 파티션 표를 다시 읽고, 사라진 장치를 정리하고, 레이블이 있는 장치를 찾아 장치를 만든다
+-- 이미 있는 장치라 새로 만든 것은 없다
+[root@ol7a ~]# rm -f /dev/oracleasm/disks/DATA2; oracleasm listdisks; oracleasm scandisks; oracleasm listdisks
+DATA1
+Reloading disk partitions: done
+Cleaning any stale ASM disks...
+Scanning system for ASM disks...
+Instantiating disk "DATA2"
+DATA1
+DATA2
+-- /dev/oracleasm/disks/DATA2 노드를 지우자 listdisks 에서 사라졌다. 디스크 헤더는 그대로다
+-- scandisks 가 헤더에서 레이블을 다시 찾아 Instantiating disk "DATA2" 로 되살렸다
+-- 장치 이름이 바뀌거나 새 노드에서 처음 볼 때도 이 동작으로 같은 이름을 얻는다
+-- RAC 의 둘째 노드라면 createdisk 없이 configure·init 뒤 scandisks 만 하면 같은 DATA1·DATA2 가 생긴다
+-- 두 노드에서 같은 디스크에 createdisk 를 두 번 하면 헤더를 덮어쓰니 한 노드에서만 한다
+
+--------------------------------------------------------------------------------
+ [9] RHCK 로 부팅하면
+--------------------------------------------------------------------------------
+
+-- grub2-reboot 메뉴이름 : 다음 한 번의 부팅만 그 항목으로. GRUB_DEFAULT=saved 일 때 쓸 수 있다
+-- awk 로 grub.cfg 에서 RHCK 3.10.0-1160.119 항목의 제목을 뽑아 넘긴다
+[root@ol7a ~]# grub2-reboot "$(awk -F"'" '/^menuentry .*3\.10\.0-1160\.119/{print $2; exit}' /boot/grub2/grub.cfg)"; grub2-editenv list
+saved_entry=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.338.4.2.el7uek.x86_64
+next_entry=Oracle Linux Server 7.9, with Linux 3.10.0-1160.119.1.0.5.el7.x86_64
+-- saved_entry 는 그대로 UEK, next_entry 에 RHCK 가 들어갔다. 다음 부팅이 끝나면 next_entry 는 비워진다
+-- 기본 부팅 항목은 바뀌지 않는다
+-- 재부팅
+[root@ol7a ~]# uname -r; systemctl status oracleasm --no-pager 2>&1 | sed -n '1,4p'
+3.10.0-1160.119.1.0.5.el7.x86_64
+● oracleasm.service - Load oracleasm Modules
+   Loaded: loaded (/usr/lib/systemd/system/oracleasm.service; enabled; vendor preset: disabled)
+   Active: active (exited) since Mon 2026-11-16 10:55:07 KST; 10s ago
+  Process: 871 ExecStart=/usr/sbin/oracleasm.init start_sysctl (code=exited, status=0/SUCCESS)
+-- RHCK 3.10.0-1160.119.1.0.5 로 떴다. oracleasm.service 는 active (exited), status=0/SUCCESS
+-- 서비스는 성공으로 끝났지만 아래에서 보듯 드라이버는 올라오지 않았다. 서비스 상태만 보면 놓친다
+-- start_sysctl : 서비스가 부르는 단계 이름. 드라이버 적재 실패를 서비스 실패로 올리지 않는다
+[root@ol7a ~]# oracleasm status; echo "exit=$?"
+Checking if ASM is loaded: no
+Checking if /dev/oracleasm is mounted: no
+exit=1
+-- status 의 두 검사 모두 no. UEK 에서 init 직후 yes 였던 것과 대조된다
+[root@ol7a ~]# oracleasm init; echo "exit=$?"
+Loading module "oracleasm": failed
+Unable to load module "oracleasm"
+Mounting ASMlib driver filesystem: failed
+Unable to mount ASMlib driver filesystem
+exit=0
+-- 증상   : "Loading module "oracleasm": failed", "Unable to mount ASMlib driver filesystem"
+--          그런데 종료 코드는 0이다. 스크립트로 init 결과를 판단하면 성공으로 오인한다
+-- 원인   : 아래 modprobe 가 보여 주듯 RHCK 에는 oracleasm 모듈이 없다. [1] 의 grep -c 결과 0 과 같은 이야기다
+[root@ol7a ~]# modprobe oracleasm; echo "exit=$?"
+modprobe: FATAL: Module oracleasm not found.
+exit=1
+-- modprobe 는 /lib/modules/$(uname -r) 에서만 찾는다. 다른 커널(UEK)의 모듈은 쓸 수 없다
+-- FATAL: 모듈 파일을 찾지 못함
+[root@ol7a ~]# yum list available kmod-redhat-oracleasm 2>&1 | tail -2
+Loaded plugins: langpacks, ulninfo
+Error: No matching Packages to list
+-- 문서가 적은 kmod-redhat-oracleasm 이라는 이름은 ol7_latest 에 없다. [2] 의 목록에서 본 kmod-oracleasm 이 그 자리다
+-- 이름은 저장소마다 다를 수 있다
+[root@ol7a ~]# ls /dev/oracleasm/disks/ 2>&1; blkid /dev/sdc1
+ls: cannot access /dev/oracleasm/disks/: No such file or directory
+/dev/sdc1: LABEL="DATA1" TYPE="oracleasm" 
+-- 드라이버가 없으니 /dev/oracleasm 자체가 없다. 디스크 헤더는 그대로라 blkid 는 레이블을 읽는다
+-- 이 상태에서 ASM 인스턴스를 띄우면 ORCL: 디스크를 하나도 찾지 못해 디스크그룹이 마운트되지 않는다
+-- 조치   : 기본 커널(UEK)로 다시 부팅한다. RHCK 를 계속 써야 한다면 yum install kmod-oracleasm 으로
+--          그 커널용 드라이버를 깔고 oracleasm init 을 다시 한다. 커널 업데이트 때마다 kmod 도 함께 맞춘다
+
+--------------------------------------------------------------------------------
+ [변형] UEK 로 돌아와 레이블 자동 인식
+--------------------------------------------------------------------------------
+
+-- 재부팅. grub2-reboot 는 한 번만 적용되므로 따로 되돌리지 않아도 saved_entry 의 UEK 로 뜬다
+[root@ol7a ~]# uname -r; systemctl is-active oracleasm; oracleasm listdisks; ls -l /dev/oracleasm/disks/
+5.4.17-2136.338.4.2.el7uek.x86_64
+active
+DATA1
+DATA2
+total 0
+brw-rw----. 1 grid asmadmin 8, 33 Nov 16 10:55 DATA1
+brw-rw----. 1 grid asmadmin 8, 49 Nov 16 10:55 DATA2
+-- 재확인 : UEK 5.4.17-2136.338.4.2 로 돌아오자 서비스 active, DATA1·DATA2 가 grid:asmadmin 으로 다시 생겼다
+-- 손으로 init·scandisks 를 하지 않았다. 부팅 때 서비스가 레이블을 찾아 만들었다
+-- 장치 번호 8, 33 과 8, 49 도 재부팅 전과 같다. 디스크 발견 순서가 같았기 때문이다
+-- 순서가 바뀌어 sdc1 이 다른 번호가 되더라도 레이블로 찾으니 DATA1 은 같은 디스크를 가리킨다
+[root@ol7a ~]# journalctl -b -u oracleasm --no-pager | tail -5 | cut -c1-120
+-- Logs begin at Mon 2026-11-16 10:55:28 KST, end at Mon 2026-11-16 10:55:44 KST. --
+Nov 16 10:55:30 ol7a.example.com systemd[1]: Starting Load oracleasm Modules...
+Nov 16 10:55:31 ol7a.example.com oracleasm.init[987]: Initializing the Oracle ASMLib driver: OK
+Nov 16 10:55:31 ol7a.example.com oracleasm.init[987]: Scanning the system for Oracle ASMLib disks: OK
+Nov 16 10:55:31 ol7a.example.com systemd[1]: Started Load oracleasm Modules.
+-- 서비스 로그의 두 줄이 부팅 때 한 일이다: Initializing the Oracle ASMLib driver, Scanning the system ... disks
+-- -b : 이번 부팅의 로그만
+-- udev 방식(실습 07)과 비교하면
+--   udev   : 규칙 한 줄을 사람이 디스크마다 적고, 커널과 상관없이 동작
+--   ASMLib : 레이블을 한 번 쓰면 스캔이 찾아 주지만, 커널마다 드라이버가 있어야 동작
+
+--------------------------------------------------------------------------------
+ [10] 되돌리기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# oracleasm deletedisk DATA1; oracleasm deletedisk DATA2
+Clearing disk header: done
+Dropping disk: done
+Clearing disk header: done
+Dropping disk: done
+-- deletedisk : 헤더를 지우고(Clearing disk header) 장치를 없앤다(Dropping disk). 데이터 영역은 건드리지 않는다
+-- ASM 디스크그룹에 속한 디스크라면 먼저 ASM 에서 DROP DISK 하고 리밸런스가 끝난 뒤 deletedisk 한다
+[root@ol7a ~]# systemctl disable oracleasm 2>&1; oracleasm exit; yum remove -y oracleasm-support >/dev/null 2>&1; rpm -q oracleasm-support
+Removed symlink /etc/systemd/system/multi-user.target.wants/oracleasm.service.
+Unmounting ASMlib driver filesystem: /dev/oracleasm
+Unloading module "oracleasm": oracleasm
+package oracleasm-support is not installed
+-- oracleasm exit : 마운트를 풀고 모듈을 내린다. 그 뒤 패키지를 지웠다
+-- 서비스 링크도 지웠다(disable)
+[root@ol7a ~]# wipefs -a /dev/sdc1 /dev/sdd1 >/dev/null; wipefs -a /dev/sdc /dev/sdd >/dev/null; partprobe /dev/sdc /dev/sdd; userdel -r grid; groupdel asmadmin; groupdel oinstall
+[root@ol7a ~]# lsblk -o NAME,SIZE,TYPE,FSTYPE /dev/sdc /dev/sdd; lsmod | grep -c oracleasm
+NAME SIZE TYPE FSTYPE
+sdc   10G disk 
+sdd   10G disk 
+0
+-- lsblk 에 파티션이 없고 FSTYPE 도 비었다. lsmod 의 oracleasm 0 줄. [0] 과 같은 상태다
+-- grid·asmadmin·oinstall 도 지웠다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+--  항목                        시작 전        UEK 구성 후             RHCK 부팅         되돌린 뒤
+--  oracleasm 모듈              (미적재)       oracleasm 61440 1       Module not found  (미적재)
+--  oracleasm status            -              loaded yes / mounted yes no / no          -
+--  /etc/sysconfig/oracleasm    -              UID=grid GID=asmadmin   같음              (패키지 제거)
+--  createdisk /dev/sdc         -              is not a partition      -                 -
+--  DATA1 / DATA2               -              sdc1 / sdd1, 0660       장치 없음         헤더 지움
+--  blkid sdc1                  (없음)         TYPE="oracleasm"        TYPE="oracleasm"  (없음)
+--  oracleasm init 종료 코드    -              -                       0 (실패 메시지)   -
+--
+--  · 드라이버는 kernel-uek 패키지에 들어 있다. RHCK 는 kmod-oracleasm 이 따로 필요하다
+--  · oracleasmlib 은 공개 저장소에 없어 OTN 에서 받는다. 레이블 작업에는 필요 없다
+--  · init 이 실패해도 종료 코드 0, 서비스도 SUCCESS. status 로 확인한다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. /etc/sysconfig/oracleasm 의 ORACLEASM_SCANEXCLUDE 에 "sdd" 를 넣고 scandisks 를 한다
+--    확인: oracleasm listdisks 에 DATA2 가 남는지, /dev/oracleasm/disks 에 노드가 있는지
+-- 2. 레이블이 있는 sdc1 에 mkfs.xfs 를 실행해 어떤 경고가 나오는지 본다(-f 없이)
+--    확인: mkfs.xfs 의 출력, blkid /dev/sdc1
+-- 3. RHCK 로 부팅한 상태에서 kmod-oracleasm 을 설치하고 oracleasm init 을 다시 한다
+--    확인: oracleasm status 두 줄이 yes 인지, rpm -ql kmod-oracleasm 의 모듈 경로
+
+================================================================================
+ 실습 08 종료 — ASMLib 레이블은 디스크 첫 섹터에 남고, 드라이버가 있는 커널(UEK)에서만 장치가 생긴다
+================================================================================

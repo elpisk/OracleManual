@@ -1,0 +1,463 @@
+================================================================================
+ 제16장 실습 06 — 리스너 포트 1521 개방
+ 대상   : ol7a(DB 서버 역할), ol7b(클라이언트 역할)
+ 목표   : Oracle Net 리스너 포트 1521 을 firewalld 에 여는 세 가지 방법(포트, 직접 만든
+          서비스, 출발지 제한 rich rule)을 비교한다. 클라이언트에서 보이는 세 가지 실패
+          메시지(No route to host, Connection refused, Connection timed out)가 각각
+          무엇을 뜻하는지 구분하고, ss 로 리스너가 어느 주소에 묶였는지 확인한다
+ 배경   : 접속 실패는 방화벽이 거부(REJECT)했는지, 버렸는지(DROP), 방화벽은 통과했는데
+          그 포트를 듣는 프로세스가 없는지에 따라 클라이언트 메시지가 다르다. DB 접속
+          장애를 볼 때 이 구분이 첫 단계다. 실제 리스너 대신 ncat 이 1521 을 듣게
+          한다(본문 16.4·16.5, 17장 리스너 준비와 이어짐)
+ 소요   : 약 25분
+ 선행   : ol7-base, ol7b-base 스냅샷
+ 계정   : root
+ 주의   : drop 영역에 ol7b 주소를 넣는 단계가 있다. ol7b → ol7a 만 영향받고 강사 PC 의
+          접속은 그대로다. 끝나면 반드시 뺀다
+ 되돌림 : public 영역 [0] 과 같음, oracledb 서비스 정의 삭제, 1521 리스너 없음.
+          확인: firewall-cmd --list-all, ls /etc/firewalld/services, ss -ltn
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- -l : 대기 소켓, -t : TCP, -n : 숫자로
+[root@ol7a ~]# ss -ltn
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0      128          0.0.0.0:111       0.0.0.0:*          
+LISTEN 0      128          0.0.0.0:22        0.0.0.0:*          
+LISTEN 0      100        127.0.0.1:25        0.0.0.0:*          
+LISTEN 0      128             [::]:111          [::]:*          
+LISTEN 0      128             [::]:22           [::]:*          
+LISTEN 0      100            [::1]:25           [::]:*          
+-- 열: State · Recv-Q · Send-Q · Local Address:Port · Peer Address:Port · Process(-p 없어 빈칸)
+--   111  rpcbind, 모든 주소(0.0.0.0·[::])
+--   22   sshd, 모든 주소
+--   25   postfix, 루프백(127.0.0.1·[::1])만
+-- 1521 을 듣는 프로세스는 없다. Send-Q 는 대기 큐 한도(128·100)
+-- -l 대기, -t TCP, -n 숫자. -u 를 빼서 UDP 는 보지 않았다
+-- 이 목록이 [11] 끝에서 다시 같아야 한다
+-- 111(rpcbind) 은 방화벽에 열려 있지 않아 바깥에서는 닿지 않는다
+[root@ol7a ~]# firewall-cmd --list-all | sed -n '1,7p'; ls /etc/firewalld/services/
+public (active)
+  target: default
+  icmp-block-inversion: no
+  interfaces: ens32
+  sources: 
+  services: dhcpv6-client ssh
+  ports: 
+-- public 의 서비스는 dhcpv6-client ssh, 포트 없음. /etc/firewalld/services 는 비었다
+-- sed -n '1,7p' 로 앞 일곱 줄만 잘랐다. 나머지는 실습 02 에서 본 빈 항목들
+
+-- firewalld 가 1521 용 서비스를 갖고 있는지
+[root@ol7a ~]# firewall-cmd --get-services | tr ' ' '\n' | grep -i -E 'ora|1521'; echo "rc=$?"; grep -l '1521' /usr/lib/firewalld/services/*.xml; echo "rc=$?"
+ovirt-storageconsole
+rc=0
+rc=1
+-- grep -i 'ora' 에 ovirt-storageconsole 이 걸렸을 뿐 Oracle 서비스는 없다(rc=0 은 그 한 줄 때문)
+-- 서비스 XML 어디에도 1521 이 없다(rc=1). 7.9 의 firewalld 에는 리스너용 정의가 없다
+-- 그래서 포트로 열거나([3]) 서비스를 직접 만든다([7])
+
+-- /etc/services 에는 이름이 있다. 이 이름은 ss·iptables 가 포트를 이름으로 보일 때 쓴다
+[root@ol7a ~]# grep -w 1521 /etc/services
+ncube-lm        1521/tcp                # nCube License Manager
+ncube-lm        1521/udp                # nCube License Manager
+-- /etc/services 에서 1521 의 이름은 ncube-lm. IANA 등록 이름일 뿐 Oracle 과 무관하다
+-- ss·iptables -L(-n 없이)·netstat 이 1521 을 ncube-lm 으로 보이는 이유다
+-- 이름을 보고 다른 프로그램이 1521 을 쓰는 줄 오해하지 않는다
+
+--------------------------------------------------------------------------------
+ [1] 클라이언트 도구 준비
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# yum -y -q install nmap-ncat; rpm -q nmap-ncat
+nmap-ncat-6.40-19.el7.x86_64
+[root@ol7b ~]# yum -y -q install nmap-ncat telnet; rpm -q nmap-ncat telnet
+nmap-ncat-6.40-19.el7.x86_64
+telnet-0.17-66.el7.x86_64
+-- ol7b 에 ncat 과 telnet. telnet 은 DBA 가 흔히 쓰는 확인 도구라 비교용으로 넣었다
+-- telnet 클라이언트는 보안 가이드가 서버에서 지우라는 telnet-server 와 다른 패키지다
+-- ol7a 에도 ncat 을 깔았다. [5] 의 리스너 역할
+-- -q 라 설치 진행 줄은 없다
+
+--------------------------------------------------------------------------------
+ [2] 실패 메시지 ① — 방화벽 거부
+--------------------------------------------------------------------------------
+
+-- -v : 연결 과정 출력, -w 3 : 3초 제한. </dev/null : 보낼 것 없음
+[root@ol7b ~]# ncat -v -w 3 ol7a 1521 </dev/null; echo "rc=$?"
+Ncat: Version 7.50 ( https://nmap.org/ncat )
+Ncat: No route to host.
+rc=1
+-- 메시지 ① No route to host. ol7b 의 ncat 은 Version 7.50 으로 나온다(패키지 이름은 6.40-19)
+-- -v 로 연결 과정을 보였다. 거부 응답이 바로 와서 3초를 기다리지 않았다
+-- firewalld 기본 거부(icmp-host-prohibited)다. 이 서버의 1521 은 아직 방화벽에서 막혀 있다
+-- rc=1 은 ncat 의 연결 실패. 세 메시지 모두 rc=1 이라 rc 로는 구별되지 않는다
+
+--------------------------------------------------------------------------------
+ [3] 오류 재현 ① — 포트는 열렸는데 리스너가 없음
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# firewall-cmd --add-port=1521/tcp; firewall-cmd --list-ports
+success
+1521/tcp
+-- runtime 에 1521/tcp 를 열었다
+-- reload 하면 사라지는 runtime 개방이다. [7] 의 reload 에서 실제로 사라진다
+[root@ol7b ~]# ncat -v -w 3 ol7a 1521 </dev/null; echo "rc=$?"
+Ncat: Version 7.50 ( https://nmap.org/ncat )
+Ncat: Connection refused.
+rc=1
+-- 증상   : 방화벽을 열었는데 ol7b 는 "Ncat: Connection refused."
+-- 원인   : 1521 을 듣는 프로세스가 없다(아래 ss 결과가 머리 줄뿐). 커널이 RST 를 돌려보냈다
+-- 조치   : [5] 에서 리스너를 띄운다
+-- 재확인 : [5] 의 ncat 이 Connected to 172.16.225.61:1521
+-- 메시지가 No route to host 에서 Connection refused 로 바뀌었다. 방화벽 단계는 지났다는 뜻
+-- 응답이 즉시 왔다. 서버가 살아 있고 경로도 정상이다
+-- 방화벽은 지났고 프로세스가 없다
+
+-- 듣는 프로세스가 있는지 서버에서 본다
+[root@ol7a ~]# ss -ltn '( sport = :1521 )'
+State Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+-- 머리 줄만 있다. 필터 '( sport = :1521 )' 에 맞는 대기 소켓이 없다
+-- DB 로 치면 리스너가 내려가 있거나 다른 포트를 듣는 상황이다
+-- Oracle 이라면 lsnrctl status 로 리스너 상태와 듣는 주소를 함께 본다(17장)
+
+--------------------------------------------------------------------------------
+ [4] 실패 메시지 ③ — 패킷을 버리는 drop 영역
+--------------------------------------------------------------------------------
+
+-- ol7b 주소를 drop 영역에 묶는다. 출발지 영역이 먼저 평가된다(실습 03)
+[root@ol7a ~]# firewall-cmd --zone=drop --add-source=172.16.225.62/32; firewall-cmd --get-active-zones
+success
+drop
+  sources: 172.16.225.62/32
+public
+  interfaces: ens32
+-- drop 영역이 sources 172.16.225.62/32 로 활성이 됐다. 출발지 영역이 먼저다
+-- runtime 에만 넣었다. 강사 PC 의 접속은 영향이 없다
+[root@ol7b ~]# ncat -v -w 3 ol7a 1521 </dev/null; echo "rc=$?"
+Ncat: Version 7.50 ( https://nmap.org/ncat )
+Ncat: Connection timed out.
+rc=1
+-- 메시지 ③ Connection timed out. -w 3 만큼 기다렸다. drop 은 응답을 보내지 않는다
+-- -w 를 주지 않으면 TCP 재전송 한도(1분 이상)까지 기다린다
+-- 응용 프로그램의 접속 제한 시간이 길면 화면이 멈춘 것처럼 보인다
+[root@ol7b ~]# ping -c 1 -W 2 ol7a | tail -2
+1 packets transmitted, 0 received, 100% packet loss, time 0ms
+-- ping 도 응답 없음. drop 영역은 ICMP 까지 버린다
+-- 클라이언트에서 보면 "서버가 꺼졌다" 와 구별되지 않는다. 장애 대응 시간이 길어진다
+-- tail -2 로 통계 두 줄만 남겼다. 마지막 rtt 줄은 응답이 없어 출력되지 않았다
+[root@ol7a ~]# firewall-cmd --zone=drop --remove-source=172.16.225.62/32
+success
+-- ol7b 를 drop 에서 뺐다
+-- 세 메시지를 표로 다시 정리하면 [정리] 와 같다
+
+--------------------------------------------------------------------------------
+ [5] 리스너 띄우기
+--------------------------------------------------------------------------------
+
+-- ncat 을 1521 에 띄운다. 받은 내용은 /tmp/l1521.log
+[root@ol7a ~]# nohup ncat -lk 1521 >/tmp/l1521.log 2>&1 </dev/null &
+[root@ol7a ~]# sleep 1; ss -ltnp '( sport = :1521 )'
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess                        
+LISTEN 0      10           0.0.0.0:1521      0.0.0.0:*    users:(("ncat",pid=2204,fd=4))
+LISTEN 0      10              [::]:1521         [::]:*    users:(("ncat",pid=2204,fd=3))
+-- 이제 1521 을 ncat 이 듣는다. IPv4 0.0.0.0·IPv6 [::] 두 소켓
+-- -p 로 프로세스 이름과 PID 가 보였다. 실제 DB 서버면 tnslsnr 이 이 자리에 나온다
+-- -lk : 연결이 끝나도 계속 듣는다. 받은 내용은 /tmp/l1521.log
+
+[root@ol7b ~]# ncat -v -w 3 ol7a 1521 </dev/null; echo "rc=$?"
+Ncat: Version 7.50 ( https://nmap.org/ncat )
+Ncat: Connected to 172.16.225.61:1521.
+Ncat: 0 bytes sent, 0 bytes received in 0.01 seconds.
+rc=0
+-- Connected to 172.16.225.61:1521, rc=0. 방화벽·리스너 모두 통과
+-- 0 bytes sent, 0 bytes received : </dev/null 이라 보낸 것이 없다
+-- 0.01 seconds 는 연결부터 종료까지 걸린 시간
+
+-- DBA 가 흔히 쓰는 telnet 확인. 연결되면 Escape character 줄이 나오고 입력이 끝나면 끊긴다
+[root@ol7b ~]# echo PING | telnet ol7a 1521; echo "rc=$?"
+Trying 172.16.225.61...
+Connected to ol7a.
+Escape character is '^]'.
+Connection closed by foreign host.
+rc=1
+-- telnet 은 Trying → Connected to ol7a → Escape character 세 줄로 연결을 알린다
+-- 표준 입력이 끝나자 바로 Connection closed by foreign host. 와 rc=1 로 끝났다
+-- rc=1 이지만 연결은 성공했다. telnet 의 rc 로 판정하지 말고 Connected 줄을 본다
+[root@ol7a ~]# cat /tmp/l1521.log
+-- 리스너 로그는 비었다. telnet 은 입력을 보내기 전에 EOF 로 끝나 PING 이 도착하지 않았다
+-- 연결 확인만 하려면 ncat -v 쪽이 판정이 분명하다
+-- Windows 클라이언트라면 Test-NetConnection 이 같은 역할을 한다
+
+--------------------------------------------------------------------------------
+ [6] 루프백에만 묶인 리스너
+--------------------------------------------------------------------------------
+
+-- 리스너가 localhost 에만 묶이는 실수(listener.ora 의 HOST=localhost 와 같은 상황)를 1522 로 재현
+[root@ol7a ~]# nohup ncat -lk 127.0.0.1 1522 >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# firewall-cmd --add-port=1522/tcp; sleep 1; ss -ltn '( sport = :1521 or sport = :1522 )'
+success
+State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0      10           0.0.0.0:1521      0.0.0.0:*          
+LISTEN 0      10         127.0.0.1:1522      0.0.0.0:*          
+LISTEN 0      10              [::]:1521         [::]:*          
+-- 1521 은 0.0.0.0, 1522 는 127.0.0.1 에만 묶였다. 1522 의 IPv6 소켓도 없다
+-- ncat -l 127.0.0.1 1522 처럼 주소를 주면 그 주소에만 묶인다
+-- 필터에 or 를 써서 두 포트를 한 번에 봤다
+[root@ol7b ~]# ncat -v -w 3 ol7a 1522 </dev/null; echo "rc=$?"
+Ncat: Version 7.50 ( https://nmap.org/ncat )
+Ncat: Connection refused.
+rc=1
+-- 방화벽에서 1522 를 열었는데도 Connection refused. 바깥 주소에서 듣는 소켓이 없다
+-- [3] 의 리스너 없음과 같은 메시지다. 서버에서 ss 로 주소를 봐야 둘이 구별된다
+[root@ol7a ~]# ncat -v -w 3 127.0.0.1 1522 </dev/null; echo "rc=$?"
+Ncat: Version 7.50 ( https://nmap.org/ncat )
+Ncat: Connected to 127.0.0.1:1522.
+Ncat: 0 bytes sent, 0 bytes received in 0.01 seconds.
+rc=0
+-- 서버 자신(127.0.0.1)에서는 연결된다
+-- 증상   : 포트는 열었는데 ol7b 에서만 Connection refused, 서버 안에서는 됨
+-- 원인   : 리스너가 127.0.0.1 에 묶였다(ss 의 Local Address)
+-- 조치   : 리스너를 0.0.0.0 이나 서버 주소에 묶는다. Oracle 이면 listener.ora 의 HOST 를 호스트 이름으로
+-- 재확인 : ss 의 Local Address 가 0.0.0.0:포트 또는 172.16.225.61:포트
+[root@ol7a ~]# pkill -f 'ncat -lk 127.0.0.1 1522'; firewall-cmd --remove-port=1522/tcp
+success
+-- 1522 리스너와 포트를 정리했다
+-- 1522 는 이 단계에서만 썼다
+-- pkill -f 는 명령줄 전체로 프로세스를 고른다. 1521 리스너는 살아 있다
+
+--------------------------------------------------------------------------------
+ [7] 서비스 정의 파일 만들기
+--------------------------------------------------------------------------------
+
+-- 포트 번호 대신 이름으로 관리하려고 oracledb 서비스를 만든다
+-- 방법 A : firewall-cmd 로 만든다. 새 서비스는 permanent 로만 만들 수 있다
+[root@ol7a ~]# firewall-cmd --permanent --new-service=oracledb
+success
+-- --new-service 는 permanent 전용. /etc/firewalld/services/oracledb.xml 이 생긴다
+-- 이름은 소문자·숫자·하이픈. 영역 이름과 같은 규칙
+[root@ol7a ~]# firewall-cmd --permanent --service=oracledb --set-short="Oracle Net Listener"; firewall-cmd --permanent --service=oracledb --set-description="Oracle Database listener (TNS) 1521/tcp"; firewall-cmd --permanent --service=oracledb --add-port=1521/tcp
+success
+success
+success
+-- short·description·port 세 속성을 넣었다. 셋 다 success
+-- 명령 줄이 길어 화면에서 잘렸다. 세 번째는 --add-port=1521/tcp
+[root@ol7a ~]# cat /etc/firewalld/services/oracledb.xml
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>Oracle Net Listener</short>
+  <description>Oracle Database listener (TNS) 1521/tcp</description>
+  <port protocol="tcp" port="1521"/>
+</service>
+-- 직접 쓴 XML 과 같은 형식이다. short 는 GUI 에 보이는 이름, port 가 실제 규칙
+-- 이 파일 하나를 다른 서버의 같은 자리에 복사하면 같은 서비스가 생긴다
+
+-- reload 전에는 runtime 이 이 서비스를 모른다
+[root@ol7a ~]# firewall-cmd --info-service=oracledb; echo "rc=$?"
+Error: INVALID_SERVICE: oracledb
+rc=101
+-- reload 전에는 runtime 이 이 서비스를 모른다. 원문: Error: INVALID_SERVICE: oracledb
+-- rc 101 은 INVALID_SERVICE 의 오류 코드
+[root@ol7a ~]# firewall-cmd --reload; firewall-cmd --info-service=oracledb
+success
+oracledb
+  ports: 1521/tcp
+  protocols: 
+  source-ports: 
+  modules: 
+  destination: 
+-- reload 뒤 --info-service 가 ports 1521/tcp 를 보였다. modules·destination 은 빈칸
+-- protocols·source-ports 도 빈칸. 포트 하나짜리 단순한 서비스다
+
+--------------------------------------------------------------------------------
+ [8] 오류 재현 ② — 다른 영역에 연 경우
+--------------------------------------------------------------------------------
+
+-- reload 로 [3] 의 runtime 포트가 사라졌다. 이제 서비스로 연다. 그런데 영역을 잘못 골랐다
+[root@ol7a ~]# firewall-cmd --list-ports; firewall-cmd --zone=internal --add-service=oracledb
+
+success
+-- reload 로 [3] 의 runtime 1521/tcp 가 사라졌다(--list-ports 빈 줄). 그 상태에서 internal 에 넣었다
+-- --zone=internal 은 runtime 변경이다. 실수해도 reload 로 되돌릴 수 있다
+[root@ol7b ~]# ncat -v -w 3 ol7a 1521 </dev/null; echo "rc=$?"
+Ncat: Version 7.50 ( https://nmap.org/ncat )
+Ncat: No route to host.
+rc=1
+-- 증상   : oracledb 를 열었다(success)는데 ol7b 는 No route to host
+-- 원인   : internal 영역에 넣었다. ens32 는 public 에 묶여 있다(아래 --get-active-zones)
+-- 조치   : --zone=internal --remove-service, --zone=public --add-service(두 벌 모두)
+-- 재확인 : ncat 이 Connected, --list-services 와 --permanent --list-services 에 oracledb
+
+[root@ol7a ~]# firewall-cmd --get-active-zones; firewall-cmd --zone=internal --list-services
+public
+  interfaces: ens32
+dhcpv6-client mdns oracledb samba-client ssh
+-- 활성 영역은 public 하나. internal 은 묶인 것이 없어 목록에 없다
+-- internal 의 서비스에 oracledb 가 들어가 있다. 아무도 쓰지 않는 영역이다
+-- internal 기본 서비스는 dhcpv6-client mdns samba-client ssh. public 보다 넓다
+-- 운영에서는 기본 영역을 internal 로 바꾼 서버가 있다. 영역을 생략한 명령이 어디로 가는지 먼저 본다
+[root@ol7a ~]# firewall-cmd --zone=internal --remove-service=oracledb
+success
+
+-- 조치 : 인터페이스가 묶인 영역(public)에 연다. 두 벌 모두
+[root@ol7a ~]# firewall-cmd --zone=public --add-service=oracledb; firewall-cmd --permanent --zone=public --add-service=oracledb
+success
+success
+[root@ol7b ~]# ncat -v -w 3 ol7a 1521 </dev/null; echo "rc=$?"
+Ncat: Version 7.50 ( https://nmap.org/ncat )
+Ncat: Connected to 172.16.225.61:1521.
+Ncat: 0 bytes sent, 0 bytes received in 0.00 seconds.
+rc=0
+-- public 에 넣자 바로 Connected
+-- runtime 과 permanent 두 벌에 함께 넣었다
+[root@ol7a ~]# firewall-cmd --list-services; firewall-cmd --permanent --list-services
+dhcpv6-client oracledb ssh
+dhcpv6-client oracledb ssh
+-- runtime 과 permanent 가 같다. reload·재부팅 뒤에도 유지된다
+-- 서비스 이름이 목록에 보여 무엇을 위해 연 포트인지 바로 안다. 포트 번호만 있을 때보다 낫다
+
+--------------------------------------------------------------------------------
+ [9] 서버에서 본 연결
+--------------------------------------------------------------------------------
+
+-- ol7b 에서 20초짜리 연결을 하나 띄우고 ol7a 에서 그 연결을 본다
+[root@ol7b ~]# nohup sh -c 'sleep 20 | ncat ol7a 1521' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# sleep 2; ss -tn state established '( sport = :1521 )'
+Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+0      0      172.16.225.61:1521 172.16.225.62:33756       
+-- ESTABLISHED 한 줄. Local 172.16.225.61:1521, Peer 172.16.225.62:33756(ol7b 의 임시 포트)
+-- state established 필터로 대기 소켓은 빼고 맺어진 연결만 보았다
+-- ol7b 의 sleep 20 이 끝나면 이 연결도 닫힌다
+
+-- 방화벽 카운터. 서비스 규칙에 패킷이 잡힌 횟수
+[root@ol7a ~]# iptables -L IN_public_allow -n -v | grep -E 'pkts|1521'
+ pkts bytes target     prot opt in     out     source               destination         
+    2   120 ACCEPT     tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            tcp dpt:1521 ctstate NEW,UNTRACKED
+-- oracledb 서비스 규칙. pkts 2 = [8] 의 ncat 한 번과 [9] 의 연결 한 번
+-- 새 연결(NEW)만 센다. 연결 안의 데이터 패킷은 INPUT 첫 줄(ESTABLISHED)이 받는다
+-- grep 으로 머리 줄과 1521 줄만 남겼다
+
+--------------------------------------------------------------------------------
+ [10] 출발지를 제한해 열기
+--------------------------------------------------------------------------------
+
+-- 운영에서는 1521 을 응용 서버 대역에만 연다. 서비스를 빼고 rich rule 로 바꾼다
+[root@ol7a ~]# firewall-cmd --remove-service=oracledb; firewall-cmd --add-rich-rule='rule family="ipv4" source address="172.16.225.62/32" service name="oracledb" accept'
+success
+success
+[root@ol7a ~]# firewall-cmd --list-rich-rules
+rule family="ipv4" source address="172.16.225.62/32" service name="oracledb" accept
+-- runtime 에서 서비스를 빼고 rich rule 로 바꿨다. 이제 ol7b 만 1521 에 닿는다
+-- 서비스를 빼고 넣는 사이는 짧지만 그 순간 새 연결은 거부된다
+[root@ol7b ~]# ncat -v -w 3 ol7a 1521 </dev/null; echo "rc=$?"
+Ncat: Version 7.50 ( https://nmap.org/ncat )
+Ncat: Connected to 172.16.225.61:1521.
+Ncat: 0 bytes sent, 0 bytes received in 0.00 seconds.
+rc=0
+-- ol7b 는 계속 Connected
+-- 결과는 같고 범위만 좁아졌다
+
+-- 출발지가 다르면? ol7a 자기 주소는 lo 로 들어가 방화벽과 무관하니, 판정은 iptables 규칙으로 본다
+[root@ol7a ~]# iptables -S IN_public_allow | grep 1521
+-A IN_public_allow -s 172.16.225.62/32 -p tcp -m tcp --dport 1521 -m conntrack --ctstate NEW,UNTRACKED -j ACCEPT
+-- 서비스 이름 oracledb 가 포트 1521 로 풀려 들어갔다. -s 로 출발지 조건이 붙었다
+-- 다른 주소는 이 줄에 맞지 않아 기본 거부(No route to host)를 받는다
+-- 응용 서버가 여러 대면 source address 에 대역(/24)을 쓰거나 규칙을 서버마다 둔다
+-- 이 rich rule 은 runtime 에만 있다. [변형] 의 reload 에서 사라지고 permanent 의 서비스 개방이 돌아온다
+
+--------------------------------------------------------------------------------
+ [변형] 서비스 정의를 XML 로 직접 쓰기
+--------------------------------------------------------------------------------
+
+-- 방법 B : 파일을 직접 쓴다. 방법 A 와 같은 결과인지 비교한다
+[root@ol7a ~]# cat > /etc/firewalld/services/oracledb2.xml <<'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<service>
+  <short>Oracle Net Listener</short>
+  <description>Oracle Database listener (TNS) 1521/tcp</description>
+  <port protocol="tcp" port="1521"/>
+</service>
+EOF
+[root@ol7a ~]# firewall-cmd --reload; firewall-cmd --info-service=oracledb2
+success
+oracledb2
+  ports: 1521/tcp
+  protocols: 
+  source-ports: 
+  modules: 
+  destination: 
+-- 손으로 쓴 oracledb2 도 같은 내용으로 읽혔다
+-- 손으로 쓴 파일도 reload 해야 보인다. --permanent --new-service 와 같다
+[root@ol7a ~]# diff /etc/firewalld/services/oracledb.xml /etc/firewalld/services/oracledb2.xml; echo "rc=$?"
+rc=0
+-- diff 출력 없음, rc=0. 두 파일이 바이트 단위로 같다. firewall-cmd 가 쓴 형식과 손으로 쓴 형식이 같다
+
+-- 서비스 파일에 포트를 하나 더 넣으면, 그 서비스를 쓰는 모든 영역에 함께 반영된다
+[root@ol7a ~]# firewall-cmd --permanent --service=oracledb --add-port=5500/tcp; firewall-cmd --reload; firewall-cmd --info-service=oracledb | grep ports
+success
+success
+  ports: 1521/tcp 5500/tcp
+  source-ports: 
+-- 서비스에 5500(EM Express)을 더했다. reload 뒤 정의가 1521·5500 두 포트가 됐다
+-- 이 서비스를 쓰는 모든 영역과 rich rule 에 5500 이 함께 열린다. 편하지만 범위를 확인하고 바꾼다
+[root@ol7a ~]# rm -f /etc/firewalld/services/oracledb2.xml
+
+--------------------------------------------------------------------------------
+ [11] 되돌리기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# firewall-cmd --permanent --remove-service=oracledb; firewall-cmd --permanent --delete-service=oracledb; rm -f /etc/firewalld/zones/public.xml* /etc/firewalld/services/oracledb.xml*; firewall-cmd --reload
+success
+success
+success
+-- 영역에서 빼고, 서비스 정의를 지우고, 남은 파일을 지운 뒤 reload
+-- 순서: 영역에서 빼기 → 서비스 정의 지우기 → 파일 정리 → reload
+-- .old 백업 파일도 함께 지웠다
+[root@ol7a ~]# firewall-cmd --list-all | sed -n '1,7p'; firewall-cmd --list-rich-rules | wc -l; ls /etc/firewalld/services/
+public (active)
+  target: default
+  icmp-block-inversion: no
+  interfaces: ens32
+  sources: 
+  services: dhcpv6-client ssh
+  ports: 
+1
+-- 허용 목록이 [0] 과 같다. rich rule 목록 1 줄은 빈 줄이다. services 디렉터리도 비었다
+[root@ol7a ~]# pkill -x ncat; rm -f /tmp/l1521.log; ss -ltn '( sport = :1521 )'
+State Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+-- 1521 리스너도 내렸다
+-- pkill -x ncat : 이름이 정확히 ncat 인 프로세스만
+-- ss 결과가 머리 줄뿐. [0] 의 목록에도 1521 이 없었다
+[root@ol7b ~]# ncat -v -w 3 ol7a 1521 </dev/null; echo "rc=$?"
+Ncat: Version 7.50 ( https://nmap.org/ncat )
+Ncat: No route to host.
+rc=1
+-- [2] 와 같은 No route to host. 시작 전 상태다
+-- ol7b 의 ncat·telnet 패키지는 남았다. 스냅샷이 지운다
+-- ol7b 는 이 실습 끝에서 전원을 끈다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                     시작 전           작업 중                             되돌린 뒤
+--  1521 방화벽              닫힘              port → oracledb 서비스 → rich rule  닫힘
+--  1521 리스너              없음              ncat 0.0.0.0:1521                   없음
+--  ol7b 메시지              No route to host  refused(리스너 없음) / timed out(drop) / Connected   No route to host
+--  1522(127.0.0.1)          -                 바깥 refused, 안쪽 Connected        -
+--  oracledb 서비스 정의     없음              1521 → 1521·5500                    없음
+-- 오류 두 가지
+--   포트 열림·리스너 없음 : Connection refused → ss -ltn 으로 리스너 확인
+--   다른 영역에 개방      : No route to host 그대로 → --get-active-zones 로 영역 확인
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. drop 대신 block 영역에 ol7b 를 넣고 ncat 메시지가 어떻게 바뀌는지 본다
+-- 2. rich rule 에 log prefix="ORA " 를 붙여 거부된 1521 접속을 journalctl -k 로 기록한다
+-- 3. oracledb 서비스에 <destination ipv4="172.16.225.61"/> 를 넣어 목적지 주소 조건을 시험한다
+
+================================================================================
+ 실습 06 종료 — 1521 은 서비스 정의와 rich rule 로 열고, 세 가지 실패 메시지로 방화벽·리스너·DROP 을 구분함
+================================================================================

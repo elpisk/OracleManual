@@ -1,0 +1,457 @@
+================================================================================
+ 제7장 실습 04 — 부팅 시 적재와 블랙리스트
+ 대상   : ol7a
+ 목표   : /etc/modules-load.d 로 부팅 때 모듈을 올리고, blacklist 가 무엇을 막고
+          무엇을 못 막는지(이름 직접 적재, 의존성, 별칭) 구분한다. install ... /bin/false
+          로 완전히 막는 방법과, initramfs 안에 든 모듈은 dracut -f 로 다시 만들기
+          전까지 블랙리스트가 듣지 않는 것을 재부팅으로 확인한다
+ 배경   : 부팅 중 모듈은 세 경로로 올라온다. initramfs 안의 udev, 루트 전환 뒤의
+          udev(장치 별칭 modalias), systemd-modules-load(/etc/modules-load.d).
+          blacklist 는 "별칭으로 찾을 때 이 모듈을 후보에서 뺀다" 는 뜻일 뿐이라
+          이름을 직접 부르거나 의존성으로 끌려오는 적재는 막지 못한다. initramfs 는
+          만들 때의 /etc/modprobe.d 사본을 들고 있다(본문 7.5)
+ 소요   : 약 40분 (재부팅 4회, dracut 2회)
+ 선행   : ol7-base 스냅샷
+ 계정   : root
+ 주의   : initramfs 를 다시 만든다. 잘못 만들면 부팅이 멈출 수 있으므로 스냅샷이
+          있는 상태에서만 한다. 실습 끝에서 원래 구성으로 다시 만든다
+ 되돌림 : 만든 conf 네 개 삭제, initramfs 재생성, 재부팅. lsmod 의 dummy 없음,
+          pcspkr 적재(기준 상태와 같음), lsinitrd 에 pcspkr 없음
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# uname -r; lsmod | wc -l; lsmod | grep -w -E 'dummy|pcspkr|vfat|fat'
+5.4.17-2136.338.4.2.el7uek.x86_64
+73
+pcspkr                 16384  0 
+-- 기준 커널 UEK 2136, lsmod 73 줄. 관심 모듈 넷 중 pcspkr 하나만 적재돼 있다(Used by 0)
+-- dummy·vfat·fat 은 없다. pcspkr 는 아무도 설정하지 않았는데 올라와 있다. [1] 에서 이유를 본다
+
+-- 설정 디렉터리 다섯 곳. 비어 있는 것이 기준 상태다.
+[root@ol7a ~]# for d in /etc/modules-load.d /usr/lib/modules-load.d /etc/modprobe.d /etc/dracut.conf.d /etc/sysconfig/modules; do printf '%-24s %s\n' $d "$(ls $d | tr '\n' ' ')"; done
+/etc/modules-load.d      
+/usr/lib/modules-load.d  open-vm-tools.conf 
+/etc/modprobe.d          dccp-blacklist.conf firewalld-sysctls.conf lockd.conf tcindex-disable.conf tuned.conf 
+/etc/dracut.conf.d       
+/etc/sysconfig/modules   
+-- 다섯 곳의 기준 상태(printf 로 디렉터리 이름 뒤에 파일 목록을 한 줄로 붙였다)
+--   /etc/modules-load.d, /etc/dracut.conf.d, /etc/sysconfig/modules : 비어 있음
+--   /etc/modprobe.d : 패키지·설치가 넣은 다섯 파일
+--   /usr/lib/modules-load.d : open-vm-tools.conf 하나(VMware 게스트 도구 것)
+-- 실습이 만드는 파일은 이름에 m07 을 넣어 끝에서 한 번에 지운다
+
+-- 지금 initramfs 의 크기·시각과 안에 든 모듈 수.
+-- lsinitrd : initramfs 내용 목록. 모듈 파일만 세려고 .ko 로 거른다
+[root@ol7a ~]# ls -l /boot/initramfs-$(uname -r).img; lsinitrd /boot/initramfs-$(uname -r).img | grep -c '\.ko'
+-rw-------. 1 root root 22668216 Nov 11 20:17 /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img
+38
+-- initramfs 22,668,216 바이트, 11-11 20:17 생성(ol7-base 를 만들 때 커널 업데이트로 생긴 것)
+-- 권한 -rw------- : root 만 읽는다. 안에 든 .ko 파일 38 개
+
+[root@ol7a ~]# cp -a /boot/initramfs-$(uname -r).img /root/initramfs-base.img; ls -l /root/initramfs-base.img
+-rw-------. 1 root root 22668216 Nov 11 20:17 /root/initramfs-base.img
+-- cp -a 로 시각·권한까지 그대로 복사했다. 실습 끝에서 지금 initramfs 와 비교하는 기준이다
+
+--------------------------------------------------------------------------------
+ [1] 지금 올라와 있는 모듈은 누가 올렸나
+--------------------------------------------------------------------------------
+-- pcspkr 는 PC 스피커 드라이버다. 아무도 설정하지 않았는데 올라와 있다.
+-- 장치가 있고 그 장치의 modalias 를 udev 가 modprobe 에 넘겼기 때문이다.
+[root@ol7a ~]# cat /sys/devices/platform/pcspkr/modalias; modprobe -R platform:pcspkr
+platform:pcspkr
+pcspkr
+snd_pcsp
+-- /sys/devices/platform/pcspkr/modalias 는 platform:pcspkr. 커널이 PC 스피커 장치를 찾고 만든 문자열이다
+-- modprobe -R 은 이 별칭을 모듈 이름으로 풀어 보여 준다: pcspkr 와 snd_pcsp 둘
+-- snd_pcsp 는 dist-blacklist.conf 의 blacklist snd_pcsp 로 빠지고 pcspkr 만 올라온다
+
+-- initramfs 안에 든 모듈. 루트 파일 시스템을 열기 전에 필요한 것만 들어 있다.
+[root@ol7a ~]# lsinitrd /boot/initramfs-$(uname -r).img | grep '\.ko' | awk '{print $NF}' | sed 's#.*/##' | sort | tr '\n' ' '; echo
+ata_generic.ko.xz ata_piix.ko.xz cdrom.ko.xz dm-bufio.ko.xz dm-dust.ko.xz dm-log.ko.xz dm-mirror.ko.xz dm-mod.ko.xz dm-region-hash.ko.xz dm-snapshot.ko.xz drm_kms_helper.ko.xz drm.ko.xz e1000.ko.xz fb_sys_fops.ko.xz fuse.ko.xz ib_cm.ko.xz ib_core.ko.xz iscsi_boot_sysfs.ko.xz iscsi_ibft.ko.xz libata.ko.xz libcrc32c.ko.xz mptbase.ko.xz mptscsih.ko.xz mptspi.ko.xz pata_acpi.ko.xz scsi_transport_fc.ko.xz scsi_transport_spi.ko.xz sd_mod.ko.xz serio_raw.ko.xz sr_mod.ko.xz syscopyarea.ko.xz sysfillrect.ko.xz sysimgblt.ko.xz ttm.ko.xz vmwgfx.ko.xz xfs.ko.xz xscore.ko.xz xsvhba.ko.xz 
+-- 파일 이름 38 개를 한 줄로. 디스크 경로(ata_piix, mptspi, sd_mod), LVM(dm-*), 루트 파일 시스템(xfs, libcrc32c),
+-- 화면(drm, vmwgfx), NIC(e1000) 처럼 루트를 열기 전에 필요한 것들이다
+-- pcspkr 는 없다. pcspkr 는 루트 전환 뒤 udev 가 올렸다
+
+-- 부팅 로그에서 systemd-modules-load 가 한 일. 지금은 설정이 없어 할 일이 없다.
+[root@ol7a ~]# systemctl status systemd-modules-load --no-pager | head -3
+● systemd-modules-load.service - Load Kernel Modules
+   Loaded: loaded (/usr/lib/systemd/system/systemd-modules-load.service; static; vendor preset: disabled)
+   Active: active (exited) since Fri 2026-11-13 20:10:17 KST; 15s ago
+-- head -3 으로 머리만. Active: active (exited) — 부팅 때 한 번 돌고 끝나는 oneshot 서비스
+-- static 은 [Install] 이 없어 enable/disable 대상이 아니라는 표시. sysinit.target 이 직접 부른다
+-- 지금 읽은 설정은 /usr/lib/modules-load.d/open-vm-tools.conf 뿐이다
+
+--------------------------------------------------------------------------------
+ [2] /etc/modules-load.d — 부팅 때 이 모듈을 올려라
+--------------------------------------------------------------------------------
+-- 형식: 한 줄에 모듈 이름 하나. # 줄은 주석. 파라미터는 여기 쓰지 않고 modprobe.d 에 쓴다
+[root@ol7a ~]# printf '# 7장 실습 04\ndummy\n' > /etc/modules-load.d/m07.conf; echo 'options dummy numdummies=2' > /etc/modprobe.d/m07-dummy.conf; cat /etc/modules-load.d/m07.conf /etc/modprobe.d/m07-dummy.conf
+# 7장 실습 04
+dummy
+options dummy numdummies=2
+-- dummy 는 가짜 네트워크 장치 드라이버다. 하드웨어가 없어 udev 가 부를 일이 없다
+-- 그래서 modules-load.d 로 이름을 지정해야 부팅 때 올라온다. numdummies=2 는 장치 두 개
+
+-- 재부팅 없이 같은 서비스를 다시 돌려 즉시 반영되는지 본다.
+[root@ol7a ~]# systemctl restart systemd-modules-load; lsmod | grep -w dummy; ip -br link show type dummy
+dummy                  16384  0 
+dummy0           DOWN           62:a7:da:e5:fa:03 <BROADCAST,NOARP> 
+dummy1           DOWN           5a:8c:20:34:79:d8 <BROADCAST,NOARP> 
+-- systemctl restart 로 서비스를 다시 돌리자 dummy 가 올라왔다(Used by 0)
+-- ip -br link show type dummy : dummy0, dummy1 두 장치. numdummies=2 가 적용됐다
+-- modules-load.d 에는 파라미터를 못 쓰지만 modprobe.d 의 options 는 붙는다
+
+[root@ol7a ~]# journalctl -u systemd-modules-load -b --no-pager | tail -3
+Nov 13 20:10:32 ol7a.example.com systemd[1]: Stopping Load Kernel Modules...
+Nov 13 20:10:32 ol7a.example.com systemd[1]: Starting Load Kernel Modules...
+Nov 13 20:10:32 ol7a.example.com systemd[1]: Started Load Kernel Modules.
+-- 재시작 기록 세 줄. 별다른 메시지가 없으면 성공이다. 실패한 모듈이 있으면 여기에 이름이 남는다
+
+--------------------------------------------------------------------------------
+ [3] blacklist 는 이름 직접 적재를 막지 못한다
+--------------------------------------------------------------------------------
+-- 블랙리스트 파일은 이름을 아무렇게나 지어도 되지만 .conf 로 끝나야 한다.
+[root@ol7a ~]# echo 'blacklist vfat' > /etc/modprobe.d/m07-blacklist.conf; modprobe -c | grep -c '^blacklist'; modprobe -c | grep -E '^blacklist (vfat|fat)$'
+32
+blacklist vfat
+-- modprobe -c 의 blacklist 줄 32 개. 패키지가 넣은 31 개(dccp, 프레임버퍼, snd_pcsp 등)에 방금 넣은 vfat 하나
+
+-- 이름으로 부르면 그냥 올라간다.
+[root@ol7a ~]# modprobe -v vfat; lsmod | grep -w -E 'vfat|fat'
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/fat.ko.xz 
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/vfat.ko.xz 
+vfat                   20480  0 
+fat                    73728  1 vfat
+-- blacklist vfat 이 있는데도 modprobe -v vfat 이 insmod 두 줄로 성공했다
+-- 이름을 직접 부르는 적재는 블랙리스트를 보지 않는다
+
+-- -b(--use-blacklist) 를 붙이면 그때서야 블랙리스트가 적용된다.
+[root@ol7a ~]# modprobe -r vfat; modprobe -v -b vfat; echo "rc=$?"; lsmod | grep -w vfat; echo "rc=$?"
+rc=0
+rc=1
+-- modprobe -v -b vfat: 출력 없이 rc=0, lsmod 에 vfat 없음(rc=1)
+-- -b 를 주면 블랙리스트를 적용한다. 적재하지 않았는데 rc=0 이라 실패로 보이지 않는다는 점에 주의
+
+--------------------------------------------------------------------------------
+ [4] blacklist 가 막는 것 — 별칭으로 찾는 적재
+--------------------------------------------------------------------------------
+-- 커널이 모르는 파일 시스템을 마운트하려 하면 "fs-이름" 별칭으로 modprobe 를 부른다.
+[root@ol7a ~]# modinfo -F alias vfat
+fs-vfat
+-- vfat 의 alias 는 fs-vfat 하나. 커널이 vfat 마운트를 처리하려고 부르는 이름이다
+
+[root@ol7a ~]# mkdir -p /root/m07 && dd if=/dev/zero of=/root/m07/fat.img bs=1M count=32 2>/dev/null && mkfs.vfat /root/m07/fat.img >/dev/null && ls -l /root/m07/fat.img
+-rw-r--r--. 1 root root 33554432 Nov 13 20:10 /root/m07/fat.img
+-- 32MiB 이미지를 vfat 으로 포맷했다. 출력은 ls 한 줄만 남기고 버렸다(2>/dev/null, >/dev/null)
+
+[root@ol7a ~]# modprobe -v fs-vfat; echo "rc=$?"; lsmod | grep -w vfat; echo "rc=$?"
+rc=0
+rc=1
+-- modprobe -v fs-vfat: 출력 없이 rc=0, vfat 미적재(rc=1)
+-- 별칭으로 찾을 때는 블랙리스트가 적용됐다. modprobe 가 조용히 아무것도 고르지 않았다
+
+[root@ol7a ~]# mount -o loop /root/m07/fat.img /mnt; echo "rc=$?"; dmesg | tail -3
+mount: unknown filesystem type 'vfat'
+rc=32
+[    3.979491] IPv6: ADDRCONF(NETDEV_CHANGE): ens33: link becomes ready
+[   15.184967] loop: module loaded
+[   15.226717] request_module fs-vfat succeeded, but still no fs?
+-- mount 원문: mount: unknown filesystem type 'vfat', rc=32(mount 의 실패 코드)
+-- dmesg 마지막 줄: request_module fs-vfat succeeded, but still no fs?
+-- 커널의 modprobe fs-vfat 요청은 성공(0)했지만 파일 시스템이 등록되지 않았다
+
+--------------------------------------------------------------------------------
+ [5] 오류 ① — fat 을 막았는데 fat 이 올라온다
+--------------------------------------------------------------------------------
+-- 블랙리스트를 vfat 에서 fat 으로 바꾼다. vfat 은 fat 에 의존한다.
+[root@ol7a ~]# echo 'blacklist fat' > /etc/modprobe.d/m07-blacklist.conf; modprobe -c | grep -c '^blacklist'; modprobe -c | grep -E '^blacklist (vfat|fat)$'
+32
+blacklist fat
+-- 이번에는 vfat 대신 fat 을 막았다. 개수 32 는 같고(vfat 이 빠지고 fat 이 들어감) 걸린 이름은 fat
+
+[root@ol7a ~]# mount -o loop /root/m07/fat.img /mnt; echo "rc=$?"; findmnt /mnt; lsmod | grep -w -E 'vfat|fat'
+rc=0
+TARGET SOURCE     FSTYPE OPTIONS
+/mnt   /dev/loop0 vfat   rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,errors=remount-ro
+vfat                   20480  1 
+fat                    73728  1 vfat
+-- 마운트 성공(rc=0), /dev/loop0 vfat. lsmod 에 vfat 과 fat 이 모두 있다
+-- 커널의 fs-vfat 요청 → vfat 선택(블랙리스트 아님) → vfat 의 의존 모듈 fat 을 함께 적재
+-- 블랙리스트는 별칭 후보를 고를 때만 적용된다. 의존성으로 끌려오는 fat 은 막지 않았다
+
+[root@ol7a ~]# umount /mnt; modprobe -r vfat; lsmod | grep -w -E 'vfat|fat'; echo "rc=$?"
+rc=1
+-- umount 후 vfat 을 내리자 fat 도 함께 내려갔다(rc=1)
+--
+-- 증상   : /etc/modprobe.d/m07-blacklist.conf 에 blacklist fat 을 넣었는데 vfat 이미지 마운트가 rc=0 으로
+--          성공하고 lsmod 에 'fat 73728 1 vfat' 이 보임
+-- 원인   : blacklist 는 별칭으로 모듈을 찾을 때만 적용된다. fat 은 별칭이 아니라 vfat 의 의존성으로
+--          적재됐다(modules.dep 의 vfat → fat)
+-- 조치   : 적재 자체를 막으려면 install fat /bin/false 를 같은 파일에 넣는다([6])
+-- 재확인 : 같은 mount 가 unknown filesystem type 'vfat' 로 실패, lsmod 에 fat 없음
+
+--------------------------------------------------------------------------------
+ [6] install ... /bin/false — 정말로 막기
+--------------------------------------------------------------------------------
+-- install 은 "적재 대신 이 명령을 실행". /bin/false 는 아무것도 안 하고 실패를 돌려준다.
+[root@ol7a ~]# echo 'install fat /bin/false' >> /etc/modprobe.d/m07-blacklist.conf; cat /etc/modprobe.d/m07-blacklist.conf
+blacklist fat
+install fat /bin/false
+-- 파일에 두 줄. blacklist 는 별칭 경로, install 은 나머지 모든 경로를 맡는다
+
+[root@ol7a ~]# modprobe -v fat; echo "rc=$?"
+modprobe: ERROR: Error running install command for fat
+modprobe: ERROR: could not insert 'fat': Operation not permitted
+install /bin/false 
+rc=1
+-- modprobe -v fat 원문 두 줄
+--   modprobe: ERROR: Error running install command for fat
+--   modprobe: ERROR: could not insert 'fat': Operation not permitted
+-- 셋째 줄 install /bin/false 는 -v 가 보여 준 실제 실행 명령이다. /bin/false 는 1 을 돌려준다
+
+[root@ol7a ~]# modprobe -v vfat; echo "rc=$?"
+modprobe: ERROR: Error running install command for fat
+modprobe: ERROR: could not insert 'vfat': Operation not permitted
+install /bin/false 
+rc=1
+-- vfat 을 부르자 의존 모듈 fat 단계에서 같은 install 이 실행돼 vfat 까지 실패했다
+-- 오류 문구의 'vfat' 부분만 다르다. 의존성 경로도 막혔다
+
+[root@ol7a ~]# mount -o loop /root/m07/fat.img /mnt; echo "rc=$?"; lsmod | grep -w -E 'vfat|fat'; echo "rc=$?"
+mount: unknown filesystem type 'vfat'
+rc=32
+rc=1
+-- 마운트도 unknown filesystem type 'vfat'(rc=32), lsmod 에 둘 다 없음(rc=1)
+
+-- 비상구: --ignore-install 은 install 줄을 무시하고 원래대로 적재한다.
+[root@ol7a ~]# modprobe -v --ignore-install fat; lsmod | grep -w fat; modprobe -r fat
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/fat.ko.xz 
+fat                    73728  0 
+-- --ignore-install 은 install 줄을 건너뛰고 원래 insmod 를 실행했다. 장애 대응 때만 쓰는 비상구다
+
+--------------------------------------------------------------------------------
+ [7] 재부팅 — modules-load.d 와 udev 경로에 blacklist 걸기
+--------------------------------------------------------------------------------
+-- pcspkr 를 블랙리스트에 넣는다. udev 가 별칭(platform:pcspkr)으로 부르므로 막혀야 한다.
+-- dummy 도 블랙리스트에 넣어 systemd-modules-load 가 블랙리스트를 따르는지 본다.
+[root@ol7a ~]# printf 'blacklist pcspkr\nblacklist dummy\n' > /etc/modprobe.d/m07-boot.conf; cat /etc/modprobe.d/m07-boot.conf
+blacklist pcspkr
+blacklist dummy
+-- pcspkr 는 udev 경로(장치 별칭), dummy 는 systemd-modules-load 경로. 두 경로를 한 번의 재부팅으로 본다
+
+-- 재부팅
+
+[root@ol7a ~]# uptime; lsmod | grep -w -E 'dummy|pcspkr'; echo "rc=$?"
+ 20:10:58 up 0 min,  0 users,  load average: 0.07, 0.02, 0.00
+rc=1
+-- up 0 min. 재부팅 직후 dummy 도 pcspkr 도 없다(rc=1)
+-- 기준 상태에서 늘 올라와 있던 pcspkr 가 빠졌다. udev 의 별칭 적재에 블랙리스트가 적용됐다
+
+[root@ol7a ~]# journalctl -u systemd-modules-load -b --no-pager | tail -3
+Nov 13 20:10:41 ol7a.example.com systemd[1]: Stopped Load Kernel Modules.
+Nov 13 20:10:42 ol7a.example.com systemd-modules-load[609]: Module 'dummy' is blacklisted
+Nov 13 20:10:42 ol7a.example.com systemd[1]: Started Load Kernel Modules.
+-- systemd-modules-load[609]: Module 'dummy' is blacklisted
+-- modules-load.d 에 이름이 있어도 블랙리스트가 이긴다. 이 서비스는 블랙리스트를 적용하는 쪽이다
+
+-- 블랙리스트를 빼고 dummy 만 다시 확인(modules-load.d 는 그대로).
+[root@ol7a ~]# sed -i '/dummy/d' /etc/modprobe.d/m07-boot.conf; systemctl restart systemd-modules-load; lsmod | grep -w dummy; ip -br link show type dummy
+dummy                  16384  0 
+dummy0           DOWN           12:73:e5:16:bd:93 <BROADCAST,NOARP> 
+dummy1           DOWN           82:c7:3c:24:54:f5 <BROADCAST,NOARP> 
+-- dummy 줄을 지우고 서비스를 재시작하자 dummy0, dummy1 이 다시 생겼다. MAC 은 [2] 와 다르다(매번 무작위)
+
+--------------------------------------------------------------------------------
+ [8] initramfs 에 모듈 넣기
+--------------------------------------------------------------------------------
+-- 블랙리스트를 잠시 치우고, pcspkr 를 initramfs 에 넣는다.
+-- add_drivers+=" ... " : dracut 이 initramfs 에 추가로 담을 모듈. 앞뒤 공백을 남겨야 한다
+[root@ol7a ~]# mv /etc/modprobe.d/m07-boot.conf /root/; echo 'add_drivers+=" pcspkr "' > /etc/dracut.conf.d/m07.conf; cat /etc/dracut.conf.d/m07.conf
+add_drivers+=" pcspkr "
+-- add_drivers 는 dracut 이 기본으로 고르는 모듈에 더할 이름이다. += 와 앞뒤 공백은 dracut.conf 문법이다
+-- 블랙리스트 파일(m07-boot.conf)은 /root 로 옮겨 두었다. 지금 /etc/modprobe.d 에는 pcspkr 블랙리스트가 없다
+
+-- dracut -f : 지금 커널의 initramfs 를 덮어쓴다
+[root@ol7a ~]# time dracut -f
+real    0m19.076s
+user    0m12.496s
+sys     0m10.187s
+-- dracut -f 에 약 19 초. 출력 없이 끝나면 성공이다
+
+[root@ol7a ~]# ls -l /boot/initramfs-$(uname -r).img; lsinitrd /boot/initramfs-$(uname -r).img | grep -E 'pcspkr|m07'
+-rw-------. 1 root root 22212978 Nov 13 20:11 /boot/initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img
+-rw-r--r--   1 root     root           37 Nov 13 20:10 etc/modprobe.d/m07-blacklist.conf
+-rw-r--r--   1 root     root           27 Nov 13 20:10 etc/modprobe.d/m07-dummy.conf
+-rw-r--r--   1 root     root           23 Nov 13 20:10 etc/modules-load.d/m07.conf
+-rw-r--r--   1 root     root         9672 Dec 24  2024 usr/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/input/misc/pcspkr.ko.xz
+-- 크기 22,212,978 바이트, 20:11. 처음(22,668,216)보다 작다. 이유는 [되돌림] 끝의 diff 에서 본다
+-- initramfs 안에 m07 이 든 파일이 셋, pcspkr.ko.xz 가 하나 들어갔다
+--   etc/modprobe.d/m07-blacklist.conf·m07-dummy.conf : dracut 이 /etc/modprobe.d 를 통째로 복사했다
+--   etc/modules-load.d/m07.conf : modules-load.d 도 복사된다
+
+--------------------------------------------------------------------------------
+ [9] 오류 ② — 블랙리스트를 넣었는데 재부팅해도 올라온다
+--------------------------------------------------------------------------------
+-- 이제 블랙리스트를 다시 넣는다. initramfs 는 다시 만들지 않는다.
+[root@ol7a ~]# mv /root/m07-boot.conf /etc/modprobe.d/; cat /etc/modprobe.d/m07-boot.conf
+blacklist pcspkr
+-- 블랙리스트를 /etc/modprobe.d 로 되돌렸다. initramfs 는 다시 만들지 않았다
+
+-- 재부팅
+
+[root@ol7a ~]# lsmod | grep -w pcspkr; echo "rc=$?"
+pcspkr                 16384  0 
+rc=0
+-- 재부팅 뒤 pcspkr 가 다시 있다(rc=0). [7] 에서는 같은 블랙리스트로 막혔었다
+
+-- 언제 올라왔나. 커널 로그의 시간과 루트 전환 시점을 나란히 본다.
+[root@ol7a ~]# journalctl -b -o short-monotonic --no-pager | grep -E 'pcspkr|Switching root|Reached target Initrd' | head -5
+[    0.727922] ol7a.example.com kernel: input: PC Speaker as /devices/platform/pcspkr/input/input5
+[    1.574101] ol7a.example.com systemd[1]: Reached target Initrd Root File System.
+[    1.602250] ol7a.example.com systemd[1]: Reached target Initrd File Systems.
+[    1.602381] ol7a.example.com systemd[1]: Reached target Initrd Default Target.
+[    1.757922] ol7a.example.com systemd[1]: Switching root.
+-- -o short-monotonic : 부팅 뒤 경과 초로 시각을 찍는다
+-- 0.727922 초에 PC Speaker 입력 장치가 생겼고, Switching root 는 1.757922 초다
+-- pcspkr 는 루트 전환보다 약 1 초 먼저, 즉 initramfs 안에서 올라왔다
+
+-- initramfs 안의 modprobe.d 를 본다. 지금 /etc 에 있는 블랙리스트가 들어 있나.
+[root@ol7a ~]# lsinitrd /boot/initramfs-$(uname -r).img | grep -E 'm07|modprobe.d$'; lsinitrd -f etc/modprobe.d/m07-boot.conf /boot/initramfs-$(uname -r).img; echo "rc=$?"
+drwxr-xr-x   2 root     root            0 Nov 13 20:11 etc/modprobe.d
+-rw-r--r--   1 root     root           37 Nov 13 20:10 etc/modprobe.d/m07-blacklist.conf
+-rw-r--r--   1 root     root           27 Nov 13 20:10 etc/modprobe.d/m07-dummy.conf
+-rw-r--r--   1 root     root           23 Nov 13 20:10 etc/modules-load.d/m07.conf
+drwxr-xr-x   2 root     root            0 Nov 13 20:11 usr/lib/modprobe.d
+rc=0
+-- initramfs 안의 m07 파일은 [8] 과 같은 셋. m07-boot.conf 는 없다
+-- lsinitrd -f 는 없는 파일을 주면 아무것도 출력하지 않고 rc=0 이다. 출력이 없다는 것이 "없음" 이다
+--
+-- 증상   : /etc/modprobe.d/m07-boot.conf 에 blacklist pcspkr 를 넣고 재부팅했는데 lsmod 에
+--          'pcspkr 16384 0' 이 남아 있음
+-- 원인   : pcspkr 가 initramfs 에 들어 있고(add_drivers), initramfs 의 modprobe.d 사본에는 블랙리스트가
+--          없었다. 0.727922 초(루트 전환 1.757922 초 전)에 initramfs 의 udev 가 올렸다
+-- 조치   : dracut -f 로 다시 만들어 지금의 /etc/modprobe.d 를 담는다
+-- 재확인 : lsinitrd -f etc/modprobe.d/m07-boot.conf 가 blacklist pcspkr 출력, 재부팅 뒤 lsmod 에 없음
+
+-- 조치: initramfs 를 다시 만들어 지금의 /etc/modprobe.d 를 담는다
+[root@ol7a ~]# dracut -f && lsinitrd /boot/initramfs-$(uname -r).img | grep -E 'pcspkr|m07' && lsinitrd -f etc/modprobe.d/m07-boot.conf /boot/initramfs-$(uname -r).img
+-rw-r--r--   1 root     root           37 Nov 13 20:10 etc/modprobe.d/m07-blacklist.conf
+-rw-r--r--   1 root     root           17 Nov 13 20:10 etc/modprobe.d/m07-boot.conf
+-rw-r--r--   1 root     root           27 Nov 13 20:10 etc/modprobe.d/m07-dummy.conf
+-rw-r--r--   1 root     root           23 Nov 13 20:10 etc/modules-load.d/m07.conf
+-rw-r--r--   1 root     root         9672 Dec 24  2024 usr/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/input/misc/pcspkr.ko.xz
+blacklist pcspkr
+-- 새 initramfs 에 m07-boot.conf(17 바이트)가 들어갔고 -f 로 읽은 내용이 blacklist pcspkr 다
+-- pcspkr.ko.xz 자체는 여전히 들어 있다. 파일이 있어도 블랙리스트가 같이 있으면 udev 가 고르지 않는다
+
+-- 재부팅
+
+[root@ol7a ~]# lsmod | grep -w pcspkr; echo "rc=$?"
+rc=1
+-- 재부팅 뒤 pcspkr 없음(rc=1). initramfs 단계와 루트 전환 뒤 단계 모두 막혔다
+
+--------------------------------------------------------------------------------
+ [변형] 옛 방식 — /etc/sysconfig/modules/*.modules
+--------------------------------------------------------------------------------
+-- OL7 문서가 소개하는 방법. 실행 권한이 있는 셸 스크립트를 두면 부팅 때 실행된다.
+-- 이를 실행하는 것은 systemd-modules-load 가 아니라 rhel-loadmodules 서비스다.
+[root@ol7a ~]# systemctl cat rhel-loadmodules.service --no-pager | grep -E 'Condition|ExecStart'
+ConditionPathExists=|/etc/rc.modules
+ConditionDirectoryNotEmpty=|/etc/sysconfig/modules/
+ExecStart=/usr/lib/systemd/rhel-loadmodules
+-- 조건 앞의 | 는 "하나만 맞아도". rc.modules 가 있거나 sysconfig/modules 가 비어 있지 않으면 실행
+-- 기준 상태에서는 둘 다 아니라 이 서비스는 부팅 때 건너뛰어진다
+-- [OL8/9] rhel-loadmodules.service 가 없다. 부팅 때 올릴 모듈은 /etc/modules-load.d 에만 둔다
+
+[root@ol7a ~]# printf '#!/bin/sh\n/sbin/modprobe isofs\n' > /etc/sysconfig/modules/m07.modules; chmod 755 /etc/sysconfig/modules/m07.modules; ls -l /etc/sysconfig/modules
+total 4
+-rwxr-xr-x. 1 root root 31 Nov 13 20:12 m07.modules
+-- 이름이 .modules 로 끝나고 실행 권한(755)이 있어야 실행된다. 31 바이트짜리 두 줄 스크립트
+
+[root@ol7a ~]# systemctl restart rhel-loadmodules; lsmod | grep -w isofs
+isofs                  49152  0 
+-- 서비스를 재시작하자 스크립트가 돌아 isofs 가 올라왔다
+
+--------------------------------------------------------------------------------
+ [되돌림]
+--------------------------------------------------------------------------------
+[root@ol7a ~]# rm -f /etc/modules-load.d/m07.conf /etc/modprobe.d/m07-*.conf /etc/dracut.conf.d/m07.conf /etc/sysconfig/modules/m07.modules; rm -rf /root/m07; ls /etc/modules-load.d /etc/modprobe.d /etc/dracut.conf.d /etc/sysconfig/modules
+/etc/dracut.conf.d:
+/etc/modprobe.d:
+dccp-blacklist.conf
+firewalld-sysctls.conf
+lockd.conf
+tcindex-disable.conf
+tuned.conf
+/etc/modules-load.d:
+/etc/sysconfig/modules:
+-- m07 이 든 파일이 모두 지워졌다. /etc/modprobe.d 는 기본 다섯 파일
+
+[root@ol7a ~]# dracut -f && lsinitrd /boot/initramfs-$(uname -r).img | grep -c '\.ko'; lsinitrd /boot/initramfs-$(uname -r).img | grep -E 'pcspkr|m07'; echo "rc=$?"
+32
+rc=1
+-- 다시 만든 initramfs 의 .ko 는 32 개, m07·pcspkr 없음(rc=1)
+-- 처음 38 개와 다르다. [0] 의 사본과 아래에서 비교한다
+
+-- 재부팅
+
+[root@ol7a ~]# lsmod | grep -w -E 'dummy|pcspkr|isofs|vfat|fat'; lsmod | wc -l; ip -br link show type dummy
+pcspkr                 16384  0 
+73
+-- 재부팅 뒤 pcspkr 가 다시 올라왔고(기준 상태와 같음) dummy·isofs·vfat·fat 은 없다. lsmod 73 줄
+-- dummy 장치도 없다(ip 출력 없음)
+
+-- [0] 에서 복사해 둔 원래 initramfs 와 지금 것의 모듈 목록을 비교한다(개수가 38 과 달랐다).
+-- grep -o '[^/]*\.ko\.xz' : 경로를 떼고 파일 이름만
+[root@ol7a ~]# diff <(lsinitrd /root/initramfs-base.img | grep -o '[^/]*\.ko\.xz' | sort) <(lsinitrd /boot/initramfs-$(uname -r).img | grep -o '[^/]*\.ko\.xz' | sort)
+5d4
+< dm-dust.ko.xz
+16,17d14
+< ib_cm.ko.xz
+< ib_core.ko.xz
+26d22
+< scsi_transport_fc.ko.xz
+37,38d32
+< xscore.ko.xz
+< xsvhba.ko.xz
+-- 원래 initramfs 에만 있던 모듈 여섯 개: dm-dust, ib_cm, ib_core, scsi_transport_fc, xscore, xsvhba
+-- 지금 initramfs 에만 있는 것은 없다(> 줄 없음)
+-- 원래 것은 커널 패키지 설치 때 만들어졌고, 이 실습의 dracut -f 는 지금 시스템에 필요한 것만 담았다
+
+[root@ol7a ~]# rm -f /root/initramfs-base.img
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                         시작 전          변경 후                                 되돌린 뒤
+--  /etc/modules-load.d          비어 있음        m07.conf (dummy)                        비어 있음
+--  dummy (numdummies=2)         없음             dummy0·dummy1                           없음
+--  blacklist vfat + modprobe    -                적재됨(이름 직접)                       -
+--  blacklist vfat + mount       -                unknown filesystem type 'vfat'          -
+--  blacklist fat + mount        -                성공, fat 은 의존성으로 적재             -
+--  install fat /bin/false       -                fat·vfat·mount 모두 실패                 -
+--  pcspkr (블랙리스트, 재부팅)  적재(0)          없음 → initramfs 에 넣자 다시 적재      적재(0)
+--  initramfs .ko 수             38               pcspkr.ko.xz 추가                       32
+--  rhel-loadmodules             조건 불충족      m07.modules 실행 → isofs                없음
+--
+-- 확인한 사실
+--   blacklist 는 별칭(udev modalias, fs-이름) 경로와 systemd-modules-load 에만 듣는다
+--   이름 직접 적재와 의존성 적재까지 막으려면 install 모듈 /bin/false 를 쓴다
+--   initramfs 는 dracut 이 만들 때의 /etc/modprobe.d·modules-load.d 사본을 들고 있다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. /etc/modprobe.d 에 blacklist e1000 을 넣고 dracut -f 없이 재부팅하면 NIC 가 살아 있는지 본다
+--    (e1000 은 initramfs 에 들어 있다. 스냅샷이 있을 때만, 콘솔로 확인)
+--    확인: journalctl -b -o short-monotonic | grep e1000, ip -br link
+-- 2. dracut 의 omit_drivers+=" pcspkr " 로 initramfs 에서 빼는 방법과 블랙리스트를 비교한다
+--    확인: lsinitrd | grep pcspkr, 재부팅 뒤 lsmod
+-- 3. /etc/sysconfig/modules/m07.modules 의 실행 권한을 빼고 서비스를 재시작해 본다
+--    확인: lsmod | grep isofs, journalctl -u rhel-loadmodules
+
+================================================================================
+ 실습 04 종료 — blacklist 는 별칭만 막고 install /bin/false 는 모두 막음, initramfs 에 든 모듈은 dracut -f 뒤에야 블랙리스트가 들음
+================================================================================

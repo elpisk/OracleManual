@@ -1,0 +1,578 @@
+================================================================================
+ 제6장 실습 04 — at 과 batch: 한 번만 도는 작업과 부하 임계값
+ 대상   : ol7a
+ 목표   : at 으로 정한 시각에 한 번 실행하고 atq·atrm·at -c 로 대기열을 다룬다.
+          batch 가 부하 평균이 임계값을 넘는 동안 미뤄지는 것을 실제 부하로 확인하고,
+          atd 의 -l 옵션으로 임계값을 바꿔 같은 작업이 풀려나는 것을 본다
+ 배경   : at 은 지정한 시각에 한 번, batch 는 부하 평균이 임계값(atd -l) 아래일 때
+          한 번 명령을 실행한다. 둘 다 atd 가 /var/spool/at 의 작업 파일을 읽어 돌린다.
+          작업 파일에는 at 을 친 순간의 환경 변수와 작업 디렉터리가 통째로 들어간다.
+          cron 과 가장 크게 다른 점이다. 접근 제어는 /etc/at.allow·at.deny (본문 6.6 절)
+ 소요   : 약 15분 (분 경계 대기 포함)
+ 선행   : ol7-base 스냅샷 (at 패키지, atd enabled·active)
+ 계정   : root, student
+ 주의   : [6] 에서 vCPU 두 개를 최대 5분 동안 100% 로 쓴다. timeout 300 으로 스스로 끝난다
+ 되돌림 : /etc/sysconfig/atd·/etc/at.deny 원래대로, 대기열 비움, atd 재시작.
+          확인은 atq(출력 없음), ps 로 본 atd 명령줄 /usr/sbin/atd -f
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- at 패키지와 atd 서비스 상태부터 본다. at 명령은 작업을 대기열에 넣기만 하고
+-- 실제 실행은 atd 가 한다. 둘을 따로 확인하는 이유다.
+
+[root@ol7a ~]# rpm -q at; systemctl is-enabled atd; systemctl is-active atd
+at-3.1.13-25.el7_9.x86_64
+enabled
+active
+
+-- at-3.1.13 패키지, atd 는 enabled·active. 기준 상태에서 바로 쓸 수 있다
+
+-- 접근 제어 파일 두 개와 atd 옵션 파일. 바꿀 대상이라 사본을 떠 둔다.
+-- cp -p : 소유자·권한·시각을 그대로 보존
+
+[root@ol7a ~]# ls -l /etc/at.allow /etc/at.deny /etc/sysconfig/atd; cat /etc/sysconfig/atd
+ls: cannot access /etc/at.allow: No such file or directory
+-rw-r--r--. 1 root root   1 May 19  2022 /etc/at.deny
+-rw-r--r--. 1 root root 403 May 19  2022 /etc/sysconfig/atd
+# specify additional command line arguments for atd
+#
+# -l Specifies  a  limiting  load  factor,  over which batch jobs should not be run, instead of the compile-time
+#    choice of 0.8.  For an SMP system with n CPUs, you will probably want to set this higher than n-1.
+# 
+#  -b Specifiy the minimum interval in seconds between the start of two batch jobs (60 default).
+
+#example: 
+#OPTS="-l 4 -b 120"
+
+-- at.allow 는 없고 at.deny 만 있다. 크기 1 → 줄바꿈 하나
+-- /etc/sysconfig/atd 는 주석뿐이다. OPTS 가 정의돼 있지 않아 atd 는 옵션 없이 뜬다
+-- 주석이 말하는 두 옵션
+--   -l : batch 를 막는 부하 한계. 컴파일 기본값 0.8
+--   -b : batch 작업 둘 사이의 최소 간격(초). 기본 60
+-- 'n CPU 이면 n-1 보다 크게' 라는 권고가 붙어 있다. vCPU 2 개인 ol7a 라면 1 이상
+
+[root@ol7a ~]# cp -p /etc/at.deny /etc/sysconfig/atd /root/; atq; ls -l /var/spool/at
+total 0
+drwx------. 2 root root 6 May 19  2022 spool
+
+-- atq 는 아무것도 출력하지 않는다. 대기열이 비어 있다
+-- /var/spool/at 에는 spool 디렉터리 하나. 작업 파일은 이 위에, 실행 중 출력은 spool 에 쌓인다
+
+-- batch 판단 기준이 되는 부하 평균과 CPU 수
+
+[root@ol7a ~]# nproc; cat /proc/loadavg; ps -o pid,args -C atd
+2
+0.07 0.02 0.00 1/191 2065
+  PID COMMAND
+ 1028 /usr/sbin/atd -f
+
+-- nproc 2 → vCPU 둘
+-- /proc/loadavg 다섯 필드
+--   0.07 0.02 0.00 : 1분·5분·15분 부하 평균
+--   1/191          : 지금 실행 중인 태스크 / 전체 태스크
+--   2065           : 마지막으로 만든 PID
+-- batch 가 보는 것은 첫 필드(1분 평균)
+-- atd 명령줄은 '/usr/sbin/atd -f'. -f 는 systemd 아래에서 포그라운드로 도는 옵션
+
+-- 임계값 기본값은 컴파일 때 정해진다. man atd 의 -l 항목과 sysconfig 주석을 대조한다.
+-- col -b : man 의 굵은 글씨 제어 문자를 지움
+
+[root@ol7a ~]# man atd 2>/dev/null | col -b | grep -A4 -E '^ +-l'; grep -v '^$' /etc/sysconfig/atd
+       -l      Specifies  a limiting load factor, over which batch jobs should
+               not be run, instead of the compile-time choice of 0.8.  For  an
+               SMP  system  with  n  CPUs,  you will probably want to set this
+               higher than n-1.
+
+# specify additional command line arguments for atd
+#
+# -l Specifies  a  limiting  load  factor,  over which batch jobs should not be run, instead of the compile-time
+#    choice of 0.8.  For an SMP system with n CPUs, you will probably want to set this higher than n-1.
+# 
+#  -b Specifiy the minimum interval in seconds between the start of two batch jobs (60 default).
+#example: 
+#OPTS="-l 4 -b 120"
+
+-- man 페이지와 sysconfig 주석이 같은 값을 말한다. 7.9 의 at 은 기본 임계값 0.8
+-- vCPU 2 개 서버에서 0.8 은 CPU 하나도 다 쓰지 않은 상태다. [6] 에서 확인
+
+--------------------------------------------------------------------------------
+ [1] at now + 1 minute — 한 번만 도는 작업 넣기
+--------------------------------------------------------------------------------
+
+-- at 은 실행할 명령을 표준 입력으로 받는다. heredoc 으로 두 줄을 넣는다.
+-- 'now + 1 minute' : 지금부터 1분 뒤. 시각 문법은 [3] 에서 더 본다
+
+[root@ol7a ~]# date '+%T'; at now + 1 minute <<'EOF'
+date '+%F %T at-job ran' > /tmp/at-now1.txt
+echo "user=$(id -un) cwd=$PWD" >> /tmp/at-now1.txt
+EOF
+18:20:01
+job 1 at Thu Nov 12 18:21:00 2026
+
+-- 18:20:01 에 넣었는데 실행 시각은 18:21:00. 초는 버리고 다음 분 정각으로 잡힌다
+-- 'job 1' 이 작업 번호. 이후 at -c·atrm 에 쓴다
+-- 응답 줄은 표준 오류로 나온다. 스크립트에서 번호를 받으려면 2>&1 로 받아야 한다
+
+--------------------------------------------------------------------------------
+ [2] atq 와 at -c — 대기열과 작업 파일 속
+--------------------------------------------------------------------------------
+
+-- atq : 대기 중인 작업 목록 (at -l 과 같음)
+
+[root@ol7a ~]# atq; ls -l /var/spool/at
+1       Thu Nov 12 18:21:00 2026 a root
+total 4
+-rwx------. 1 root root 1023 Nov 12 18:20 a0000101c85bd1
+drwx------. 2 root root    6 May 19  2022 spool
+
+-- atq 의 네 열
+--   1                        : 작업 번호
+--   Thu Nov 12 18:21:00 2026 : 실행 예정 시각
+--   a                        : 대기열 문자. at 기본은 a
+--   root                     : 작업 주인
+-- 작업 파일 a0000101c85bd1 의 이름
+--   첫 글자 a : 대기열, 다음 5자리 00001 : 작업 번호(16진), 나머지 : 실행 시각(분, 16진)
+-- 권한 rwx------. 작업 파일 자체가 실행 가능한 셸 스크립트다
+
+-- at -c 작업번호 : atd 가 실행할 셸 스크립트 전체를 보여 준다. 길어서 나눠 본다.
+-- 앞 5줄, 환경 변수 중 PATH·HOME·LOGNAME·SHELL, 끝 6줄
+
+[root@ol7a ~]# at -c 1 | head -5
+#!/bin/sh
+# atrun uid=0 gid=0
+# mail root 0
+umask 22
+XDG_SESSION_ID=1; export XDG_SESSION_ID
+
+-- 머리 세 줄
+--   #!/bin/sh            : 작업 파일은 sh 스크립트
+--   # atrun uid=0 gid=0  : 실행할 사용자·그룹
+--   # mail root 0        : 결과 메일 수신자와 -m 여부(0 = 출력 있을 때만)
+-- umask 22 도 at 을 친 순간의 값이 저장된다
+
+[root@ol7a ~]# at -c 1 | grep -E '^(PATH|HOME|LOGNAME|SHELL)='; at -c 1 | wc -l
+SHELL=/bin/bash; export SHELL
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin; export PATH
+HOME=/root; export HOME
+LOGNAME=root; export LOGNAME
+30
+
+-- 환경 변수가 export 와 함께 그대로 들어 있다
+--   PATH 에 /usr/local/sbin·/usr/sbin 이 있다. 이 SSH 세션의 PATH 다
+-- 30 줄짜리 스크립트. cron 이 PATH=/usr/bin:/bin 으로 작업을 띄우는 것과 다르다
+-- 다만 저장되는 것은 at 을 친 그 셸의 환경이다. 대화형 셸이 아닌 곳(스크립트,
+-- 다른 데몬)에서 at 을 부르면 그쪽의 좁은 환경이 그대로 저장된다
+-- TERM·DISPLAY·UID·_ 같은 일부 변수는 at 이 일부러 빼고 저장한다(man at)
+
+[root@ol7a ~]# at -c 1 | tail -6
+}
+${SHELL:-/bin/sh} << 'marcinDELIMITER5355ceb3'
+date '+%F %T at-job ran' > /tmp/at-now1.txt
+echo "user=$(id -un) cwd=$PWD" >> /tmp/at-now1.txt
+
+marcinDELIMITER5355ceb3
+
+-- 끝부분
+--   } 는 앞에서 작업 디렉터리로 cd 하고 실패하면 끝내는 블록의 끝
+--   ${SHELL:-/bin/sh} << '구분자' : 저장된 SHELL(bash)로 본 명령을 heredoc 으로 실행
+--   구분자 marcinDELIMITER... 는 at 이 만든 임의 문자열. 명령 안의 EOF 와 겹치지 않게 함
+
+--------------------------------------------------------------------------------
+ [3] 시각 지정 문법과 atrm
+--------------------------------------------------------------------------------
+
+-- 같은 명령을 여러 시각 문법으로 넣어 본다. 실행시키지 않고 지울 작업들이다.
+--   at 23:59              오늘 23:59 (이미 지났으면 내일)
+--   at noon tomorrow      내일 12:00
+--   at now + 2 hours      두 시간 뒤
+--   at -t 202611150300    [[CC]YY]MMDDhhmm 형식의 절대 시각
+--   at -q z ...           대기열 문자를 z 로 (기본 a, batch 는 b)
+
+[root@ol7a ~]# echo 'touch /tmp/x1' | at 23:59
+job 2 at Thu Nov 12 23:59:00 2026
+[root@ol7a ~]# echo 'touch /tmp/x2' | at noon tomorrow
+job 3 at Fri Nov 13 12:00:00 2026
+[root@ol7a ~]# echo 'touch /tmp/x3' | at now + 2 hours
+job 4 at Thu Nov 12 20:20:00 2026
+[root@ol7a ~]# echo 'touch /tmp/x4' | at -q z -t 202611150300
+job 5 at Sun Nov 15 03:00:00 2026
+
+-- 넣을 때마다 at 이 해석한 절대 시각을 돌려준다
+--   23:59 → 오늘(Nov 12) 23:59, noon tomorrow → Nov 13 12:00
+--   now + 2 hours → 18:20 기준 20:20 (초 버림)
+--   -t 202611150300 → Nov 15 03:00
+
+[root@ol7a ~]# atq | sort -n
+1       Thu Nov 12 18:21:00 2026 a root
+2       Thu Nov 12 23:59:00 2026 a root
+3       Fri Nov 13 12:00:00 2026 a root
+4       Thu Nov 12 20:20:00 2026 a root
+5       Sun Nov 15 03:00:00 2026 z root
+
+-- 정렬된 목록. 대기열 문자가 5번만 z, 나머지는 a
+-- sort -n 은 번호 순 정렬. atq 자체의 출력 순서는 보장되지 않는다
+-- 4 번(20:20)이 3 번(내일 12:00)보다 먼저 돈다. 번호 순과 실행 순은 다르다
+-- 대기열 문자가 뒤쪽 글자일수록 nice 값이 커진다(우선순위가 낮아짐). man at 의 -q 설명
+
+-- atrm 번호... : 대기열에서 지운다 (at -d 와 같음)
+
+[root@ol7a ~]# atrm 2 3 4 5; atq
+1       Thu Nov 12 18:21:00 2026 a root
+
+-- atrm 은 성공하면 아무 말도 하지 않는다. 남은 것은 1번 하나
+
+--------------------------------------------------------------------------------
+ [4] 실행 결과 확인
+--------------------------------------------------------------------------------
+
+-- at now + 1 minute 의 실행 시각은 분 단위로 잘린다. 다음 분 경계를 2초 넘길 때까지
+-- 기다린다. 10#$(date +%S) : 08·09 초를 8진수로 읽지 않게 10진수로 강제
+
+[root@ol7a ~]# sleep $((62 - 10#$(date +%S))); date '+%T'; cat /tmp/at-now1.txt; atq
+18:21:02
+2026-11-12 18:21:00 at-job ran
+user=root cwd=/root
+
+-- 18:21:00 에 실행됐다. id -un 은 root, $PWD 는 at 을 친 디렉터리 /root
+-- 실행 뒤 atq 는 비었다. at 작업은 한 번 돌면 사라진다
+
+-- atd 가 작업을 시작·끝낸 기록은 어디에 남는가
+
+[root@ol7a ~]# grep -h atd /var/log/cron /var/log/messages | tail -5
+Nov 12 18:21:00 ol7a atd[2344]: Starting job 1 (a0000101c85bd1) for user 'root' (0)
+
+-- /var/log/cron 에는 없고 /var/log/messages 에 한 줄
+--   atd[2344] : 작업마다 atd 가 갈라진 자식 PID
+--   Starting job 1 (작업 파일 이름) for user 'root' (uid 0)
+-- 끝났다는 줄은 남지 않는다. 결과는 작업의 출력이나 메일로 확인한다
+
+--------------------------------------------------------------------------------
+ [5] 오류 흐름 ① — atd 가 멈춰 있으면
+--------------------------------------------------------------------------------
+
+-- 운영 서버에서 atd 를 꺼 둔 경우를 흉내 낸다. at 명령 자체는 성공하는지,
+-- 시각이 지나도 실행되지 않는지 본다.
+
+[root@ol7a ~]# systemctl stop atd; systemctl is-active atd
+inactive
+[root@ol7a ~]# date '+%T'; echo 'date "+%T late-run" > /tmp/at-stopped.txt' | at now + 1 minute
+18:21:02
+job 6 at Thu Nov 12 18:22:00 2026
+Can't open /var/run/atd.pid to signal atd. No atd running?
+
+-- at 은 작업 6 을 접수했다. 동시에 경고 한 줄
+--   at 은 새 작업을 넣으면 atd 에 신호를 보내 대기열을 다시 보게 한다
+--   /var/run/atd.pid 가 없어 신호를 못 보냈다는 뜻
+-- 작업은 접수됐으므로 rc 만 보는 스크립트는 이 경고를 놓친다
+
+[root@ol7a ~]# sleep $((62 - 10#$(date +%S))); date '+%T'; atq; ls -l /tmp/at-stopped.txt
+18:22:02
+6       Thu Nov 12 18:22:00 2026 a root
+ls: cannot access /tmp/at-stopped.txt: No such file or directory
+
+-- 18:22:00 이 지났는데 6 번은 대기열에 그대로, 결과 파일은 없다
+--
+-- 증상   : 시각이 지난 at 작업 6 이 atq 에 남고 실행되지 않음. 넣을 때
+--          'Can't open /var/run/atd.pid to signal atd. No atd running?'
+-- 원인   : 작업을 실행하는 atd 가 멈춰 있음(systemctl is-active atd → inactive)
+-- 조치   : systemctl start atd (부팅 때도 뜨게 하려면 systemctl enable atd)
+-- 재확인 : 아래에서 결과 파일이 생기고 atq 가 빈다
+
+-- 조치: atd 를 다시 띄운다. 밀린 작업이 바로 실행되는지 본다
+
+[root@ol7a ~]# systemctl start atd; sleep 3; date '+%T'; cat /tmp/at-stopped.txt; atq
+18:22:05
+18:22:02 late-run
+
+-- atd 가 뜬 18:22:02 에 밀린 작업이 곧바로 돌았다. 예정보다 2초 늦다
+-- 몇 시간이 밀렸어도 마찬가지다. 시각이 한참 지난 작업이 서버 재기동 직후
+-- 한꺼번에 도는 일이 생길 수 있으니 오래 멈춘 atd 를 띄우기 전에 atq 부터 본다
+-- at 작업은 cron 과 달리 놓쳐도 버려지지 않는다. atd 가 다시 뜨면 실행된다
+
+--------------------------------------------------------------------------------
+ [6] batch — 부하를 걸어 미뤄지는 것 확인
+--------------------------------------------------------------------------------
+
+-- CPU 를 계속 쓰는 빈 루프 세 개를 띄운다. vCPU 가 둘이라 부하 평균은 3 쪽으로 오른다.
+-- timeout 300 : 300초 뒤 스스로 끝나게 해서 실수로 남지 않게 한다
+
+[root@ol7a ~]# nohup timeout 300 sh -c 'while :; do :; done' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# nohup timeout 300 sh -c 'while :; do :; done' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# nohup timeout 300 sh -c 'while :; do :; done' >/dev/null 2>&1 </dev/null &
+[root@ol7a ~]# pgrep -af 'whil[e] :'; cat /proc/loadavg
+2481 timeout 300 sh -c while :; do :; done
+2482 sh -c while :; do :; done
+2500 timeout 300 sh -c while :; do :; done
+2501 sh -c while :; do :; done
+2519 timeout 300 sh -c while :; do :; done
+2520 sh -c while :; do :; done
+0.01 0.00 0.00 7/191 2539
+
+-- pgrep 의 패턴 'whil[e] :' 는 pgrep 을 부른 셸 자신의 명령줄과 겹치지 않게 쓴 것
+-- 루프 하나에 두 프로세스: timeout(감시)과 sh(실제 루프). 셋을 띄워 여섯 줄
+-- 방금 띄워 1분 평균은 아직 0.01. 실행 중 태스크 7 개(7/191)
+
+-- 1분 부하 평균이 임계값을 충분히 넘을 때까지 75초 기다린다
+
+[root@ol7a ~]# sleep 75; cat /proc/loadavg
+2.32 0.72 0.25 4/191 2558
+
+-- 75초 뒤 1분 평균 2.32. 기본 임계값 0.8 의 세 배 가까이 된다
+-- 5분·15분 평균은 천천히 오른다. batch 는 1분 평균만 본다
+
+-- 이제 batch 로 작업을 넣는다. 실행되는 순간의 부하 평균을 같이 남긴다
+
+[root@ol7a ~]# echo 'date "+%T batch ran" > /tmp/batch1.txt; cat /proc/loadavg >> /tmp/batch1.txt' | batch
+job 7 at Thu Nov 12 18:23:00 2026
+[root@ol7a ~]# atq
+7       Thu Nov 12 18:23:00 2026 b root
+
+-- batch 는 시각을 받지 않는다. 표시된 18:23:00 은 넣은 시각의 다음 분
+-- 대기열 문자 b. at -q b 로 넣은 것과 같다
+
+-- 70초를 더 기다린다. 부하가 계속 높으면 작업은 그대로 남아 있어야 한다
+
+[root@ol7a ~]# sleep 70; date '+%T'; cat /proc/loadavg; atq; ls -l /tmp/batch1.txt
+18:24:33
+2.89 1.23 0.47 5/191 2615
+7       Thu Nov 12 18:23:00 2026 b root
+ls: cannot access /tmp/batch1.txt: No such file or directory
+
+-- 18:24:33. 부하 2.89 로 더 올랐고 7 번은 여전히 b 로 대기, 결과 파일 없음
+--
+-- 증상   : batch 작업 7 이 1분 반이 지나도 실행되지 않고 atq 에 남음
+-- 원인   : 1분 부하 평균 2.89 가 atd 의 임계값 0.8 을 넘음.
+--          vCPU 2 개 서버에서 0.8 은 낮은 값이다
+-- 조치   : /etc/sysconfig/atd 에 OPTS="-l 4.0 -b 30" 을 넣고 atd 재시작([7])
+-- 재확인 : [7] 에서 /tmp/batch1.txt 가 생기고 atq 가 빈다
+
+--------------------------------------------------------------------------------
+ [7] atd -l 로 임계값 바꾸기
+--------------------------------------------------------------------------------
+
+-- /etc/sysconfig/atd 의 OPTS 로 atd 옵션을 준다.
+--   -l 4.0 : 부하 평균 4.0 미만이면 batch 를 실행 (루프 세 개로는 4 를 넘지 못함)
+--   -b 30  : batch 작업 사이 최소 간격 30초 (기본 60)
+
+[root@ol7a ~]# echo 'OPTS="-l 4.0 -b 30"' >> /etc/sysconfig/atd; diff /root/atd /etc/sysconfig/atd
+9a10
+> OPTS="-l 4.0 -b 30"
+
+-- diff: 원본 9행 뒤에 한 줄 추가(9a10). 원본의 #OPTS 예시 줄은 그대로 둔다
+-- 값을 4.0 으로 잡은 이유: 루프 셋이 만드는 부하는 3 근처에서 멈춘다
+-- 운영 서버라면 'CPU 수 - 1' 보다 조금 큰 값부터 시작해 평소 부하를 보고 정한다
+
+-- 설정 파일만 바꾼 지금은 반영되지 않았다. 재시작해야 한다
+
+[root@ol7a ~]# ps -o pid,args -C atd; systemctl restart atd; ps -o pid,args -C atd
+  PID COMMAND
+ 2453 /usr/sbin/atd -f
+  PID COMMAND
+ 2655 /usr/sbin/atd -f -l 4.0 -b 30
+ 2658 /usr/sbin/atd -f -l 4.0 -b 30
+
+-- 재시작 전 atd(PID 2453)는 '-f' 뿐. [5] 에서 다시 띄운 atd 다
+-- 재시작 뒤 2655 가 새 옵션 '-f -l 4.0 -b 30' 으로 떴다
+-- 2658 은 같은 명령줄의 자식. atd 가 batch 작업을 실행하려고 갈라진 프로세스다
+-- 유닛 파일이 EnvironmentFile=/etc/sysconfig/atd 를 읽어 $OPTS 를 넘긴다
+-- 즉 설정 파일만 고쳐서는 실행 중인 atd 에 반영되지 않는다
+
+[root@ol7a ~]# sleep 40; date '+%T'; atq; cat /tmp/batch1.txt
+18:25:14
+18:24:34 batch ran
+2.89 1.23 0.47 6/194 2677
+
+-- atq 는 비었고 batch1.txt 에 '18:24:34 batch ran'
+-- 재시작 직후(18:24:34) 실행됐다. 그때 1분 평균 2.89 → 새 한계 4.0 보다 작다
+-- 부하는 그대로인데 판단 기준만 바뀌어 작업이 풀렸다
+
+-- 부하를 걸었던 루프를 정리한다
+
+[root@ol7a ~]# pkill -f 'whil[e] :'; sleep 1; pgrep -af 'whil[e] :' ; cat /proc/loadavg
+2.71 1.43 0.57 1/185 2706
+
+-- pgrep 이 아무것도 찾지 못한다. 루프 여섯 프로세스가 끝났다
+-- 1분 평균은 바로 0 이 되지 않는다. 지수 평균이라 몇 분에 걸쳐 내려간다
+
+--------------------------------------------------------------------------------
+ [8] 오류 흐름 ② — at.deny 에 든 사용자
+--------------------------------------------------------------------------------
+
+-- 기본 at.deny 는 줄바꿈 하나뿐인 1바이트 파일이다. student 를 넣는다
+
+[root@ol7a ~]# echo student >> /etc/at.deny; cat /etc/at.deny
+
+student
+[student@ol7a ~]$ echo 'date > /tmp/st.txt' | at now + 5 minutes
+You do not have permission to use at.
+
+-- 첫 줄은 at.deny 가 원래 가진 빈 줄, 둘째 줄이 student
+-- >> 로 덧붙였기 때문에 원래의 빈 줄 뒤에 들어갔다
+-- student 의 at 이 즉시 거부됐다. 작업 번호도 받지 못했다
+--
+-- 증상   : student 가 at 을 치자 'You do not have permission to use at.'
+-- 원인   : /etc/at.deny 에 student 가 있음. at.allow 가 없으니 at.deny 로 판정
+-- 조치   : sed -i '/^student$/d' /etc/at.deny
+-- 재확인 : 같은 명령이 'job 8 at ...' 을 돌려주고 atq 에 보인다(아래)
+
+-- 조치: 줄을 지운다
+
+[root@ol7a ~]# sed -i '/^student$/d' /etc/at.deny; cat -A /etc/at.deny; diff /root/at.deny /etc/at.deny && echo same
+$
+same
+
+-- cat -A 로 보니 남은 것은 줄 끝 표시 $ 하나. 원본과 같다(diff 출력 없음 → same)
+
+[student@ol7a ~]$ echo 'date > /tmp/st.txt' | at now + 5 minutes; atq
+job 8 at Thu Nov 12 18:30:00 2026
+8       Thu Nov 12 18:30:00 2026 a student
+
+-- root 의 atq 는 모든 사용자의 작업을 보여 준다. 네 번째 열이 사용자다
+
+[root@ol7a ~]# atq
+8       Thu Nov 12 18:30:00 2026 a student
+
+-- student 의 atq 는 자기 작업만, root 의 atq 는 모두를 보여 준다
+-- 이 실습에서는 둘 다 8 번 하나라 같아 보인다
+
+--------------------------------------------------------------------------------
+ [9] at.allow 가 생기면
+--------------------------------------------------------------------------------
+
+-- at.allow 가 있으면 at.deny 는 보지 않고 at.allow 에 적힌 사용자만 쓸 수 있다.
+-- root 만 적은 at.allow 를 만들고 student 로 다시 시도한다
+
+[root@ol7a ~]# echo root > /etc/at.allow; ls -l /etc/at.allow /etc/at.deny
+-rw-r--r--. 1 root root 5 Nov 12 18:25 /etc/at.allow
+-rw-r--r--. 1 root root 1 Nov 12 18:25 /etc/at.deny
+[student@ol7a ~]$ echo 'date' | at now + 5 minutes; atq
+You do not have permission to use at.
+You do not have permission to use atq.
+
+-- at.allow 를 만들자 student 는 at 도 atq 도 쓸 수 없다
+-- at.deny 에는 student 가 없는데도 막혔다. at.allow 가 있으면 at.deny 는 보지 않는다
+
+-- 이미 넣어 둔 student 의 작업은 어떻게 되는가. root 로 본다
+
+[root@ol7a ~]# atq; rm -f /etc/at.allow; atrm $(atq | awk '{print $1}'); atq
+8       Thu Nov 12 18:30:00 2026 a student
+
+-- 이미 넣어 둔 8 번은 대기열에 그대로 남아 있었다
+-- 실행 시각(18:30) 전에 지웠기 때문에 atd 가 실행할 때 다시 검사하는지는 이 실습에서 보지 않았다
+-- 사용자를 막을 때는 at.allow·at.deny 수정과 함께 atq 로 남은 작업을 확인해 atrm 한다
+-- at.allow 는 새 작업을 받을 때 검사한다. 실습 05 의 cron 쪽과 비교해 볼 지점
+-- 남은 작업은 root 가 atrm 으로 지웠다. 마지막 atq 는 출력이 없다
+
+--------------------------------------------------------------------------------
+ [변형] 파일에서 읽기(-f)와 대기열 b
+--------------------------------------------------------------------------------
+
+-- 같은 일을 표준 입력 대신 스크립트 파일로 준다. batch 는 'at -q b now' 와 같다고
+-- 문서에 적혀 있다. 둘을 나란히 넣고 대기열 문자를 비교한다.
+--   -f 파일 : 명령을 파일에서 읽음
+--   -m      : 출력이 없어도 끝나면 메일을 보냄
+
+[root@ol7a ~]# printf 'date "+%%T via -f" > /tmp/atf.txt\n' > /root/atjob.sh; cat /root/atjob.sh
+date "+%T via -f" > /tmp/atf.txt
+
+-- printf 의 %% 는 % 한 글자가 된다. 파일에는 %T 가 들어갔다
+
+[root@ol7a ~]# at -m -f /root/atjob.sh now + 1 minute; echo 'true' | at -q b now + 3 minutes; echo 'true' | batch; atq | sort -n
+job 9 at Thu Nov 12 18:26:00 2026
+job 10 at Thu Nov 12 18:28:00 2026
+job 11 at Thu Nov 12 18:25:00 2026
+9       Thu Nov 12 18:26:00 2026 a root
+10      Thu Nov 12 18:28:00 2026 b root
+11      Thu Nov 12 18:25:00 2026 = root
+
+-- 9  : -f 로 넣은 작업, 대기열 a
+-- 10 : at -q b now + 3 minutes. 대기열은 b 지만 시각이 있다
+-- 11 : batch. 넣자마자 대기열 문자가 '=' → 지금 실행 중
+--      부하 한계가 4.0 이라 바로 풀렸다
+
+[root@ol7a ~]# sleep $((62 - 10#$(date +%S))); cat /tmp/atf.txt; atq
+18:26:00 via -f
+10      Thu Nov 12 18:28:00 2026 b root
+
+-- 9 번이 18:26:00 에 돌아 결과 파일이 생겼다. 11 번도 끝나 목록에서 빠졌다
+-- 10 번은 b 대기열이지만 시각(18:28)이 오기 전에는 돌지 않는다
+-- batch 는 'at -q b now' 와 같다는 문서의 설명은 시각을 now 로 줬을 때의 이야기다
+-- 시각과 부하 조건을 함께 걸고 싶으면 at -q b 시각 으로 넣는다
+
+[root@ol7a ~]# tail -12 /var/spool/mail/root
+Return-Path: <root@ol7a.example.com>
+X-Original-To: root
+Delivered-To: root@ol7a.example.com
+Received: by ol7a.example.com (Postfix, from userid 0)
+        id 9486215A; Thu, 12 Nov 2026 18:26:00 +0900 (KST)
+Subject: Output from your job        9
+To: root@ol7a.example.com
+Message-Id: <20261112092600.9486215A@ol7a.example.com>
+Date: Thu, 12 Nov 2026 18:26:00 +0900 (KST)
+From: root@ol7a.example.com (root)
+
+-- -m 을 준 9 번은 출력이 없어도 메일이 왔다
+--   Subject: Output from your job        9
+--   본문이 비어 있다. 명령 출력은 파일로 보냈기 때문
+-- -m 을 주지 않은 11 번(true)은 메일이 없다
+
+--------------------------------------------------------------------------------
+ [10] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# atrm $(atq | awk '{print $1}') 2>/dev/null; atq; cp -p /root/atd /etc/sysconfig/atd; systemctl restart atd
+
+-- 남아 있던 10 번을 지우고 sysconfig 를 되돌린 뒤 atd 를 재시작했다
+-- atrm 의 2>/dev/null 은 대기열이 비어 인자가 없을 때 나는 사용법 출력을 숨기려는 것
+-- atq 는 출력이 없다. 대기열이 비었다
+
+[root@ol7a ~]# diff /root/atd /etc/sysconfig/atd && echo atd-same; diff /root/at.deny /etc/at.deny && echo deny-same; ls -l /etc/at.allow
+atd-same
+deny-same
+ls: cannot access /etc/at.allow: No such file or directory
+[root@ol7a ~]# ps -o pid,args -C atd; systemctl is-active atd; rm -f /tmp/at-*.txt /tmp/batch1.txt /tmp/atf.txt /root/atjob.sh /root/atd /root/at.deny
+  PID COMMAND
+ 3040 /usr/sbin/atd -f
+active
+
+-- atd 명령줄이 다시 '/usr/sbin/atd -f' 로 돌아왔다. [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+--  항목                  시작 전            변경 후                     되돌린 뒤
+--  atd 명령줄            /usr/sbin/atd -f   -f -l 4.0 -b 30             /usr/sbin/atd -f
+--  batch 임계값          0.8 (컴파일 값)    4.0                         0.8
+--  부하 2.89 에서 batch  -                  대기 → 재시작 뒤 실행        -
+--  atd 정지 중 at 작업   -                  대기열에 남음 → 기동 즉시   -
+--  /etc/at.deny          빈 줄 1바이트      student 추가 → 거부         원본과 같음
+--  /etc/at.allow         없음               root 만 → student 거부      없음
+--  atq                   비어 있음          1~11 번 작업 오감           비어 있음
+--
+-- 확인한 사실
+--   at 작업 파일은 환경 변수·umask·작업 디렉터리를 통째로 저장한다
+--   atd 가 없어도 작업은 접수되고, atd 가 뜨면 밀린 작업이 바로 돈다
+--   batch 는 1분 부하 평균만 본다. 기본 0.8 은 CPU 수를 반영하지 않는다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. at.allow 와 at.deny 를 모두 지우면 student 는 at 을 쓸 수 있는가
+--    확인: man at 의 FILES 절과 student 의 'echo date | at now + 5 minutes' 결과
+-- 2. 부하를 건 채로 OPTS="-l 1.0" 을 주고 batch 두 개를 넣어, -b 간격이 지켜지는지 본다
+--    확인: atq 의 = 표시와 결과 파일의 시각 차이
+-- 3. at -q c 와 at -q z 로 같은 CPU 작업을 넣어 nice 값을 비교한다
+--    확인: 실행 중에 ps -o pid,ni,args -C sh
+--
+-- 이번 실습의 작업 번호는 1~11 까지 올라갔다. 번호는 되돌림 뒤에도 이어진다
+-- 다음 번호는 /var/spool/at/.SEQ 에 저장된다. ls -la /var/spool/at 으로 확인
+-- 스냅샷으로 되돌리면 번호도 1 부터 다시 시작한다
+
+================================================================================
+ 실습 04 종료 — at·batch 대기열, atd 정지와 부하 임계값의 영향 확인
+================================================================================

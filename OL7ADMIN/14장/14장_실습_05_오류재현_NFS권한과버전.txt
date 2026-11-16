@@ -1,0 +1,460 @@
+================================================================================
+ 제14장 실습 05 — 오류 재현: NFS 권한과 버전
+ 대상   : ol7a (NFS 서버), ol7b (NFS 클라이언트)
+ 목표   : 두 노드의 같은 이름 사용자가 다른 UID 를 가질 때 파일 소유자가 숫자로
+          보이거나 쓰기가 거부되는 문제를 재현하고 UID 를 맞춰 고친다. vers=3·4.0·
+          4.1·4.2 를 강제해 마운트하고 무엇이 달라지는지 비교한다. 서버를 세운 상태에서
+          hard 마운트와 soft 마운트가 어떻게 다르게 반응하는지 시간을 재어 본다
+ 배경   : sec=sys 의 NFS 는 사용자 이름이 아니라 UID·GID 숫자를 주고받는다.
+          7.9 의 v4 클라이언트·서버도 sec=sys 에서는 숫자를 그대로 쓴다
+          (nfs4_disable_idmapping=Y). hard 마운트는 서버가 돌아올 때까지 끝없이
+          재시도하고, soft 마운트는 retrans 만큼 재시도한 뒤 오류를 돌려준다 (본문 14.1, 14.3)
+ 소요   : 약 45분
+ 선행   : ol7-base, ol7b-base 스냅샷
+ 계정   : root, dev1 (두 노드에서 만들고 지움)
+ 주의   : [7]·[8] 에서 ol7a 의 nfs-server 를 멈춘다. ol7b 의 명령이 멈추므로 timeout 으로 감싼다
+ 되돌림 : 마운트 해제, dev1 삭제, exports·nfs-server·방화벽 원복
+          → findmnt -t nfs,nfs4, id dev1, exportfs -v, firewall-cmd --list-services
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# id dev1; getent passwd 1101 1102; systemctl is-active nfs-server
+id: dev1: no such user
+-- 두 노드 모두 dev1 이 없고, 1101·1102 도 비어 있다(getent 출력 없음)
+inactive
+[root@ol7b ~]# id dev1; getent passwd 1101 1102; findmnt -t nfs,nfs4 | wc -l
+id: dev1: no such user
+0
+-- 클라이언트 NFS 마운트 0
+
+--------------------------------------------------------------------------------
+ [1] 서버 준비
+--------------------------------------------------------------------------------
+[root@ol7a ~]# mkdir -p /srv/nfs/team; chmod 1777 /srv/nfs/team
+[root@ol7a ~]# echo '/srv/nfs/team  ol7b.example.com(rw,sync)' > /etc/exports
+[root@ol7a ~]# firewall-cmd -q --permanent --add-service={nfs,mountd,rpc-bind}; firewall-cmd -q --reload; systemctl enable -q --now nfs-server; exportfs -v
+/srv/nfs/team   ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+-- 1777 디렉터리, rw,sync, 기본 root_squash. 누구나 쓰되 남의 파일은 못 지운다
+
+--------------------------------------------------------------------------------
+ [2] 같은 이름, 다른 UID
+--------------------------------------------------------------------------------
+-- 두 서버에서 각자 useradd 를 하면 UID 는 그 서버에서 비어 있는 다음 번호가 된다.
+-- 여기서는 차이를 분명히 하려고 직접 다른 번호를 준다.
+[root@ol7a ~]# useradd -u 1101 dev1; id dev1
+uid=1101(dev1) gid=1101(dev1) groups=1101(dev1)
+[root@ol7b ~]# useradd -u 1102 dev1; id dev1
+uid=1102(dev1) gid=1102(dev1) groups=1102(dev1)
+-- 이름은 같고 번호는 1101 과 1102.
+-- 두 서버에서 따로 useradd 하면 흔히 생기는 모습이다
+-- 실제로는 그 서버에 먼저 만든 계정 수에 따라 번호가 어긋난다
+[root@ol7b ~]# mkdir -p /mnt/team; mount -t nfs ol7a:/srv/nfs/team /mnt/team; findmnt -n -o SOURCE,FSTYPE /mnt/team
+ol7a:/srv/nfs/team nfs4
+-- v4 로 붙었다.
+-- "v4 는 이름으로 주고받으니 괜찮다" 는 생각을 [4] 에서 확인한다
+-- 서버의 dev1 이 파일을 만든다.
+[dev1@ol7a ~]$ echo "from server dev1" > /srv/nfs/team/a_dev1.txt; ls -l /srv/nfs/team
+total 4
+-rw-rw-r--. 1 dev1 dev1 17 Nov 16 10:21 a_dev1.txt
+-- 서버에서는 dev1(1101) 소유
+-- 클라이언트에서 본다.
+[root@ol7b ~]# ls -l /mnt/team; ls -ln /mnt/team
+total 4
+-rw-rw-r--. 1 1101 1101 17 Nov 16  2026 a_dev1.txt
+total 4
+-rw-rw-r--. 1 1101 1101 17 Nov 16  2026 a_dev1.txt
+-- 증상   : ol7b 에서는 이름 대신 1101 숫자. ls -l 과 ls -ln 이 똑같다
+-- ol7b 에 1101 이 없어서 이름으로 바꾸지 못했다
+-- 날짜 칸이 시각 대신 2026 으로 나온 것은 클라이언트 시계가 서버보다 조금 뒤라
+-- 파일 시각이 "미래" 로 보였기 때문이다(ls 는 미래 시각에 연도를 쓴다)
+-- 클라이언트의 dev1 이 파일을 만든다.
+[dev1@ol7b ~]$ echo "from client dev1" > /mnt/team/b_dev1.txt; ls -l /mnt/team
+total 8
+-rw-rw-r--. 1 1101 1101 17 Nov 16  2026 a_dev1.txt
+-rw-rw-r--. 1 dev1 dev1 17 Nov 16  2026 b_dev1.txt
+-- ol7b 의 dev1 이 만든 파일은 ol7b 에서 dev1 로 보인다(1102)
+[root@ol7a ~]# ls -l /srv/nfs/team
+total 8
+-rw-rw-r--. 1 dev1 dev1 17 Nov 16 10:21 a_dev1.txt
+-rw-rw-r--. 1 1102 1102 17 Nov 16 10:21 b_dev1.txt
+-- 서버에서는 거꾸로 1102 가 숫자로 보인다. 서버에는 1102 가 없다
+-- 같은 디렉터리에 "dev1" 이 둘이고, 노드마다 한쪽만 이름으로 보인다
+
+--------------------------------------------------------------------------------
+ [3] 자기 파일인데 고칠 수 없다
+--------------------------------------------------------------------------------
+-- 클라이언트의 dev1 이 서버 dev1 의 파일에 덧붙인다.
+-- 같은 사람이라고 생각하고 한 작업이다.
+[dev1@ol7b ~]$ echo "append" >> /mnt/team/a_dev1.txt; echo "rc=$?"
+/tmp/_ol7lab_dev1.sh: line 1: /mnt/team/a_dev1.txt: Permission denied
+rc=1
+-- 덧붙이기 거부. 파일은 1101 의 rw-rw-r--,
+-- ol7b 의 dev1 은 1102 라 "기타" 로 판정됐다
+-- 오류 줄의 /tmp/_ol7lab_dev1.sh 는 실습 러너가 명령을 담은 스크립트 이름이다
+[dev1@ol7b ~]$ rm /mnt/team/a_dev1.txt; echo "rc=$?"
+rm: cannot remove ‘/mnt/team/a_dev1.txt’: Operation not permitted
+rc=1
+-- 지우기도 거부(Operation not permitted).
+-- 1777 의 스티키 비트가 소유자 아닌 사람의 삭제를 막는다
+-- 서버의 dev1 도 클라이언트 dev1 이 만든 파일을 지우지 못한다(스티키 디렉터리,
+-- 소유자 1102).
+[dev1@ol7a ~]$ rm -f /srv/nfs/team/b_dev1.txt; echo "rc=$?"
+rm: cannot remove ‘/srv/nfs/team/b_dev1.txt’: Operation not permitted
+rc=1
+-- 서버 쪽 dev1 도 1102 의 파일을 못 지운다. 양쪽이 서로를 남으로 본다
+
+--------------------------------------------------------------------------------
+ [4] 원인 — v4 인데도 숫자로 주고받는다
+--------------------------------------------------------------------------------
+-- 7.9 의 NFSv4 는 원래 소유자를 "이름@도메인" 문자열로 보낸다.
+-- 하지만 sec=sys 에서는 숫자로 보내도록 기본값이 바뀌어 있다.
+-- 클라이언트 nfs 모듈 nfs4_disable_idmapping = Y, 마운트는 sec=sys
+--   클라이언트 : nfs 모듈의 nfs4_disable_idmapping
+--   서버       : nfsd 모듈의 nfs4_disable_idmapping
+[root@ol7b ~]# cat /sys/module/nfs/parameters/nfs4_disable_idmapping; nfsstat -m | grep -o 'sec=[a-z0-9]*'
+Y
+-- 서버 nfsd 모듈도 Y
+-- 원인   : 두 노드의 dev1 UID 가 다르다(1101/1102). 7.9 는 sec=sys 의 v4 에서도
+--          idmapping 을 끄고 숫자를 그대로 쓴다(nfs4_disable_idmapping=Y)
+sec=sys
+[root@ol7a ~]# cat /sys/module/nfsd/parameters/nfs4_disable_idmapping
+Y
+-- idmapd 가 쓰는 도메인.
+-- 지정하지 않으면 호스트 이름의 DNS 도메인(example.com)을 쓴다.
+-- idmapd.conf 의 Domain 은 주석(#)이다.
+-- 비워 두면 호스트 이름의 DNS 도메인을 쓴다
+-- nfsidmap -d 가 그 결과 example.com 을 보여 준다
+[root@ol7a ~]# grep -E '^\s*#?\s*Domain' /etc/idmapd.conf; nfsidmap -d
+#Domain = local.domain.edu
+example.com
+-- 클라이언트도 example.com. 도메인이 같아도 이번 문제와는 상관없다
+-- 도메인이 쓰이는 것은 Kerberos(sec=krb5) 처럼 idmapping 이 켜진 경우다
+[root@ol7b ~]# nfsidmap -d
+example.com
+
+--------------------------------------------------------------------------------
+ [5] 고치기 — UID 를 맞춘다
+--------------------------------------------------------------------------------
+-- 클라이언트 dev1 의 UID 를 서버와 같은 1101 로 바꾼다.
+-- 로그인 중인 프로세스가 있으면 usermod 가 거부한다.
+-- usermod -u 는 홈 디렉터리 안 파일의 소유자는 바꾸지만 그 밖의 파일(NFS 위 b_dev1.txt 등)은 그대로 둔다.
+[root@ol7b ~]# usermod -u 1101 dev1; groupmod -g 1101 dev1; id dev1; ls -ln /home | grep dev1
+uid=1101(dev1) gid=1101(dev1) groups=1101(dev1)
+drwx------. 2 1101 1102 62 Nov 16 10:21 dev1
+-- 조치   : usermod -u 1101, groupmod -g 1101
+-- 홈 디렉터리의 소유자는 1101 로 바뀌었는데 그룹은 1102 로 남았다
+--   usermod -u 는 홈 안 파일의 UID 를 고친다
+--   groupmod -g 는 파일의 GID 를 고치지 않는다. chgrp -R 을 따로 해야 한다
+[root@ol7b ~]# ls -l /mnt/team
+total 8
+-rw-rw-r--. 1 dev1 dev1 17 Nov 16 10:21 a_dev1.txt
+-rw-rw-r--. 1 1102 1102 17 Nov 16 10:21 b_dev1.txt
+-- 이제 a_dev1.txt(1101)는 dev1 로 보인다.
+-- 옛 번호로 만든 b_dev1.txt 는 1102 숫자로 남았다
+-- 1102 로 남은 파일은 서버에서 소유자를 바로잡는다.
+[root@ol7a ~]# chown dev1:dev1 /srv/nfs/team/b_dev1.txt; ls -l /srv/nfs/team
+total 8
+-rw-rw-r--. 1 dev1 dev1 17 Nov 16 10:21 a_dev1.txt
+-rw-rw-r--. 1 dev1 dev1 17 Nov 16 10:21 b_dev1.txt
+-- 서버에서 chown 으로 b_dev1.txt 를 1101 로 맞췄다
+[dev1@ol7b ~]$ echo "append after fix" >> /mnt/team/a_dev1.txt; echo "rc=$?"; cat /mnt/team/a_dev1.txt
+-- 재확인 : 덧붙이기 rc=0, 내용에 두 줄
+rc=0
+from server dev1
+append after fix
+
+--------------------------------------------------------------------------------
+ [6] 버전을 강제해서 마운트
+--------------------------------------------------------------------------------
+-- 서버가 받는 버전부터 본다.
+[root@ol7a ~]# cat /proc/fs/nfsd/versions
+-2 +3 +4 +4.1 +4.2
+-- 서버는 3, 4(=4.0), 4.1, 4.2 를 받는다
+[root@ol7b ~]# umount /mnt/team; mkdir -p /mnt/v3 /mnt/v40 /mnt/v41 /mnt/v42
+[root@ol7b ~]# mount -t nfs -o vers=3 ol7a:/srv/nfs/team /mnt/v3; mount -t nfs -o vers=4.0 ol7a:/srv/nfs/team /mnt/v40
+[root@ol7b ~]# mount -t nfs -o vers=4.1 ol7a:/srv/nfs/team /mnt/v41; mount -t nfs -o vers=4.2 ol7a:/srv/nfs/team /mnt/v42
+[root@ol7b ~]# findmnt -t nfs,nfs4 -o TARGET,FSTYPE
+TARGET   FSTYPE
+/mnt/v3  nfs
+/mnt/v40 nfs4
+/mnt/v41 nfs4
+/mnt/v42 nfs4
+-- FSTYPE 이 v3 은 nfs, v4 계열은 nfs4
+[root@ol7b ~]# nfsstat -m
+/mnt/v3 from ol7a:/srv/nfs/team
+ Flags: rw,relatime,vers=3,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=172.16.225.61,mountvers=3,mountport=20048,mountproto=udp,local_lock=none,addr=172.16.225.61
+-- v3 줄에만 있는 필드
+--   mountaddr  : mountd 주소
+--   mountvers=3, mountport=20048, mountproto=udp : 마운트 요청을 udp 로 mountd 에 보냈다
+-- v3 에는 clientaddr 가 없다. 서버가 클라이언트로 콜백을 걸지 않는다
+
+/mnt/v40 from ol7a:/srv/nfs/team
+ Flags: rw,relatime,vers=4.0,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none,addr=172.16.225.61
+
+/mnt/v41 from ol7a:/srv/nfs/team
+ Flags: rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none,addr=172.16.225.61
+
+/mnt/v42 from ol7a:/srv/nfs/team
+ Flags: rw,relatime,vers=4.2,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none,addr=172.16.225.61
+-- 네 줄 모두 rsize·wsize 524288, hard, timeo=600. 버전만 다르다
+-- vers=4.2 도 붙었다. 7.9 서버의 versions 에 +4.2 가 있었다
+-- v3 은 mountd 를 거친다. 서버 mountd 의 기록에 클라이언트가 남는다.
+[root@ol7b ~]# showmount -a ol7a
+All mount points on ol7a:
+172.16.225.62:/srv/nfs/team
+-- [실습 01] 에서 비어 있던 showmount -a 에 이번엔 기록이 있다.
+-- v3 마운트가 mountd 를 거쳤다
+-- v3 의 잠금은 별도 프로토콜(NLM, nlockmgr)이다.
+-- 클라이언트에서도 rpc-statd 가 뜬다.
+[root@ol7b ~]# systemctl is-active rpc-statd; rpcinfo -p ol7a | grep -E 'nlockmgr|status' | sort -u -k5,5
+active
+    100021    1   udp  36945  nlockmgr
+    100024    1   udp  38639  status
+-- sort -u 로 프로그램마다 한 줄. nlockmgr 36945, status 38639 (udp)
+-- 실습 01 의 nlockmgr 40633(tcp)과 다르다. 서버가 부팅할 때마다 바뀐다
+-- v3 마운트에서 mountd 를 막으면 어떻게 되나.
+-- 이미 붙은 마운트가 아니라 새 마운트가 실패한다.
+[root@ol7a ~]# firewall-cmd -q --remove-service=mountd; firewall-cmd --list-services
+dhcpv6-client nfs rpc-bind ssh
+-- mountd 를 런타임에서만 뺐다
+[root@ol7b ~]# umount /mnt/v3
+[root@ol7b ~]# time timeout 60 mount -t nfs -o vers=3 ol7a:/srv/nfs/team /mnt/v3; echo "rc=$?"
+
+real    1m0.013s
+user    0m0.001s
+sys     0m0.002s
+rc=124
+-- 증상   : vers=3 마운트가 60초 동안 끝나지 않아 timeout 이 끊었다(rc=124)
+-- 원인   : rpcbind(111)는 열려 있어 mountd 포트(20048)는 알아냈지만 그 포트가 막혔다
+[root@ol7b ~]# time timeout 60 mount -t nfs -o vers=4.1 ol7a:/srv/nfs/team /mnt/v3; echo "rc=$?"; umount /mnt/v3
+
+real    0m0.010s
+user    0m0.001s
+sys     0m0.002s
+rc=0
+-- 같은 상태에서 vers=4.1 은 0.010초 만에 붙었다. v4 는 mountd 가 필요 없다
+[root@ol7a ~]# firewall-cmd -q --reload; firewall-cmd --list-services
+dhcpv6-client mountd nfs rpc-bind ssh
+-- 조치   : reload 로 영구 설정(mountd 포함)을 다시 올렸다
+-- 재확인 : list-services 에 mountd 가 돌아왔다. 이후 v3 마운트가 다시 된다
+-- v4 는 서버의 내보내기들을 하나의 가상 트리(pseudo-fs)로 보여 준다.
+-- / 를 마운트해도 내보낸 경로만 보인다.
+[root@ol7b ~]# mkdir -p /mnt/root; mount -t nfs -o vers=4.1 ol7a:/ /mnt/root; find /mnt/root -maxdepth 3 | head; umount /mnt/root
+/mnt/root
+/mnt/root/srv
+/mnt/root/srv/nfs
+/mnt/root/srv/nfs/team
+-- ol7a:/ 를 마운트했는데 보이는 것은 내보낸 team 까지 가는 길뿐이다
+-- /etc, /home 같은 서버 디렉터리는 가상 트리(pseudo-fs)에 없다
+[root@ol7b ~]# umount /mnt/v40 /mnt/v41 /mnt/v42
+
+--------------------------------------------------------------------------------
+ [7] 서버가 멈추면 — hard 마운트
+--------------------------------------------------------------------------------
+-- 기본값은 hard 다. 시간을 줄여 보려고 timeo 를 짧게 준다.
+--   timeo=30 : 첫 재시도까지 3초(단위 0.1초). TCP 에서는 재시도마다 늘어난다
+--   retrans=2 : "주요 시간 초과" 전까지 재시도 횟수
+[root@ol7b ~]# mkdir -p /mnt/hard /mnt/soft
+[root@ol7b ~]# mount -t nfs -o vers=4.1,hard,timeo=30,retrans=2 ol7a:/srv/nfs/team /mnt/hard
+[root@ol7b ~]# mount -t nfs -o vers=4.1,soft,timeo=30,retrans=2 ol7a:/srv/nfs/team /mnt/soft
+[root@ol7b ~]# nfsstat -m | grep -E '^/|Flags' | sed 's/,addr=.*//' | cut -c1-140
+-- sed 로 addr 이후를, cut 으로 140자 뒤를 잘랐다
+/mnt/hard from ol7a:/srv/nfs/team
+ Flags: rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=30,retrans=2,sec=sys,clientaddr=172.16.225.62,local_l
+/mnt/soft from ol7a:/srv/nfs/team
+ Flags: rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,soft,proto=tcp,timeo=30,retrans=2,sec=sys,clientaddr=172.16.225.62,local_l
+-- 두 줄은 hard / soft 한 단어만 다르다. timeo=30(3초), retrans=2
+[root@ol7b ~]# dmesg -C
+-- dmesg -C : 커널 로그 버퍼를 비운다. 아래에서 새로 생긴 줄만 보려고
+-- 서버의 nfs-server 를 멈춘다.
+-- 서버 머신은 살아 있고 NFS 서비스만 내려간 상태다.
+[root@ol7a ~]# systemctl stop nfs-server; systemctl is-active nfs-server; ss -tln | grep -c ':2049 '
+inactive
+0
+-- nfs-server inactive, 2049 를 듣는 소켓 0. 서버 머신은 살아 있고 ssh 도 된다
+-- hard 마운트에 파일을 만든다. 끝나지 않는다.
+-- 60초 뒤 timeout 이 SIGTERM, 다시 5초 뒤 SIGKILL 을 보낸다.
+[root@ol7b ~]# time timeout -k 5 60 touch /mnt/hard/during_stop; echo "rc=$?"
+
+real    1m0.001s
+user    0m0.001s
+sys     0m0.001s
+rc=124
+-- 증상   : hard 마운트의 touch 가 60초 동안 끝나지 않아 timeout 이 끊었다
+-- rc=124 는 SIGTERM 으로 끝났다는 뜻. -k 5 의 SIGKILL 까지 가지 않았다
+[root@ol7b ~]# dmesg | tail -5
+[   88.780716] nfs: server ol7a not responding, still trying
+-- hard 마운트의 메시지는 "still trying".
+-- 이 줄 이후 서버가 올 때까지 계속 재시도한다
+-- 프로세스 상태 D(디스크 대기)로 걸린 것이 있는지 본다.
+-- timeout 이 죽였으면 남지 않는다.
+[root@ol7b ~]# ps -eo stat,pid,cmd | awk '$1 ~ /^D/' | head -5; echo "(D 상태 목록 끝)"
+-- D 상태 프로세스가 없다.
+-- 7.9(UEK R6)의 hard 마운트 대기는 신호로 끊을 수 있었다
+-- 옛 커널처럼 kill -9 도 안 듣는 프로세스가 남지는 않았다
+(D 상태 목록 끝)
+
+--------------------------------------------------------------------------------
+ [8] 서버가 멈추면 — soft 마운트
+--------------------------------------------------------------------------------
+[root@ol7b ~]# time timeout -k 5 120 touch /mnt/soft/during_stop; echo "rc=$?"
+touch: cannot touch ‘/mnt/soft/during_stop’: Input/output error
+
+real    0m18.085s
+user    0m0.001s
+sys     0m0.000s
+rc=1
+-- soft 는 18.085초 뒤 Input/output error(EIO) 로 끝났다
+-- 응용 프로그램은 이 EIO 를 받는다.
+-- 처리하지 않으면 데이터가 반쯤 쓰인 채 남는다
+[root@ol7b ~]# dmesg | tail -5
+[   88.780716] nfs: server ol7a not responding, still trying
+[  147.916945] nfs: server ol7a not responding, timed out
+[  148.685175] nfs: server ol7a not responding, timed out
+[  156.940772] nfs: server ol7a not responding, timed out
+-- soft 마운트의 메시지는 "timed out".
+-- 여러 번 나온 것은 요청 여러 개(LOOKUP, OPEN 등)가 각각 끝났기 때문이다
+-- 서버를 다시 올린다.
+-- v4 서버는 재시작 뒤 유예 기간(grace)을 두어 클라이언트가 잠금을 되찾게 한다.
+[root@ol7a ~]# systemctl start nfs-server; cat /proc/fs/nfsd/nfsv4gracetime 2>/dev/null || cat /proc/fs/nfsd/nfsv4leasetime
+90
+-- nfsv4gracetime 90 : 재시작 뒤 유예 기간 90초
+[root@ol7b ~]# time timeout -k 5 150 touch /mnt/hard/after_start; echo "rc=$?"
+
+real    0m1.936s
+user    0m0.001s
+sys     0m0.000s
+rc=0
+-- 서버를 올린 뒤 hard 쪽 touch 는 1.936초 만에 끝났다
+-- 새 파일 생성이라 유예 기간에 걸리지 않았다.
+-- 잠금을 되찾는 요청이 기다리는 대상이다
+[root@ol7b ~]# dmesg | tail -4
+[  147.916945] nfs: server ol7a not responding, timed out
+[  148.685175] nfs: server ol7a not responding, timed out
+[  156.940772] nfs: server ol7a not responding, timed out
+[  157.708839] nfs: server ol7a not responding, timed out
+-- 회복 뒤에도 "server ol7a OK" 줄은 보이지 않는다.
+-- 남은 것은 서버가 없던 동안의 기록뿐이다
+[root@ol7b ~]# ls -l /mnt/hard; ls /mnt/soft
+total 8
+-rw-rw-r--. 1 dev1      dev1      34 Nov 16 10:21 a_dev1.txt
+-rw-r--r--. 1 nfsnobody nfsnobody  0 Nov 16 10:23 after_start
+-rw-rw-r--. 1 dev1      dev1      17 Nov 16 10:21 b_dev1.txt
+a_dev1.txt
+after_start
+b_dev1.txt
+-- hard 마운트의 after_start 는 nfsnobody 소유.
+-- 클라이언트 root 가 만들어 squash 됐다
+-- soft 쪽 during_stop 은 없다. 실패한 쓰기는 흔적도 남지 않았다
+
+--------------------------------------------------------------------------------
+ [변형] 서버 다운 대신 네트워크 단절 — 방화벽에서 2049 차단
+--------------------------------------------------------------------------------
+-- 서비스는 살아 있고 패킷만 막힌 상황을 만든다.
+-- 먼저 서버 방화벽에서 nfs 서비스를 런타임에서만 뺀다.
+[root@ol7a ~]# firewall-cmd -q --remove-service=nfs; firewall-cmd --list-services
+dhcpv6-client mountd rpc-bind ssh
+-- 서버 방화벽에서 nfs 를 뺐다(런타임만)
+[root@ol7b ~]# time timeout -k 5 120 touch /mnt/soft/during_block; echo "rc=$?"
+
+real    0m0.002s
+user    0m0.000s
+sys     0m0.000s
+rc=0
+-- 0.002초, rc=0. 끊긴 줄 알았는데 그대로 써졌다
+-- firewalld 는 RELATED,ESTABLISHED 연결을 서비스 규칙보다 먼저 허용한다
+-- 이미 맺은 2049 연결은 계속 통과하고, 새 연결부터 막힌다
+[root@ol7a ~]# firewall-cmd -q --reload; firewall-cmd --list-services
+dhcpv6-client mountd nfs rpc-bind ssh
+-- 이번에는 클라이언트에서 나가는 2049 패킷을 버린다(DROP).
+-- 런타임 direct 규칙이라 reload 하면 사라진다.
+[root@ol7b ~]# firewall-cmd --direct --add-rule ipv4 filter OUTPUT 0 -d 172.16.225.61 -p tcp --dport 2049 -j DROP; firewall-cmd --direct --get-all-rules
+-- 클라이언트 OUTPUT 체인 맨 앞에 DROP.
+-- 연결 상태와 상관없이 2049 로 나가는 패킷을 버린다
+success
+ipv4 filter OUTPUT 0 -d 172.16.225.61 -p tcp --dport 2049 -j DROP
+[root@ol7b ~]# time timeout -k 5 120 touch /mnt/soft/during_drop; echo "rc=$?"
+touch: cannot touch ‘/mnt/soft/during_drop’: Input/output error
+
+real    1m57.127s
+user    0m0.001s
+sys     0m0.000s
+rc=1
+-- DROP 에서는 1분 57초 뒤 EIO. 서버 정지(18초)보다 훨씬 오래 걸렸다
+--   서버 정지 : 연결이 RST 로 바로 끊겨 재시도가 빨리 소진됐다
+--   DROP      : 응답이 아예 없어 TCP 재전송이 끝날 때까지 기다렸다
+[root@ol7b ~]# dmesg | tail -3
+[  272.074984] nfs: server ol7a not responding, timed out
+[  275.658392] nfs: server ol7a not responding, timed out
+[  278.410713] nfs: server ol7a not responding, timed out
+[root@ol7b ~]# firewall-cmd --direct --remove-rule ipv4 filter OUTPUT 0 -d 172.16.225.61 -p tcp --dport 2049 -j DROP; firewall-cmd --direct --get-all-rules | wc -l
+success
+0
+-- direct 규칙을 지웠다. 규칙 0 개
+[root@ol7b ~]# time timeout -k 5 120 touch /mnt/soft/after_unblock; echo "rc=$?"; ls /mnt/soft
+touch: cannot touch ‘/mnt/soft/after_unblock’: Input/output error
+
+real    0m36.078s
+user    0m0.001s
+sys     0m0.001s
+rc=1
+-- 규칙을 지운 직후에도 EIO(36초).
+-- 끊겼던 TCP 연결을 다시 맺는 동안 soft 의 재시도가 먼저 소진됐다
+-- soft 는 망이 돌아온 직후에도 오류를 낼 수 있다.
+-- hard 였다면 기다렸다가 성공했다
+a_dev1.txt
+after_start
+b_dev1.txt
+during_block
+-- during_block 만 생겼다. during_drop, after_unblock 은 없다
+
+--------------------------------------------------------------------------------
+ [9] 되돌리기
+--------------------------------------------------------------------------------
+[root@ol7b ~]# umount /mnt/hard /mnt/soft; rmdir /mnt/{team,v3,v40,v41,v42,root,hard,soft}; userdel -r dev1; findmnt -t nfs,nfs4 | wc -l; id dev1
+0
+id: dev1: no such user
+[root@ol7a ~]# exportfs -ua; : > /etc/exports; systemctl disable -q --now nfs-server; firewall-cmd -q --permanent --remove-service={nfs,mountd,rpc-bind}; firewall-cmd -q --reload
+[root@ol7a ~]# userdel -r dev1; rm -rf /srv/nfs; id dev1; firewall-cmd --list-services; exportfs -v | wc -l
+id: dev1: no such user
+dhcpv6-client ssh
+0
+-- 두 노드 모두 [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                     관찰
+--  dev1 UID                 ol7a 1101 / ol7b 1102 → ol7b 에서 1101 숫자, 덧붙이기 Permission denied
+--  고친 뒤                  ol7b usermod -u 1101 → 이름으로 보임, 덧붙이기 rc=0
+--  idmapping                nfs·nfsd nfs4_disable_idmapping = Y, Domain example.com
+--  vers=3 / 4.0 / 4.1 / 4.2 모두 성공. v3 만 mountaddr·mountport=20048 필드
+--  mountd 차단              v3 마운트 60초 timeout, v4.1 은 0.010초 성공
+--
+--  상황                     hard                       soft
+--  nfs-server 정지          60초 뒤 timeout 이 끊음     18.085초 뒤 Input/output error
+--  서버 재시작 뒤           1.936초에 성공              -
+--  방화벽 서비스 제거       -                          0.002초 성공(기존 연결 유지)
+--  클라이언트 DROP          -                          1분 57초 뒤 EIO
+--  DROP 제거 직후           -                          36초 뒤 EIO
+--
+--  항목             시작 전      되돌린 뒤
+--  dev1             없음         없음 (두 노드)
+--  NFS 마운트       0            0
+--  방화벽           ssh dhcpv6   dhcpv6-client ssh
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. hard 마운트에 intr 를 주고 같은 시험을 한다
+--    확인: nfsstat -m 에 intr 가 없고 결과가 [7] 과 같은지
+-- 2. soft 마운트의 timeo 를 100, retrans 를 5 로 늘린다
+--    확인: [8] 의 18초가 얼마로 바뀌는지 time 으로 잰다
+-- 3. 서버 /etc/idmapd.conf 의 Domain 을 다른 값으로 바꾸고 nfs-idmapd 를 재시작한다
+--    확인: sec=sys 마운트의 ls -l 이 달라지지 않는지(idmapping 이 꺼져 있으므로)
+
+================================================================================
+ 실습 05 종료 — UID 1101/1102 불일치 재현·해결, hard 는 무한 대기, soft 는 18초 뒤 EIO
+================================================================================

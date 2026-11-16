@@ -1,0 +1,508 @@
+================================================================================
+ 제13장 실습 02 — nmcli 로 고정 IP 변경
+ 대상   : ol7a (ens33 에서 실험, 마지막에 ens32), ol7b (밖에서 확인)
+ 목표   : nmcli connection modify 로 고정 IP·자동 연결·보조 IP 를 넣고, ifcfg 파일이
+          어떻게 바뀌는지 diff 로 본다. modify 만으로는 반영되지 않는다는 것과
+          up·reapply 의 차이, SSH 가 붙은 인터페이스를 바꿨을 때의 복구를 확인한다
+ 배경   : nmcli connection modify 는 연결 프로필(디스크의 ifcfg 파일)만 바꾼다.
+          커널에 적용하려면 nmcli connection up(연결을 다시 활성화) 이나
+          nmcli device reapply(활성 상태를 유지한 채 다시 적용)가 필요하다. ip addr add 로
+          넣은 주소는 프로필에 없으므로 다음 활성화 때 사라진다 (본문 13.3·13.4)
+ 소요   : 약 40분
+ 선행   : ol7-base, ol7b-base 스냅샷
+ 계정   : root
+ 주의   : [10] 에서 ens32 의 주소를 바꿔 SSH 가 끊긴다. 직렬 콘솔로 복구한다
+ 되돌림 : ifcfg-ens33 원본(ONBOOT=no, 주소 없음), ens32 172.16.225.61
+          → md5sum ifcfg-ens3?, ip -br addr
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ip -br addr; nmcli connection show
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens32            UP             172.16.225.61/24 fe80::87f4:d993:7b43:e0c1/64 
+ens33            UP             
+NAME   UUID                                  TYPE      DEVICE 
+ens32  987096e5-6a52-4e8e-bce9-5978c9bb9f51  ethernet  ens32  
+ens33  09e33476-a93c-4005-a933-74479920bb5b  ethernet  --     
+[root@ol7a ~]# md5sum /etc/sysconfig/network-scripts/ifcfg-ens3?; cp -p /etc/sysconfig/network-scripts/ifcfg-ens3? /root/
+f552067d2505b12131aa64d5d47de68c  /etc/sysconfig/network-scripts/ifcfg-ens32
+709a178c513f436914a04106c09e3303  /etc/sysconfig/network-scripts/ifcfg-ens33
+-- ens32 는 172.16.225.61/24(SSH 가 붙은 주소),
+-- ens33 은 링크만 UP 이고 주소가 없다
+-- 프로필 ens33 은 DEVICE 가 -- 다. 만들어져 있지만 활성화돼 있지 않다
+-- 두 ifcfg 의 지문을 남기고 원본을 /root 에 복사했다
+-- [되돌림] 에서 이 사본으로 덮는다
+
+--------------------------------------------------------------------------------
+ [1] ens33 프로필의 현재 IPv4 설정
+--------------------------------------------------------------------------------
+
+-- 소문자 속성(ipv4.*)은 프로필에 저장된 설정값,
+-- 대문자 속성(IP4.*)은 지금 장치에 적용된 값이다.
+-- 연결이 활성화돼 있지 않으면 대문자 묶음은 나오지 않는다.
+[root@ol7a ~]# nmcli -f connection.autoconnect,ipv4.method,ipv4.addresses,ipv4.gateway,ipv4.dns connection show ens33
+connection.autoconnect:                 no
+ipv4.method:                            auto
+ipv4.addresses:                         --
+ipv4.gateway:                           --
+ipv4.dns:                               --
+-- autoconnect no 가 ifcfg 의 ONBOOT=no,
+-- ipv4.method auto 가 BOOTPROTO=dhcp 다
+-- 주소·게이트웨이·DNS 는 비어 있다(--). DHCP 로 받을 값이기 때문이다
+[root@ol7a ~]# nmcli -f GENERAL.STATE,IP4 connection show ens33
+-- 아무것도 나오지 않았다. 연결이 활성화돼 있지 않으면 GENERAL·IP4 묶음은 없다
+
+--------------------------------------------------------------------------------
+ [2] 고정 IP 로 바꾼다 — connection modify
+--------------------------------------------------------------------------------
+
+-- ipv4.method manual 은 BOOTPROTO=none(고정)에 해당한다
+-- 주소는 접두사 길이(/24)와 함께 준다.
+-- 한 명령에 속성을 여러 개 이어 쓸 수 있다.
+[root@ol7a ~]# nmcli connection modify ens33 ipv4.method manual ipv4.addresses 172.16.225.71/24
+
+[root@ol7a ~]# diff /root/ifcfg-ens33 /etc/sysconfig/network-scripts/ifcfg-ens33
+4c4
+< BOOTPROTO=dhcp
+---
+> BOOTPROTO=none
+15a16,17
+> IPADDR=172.16.225.71
+> PREFIX=24
+-- modify 는 출력 없이 끝난다. 그 대신 ifcfg 가 바로 고쳐졌다
+--   4c4       BOOTPROTO 가 dhcp → none
+--   15a16,17  파일 끝에 IPADDR·PREFIX 두 줄 추가
+-- NetworkManager 메모리와 디스크는 이미 새 값이다. 남은 것은 커널이다
+
+--------------------------------------------------------------------------------
+ [3] 오류 ① — 고쳤는데 주소가 없다
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# ip -4 addr show ens33; nmcli -f ipv4.addresses connection show ens33
+ipv4.addresses:                         172.16.225.71/24
+-- ip -4 addr show ens33 은 아무것도 찍지 않았다
+-- 장치에는 IPv4 주소가 없다
+-- 프로필 값은 172.16.225.71/24 다. 두 층이 어긋나 있다
+[root@ol7a ~]# ping -c 2 -W 2 -I ens33 172.16.225.2
+ping: Warning: source address might be selected on device other than ens33.
+PING 172.16.225.2 (172.16.225.2) from 172.16.225.61 ens33: 56(84) bytes of data.
+
+--- 172.16.225.2 ping statistics ---
+2 packets transmitted, 0 received, 100% packet loss, time 1053ms
+-- 경고 줄 source address might be selected on device other than ens33 이 핵심이다
+-- -I ens33 은 장치만 묶을 뿐 출발 주소는 경로표로 고른다
+-- 출발 주소가 172.16.225.61(ens32 의 것)이 됐다
+-- ens33 에 주소가 없으니 어차피 응답을 받을 수 없다
+-- 오류 흐름
+-- 증상   : modify 뒤 ip -4 addr show ens33 이 비어 있고 ping -I ens33 이 100% packet loss
+-- 원인   : nmcli connection modify 는 프로필·ifcfg 만 고친다. 장치에 반영하는 단계가 빠졌다
+-- 조치   : nmcli connection up ens33 (또는 활성 연결이면 nmcli device reapply ens33)
+-- 재확인 : ip -4 addr 에 inet 172.16.225.71/24, nmcli 의 GENERAL.STATE activated·IP4.ADDRESS[1]
+
+--------------------------------------------------------------------------------
+ [4] 반영 — connection up
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# nmcli connection up ens33
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/2)
+[root@ol7a ~]# ip -4 addr show ens33; nmcli -f GENERAL.STATE,IP4.ADDRESS connection show ens33
+3: ens33: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP group default qlen 1000
+    inet 172.16.225.71/24 brd 172.16.225.255 scope global noprefixroute ens33
+       valid_lft forever preferred_lft forever
+GENERAL.STATE:                          activated
+IP4.ADDRESS[1]:                         172.16.225.71/24
+-- 장치에 172.16.225.71/24 가 걸렸다
+-- noprefixroute 는 NetworkManager 가 넣은 주소라는 표시다
+-- 대문자 묶음이 이제 보인다. GENERAL.STATE activated, IP4.ADDRESS[1] 이 프로필 값과 같다
+[root@ol7a ~]# ping -c 2 -W 2 -I ens33 172.16.225.2 | tail -2
+2 packets transmitted, 0 received, 100% packet loss, time 1031ms
+-- 주소가 있는데도 -I ens33 ping 은 여전히 실패한다
+-- 출발 주소가 여전히 .61 로 골라지기 때문이다
+-- 같은 서브넷에 NIC 가 둘이면 응답이 어느 장치로 돌아오는지가 꼬인다
+-- ping -I 172.16.225.71 처럼 주소로 지정해야 정확하다
+-- 그래서 확인은 밖(ol7b)에서 한다
+
+-- 같은 서브넷에 NIC 두 개가 붙었다. 경로 표를 본다.
+[root@ol7a ~]# ip route
+default via 172.16.225.2 dev ens32 proto static metric 100 
+172.16.225.0/24 dev ens32 proto kernel scope link src 172.16.225.61 metric 100 
+172.16.225.0/24 dev ens33 proto kernel scope link src 172.16.225.71 metric 101 
+-- 같은 172.16.225.0/24 로 가는 연결 경로가 둘이다
+-- metric 100(ens32)이 101(ens33)보다 우선한다
+-- 기본 경로는 ens32 하나뿐이다. ens33 프로필에는 게이트웨이가 없다
+
+-- 밖(ol7b)에서 새 주소가 보이는지 확인한다.
+[root@ol7b ~]# ping -c 2 -W 2 172.16.225.71 | tail -2; ip neigh show 172.16.225.71
+2 packets transmitted, 1 received, 50% packet loss, time 1006ms
+rtt min/avg/max/mdev = 0.318/0.318/0.318/0.000 ms
+172.16.225.71 dev ens32 lladdr 00:0c:29:ac:5e:aa DELAY
+-- ol7b 에서는 응답이 왔다. 첫 패킷은 ARP 를 묻는 동안 사라져 50% 다
+-- ip neigh 의 lladdr 00:0c:29:ac:5e:aa 는 ens33 의 MAC 이다
+-- .71 은 ens33 이 대답하고 있다
+-- 뒤의 dev ens32 는 ol7b 쪽 장치 이름이다(ol7b 도 NIC 가 ens32 다)
+
+--------------------------------------------------------------------------------
+ [5] 부팅 때 자동 활성화 — connection.autoconnect
+--------------------------------------------------------------------------------
+
+-- 지금은 수동으로 올렸다. 재부팅하면 ONBOOT=no 라 다시 꺼진 채 올라온다.
+[root@ol7a ~]# nmcli connection modify ens33 connection.autoconnect yes
+[root@ol7a ~]# diff /root/ifcfg-ens33 /etc/sysconfig/network-scripts/ifcfg-ens33
+4c4
+< BOOTPROTO=dhcp
+---
+> BOOTPROTO=none
+15c15,17
+< ONBOOT=no
+---
+> ONBOOT=yes
+> IPADDR=172.16.225.71
+> PREFIX=24
+-- 15c15,17 로 바뀌었다. ONBOOT=no 가 yes 로 바뀐 줄이 diff 에 더해졌다
+-- 이 값은 지금 상태에 영향이 없다
+-- 다음 부팅이나 NetworkManager 재시작 때 자동으로 올릴지만 정한다
+
+--------------------------------------------------------------------------------
+ [6] 보조 IP — +ipv4.addresses
+--------------------------------------------------------------------------------
+
+-- 속성 이름 앞의 + 는 목록에 추가, - 는 목록에서 제거다
+-- + 없이 쓰면 목록 전체를 바꾼다.
+[root@ol7a ~]# nmcli connection modify ens33 +ipv4.addresses 172.16.225.72/24
+[root@ol7a ~]# nmcli -g ipv4.addresses connection show ens33
+172.16.225.71/24, 172.16.225.72/24
+-- -g 는 값만 쉼표로 이어 보인다. 주소 목록에 두 개가 들어 있다
+[root@ol7a ~]# diff /root/ifcfg-ens33 /etc/sysconfig/network-scripts/ifcfg-ens33
+4c4
+< BOOTPROTO=dhcp
+---
+> BOOTPROTO=none
+15c15,19
+< ONBOOT=no
+---
+> ONBOOT=yes
+> IPADDR=172.16.225.71
+> PREFIX=24
+> IPADDR1=172.16.225.72
+> PREFIX1=24
+-- 보조 주소는 별칭 파일(ifcfg-ens33:0)이 아니라 같은 파일의 번호 붙은 키 IPADDR1·PREFIX1 로 들어간다
+
+-- 이번에는 up 대신 reapply 로 반영한다. 활성 연결을 내리지 않고 바뀐 값만 적용한다.
+[root@ol7a ~]# nmcli device reapply ens33; ip -4 addr show ens33
+Connection successfully reapplied to device 'ens33'.
+3: ens33: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP group default qlen 1000
+    inet 172.16.225.71/24 brd 172.16.225.255 scope global noprefixroute ens33
+       valid_lft forever preferred_lft forever
+    inet 172.16.225.72/24 brd 172.16.225.255 scope global secondary noprefixroute ens33
+       valid_lft forever preferred_lft forever
+-- reapply 는 Connection successfully reapplied 한 줄로 끝났다
+-- 연결 번호를 새로 받지 않았다
+-- .72 줄에 secondary 가 붙었다
+-- 같은 서브넷의 두 번째 주소라는 뜻이다. .71 은 내려가지 않았다
+
+[root@ol7b ~]# ping -c 1 -W 2 172.16.225.72 | tail -2
+1 packets transmitted, 1 received, 0% packet loss, time 0ms
+rtt min/avg/max/mdev = 0.344/0.344/0.344/0.000 ms
+-- 이번에는 ARP 가 이미 알려져 있어 첫 패킷부터 응답했다(0% packet loss)
+
+--------------------------------------------------------------------------------
+ [7] 런타임으로만 넣은 주소 — ip addr add
+--------------------------------------------------------------------------------
+
+-- ip addr add 는 커널에만 넣는다. 프로필과 ifcfg 파일은 모른다.
+[root@ol7a ~]# ip addr add 172.16.225.73/24 dev ens33; ip -4 addr show ens33 | grep inet
+    inet 172.16.225.71/24 brd 172.16.225.255 scope global noprefixroute ens33
+    inet 172.16.225.72/24 brd 172.16.225.255 scope global secondary noprefixroute ens33
+    inet 172.16.225.73/24 scope global secondary ens33
+-- .73 줄에는 brd 와 noprefixroute 가 없다
+-- 손으로 넣은 주소와 NetworkManager 가 넣은 주소가 꼬리표로 구분된다
+[root@ol7a ~]# nmcli -g ipv4.addresses connection show ens33; grep -c 172.16.225.73 /etc/sysconfig/network-scripts/ifcfg-ens33
+172.16.225.71/24, 172.16.225.72/24
+0
+-- 프로필 목록에는 .71·.72 뿐이고 ifcfg 에는 .73 이 한 번도 없다(grep -c 가 0)
+
+-- 연결을 다시 올리면 NetworkManager 가 프로필대로 다시 맞춘다.
+[root@ol7a ~]# nmcli connection up ens33 >/dev/null; ip -4 addr show ens33 | grep inet
+    inet 172.16.225.71/24 brd 172.16.225.255 scope global noprefixroute ens33
+    inet 172.16.225.72/24 brd 172.16.225.255 scope global secondary noprefixroute ens33
+-- connection up 한 번에 .73 이 사라졌다
+-- NetworkManager 는 장치를 프로필대로 다시 맞춘다
+-- 서비스 주소를 ip addr add 로만 걸어 두면 링크 재연결·재부팅·NetworkManager 의 재활성화 때 조용히 없어진다
+
+--------------------------------------------------------------------------------
+ [8] 보조 IP 빼기 — -ipv4.addresses
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# nmcli connection modify ens33 -ipv4.addresses 172.16.225.72/24; nmcli -g ipv4.addresses connection show ens33
+172.16.225.71/24
+-- - 는 목록에서 그 값만 뺀다. .71 만 남았다
+[root@ol7a ~]# nmcli device reapply ens33; ip -4 addr show ens33 | grep inet
+Connection successfully reapplied to device 'ens33'.
+    inet 172.16.225.71/24 brd 172.16.225.255 scope global noprefixroute ens33
+-- reapply 로 .72 가 장치에서도 빠졌다. 연결은 계속 살아 있다
+[root@ol7a ~]# grep -E '^(IPADDR|PREFIX)' /etc/sysconfig/network-scripts/ifcfg-ens33
+IPADDR=172.16.225.71
+PREFIX=24
+-- IPADDR1·PREFIX1 키가 파일에서 사라졌다
+
+--------------------------------------------------------------------------------
+ [9] up 과 reapply 는 무엇이 다른가
+--------------------------------------------------------------------------------
+
+-- 연결이 활성화된 시각은 GENERAL.STATE 가 아니라 장치의 이벤트로 본다
+-- 두 명령 직후의 로그를 비교한다.
+[root@ol7a ~]# journalctl -u NetworkManager --since '-2min' --no-pager | grep 'device (ens33)' | grep -oE '(state change: [a-z-]+ -> [a-z-]+|reapply.*)' | tail -9
+state change: secondaries -> activated
+-- grep -oE 로 상태 변화 부분만 잘랐고 tail -9 로 마지막 아홉 줄만 봤다
+-- [7] 의 connection up 이 남긴 기록이다
+-- up 은 activated → deactivating → disconnected 로 한 번 내려갔다가 prepare → config → ip-config → ip-check → secondaries → activated 로 다시 올라온다
+-- [6]·[8] 의 reapply 는 상태 변화 줄을 하나도 남기지 않았다
+-- 장치가 activated 상태를 벗어나지 않았다
+-- 운영 중에 주소 하나를 더하거나 뺄 때 reapply 가 덜 거친 이유다
+state change: activated -> deactivating
+state change: deactivating -> disconnected
+state change: disconnected -> prepare
+state change: prepare -> config
+state change: config -> ip-config
+state change: ip-config -> ip-check
+state change: ip-check -> secondaries
+state change: secondaries -> activated
+
+--------------------------------------------------------------------------------
+ [10] 오류 ② — SSH 가 붙은 ens32 를 바꾸면
+--------------------------------------------------------------------------------
+
+-- 지금 이 세션은 172.16.225.61 의 22번 포트로 들어와 있다.
+[root@ol7a ~]# ss -tn state established '( sport = :22 )' | head -3
+Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+0      0      172.16.225.61:22   172.16.225.1:51515       
+-- 이 세션의 출발지 포트 51515 를 기억해 둔다. [10] 이 끝날 때 다시 본다
+
+-- 원격에서 흔히 하는 실수를 그대로 한다. ens32 의 주소를 .81 로 바꾸고 up 한다.
+[root@ol7a ~]# nmcli connection modify ens32 ipv4.addresses 172.16.225.81/24
+[root@ol7a ~]# nmcli connection up ens32
+-- 프롬프트만 남고 출력이 없다. 실습 러너가 20초를 기다리다 연결을 놓았다
+-- 실제 터미널이라면 커서가 멈춘 채 아무 반응이 없다
+
+-- 명령의 결과가 돌아오지 않는다. 다른 곳에서 확인한다.
+[root@ol7b ~]# ping -c 2 -W 1 172.16.225.61 | tail -2; ping -c 2 -W 1 172.16.225.81 | tail -2
+2 packets transmitted, 0 received, 100% packet loss, time 1034ms
+
+2 packets transmitted, 2 received, 0% packet loss, time 1045ms
+rtt min/avg/max/mdev = 0.230/0.324/0.418/0.094 ms
+-- 옛 주소 .61 은 100% packet loss, 새 주소 .81 은 응답한다
+-- 명령은 성공했고 주소가 바뀌었을 뿐이다
+-- SSH 는 .61 로 붙어 있었으니 돌아갈 길이 없다
+
+-- 원격 접속으로는 되돌릴 수 없다. 콘솔(이 랩에서는 직렬 콘솔)로 들어간다.
+-- 아래는 VMware 직렬 포트로 붙은 콘솔 화면이다
+-- 실 서버라면 iLO·iDRAC 같은 원격 콘솔이다
+-- 콘솔은 명령을 친 뒤 줄이 바뀌어 보인다. 프롬프트 다음 줄이 친 명령이다
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+root
+
+Password: 
+
+Last login: Wed Nov 11 20:40:42 on ttyS0
+[root@ol7a ~]# 
+ip -4 -br addr
+lo               UNKNOWN        127.0.0.1/8 
+ens32            UP             172.16.225.81/24 
+ens33            UP             172.16.225.71/24 
+-- ens32 가 172.16.225.81/24 다
+-- ens33 의 .71 은 [8] 상태 그대로다
+[root@ol7a ~]# 
+nmcli connection modify ens32 ipv4.addresses 172.16.225.61/24
+[root@ol7a ~]# 
+nmcli connection up ens32
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/5)
+-- 콘솔에서는 같은 명령이 끝까지 돌아 결과 문구가 찍혔다
+[root@ol7a ~]# 
+ip -4 -br addr
+lo               UNKNOWN        127.0.0.1/8 
+ens32            UP             172.16.225.61/24 
+ens33            UP             172.16.225.71/24 
+-- .61 로 돌아왔다
+[root@ol7a ~]# 
+exit
+logout
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+
+[root@ol7a ~]# ss -tn state established '( sport = :22 )' | head -3
+Recv-Q Send-Q Local Address:Port Peer Address:Port Process
+0      0      172.16.225.61:22   172.16.225.1:63695       
+0      336    172.16.225.61:22   172.16.225.1:51515       
+-- 새 세션(63695)으로 다시 접속했다. 옛 세션 51515 도 아직 목록에 있다
+-- Send-Q 336 은 보내지 못하고 쌓인 바이트다
+-- 주소가 바뀐 사이 응답이 상대에게 가지 못했다. 이 세션은 곧 시간 초과로 정리된다
+-- 오류 흐름
+-- 증상   : SSH 에서 nmcli connection up ens32 를 친 뒤 응답 없음. ol7b 에서 .61 은 100% loss, .81 은 응답
+-- 원인   : 접속에 쓰던 주소를 바꿨다. modify 와 up 은 확인 없이 바로 적용된다
+-- 조치   : 콘솔로 들어가 nmcli connection modify ens32 ipv4.addresses 172.16.225.61/24 → nmcli connection up ens32
+-- 재확인 : ip -4 -br addr 의 ens32 가 172.16.225.61/24, SSH 재접속, ifcfg-ens32 가 사본과 같다(SAME)
+-- 원격으로 접속 장치를 바꿔야 할 때는 실습 04 의 되돌림 타이머 스크립트 방식을 쓴다
+[root@ol7a ~]# diff /root/ifcfg-ens32 /etc/sysconfig/network-scripts/ifcfg-ens32 && echo "ifcfg-ens32 SAME"
+ifcfg-ens32 SAME
+
+--------------------------------------------------------------------------------
+ [변형] 장치 하나에 프로필 둘 — DHCP 프로필 추가
+--------------------------------------------------------------------------------
+
+-- 같은 ens33 에 DHCP 로 주소를 받는 프로필을 하나 더 만든다
+-- 장치는 한 번에 한 프로필만 쓴다.
+-- type ethernet 은 유선 프로필,
+-- ifname 은 묶을 장치, con-name 은 프로필 이름이다.
+-- ipv4.method auto 가 BOOTPROTO=dhcp 에 해당한다
+-- autoconnect no 로 저절로 올라오지 않게 한다.
+[root@ol7a ~]# nmcli connection add type ethernet ifname ens33 con-name ens33-dhcp ipv4.method auto connection.autoconnect no
+Connection 'ens33-dhcp' (ae292b0d-6057-4044-8054-afdde15c5309) successfully added.
+[root@ol7a ~]# grep -E '^(BOOTPROTO|ONBOOT|DEVICE|NAME)=' /etc/sysconfig/network-scripts/ifcfg-ens33-dhcp
+BOOTPROTO=dhcp
+NAME=ens33-dhcp
+DEVICE=ens33
+ONBOOT=no
+-- 파일 이름은 con-name 을 따라 ifcfg-ens33-dhcp 다
+-- DEVICE=ens33 으로 같은 장치에 묶였다
+-- BOOTPROTO=dhcp, ONBOOT=no. 한 장치에 프로필 두 개가 생겼다
+
+-- DHCP 프로필로 바꿔 올린다. VMware NAT 의 DHCP 서버가 주소를 준다.
+[root@ol7a ~]# nmcli connection up ens33-dhcp; nmcli -f NAME,DEVICE connection show --active; ip -4 addr show ens33 | grep inet
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/6)
+NAME        DEVICE 
+ens32       ens32  
+ens33-dhcp  ens33  
+    inet 172.16.225.132/24 brd 172.16.225.255 scope global dynamic noprefixroute ens33
+-- ens33 의 활성 연결이 ens33 에서 ens33-dhcp 로 바뀌었다
+-- 장치는 한 번에 프로필 하나만 쓴다
+-- 172.16.225.132 는 VMware NAT 의 DHCP 범위(.128~.254)에서 받은 주소다
+-- dynamic 이 임대 주소 표시다
+
+-- DHCP4 묶음은 서버에게서 받은 값 전체다
+-- 임대 시간·서버 주소·게이트웨이·DNS 를 본다.
+[root@ol7a ~]# nmcli -f DHCP4 connection show ens33-dhcp | grep -E ' (dhcp_lease_time|dhcp_server_identifier|ip_address|routers|domain_name_servers) ='
+DHCP4.OPTION[2]:                        dhcp_lease_time = 1800
+DHCP4.OPTION[4]:                        dhcp_server_identifier = 172.16.225.254
+DHCP4.OPTION[6]:                        domain_name_servers = 172.16.225.2
+DHCP4.OPTION[8]:                        ip_address = 172.16.225.132
+DHCP4.OPTION[29]:                       routers = 172.16.225.2
+-- DHCP4.OPTION 은 서버가 준 옵션이다. 번호는 목록 순서일 뿐 의미가 없다
+--   dhcp_lease_time = 1800          임대 30분
+--   dhcp_server_identifier          DHCP 서버는 172.16.225.254(VMware 의 DHCP 서비스)
+--   domain_name_servers / routers   DNS 와 게이트웨이 모두 172.16.225.2
+
+-- 7.9 의 NetworkManager 는 DHCP 를 dhclient 프로세스에 맡긴다. 임대 파일도 남는다.
+[root@ol7a ~]# pgrep -a dhclient | grep -oE '^[0-9]+ [^ ]+|-lf [^ ]+'
+2930 /sbin/dhclient
+-lf /var/lib/NetworkManager/dhclient-ae292b0d-6057-4044-8054-afdde15c5309-ens33.lease
+-- PID 2930 의 /sbin/dhclient 가 떠 있다
+-- -lf 는 임대 파일 경로다. 파일 이름에 프로필 UUID 와 장치 이름이 들어간다
+-- [OL8/9] OL 8 부터는 NetworkManager 내장 DHCP 클라이언트가 기본이라 dhclient 프로세스가 보이지 않는다
+-- 공식 문서(NET-2)는 임대 정보가 /var/lib/dhclient 에 남는다고 적는다
+-- NetworkManager 가 띄운 dhclient 는 다른 곳에 쓴다.
+[root@ol7a ~]# ls /var/lib/dhclient/; ls /var/lib/NetworkManager/ | grep -i lease
+dhclient-ae292b0d-6057-4044-8054-afdde15c5309-ens33.lease
+-- /var/lib/dhclient 는 비어 있다
+-- 문서가 말하는 위치는 network 서비스가 dhclient 를 띄울 때의 것이다
+[root@ol7a ~]# grep -E 'fixed-address|routers|lease-time|server-identifier|renew|expire' /var/lib/NetworkManager/dhclient-*-ens33.lease
+  fixed-address 172.16.225.132;
+  option routers 172.16.225.2;
+  option dhcp-lease-time 1800;
+  option dhcp-server-identifier 172.16.225.254;
+  renew 1 2026/11/16 02:00:31;
+  expire 1 2026/11/16 02:15:33;
+-- renew·expire 시각은 UTC 다(서버 시계는 KST). 숫자 1 은 요일(월요일)이다
+-- renew 는 임대 절반쯤 지난 시각, expire 는 임대가 끝나는 시각이다
+-- dhclient 가 그 전에 갱신한다
+
+-- DHCP 가 준 게이트웨이와 DNS 가 경로표와 resolv.conf 에 더해졌는지 본다.
+[root@ol7a ~]# ip route; cat /etc/resolv.conf
+default via 172.16.225.2 dev ens32 proto static metric 102 
+default via 172.16.225.2 dev ens33 proto dhcp metric 103 
+172.16.225.0/24 dev ens32 proto kernel scope link src 172.16.225.61 metric 102 
+172.16.225.0/24 dev ens33 proto kernel scope link src 172.16.225.132 metric 103 
+# Generated by NetworkManager
+search localdomain example.com
+nameserver 172.16.225.2
+-- 기본 경로가 둘이 됐다. ens32 의 static 경로가 metric 102, ens33 의 dhcp 경로가 103 이다
+-- 두 번째 연결이 생기자 NetworkManager 가 ens32 쪽 metric 도 100 에서 102 로 다시 매겼다. ens32 가 계속 우선이다
+-- search 에 DHCP 가 준 localdomain 이 붙었다
+-- DNS 서버는 같아서 한 줄이다
+
+-- 고정 IP 프로필로 되돌아간다
+-- connection up 은 같은 장치의 다른 프로필을 내리고 올린다.
+[root@ol7a ~]# nmcli connection up ens33; nmcli -f NAME,DEVICE connection show --active; ip -4 addr show ens33 | grep inet
+Connection successfully activated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/7)
+NAME   DEVICE 
+ens32  ens32  
+ens33  ens33  
+    inet 172.16.225.71/24 brd 172.16.225.255 scope global noprefixroute ens33
+-- connection up ens33 이 ens33-dhcp 를 내리고 고정 프로필을 올렸다. 다시 .71 이다
+[root@ol7a ~]# ps -eo pid,args | grep -c [d]hclient
+0
+-- DHCP 프로필이 내려가자 dhclient 도 끝났다(grep -c 0)
+
+--------------------------------------------------------------------------------
+ [되돌림]
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# nmcli connection delete ens33-dhcp; nmcli connection down ens33
+Connection 'ens33-dhcp' (ae292b0d-6057-4044-8054-afdde15c5309) successfully deleted.
+Connection 'ens33' successfully deactivated (D-Bus active path: /org/freedesktop/NetworkManager/ActiveConnection/7)
+-- DHCP 프로필은 지우고(ifcfg-ens33-dhcp 도 함께 지워진다),
+-- 고정 프로필은 내린다
+[root@ol7a ~]# cp -p /root/ifcfg-ens33 /etc/sysconfig/network-scripts/ifcfg-ens33; nmcli connection reload
+[root@ol7a ~]# ip -br addr; nmcli connection show
+lo               UNKNOWN        127.0.0.1/8 ::1/128 
+ens32            UP             172.16.225.61/24 fe80::87f4:d993:7b43:e0c1/64 
+ens33            UP             
+NAME   UUID                                  TYPE      DEVICE 
+ens32  987096e5-6a52-4e8e-bce9-5978c9bb9f51  ethernet  ens32  
+ens33  09e33476-a93c-4005-a933-74479920bb5b  ethernet  --     
+-- 원본 ifcfg-ens33 을 덮고 reload 했다
+-- ens33 은 주소 없음, 프로필은 비활성. [0] 과 같다
+[root@ol7a ~]# md5sum /etc/sysconfig/network-scripts/ifcfg-ens3?; rm -f /root/ifcfg-ens3?
+f552067d2505b12131aa64d5d47de68c  /etc/sysconfig/network-scripts/ifcfg-ens32
+709a178c513f436914a04106c09e3303  /etc/sysconfig/network-scripts/ifcfg-ens33
+-- 두 지문이 [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                  시작 전            변경 후                              되돌린 뒤
+--  ens33 ipv4.method     auto (dhcp)        manual 172.16.225.71/24              auto
+--  ens33 ONBOOT          no                 yes                                  no
+--  ens33 주소            없음               .71 (+ .72 보조, .73 런타임)          없음
+--  ens32 주소            .61                .81 → 콘솔로 .61                     .61
+--  ens33-dhcp            없음               172.16.225.132, 임대 1800초          없음
+--  ifcfg md5             f552067d / 709a178c  여러 번 바뀜                       f552067d / 709a178c
+--
+--  반영 명령      주소가 잠깐 빠지는가   상태 변화 로그   이번 실습
+--  connection up  예                     9줄              [4] [7] [10]
+--  device reapply 아니오                 없음             [6] [8]
+--  ip addr add    -(커널에만)            -                [7], up 한 번에 사라짐
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. ping -c 2 -I 172.16.225.71 172.16.225.2 로 [4] 를 다시 해 본다
+-- 확인: 출발 주소를 주소로 고르면 응답이 오는가
+-- 2. sysctl net.ipv4.conf.all.rp_filter 와 net.ipv4.conf.ens33.rp_filter 값을 보고, 같은 서브넷 NIC 두 개에서 무엇을 막는지 찾아본다
+-- 3. ens33 에 ipv4.never-default yes 를 주고 DHCP 프로필을 올린다
+-- 확인: ip route 에 ens33 의 default 줄이 생기지 않는가
+
+================================================================================
+ 실습 02 종료
+================================================================================

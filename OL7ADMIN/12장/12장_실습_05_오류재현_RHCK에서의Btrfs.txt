@@ -1,0 +1,451 @@
+================================================================================
+ 제12장 실습 05 — 오류 재현: RHCK 에서의 Btrfs
+ 대상   : ol7a (추가 디스크 sdb 사용, 재부팅 두 번)
+ 목표   : UEK 에서 quota group 으로 서브볼륨 한도를 걸고 초과 쓰기를 본다. 같은 Btrfs 를
+          RHCK 로 부팅해 마운트해 보고 모듈·커널 메시지로 지원 범위를 확인한다.
+          끝에 UEK 로 돌아온 것을 보인다
+ 배경   : Oracle Linux 7 에서 Btrfs 는 UEK R4 이후 UEK 에서만 정식 지원된다. RHCK 의
+          Btrfs 는 7.4 부터 deprecated 다(RN79 4장). 같은 디스크라도 어느 커널로
+          부팅했느냐에 따라 지원 여부가 갈린다. grub2-reboot 는 다음 한 번만 다른 항목으로
+          부팅하게 하므로 기본 커널을 바꾸지 않고 시험할 수 있다(본문 12.1·12.8절)
+ 소요   : 약 25분(재부팅 포함)
+ 선행   : storage-clean 스냅샷, UEK R6 로 부팅, RHCK 3.10.0-1160.119.1.0.5 설치돼 있음
+ 계정   : root
+ 주의   : 기본 부팅 항목(saved_entry)을 바꾸지 않는다. grub2-reboot 만 쓴다
+ 되돌림 : UEK 로 부팅된 상태, Btrfs 해제와 wipefs.
+          확인 uname -r, grub2-editenv list, lsblk -f /dev/sdb
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 시작 커널과 대상 디스크. 이 실습은 재부팅을 두 번 하므로 커널을 매번 확인한다
+-- 흐름: UEK 에서 qgroup 한도와 초과 → grub2-reboot 로 RHCK 한 번 → RHCK 에서 마운트·쓰기 →
+--   그냥 재부팅해 UEK 복귀 → UEK 에서 RHCK 가 쓴 내용 확인 → [변형] grubby 로 기본 커널 지정
+[root@ol7a ~]# uname -r; lsblk -f /dev/sdb
+5.4.17-2136.338.4.2.el7uek.x86_64
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+-- UEK R6 5.4.17-2136.338.4.2 로 부팅돼 있다. sdb 는 빈 디스크
+-- 이 실습에서 재부팅 뒤에는 /dev/sdb 대신 LABEL=qg 로 장치를 찾는다([7]·[10])
+-- 기본 부팅 항목과 일회성 항목(next_entry)을 함께 본다.
+[root@ol7a ~]# grub2-editenv list
+saved_entry=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.338.4.2.el7uek.x86_64
+-- grubenv 에 saved_entry 한 줄뿐. 값은 번호가 아니라 메뉴 항목 제목이다
+-- next_entry 줄이 없다. 일회성 부팅이 예약되지 않은 상태
+-- grubenv 는 /boot/grub2/grubenv,
+-- 1024바이트 고정 크기 파일이다. 편집기로 열지 않는다
+-- /etc/default/grub 의 GRUB_DEFAULT=saved 라서 GRUB 이 이 값을 따른다(3장)
+[root@ol7a ~]# grubby --default-kernel; grubby --default-index
+/boot/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+0
+-- 기본 커널 파일과 그 index 0. saved_entry 의 제목과 같은 항목이다
+[root@ol7a ~]# grubby --info=ALL | grep -E '^(index|title)'
+index=0
+title=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.338.4.2.el7uek.x86_64
+index=1
+title=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2102.201.3.el7uek.x86_64
+index=2
+title=Oracle Linux Server 7.9, with Linux 3.10.0-1160.119.1.0.5.el7.x86_64
+index=3
+title=Oracle Linux Server 7.9, with Linux 3.10.0-1160.el7.x86_64
+index=4
+title=Oracle Linux Server 7.9, with Linux 0-rescue-b8658360b45f49fe8174bcd0b610ae6e
+index=5
+-- 항목 여섯 개(index 0~4 와 마지막 빈 5)
+--   0 UEK 2136(기본), 1 UEK 2102(설치 매체), 2 RHCK 1160.119.1.0.5(업데이트), 3 RHCK 1160, 4 rescue
+-- [5] 에서 쓸 RHCK 의 index 는 2.
+-- 끝의 index=5 는 title 이 없는 빈 줄로 grubby 출력 습관이다
+-- index 는 grub.cfg 의 menuentry 순서라 커널을 설치·삭제하면 바뀐다. 쓰기 직전에 다시 본다
+[root@ol7a ~]# rpm -q btrfs-progs
+btrfs-progs-5.12.1-1.el7.x86_64
+-- 도구는 커널과 따로라 RHCK 로 부팅해도 같은 5.12.1 을 쓴다([6])
+
+--------------------------------------------------------------------------------
+ [1] UEK 에서 Btrfs 와 quota 준비
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# mkfs.btrfs -L qg /dev/sdb | grep -E 'Label|UUID|Incompat'; mkdir -p /qg; mount /dev/sdb /qg
+Label:              qg
+UUID:               5ef469cc-29a9-4fab-ae72-d12b1f44f4df
+Incompat features:  extref, skinny-metadata
+-- grep 으로 세 줄만. RHCK 3.10 이 이 두 기능을 아는지가 [7] 마운트의 관건이다
+-- 레이블 qg 는 재부팅 뒤 장치를 찾을 때 쓴다.
+-- UUID 5ef469cc-... 는 이 파일 시스템 하나의 값
+-- 문서 권고대로 서브볼륨을 만들기 전에 quota 를 켠다.
+[root@ol7a ~]# btrfs quota enable /qg
+[root@ol7a ~]# btrfs subvolume create /qg/proj1; btrfs subvolume create /qg/proj2
+Create subvolume '/qg/proj1'
+Create subvolume '/qg/proj2'
+-- quota enable 은 출력이 없다. 서브볼륨 둘을 그 뒤에 만들었다
+-- 문서는 서브볼륨을 만들기 전에 quota 를 켜라고 한다.
+-- 나중에 켜면 기존 데이터를 다시 세는
+--   rescan 이 돌아 그동안 값이 맞지 않는다(btrfs quota rescan -s 로 진행 확인)
+-- proj1 은 ID 257, proj2 는 ID 258
+[root@ol7a ~]# btrfs qgroup show /qg
+qgroupid         rfer         excl 
+--------         ----         ---- 
+0/5          16.00KiB     16.00KiB 
+0/257        16.00KiB     16.00KiB 
+0/258        16.00KiB     16.00KiB 
+-- qgroup show 의 열
+--   qgroupid : 0/ID. 0 은 레벨(서브볼륨 자신), ID 는 서브볼륨 ID. 0/5 는 최상위
+--   rfer     : referenced. 이 서브볼륨이 가리키는 전체 양
+--   excl     : exclusive. 다른 서브볼륨·스냅샷과 공유하지 않는 양
+-- 빈 서브볼륨이라 셋 다 16.00KiB(메타데이터 노드 하나)
+-- quota 를 켠 뒤 만든 서브볼륨은 qgroup 이 자동으로 생겼다
+
+--------------------------------------------------------------------------------
+ [2] qgroup 한도 걸기
+--------------------------------------------------------------------------------
+
+-- 한도는 서브볼륨 경로로 지정한다. 해당 서브볼륨의 0/ID qgroup 에 걸린다.
+[root@ol7a ~]# btrfs qgroup limit 100m /qg/proj1
+-- -r 은 참조(referenced) 한도, -e 는 배타(exclusive) 한도 열을 보탠다.
+[root@ol7a ~]# btrfs qgroup show -re /qg
+qgroupid         rfer         excl     max_rfer     max_excl 
+--------         ----         ----     --------     -------- 
+0/5          16.00KiB     16.00KiB         none         none 
+0/257        16.00KiB     16.00KiB    100.00MiB         none 
+0/258        16.00KiB     16.00KiB         none         none 
+-- -r·-e 로 max_rfer·max_excl 두 열이 붙었다
+-- proj1(0/257)의 max_rfer 가 100.00MiB.
+-- limit 은 기본으로 referenced 에 건다(-e 를 주면 excl)
+-- proj2·최상위는 none
+-- 한도는 서브볼륨 경로로 지정했지만 실제로는 qgroup 0/257 에 걸린다
+--   btrfs qgroup limit 100m 0/257 /qg 처럼 qgroup ID 로 지정해도 같다
+
+--------------------------------------------------------------------------------
+ [3] 한도를 넘겨 쓰기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# dd if=/dev/zero of=/qg/proj1/fill bs=1M count=150; echo "rc=$?"
+dd: error writing ‘/qg/proj1/fill’: Disk quota exceeded
+100+0 records in
+99+0 records out
+104792064 bytes (105 MB) copied, 0.310302 s, 338 MB/s
+rc=1
+-- 증상   : 150MiB 를 쓰려던 dd 가 'dd: error writing ‘/qg/proj1/fill’: Disk quota exceeded', rc=1
+-- 원인   : proj1 의 qgroup 0/257 에 max_rfer 100.00MiB 를 걸었다. 99MiB 째에서 한도에 닿았다
+-- 조치   : 필요 없는 파일을 지우거나 btrfs qgroup limit 300m /qg/proj1 로 한도를 늘린다([4])
+-- 재확인 : 같은 dd 가 rc=0,
+-- qgroup show 의 max_rfer 300.00MiB
+-- dd 의 records in 100+0,
+-- out 99+0 : 100번째 1MiB 블록을 쓰다 실패했다
+-- 104792064 바이트(약 99.94MiB)가 기록된 채 남았다
+-- 일반 Ext·XFS quota 의 'Disk quota exceeded' 와 같은 errno(EDQUOT)라 응용 프로그램은 구별하지 못한다
+[root@ol7a ~]# ls -l /qg/proj1/fill; sync; btrfs qgroup show -re /qg
+-rw-r--r--. 1 root root 104792064 Nov 16 12:04 /qg/proj1/fill
+qgroupid         rfer         excl     max_rfer     max_excl 
+--------         ----         ----     --------     -------- 
+0/5          16.00KiB     16.00KiB         none         none 
+0/257        99.95MiB     99.95MiB    100.00MiB         none 
+0/258        16.00KiB     16.00KiB         none         none 
+-- fill 파일은 지워지지 않았다. 크기 104792064.
+-- 응용 프로그램은 잘린 파일을 처리해야 한다
+-- rfer·excl 99.95MiB 로 한도 100MiB 바로 아래.
+-- 일반 quota 처럼 유예(grace) 기간이 없다
+-- sync 뒤에 qgroup show 를 봤다.
+-- qgroup 값은 트랜잭션 커밋 때 갱신된다
+--   sync 없이 바로 보면 직전 값이 보일 수 있다
+-- 한도가 없는 proj2 에는 같은 크기가 그대로 들어간다.
+[root@ol7a ~]# dd if=/dev/zero of=/qg/proj2/fill bs=1M count=150 status=none; echo "rc=$?"; sync; btrfs qgroup show -re /qg | tail -2
+rc=0
+0/257        99.95MiB     99.95MiB    100.00MiB         none 
+0/258       150.02MiB    150.02MiB         none         none 
+-- 한도가 없는 proj2 에는 150MiB 가 그대로 들어갔다(rc=0)
+-- tail -2 로 두 서브볼륨 줄만 보였다. 머리 줄과 0/5 는 뺐다
+-- 서브볼륨마다 한도가 따로다. 파일 시스템 전체에는 여유가 있다
+-- status=none 으로 dd 의 통계 줄을 껐다. 실패하면 오류 줄은 그대로 나온다
+
+--------------------------------------------------------------------------------
+ [4] 한도 조정과 재확인
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# btrfs qgroup limit 300m /qg/proj1; rm -f /qg/proj1/fill; sync
+[root@ol7a ~]# dd if=/dev/zero of=/qg/proj1/fill bs=1M count=150 status=none; echo "rc=$?"; sync; btrfs qgroup show -re /qg | tail -2
+rc=0
+0/257       150.02MiB    150.02MiB    300.00MiB         none 
+0/258       150.02MiB    150.02MiB         none         none 
+-- 한도를 300MiB 로 올리고 다시 쓰자 rc=0. 재마운트 없이 바로 반영됐다
+-- proj1 rfer 150.02MiB, max_rfer 300.00MiB
+-- 0.02MiB 는 파일 하나의 메타데이터 몫이다. 데이터 150MiB 와 노드 하나
+-- 운영에서는 한도에 닿기 전에 경보를 걸어야 한다.
+-- qgroup show 를 주기적으로 수집한다
+
+--------------------------------------------------------------------------------
+ [5] UEK 쪽 기록을 남기고 RHCK 로 한 번만 부팅
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# echo "written on $(uname -r)" > /qg/proj2/origin.txt; sync
+-- origin.txt 에 지금 커널 이름을 적었다.
+-- RHCK 에서 다시 읽어 어느 커널이 썼는지 구별한다
+[root@ol7a ~]# modinfo -n btrfs; dmesg | grep -i btrfs | head -3
+/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/btrfs/btrfs.ko.xz
+[  102.368869] Btrfs loaded, crc32c=crc32c-intel
+[  102.369483] BTRFS: device label qg devid 1 transid 5 /dev/sdb
+[  102.376890] BTRFS info (device sdb): using crc32c (crc32c-intel) checksum algorithm
+-- UEK 의 모듈 경로와 첫 적재 메시지.
+-- Btrfs loaded 는 첫 마운트 때(102초) 나왔다
+--   crc32c=crc32c-intel : CPU 의 SSE4.2 명령으로 체크섬을 계산한다
+[root@ol7a ~]# btrfs inspect-internal dump-super /dev/sdb | grep -E '^(incompat_flags|compat_ro_flags)'
+compat_ro_flags         0x0
+incompat_flags          0x141
+-- 슈퍼블록 기능 비트. incompat_flags 0x141 = MIXED_BACKREF + EXTENDED_IREF + SKINNY_METADATA
+-- compat_ro_flags 0x0 : 읽기 전용으로만 열게 하는 기능(free space tree 등)이 없다
+-- 이 두 값이 RHCK 가 이 파일 시스템을 열 수 있는지를 가른다
+-- 마운트할 커널이 모르는 incompat 비트가 하나라도 있으면 마운트가 거부된다
+-- 옮겨 다닐 디스크라면 mkfs 때 -O ^기능 으로 오래된 커널에 맞출 수 있다
+[root@ol7a ~]# umount /qg
+-- 2 는 [0] 의 grubby 목록에서 RHCK 1160.119.1.0.5 의 index 다.
+-- grub2-reboot 는 GRUB 환경 블록에 next_entry 를 적는다. saved_entry 는 그대로다.
+[root@ol7a ~]# grub2-reboot 2
+[root@ol7a ~]# grub2-editenv list
+saved_entry=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.338.4.2.el7uek.x86_64
+next_entry=2
+-- grub2-reboot 는 출력이 없다.
+-- 뒤의 grub2-editenv 에 next_entry=2 가 생겼다
+-- saved_entry 는 그대로 UEK. 기본 커널을 건드리지 않았다
+-- 번호 대신 메뉴 제목 문자열을 줘도 된다
+-- 이어서 systemctl reboot 으로 재부팅했다
+-- 재부팅
+
+--------------------------------------------------------------------------------
+ [6] RHCK 에서 — 커널과 모듈
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# uname -r; grub2-editenv list
+3.10.0-1160.119.1.0.5.el7.x86_64
+saved_entry=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.338.4.2.el7uek.x86_64
+next_entry=
+-- RHCK 3.10.0-1160.119.1.0.5 로 부팅됐다
+-- next_entry= 가 빈 값이 됐다.
+-- GRUB 이 부팅하면서 쓰고 지웠다. 그래서 "한 번만"이다
+-- 부팅이 실패해도 다음 재부팅은 saved_entry 로 간다. 시험 부팅이 안전한 이유다
+[root@ol7a ~]# rpm -q btrfs-progs; modinfo -n btrfs; modinfo btrfs | grep -E '^(vermagic|description|license)'
+btrfs-progs-5.12.1-1.el7.x86_64
+/lib/modules/3.10.0-1160.119.1.0.5.el7.x86_64/kernel/fs/btrfs/btrfs.ko.xz
+license:        GPL
+vermagic:       3.10.0-1160.119.1.0.5.el7.x86_64 SMP mod_unload modversions 
+-- RHCK 에도 btrfs 모듈이 있다. 경로가 /lib/modules/3.10.0-1160.119.1.0.5.el7.x86_64/... 로 바뀌었다
+-- deprecated 는 "모듈을 뺐다"가 아니다.
+-- 7.9 의 RHCK 에는 아직 들어 있다
+-- grep 한 description 줄은 이 모듈에 없어 license·vermagic 둘만 나왔다
+[root@ol7a ~]# grep btrfs /proc/filesystems; lsmod | grep -c '^btrfs'
+        btrfs
+1
+-- /proc/filesystems 에 btrfs,
+-- lsmod 에 btrfs 한 줄. 부팅 중에 이미 적재됐다
+--   (blkid 가 부팅 때 Btrfs 서명을 보고 모듈을 올렸다. [7] 의 dmesg 3초)
+[root@ol7a ~]# cat /proc/sys/kernel/tainted
+0
+-- tainted 0 : 커널이 깨끗한 상태.
+-- 서명 없는 모듈이나 tech preview 모듈을 올리면 비트가 선다
+-- 이 값은 비트 합이다. 예를 들어 1 은 독점(비GPL) 모듈,
+-- 4096 은 서명 안 된 모듈 적재
+
+--------------------------------------------------------------------------------
+ [7] RHCK 에서 같은 Btrfs 마운트
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# blkid -L qg; mount LABEL=qg /qg; echo "rc=$?"; findmnt /qg
+/dev/sdb
+rc=0
+TARGET SOURCE   FSTYPE OPTIONS
+/qg    /dev/sdb btrfs  rw,relatime,seclabel,space_cache,subvolid=5,subvol=/
+-- 장치 이름 대신 LABEL=qg 로 마운트했다.
+-- 재부팅으로 장치 이름이 바뀌어도 같은 디스크를 찾는다
+-- RHCK 에서도 rc=0. 마운트 옵션도 UEK 와 같다
+-- blkid -L qg 의 답은 /dev/sdb. 이번 부팅에서는 이름이 바뀌지 않았다
+[root@ol7a ~]# dmesg | grep -iE 'btrfs|tech preview|deprecat' | tail -8
+[    3.122122] Btrfs loaded, crc32c=crc32c-intel
+[    3.122636] BTRFS: device label qg devid 1 transid 17 /dev/sdb
+[   16.959083] BTRFS info (device sdb): disk space caching is enabled
+[   16.959085] BTRFS info (device sdb): has skinny extents
+[   16.959086] BTRFS info (device sdb): flagging fs with big metadata feature
+-- RHCK 의 btrfs 메시지 다섯 줄.
+-- deprecated·tech preview 를 찾았지만 해당 줄이 없다
+--   Btrfs loaded 3초 : 부팅 중 적재, transid 17 은 UEK 에서 마지막으로 커밋한 트랜잭션 번호
+--   disk space caching is enabled : space_cache(v1)를 쓴다. UEK 와 같은 옵션
+--   has skinny extents : skinny-metadata 를 알아봤다
+--   flagging fs with big metadata feature : 노드 16KiB 를 쓰는 파일 시스템 표시
+[root@ol7a ~]# cat /proc/sys/kernel/tainted
+0
+-- 마운트 뒤에도 tainted 0
+--
+-- 증상   : RHCK 로 부팅한 뒤 UEK 에서 만든 Btrfs 가 rc=0 으로 마운트되고, dmesg 에
+--          경고가 없으며 tainted 도 0. "RHCK 에서도 문제없다"고 판단하기 쉽다
+-- 원인   : OL 7.9 릴리스 노트의 deprecated 는 지원 정책이다. 모듈은 남아 있고 동작도 하지만
+--          이 커널에서 생긴 Btrfs 문제는 지원 대상이 아니다. 화면에는 아무 표시가 없다
+-- 조치   : Btrfs 를 쓰는 서버는 UEK 로 부팅한다. grub2-editenv list 의 saved_entry 가 UEK 인지,
+--          uname -r 이 el7uek 인지 확인한다
+-- 재확인 : [9] 재부팅 뒤 uname -r 이 5.4.17-2136.338.4.2.el7uek.x86_64
+
+--------------------------------------------------------------------------------
+ [8] RHCK 에서 읽기·쓰기와 qgroup
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cat /qg/proj2/origin.txt; btrfs subvolume list /qg
+written on 5.4.17-2136.338.4.2.el7uek.x86_64
+ID 257 gen 15 top level 5 path proj1
+ID 258 gen 16 top level 5 path proj2
+-- UEK 에서 쓴 origin.txt 가 그대로 읽힌다. 서브볼륨 목록도 같다
+-- gen 15·16 은 UEK 에서 마지막으로 쓴 세대다.
+-- RHCK 가 아직 아무것도 쓰지 않았다
+[root@ol7a ~]# btrfs qgroup show -re /qg
+qgroupid         rfer         excl     max_rfer     max_excl 
+--------         ----         ----     --------     -------- 
+0/5          16.00KiB     16.00KiB         none         none 
+0/257       150.02MiB    150.02MiB    300.00MiB         none 
+0/258       150.02MiB    150.02MiB         none         none 
+-- RHCK 도 qgroup 정보를 읽는다. 값이 [4] 와 같다
+-- max_rfer 300.00MiB 한도도 그대로 보인다.
+-- 한도는 디스크의 quota tree 에 저장돼 커널과 무관하다
+[root@ol7a ~]# dd if=/dev/zero of=/qg/proj1/fill2 bs=1M count=200; echo "rc=$?"
+dd: error writing ‘/qg/proj1/fill2’: Disk quota exceeded
+150+0 records in
+149+0 records out
+157040640 bytes (157 MB) copied, 0.305249 s, 514 MB/s
+rc=1
+-- RHCK 에서도 한도가 지켜졌다.
+-- 남은 여유 약 150MiB 에서 149MiB 째에 Disk quota exceeded
+--   records in 150+0, out 149+0. 157040640 바이트 기록
+[root@ol7a ~]# echo "written on $(uname -r)" > /qg/proj2/origin2.txt; sync; ls /qg/proj2
+fill
+origin2.txt
+origin.txt
+-- RHCK 에서 origin2.txt 를 썼다.
+-- ls 의 순서는 로캘 정렬이라 origin2 가 앞에 나온다
+-- 이 파일은 RHCK 가 만든 트랜잭션으로 디스크에 남았다.
+-- [10] 에서 UEK 가 읽는다
+-- umount 는 출력이 없다. 다음 재부팅 전에 정상적으로 내렸다
+[root@ol7a ~]# umount /qg
+
+--------------------------------------------------------------------------------
+ [9] UEK 로 돌아오기
+--------------------------------------------------------------------------------
+
+-- grub2-reboot 는 한 번만 유효하다. 아무것도 하지 않고 재부팅하면 saved_entry 로 간다.
+[root@ol7a ~]# grub2-editenv list
+saved_entry=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.338.4.2.el7uek.x86_64
+next_entry=
+-- RHCK 에서 본 환경 블록. next_entry 가 비어 있으니 다음 재부팅은 saved_entry 의 UEK 다
+-- 재부팅
+[root@ol7a ~]# uname -r; grub2-editenv list
+5.4.17-2136.338.4.2.el7uek.x86_64
+saved_entry=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.338.4.2.el7uek.x86_64
+next_entry=
+-- 재부팅 뒤 UEK 2136 으로 돌아왔다. 아무 설정도 바꾸지 않았다
+-- 기본 커널을 바꾸지 않고 다른 커널을 시험하는 절차는 네 단계다
+--   grub2-reboot 번호 → 재부팅 → 확인 → 그냥 재부팅
+
+--------------------------------------------------------------------------------
+ [10] UEK 에서 RHCK 가 쓴 내용 확인
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# blkid -L qg; mount LABEL=qg /qg; cat /qg/proj2/origin.txt /qg/proj2/origin2.txt
+/dev/sdb
+written on 5.4.17-2136.338.4.2.el7uek.x86_64
+written on 3.10.0-1160.119.1.0.5.el7.x86_64
+-- 재부팅으로 장치 이름이 바뀌었을 수 있어 blkid -L 로 찾았다.
+-- 이번에도 /dev/sdb
+-- UEK 가 쓴 줄과 RHCK 가 쓴 줄이 둘 다 읽힌다
+[root@ol7a ~]# btrfs qgroup show -re /qg
+qgroupid         rfer         excl     max_rfer     max_excl 
+--------         ----         ----     --------     -------- 
+0/5          16.00KiB     16.00KiB         none         none 
+0/257       299.78MiB    299.78MiB    300.00MiB         none 
+-- proj1 이 299.78MiB.
+-- RHCK 에서 쓴 fill2 의 149MiB 가 더해졌다
+-- 한도 300.00MiB 에 0.22MiB 남았다.
+-- RHCK 의 한도 계산도 UEK 와 맞았다
+0/258       150.02MiB    150.02MiB         none         none 
+[root@ol7a ~]# btrfs scrub start -B /qg | tail -4
+Duration:         0:00:01
+Total to scrub:   1.52GiB
+Rate:             451.36MiB/s
+Error summary:    no errors found
+-- scrub 으로 RHCK 가 쓴 블록까지 체크섬을 검사했다. 1.52GiB, 오류 없음
+-- 두 커널이 같은 디스크 형식을 쓴다는 확인이다. 지원 여부와는 별개다
+-- Rate 451.36MiB/s, Duration 0:00:01.
+-- 1.52GiB 는 Metadata DUP 사본까지 센 값
+
+--------------------------------------------------------------------------------
+ [변형] grub2-reboot 대신 grubby --set-default 로 바꾸면
+--------------------------------------------------------------------------------
+
+-- 재부팅은 하지 않고 환경 블록이 어떻게 바뀌는지만 본다.
+[root@ol7a ~]# cp /boot/grub2/grubenv /root/grubenv.before
+[root@ol7a ~]# grubby --set-default=/boot/vmlinuz-3.10.0-1160.119.1.0.5.el7.x86_64; grub2-editenv list; grubby --default-kernel
+saved_entry=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.338.4.2.el7uek.x86_64
+next_entry=
+/bootvmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+-- RHCK 로 바꾸려던 명령인데 saved_entry 는 UEK 그대로다. 오류 메시지도 없다
+-- --default-kernel 의 답에서 /boot 와 vmlinuz 사이의 / 가 빠졌다
+[root@ol7a ~]# grubby --set-default=/boot/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64; grub2-editenv list; grubby --default-kernel
+saved_entry=Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.338.4.2.el7uek.x86_64
+next_entry=
+/bootvmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+[root@ol7a ~]# cmp /root/grubenv.before /boot/grub2/grubenv && echo "grubenv same as before"
+-- 증상   : grubby --set-default=/boot/vmlinuz-3.10.0-1160.119.1.0.5.el7.x86_64 뒤에도
+--          saved_entry 가 UEK, --default-kernel 은 '/bootvmlinuz-5.4.17-...' 로 보임
+-- 원인   : = 를 붙인 형식에서 grubby 가 커널 경로를 제대로 받지 못했다. grubenv 가 [변형] 시작
+--          전과 바이트까지 같다(cmp). 3장 실습 02 는 공백 형식 --set-default /boot/vmlinuz-...
+--          으로 saved_entry 가 바뀌었다
+-- 조치   : --set-default 경로(공백) 또는 grubby --set-default-index=번호, grub2-set-default '제목'
+-- 재확인 : grub2-editenv list 의 saved_entry 와 grubby --default-kernel 이 바꾼 커널을 가리킴
+-- 출력이 없다고 성공이 아니다.
+-- 기본 커널을 바꾼 뒤에는 반드시 grub2-editenv list 로 본다
+-- 둘째 명령(UEK 로 되돌리기)도 같은 형식이라 역시 아무것도 바꾸지 않았다
+grubenv same as before
+
+--------------------------------------------------------------------------------
+ [11] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# D=$(blkid -L qg); umount /qg; rmdir /qg; wipefs -a $D >/dev/null; udevadm settle; lsblk -f $D
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+-- LABEL 로 장치를 찾아 마운트 해제·서명 삭제.
+-- udevadm settle 뒤 lsblk 는 빈 칸
+[root@ol7a ~]# uname -r; grubby --default-kernel
+5.4.17-2136.338.4.2.el7uek.x86_64
+/boot/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+-- UEK 로 부팅된 채, 기본 커널도 UEK.
+-- [0] 과 같다(이번에는 / 가 붙은 정상 경로)
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                     시작 전(UEK)     RHCK 부팅 중              되돌린 뒤(UEK)
+--  uname -r                 5.4.17-2136      3.10.0-1160.119.1.0.5     5.4.17-2136
+--  grubenv next_entry       없음             빈 값(쓰고 지워짐)        빈 값
+--  btrfs 모듈 경로          UEK 판           RHCK 판                   UEK 판
+--  마운트 / dmesg 경고      -                rc=0 / 없음               -
+--  tainted                  -                0                         -
+--  proj1 qgroup             100m → 300m      한도 지켜짐(149MiB 째)    299.78MiB / 300MiB
+--  grubby --set-default=    -                -                         saved_entry 안 바뀜
+--  sdb                      없음             btrfs (qg)                없음
+--
+-- 확인한 사실
+--   qgroup 한도 초과는 Disk quota exceeded, 쓴 부분은 남는다. limit 변경은 바로 반영
+--   7.9 의 RHCK 에도 btrfs 모듈이 있고 UEK 로 만든 Btrfs 를 경고 없이 읽고 쓴다
+--   지원 여부는 화면이 아니라 커널(uname -r)과 릴리스 노트로 판단한다
+--   grub2-reboot 는 next_entry 를 한 번만 쓰고 GRUB 이 지운다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. proj1 의 스냅샷을 만든 뒤 qgroup show 의 rfer·excl 이 어떻게 갈리는지 본다
+--    확인: 스냅샷 직후 원본 excl 이 줄어드는지
+-- 2. btrfs qgroup limit -e 100m 으로 excl 한도를 걸고 스냅샷이 있을 때 쓰기 한도를 비교한다
+--    확인: max_excl 열과 dd 의 records out
+-- 3. RHCK 로 부팅한 상태에서 mkfs.btrfs 로 새 Btrfs 를 만들어 UEK 에서 마운트한다
+--    확인: UEK 의 dmesg, btrfs inspect-internal dump-super 의 incompat_flags
+-- 4. grubby --set-default 를 공백 형식으로 쳐서 saved_entry 가 RHCK 제목으로 바뀌는지 본 뒤
+--    grub2-set-default 로 UEK 제목을 되돌린다. 확인: grub2-editenv list
+
+================================================================================
+ 실습 05 종료 — qgroup 한도 초과, RHCK 에서의 무경고 마운트와 지원 범위, grub2-reboot 복귀 확인
+================================================================================

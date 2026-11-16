@@ -1,0 +1,631 @@
+================================================================================
+ 제10장 실습 08 — RAID 5 구성과 재구축: 디스크 장애, 교체, mdadm.conf 없는 재부팅
+ 대상   : ol7a
+ 목표   : mdadm 으로 RAID 5 를 만들고 /proc/mdstat 과 mdadm --detail 을 필드
+          단위로 읽는다. 디스크 하나를 fail·remove 하고 새 디스크로 재구축하는
+          동안 데이터가 살아 있는지 확인한다. 빼낸 디스크에 남은 슈퍼블록,
+          mdadm.conf 없이 재부팅했을 때 배열 이름이 어떻게 되는지 본다
+ 배경   : RAID 5 는 디스크 N 개 중 하나 몫을 패리티로 써서 한 개 장애를
+          견딘다. 장애가 나면 degraded 상태로 계속 동작하고, 새 디스크를
+          넣으면 나머지 디스크와 패리티로 내용을 다시 계산해 채운다(재구축).
+          배열 구성은 각 디스크의 md 슈퍼블록에 있고, /etc/mdadm.conf 는
+          부팅 때 어떤 이름으로 조립할지를 정한다 (본문 10.8, 10.9)
+ 소요   : 약 40분 (재부팅 두세 번 포함)
+ 선행   : storage-clean 스냅샷
+ 계정   : root
+ 주의   : sdb~sde 네 디스크를 모두 쓴다. 재부팅 전에 RAID 를 fstab 에 넣지 않는다
+ 되돌림 : 배열 정지, 슈퍼블록 삭제, mdadm.conf 삭제. 확인은 cat /proc/mdstat
+          (배열 없음), lsblk (sdb~sde 비어 있음)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# cat /proc/mdstat; ls -l /etc/mdadm.conf
+Personalities : 
+unused devices: <none>
+ls: cannot access /etc/mdadm.conf: No such file or directory
+-- Personalities 빈칸 :
+-- RAID 모듈이 아직 올라오지 않음
+-- unused devices <none>,
+-- mdadm.conf 없음 → 배열이 하나도 없다
+[root@ol7a ~]# rpm -q mdadm; lsblk -o NAME,SIZE,TYPE,FSTYPE /dev/sd[b-e]
+mdadm-4.1-9.0.1.el7_9.x86_64
+NAME SIZE TYPE FSTYPE
+sdb   10G disk 
+sdc   10G disk 
+sdd   10G disk 
+sde   10G disk 
+-- mdadm 4.1 설치됨. 네 디스크 모두 FSTYPE 빈칸
+-- 재동기화 속도 한도. 단위는
+-- KiB/s 이고 디스크 하나당 값이다.
+-- speed_limit_min :
+-- 다른 I/O 가 있어도 이만큼은 보장
+-- speed_limit_max :
+-- 다른 I/O 가 없어도 이 이상은 안 냄
+[root@ol7a ~]# cat /proc/sys/dev/raid/speed_limit_min /proc/sys/dev/raid/speed_limit_max
+1000
+200000
+-- 기본값 1000 / 200000 KiB/s.
+-- [13] 에서 같은지 본다
+
+--------------------------------------------------------------------------------
+ [1] RAID 5 만들기 — 작게, 그리고 천천히
+--------------------------------------------------------------------------------
+-- 10G 디스크 셋을 다 쓰면 초기 동기화가 길다.
+-- --size 로 디스크마다 1GiB 만 쓰고,
+-- 진행 모습을 볼 수 있게 speed_limit_max
+-- 를 잠시 20000(약 20MB/s)으로 낮춘다.
+[root@ol7a ~]# echo 20000 > /proc/sys/dev/raid/speed_limit_max
+-- --create /dev/md0 : 만들 배열 장치
+-- --level=5 : RAID 레벨,
+-- --raid-devices=3 : 활성 디스크 수
+-- --size=1G : 디스크마다 쓸
+-- 크기(생략하면 가장 작은 디스크 전체)
+-- --run : "계속할까요" 질문 없이 바로 시작
+[root@ol7a ~]# mdadm --create /dev/md0 --level=5 --raid-devices=3 --size=1G --run /dev/sdb /dev/sdc /dev/sdd
+mdadm: largest drive (/dev/sdb) exceeds size (1048576K) by more than 1%
+mdadm: Defaulting to version 1.2 metadata
+mdadm: array /dev/md0 started.
+-- 첫 줄 : 디스크(10G)가 --size(1G)보다
+-- 1% 넘게 크다는 알림. 의도한 것이다
+-- 둘째 줄 : 슈퍼블록 형식 1.2 (디스크 앞쪽 4KiB 지점)
+[root@ol7a ~]# cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdd[3] sdc[1] sdb[0]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [UU_]
+      [>....................]  recovery =  1.9% (20480/1048576) finish=0.8min speed=20480K/sec
+-- 필드 해설
+--   Personalities [raid6] [raid5] [raid4] :
+--   raid456 모듈이 올라옴
+--   md0 : active raid5 : 동작 중, 레벨 5
+--   sdd[3] sdc[1] sdb[0] : 디스크와 역할 번호
+--   2097152 blocks : 쓸 수 있는 크기
+--   2GiB (1G × 3 - 패리티 1개분)
+--   512k chunk, algorithm 2 : 청크 크기,
+--   패리티 배치(left-symmetric)
+--   [3/2] [UU_] : 필요 3,
+--   동작 2, 세 번째가 아직 채워지는 중
+--   recovery 1.9%, speed=20480K/sec :
+--   max 20000 근처로 묶여 있다
+-- 새 RAID 5 는 마지막 디스크를
+-- "재구축" 하는 방식으로 초기화한다
+      
+unused devices: <none>
+[root@ol7a ~]# sleep 10; cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdd[3] sdc[1] sdb[0]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [UU_]
+      [===>.................]  recovery = 19.1% (201472/1048576) finish=0.6min speed=20147K/sec
+      
+unused devices: <none>
+[root@ol7a ~]# sleep 10; cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdd[3] sdc[1] sdb[0]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [UU_]
+      [=======>.............]  recovery = 38.2% (401408/1048576) finish=0.5min speed=20070K/sec
+-- 10초마다 약 200MB 씩 진행. 속도가 상한에 붙어 있다
+      
+unused devices: <none>
+-- 동기화 중에도 배열은 쓸 수 있다.
+-- 다만 끝날 때까지 이중화가 완성되지 않는다.
+-- 끝까지 기다린다. --wait :
+-- 재동기화·재구축이 끝날 때까지 돌아오지 않는다
+[root@ol7a ~]# time mdadm --wait /dev/md0; cat /proc/mdstat
+real    0m32.277s
+user    0m0.002s
+sys     0m0.000s
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdd[3] sdc[1] sdb[0]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+      
+unused devices: <none>
+-- --wait 가 32 초 뒤 돌아왔고 [3/3]
+-- [UUU] 가 됐다. 이제 이중화가 완성됐다
+[root@ol7a ~]# echo 200000 > /proc/sys/dev/raid/speed_limit_max
+
+--------------------------------------------------------------------------------
+ [2] mdadm --detail — 배열 쪽에서 본 상태
+--------------------------------------------------------------------------------
+[root@ol7a ~]# mdadm --detail /dev/md0
+/dev/md0:
+           Version : 1.2
+     Creation Time : Fri Nov 13 18:19:11 2026
+        Raid Level : raid5
+        Array Size : 2097152 (2.00 GiB 2.15 GB)
+     Used Dev Size : 1048576 (1024.00 MiB 1073.74 MB)
+      Raid Devices : 3
+     Total Devices : 3
+       Persistence : Superblock is persistent
+       Update Time : Fri Nov 13 18:20:04 2026
+             State : clean 
+    Active Devices : 3
+   Working Devices : 3
+    Failed Devices : 0
+     Spare Devices : 0
+            Layout : left-symmetric
+        Chunk Size : 512K
+Consistency Policy : resync
+              Name : ol7a.example.com:0  (local to host ol7a.example.com)
+              UUID : 837ac89c:232de632:6e1ff6a5:2ac8dfc1
+            Events : 18
+    Number   Major   Minor   RaidDevice State
+       0       8       16        0      active sync   /dev/sdb
+       1       8       32        1      active sync   /dev/sdc
+       3       8       48        2      active sync   /dev/sdd
+-- 이 실습에서 볼 필드
+--   Array Size 2.00 GiB,
+--   Used Dev Size 1024 MiB :
+--   디스크당 1GiB 사용
+--   State clean : 동기화 끝, 이상 없음
+--   Active/Working 3,
+--   Failed 0, Spare 0
+--   Layout left-symmetric,
+--   Chunk Size 512K
+--   Name ol7a.example.com:0
+--   (local to host) : 호스트이름:번호
+--   UUID : 배열 UUID.
+--   mdadm.conf 가 이 값으로 배열을 찾는다
+--   Events 18 : 상태가 바뀔 때마다 오르는 카운터
+-- 아래 표 : Number(슬롯), Major·Minor,
+-- RaidDevice(역할), State, 장치
+--   sdd 의 Number 가 2 가 아니라 3 이다.
+--   처음에 재구축 대상으로 들어갔기 때문
+
+--------------------------------------------------------------------------------
+ [3] mdadm --examine — 디스크 쪽에서 본 슈퍼블록
+--------------------------------------------------------------------------------
+-- 구성은 각 디스크의 슈퍼블록(메타데이터 1.2
+-- 는 디스크 시작 4KiB 지점)에 있다.
+[root@ol7a ~]# mdadm --examine /dev/sdc
+/dev/sdc:
+          Magic : a92b4efc
+        Version : 1.2
+    Feature Map : 0x0
+     Array UUID : 837ac89c:232de632:6e1ff6a5:2ac8dfc1
+           Name : ol7a.example.com:0  (local to host ol7a.example.com)
+  Creation Time : Fri Nov 13 18:19:11 2026
+     Raid Level : raid5
+   Raid Devices : 3
+ Avail Dev Size : 20953088 sectors (9.99 GiB 10.73 GB)
+     Array Size : 2097152 KiB (2.00 GiB 2.15 GB)
+  Used Dev Size : 2097152 sectors (1024.00 MiB 1073.74 MB)
+    Data Offset : 18432 sectors
+   Super Offset : 8 sectors
+   Unused Space : before=18352 sectors, after=18855936 sectors
+          State : clean
+    Device UUID : 6c2a52f1:31b20f07:a614e85e:f80e90c8
+    Update Time : Fri Nov 13 18:20:04 2026
+  Bad Block Log : 512 entries available at offset 16 sectors
+       Checksum : 6d6f64f6 - correct
+         Events : 18
+         Layout : left-symmetric
+     Chunk Size : 512K
+   Device Role : Active device 1
+   Array State : AAA ('A' == active, '.' == missing, 'R' == replacing)
+-- 디스크 쪽 기록이라 배열이 멈춰 있어도 읽힌다
+--   Array UUID 가 --detail 의 UUID 와 같다
+--   Data Offset 18432 섹터 :
+--   데이터는 9MiB 뒤부터
+--   Super Offset 8 섹터 : 슈퍼블록은 4KiB 지점
+--   Device Role : Active device 1 →
+--   이 디스크는 역할 1
+--   Events 18 : 배열과 같은 값.
+--   다르면 빠졌다 들어온 디스크다
+--   Array State AAA :
+--   이 디스크가 아는 세 자리 모두 active
+[root@ol7a ~]# lsblk -o NAME,SIZE,TYPE,FSTYPE /dev/sd[b-e]
+NAME  SIZE TYPE  FSTYPE
+sdb    10G disk  linux_raid_member
+└─md0   2G raid5 
+sdc    10G disk  linux_raid_member
+└─md0   2G raid5 
+sdd    10G disk  linux_raid_member
+└─md0   2G raid5 
+sde    10G disk  
+-- 세 디스크의 FSTYPE 이 linux_raid_member.
+-- lsblk 는 md0 을 세 디스크 밑에 모두 그린다
+
+--------------------------------------------------------------------------------
+ [4] 파일 시스템과 데이터
+--------------------------------------------------------------------------------
+-- mkfs.xfs 는 md 장치의 청크·스트라이프
+-- 폭을 읽어 sunit·swidth 를 맞춘다.
+[root@ol7a ~]# mkfs.xfs /dev/md0
+log stripe unit (524288 bytes) is too large (maximum is 256KiB)
+log stripe unit adjusted to 32KiB
+meta-data=/dev/md0               isize=256    agcount=8, agsize=65408 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=0        finobt=0, sparse=0, rmapbt=0
+         =                       reflink=0
+data     =                       bsize=4096   blocks=523264, imaxpct=25
+         =                       sunit=128    swidth=256 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=2560, version=2
+         =                       sectsz=512   sunit=8 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+-- 앞 두 줄 : 로그 stripe unit 이 512KiB
+-- 라 최대값을 넘어 32KiB 로 줄였다는 알림
+-- data 의 sunit=128
+-- swidth=256 블록(4KiB)
+--   sunit 128 × 4KiB = 512KiB = 청크 크기
+--   swidth 256 = 데이터 디스크 2개 × sunit
+-- mkfs.xfs 가 md 의 구조를 읽어 맞췄다.
+-- LVM 을 끼우면 이 값을 손으로 줘야 할 때가 있다
+[root@ol7a ~]# mkdir -p /data/raid; mount /dev/md0 /data/raid
+[root@ol7a ~]# cp -a /usr/share/doc /data/raid/; dd if=/dev/urandom of=/data/raid/f1 bs=1M count=300 status=none
+[root@ol7a ~]# md5sum /data/raid/f1 | tee /root/f1.md5; df -hT /data/raid
+83c77fcb09c6cbd7b6410bdebf5756d5  /data/raid/f1
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/md0       xfs   2.0G  400M  1.6G  20% /data/raid
+-- 체크섬을 /root 에 저장. 사용량 400M
+
+--------------------------------------------------------------------------------
+ [5] mdadm.conf 만들기
+--------------------------------------------------------------------------------
+-- --detail --scan :
+-- 지금 돌고 있는 배열을 mdadm.conf 형식 한 줄로
+[root@ol7a ~]# mdadm --detail --scan
+ARRAY /dev/md0 metadata=1.2 name=ol7a.example.com:0 UUID=837ac89c:232de632:6e1ff6a5:2ac8dfc1
+-- ARRAY 줄 : 장치 이름,
+-- 메타데이터 형식, 이름, 배열 UUID
+[root@ol7a ~]# mdadm --detail --scan > /etc/mdadm.conf; cat /etc/mdadm.conf
+ARRAY /dev/md0 metadata=1.2 name=ol7a.example.com:0 UUID=837ac89c:232de632:6e1ff6a5:2ac8dfc1
+-- 파일에 그대로 저장했다. 부팅 때 이 UUID
+-- 의 배열을 /dev/md0 으로 조립한다
+
+--------------------------------------------------------------------------------
+ [6] 디스크 장애 — fail
+--------------------------------------------------------------------------------
+-- 실제 장애 대신 --fail 로 sdc 를 고장 상태로 만든다.
+[root@ol7a ~]# mdadm /dev/md0 --fail /dev/sdc
+mdadm: set /dev/sdc faulty in /dev/md0
+-- 증상   : sdc 가 faulty. 실제 장애라면 커널이 이 표시를 붙인다
+[root@ol7a ~]# cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdd[3] sdc[1](F) sdb[0]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [U_U]
+-- sdc[1](F) : 고장 표시.
+-- [3/2] [U_U] : 가운데 자리가 빠졌다
+      
+unused devices: <none>
+[root@ol7a ~]# mdadm --detail /dev/md0 | grep -E 'State :|Devices :|faulty|active sync|removed'
+      Raid Devices : 3
+     Total Devices : 3
+             State : clean, degraded 
+    Active Devices : 2
+   Working Devices : 2
+    Failed Devices : 1
+     Spare Devices : 0
+       0       8       16        0      active sync   /dev/sdb
+       -       0        0        1      removed
+       3       8       48        2      active sync   /dev/sdd
+       1       8       32        -      faulty   /dev/sdc
+-- State clean, degraded.
+-- Failed Devices 1
+-- 슬롯 1 은 removed,
+-- sdc 는 아래에 faulty 로 따로 남아 있다
+-- degraded 상태에서도 읽기와 쓰기가 된다.
+-- 읽은 값은 패리티로 다시 계산한 것이다.
+[root@ol7a ~]# md5sum -c /root/f1.md5; echo degraded-write > /data/raid/during.txt; cat /data/raid/during.txt
+-- 기존 파일 체크섬 OK, 새 파일 쓰기도 됨
+-- 빠진 sdc 몫은 나머지 두 디스크와 패리티로 계산해 읽는다
+/data/raid/f1: OK
+degraded-write
+[root@ol7a ~]# dmesg | grep -E 'md/raid|md0' | tail -3
+[   65.165278] XFS (md0): Ending clean mount
+[   74.256722] md/raid:md0: Disk failure on sdc, disabling device.
+[   74.257564] md/raid:md0: Operation continuing on 2 devices.
+-- 원인   : 디스크 하나를 잃어 degraded. 이 상태에서 하나 더 잃으면 배열 전체를 잃는다
+
+--------------------------------------------------------------------------------
+ [7] 빼고 새 디스크로 재구축
+--------------------------------------------------------------------------------
+-- --remove : 고장 표시된 디스크를
+-- 배열에서 뺀다(물리 교체 전 단계)
+[root@ol7a ~]# mdadm /dev/md0 --remove /dev/sdc
+mdadm: hot removed /dev/sdc from /dev/md0
+-- 물리 디스크를 빼기 전 단계. 서버를 끄지 않는다(hot)
+-- 재구축을 빨리 끝내려고 이번에는 speed_limit_min 을 올린다.
+-- 다른 I/O 가 있어도 이 속도는 낸다.
+[root@ol7a ~]# echo 100000 > /proc/sys/dev/raid/speed_limit_min
+-- 교체 디스크 sde 를 넣는다.
+-- 배열이 degraded 라 바로 재구축이 시작된다.
+[root@ol7a ~]# mdadm /dev/md0 --add /dev/sde
+mdadm: added /dev/sde
+-- 조치   : --remove sdc → --add sde. 넣자마자 recovery 시작
+[root@ol7a ~]# cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sde[4] sdd[3] sdb[0]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [U_U]
+      [>....................]  recovery =  2.0% (21660/1048576) finish=0.7min speed=21660K/sec
+      
+unused devices: <none>
+[root@ol7a ~]# sleep 3; cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sde[4] sdd[3] sdb[0]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [U_U]
+      [===========>.........]  recovery = 57.2% (601216/1048576) finish=0.0min speed=200405K/sec
+-- min 을 100000 으로 올려 두어
+-- 속도가 200405K/sec 까지 올라갔다
+-- 3초에 57% → 1GiB 재구축이 수 초 안에 끝난다
+-- sde[4] : 새 슬롯 번호 4.
+-- 역할은 빠졌던 자리 1 을 채운다
+      
+unused devices: <none>
+[root@ol7a ~]# mdadm --wait /dev/md0; cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sde[4] sdd[3] sdb[0]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+      
+unused devices: <none>
+[root@ol7a ~]# echo 1000 > /proc/sys/dev/raid/speed_limit_min
+[root@ol7a ~]# mdadm --detail /dev/md0 | grep -E 'State :|Devices :|Events|active sync'
+      Raid Devices : 3
+     Total Devices : 3
+             State : clean 
+    Active Devices : 3
+   Working Devices : 3
+    Failed Devices : 0
+     Spare Devices : 0
+            Events : 40
+       0       8       16        0      active sync   /dev/sdb
+       4       8       64        1      active sync   /dev/sde
+       3       8       48        2      active sync   /dev/sdd
+-- 재확인 : State clean, Active 3,
+-- sde 가 RaidDevice 1. Events 18 → 40
+[root@ol7a ~]# md5sum -c /root/f1.md5; cat /data/raid/during.txt
+/data/raid/f1: OK
+degraded-write
+-- 체크섬 OK, degraded 중에 쓴 파일도 그대로
+
+--------------------------------------------------------------------------------
+ [8] 빼낸 디스크를 다른 데 쓰려면 — 남아 있는 슈퍼블록
+--------------------------------------------------------------------------------
+-- sdc 는 배열에서 빠졌지만 디스크 위의 슈퍼블록은 그대로다.
+[root@ol7a ~]# mdadm --examine /dev/sdc | grep -E 'Array UUID|Raid Level|Device Role|Array State|Events'
+     Array UUID : 837ac89c:232de632:6e1ff6a5:2ac8dfc1
+     Raid Level : raid5
+         Events : 18
+   Device Role : Active device 1
+   Array State : AAA ('A' == active, '.' == missing, 'R' == replacing)
+-- 빼낸 sdc 에 옛 슈퍼블록이 그대로다
+--   Events 18 : 빠진 시점에서 멈춤(배열은 40)
+--   Array State AAA :
+--   이 디스크는 자기가 빠진 것을 모른다
+[root@ol7a ~]# pvcreate /dev/sdc </dev/null
+  Device /dev/sdc excluded by a filter.
+-- 증상   : pvcreate /dev/sdc 가 "excluded by a filter." 로 거부
+-- 원인   : lvm2 가 md 구성원 서명(linux_raid_member)을 보고 후보에서 뺐다
+--          실습 01 의 파티션 테이블과 같은 문구다.
+--          이유는 서명이 다르다
+-- --zero-superblock : md 슈퍼블록을 지운다
+[root@ol7a ~]# mdadm --zero-superblock /dev/sdc
+-- 조치   : mdadm --zero-superblock /dev/sdc. 출력 없음
+[root@ol7a ~]# mdadm --examine /dev/sdc
+mdadm: No md superblock detected on /dev/sdc.
+-- 재확인 : --examine 이 "No md superblock detected" 로 답한다
+[root@ol7a ~]# wipefs /dev/sdc; echo "wipefs 출력 끝"
+-- wipefs 도 아무 서명을 보지 못했다.
+-- 이제 다른 용도로 쓸 수 있다
+wipefs 출력 끝
+
+--------------------------------------------------------------------------------
+ [9] 핫 스페어 — 깨끗해진 sdc 를 예비로
+--------------------------------------------------------------------------------
+-- 배열이 정상일 때 --add 하면 예비(spare)로 들어간다.
+-- 다음 장애 때 자동으로 재구축에 쓰인다.
+[root@ol7a ~]# mdadm /dev/md0 --add /dev/sdc
+mdadm: added /dev/sdc
+[root@ol7a ~]# cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdc[5](S) sde[4] sdd[3] sdb[0]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+-- sdc[5](S) : 예비(spare).
+-- 배열은 [3/3] 그대로
+      
+unused devices: <none>
+[root@ol7a ~]# mdadm --detail /dev/md0 | grep -E 'Devices :|spare|active sync'
+      Raid Devices : 3
+     Total Devices : 4
+    Active Devices : 3
+   Working Devices : 4
+    Failed Devices : 0
+     Spare Devices : 1
+       0       8       16        0      active sync   /dev/sdb
+       4       8       64        1      active sync   /dev/sde
+       3       8       48        2      active sync   /dev/sdd
+       5       8       32        -      spare   /dev/sdc
+-- Total 4, Active 3, Spare 1.
+-- 다음 장애 때 sdc 가 자동으로 재구축에 들어간다
+
+--------------------------------------------------------------------------------
+ [변형] --replace — degraded 를 거치지 않는 교체
+--------------------------------------------------------------------------------
+-- [6]~[7] 은 디스크를 먼저 빼서 한동안 이중화가 없었다.
+-- 아직 살아 있는 디스크를
+-- 미리 바꾸고 싶다면 --replace 가 낫다.
+-- 예비 디스크에 먼저 복사한 뒤 원래 디스크를 뺀다.
+[root@ol7a ~]# echo 100000 > /proc/sys/dev/raid/speed_limit_min
+[root@ol7a ~]# mdadm /dev/md0 --replace /dev/sdb --with /dev/sdc
+mdadm: Marked /dev/sdb (device 0 in /dev/md0) for replacement
+mdadm: Marked /dev/sdc in /dev/md0 as replacement for device 0
+-- sdb 를 교체 대상으로, sdc 를 그 대체로 표시했다.
+-- 아직 아무것도 빼지 않았다
+[root@ol7a ~]# cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdc[5](R) sde[4] sdd[3] sdb[0]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+      [>....................]  recovery =  2.7% (29532/1048576) finish=0.5min speed=29532K/sec
+-- sdc[5](R) : replacing.
+-- [3/3] [UUU] 가 유지된다
+-- fail 방식([6])과 달리
+-- 복사하는 동안에도 이중화가 살아 있다
+      
+unused devices: <none>
+[root@ol7a ~]# mdadm --wait /dev/md0; sleep 2; cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdc[5] sde[4] sdd[3] sdb[0](F)
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+      
+unused devices: <none>
+-- 복사가 끝나자 sdb[0](F) 로 바뀌었다.
+-- sdc 는 역할 0 의 정식 구성원
+[root@ol7a ~]# echo 1000 > /proc/sys/dev/raid/speed_limit_min
+[root@ol7a ~]# mdadm --detail /dev/md0 | grep -E 'State :|Devices :|faulty|active sync|spare'
+      Raid Devices : 3
+     Total Devices : 4
+             State : clean 
+    Active Devices : 3
+   Working Devices : 3
+    Failed Devices : 1
+     Spare Devices : 0
+       5       8       32        0      active sync   /dev/sdc
+       4       8       64        1      active sync   /dev/sde
+       3       8       48        2      active sync   /dev/sdd
+       0       8       16        -      faulty   /dev/sdb
+-- sdc 가 RaidDevice 0,
+-- sdb 는 faulty 로 남음.
+-- Failed Devices 1
+-- 교체된 sdb 는 faulty 로 남는다. 빼낸다.
+[root@ol7a ~]# mdadm /dev/md0 --remove /dev/sdb; mdadm --zero-superblock /dev/sdb
+mdadm: hot removed /dev/sdb from /dev/md0
+-- sdb 를 빼고 슈퍼블록까지
+-- 지웠다(--zero-superblock 은 출력 없음)
+
+--------------------------------------------------------------------------------
+ [10] mdadm.conf 없이 재부팅하면
+--------------------------------------------------------------------------------
+-- 설정 파일을 치워 두고 재부팅한다.
+-- fstab 에는 넣지 않았으니 부팅은 멈추지 않는다.
+[root@ol7a ~]# umount /data/raid; mv /etc/mdadm.conf /root/mdadm.conf.bak
+-- (설계) mdadm.conf 가 없으면
+-- 이름이 md127 로 바뀌는지 본다
+-- (재부팅)
+[root@ol7a ~]# cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdd[3] sde[4] sdc[5]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+      
+unused devices: <none>
+-- 재부팅 뒤에도 md0. 구성원은 sdd·sde·sdc
+[root@ol7a ~]# ls -l /dev/md*; mdadm --detail /dev/md127 | grep -E 'Name :|UUID :|State :'
+brw-rw----. 1 root disk 9, 0 Nov 13 18:20 /dev/md0
+/dev/md:
+total 0
+lrwxrwxrwx. 1 root root 6 Nov 13 18:20 0 -> ../md0
+mdadm: cannot open /dev/md127: No such file or directory
+-- md127 은 없다. /dev/md/0
+-- 링크가 md0 을 가리킨다
+[root@ol7a ~]# hostname; mdadm --examine /dev/sdd | grep -E 'Name :'
+ol7a.example.com
+           Name : ol7a.example.com:0  (local to host ol7a.example.com)
+-- 설계한 오류(md127)는 7.9 에서 재현되지 않았다
+--   슈퍼블록의 이름이 ol7a.example.com:0
+--   이고 지금 호스트 이름과 같다
+--   mdadm 은 "자기 호스트의 배열" 로 보고 이름
+--   뒤 번호 0 을 그대로 써서 md0 을 만든다
+-- md127 은 이름이 다른 호스트의 것일
+-- 때(디스크를 다른 서버로 옮겼을 때) 생긴다
+-- 이 VM 에서는 다시 확인하지 못했다(VM
+-- 접근 오류로 재실측 실패, 보고서 참고)
+
+--------------------------------------------------------------------------------
+ [11] 이름을 md0 으로 되돌린다
+--------------------------------------------------------------------------------
+[root@ol7a ~]# cp /root/mdadm.conf.bak /etc/mdadm.conf; cat /etc/mdadm.conf
+ARRAY /dev/md0 metadata=1.2 name=ol7a.example.com:0 UUID=837ac89c:232de632:6e1ff6a5:2ac8dfc1
+[root@ol7a ~]# mdadm --stop /dev/md127
+mdadm: error opening /dev/md127: No such file or directory
+-- md127 이 없으니 멈출 것도 없다.
+-- 이름을 되돌리는 절차만 형식대로 쳐 둔다
+[root@ol7a ~]# mdadm --assemble --scan
+[root@ol7a ~]# cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdd[3] sde[4] sdc[5]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+      
+unused devices: <none>
+-- --assemble --scan 은 이미
+-- 조립된 배열을 건드리지 않았다. 출력 없음
+-- 재부팅해도 md0 인지 확인한다.
+-- (재부팅)
+[root@ol7a ~]# cat /proc/mdstat
+Personalities : [raid6] [raid5] [raid4] 
+md0 : active raid5 sdc[5] sde[4] sdd[3]
+      2097152 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/3] [UUU]
+      
+unused devices: <none>
+[root@ol7a ~]# mount /dev/md0 /data/raid; md5sum -c /root/f1.md5
+/data/raid/f1: OK
+-- 재부팅 뒤에도 md0, 체크섬 OK
+-- 부팅 초기 램디스크(initramfs)에
+-- mdadm.conf 가 들어 있는지도 본다.
+[root@ol7a ~]# lsinitrd /boot/initramfs-$(uname -r).img | grep -E 'mdadm|mdraid' | head -5
+-- 출력이 없다. initramfs
+-- 에 mdadm 이 들어 있지 않다
+-- 루트가 RAID 가 아니라 dracut 이 넣지 않았다.
+-- 이 배열은 정식 루트로 넘어간 뒤
+-- udev 가 디스크를 볼 때마다 조립한다.
+-- 루트·/boot 가 RAID 면
+-- dracut -f 로 다시 만든다
+
+--------------------------------------------------------------------------------
+ [12] 되돌림
+--------------------------------------------------------------------------------
+[root@ol7a ~]# umount /data/raid; rm -rf /data
+[root@ol7a ~]# mdadm --stop /dev/md0
+mdadm: stopped /dev/md0
+-- 배열을 멈춘 뒤 세 디스크의 슈퍼블록을 지운다
+[root@ol7a ~]# mdadm --zero-superblock /dev/sdc /dev/sdd /dev/sde
+[root@ol7a ~]# rm -f /etc/mdadm.conf /root/mdadm.conf.bak /root/f1.md5
+
+--------------------------------------------------------------------------------
+ [13] 시작 전과 비교
+--------------------------------------------------------------------------------
+[root@ol7a ~]# cat /proc/mdstat; ls -l /etc/mdadm.conf
+Personalities : [raid6] [raid5] [raid4] 
+unused devices: <none>
+ls: cannot access /etc/mdadm.conf: No such file or directory
+[root@ol7a ~]# lsblk -o NAME,SIZE,TYPE,FSTYPE /dev/sd[b-e]
+NAME SIZE TYPE FSTYPE
+sdb   10G disk 
+sdc   10G disk 
+sdd   10G disk 
+sde   10G disk 
+[root@ol7a ~]# cat /proc/sys/dev/raid/speed_limit_min /proc/sys/dev/raid/speed_limit_max
+1000
+200000
+-- 속도 한도도 1000 / 200000 으로 돌아왔다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목              시작 전   작업 중                                     되돌린 뒤
+--  배열              없음      md0 raid5 [3/3] → [3/2] [U_U] → [3/3]        없음
+--  구성원            -         sdb·sdc·sdd → sdb·sde·sdd → sdc·sde·sdd      -
+--  Events            -         18 → 40                                     -
+--  재구축 속도       -         20 MB/s(max 20000) / 200 MB/s(min 100000)   -
+--  f1 체크섬         -         83c77fcb... 끝까지 OK                        -
+--  mdadm.conf        없음      ARRAY /dev/md0 ... UUID=837ac89c...         없음
+--  speed_limit       1000/200000  바꿨다 되돌림                             1000/200000
+-- 오류
+--   디스크 장애      : [U_U] degraded → remove·add → [UUU]
+--   빼낸 디스크 재사용 : excluded by a filter → --zero-superblock
+--   md127            : 재현 안 됨(같은 호스트의 배열은 이름 유지)
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. 같은 디스크 넷으로 --level=10 배열을 만들어
+-- --detail 의 Layout 과 용량을 RAID 5 와 비교한다.
+-- 2. mdadm --monitor --scan --oneshot
+-- --test 로 경고 메일·로그가 어떻게 나가는지 본다.
+--    확인: journalctl -t mdadm
+-- 3. --grow --raid-devices=4 로 예비
+-- 디스크를 활성 디스크로 바꿔 용량을 늘리고(reshape)
+--    /proc/mdstat 의 reshape 진행을 관찰한다.
+
+================================================================================
+ 실습 08 종료 — RAID 5 장애·재구축·교체 후 체크섬 그대로, mdadm.conf 없는 재부팅에도 md0 유지
+================================================================================

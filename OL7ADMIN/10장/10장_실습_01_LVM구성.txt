@@ -1,0 +1,590 @@
+================================================================================
+ 제10장 실습 01 — LVM 구성: PV·VG·LV 만들기
+ 대상   : ol7a
+ 목표   : 빈 디스크 두 개로 PV·VG·LV 를 만들고 pvs·vgs·lvs 와 display 출력을
+          필드 단위로 읽는다. PE 크기가 할당 단위가 되는 것과, LV 가 장치 매퍼
+          장치(dm-N)로 만들어져 /dev/mapper·/dev/VG 이름으로 연결되는 것을 본다
+ 배경   : LVM 은 디스크(PV)를 묶어 저장소 풀(VG)을 만들고, 그 안에서 원하는
+          크기의 논리 볼륨(LV)을 잘라 쓴다. VG 는 공간을 PE(기본 4MiB) 단위로
+          나누고 LV 는 PE 의 목록이다. LV 는 커널의 장치 매퍼가 만든 dm 장치라
+          파일 시스템 입장에서는 보통 디스크와 같다 (본문 10.1, 10.2, 10.3)
+ 소요   : 약 25분
+ 선행   : storage-clean 스냅샷 (sdb~sde 10G 네 개가 비어 있음)
+ 계정   : root
+ 주의   : sdb·sdc·sdd 의 내용을 지운다. OS 의 VG ol 은 건드리지 않는다
+ 되돌림 : 만든 LV·VG·PV 를 지우고 wipefs 로 서명을 없앤다.
+          확인은 pvs (ol 의 /dev/sda2 하나만), lsblk (sdb~sdd 아래 아무것도 없음)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 손대기 전 디스크와 LVM 의 모습을 남긴다. 끝에서 이 출력과 비교한다.
+-- lsblk -o 로 열을 골라 보면 TYPE 열에서 disk·part·lvm 을 구분하기 쉽다.
+[root@ol7a ~]# lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
+NAME         SIZE TYPE FSTYPE      MOUNTPOINT
+-- 열 해설
+--   TYPE       : disk·part·lvm·rom
+--   FSTYPE     : blkid 가 읽은 서명. LVM2_member 는 PV 라는 표시
+--   MOUNTPOINT : 마운트 위치. 스왑은 [SWAP]
+sdd           10G disk             
+sdb           10G disk             
+sr0          4.5G rom  iso9660     
+sde           10G disk             
+sdc           10G disk             
+sda           40G disk             
+├─sda2        39G part LVM2_member 
+│ ├─ol-swap  3.9G lvm  swap        [SWAP]
+│ └─ol-root 35.1G lvm  xfs         /
+└─sda1         1G part xfs         /boot
+-- sdb~sde 는 FSTYPE 이 빈칸이고 아래에 아무것도 없다 → 빈 디스크
+-- sda2 → ol-swap·ol-root 가 OS 의 LVM.
+-- 이 실습은 그쪽을 건드리지 않는다
+
+-- OS 설치 때 autopart 가 만든 LVM 이 이미 하나 있다. 실습 VG 는 다른 이름으로 만든다.
+[root@ol7a ~]# pvs; vgs; lvs
+  PV         VG Fmt  Attr PSize   PFree
+  /dev/sda2  ol lvm2 a--  <39.00g 4.00m
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+  LV   VG Attr       LSize   Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  root ol -wi-ao---- <35.12g                                                    
+  swap ol -wi-ao----  <3.88g                                                    
+-- 세 명령의 첫 열 해설은 [2]~[4] 에서 한다. 지금 볼 값만 고른다
+--   pvs  : PV 는 /dev/sda2 하나, VG ol, PFree 4.00m
+--   vgs  : VG ol 의 #LV 2, VFree 4.00m → OS VG 에는 남은 공간이 거의 없다
+--   lvs  : root <35.12g, swap <3.88g. '<' 는 표시값보다 조금 작다는 뜻
+-- [12] 에서 이 세 줄이 그대로인지 비교한다
+
+--------------------------------------------------------------------------------
+ [1] 이전 사용 흔적이 남은 디스크 — pvcreate 가 거부한다
+--------------------------------------------------------------------------------
+
+-- 다른 서버에서 쓰던 디스크를 붙인 상황을 흉내 낸다. sdb 에 MBR 파티션 테이블만 만든다.
+-- parted -s : 질문 없이 실행(script 모드)
+-- mklabel msdos : MBR 파티션 테이블을 쓴다
+[root@ol7a ~]# parted -s /dev/sdb mklabel msdos mkpart primary 1MiB 100%
+[root@ol7a ~]# lsblk /dev/sdb; wipefs /dev/sdb
+NAME   MAJ:MIN RM SIZE RO TYPE MOUNTPOINT
+sdb      8:16   0  10G  0 disk 
+└─sdb1   8:17   0  10G  0 part 
+offset               type
+----------------------------------------------------------------
+0x1fe                dos   [partition table]
+-- lsblk 에 sdb1 이 생겼고,
+-- wipefs 는 0x1fe(510 바이트) 지점의 dos 서명을 본다
+--   0x1fe 의 55 aa 두 바이트가 MBR 의 끝 표시(boot signature)다
+-- wipefs 를 -a 없이 치면 지우지 않고 목록만 보여 준다
+
+-- 디스크 전체를 PV 로 만들려고 한다.
+[root@ol7a ~]# pvcreate /dev/sdb
+  Device /dev/sdb excluded by a filter.
+-- 증상   : pvcreate /dev/sdb 가 "Device /dev/sdb excluded by a filter." 로 거부됨
+
+-- -vvv 로 필터 판정 과정을 볼 수 있는지 확인한다. 출력이 수백 줄이라 filter·partition 이 든 줄만 고른다.
+[root@ol7a ~]# pvcreate -vvv /dev/sdb 2>&1 | grep -iE 'filter|partition' | head -5
+      devices/global_filter not found in config: defaulting to global_filter = [ "a|.*/|" ]
+        Sysfs filter initialised.
+        Internal filter initialised.
+        LVM type filter initialised.
+        Usable device filter initialised (scan_lvs 0).
+-- 다섯 줄은 필터를 준비하는 기록뿐이다
+--   global_filter 는 기본값 a|.*/| (모든 장치 허용)
+--   거부 이유를 직접 말하는 줄은 head -5 범위에 없다
+-- 그래서 원인은 앞의 wipefs 출력으로 판단한다
+-- 원인   : 디스크에 MBR 파티션 테이블이 있다. lvm2 의 파티션 필터는 파티션
+--          테이블이 있는 디스크 전체를 PV 후보에서 뺀다. lvm.conf 의 filter
+--          (사용자 설정)가 아니라 내장 필터의 판정이라 메시지가 모호하다
+
+-- wipefs -a : 장치에 있는 모든 서명(파티션 테이블, 파일 시스템, LVM 레이블 등)을 지운다
+-- 지우기 전에 wipefs 만 쳐서(-a 없이) 무엇이 있는지 먼저 보는 습관을 들인다.
+[root@ol7a ~]# wipefs -a /dev/sdb
+/dev/sdb: 2 bytes were erased at offset 0x000001fe (dos): 55 aa
+/dev/sdb: calling ioclt to re-read partition table: Success
+-- 조치   : wipefs -a /dev/sdb 로 dos 서명(55 aa)을 지움
+[root@ol7a ~]# pvcreate /dev/sdb
+  Physical volume "/dev/sdb" successfully created.
+-- 재확인 : 같은 pvcreate 가 successfully created 로 끝남
+
+--------------------------------------------------------------------------------
+ [2] PV 만들기와 조회
+--------------------------------------------------------------------------------
+
+-- 두 번째 디스크도 PV 로 만든다. -v 를 주면 무엇을 하는지 한 줄씩 보여 준다.
+[root@ol7a ~]# pvcreate -v /dev/sdc
+    Wiping signatures on new PV /dev/sdc.
+    Set up physical volume for "/dev/sdc" with 20971520 available sectors.
+    Zeroing start of device /dev/sdc.
+    Writing physical volume data to disk "/dev/sdc".
+  Physical volume "/dev/sdc" successfully created.
+-- -v 출력 네 줄이 pvcreate 의 일 순서다
+--   1) 기존 서명 지우기  2) 크기 계산(20971520 섹터 = 10GiB)
+--   3) 앞부분 0 으로 채우기  4) PV 레이블·메타데이터 영역 쓰기
+
+-- pvs 는 한 줄 요약, pvdisplay 는 필드별 상세다.
+[root@ol7a ~]# pvs
+  PV         VG Fmt  Attr PSize   PFree 
+  /dev/sda2  ol lvm2 a--  <39.00g  4.00m
+  /dev/sdb      lvm2 ---   10.00g 10.00g
+  /dev/sdc      lvm2 ---   10.00g 10.00g
+-- 열 해설
+--   PV    : 장치 이름
+--   VG    : 속한 VG. sdb·sdc 는 아직 비어 있음
+--   Fmt   : 메타데이터 형식. lvm2
+--   Attr  : 세 글자. a(할당 가능) - (내보내기 아님) - (missing 아님)
+--           sdb·sdc 는 --- → VG 에 들기 전이라 할당 불가
+--   PSize : PV 크기, PFree : 남은 공간
+[root@ol7a ~]# pvdisplay /dev/sdb
+  "/dev/sdb" is a new physical volume of "10.00 GiB"
+  --- NEW Physical volume ---
+  PV Name               /dev/sdb
+  VG Name               
+  PV Size               10.00 GiB
+  Allocatable           NO
+  PE Size               0   
+  Total PE              0
+  Free PE               0
+  Allocated PE          0
+  PV UUID               QE6v1K-Ls39-Dvu7-bxzm-Mc6v-3T2B-cqmL4p
+-- 필드 해설
+--   "NEW Physical volume" : VG 에 들지 않은 PV
+--   Allocatable NO        : VG 가 없어 PE 를 나눠 줄 수 없음
+--   PE Size 0, Total PE 0 : PE 는 VG 가 정한다. PV 혼자서는 PE 가 없다
+--   PV UUID               : 레이블에 기록된 고유 ID. 이름이 바뀌어도 LVM 은 이 값으로 찾는다
+   
+-- PV 레이블이 디스크의 어디에 쓰였는지 본다. LVM2 레이블은 두 번째 섹터(512 바이트 지점)에 있다.
+[root@ol7a ~]# wipefs /dev/sdb
+offset               type
+----------------------------------------------------------------
+0x218                LVM2_member   [raid]
+                     UUID:  QE6v1K-Ls39-Dvu7-bxzm-Mc6v-3T2B-cqmL4p
+-- offset 0x218 = 536 바이트.
+-- 두 번째 섹터(512) 안 24 바이트 지점에 LVM2 레이블이 있다
+-- UUID 는 pvdisplay 의 PV UUID 와 같다
+
+--------------------------------------------------------------------------------
+ [3] VG 만들기 — PE 가 생긴다
+--------------------------------------------------------------------------------
+
+-- vgcreate 이름 PV... : PV 를 묶어 VG 를 만든다. -s 를 주지 않으면 PE 는 4MiB 다.
+[root@ol7a ~]# vgcreate vgdata /dev/sdb /dev/sdc
+  Volume group "vgdata" successfully created
+-- sdb·sdc 는 이미 PV 라 pvcreate 단계 출력이 없다.
+-- 아니었다면 [변형] 처럼
+-- "Physical volume ...
+-- successfully created" 가 먼저 나온다
+
+-- PV 가 VG 에 들어가면 pvs 의 VG 열과 PFree 가 바뀐다.
+[root@ol7a ~]# pvs
+  PV         VG     Fmt  Attr PSize   PFree  
+  /dev/sda2  ol     lvm2 a--  <39.00g   4.00m
+  /dev/sdb   vgdata lvm2 a--  <10.00g <10.00g
+  /dev/sdc   vgdata lvm2 a--  <10.00g <10.00g
+-- [2] 와 바뀐 열만 본다
+--   VG    : vgdata
+--   Attr  : a-- → 할당 가능
+--   PSize : 10.00g → <10.00g. 메타데이터 영역(약 1MiB)을 빼고 PE 로 나눈 나머지
+[root@ol7a ~]# vgs vgdata
+  VG     #PV #LV #SN Attr   VSize  VFree 
+  vgdata   2   0   0 wz--n- 19.99g 19.99g
+-- 열 해설
+--   #PV 2, #LV 0, #SN 0 : PV·LV·스냅샷 수
+--   Attr wz--n- : w 쓰기, z 크기 변경 가능, n 할당 정책 normal
+--   VSize·VFree : 19.99g. 10G 두 개에서 메타데이터 몫이 빠짐
+[root@ol7a ~]# vgdisplay vgdata
+  --- Volume group ---
+  VG Name               vgdata
+  System ID             
+  Format                lvm2
+  Metadata Areas        2
+  Metadata Sequence No  1
+  VG Access             read/write
+  VG Status             resizable
+  MAX LV                0
+  Cur LV                0
+  Open LV               0
+  Max PV                0
+  Cur PV                2
+  Act PV                2
+  VG Size               19.99 GiB
+  PE Size               4.00 MiB
+  Total PE              5118
+  Alloc PE / Size       0 / 0   
+  Free  PE / Size       5118 / 19.99 GiB
+  VG UUID               81EsjY-TAup-XfDQ-eTd4-t8Fy-bfMi-yUzOzp
+-- 이 실습에서 볼 필드
+--   Metadata Areas 2       : PV 마다 메타데이터 사본이 하나씩
+--   Metadata Sequence No 1 : 메타데이터 판 번호. 바뀔 때마다 오른다 ([10])
+--   PE Size 4.00 MiB       : -s 를 주지 않은 기본값
+--   Total PE 5118          : 디스크당 2559개 × 2
+--   Alloc PE / Free PE     : 0 / 5118. 두 값의 합이 Total PE
+-- MAX LV 0·Max PV 0 은 "제한 없음".
+-- LVM1 시절 필드라 lvm2 에서는 늘 0
+-- 계산: 5118 × 4MiB = 20472MiB = 19.99GiB
+   
+--------------------------------------------------------------------------------
+ [4] LV 만들기 — 크기로(-L), PE 개수로(-l)
+--------------------------------------------------------------------------------
+
+-- -L 3G : 크기로 지정. -n : LV 이름
+[root@ol7a ~]# lvcreate -L 3G -n lvdata vgdata
+  Logical volume "lvdata" created.
+
+-- -l 은 PE 개수나 비율로 지정한다. 50%FREE 는 남은 공간의 절반.
+[root@ol7a ~]# lvcreate -l 50%FREE -n lvlog vgdata
+  Logical volume "lvlog" created.
+-- 50%FREE 는 "지금 남은 PE 의 절반"이다. 순서대로 계산하면
+--   lvdata 768 PE 를 쓴 뒤 남은 PE 4350 → 절반 2175 PE
+[root@ol7a ~]# lvs vgdata
+  LV     VG     Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  lvdata vgdata -wi-a-----  3.00g                                                    
+  lvlog  vgdata -wi-a----- <8.50g                                                    
+-- 열 해설
+--   LV·VG  : 이름
+--   Attr   : 열 글자 -wi-a-----
+--            1 '-' 일반 LV, 2 'w' 쓰기, 3 'i' 할당 정책 inherit
+--            5 'a' 활성, 6 '-' 열려 있지 않음(마운트 전)
+--   LSize  : lvlog 는 2175 × 4MiB = 8700MiB = 8.496GiB → <8.50g
+[root@ol7a ~]# vgs vgdata
+  VG     #PV #LV #SN Attr   VSize  VFree 
+  vgdata   2   2   0 wz--n- 19.99g <8.50g
+-- VFree 도 <8.50g. 남은 PE 는 2175개 ([5] 에서 숫자로 확인)
+
+-- lvdisplay 로 한 LV 를 자세히 본다.
+[root@ol7a ~]# lvdisplay vgdata/lvdata
+  --- Logical volume ---
+  LV Path                /dev/vgdata/lvdata
+  LV Name                lvdata
+  VG Name                vgdata
+  LV UUID                YUcZ5g-3VJZ-qoiN-ARcW-WPNf-wD9S-qqmyKz
+  LV Write Access        read/write
+  LV Creation host, time ol7a.example.com, 2026-11-13 09:03:48 +0900
+  LV Status              available
+  # open                 0
+  LV Size                3.00 GiB
+  Current LE             768
+  Segments               1
+  Allocation             inherit
+  Read ahead sectors     auto
+  - currently set to     8192
+  Block device           252:2
+-- 필드 해설
+--   LV Path            : /dev/VG/LV 링크
+--   LV Status available: 활성. 비활성이면 NOT available ([실습 04])
+--   # open 0           : 아직 마운트되지 않음
+--   Current LE 768     : LV 쪽에서 센 extent(LE). 3GiB ÷ 4MiB = 768
+--   Segments 1         : 한 조각으로 이어진 할당
+--   Block device 252:2 : 장치 매퍼의 major 252, minor 2 → /dev/dm-2
+   
+--------------------------------------------------------------------------------
+ [5] VG 에 남은 것보다 큰 LV 를 요청하면
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# lvcreate -L 10G -n lvbig vgdata
+  Volume group "vgdata" has insufficient free space (2175 extents): 2560 required.
+-- 증상   : "has insufficient free space (2175 extents): 2560 required."
+-- 원인   : 10G 는 2560 PE 인데 VG 에 남은 PE 가 2175 개뿐이다.
+--          lvcreate 는 일부만 만들지 않고 통째로 거부한다
+
+-- 남은 PE 를 전부 쓰려면 100%FREE 가 안전하다. 여기서는 지운 뒤 다시 해 보지 않고 남겨 둔다.
+[root@ol7a ~]# vgs -o vg_name,vg_extent_size,vg_extent_count,vg_free_count,vg_free vgdata
+  VG     Ext   #Ext Free VFree 
+  vgdata 4.00m 5118 2175 <8.50g
+-- 열 해설: Ext(PE 크기) #Ext(전체 PE) Free(남은 PE) VFree(남은 크기)
+-- 조치   : 남은 만큼만 쓰려면 -l 100%FREE, 정말 10G 가 필요하면
+--          vgextend 로 PV 를 더한다(실습 02)
+-- 재확인 : 여기서는 만들지 않았다. Free 2175 가 그대로 남은 것만 확인
+
+--------------------------------------------------------------------------------
+ [6] LV 는 어느 디스크에 놓였나 — 세그먼트와 PE 지도
+--------------------------------------------------------------------------------
+
+-- lvs -o +devices : LV 가 쓰는 PV 와 시작 PE 번호
+-- --segments      : LV 가 몇 조각(세그먼트)으로 되어 있는지
+[root@ol7a ~]# lvs -o +devices --segments vgdata
+  LV     VG     Attr       #Str Type   SSize  Devices    
+  lvdata vgdata -wi-a-----    1 linear  3.00g /dev/sdb(0)
+  lvlog  vgdata -wi-a-----    1 linear <8.50g /dev/sdc(0)
+-- 열 해설
+--   #Str 1      : 스트라이프 수. 1 이면 linear
+--   Type linear : 이어 붙이는 방식
+--   SSize       : 세그먼트 크기
+--   Devices     : 놓인 PV 와 시작 PE 번호. sdb(0)·sdc(0) 모두 0번부터
+-- lvdata 3G 는 sdb 에,
+-- lvlog 는 sdb 남은 공간이 아니라 sdc 에 놓였다
+-- normal 정책이 빈 PV 의 큰 연속 공간을 골랐다. 위치는 LVM 이 정한다
+
+-- pvdisplay -m : PV 쪽에서 본 PE 지도. 어느 PE 범위를 어느 LV 가 쓰는지 나온다.
+[root@ol7a ~]# pvdisplay -m /dev/sdb | sed -n '/--- Physical Segments ---/,$p'
+  --- Physical Segments ---
+  Physical extent 0 to 767:
+    Logical volume      /dev/vgdata/lvdata
+    Logical extents     0 to 767
+  Physical extent 768 to 2558:
+    FREE
+-- PE 0~767 이 lvdata 의 LE 0~767. 768~2558 은 빈 칸
+-- 마지막 PE 번호가 2558 → sdb 의 PE 는 0~2558, 2559 개
+   
+--------------------------------------------------------------------------------
+ [7] 장치 매퍼 — LV 의 실체
+--------------------------------------------------------------------------------
+
+-- LV 는 /dev/vgdata/lvdata 와 /dev/mapper/vgdata-lvdata 두 이름으로 보인다. 둘 다 링크다.
+[root@ol7a ~]# ls -l /dev/vgdata/ /dev/mapper/ | grep -v total
+/dev/mapper/:
+crw-------. 1 root root 10, 236 Nov 13 09:03 control
+lrwxrwxrwx. 1 root root       7 Nov 13 09:03 ol-root -> ../dm-0
+lrwxrwxrwx. 1 root root       7 Nov 13 09:03 ol-swap -> ../dm-1
+lrwxrwxrwx. 1 root root       7 Nov 13 09:03 vgdata-lvdata -> ../dm-2
+lrwxrwxrwx. 1 root root       7 Nov 13 09:03 vgdata-lvlog -> ../dm-3
+
+/dev/vgdata/:
+lrwxrwxrwx. 1 root root 7 Nov 13 09:03 lvdata -> ../dm-2
+lrwxrwxrwx. 1 root root 7 Nov 13 09:03 lvlog -> ../dm-3
+-- 두 디렉터리의 링크가 모두 ../dm-N 을 가리킨다
+--   /dev/mapper/VG-LV : 장치 매퍼 이름
+--   /dev/VG/LV        : LVM 이 만드는 편의 링크
+-- dm-0·1 은 OS 의 root·swap. 실습 LV 는 2·3 번을 받았다
+-- dm 번호는 활성화 순서라 재부팅하면 바뀔 수 있다. fstab 에는 쓰지 않는다
+
+-- dmsetup 은 장치 매퍼를 직접 다루는 저수준 도구다.
+-- ls : 매퍼 장치 목록과 (major, minor) 번호
+-- table : 매퍼 장치가 어느 디스크의 어느 섹터를 가리키는지
+[root@ol7a ~]# dmsetup ls
+vgdata-lvdata   (252:2)
+ol-swap (252:1)
+ol-root (252:0)
+vgdata-lvlog    (252:3)
+[root@ol7a ~]# dmsetup table vgdata-lvdata
+0 6291456 linear 8:16 2048
+-- 필드 해설 (단위는 512 바이트 섹터)
+--   0 6291456 : LV 의 0 번 섹터부터 6291456 개 = 3GiB
+--   linear    : 그대로 이어 붙이는 대상(target)
+--   8:16      : 실제 장치 major:minor → sdb
+--   2048      : sdb 의 2048 번 섹터(1MiB)부터. 앞 1MiB 는 레이블·메타데이터 몫
+-- LV 의 실체는 이 한 줄짜리 표다. LVM 은 이 표를 만들어 커널에 넘긴다
+[root@ol7a ~]# dmsetup info vgdata-lvdata
+Name:              vgdata-lvdata
+State:             ACTIVE
+Read Ahead:        8192
+Tables present:    LIVE
+Open count:        0
+Event number:      0
+Major, minor:      252, 2
+Number of targets: 1
+UUID: LVM-81EsjYTAupXfDQeTd4t8FybfMiyUzOzpYUcZ5g3VJZqoiNARcWWPNfwD9SqqmyKz
+-- 필드 해설
+--   State ACTIVE / Tables present LIVE : 표가 커널에 올라가 동작 중
+--   Open count 0       : 열고 있는 사용자 없음. 마운트하면 1
+--   Number of targets 1: 표의 줄 수(세그먼트 수)
+--   UUID               : "LVM-" + VG UUID + LV UUID (하이픈 없이)
+
+-- lsblk 로 보면 dm 장치가 디스크 아래 매달린다.
+[root@ol7a ~]# lsblk /dev/sdb /dev/sdc
+NAME            MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+sdb               8:16   0   10G  0 disk 
+└─vgdata-lvdata 252:2    0    3G  0 lvm  
+sdc               8:32   0   10G  0 disk 
+└─vgdata-lvlog  252:3    0  8.5G  0 lvm  
+
+--------------------------------------------------------------------------------
+ [8] 파일 시스템을 만들고 마운트
+--------------------------------------------------------------------------------
+
+-- LV 는 블록 장치라 파티션과 똑같이 mkfs 를 한다. lvdata 는 XFS, lvlog 는 Ext4.
+[root@ol7a ~]# mkfs.xfs -q /dev/vgdata/lvdata
+[root@ol7a ~]# mkfs.ext4 -q /dev/vgdata/lvlog
+[root@ol7a ~]# mkdir -p /data /logs; mount /dev/vgdata/lvdata /data; mount /dev/vgdata/lvlog /logs
+[root@ol7a ~]# df -hT /data /logs
+Filesystem                Type  Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvdata xfs   3.0G   33M  3.0G   2% /data
+/dev/mapper/vgdata-lvlog  ext4  8.3G   24K  7.9G   1% /logs
+-- 열 해설
+--   Filesystem : /dev/mapper 이름으로 나온다
+--   Type       : xfs·ext4
+--   Size       : 파일 시스템 크기. ext4 8.3G 는 LV 8.5G 에서 메타데이터 몫이 빠진 값
+--   Avail      : ext4 는 7.9G. Size-Used 보다 작은 것은 예약 블록 5% 때문(9장)
+
+-- mount 와 /proc/mounts 는 장치를 /dev/mapper 이름으로 적는다.
+[root@ol7a ~]# grep -E '/data|/logs' /proc/mounts
+/dev/mapper/vgdata-lvdata /data xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+/dev/mapper/vgdata-lvlog /logs ext4 rw,seclabel,relatime 0 0
+-- /proc/mounts 도 /dev/mapper 이름이다.
+-- /dev/vgdata/lvdata 로 마운트했지만
+-- mount 가 링크를 따라가 정식 이름으로 기록한다
+
+--------------------------------------------------------------------------------
+ [9] 이름 바꾸기 — 즉시 반영되는가
+--------------------------------------------------------------------------------
+
+-- lvrename 은 마운트된 LV 에도 할 수 있다. 매퍼 이름이 바뀌는지 본다.
+[root@ol7a ~]# lvrename vgdata lvlog lvapp
+  Renamed "lvlog" to "lvapp" in volume group "vgdata"
+-- 마운트된 LV 에도 거부 없이 바로 바뀌었다
+[root@ol7a ~]# lvs vgdata; ls /dev/mapper/ | grep vgdata
+  LV     VG     Attr       LSize  Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  lvapp  vgdata -wi-ao---- <8.50g                                                    
+  lvdata vgdata -wi-ao----  3.00g                                                    
+vgdata-lvapp
+vgdata-lvdata
+-- lvs 와 /dev/mapper 는 새 이름 lvapp.
+-- Attr 6번째가 'o' → 열려 있음(마운트)
+[root@ol7a ~]# df -hT /logs
+Filesystem               Type  Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-lvlog ext4  8.3G   24K  7.9G   1% /logs
+-- df 는 아직 옛 이름 vgdata-lvlog 를 보여 준다
+--   df 는 /proc/mounts 에 마운트 당시 기록된 문자열을 읽는다
+--   장치는 같은 dm-3 이라 동작에는 문제가 없다
+-- 이름 바꾸기는 LVM·udev 쪽에 즉시 반영되고, 마운트 기록은 다시 마운트해야 바뀐다
+-- fstab 에 옛 이름이 있었다면 다음 부팅에 그 장치를 찾지 못한다. 함께 고친다
+
+--------------------------------------------------------------------------------
+ [10] 메타데이터는 어디에 — 디스크와 /etc/lvm
+--------------------------------------------------------------------------------
+
+-- VG 구성은 각 PV 앞부분의 메타데이터 영역에 들어 있고, /etc/lvm/backup 에 사본이 남는다.
+-- seqno 는 메타데이터가 바뀔 때마다 1씩 오른다.
+[root@ol7a ~]# vgs -o vg_name,vg_seqno,pv_count,lv_count,vg_mda_count,vg_mda_size vgdata
+  VG     Seq #PV #LV #VMda VMdaSize 
+  vgdata   4   2   2     2  1020.00k
+-- 열 해설
+--   Seq 4       : vgcreate 1 → lvcreate 2 → lvcreate 3 → lvrename 4
+--   #VMda 2     : 메타데이터 영역이 PV 마다 하나씩
+--   VMdaSize    : 영역 크기 1020KiB. [7] 에서 본 2048 섹터 안에 들어간다
+[root@ol7a ~]# ls -l /etc/lvm/backup/ /etc/lvm/archive/ | grep -v total
+/etc/lvm/archive/:
+-rw-------. 1 root root 1746 Nov 11 19:58 ol_00000-215091343.vg
+-rw-------. 1 root root 1145 Nov 13 09:03 vgdata_00000-1097781923.vg
+-rw-------. 1 root root 1143 Nov 13 09:03 vgdata_00001-1798175088.vg
+-rw-------. 1 root root 1573 Nov 13 09:03 vgdata_00002-1987757514.vg
+-rw-------. 1 root root 1975 Nov 13 09:03 vgdata_00003-1636461794.vg
+
+/etc/lvm/backup/:
+-rw-------. 1 root root 1745 Nov 11 19:58 ol
+-rw-------. 1 root root 1974 Nov 13 09:03 vgdata
+-- archive 에는 vgdata_00000~00003 네 개.
+-- 명령마다 "바꾸기 직전" 사본이 하나씩
+-- backup 의 vgdata 는 최신 상태 하나. ol 파일은 설치 때(11-11) 것
+[root@ol7a ~]# grep -E 'seqno|description|creation_time' /etc/lvm/backup/vgdata
+description = "Created *after* executing 'lvrename vgdata lvlog lvapp'"
+creation_time = 1794528230      # Fri Nov 13 09:03:50 2026
+        seqno = 4
+                        creation_time = 1794528228      # 2026-11-13 09:03:48 +0900
+-- description 이 "after executing 'lvrename ...'" → 이 명령 뒤의 상태
+-- seqno = 4 가 vgs 의 Seq 와 같다
+-- 아래 두 creation_time 은 LV 둘(lvdata·lvapp)의 생성 시각
+                        creation_time = 1794528228      # 2026-11-13 09:03:48 +0900
+
+--------------------------------------------------------------------------------
+ [변형] PE 크기를 바꿔 VG 만들기 — vgcreate -s
+--------------------------------------------------------------------------------
+
+-- 세 번째 디스크로 PE 16MiB 짜리 VG 를 하나 더 만든다. pvcreate 를 따로 하지 않아도
+-- vgcreate 가 PV 초기화를 함께 한다.
+-- -s 16M : PE 크기
+[root@ol7a ~]# vgcreate -s 16M vgtest /dev/sdd
+  Physical volume "/dev/sdd" successfully created.
+  Volume group "vgtest" successfully created
+-- sdd 는 PV 가 아니었는데도 vgcreate 가 pvcreate 를 먼저 해 주었다
+[root@ol7a ~]# vgs -o vg_name,vg_extent_size,vg_extent_count,vg_size vgdata vgtest
+  VG     Ext    #Ext VSize 
+  vgdata  4.00m 5118 19.99g
+  vgtest 16.00m  639  9.98g
+-- vgtest 는 PE 16MiB, 639 개.
+-- 10GiB ÷ 16MiB = 640 에서 메타데이터 몫
+-- 하나가 빠지고, 남는 자투리(16MiB 미만)는 쓰지 않아 9.98g
+
+-- PE 의 배수가 아닌 크기를 요청하면 올림한다.
+[root@ol7a ~]# lvcreate -L 100M -n lvt vgtest
+  Rounding up size to full physical extent 112.00 MiB
+-- 100MiB ÷ 16MiB = 6.25 → 7 개로 올림 = 112MiB
+  Logical volume "lvt" created.
+[root@ol7a ~]# lvcreate -L 100M -n lvt vgdata
+  Logical volume "lvt" created.
+[root@ol7a ~]# lvs -o lv_name,vg_name,lv_size,seg_size_pe vgtest vgdata
+  LV     VG     LSize   SSize
+  lvapp  vgdata  <8.50g  2175
+  lvdata vgdata   3.00g   768
+  lvt    vgdata 100.00m    25
+  lvt    vgtest 112.00m     7
+-- 같은 -L 100M 이 vgdata 에서는 25 PE(정확히 100MiB),
+-- vgtest 에서는 7 PE
+
+--------------------------------------------------------------------------------
+ [11] 되돌림 — LV → VG → PV 순서로 지운다
+--------------------------------------------------------------------------------
+
+-- 만든 순서의 역순이다. 마운트를 먼저 내린다.
+[root@ol7a ~]# umount /data /logs; rmdir /data /logs
+[root@ol7a ~]# lvremove -y vgtest; lvremove -y vgdata
+  Logical volume "lvt" successfully removed
+-- lvremove 에 VG 이름만 주면 그 VG 의 LV 를 모두 지운다. -y 는 확인 질문 생략
+  Logical volume "lvdata" successfully removed
+  Logical volume "lvapp" successfully removed
+  Logical volume "lvt" successfully removed
+[root@ol7a ~]# vgremove vgtest vgdata
+  Volume group "vgtest" successfully removed
+  Volume group "vgdata" successfully removed
+[root@ol7a ~]# pvremove /dev/sdb /dev/sdc /dev/sdd
+  Labels on physical volume "/dev/sdb" successfully wiped.
+  Labels on physical volume "/dev/sdc" successfully wiped.
+  Labels on physical volume "/dev/sdd" successfully wiped.
+-- pvremove 는 0x218 의 LVM2 레이블을 지운다
+[root@ol7a ~]# wipefs /dev/sdb /dev/sdc /dev/sdd; echo "wipefs 출력 끝"
+-- wipefs 가 아무것도 출력하지 않았다 → 서명이 남지 않음
+wipefs 출력 끝
+
+--------------------------------------------------------------------------------
+ [12] 시작 전과 비교
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT
+NAME         SIZE TYPE FSTYPE      MOUNTPOINT
+sdd           10G disk             
+sdb           10G disk             
+sr0          4.5G rom  iso9660     
+sde           10G disk             
+sdc           10G disk             
+sda           40G disk             
+├─sda2        39G part LVM2_member 
+│ ├─ol-swap  3.9G lvm  swap        [SWAP]
+│ └─ol-root 35.1G lvm  xfs         /
+└─sda1         1G part xfs         /boot
+[root@ol7a ~]# pvs; vgs
+  PV         VG Fmt  Attr PSize   PFree
+  /dev/sda2  ol lvm2 a--  <39.00g 4.00m
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+-- [0] 과 같다. sdb~sdd 는 다시 FSTYPE 빈칸, VG 는 ol 하나
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                  시작 전          작업 중                     되돌린 뒤
+--  sdb 서명              없음             dos → LVM2_member(0x218)    없음
+--  VG                    ol               ol, vgdata, vgtest          ol
+--  vgdata PE / 전체 PE   -                4.00m / 5118                -
+--  vgtest PE / 전체 PE   -                16.00m / 639                -
+--  lvdata / lvlog        -                768 PE / 2175 PE            -
+--  dm 장치               dm-0, dm-1       dm-2, dm-3 추가             dm-0, dm-1
+--  vgdata seqno          -                4 (lvrename 뒤)             -
+--  -L 100M 의 실제 크기  -                100.00m / 112.00m           -
+-- 오류 두 가지
+--   pvcreate 거부  : 파티션 테이블 → wipefs -a
+--   lvcreate 거부  : 남은 PE 2175 < 요청 2560
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. lvcreate -i 2 -I 64 로 sdb·sdc 에 걸친 스트라이프 LV 를 만들고
+--    lvs -o +stripes,stripe_size,devices 로 두 PV 에 번갈아 놓였는지 확인한다.
+-- 2. pvcreate --metadatasize 로 메타데이터 영역을 키운 PV 를 만들고
+--    pvs -o +pv_mda_size 로 기본값과 비교한다.
+-- 3. lvs 의 Attr 열 열 글자를 lvs(8) 맨 페이지의 lv_attr 설명과 하나씩 맞춰 본다.
+--    확인 방법: lvs -o lv_name,lv_attr,lv_active,lv_permissions
+
+================================================================================
+ 실습 01 종료 — sdb·sdc 로 VG vgdata(PE 5118개)를 만들고 LV 두 개를 dm-2·dm-3 으로 확인함
+================================================================================

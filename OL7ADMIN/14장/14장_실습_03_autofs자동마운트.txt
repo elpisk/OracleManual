@@ -1,0 +1,476 @@
+================================================================================
+ 제14장 실습 03 — autofs 자동 마운트
+ 대상   : ol7a (NFS 서버), ol7b (autofs 클라이언트)
+ 목표   : auto.master 와 간접 맵으로 /proj 아래를 접근할 때만 마운트하고, 유휴
+          시간(timeout)이 지나면 스스로 해제되는 것을 관찰한다. 와일드카드 맵(* 와 &),
+          직접 맵(/-), -hosts 맵을 차례로 써 보고, 맵 문법 오류와 마운트 지점
+          디렉터리를 손대서 생기는 충돌을 재현한다
+ 배경   : autofs 는 커널 모듈(autofs4)과 사용자 공간 데몬(automount) 두 부분이다.
+          automount 가 auto.master 의 마운트 지점마다 autofs 형식의 빈 파일 시스템을
+          걸어 두고, 그 아래 이름에 접근이 오면 맵에서 키를 찾아 실제 마운트를 한다.
+          간접 맵은 마운트 지점 아래의 이름을, 직접 맵은 절대 경로를 키로 쓴다 (본문 14.4)
+ 소요   : 약 40분
+ 선행   : ol7-base, ol7b-base 스냅샷
+ 계정   : root, student
+ 주의   : 없음. /etc/auto.master 는 고치지 않고 /etc/auto.master.d 에 파일을 더한다
+ 되돌림 : autofs 정지·비활성, 추가한 맵 파일 삭제, ol7a 의 내보내기·방화벽 원복
+          → systemctl is-active autofs, ls /etc/auto.master.d, findmnt -t autofs
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7b ~]# rpm -q autofs nfs-utils; systemctl is-active autofs; findmnt -t autofs,nfs4 | wc -l
+package autofs is not installed
+nfs-utils-1.3.0-0.68.0.1.el7.2.x86_64
+unknown
+-- autofs 미설치라 is-active 는 unknown
+2
+-- 2 줄 = findmnt 머리글 + systemd 의 binfmt_misc(autofs 형식). NFS 마운트는 없다
+[root@ol7a ~]# systemctl is-active nfs-server; firewall-cmd --list-services
+inactive
+dhcpv6-client ssh
+-- 서버도 기준 상태: nfs-server inactive, 방화벽 기본
+
+--------------------------------------------------------------------------------
+ [1] 서버 준비 — 프로젝트 디렉터리 세 개를 한 번에 내보낸다
+--------------------------------------------------------------------------------
+-- /srv/nfs/proj 를 내보내면 그 아래 p1·p2·p3 도 같은 내보내기로 마운트할 수 있다(하위 디렉터리 마운트).
+[root@ol7a ~]# mkdir -p /srv/nfs/proj/{p1,p2,p3}; for p in p1 p2 p3; do echo "project $p" > /srv/nfs/proj/$p/README; done
+[root@ol7a ~]# mkdir -p /srv/nfs/tools; echo "shared tools" > /srv/nfs/tools/VERSION
+[root@ol7a ~]# printf '%s\n' '/srv/nfs/proj   ol7b.example.com(rw,sync)' '/srv/nfs/tools  ol7b.example.com(ro,sync)' > /etc/exports
+[root@ol7a ~]# firewall-cmd -q --permanent --add-service={nfs,mountd,rpc-bind}; firewall-cmd -q --reload; systemctl enable -q --now nfs-server; exportfs -v
+/srv/nfs/proj   ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/srv/nfs/tools  ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,ro,secure,root_squash,no_all_squash)
+-- 내보내기 두 개: proj(rw), tools(ro).
+-- p1~p3 는 proj 아래 하위 디렉터리라 따로 내보내지 않았다
+
+--------------------------------------------------------------------------------
+ [2] autofs 설치와 기본 구성 파일
+--------------------------------------------------------------------------------
+[root@ol7b ~]# yum -y -q install autofs; rpm -q autofs
+autofs-5.0.7-116.0.3.el7_9.1.x86_64
+-- autofs 5.0.7. yum -q 라 설치 과정은 출력되지 않았다
+-- 패키지가 주는 파일. auto.master 가 시작점이고 나머지는 예시 맵이다.
+[root@ol7b ~]# rpm -qc autofs
+/etc/auto.master
+/etc/auto.misc
+/etc/auto.net
+/etc/auto.smb
+/etc/autofs.conf
+/etc/autofs_ldap_auth.conf
+/etc/sysconfig/autofs
+/usr/lib/systemd/system/autofs.service
+-- rpm -qc : 패키지의 설정 파일 목록
+--   auto.master       : 마스터 맵
+--   auto.misc·net·smb : 예시 맵
+--   autofs.conf       : 데몬 설정(timeout 등)
+--   sysconfig/autofs  : 데몬 시작 옵션
+-- 주석을 뺀 auto.master. 줄 형식: 마운트지점  맵  [옵션]
+[root@ol7b ~]# grep -vE '^\s*(#|$)' /etc/auto.master
+/misc   /etc/auto.misc
+/net    -hosts
++dir:/etc/auto.master.d
++auto.master
+-- 줄 해설
+--   /misc  /etc/auto.misc  : 간접 맵 예시
+--   /net   -hosts          : 서버 이름으로 내보내기를 붙이는 특수 맵([변형])
+--   +dir:/etc/auto.master.d : 이 디렉터리의 *.autofs 를 포함
+--   +auto.master           : NIS 등 다른 출처의 auto.master 를 포함(여기서는 없음)
+-- 데몬 설정. TIMEOUT 이 유휴 해제 시간(초)의 기본값이다.
+[root@ol7b ~]# grep -vE '^\s*(#|$)' /etc/autofs.conf | head -20
+[ autofs ]
+timeout = 300
+browse_mode = no
+mount_nfs_default_protocol = 4
+[ amd ]
+dismount_interval = 300
+-- 패키지 기본 timeout = 300(초).
+-- 공식 문서에 나오는 600 이 아니라 7.9 의 autofs.conf 는 300 이다
+-- mount_nfs_default_protocol = 4 : 버전을 적지 않으면 v4 로 시도
+[root@ol7b ~]# grep -nE '^\s*#?\s*(timeout|negative_timeout|browse_mode|logging)\s*=' /etc/autofs.conf
+15:timeout = 300
+27:#negative_timeout = 60
+51:browse_mode = no
+71:#logging = none
+-- 행 번호가 붙은 결과
+--   27 #negative_timeout = 60 : 실패한 조회를 60초 기억(주석 = 기본값)
+--   51 browse_mode = no       : 마운트 전에는 키를 보여 주지 않음
+--   71 #logging = none        : 마운트·해제 로그 없음
+-- 기본 logging = none 이라 마운트·해제가 로그에 남지 않는다.
+-- 실습에서는 verbose 로 켠다.
+[root@ol7b ~]# sed -i 's/^#\s*logging = none/logging = verbose/' /etc/autofs.conf; grep -n '^logging' /etc/autofs.conf
+71:logging = verbose
+-- verbose 로 바꿨다. autofs 를 시작하기 전이라 재시작은 필요 없다
+
+--------------------------------------------------------------------------------
+ [3] 간접 맵 만들기 — /proj
+--------------------------------------------------------------------------------
+-- auto.master 를 직접 고치지 않고 auto.master.d 에 .autofs 파일을 둔다.
+-- 패키지 업데이트와 부딪히지 않는다.
+--   --timeout=20 : 실습에서 해제를 빨리 보려고 20초로 줄인다(기본 600초)
+[root@ol7b ~]# echo '/proj  /etc/auto.proj  --timeout=20' > /etc/auto.master.d/proj.autofs; cat /etc/auto.master.d/proj.autofs
+-- 마운트 지점 /proj, 맵 /etc/auto.proj, 맵 옵션 --timeout=20(이 맵만 20초)
+/proj  /etc/auto.proj  --timeout=20
+-- 맵 줄 형식: 키  -옵션  위치(서버:경로).
+-- 옵션 앞에 - 를 붙인다. 파일 시스템 종류를 적지 않으면 nfs 다.
+[root@ol7b ~]# cat > /etc/auto.proj <<'EOF'
+p1   -rw,sync   ol7a:/srv/nfs/proj/p1
+p2   -rw,sync   ol7a:/srv/nfs/proj/p2
+EOF
+[root@ol7b ~]# cat /etc/auto.proj
+p1   -rw,sync   ol7a:/srv/nfs/proj/p1
+p2   -rw,sync   ol7a:/srv/nfs/proj/p2
+-- 키 p1·p2, 옵션 -rw,sync, 위치 서버:경로. 파일 시스템 종류를 적지 않아 nfs
+-- /proj 는 만들지 않는다. automount 가 만든다.
+[root@ol7b ~]# ls -ld /proj; systemctl enable --now autofs; systemctl is-active autofs; ls -ld /proj
+ls: cannot access /proj: No such file or directory
+Created symlink from /etc/systemd/system/multi-user.target.wants/autofs.service to /usr/lib/systemd/system/autofs.service.
+active
+drwxr-xr-x. 2 root root 0 Nov 16 17:23 /proj
+-- 시작 전에는 /proj 가 없었고(No such file), 시작 뒤 automount 가 만들었다
+-- 크기 0 은 autofs 형식 디렉터리의 특징이다
+
+--------------------------------------------------------------------------------
+ [4] 접근할 때 마운트된다
+--------------------------------------------------------------------------------
+-- 시작 직후의 /proj.
+-- autofs 파일 시스템만 걸려 있고 그 아래 NFS 는 아직 없다.
+[root@ol7b ~]# findmnt -R /proj
+TARGET SOURCE         FSTYPE OPTIONS
+/proj  /etc/auto.proj autofs rw,relatime,fd=18,pgrp=9288,timeout=20,minproto=5,maxproto=5,indirect,pipe_ino=35604
+-- /proj 에 autofs 가 걸렸다. OPTIONS 의 뜻
+--   fd·pgrp·pipe_ino : 커널과 automount 데몬이 통신하는 파이프
+--   timeout=20       : 유휴 해제 시간
+--   indirect         : 간접 맵
+[root@ol7b ~]# ls -la /proj
+total 4
+drwxr-xr-x.  2 root root    0 Nov 16 17:23 .
+dr-xr-xr-x. 20 root root 4096 Nov 16 17:23 ..
+-- 아직 아무것도 안 보인다. browse_mode = no 라 키를 미리 보여 주지 않는다
+-- 이름을 부르면 그때 마운트한다.
+[root@ol7b ~]# cat /proj/p1/README
+project p1
+-- 이름을 부르는 순간 마운트되어 내용이 나왔다
+[root@ol7b ~]# findmnt -R /proj -o TARGET,SOURCE,FSTYPE,OPTIONS | cut -c1-120
+TARGET     SOURCE                FSTYPE OPTIONS
+/proj      /etc/auto.proj        autofs rw,relatime,fd=18,pgrp=9288,timeout=20,minproto=5,maxproto=5,indirect,pipe_ino=3
+└─/proj/p1 ol7a:/srv/nfs/proj/p1 nfs4   rw,relatime,sync,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,ti
+-- /proj(autofs) 아래 /proj/p1(nfs4)이 생겼다.
+-- 맵의 sync 가 마운트 옵션에 들어갔다
+[root@ol7b ~]# ls /proj
+p1
+-- 이제 ls /proj 에 p1 이 보인다
+-- 일반 사용자의 접근도 마운트를 일으킨다.
+-- 마운트 자체는 automount(root)가 한다.
+[student@ol7b ~]$ ls /proj/p2; findmnt -n -o TARGET,SOURCE /proj/p2
+README
+/proj/p2 ol7a:/srv/nfs/proj/p2
+-- 일반 사용자 student 의 접근으로도 붙었다.
+-- 마운트 자체는 root 인 automount 가 한다
+
+--------------------------------------------------------------------------------
+ [5] 유휴 해제 — timeout 20초
+--------------------------------------------------------------------------------
+-- 아무도 쓰지 않으면 timeout 이 지난 뒤 해제된다.
+-- automount 는 timeout 의 1/4 간격으로 점검한다.
+-- 해제를 막는 것: 그 안에 cd 해 있는 셸,
+-- 열린 파일. 여기서는 아무것도 잡고 있지 않다.
+[root@ol7b ~]# date +%T; findmnt -n -t nfs4 -o TARGET
+17:23:13
+/proj/p1
+/proj/p2
+-- 17:23:13 에 두 개가 붙어 있다
+[root@ol7b ~]# sleep 35; date +%T; findmnt -n -t nfs4 -o TARGET | wc -l
+17:23:49
+0
+-- 35초 뒤 nfs4 마운트 0 개. 20초 timeout 에 점검 주기(5초)가 더해져 해제됐다
+[root@ol7b ~]# ls /proj
+-- 로그에 마운트·해제 기록이 남는다.
+[root@ol7b ~]# journalctl -u autofs --no-pager -o cat | grep -vE '^(Starting|Started)' | tail -8
+attempting to mount entry /proj/p1
+mounted /proj/p1
+attempting to mount entry /proj/p2
+mounted /proj/p2
+expiring path /proj/p1
+expired /proj/p1
+-- verbose 로그가 순서를 보여 준다
+--   attempting to mount entry → mounted : 접근 때 마운트
+--   expiring path → expired             : 유휴 해제
+expiring path /proj/p2
+expired /proj/p2
+
+--------------------------------------------------------------------------------
+ [6] 와일드카드 맵 — * 와 &
+--------------------------------------------------------------------------------
+-- 프로젝트가 늘 때마다 맵에 줄을 더하지 않으려면 * 키를 쓴다.
+-- & 는 찾던 키로 바뀐다.
+[root@ol7b ~]# cp -p /etc/auto.proj /root/auto.proj.v1
+[root@ol7b ~]# echo '*    -rw,sync   ol7a:/srv/nfs/proj/&' >> /etc/auto.proj; diff /root/auto.proj.v1 /etc/auto.proj
+2a3
+> *    -rw,sync   ol7a:/srv/nfs/proj/&
+-- 2a3 : 원본 2번째 줄 뒤에 3번째 줄 추가. * 는 어떤 키든, & 는 그 키
+-- 맵 파일(파일 형식 맵)을 고친 것은 다시 읽기 없이도 다음 조회 때 반영된다.
+-- auto.master 를 고치면 reload 가 필요하다.
+[root@ol7b ~]# cat /proj/p3/README; findmnt -n -o TARGET,SOURCE /proj/p3
+project p3
+/proj/p3 ol7a:/srv/nfs/proj/p3
+-- 맵에 없던 p3 가 와일드카드로 붙었다. reload 없이 바로 반영됐다
+-- 없는 프로젝트를 부르면 서버에 경로가 없어 실패한다.
+[root@ol7b ~]# ls /proj/p9; journalctl -u autofs --no-pager -o cat | tail -4
+ls: cannot access /proj/p9: No such file or directory
+attempting to mount entry /proj/p9
+>> mount.nfs: mounting ol7a:/srv/nfs/proj/p9 failed, reason given by server: No such file or directory
+mount(nfs): nfs: mount failure ol7a:/srv/nfs/proj/p9 on /proj/p9
+failed to mount /proj/p9
+-- p9 는 서버에 디렉터리가 없다.
+-- 서버가 준 이유(No such file or directory)가 로그에 그대로 있다
+-- 사용자 화면에는 "No such file or directory" 한 줄뿐이다
+
+--------------------------------------------------------------------------------
+ [7] 맵 문법 오류
+--------------------------------------------------------------------------------
+-- 옵션 앞의 - 를 빠뜨리는 실수를 넣는다.
+-- 서버 이름과 경로 사이의 : 도 하나 빠뜨린다.
+[root@ol7b ~]# printf '%s\n' 'tools   ro,sync    ol7a:/srv/nfs/tools' 'tools2  -ro        ol7a/srv/nfs/tools' >> /etc/auto.proj; tail -2 /etc/auto.proj
+-- 일부러 넣은 실수 두 가지
+--   tools  : 옵션 앞 - 가 없다
+--   tools2 : 서버와 경로 사이 : 가 없다
+tools   ro,sync    ol7a:/srv/nfs/tools
+tools2  -ro        ol7a/srv/nfs/tools
+[root@ol7b ~]# ls /proj/tools; ls /proj/tools2
+ls: cannot access /proj/tools: No such file or directory
+ls: cannot access /proj/tools2: No such file or directory
+-- 증상   : 두 키 모두 No such file or directory
+[root@ol7b ~]# journalctl -u autofs --no-pager -o cat | tail -8
+attempting to mount entry /proj/tools
+>> mount.nfs: mounting ol7a:/srv/nfs/proj/tools failed, reason given by server: No such file or directory
+mount(nfs): nfs: mount failure ol7a:/srv/nfs/proj/tools on /proj/tools
+failed to mount /proj/tools
+attempting to mount entry /proj/tools2
+>> mount.nfs: mounting ol7a:/srv/nfs/proj/tools2 failed, reason given by server: No such file or directory
+mount(nfs): nfs: mount failure ol7a:/srv/nfs/proj/tools2 on /proj/tools2
+failed to mount /proj/tools2
+-- 그런데 로그를 보면 문법 오류가 아니다.
+-- autofs 가 ol7a:/srv/nfs/proj/tools 를 마운트하려 했다
+-- tools 줄이 아니라 와일드카드 * 줄이 쓰였다
+-- 무엇이 잘못 읽혔는지 automount -m 으로 본다.
+-- 맵을 어떻게 해석했는지 그대로 보여 준다.
+[root@ol7b ~]# automount -m 2>&1 | grep -A16 'Mount point: /proj' | head -24
+Mount point: /proj
+
+source(s):
+
+  instance type(s): file 
+  map: /etc/auto.proj
+
+  tools2 | -ro        ol7a/srv/nfs/tools
+  p2 | -rw,sync   ol7a:/srv/nfs/proj/p2
+  * | -rw,sync   ol7a:/srv/nfs/proj/&
+  p1 | -rw,sync   ol7a:/srv/nfs/proj/p1
+  tools | ro,sync    ol7a:/srv/nfs/tools
+-- automount -m : 맵을 읽은 결과(키 | 나머지)
+-- 원인   : 맵 파일은 위에서부터 찾는다. * 가 tools·tools2 보다 앞에 있어 모든 키를 먼저 가져갔다
+--          (-m 의 표시 순서는 내부 해시 순서라 파일 순서와 다르다)
+-- 맵 파일은 위에서부터 읽는다. 와일드카드 줄을 맵 맨 끝으로 옮긴다.
+[root@ol7b ~]# sed -i '/^\*/d' /etc/auto.proj; echo '*    -rw,sync   ol7a:/srv/nfs/proj/&' >> /etc/auto.proj; cat /etc/auto.proj
+p1   -rw,sync   ol7a:/srv/nfs/proj/p1
+p2   -rw,sync   ol7a:/srv/nfs/proj/p2
+tools   ro,sync    ol7a:/srv/nfs/tools
+tools2  -ro        ol7a/srv/nfs/tools
+*    -rw,sync   ol7a:/srv/nfs/proj/&
+-- 조치   : (1) * 줄을 지우고 맨 끝에 다시 붙였다
+-- 실패한 조회는 음성 캐시(negative_timeout,
+-- 기본 60초)에 남는다. restart 로 비우고 다시 부른다.
+[root@ol7b ~]# systemctl restart autofs; ls /proj/tools; ls /proj/tools2; journalctl -u autofs --no-pager -o cat | grep -vE '^(Starting|Started|Stopp)' | tail -8
+ls: cannot access /proj/tools: No such file or directory
+ls: cannot access /proj/tools2: No such file or directory
+mounted indirect on /net with timeout 300, freq 75 seconds
+mounted indirect on /proj with timeout 20, freq 5 seconds
+attempting to mount entry /proj/tools
+validate_location: invalid character " " found in location ro,sync    ol7a:/srv/nfs/tools
+failed to mount /proj/tools
+attempting to mount entry /proj/tools2
+mount(nfs): no hosts available
+failed to mount /proj/tools2
+-- restart 로 음성 캐시를 비우고 다시 불렀다.
+-- 이제 진짜 문법 오류가 드러난다
+--   tools  : validate_location: invalid character " " found in location ro,sync ...
+--            - 가 없어 "ro,sync    ol7a:/srv/nfs/tools" 전체를 위치로 읽었다
+--   tools2 : mount(nfs): no hosts available
+--            : 가 없어 ol7a/srv/nfs/tools 를 서버 이름이 없는 위치로 읽었다
+-- 와일드카드가 가리고 있던 오류다
+-- 두 줄의 문법을 고친다.
+[root@ol7b ~]# sed -i 's|^tools   ro,sync|tools   -ro,sync|; s|ol7a/srv/nfs/tools|ol7a:/srv/nfs/tools|' /etc/auto.proj; cat /etc/auto.proj
+p1   -rw,sync   ol7a:/srv/nfs/proj/p1
+p2   -rw,sync   ol7a:/srv/nfs/proj/p2
+tools   -ro,sync    ol7a:/srv/nfs/tools
+tools2  -ro        ol7a:/srv/nfs/tools
+*    -rw,sync   ol7a:/srv/nfs/proj/&
+--          (2) - 와 : 를 넣었다. * 는 맨 끝에 있다
+[root@ol7b ~]# systemctl restart autofs; cat /proj/tools/VERSION; cat /proj/tools2/VERSION; findmnt -n -o TARGET,SOURCE /proj/tools; findmnt -n -o TARGET,SOURCE /proj/tools2
+shared tools
+shared tools
+/proj/tools ol7a:/srv/nfs/tools
+/proj/tools2 ol7a:/srv/nfs/tools
+-- 재확인 : 두 키 모두 shared tools, ol7a:/srv/nfs/tools 로 붙었다
+
+--------------------------------------------------------------------------------
+ [8] 마운트 지점을 손대면 생기는 일
+--------------------------------------------------------------------------------
+-- autofs 가 관리하는 /proj 안에 직접 디렉터리를 만들려고 한다.
+[root@ol7b ~]# mkdir /proj/mine; echo "rc=$?"
+mkdir: cannot create directory ‘/proj/mine’: Permission denied
+rc=1
+-- autofs 가 관리하는 /proj 안에는 root 도 디렉터리를 만들 수 없다
+-- autofs 를 멈춘 상태에서 /proj 안에 로컬 파일을 둔다.
+-- 다른 관리자가 "빈 디렉터리니 써도 되겠지" 하고 쓴 상황.
+[root@ol7b ~]# systemctl stop autofs; ls -la /proj; mkdir -p /proj/local; echo "local data" > /proj/local/important.txt; ls -R /proj
+-- autofs 를 멈추자 /proj 가 사라졌고(automount 가 만든 것),
+-- mkdir -p 로 평범한 디렉터리를 만들어 썼다
+ls: cannot access /proj: No such file or directory
+/proj:
+local
+
+/proj/local:
+important.txt
+[root@ol7b ~]# systemctl start autofs; ls -la /proj; ls /proj/local; echo "rc=$?"
+total 4
+drwxr-xr-x.  2 root root    0 Nov 16 17:23 .
+dr-xr-xr-x. 20 root root 4096 Nov 16 17:23 ..
+ls: cannot access /proj/local: No such file or directory
+rc=2
+-- 증상   : autofs 를 다시 시작하자 /proj 가 비어 보이고 local 이 없다
+-- 원인   : 로컬 디렉터리 /proj 위에 autofs 가 걸려 아래 내용을 가렸다
+-- 파일은 지워지지 않았다. autofs 마운트 밑에 가려졌을 뿐이다.
+[root@ol7b ~]# systemctl stop autofs; cat /proj/local/important.txt; rm -rf /proj/local; systemctl start autofs
+local data
+-- 조치   : autofs 를 멈추면 파일이 그대로 있다. 옮기거나 지운 뒤 다시 시작한다
+-- 재확인 : cat 이 local data 를 보였다. 지워진 것이 아니라 가려졌던 것이다
+
+--------------------------------------------------------------------------------
+ [9] browse 모드 — 마운트 전에도 이름 보이기
+--------------------------------------------------------------------------------
+-- 기본은 browse_mode = no 라 ls /proj 에 마운트된 것만 보인다.
+-- 사용자가 이름을 모르면 접근할 수 없다.
+-- --ghost(= browse) 를 주면 맵의 키를 빈 디렉터리로 미리 보여 준다.
+-- 와일드카드 키(*)는 보여 줄 수 없다.
+[root@ol7b ~]# sed -i 's|--timeout=20|--timeout=20 --ghost|' /etc/auto.master.d/proj.autofs; cat /etc/auto.master.d/proj.autofs
+/proj  /etc/auto.proj  --timeout=20 --ghost
+-- --ghost : 맵의 키를 마운트 전에도 빈 디렉터리로 보여 준다
+[root@ol7b ~]# systemctl reload autofs; ls -l /proj
+total 0
+-- reload 로는 바뀌지 않았다. 이미 걸린 /proj 의 옵션은 그대로다
+-- reload 로는 이미 걸린 마운트 지점의 옵션이 바뀌지 않았다면 restart 로 다시 건다.
+[root@ol7b ~]# systemctl restart autofs; ls -l /proj; findmnt -n -t nfs4 | wc -l
+total 0
+dr-xr-xr-x. 2 root root 0 Nov 16 17:23 p1
+dr-xr-xr-x. 2 root root 0 Nov 16 17:23 p2
+dr-xr-xr-x. 2 root root 0 Nov 16 17:23 tools
+dr-xr-xr-x. 2 root root 0 Nov 16 17:23 tools2
+0
+-- restart 뒤에는 p1·p2·tools·tools2 가 보인다. 마운트는 0 개(보이기만 한다)
+-- 와일드카드 * 로 붙는 p3 는 목록에 없다.
+-- 이름을 모르는 키는 미리 보여 줄 수 없다
+-- 권한 dr-xr-xr-x 의 빈 디렉터리다. 들어가는 순간 마운트된다
+
+--------------------------------------------------------------------------------
+ [10] 직접 맵 — /-
+--------------------------------------------------------------------------------
+-- 직접 맵은 키가 절대 경로다.
+-- 기존 디렉터리 구조 중간에 NFS 를 끼워 넣을 때 쓴다.
+[root@ol7b ~]# echo '/-  /etc/auto.direct  --timeout=20' > /etc/auto.master.d/direct.autofs
+[root@ol7b ~]# echo '/opt/tools  -ro  ol7a:/srv/nfs/tools' > /etc/auto.direct
+[root@ol7b ~]# systemctl reload autofs; sleep 2; findmnt -t autofs -o TARGET,SOURCE,FSTYPE
+TARGET                   SOURCE           FSTYPE
+/proc/sys/fs/binfmt_misc systemd-1        autofs
+/misc                    /etc/auto.misc   autofs
+/net                     -hosts           autofs
+/proj                    /etc/auto.proj   autofs
+/opt/tools               /etc/auto.direct autofs
+-- 직접 맵은 키마다 autofs 마운트가 하나씩 걸린다. /opt/tools 에 직접 걸렸다
+-- 맨 위 binfmt_misc 는 systemd 의 것이고 /misc·/net 은 auto.master 기본 줄이다
+[root@ol7b ~]# cat /opt/tools/VERSION; findmnt -n -o TARGET,SOURCE,FSTYPE /opt/tools | head -3
+shared tools
+/opt/tools /etc/auto.direct    autofs
+/opt/tools ol7a:/srv/nfs/tools nfs4
+-- 같은 경로에 두 줄: 아래가 autofs, 위에 nfs4 가 덮였다
+-- /opt 의 다른 내용은 그대로다.
+-- 기존 디렉터리 구조 한가운데에 NFS 하나를 끼운 모양이다
+
+--------------------------------------------------------------------------------
+ [변형] -hosts 맵 — /net/서버이름
+--------------------------------------------------------------------------------
+-- 주석을 뺀 auto.master 에 /net -hosts 가 이미 있었다([2]).
+-- 서버 이름만으로 그 서버의 내보내기 전체가 보인다.
+-- 맵 파일을 만들지 않는 대신 showmount 가 쓰는 mountd 를 서버가 열어 두어야 한다.
+[root@ol7b ~]# ls /net/ol7a; ls /net/ol7a/srv/nfs; cat /net/ol7a/srv/nfs/proj/p1/README
+srv
+proj
+tools
+project p1
+-- /net/ol7a 아래 srv → nfs → proj·tools.
+-- 서버의 내보내기를 경로대로 보여 준다
+-- 맵 파일을 만들지 않았다. 목록은 서버 mountd 에 물어 얻는다
+[root@ol7b ~]# findmnt -n -o TARGET,SOURCE,OPTIONS -t nfs4 | grep /net | cut -c1-110
+/net/ol7a/srv/nfs/proj ol7a:/srv/nfs/proj  rw,nosuid,nodev,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=
+-- /net 아래 마운트에는 nosuid,nodev 가 붙었다. /proj 의 마운트에는 없었다
+-- 출처를 모르는 서버의 setuid 파일과 장치 파일을 막는 기본값이다
+-- /net 이 쓰는 기본 옵션에는 nosuid,nodev 가 들어 있다.
+-- 간접 맵 /proj 에는 없다.
+
+--------------------------------------------------------------------------------
+ [11] 되돌리기
+--------------------------------------------------------------------------------
+[root@ol7b ~]# systemctl disable --now autofs; rm -f /etc/auto.master.d/proj.autofs /etc/auto.master.d/direct.autofs /etc/auto.proj /etc/auto.direct /root/auto.proj.v1
+Removed symlink /etc/systemd/system/multi-user.target.wants/autofs.service.
+[root@ol7b ~]# rmdir /proj; systemctl is-active autofs; ls /etc/auto.master.d | wc -l; findmnt -t autofs,nfs4 | wc -l; ls -d /proj /opt/tools 2>&1
+unknown
+0
+2
+ls: cannot access /proj: No such file or directory
+ls: cannot access /opt/tools: No such file or directory
+-- autofs unknown, auto.master.d 비어 있음(0),
+-- findmnt 2 줄(머리글 + binfmt_misc) — [0] 과 같다
+-- /proj 는 rmdir 로, /opt/tools 는 autofs 가 지웠다
+[root@ol7a ~]# exportfs -ua; : > /etc/exports; systemctl disable -q --now nfs-server; firewall-cmd -q --permanent --remove-service={nfs,mountd,rpc-bind}; firewall-cmd -q --reload
+[root@ol7a ~]# rm -rf /srv/nfs; firewall-cmd --list-services; systemctl is-active nfs-server
+dhcpv6-client ssh
+inactive
+-- 서버도 기준 상태.
+-- autofs 패키지는 설치된 채 남았다(스냅샷 되돌리기로 지운다)
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                     관찰
+--  autofs.conf 기본값       timeout 300, negative_timeout 60(주석), browse_mode no, logging none
+--  /proj --timeout=20       35초 뒤 nfs4 마운트 0, 로그 expiring → expired
+--  와일드카드 * + &         p3 자동 마운트, 없는 p9 는 서버 No such file
+--  * 뒤에 둔 키             * 가 먼저 잡아 /srv/nfs/proj/tools 로 마운트 시도
+--  - 누락                   validate_location: invalid character " " found in location
+--  : 누락                   mount(nfs): no hosts available
+--  /proj 안 mkdir           Permission denied
+--  정지 중 쓴 로컬 파일      재시작 뒤 가려짐, 정지하면 다시 보임
+--  --ghost                  reload 로는 반영 안 됨, restart 뒤 p1 p2 tools tools2 표시
+--  직접 맵 /opt/tools       키마다 autofs 마운트, 접근 때 nfs4
+--  -hosts /net              nosuid,nodev 기본
+--
+--  항목             시작 전          되돌린 뒤
+--  autofs           미설치           설치·inactive
+--  auto.master.d    비어 있음        비어 있음
+--  autofs 마운트    binfmt_misc 만   binfmt_misc 만
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. auto.proj 의 p1 줄에 -fstype=nfs,vers=3 을 주고 마운트한다
+--    확인: findmnt 의 FSTYPE 이 nfs, nfsstat -m 에 vers=3
+-- 2. /etc/autofs.conf 의 negative_timeout 을 10 으로 바꾸고 [7] 처럼 고친 맵을 다시 부른다
+--    확인: restart 없이 10초 뒤 붙는지
+-- 3. 학생 홈 디렉터리를 /home2/* 와일드카드 맵으로 만든다
+--    확인: su - 사용자 로 로그인할 때 그 홈이 붙는지
+
+================================================================================
+ 실습 03 종료 — 20초 유휴 해제 확인, 와일드카드가 뒤의 키를 가로챈 맵 오류를 순서·문법 수정으로 해결
+================================================================================

@@ -1,0 +1,595 @@
+================================================================================
+ 제4장 실습 01 — chrony 서버와 클라이언트 (ol7a → ol7b)
+ 대상   : ol7a (시간 서버), ol7b (클라이언트)
+ 목표   : ol7a 의 chronyd 를 랩 안의 시간 서버로 만들고 ol7b 가 인터넷 pool 대신
+          ol7a 만 바라보게 바꾼다. chrony.conf 의 server·allow·local stratum,
+          chronyc sources -v·tracking·clients·serverstats 출력의 열을 읽는다
+ 배경   : chronyd 는 OL 7 의 기본 시간 동기화 데몬이다. 같은 데몬이 클라이언트이면서
+          server 지시어로 위를 보고, allow 지시어로 아래(다른 호스트)에 시간을 준다.
+          allow 가 없으면 NTP 요청을 받아도 응답하지 않는다. 바깥에서 오는 요청은
+          firewalld 의 ntp 서비스(123/udp)도 통과해야 한다. local stratum 은 위쪽
+          서버를 잃었을 때도 자기 시계로 계속 응답하게 한다 (본문 4.3 절)
+ 소요   : 약 25분
+ 선행   : ol7a 는 ol7-base, ol7b 는 ol7b-base. 두 노드 모두 chronyd 가 켜져 있고
+          0~3.pool.ntp.org 로 동기화된 상태
+ 계정   : root (두 노드)
+ 주의   : chrony.conf 와 방화벽만 바꾼다. 끝에서 원래 파일로 되돌린다
+ 되돌림 : 두 노드 chrony.conf 가 백업과 같고(diff 무출력), ol7a 방화벽에 ntp 가 없고,
+          ol7b 의 chronyc sources 가 다시 pool 서버 4개를 보임
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 두 노드의 현재 시간 원천부터 남긴다. 마지막 단계에서 이 출력과 비교한다.
+-- chronyc sources 는 chronyd 가 지금 쓰고 있는 시간 원천 목록이다.
+[root@ol7a ~]# chronyc sources
+210 Number of sources = 4
+MS Name/IP address         Stratum Poll Reach LastRx Last sample               
+===============================================================================
+^- 211.222.238.30                2   6    37     5   +381us[ +381us] +/-   80ms
+^- ec2-3-39-176-65.ap-north>     2   6    37     4    -96us[  -96us] +/- 4093us
+^* 121.134.215.104               2   6    37     5  +4562ns[ -118us] +/- 1971us
+^- 121.174.142.82                3   6    17    69   +299us[ +186us] +/-   51ms
+
+-- 첫 줄 "210 Number of sources = 4" 는 응답 코드와 원천 수다.
+-- 열은 [6] 에서 -v 로 읽는다. 지금은 첫 두 글자만 본다.
+--   ^* 121.134.215.104 : 지금 따르는 서버. stratum 2
+--   ^- 나머지 셋        : 후보지만 계산에서 뺀 서버
+-- pool.ntp.org 는 물을 때마다 다른 서버를 준다.
+--   이름이 매번 바뀌는 것이 정상이다.
+
+[root@ol7b ~]# chronyc sources
+210 Number of sources = 4
+MS Name/IP address         Stratum Poll Reach LastRx Last sample               
+===============================================================================
+^- ec2-3-39-176-65.ap-north>     2   6    17     5   +134us[ +244us] +/- 3889us
+^? mail.zeroweb.kr               0   6     0     -     +0ns[   +0ns] +/-    0ns
+^* 211.108.117.211               2   6    17     5    +15us[ +125us] +/- 1300us
+^? 121.174.142.82                3   7    40    11   +789us[-2095ms] +/-   51ms
+
+-- ol7b 는 ^? 가 둘이다. mail.zeroweb.kr 은 stratum 0,
+--   Reach 0, LastRx "-" — 한 번도 응답이 없었다.
+-- 마지막 줄의 [-2095ms] 는 부팅 직후 약 2초를 한 번에
+--   옮긴(step) 흔적이다. 스냅샷 시각이 늦어서 생긴 차이다.
+
+-- 설정 파일은 주석과 빈 줄을 뺀 실제 지시어만 본다.
+-- grep -v '^#' 로 주석 줄을, grep -v '^$' 로 빈 줄을 뺐다. 원본 파일은
+--   이보다 훨씬 길다.
+[root@ol7a ~]# grep -v '^#' /etc/chrony.conf | grep -v '^$'
+server 0.pool.ntp.org iburst
+server 1.pool.ntp.org iburst
+server 2.pool.ntp.org iburst
+server 3.pool.ntp.org iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
+logdir /var/log/chrony
+
+-- 주석을 뺀 실제 지시어는 여덟 줄이다.
+--   server ... iburst : 위쪽 서버 넷. iburst 는 시작 직후
+--                       네 번을 짧은 간격으로 물음
+--   driftfile         : 시계의 고유 오차(ppm) 저장 파일
+--   makestep 1.0 3    : 시작 후 세 번 측정 안에서만
+--                       1초 넘는 차이를 한 번에 맞춤
+--   rtcsync           : 커널이 11분마다 RTC 를 맞추게 함
+--   logdir            : 측정 로그를 켰을 때 쓸 곳
+-- allow 가 없다. 기본 chronyd 는 시간을 받기만 한다.
+
+[root@ol7b ~]# grep -v '^#' /etc/chrony.conf | grep -v '^$' | md5sum
+09b2733c11deeebfc18a1b1b728a4c2c  -
+
+-- 원본을 /root 에 복사해 둔다. cp -p 는 권한·시각을 보존한다. md5sum 은 두
+--   노드 설정 비교용.
+[root@ol7a ~]# cp -p /etc/chrony.conf /root/chrony.conf.orig; grep -v '^#' /etc/chrony.conf | grep -v '^$' | md5sum
+09b2733c11deeebfc18a1b1b728a4c2c  -
+
+-- 두 값이 09b2733c... 로 같다. 두 노드 설정이 똑같다.
+
+[root@ol7b ~]# cp -p /etc/chrony.conf /root/chrony.conf.orig
+
+-- ol7a 방화벽이 지금 무엇을 열어 두었는지. --list-services 는 서비스 이름만
+--   한 줄로 보인다.
+[root@ol7a ~]# firewall-cmd --list-services; firewall-cmd --permanent --list-services
+dhcpv6-client ssh
+dhcpv6-client ssh
+
+-- 첫 줄은 런타임(지금 적용된) 설정, 둘째 줄은 영구(재시작·재부팅 뒤) 설정이다.
+-- 열린 서비스는 dhcpv6-client 와 ssh 뿐. ntp(123/udp)는 막혀 있다.
+
+-- chronyd 가 어떤 UDP 포트를 열고 있는지. ss 옵션: -u UDP, -l 대기 중,
+--   -p 프로세스, -n 숫자로.
+[root@ol7a ~]# ss -ulpn | grep chronyd
+UNCONN 0      0          127.0.0.1:323       0.0.0.0:*    users:(("chronyd",pid=1423,fd=5))
+UNCONN 0      0              [::1]:323          [::]:*    users:(("chronyd",pid=1423,fd=6))
+
+-- 열의 뜻 — 상태 | 수신 큐 | 송신 큐 | 로컬 주소:포트 | 상대 주소:포트 | 프로세스
+--   UDP 는 연결이 없어 상태가 UNCONN 으로 찍힌다.
+-- chronyd 는 127.0.0.1:323 과 [::1]:323 만 듣고 있다. chronyc
+--   가 데몬과 이야기하는 명령 포트다.
+-- 0.0.0.0:123 이 없다. NTP 서버 포트가 열려 있지 않다. 이것이 [5] 오류의
+--   실마리다.
+
+--------------------------------------------------------------------------------
+ [1] 기본 chrony.conf 의 지시어 읽기
+--------------------------------------------------------------------------------
+
+-- 주석 안에는 쓰지 않은 지시어 예시가 들어 있다. 어떤 것이 꺼져 있는지 확인한다.
+-- -n 은 줄 번호. allow·local·hwtimestamp 가 주석으로만 있는지 본다.
+[root@ol7a ~]# grep -n -E '^#?(allow|local|hwtimestamp|keyfile|minsources|leapsectz)' /etc/chrony.conf
+19:#hwtimestamp *
+23:#minsources 2
+26:#allow 192.168.0.0/16
+29:#local stratum 10
+32:#keyfile /etc/chrony.keys
+
+-- 모두 # 로 시작하는 예시다. allow(26행)와 local stratum
+--   (29행)이 이 실습에서 켤 두 지시어다.
+
+-- chronyd 가 쓰는 보조 파일. drift 파일은 시계가 얼마나 빨리/늦게
+--   가는지(ppm)를 저장한다.
+[root@ol7a ~]# ls -l /var/lib/chrony/ /var/log/chrony/; cat /var/lib/chrony/drift
+/var/lib/chrony/:
+total 4
+-rw-r--r--. 1 chrony chrony 42 Nov 11 20:43 drift
+
+-- drift 의 -18.774591 은 이 VM 시계가 보정 없이 약
+--   18.8 ppm 늦게 간다는 뜻이다. 하루 1.6초쯤이다.
+
+/var/log/chrony/:
+total 0
+          -18.774591             4.873614
+
+--------------------------------------------------------------------------------
+ [2] ol7a 를 서버로 — local stratum 만 넣고 allow 는 빠뜨림
+--------------------------------------------------------------------------------
+
+-- 위쪽 pool 서버는 그대로 두고, 그것을 잃었을 때 자기 시계로 stratum 10 을
+--   내도록 한다.
+-- 일부러 allow 는 넣지 않는다. 이 상태가 오류 ① 의 출발점이다.
+[root@ol7a ~]# echo 'local stratum 10' >> /etc/chrony.conf; diff /root/chrony.conf.orig /etc/chrony.conf
+38a39
+> local stratum 10
+
+-- diff 출력 "38a39" 는 원본 38 줄 뒤에(a = add) 새 파일의 39 번째 줄이
+--   붙었다는 뜻. > 는 새 파일 쪽 내용.
+
+[root@ol7a ~]# systemctl restart chronyd; sleep 3; systemctl is-active chronyd
+active
+[root@ol7a ~]# ss -ulpn | grep chronyd
+UNCONN 0      0          127.0.0.1:323       0.0.0.0:*    users:(("chronyd",pid=2171,fd=5))
+UNCONN 0      0              [::1]:323          [::]:*    users:(("chronyd",pid=2171,fd=6))
+
+-- PID 가 바뀌었을 뿐 포트는 그대로 323 둘이다. local stratum 만으로는 서버
+--   포트가 열리지 않는다.
+
+--------------------------------------------------------------------------------
+ [3] ol7b 를 ol7a 의 클라이언트로
+--------------------------------------------------------------------------------
+
+-- pool 서버 네 줄을 주석으로 막고 ol7a 한 줄만 넣는다.
+-- sed 의 \(...\) 는 묶음, \1 은 그 묶음을 다시 쓰라는 뜻. 0~3 번호를 살린
+--   채 앞에 # 만 붙인다.
+-- iburst 는 시작 직후 4번을 짧은 간격으로 보내 첫 동기화를 빨리 끝내게 한다.
+[root@ol7b ~]# sed -i 's/^server \([0-3]\)\.pool/#server \1.pool/' /etc/chrony.conf
+[root@ol7b ~]# echo 'server ol7a.example.com iburst' >> /etc/chrony.conf
+[root@ol7b ~]# grep -E '^#?server' /etc/chrony.conf
+#server 0.pool.ntp.org iburst
+#server 1.pool.ntp.org iburst
+#server 2.pool.ntp.org iburst
+#server 3.pool.ntp.org iburst
+server ol7a.example.com iburst
+
+-- pool 네 줄 앞에 # 이 붙었고 끝에 ol7a 한 줄이 붙었다.
+
+[root@ol7b ~]# getent hosts ol7a.example.com
+172.16.225.61   ol7a.example.com ol7a
+[root@ol7b ~]# systemctl restart chronyd; sleep 20; chronyc sources
+210 Number of sources = 1
+MS Name/IP address         Stratum Poll Reach LastRx Last sample               
+===============================================================================
+^? ol7a.example.com              0   7     0     -     +0ns[   +0ns] +/-    0ns
+
+-- 20초를 기다렸는데도 ^? 에 stratum 0, Reach 0, LastRx "-". 응답이
+--   한 번도 오지 않았다.
+-- Poll 이 7(128초)로 늘었다. 응답이 없으면 chronyd 는 조회 간격을 점점 벌린다.
+-- 원인 후보는 셋이다. 이름 해석(위에서 아님을 확인), 서버 방화벽, 서버의 allow.
+
+--------------------------------------------------------------------------------
+ [4] 오류 ② — 방화벽이 123/udp 를 막고 있음
+--------------------------------------------------------------------------------
+
+-- ol7a 쪽에서 요청이 들어오기는 하는지부터 본다.
+-- serverstats 는 chronyd 가 서버로서 받은·버린 패킷 수를 센다.
+[root@ol7a ~]# chronyc serverstats
+NTP packets received       : 0
+NTP packets dropped        : 0
+Command packets received   : 1
+Command packets dropped    : 0
+Client log records dropped : 0
+
+-- 서버가 받은 패킷 수다.
+--   NTP packets received 0    : NTP 요청이 chronyd 까지 하나도 오지 않았다
+--   Command packets received 1: 방금 친 chronyc 명령 자체(323
+--     포트)
+-- 방화벽에서 막혔든 포트가 닫혀 있든 이 숫자는 0 이다. 둘을 가르려면 ss 와 방화벽을 함께
+--   본다.
+
+-- 방화벽에서 거부된 패킷은 기본 설정에서 로그로 남지 않는다. 열린 서비스 목록을 다시 본다.
+[root@ol7a ~]# firewall-cmd --list-services
+dhcpv6-client ssh
+[root@ol7a ~]# firewall-cmd --info-service=ntp | grep ports
+  ports: 123/udp
+  source-ports: 
+
+-- 방화벽의 ntp 서비스 정의는 123/udp 하나다.
+-- grep ports 가 source-ports 줄(빈 값)도 함께 잡았다.
+
+-- 런타임과 영구 설정 양쪽에 ntp 를 넣는다. --permanent 만 하면 --reload
+--   전까지 적용되지 않는다.
+[root@ol7a ~]# firewall-cmd --add-service=ntp; firewall-cmd --permanent --add-service=ntp
+success
+success
+[root@ol7a ~]# firewall-cmd --list-services; firewall-cmd --permanent --list-services
+dhcpv6-client ntp ssh
+dhcpv6-client ntp ssh
+
+-- ol7b 에서 바로 다시 요청하게 한다. burst 4/4 는 좋은 응답 4개를 얻을 때까지
+--   최대 4번 보낸다.
+[root@ol7b ~]# chronyc burst 4/4; sleep 12; chronyc sources
+200 OK
+210 Number of sources = 1
+MS Name/IP address         Stratum Poll Reach LastRx Last sample               
+===============================================================================
+^? ol7a.example.com              0   8     0     -     +0ns[   +0ns] +/-    0ns
+
+-- burst 는 200 OK 를 돌려줬지만 결과는 여전히 ^? Reach 0. Poll 은
+--   8(256초)까지 늘었다.
+-- 증상   : 방화벽에 ntp 를 열었는데도 ol7b 의 sources 가 "^?
+--          ol7a.example.com 0 8 0 -"
+-- 원인   : 방화벽은 원인의 절반이었다. ol7a 의 chronyd 가 123 포트를 아예
+--          열지 않았다([2] 의 ss 출력).
+--          방화벽을 통과한 패킷도 받을 곳이 없다
+-- 조치   : 방화벽 설정은 그대로 두고 [5] 에서 allow 를 넣는다
+-- 재확인 : [5] 의 ss -ulpn 에 0.0.0.0:123 이 보이고 ol7b
+--          sources 에 ^* 가 생김
+
+--------------------------------------------------------------------------------
+ [5] 오류 ① — allow 가 없어 응답하지 않음
+--------------------------------------------------------------------------------
+
+-- 이번에는 패킷이 ol7a 의 chronyd 까지 오는지 serverstats 로 확인한다.
+[root@ol7a ~]# chronyc serverstats | head -1
+NTP packets received       : 0
+
+-- 방화벽을 연 뒤에도 NTP packets received 0.
+
+-- 어느 대역에 시간을 줄지 allow 로 정한다. 랩 대역 172.16.225.0/24 전체를
+--   허용한다.
+[root@ol7a ~]# echo 'allow 172.16.225.0/24' >> /etc/chrony.conf; diff /root/chrony.conf.orig /etc/chrony.conf
+38a39,40
+> local stratum 10
+> allow 172.16.225.0/24
+
+-- 원본 대비 두 줄이 붙었다. local stratum 10 과 allow
+--   172.16.225.0/24.
+
+[root@ol7a ~]# systemctl restart chronyd; sleep 3; ss -ulpn | grep chronyd
+UNCONN 0      0            0.0.0.0:123       0.0.0.0:*    users:(("chronyd",pid=2360,fd=7))
+UNCONN 0      0          127.0.0.1:323       0.0.0.0:*    users:(("chronyd",pid=2360,fd=5))
+UNCONN 0      0              [::1]:323          [::]:*    users:(("chronyd",pid=2360,fd=6))
+
+-- 0.0.0.0:123 이 새로 열렸다. allow 가 하나라도 있어야 chronyd 가 NTP
+--   서버 포트를 연다.
+-- 0.0.0.0 은 모든 IPv4 주소에서 받는다는 뜻이다. 누구에게 응답할지는 allow
+--   대역이 다시 거른다.
+
+-- ol7a 가 위쪽 pool 과 다시 동기화돼야 ol7b 에게 쓸모 있는 시간을 준다. 잠시
+--   기다린다.
+[root@ol7a ~]# chronyc sources
+210 Number of sources = 4
+MS Name/IP address         Stratum Poll Reach LastRx Last sample               
+===============================================================================
+^- any.time.nl                   2   6    17    16   +457us[ +457us] +/-   18ms
+^+ mail.innotab.com              2   6    17    17   +200us[ +160us] +/- 5633us
+^* 121.134.215.104               2   6    17    17   +109us[  +68us] +/- 1951us
+^+ 193.123.243.2                 3   6    17    17   -301us[ -342us] +/- 3920us
+
+-- ol7a 자신은 재시작 뒤 pool 서버와 다시 동기화했다.
+--   ^* 121.134.215.104, Reach 17(최근 네 번 성공).
+-- ^+ 두 줄은 함께 계산에 쓰는 후보다.
+-- 서버가 먼저 동기화돼 있어야 클라이언트에게 쓸모 있는 시간을 준다.
+
+[root@ol7b ~]# chronyc burst 4/4; sleep 15; chronyc sources
+200 OK
+210 Number of sources = 1
+MS Name/IP address         Stratum Poll Reach LastRx Last sample               
+===============================================================================
+^* ol7a.example.com              3   6    17     9    +63ns[+2110ns] +/- 3031us
+
+-- ^* ol7a.example.com, stratum 3, Reach 17. ol7b 가
+--   ol7a 를 따르기 시작했다.
+-- ol7a 의 stratum 이 3 인 것은 ol7a 가 stratum 2 서버를
+--   따르기 때문이다.
+-- 증상   : ol7b 의 chronyc sources 가 "^? ol7a.example.com
+--          0 7 0 -" (Reach 0)
+-- 원인   : ol7a 의 chrony.conf 에 allow 가 없어 chronyd 가
+--          123/udp 를 열지 않았다.
+--          ss -ulpn 에 323 포트 둘만 있었고 serverstats 의 NTP
+--            packets received 가 0
+-- 조치   : ol7a 에 allow 172.16.225.0/24 를 넣고 systemctl
+--          restart chronyd,
+--          ol7b 에서 chronyc burst 4/4 로 바로 다시 묻게 함
+-- 재확인 : ol7a 의 ss 에 0.0.0.0:123, ol7b 의 sources 에 "^*
+--          ol7a.example.com",
+--          아래 serverstats 의 NTP packets received 가 0
+--            보다 큼
+
+[root@ol7a ~]# chronyc serverstats | head -1
+NTP packets received       : 4
+
+-- NTP packets received 4. burst 4/4 의 네 요청이 그대로 들어왔다.
+--   dropped 는 0.
+
+--------------------------------------------------------------------------------
+ [6] chronyc sources -v — 열 해석
+--------------------------------------------------------------------------------
+
+-- -v 는 각 기호와 열의 뜻을 머리말로 함께 찍는다.
+[root@ol7b ~]# chronyc sources -v
+210 Number of sources = 1
+
+-- -v 는 범례를 머리말로 함께 찍는다.
+-- Source mode : ^ 서버, = 피어, # 로컬 참조 시계
+-- Source state: * 동기화, + 함께 계산, - 뺌, ? 연결 안 됨,
+--   x 틀린 시계, ~ 변동 큼
+-- Reach 17 은 이진수 1111. 최근 네 번 성공했다.
+-- Poll 6 은 2^6 = 64초 간격.
+-- xxxx [ yyyy ] +/- zzzz = 보정 뒤 차이 [잰 차이] +/- 오차.
+-- +63ns[+2110ns] — 나노초 단위다. 같은 호스트의 두 VM 이라
+--   지연이 거의 없다.
+
+  .-- Source mode  '^' = server, '=' = peer, '#' = local clock.
+ / .- Source state '*' = current synced, '+' = combined , '-' = not combined,
+| /   '?' = unreachable, 'x' = time may be in error, '~' = time too variable.
+||                                                 .- xxxx [ yyyy ] +/- zzzz
+||      Reachability register (octal) -.           |  xxxx = adjusted offset,
+||      Log2(Polling interval) --.      |          |  yyyy = measured offset,
+||                                \     |          |  zzzz = estimated error.
+||                                 |    |           \
+MS Name/IP address         Stratum Poll Reach LastRx Last sample               
+===============================================================================
+^* ol7a.example.com              3   6    17    39    +63ns[+2110ns] +/- 3031us
+
+--------------------------------------------------------------------------------
+ [7] chronyc tracking — ol7b 의 시계 상태
+--------------------------------------------------------------------------------
+
+[root@ol7b ~]# chronyc tracking
+Reference ID    : AC10E13D (ol7a.example.com)
+Stratum         : 4
+Ref time (UTC)  : Thu Nov 12 11:20:31 2026
+System time     : 0.000000002 seconds slow of NTP time
+Last offset     : +0.000002047 seconds
+RMS offset      : 0.000002047 seconds
+Frequency       : 19.435 ppm slow
+Residual freq   : +0.814 ppm
+Skew            : 0.876 ppm
+Root delay      : 0.003833161 seconds
+Root dispersion : 0.001226303 seconds
+Update interval : 2.0 seconds
+Leap status     : Normal
+
+-- 줄별로 읽는다.
+-- Reference ID AC10E13D 는 172.16.225.61 의 16진수 표기다.
+-- Stratum 4 = ol7a(3) + 1.
+-- System time 0.000000002 seconds slow — 2나노초 늦다.
+-- Last offset, RMS offset 은 마지막 차이와 장기 평균.
+-- Frequency 19.435 ppm slow 는 이 VM 시계의 고유 오차다.
+--   ol7a 의 drift(약 18.8)와 비슷하다. 같은 호스트라서다.
+-- Root delay·dispersion 은 stratum 1 까지 누적된 지연과
+--   오차다. 위로 갈수록 커진다.
+-- Update interval 2.0 은 burst 로 짧게 물었기 때문이다.
+-- Leap status Normal — 동기화된 정상 상태.
+
+[root@ol7a ~]# chronyc tracking | head -3
+Reference ID    : 7986D768 (121.134.215.104)
+Stratum         : 3
+Ref time (UTC)  : Thu Nov 12 11:20:09 2026
+
+--------------------------------------------------------------------------------
+ [8] 서버 쪽에서 보기 — chronyc clients
+--------------------------------------------------------------------------------
+
+-- clients 는 이 chronyd 에 NTP 요청을 보낸 호스트 목록이다. allow 가
+--   있어야 기록된다.
+[root@ol7a ~]# chronyc clients
+Hostname                      NTP   Drop Int IntL Last     Cmd   Drop Int  Last
+===============================================================================
+ol7b.example.com                4      0   1   -    38       0      0   -     -
+
+-- 서버 쪽에서 본 클라이언트 목록. allow 가 있어야 기록이 쌓인다.
+--   NTP 4 / Drop 0  : ol7b 가 보낸 NTP 요청 4개, 버린 것 없음
+--   Int 1           : 요청 간격(2의 거듭제곱 초). burst 라 2초
+--   Last 38         : 38초 전에 마지막 요청
+--   Cmd 열          : chronyc 명령 패킷. ol7b 는 원격 명령을 보내지 않아 0
+
+--------------------------------------------------------------------------------
+ [9] chronyc sourcestats — 원천별 통계
+--------------------------------------------------------------------------------
+
+[root@ol7b ~]# chronyc sourcestats
+210 Number of sources = 1
+Name/IP Address            NP  NR  Span  Frequency  Freq Skew  Offset  Std Dev
+==============================================================================
+ol7a.example.com            4   4     6     +0.814     50.952    +32us  5319ns
+
+-- NP 표본 수 4, Span 6초, Frequency +0.814 ppm,
+--   Freq Skew 50.952 ppm. 표본이 적어 Skew 가 크다.
+
+--------------------------------------------------------------------------------
+ [10] timedatectl 로 본 동기화 상태
+--------------------------------------------------------------------------------
+
+-- timedatectl 은 chronyd 를 직접 읽지 않고 커널의 동기화 플래그를 본다.
+[root@ol7b ~]# timedatectl | grep -E 'NTP|RTC'
+        RTC time: Thu 2026-11-12 11:21:11
+     NTP enabled: yes
+NTP synchronized: yes
+ RTC in local TZ: no
+
+-- NTP enabled: yes, NTP synchronized: yes. timedatectl
+--   은 chronyd 에게 직접 묻지 않고 커널의 동기화
+--   플래그를 본다. chronyd 가 ol7a 를 따르든 pool 을 따르든 이 줄은 같다.
+-- [OL8/9] 같은 정보가 "System clock synchronized: yes",
+--   "NTP service: active" 라는 이름으로 나온다.
+
+--------------------------------------------------------------------------------
+ [11] ol7a 가 위쪽 서버를 잃으면 — local stratum 10
+--------------------------------------------------------------------------------
+
+-- 실제 네트워크를 끊지 않고 상위 서버 상실을 흉내 낸다.
+-- chronyc -n sources 는 이름 대신 IP 로 찍는다. ^ 로 시작하는 줄의 두
+--   번째 열(IP)마다
+-- chronyc delete 로 원천을 지운다. 런타임 변경이라 설정 파일은 그대로다.
+[root@ol7a ~]# for ip in $(chronyc -n sources | awk '/^\^/{print $2}'); do chronyc delete $ip; done
+200 OK
+200 OK
+200 OK
+200 OK
+[root@ol7a ~]# chronyc sources | head -1; sleep 60; chronyc tracking | grep -E 'Reference|Stratum|Leap'
+210 Number of sources = 0
+Reference ID    : 7986D768 (121.134.215.104)
+Stratum         : 3
+Leap status     : Normal
+
+-- 원천이 0 개가 됐다. 그런데 60초 뒤에도 tracking 은
+--   마지막 원천 121.134.215.104, Stratum 3, Leap Normal 이다.
+-- chronyd 는 원천을 잃어도 마지막 동기화 상태를 유지하며
+--   누적 오차만 키워 간다. 1분으로는 local stratum 10
+--   으로 넘어가지 않았다.
+
+[root@ol7b ~]# chronyc burst 4/4; sleep 15; chronyc sources | tail -1; chronyc tracking | grep -E 'Reference|Stratum'
+200 OK
+^* ol7a.example.com              3   6   377     9    -11us[  -15us] +/- 7300us
+Reference ID    : AC10E13D (ol7a.example.com)
+Stratum         : 4
+
+-- ol7b 는 여전히 ol7a 를 ^* 로 따른다. ol7a 3, ol7b 4.
+-- Reach 377 — 8번 연속 성공. 위를 잃은 ol7a 도 응답은
+--   계속한다.
+-- local stratum 10 이 쓰이는 것은 ol7a 의 동기화가 오래
+--   끊겨 Leap status 가 Not synchronised 로 바뀐 뒤다.
+--   이 실습의 짧은 대기에서는 그 단계까지 가지 않았다.
+--   [더 해 보기] 1 에서 길게 기다려 확인한다.
+
+-- chronyd 를 재시작하면 설정 파일의 server 줄을 다시 읽어 pool 원천이 돌아온다.
+[root@ol7a ~]# systemctl restart chronyd; sleep 25; chronyc sources | head -4
+210 Number of sources = 4
+MS Name/IP address         Stratum Poll Reach LastRx Last sample               
+===============================================================================
+^- ec2-3-39-176-65.ap-north>     2   6    17    18    -77us[  -77us] +/- 4137us
+
+--------------------------------------------------------------------------------
+ [변형] 파일 대신 chronyc 로 원천 추가 — 런타임 변경은 재시작에서 사라짐
+--------------------------------------------------------------------------------
+
+-- ol7b 의 설정 파일을 원래대로 돌린 상태에서, ol7a 를 chronyc add
+--   server 로 런타임에 붙여 본다.
+[root@ol7b ~]# cp -p /root/chrony.conf.orig /etc/chrony.conf; systemctl restart chronyd; sleep 15
+[root@ol7b ~]# chronyc add server 172.16.225.61 iburst
+200 OK
+[root@ol7b ~]# sleep 15; chronyc -n sources | grep -c '^\^'; chronyc -n sources | grep -E '^\^\*|172.16.225.61'
+5
+^* 121.134.215.104               2   6    17    23    +93us[ +232us] +/- 1971us
+^- 172.16.225.61                 3   6    17     8   +219us[ +219us] +/- 4383us
+
+-- 원천이 다섯 개가 됐다(첫 줄 5). -n 이라 IP 로 찍힌다.
+-- 172.16.225.61 은 ^- 로 들어왔다. 후보지만 계산에서 뺐다.
+--   chronyd 는 stratum 만이 아니라 지연·오차를 합친
+--   거리로 고른다. 이번에는 pool 의 stratum 2 서버가 이겼다.
+
+[root@ol7b ~]# systemctl restart chronyd; sleep 15; chronyc -n sources | grep -c '^\^'; chronyc -n sources | grep -c 172.16.225.61
+4
+0
+
+-- 재시작 뒤 원천 4, 172.16.225.61 은 0.
+-- chronyc add 로 넣은 원천이 사라졌다. add·delete 는
+--   시험용 런타임 변경이다. 영구 변경은 chrony.conf 에 한다.
+
+--------------------------------------------------------------------------------
+ [되돌림] 두 노드를 시작 전 상태로
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cp -p /root/chrony.conf.orig /etc/chrony.conf; systemctl restart chronyd
+[root@ol7a ~]# firewall-cmd --remove-service=ntp; firewall-cmd --permanent --remove-service=ntp
+success
+success
+[root@ol7a ~]# diff /root/chrony.conf.orig /etc/chrony.conf && echo SAME; firewall-cmd --list-services; firewall-cmd --permanent --list-services
+SAME
+dhcpv6-client ssh
+dhcpv6-client ssh
+
+-- diff 가 아무것도 찍지 않고 성공해 SAME. 방화벽은 [0] 과 같은
+--   dhcpv6-client ssh.
+
+[root@ol7b ~]# diff /root/chrony.conf.orig /etc/chrony.conf && echo SAME
+SAME
+[root@ol7a ~]# ss -ulpn | grep chronyd
+UNCONN 0      0          127.0.0.1:323       0.0.0.0:*    users:(("chronyd",pid=2548,fd=5))
+UNCONN 0      0              [::1]:323          [::]:*    users:(("chronyd",pid=2548,fd=6))
+
+-- 123 포트가 다시 닫혔다. allow 를 지운 원본 설정으로 재시작했기 때문이다.
+
+[root@ol7a ~]# chronyc sources | grep -E '^210|^\^\*'
+210 Number of sources = 4
+^* 211.108.117.211               2   6    17    14   -129us[ -131us] +/- 1532us
+
+-- ol7a 는 pool 서버 넷, ^* 하나. [0] 과 같은 구조다.
+
+[root@ol7b ~]# chronyc sources | grep -E '^210|^\^\*'
+210 Number of sources = 4
+^* 122.45.50.24                  1   6    17    29   +124us[ +278us] +/- 2199us
+
+-- ol7b 도 pool 서버 넷. 이번 ^* 는 stratum 1 서버다.
+-- pool 은 매번 다른 서버를 주므로 이름은 [0] 과 다르다.
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+--  항목                         시작 전              변경 중                          되돌린 뒤
+--  ol7a chrony.conf 유효 줄     8                    + local stratum 10, allow 대역    8 (diff 무출력)
+--  ol7a 123/udp (ss)            없음(323 만)         allow 넣은 뒤 0.0.0.0:123        없음
+--  ol7a 방화벽 서비스           dhcpv6-client ssh    + ntp (런타임·영구)              dhcpv6-client ssh
+--  ol7b 원천                    pool 4개             ol7a 하나(^*, stratum 3)         pool 4개
+--  ol7b 의 ol7a 원천([변형])     —                    chronyc add 로 추가(^-)          재시작 뒤 사라짐
+--  ol7a serverstats 수신         0                    0 → 0 → 4                        —
+--
+--  단계별 ol7b 의 증상
+--  server 만 바꿈              ^? ol7a 0 7 0 -    (응답 없음)
+--  + 방화벽 ntp                ^? ol7a 0 8 0 -    (여전히 없음. 포트가 닫혀 있음)
+--  + allow                     ^* ol7a 3 6 17     (동기화)
+--
+--  관찰 1  allow 가 없으면 123/udp 가 열리지 않는다
+--  관찰 2  클라이언트 증상은 원인과 상관없이 ^?, Reach 0
+--  관찰 3  chronyc add·delete 는 재시작하면 사라진다
+--  관찰 4  위쪽 원천을 지운 뒤 1분 동안 ol7a 는 마지막 동기화 상태(stratum
+--    3)로 응답을 계속했다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. [11] 처럼 ol7a 의 원천을 지운 뒤 10분 이상 기다리며 chronyc
+--   tracking 의 Stratum 과 Leap status 를
+--    몇 분마다 기록한다. local stratum 10 이 언제부터 쓰이는지, ol7b 의
+--      sources 에 stratum 10 이 보이는지 확인한다.
+-- 2. allow 를 172.16.225.62/32 로 좁히고 ol7b 에서는 동기화되는지,
+--   다른 주소에서는 거부되는지 생각해 본다.
+--    chronyc clients 의 NTP·Drop 열로 확인한다.
+
+================================================================================
+ 실습 01 종료 — chronyd 서버는 allow 로 포트를 열고 방화벽으로 통과시킨다. 둘 중 하나만으로는 안 된다
+================================================================================

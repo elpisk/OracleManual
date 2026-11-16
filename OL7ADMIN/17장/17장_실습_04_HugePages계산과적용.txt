@@ -1,0 +1,461 @@
+================================================================================
+ 제17장 실습 04 — HugePages 계산과 적용
+ 대상   : ol7a
+ 목표   : SGA 크기로 HugePages 페이지 수를 계산해 vm.nr_hugepages 로 확보하고,
+          /proc/meminfo 의 HugePages 줄 다섯 개가 공유 메모리 세그먼트를
+          만들 때 어떻게 바뀌는지 본다. memlock 한도가 모자랄 때와 메모리가
+          차 있어 요청한 만큼 확보되지 않을 때를 재현하고, 부팅 시 확보로 고친다
+ 배경   : HugePages 는 2MB 페이지를 미리 떼어 두는 풀이다. 일반 페이지로 바꿔
+          쓸 수 없고, 쓰지 않아도 메모리를 차지한다. Oracle SGA 는 SHM_HUGETLB
+          로 공유 메모리를 만들 때 이 풀을 쓴다. 일반 사용자가 HugePages 세그먼트를
+          만들려면 memlock 한도가 그 크기 이상이어야 한다(본문 17.8)
+ 소요   : 약 30분
+ 선행   : ol7-base 스냅샷. preinstall 을 미리 설치(출력 생략)
+ 계정   : root, oracle, student
+ 주의   : 메모리 4GB VM 이라 풀은 최대 2GB 로 잡는다. [7] 에서 잠깐 스왑을 끈다
+ 되돌림 : 설정 파일 삭제, vm.nr_hugepages=0, 스왑 다시 켬. 확인은 grep Huge /proc/meminfo
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 바꿀 대상은 /proc/meminfo 의 HugePages 줄과 vm.nr_hugepages. 시작 값을 먼저 남긴다
+-- grep -E '^(…)' : 줄 머리가 괄호 안 이름 중 하나인 줄만
+[root@ol7a ~]# grep -E '^(MemTotal|MemFree|MemAvailable|Hugepagesize|HugePages_|AnonHugePages)' /proc/meminfo
+MemTotal:        3716112 kB
+MemFree:         3077700 kB
+MemAvailable:    3288644 kB
+AnonHugePages:     40960 kB
+HugePages_Total:       0
+HugePages_Free:        0
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugepagesize:       2048 kB
+-- MemTotal 3716112 kB ≈ 3.54GiB : 커널이 쓸 수 있는 전체 메모리
+-- MemFree 3077700 kB : 아무도 쓰지 않는 메모리, MemAvailable : 캐시를 비우면 쓸 수 있는 양까지 더한 값
+-- AnonHugePages 40960 kB : THP 가 지금 묶어 쓰는 양(실습 05). HugePages 풀과는 별개다
+-- HugePages_ 네 줄이 모두 0 : 풀이 없다. Hugepagesize 2048 kB 가 한 장의 크기
+-- 이 실습은 oracle 을 쓰므로 preinstall 을 조용히 깔아 두었다(머리 상자 선행)
+[root@ol7a ~]# sysctl vm.nr_hugepages vm.hugetlb_shm_group; free -m
+vm.nr_hugepages = 0
+vm.hugetlb_shm_group = 0
+              total        used        free      shared  buff/cache   available
+Mem:           3629         190        3005           8         433        3211
+Swap:          3967           0        3967
+-- vm.hugetlb_shm_group = 0 : memlock 검사를 건너뛸 그룹이 없다([6] 에서 다시 본다)
+-- free -m 의 used 194MB 안팎, free 3001MB. 풀을 만든 뒤 이 두 열이 얼마나 움직이는지 본다
+-- free -m 열: total, used, free, shared(tmpfs 등 공유), buff/cache, available
+[root@ol7a ~]# ls /etc/sysctl.d/; swapon --show
+99-initial-sysctl.conf
+99-oracle-database-preinstall-19c-sysctl.conf
+99-sysctl.conf
+NAME      TYPE      SIZE USED PRIO
+/dev/dm-1 partition 3.9G   0B   -2
+-- sysctl.d 의 99-oracle-database-preinstall-19c-sysctl.conf 는 preinstall 이 둔 파일이다
+-- 스왑은 ol/swap LV(dm-1) 3.9G. [7] 에서 잠시 끈다
+
+--------------------------------------------------------------------------------
+ [1] 페이지 크기 두 가지
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# getconf PAGE_SIZE; grep Hugepagesize /proc/meminfo
+4096
+Hugepagesize:       2048 kB
+-- 일반 페이지 4096 바이트, HugePages 한 장 2048 kB. 512 배 차이다
+-- SGA 1GB 를 4KB 로 매핑하면 262144 개 항목, 2MB 로 매핑하면 512 개
+-- 서버 프로세스 수백 개가 각자 이 매핑을 가지니 차이가 프로세스 수만큼 곱해진다
+[root@ol7a ~]# ls /sys/kernel/mm/hugepages/
+hugepages-1048576kB
+hugepages-2048kB
+-- 커널이 지원하는 큰 페이지 크기마다 디렉터리가 하나씩. 2MB 와 1GB 두 가지
+-- 지금 쓰는 것은 2048kB 쪽이다
+[root@ol7a ~]# grep -o -w 'pse\|pdpe1gb' /proc/cpuinfo | sort | uniq -c
+      2 pdpe1gb
+      2 pse
+-- CPU 플래그 pse 는 2MB 페이지, pdpe1gb 는 1GB 페이지 지원. vCPU 두 개라 2 로 센다
+-- 1GB 페이지는 부트 파라미터(hugepagesz=1G)로만 잡는다. 19c 는 2MB 를 기본으로 쓴다
+-- 이 VM 은 두 크기를 모두 지원한다
+
+--------------------------------------------------------------------------------
+ [2] 페이지 수 계산
+--------------------------------------------------------------------------------
+
+-- SGA 1GB 를 가정한다. 페이지 수 = SGA / 2MB, 여유로 몇 장 더
+[root@ol7a ~]# SGA_MB=1024; HP_KB=$(awk '/Hugepagesize/{print $2}' /proc/meminfo); echo "pages = $SGA_MB*1024/$HP_KB = $((SGA_MB*1024/HP_KB)) (+8 => $((SGA_MB*1024/HP_KB+8)))"
+pages = 1024*1024/2048 = 512 (+8 => 520)
+-- SGA 1024MB = 1048576 kB, ÷ 2048 kB = 512 장. 여유로 8 장 더해 520
+-- 셸 산술 $(( )) 는 정수만 다룬다. 나눠떨어지지 않으면 내림이라 여유분을 따로 더한다
+-- 인스턴스가 여러 개면 SGA 합계로 계산한다. ASM 인스턴스의 SGA 도 잊지 않는다
+-- 운영 서버는 인스턴스를 띄운 상태에서 hugepages_settings.sh(MOS 401749.1)가 세그먼트 크기로 계산한다
+-- memlock 권고: HugePages 를 쓸 때 전체 메모리의 90% 이상(KB 단위)
+[root@ol7a ~]# awk '/MemTotal/{printf "MemTotal=%d KB  90%%=%d KB\n",$2,$2*0.9}' /proc/meminfo
+MemTotal=3716112 KB  90%=3344500 KB
+-- 90% = 3344500 KB. 이 VM 에서는 memlock 이 이 값 이상이면 권고를 만족한다
+-- awk 의 %% 는 printf 에서 % 글자 하나를 찍는다
+[oracle@ol7a ~]$ ulimit -Sl; ulimit -Hl
+134217728
+134217728
+-- soft·hard 모두 preinstall 의 oracle memlock 은 134217728 KB = 128GiB. 메모리보다 커서 넉넉하다
+
+--------------------------------------------------------------------------------
+ [3] 실행 중에 풀 만들기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# sysctl -w vm.nr_hugepages=520
+vm.nr_hugepages = 520
+-- sysctl -w : 실행 중인 커널 값만 바꾼다(재부팅하면 사라짐)
+-- 520 장 = 1040MB
+-- /proc/sys/vm/nr_hugepages 에 echo 520 을 쓰는 것과 같다
+[root@ol7a ~]# grep -E '^(MemFree|MemAvailable|HugePages_|Hugetlb)' /proc/meminfo
+MemFree:         2012484 kB
+MemAvailable:    2223712 kB
+HugePages_Total:     520
+HugePages_Free:      520
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugetlb:         1064960 kB
+-- HugePages_Total 520, Free 520 : 520 장 확보, 아직 아무도 쓰지 않음
+-- Rsvd 0 : 예약도 없다
+-- Hugetlb 1064960 kB = 520 × 2048 kB. 풀 전체가 차지하는 메모리
+-- MemFree 가 약 1GB 줄었다. 아무도 쓰지 않아도 풀은 바로 메모리를 차지한다
+[root@ol7a ~]# free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629        1230        1965           8         433        2171
+Swap:          3967           0        3967
+-- used 가 1230MB 로 늘었다. free 명령은 HugePages 풀을 "used" 로 센다
+-- 캐시(buff/cache)는 그대로 433. 풀은 캐시처럼 필요할 때 돌려받을 수 없는 메모리다
+-- MemAvailable 도 약 1GB 줄었다. 풀은 "쓸 수 있는 메모리"에서 빠진다
+-- 풀은 사용 여부와 상관없이 잡힌다
+-- 메모리가 작은 서버에서 풀을 과하게 잡으면 OS 와 PGA 가 쓸 메모리가 모자라 스왑이 늘어난다
+
+--------------------------------------------------------------------------------
+ [4] SHM_HUGETLB 세그먼트를 만드는 시험 프로그램
+--------------------------------------------------------------------------------
+
+-- Oracle 인스턴스 대신 SGA 를 만드는 시스템 호출 shmget(SHM_HUGETLB) 만 흉내 낸다
+-- 파이썬 2.7 의 ctypes 로 libc 의 shmget·shmat 을 직접 부른다
+-- Oracle 은 SGA 를 만들 때 shmget 에 SHM_HUGETLB 를 준다. 이 프로그램은 그 호출만 똑같이 한다
+-- 실패하면 errno 를 os.strerror 로 바꿔 커널이 돌려준 이유를 그대로 찍는다
+--   인자 1 : 만들 크기(MB), 인자 2 : 붙여서 실제로 쓸 크기(MB, 생략하면 만들기만)
+--   IPC_CREAT 0o1000, SHM_HUGETLB 0o4000 : <sys/ipc.h>·<sys/shm.h> 의 상수
+--   키 0 = IPC_PRIVATE : 새 세그먼트, 권한 0600
+[root@ol7a ~]# cat > /usr/local/bin/hugeshm.py <<'EOF'
+#!/usr/bin/python
+import ctypes, os, sys
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.shmget.argtypes = [ctypes.c_int, ctypes.c_size_t, ctypes.c_int]
+libc.shmat.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+libc.shmat.restype = ctypes.c_void_p
+IPC_CREAT, SHM_HUGETLB = 0o1000, 0o4000
+mb = int(sys.argv[1])
+touch = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+shmid = libc.shmget(0, mb << 20, IPC_CREAT | SHM_HUGETLB | 0o600)
+if shmid < 0:
+    e = ctypes.get_errno()
+    print("shmget %dMB SHM_HUGETLB failed: %s" % (mb, os.strerror(e)))
+    sys.exit(1)
+print("shmget %dMB SHM_HUGETLB ok: shmid=%d" % (mb, shmid))
+if touch:
+    addr = libc.shmat(shmid, None, 0)
+    ctypes.memset(addr, 1, touch << 20)
+    print("attached and wrote %dMB" % touch)
+EOF
+[root@ol7a ~]# chmod 755 /usr/local/bin/hugeshm.py; python -V
+Python 2.7.5
+-- 첫 줄 #!/usr/bin/python 이 있어야 실행 파일로 직접 부를 수 있다. 7.9 기본 파이썬은 2.7.5
+-- 이 줄이 없으면 bash 가 파일을 셸 스크립트로 읽어 import 에서 command not found 로 끝난다
+
+--------------------------------------------------------------------------------
+ [5] oracle 로 1000MB 세그먼트 — Rsvd 와 Free
+--------------------------------------------------------------------------------
+
+[oracle@ol7a ~]$ /usr/local/bin/hugeshm.py 1000
+shmget 1000MB SHM_HUGETLB ok: shmid=0
+-- oracle(memlock 128GiB)로 1000MB 를 요청했다. 1000MB 는 2MB 의 배수라 500 장이다
+-- shmid=0 : 커널이 붙인 세그먼트 번호. ipcs -m 의 shmid 열과 같다
+[root@ol7a ~]# ipcs -m
+
+------ Shared Memory Segments --------
+key        shmid      owner      perms      bytes      nattch     status      
+0x00000000 0          oracle     600        1048576000 0                       
+-- key 0x00000000 : IPC_PRIVATE, owner oracle, perms 600, bytes 1048576000(1000MiB), nattch 0(붙은 프로세스 없음)
+-- ipcs 출력에는 HugePages 를 쓰는 세그먼트인지 표시가 없다. meminfo 로 확인한다
+-- 만든 프로세스는 이미 끝났지만 세그먼트는 남는다. 지울 때까지 남는 것이 System V 공유 메모리의 성질이다
+-- 지울 때는 ipcrm -m shmid
+[root@ol7a ~]# grep -E '^HugePages_' /proc/meminfo
+HugePages_Total:     520
+HugePages_Free:      520
+HugePages_Rsvd:      500
+HugePages_Surp:        0
+-- Free 는 520 그대로, Rsvd 가 500. 세그먼트를 만들 때 500 장을 예약만 했다
+-- 실제 남은 것은 Free − Rsvd = 20 장. 새 세그먼트는 이 20 장 안에서만 만들 수 있다
+-- 세그먼트를 붙여 실제로 쓰면 예약(Rsvd)이 사용(Free 감소)으로 옮겨 간다. 둘째 인자 = 쓸 MB
+[root@ol7a ~]# ipcrm --all=shm
+[oracle@ol7a ~]$ /usr/local/bin/hugeshm.py 1000 512
+shmget 1000MB SHM_HUGETLB ok: shmid=1
+attached and wrote 512MB
+-- 1000MB 를 만들고 앞 512MB 를 실제로 썼다(memset). Oracle 이 SGA 를 처음 건드리는 것과 같다
+[root@ol7a ~]# grep -E '^HugePages_' /proc/meminfo
+HugePages_Total:     520
+HugePages_Free:      264
+HugePages_Rsvd:      244
+HugePages_Surp:        0
+-- Free 520 → 264(256 장 = 512MB 를 썼다), Rsvd 500 → 244(아직 안 쓴 488MB)
+-- 쓴 만큼 예약에서 사용으로 옮겨 갔다. Free − Rsvd = 20 장은 그대로다
+-- 예약 덕분에 나중에 SGA 를 건드릴 때 풀이 모자라 죽는 일이 없다
+-- 만드는 순간 필요한 장수를 확보해 두는 방식이다
+[root@ol7a ~]# ipcrm --all=shm; grep -E '^HugePages_' /proc/meminfo
+HugePages_Total:     520
+HugePages_Free:      520
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+-- ipcrm 으로 지우자 Free·Rsvd 가 처음으로 돌아왔다. 세그먼트를 지워야 풀이 돌아온다
+
+--------------------------------------------------------------------------------
+ [6] memlock 한도가 모자라면
+--------------------------------------------------------------------------------
+
+[student@ol7a ~]$ ulimit -Sl; ulimit -Hl
+64
+64
+-- (soft·hard) student 의 memlock 은 64 KB. 기본값이다
+-- ulimit -l 은 KB 단위다. 64 KB = 65536 바이트
+[student@ol7a ~]$ /usr/local/bin/hugeshm.py 100; echo "exit=$?"
+shmget 100MB SHM_HUGETLB failed: Operation not permitted
+exit=1
+-- 증상   : "shmget 100MB SHM_HUGETLB failed: Operation not permitted"(EPERM), 종료 코드 1
+-- 원인   : 일반 사용자가 SHM_HUGETLB 세그먼트를 만들면 크기가 memlock 한도(64 KB)로 검사된다
+--          100MB 는 한도를 넘는다. 풀(Free 520)은 비어 있어도 거부된다
+[root@ol7a ~]# dmesg | grep -i 'SHM_HUGETLB' | tail -2
+[   25.039046] hugetlbfs: hugeshm.py (7297): Using mlock ulimits for SHM_HUGETLB is deprecated
+-- 커널이 한 번만 남기는 경고. memlock 으로 검사하는 방식을 deprecated 로 표시하고 hugetlb_shm_group 쪽을 권한다
+-- 그래도 7.9 의 UEK 는 이 검사를 그대로 한다. Oracle 설치 가이드가 memlock 을 요구하는 이유다
+-- vm.hugetlb_shm_group 에 dba 그룹 번호를 넣는 방법도 있지만 설치 가이드는 memlock 방식을 쓴다
+[root@ol7a ~]# grep -E '^HugePages_' /proc/meminfo
+HugePages_Total:     520
+HugePages_Free:      520
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+-- 거부된 요청은 아무것도 예약하지 않았다. Rsvd 0
+-- 풀은 그대로 520 장 비어 있다
+-- 권한 문제와 풀 크기 문제는 따로 본다
+[root@ol7a ~]# echo 'student soft memlock 204800' > /etc/security/limits.d/90-student-memlock.conf; echo 'student hard memlock 204800' >> /etc/security/limits.d/90-student-memlock.conf; cat /etc/security/limits.d/90-student-memlock.conf
+student soft memlock 204800
+student hard memlock 204800
+-- 조치   : student 의 memlock 을 soft·hard 모두 204800 KB(200MB)로 올렸다
+-- echo 두 번으로 soft·hard 두 줄을 썼다. soft 만 올리면 hard(64)를 넘을 수 없어 적용되지 않는다
+[student@ol7a ~]$ ulimit -l; /usr/local/bin/hugeshm.py 100; echo "exit=$?"
+204800
+shmget 100MB SHM_HUGETLB ok: shmid=2
+exit=0
+-- 재확인 : ulimit -l 204800, 같은 100MB 요청이 성공했다(shmid=2)
+[student@ol7a ~]$ /usr/local/bin/hugeshm.py 300; echo "exit=$?"
+shmget 300MB SHM_HUGETLB failed: Operation not permitted
+exit=1
+-- 이어서 300MB 를 요청하자 다시 거부됐다. 한도는 요청 하나가 아니라 그 사용자가 잠근 합계로 본다
+-- 한도를 넘는 요청은 통째로 거부된다
+--   이미 100MB 를 가진 상태에서 300MB 를 더하면 400MB > 200MB
+-- 그래서 memlock 은 SGA 전체(여러 세그먼트의 합)보다 커야 한다
+-- 권고값 90% 는 SGA 가 커지거나 인스턴스가 늘어도 한도를 다시 고치지 않게 하려는 여유다
+[root@ol7a ~]# ipcs -m; ipcrm --all=shm; rm -f /etc/security/limits.d/90-student-memlock.conf
+
+------ Shared Memory Segments --------
+key        shmid      owner      perms      bytes      nattch     status      
+0x00000000 2          student    600        104857600  0                       
+-- 남아 있던 student 의 100MB 세그먼트. 정리하고 시험용 한도 파일도 지웠다
+-- ipcrm --all=shm 은 모든 사용자의 세그먼트를 지운다
+-- 운영 서버에서는 쓰지 않는다
+
+--------------------------------------------------------------------------------
+ [7] 메모리가 차 있으면 요청한 만큼 안 나온다
+--------------------------------------------------------------------------------
+
+-- SGA 를 2GB 로 늘리려고 1024 장을 요청하는 상황. 먼저 풀을 비운다
+-- 풀을 0 으로 내리면 커널이 페이지를 일반 메모리로 돌려준다. 쓰는 세그먼트가 있으면 그만큼은 남는다
+-- 이 상황은 "운영 중에 SGA 를 늘리며 풀을 키우는" 경우를 흉내 낸다
+[root@ol7a ~]# sysctl -w vm.nr_hugepages=0
+vm.nr_hugepages = 0
+-- 다른 프로세스가 메모리를 잡고 있는 상황을 tmpfs 파일로 만든다. 스왑을 끄면 이 페이지는 내보낼 수 없다
+[root@ol7a ~]# swapoff -a; dd if=/dev/zero of=/dev/shm/fill bs=1M count=1600 status=none; free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629         186        1405        1608        2036        1613
+Swap:             0           0           0
+-- dd 로 /dev/shm(tmpfs)에 1600MB 를 썼다. shared 열 1608, buff/cache 2036 으로 올라갔다
+-- 스왑을 껐으니 이 1.6GB 는 내보낼 곳이 없다. free 는 1405MB
+-- 실습 VM 은 4GB 라 채우는 양을 1600MB 로 잡았다. 풀 1024 장(2GB)과 합쳐 메모리를 넘지 않는다
+[root@ol7a ~]# sysctl -w vm.nr_hugepages=1024; grep -E '^HugePages_(Total|Free)' /proc/meminfo
+vm.nr_hugepages = 1024
+HugePages_Total:     772
+HugePages_Free:      772
+-- 1024 를 요청했고 sysctl 은 "vm.nr_hugepages = 1024" 라고 답했다. 그러나 Total 은 772
+-- sysctl 은 쓴 값을 되읽어 찍지 않고 입력한 값을 그대로 보여 준다. 결과는 meminfo 로 확인한다
+[root@ol7a ~]# free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629        1721         205        1608        1702         135
+Swap:             0           0           0
+-- 증상   : 요청 1024, 확보 772 장(1544MB). 오류 메시지도 종료 코드도 없다
+-- 원인   : 실행 중 확보는 그 순간 비어 있는 연속 2MB 영역만 모은다. tmpfs 가 1.6GB 를 잡고 있어
+--          free 가 205MB 까지 내려가자 커널이 더 모으기를 멈췄다. available 은 135MB
+--          운영 서버라면 tmpfs 대신 페이지 캐시·다른 프로세스·단편화가 같은 결과를 만든다
+
+[root@ol7a ~]# rm -f /dev/shm/fill; swapon -a; free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629        1726        1803           8          99        1732
+Swap:          3967           0        3967
+-- 채운 파일을 지우고 스왑을 다시 켰다. free 가 1803MB 로 돌아왔다
+-- 앞서 잡힌 772 장은 그대로 남아 있다(used 1726). 그 위에 252 장을 더 모은다
+[root@ol7a ~]# sysctl -w vm.nr_hugepages=1024; grep -E '^HugePages_(Total|Free)' /proc/meminfo
+vm.nr_hugepages = 1024
+HugePages_Total:    1024
+HugePages_Free:     1024
+-- 메모리가 비자 같은 요청으로 1024 장이 모두 잡혔다
+-- 재확인 : 메모리를 비우자 1024 장 전부
+[root@ol7a ~]# grep -E 'Normal|DMA32' /proc/buddyinfo
+Node 0, zone    DMA32      4      9      7      8      9      8      8      9      9      2    241 
+Node 0, zone   Normal   5018   3334   1698    892    495    301    151     88     49      0      0 
+-- /proc/buddyinfo : 영역(zone)별로 크기 2^0 ~ 2^10 페이지의 빈 덩어리 수
+--   2MB 페이지는 2^9(512 페이지) 덩어리가 필요하다. 오른쪽에서 둘째 열이 그 값이다
+--   Normal 영역은 2^9·2^10 열이 0 이다. 큰 덩어리는 이미 풀이 가져갔고, DMA32 에는 2^10 덩어리 241 개가 남았다
+-- 조치   : 실행 중에 늘리지 않고 /etc/sysctl.d 에 값을 두어 부팅 때 확보한다(아래 [8])
+
+--------------------------------------------------------------------------------
+ [8] 부팅할 때 확보 — sysctl.d
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# sysctl -w vm.nr_hugepages=0 >/dev/null; echo 'vm.nr_hugepages = 1024' > /etc/sysctl.d/98-hugepages.conf; cat /etc/sysctl.d/98-hugepages.conf
+vm.nr_hugepages = 1024
+-- 재부팅. systemd-sysctl 이 부팅 초기에 98-hugepages.conf 를 적용한다
+-- 부팅 초기에는 메모리가 거의 비어 있어 큰 연속 영역을 쉽게 모은다
+[root@ol7a ~]# uptime; grep -E '^(MemTotal|MemFree|MemAvailable|HugePages_|Hugetlb)' /proc/meminfo
+ 11:10:26 up 0 min,  0 users,  load average: 0.07, 0.02, 0.00
+MemTotal:        3716112 kB
+MemFree:         1281992 kB
+MemAvailable:    1385660 kB
+HugePages_Total:    1024
+HugePages_Free:     1024
+HugePages_Rsvd:        0
+HugePages_Surp:        0
+Hugetlb:         2097152 kB
+-- 재확인 : 부팅 직후 HugePages_Total 1024, Hugetlb 2097152 kB(2GiB)
+-- MemFree 1281992 kB. 메모리 3.5GiB 중 2GiB 를 풀이 가져가 일반 용도로는 1.2GiB 남짓 남았다
+-- 이 VM 에서는 풀 2GB 가 상한에 가깝다. 4GB 서버에 SGA 2GB 면 PGA·OS 몫이 1.2GB 남짓이다
+[root@ol7a ~]# free -m
+              total        used        free      shared  buff/cache   available
+Mem:           3629        2212        1251           8         164        1353
+Swap:          3967           0        3967
+-- used 2212MB 중 2048MB 가 풀이다. 실제 프로세스가 쓰는 메모리는 약 160MB 다
+[root@ol7a ~]# journalctl -b -u systemd-sysctl --no-pager | tail -3
+Nov 16 11:10:11 ol7a.example.com systemd[1]: Stopped Apply Kernel Variables.
+Nov 16 11:10:12 ol7a.example.com systemd[1]: Starting Apply Kernel Variables...
+Nov 16 11:10:12 ol7a.example.com systemd[1]: Started Apply Kernel Variables.
+-- Apply Kernel Variables = systemd-sysctl.service. 오류 줄이 없으면 파일 값이 모두 적용됐다
+-- 부팅 로그는 journalctl -b 로
+
+--------------------------------------------------------------------------------
+ [9] 확보한 풀을 SGA 처럼 쓰기
+--------------------------------------------------------------------------------
+
+[oracle@ol7a ~]$ /usr/local/bin/hugeshm.py 2040; echo "exit=$?"
+shmget 2040MB SHM_HUGETLB ok: shmid=0
+exit=0
+-- 2040MB 세그먼트를 만들었다. 1020 장 예약(2MB 배수로 올림)
+-- SGA 2040MB 짜리 인스턴스를 띄운 것과 같은 예약 상태다
+[root@ol7a ~]# grep -E '^HugePages_' /proc/meminfo; ipcs -m | tail -2
+HugePages_Total:    1024
+HugePages_Free:     1024
+HugePages_Rsvd:     1020
+HugePages_Surp:        0
+0x00000000 0          oracle     600        2139095040 0                       
+-- Rsvd 1020 → Free − Rsvd = 4 장(8MB)만 남았다. bytes 2139095040 = 2040MiB
+[oracle@ol7a ~]$ /usr/local/bin/hugeshm.py 100; echo "exit=$?"
+shmget 100MB SHM_HUGETLB failed: Cannot allocate memory
+exit=1
+-- 같은 oracle 로 100MB 를 더 요청했다. memlock 은 충분하다
+-- 필요한 장수 50, 남은 장수 4
+-- "Cannot allocate memory"(ENOMEM) : 이번에는 권한이 아니라 풀이 모자라서 거부됐다
+--   memlock 부족 → Operation not permitted, 풀 부족 → Cannot allocate memory
+-- Oracle 인스턴스라면 USE_LARGE_PAGES=TRUE 일 때 일반 페이지로 물러서고, ONLY 일 때 기동을 거부한다
+-- 경고 로그의 Large Pages Information 에 "Total Shared Global Region in Large Pages" 가 SGA 보다 작게 찍힌다
+[root@ol7a ~]# ipcrm --all=shm
+
+--------------------------------------------------------------------------------
+ [변형] sysfs 로 같은 값 바꾸기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+1024
+-- sysfs 의 nr_hugepages 는 sysctl vm.nr_hugepages 와 같은 값이다
+[root@ol7a ~]# echo 512 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages; sysctl vm.nr_hugepages; grep HugePages_Total /proc/meminfo
+vm.nr_hugepages = 512
+HugePages_Total:     512
+-- sysfs 에 512 를 쓰자 sysctl 값과 meminfo 가 함께 512 가 됐다. 두 경로가 같은 커널 변수를 바꾼다
+-- 차이는 sysfs 경로가 페이지 크기별로 나뉜다는 점이다. 1GB 페이지는 hugepages-1048576kB 쪽을 쓴다
+-- NUMA 서버라면 /sys/devices/system/node/node*/hugepages 아래에서 노드별로도 볼 수 있다
+[root@ol7a ~]# ls /sys/kernel/mm/hugepages/hugepages-2048kB/
+free_hugepages
+nr_hugepages
+nr_hugepages_mempolicy
+nr_overcommit_hugepages
+resv_hugepages
+surplus_hugepages
+-- free·resv·surplus 는 meminfo 의 Free·Rsvd·Surp 와 같은 값을 크기별로 보여 준다
+-- 값 세 개가 한 줄씩 찍힌다
+-- nr_overcommit_hugepages : 풀을 넘어 임시로 더 만들 수 있는 장수(기본 0)
+[root@ol7a ~]# cat /sys/kernel/mm/hugepages/hugepages-2048kB/{free_hugepages,resv_hugepages,surplus_hugepages}
+512
+0
+0
+-- (세 값) free 512, resv 0, surplus 0
+
+--------------------------------------------------------------------------------
+ [10] 되돌리기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# rm -f /etc/sysctl.d/98-hugepages.conf /usr/local/bin/hugeshm.py; sysctl -w vm.nr_hugepages=0
+vm.nr_hugepages = 0
+-- 설정 파일과 시험 프로그램을 지우고 풀을 0 으로 내렸다
+[root@ol7a ~]# grep -E '^(MemFree|HugePages_Total)' /proc/meminfo; swapon --show; ls /etc/sysctl.d/
+MemFree:         3377840 kB
+HugePages_Total:       0
+NAME      TYPE      SIZE USED PRIO
+/dev/dm-1 partition 3.9G   0B   -2
+99-initial-sysctl.conf
+99-oracle-database-preinstall-19c-sysctl.conf
+99-sysctl.conf
+-- MemFree 3377016 kB, HugePages_Total 0, 스왑 켜짐, 98-hugepages.conf 없음. [0] 과 같은 상태다
+-- 시험 프로그램도 지웠다
+-- 스왑은 [7] 에서 다시 켰다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+--  항목                       시작 전     실행 중 520  1000MB 생성  512MB 씀   부분 확보   부팅 확보   되돌린 뒤
+--  HugePages_Total            0           520          520          520        772         1024        0
+--  HugePages_Free             0           520          520          264        772         1024        0
+--  HugePages_Rsvd             0           0            500          244        -           0 → 1020    0
+--  MemFree (kB)               3077700     2012484 -            -          -           1281992     3377016
+--
+--  요청                        결과
+--  student 100MB(memlock 64)   Operation not permitted
+--  student 100MB(memlock 200M) ok, 이어서 300MB 는 Operation not permitted
+--  oracle 100MB(Free−Rsvd 4장) Cannot allocate memory
+--
+--  · 세그먼트를 만들면 Rsvd, 쓰면 Free 가 준다. 남은 양은 Free − Rsvd
+--  · 실행 중 확보는 오류 없이 적게 잡힌다. 부팅 시 확보로 고친다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. vm.hugetlb_shm_group 에 student 의 그룹 번호를 넣고 memlock 64KB 인 채로 100MB 를 만들어 본다
+--    확인: hugeshm.py 결과와 dmesg 의 경고가 다시 나오는지
+-- 2. 부트 파라미터 hugepages=1024 로 확보하고 sysctl.d 방식과 MemFree 를 비교한다
+--    확인: /proc/cmdline, grep HugePages_Total /proc/meminfo
+-- 3. vm.nr_overcommit_hugepages=100 을 두고 풀보다 큰 세그먼트를 만들어 HugePages_Surp 를 본다
+
+================================================================================
+ 실습 04 종료 — SGA 1GB 기준 520 장을 계산해 확보했고, memlock 부족(EPERM)·풀 부족(ENOMEM)·부분 확보를 재현했다
+================================================================================

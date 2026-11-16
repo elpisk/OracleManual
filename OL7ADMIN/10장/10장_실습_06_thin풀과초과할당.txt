@@ -1,0 +1,452 @@
+================================================================================
+ 제10장 실습 06 — thin 풀과 초과 할당: 풀이 가득 차면
+ 대상   : ol7a
+ 목표   : thin pool 을 만들고 풀보다 큰 thin LV 를 잘라 쓴다(초과 할당).
+          lvs 의 Data%·Meta% 를 읽고, 풀이 가득 찼을 때 쓰기가 어떻게
+          멈추고 실패하는지 본다. lvm.conf 의 자동 확장 임계값으로 같은
+          상황을 막는다. thin 스냅샷이 풀 안에서 만들어지는 것을 확인한다
+ 배경   : 일반 LV 는 만들 때 PE 를 모두 잡는다. thin LV 는 크기만 선언하고
+          실제 블록은 쓰는 순간 풀에서 받는다. 그래서 풀보다 큰 LV 를 여러 개
+          만들 수 있지만, 실제 사용량이 풀을 넘으면 모든 thin LV 의 쓰기가
+          멈춘다. 감시와 자동 확장이 운영의 핵심 설정이다 (본문 10.6)
+ 소요   : 약 30분
+ 선행   : storage-clean 스냅샷
+ 계정   : root
+ 주의   : [5] 에서 쓰기가 약 60초 멈춘다. /etc/lvm/lvm.conf 를 고쳤다가 되돌린다
+ 되돌림 : lvm.conf 원복(diff 로 확인), LV·VG·PV 삭제. 확인은 pvs·lsblk
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 이 실습은 sdb 하나만 쓴다
+[root@ol7a ~]# vgs; lsblk -o NAME,SIZE,TYPE /dev/sdb
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+NAME SIZE TYPE
+sdb   10G disk
+
+-- VG 는 ol 하나, sdb 는 비어 있다
+-- [7] 에서 lvm.conf 를 고친다.
+-- 원본을 먼저 복사해 둔다. -p : 권한·시각 유지
+[root@ol7a ~]# cp -p /etc/lvm/lvm.conf /root/lvm.conf.orig
+[root@ol7a ~]# lvmconfig activation/thin_pool_autoextend_threshold activation/thin_pool_autoextend_percent activation/monitoring
+thin_pool_autoextend_threshold=100
+thin_pool_autoextend_percent=20
+monitoring=1
+
+-- 세 값의 뜻
+--   thin_pool_autoextend_threshold=100 : 사용률이 이 값을 넘으면 늘린다. 100 은 "끔"
+--   thin_pool_autoextend_percent=20    : 한 번에 늘리는 비율
+--   monitoring=1                       : dmeventd 가 풀을 감시한다
+-- 감시는 켜져 있지만 늘리는 기준이 100% 라 실제로는 아무것도 하지 않는다
+[root@ol7a ~]# systemctl is-active lvm2-monitor dm-event.socket; rpm -q device-mapper-persistent-data
+active
+active
+device-mapper-persistent-data-0.8.5-3.el7_9.2.x86_64
+-- lvm2-monitor·dm-event.socket 모두 active → dmeventd 를 부를 준비가 됨
+-- device-mapper-persistent-data 는 thin_check·thin_repair 같은 thin 메타데이터 도구다
+-- 이 패키지가 없으면 thin pool 활성화 때 thin_check 를 찾지 못해 실패한다
+
+--------------------------------------------------------------------------------
+ [1] thin pool 만들기
+--------------------------------------------------------------------------------
+
+-- thin pool 도 VG 안의 LV 다. 먼저 VG 를 만든다
+[root@ol7a ~]# vgcreate vgdata /dev/sdb
+  Physical volume "/dev/sdb" successfully created.
+  Volume group "vgdata" successfully created
+
+-- -T (--thin) VG/풀이름 : thin pool 을 만든다. -L 은 풀의 실제 데이터 공간
+[root@ol7a ~]# lvcreate -L 1G -T vgdata/tpool
+  Thin pool volume with chunk size 64.00 KiB can address at most 15.81 TiB of data.
+  Logical volume "tpool" created.
+-- 첫 줄은 정보 메시지. 청크(chunk) 64KiB 는 풀이 블록을 나눠 주는 단위다
+-- 15.81 TiB 는 이 청크 크기와 메타데이터로 표현할 수 있는 최대 데이터 크기
+
+-- -a : 숨은 LV 까지. 풀은 데이터(_tdata)와 메타데이터(_tmeta) 두 LV 로 되어 있고,
+-- 메타데이터 복구용 예비 공간(lvol0_pmspare)이 따로 잡힌다.
+[root@ol7a ~]# lvs -a vgdata
+  LV              VG     Attr       LSize Pool Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  [lvol0_pmspare] vgdata ewi------- 4.00m                                                    
+-- lvol0_pmspare 는 VG 에 하나만 생긴다.
+-- 풀을 여러 개 만들어도 가장 큰 _tmeta 크기로 공유한다
+  tpool           vgdata twi-a-tz-- 1.00g             0.00   10.94                           
+  [tpool_tdata]   vgdata Twi-ao---- 1.00g                                                    
+  [tpool_tmeta]   vgdata ewi-ao---- 4.00m                                                    
+
+-- 네 LV 가 생겼다. [ ] 는 숨은 LV
+--   tpool          : 풀 자체. Attr 첫 글자 t(thin pool), Data% 0.00, Meta% 10.94
+--   [tpool_tdata]  : 실제 데이터 공간 1G. 첫 글자 T(풀 데이터)
+--   [tpool_tmeta]  : 어느 thin LV 의 어느 블록이 풀의 어디에 있는지 적는 표 4M
+--   [lvol0_pmspare]: 메타데이터 복구용 예비 4M. _tmeta 와 같은 크기
+-- 빈 풀인데도 Meta% 10.94. 메타데이터 구조의 기본 몫이다
+[root@ol7a ~]# vgs vgdata
+  VG     #PV #LV #SN Attr   VSize   VFree 
+  vgdata   1   1   0 wz--n- <10.00g <8.99g
+-- #LV 1 (숨은 LV 는 세지 않음).
+-- VFree 는 1G + 4M + 4M 를 뺀 <8.99g
+
+--------------------------------------------------------------------------------
+ [2] 풀보다 큰 thin LV — 초과 할당
+--------------------------------------------------------------------------------
+
+-- -V (--virtualsize) : thin LV 가 밖에 보이는 크기. -T 로 어느 풀에서 받을지
+[root@ol7a ~]# lvcreate -V 5G -T vgdata/tpool -n thin1
+  WARNING: Sum of all thin volume sizes (5.00 GiB) exceeds the size of thin pool vgdata/tpool (1.00 GiB).
+  WARNING: You have not turned on protection against thin pools running out of space.
+  WARNING: Set activation/thin_pool_autoextend_threshold below 100 to trigger automatic extension of thin pools before they get full.
+  Logical volume "thin1" created.
+
+-- 경고 세 줄
+--   1) thin LV 크기 합(5G)이 풀(1G)보다 크다 → 초과 할당
+--   2) 풀이 찰 때를 대비한 보호가 꺼져 있다
+--   3) threshold 를 100 아래로 두라는 권고
+-- 만드는 것은 막지 않는다. 경고만 하고 만든다
+[root@ol7a ~]# lvs vgdata
+  LV    VG     Attr       LSize Pool  Origin Data%  Meta%  Move Log Cpy%Sync Convert
+  thin1 vgdata Vwi-a-tz-- 5.00g tpool        0.00                                   
+  tpool vgdata twi-aotz-- 1.00g              0.00   11.04                           
+
+-- 열 해설
+--   thin1 Attr V : thin LV(가상). LSize 5.00g, Pool tpool, Data% 0.00
+--   tpool Attr 6번째 o : thin1 이 풀을 쓰고 있어 열림
+--   tpool Meta% 10.94 → 11.04 : thin1 의 항목만큼 메타데이터가 늘었다
+-- thin LV 는 보통 LV 처럼 mkfs·mount 한다.
+-- 파일 시스템 쪽에서는 차이가 없다
+[root@ol7a ~]# mkfs.xfs -q /dev/vgdata/thin1; mkdir -p /data/t1; mount /dev/vgdata/thin1 /data/t1
+[root@ol7a ~]# df -hT /data/t1
+Filesystem               Type  Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-thin1 xfs   5.0G   33M  5.0G   1% /data/t1
+-- 응용이 df 만 보고 공간을 믿으면 풀이 차는 순간까지 아무 경고도 받지 못한다
+-- thin 환경의 용량 감시는 df 가 아니라 lvs 의 풀 Data%·Meta% 로 한다
+-- df 는 5.0G 를 보여 준다. 파일 시스템은 풀이 1G 라는 것을 모른다
+
+--------------------------------------------------------------------------------
+ [3] 쓰는 만큼만 풀에서 가져간다
+--------------------------------------------------------------------------------
+
+-- 300M 를 쓰고 sync 로 디스크까지 내려보낸다. 풀은 실제로 쓰인 블록만 센다
+[root@ol7a ~]# dd if=/dev/zero of=/data/t1/f300 bs=1M count=300 status=none; sync
+[root@ol7a ~]# lvs -o lv_name,lv_size,data_percent,metadata_percent,pool_lv vgdata
+  LV    LSize Data%  Meta%  Pool 
+  thin1 5.00g 6.07          tpool
+  tpool 1.00g 30.34  14.84       
+
+-- 300M 를 쓰자
+--   thin1 Data% 6.07  : 5G 중 약 310M 가 할당됨
+--   tpool Data% 30.34 : 1G 중 약 310M. 같은 블록을 두 쪽에서 센 것이다
+--   tpool Meta% 14.84 : 매핑 항목이 늘어 메타데이터도 올랐다
+-- /dev/zero 로 쓴 0 블록이라도 파일 시스템이 쓴 블록은 풀에서 받는다
+[root@ol7a ~]# df -h /data/t1 | tail -1
+/dev/mapper/vgdata-thin1  5.0G  333M  4.7G   7% /data/t1
+-- df Used 333M. 파일 시스템 쪽 사용량과 풀 쪽 사용량은 따로 셈한다
+
+-- 파일을 지워도 풀 사용량은 바로 줄지 않는다. 파일 시스템이 블록을 반환(discard)해야 한다.
+[root@ol7a ~]# rm -f /data/t1/f300; sync; lvs -o lv_name,data_percent vgdata
+  LV    Data% 
+  thin1 6.07  
+  tpool 30.34 
+
+-- 증상   : 파일을 지웠는데 thin1 6.07, tpool 30.34 그대로
+-- 원인   : rm 은 파일 시스템 안의 빈칸 표시만 바꾼다. 풀은 그 블록이 비었다는 것을 모른다
+[root@ol7a ~]# fstrim -v /data/t1; lvs -o lv_name,data_percent vgdata
+/data/t1: 5 GiB (5357879296 bytes) trimmed
+  LV    Data% 
+  thin1 0.21  
+  tpool 30.34 
+-- 조치   : fstrim -v /data/t1. 파일 시스템이 빈 블록 목록을 discard 로 아래에 알린다
+-- 5 GiB trimmed : 빈 공간 전체를 알렸다는 뜻
+-- 재확인 : thin1 Data% 6.07 → 0.21 로 내려갔다
+-- 그런데 tpool 은 30.34 그대로다
+--   fstrim 직후의 lvs 에는 풀 쪽 반환이 아직 반영되지 않았다
+--   [4] 에서 thin2 를 쓴 뒤의 tpool 값으로 실제 반환량을 확인한다
+
+--------------------------------------------------------------------------------
+ [4] 두 번째 thin LV — 합이 풀의 열 배
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# lvcreate -V 5G -T vgdata/tpool -n thin2
+  WARNING: Sum of all thin volume sizes (10.00 GiB) exceeds the size of thin pool vgdata/tpool and the size of whole volume group (<10.00 GiB).
+  WARNING: You have not turned on protection against thin pools running out of space.
+  WARNING: Set activation/thin_pool_autoextend_threshold below 100 to trigger automatic extension of thin pools before they get full.
+  Logical volume "thin2" created.
+
+-- 이번 경고는 풀뿐 아니라 VG 전체(<10.00 GiB)보다도 크다고 말한다
+-- thin2 에는 Ext4 를 올린다. 같은 풀을 두 형식이 나눠 쓴다
+[root@ol7a ~]# mkfs.ext4 -q /dev/vgdata/thin2; mkdir -p /data/t2; mount /dev/vgdata/thin2 /data/t2
+[root@ol7a ~]# dd if=/dev/zero of=/data/t2/f400 bs=1M count=400 oflag=direct status=none
+[root@ol7a ~]# lvs -o lv_name,lv_size,data_percent vgdata; df -h /data/t1 /data/t2
+  LV    LSize Data% 
+  thin1 5.00g 0.21  
+  thin2 5.00g 9.10  
+  tpool 1.00g 46.55 
+Filesystem                Size  Used Avail Use% Mounted on
+/dev/mapper/vgdata-thin1  5.0G   33M  5.0G   1% /data/t1
+/dev/mapper/vgdata-thin2  4.9G  401M  4.2G   9% /data/t2
+-- tpool 46.55% ≈ 477M.
+-- thin1 0.21%(약 11M) + thin2 9.10%(약 466M)
+-- [3] 의 30.34% 가 남아 있었다면 77% 를 넘었을 것이다.
+-- fstrim 몫이 실제로 돌아왔다
+-- df 로는 두 파일 시스템 합이 10G 다. 실제 공간은 1G 다
+
+--------------------------------------------------------------------------------
+ [5] 풀이 가득 차면
+--------------------------------------------------------------------------------
+
+-- thin1 에 800M 를 더 쓴다. 풀 1G 에 thin2 가 400M 넘게 쓰고 있으니 넘친다.
+-- oflag=direct : 페이지 캐시를 거치지 않아 오류가 dd 에게 바로 돌아온다
+-- time 으로 dd 가 얼마나 멈춰 있었는지 잰다.
+[root@ol7a ~]# time dd if=/dev/zero of=/data/t1/fill bs=1M count=800 oflag=direct
+dd: error writing ‘/data/t1/fill’: No space left on device
+548+0 records in
+547+0 records out
+573571072 bytes (574 MB) copied, 64.1313 s, 8.9 MB/s
+
+real    1m4.133s
+user    0m0.000s
+sys     0m0.038s
+
+-- 증상   : dd 가 "No space left on device" 로 실패. 547M 를 쓰고 멈췄고 real 1m4.133s
+-- 64초 가운데 대부분은 쓰기가 멈춰 있던 시간이다(평균 8.9 MB/s)
+-- lv_health_status : 풀·RAID 의 이상 상태를 낱말로 보여 주는 열
+[root@ol7a ~]# lvs -o lv_name,lv_size,data_percent,lv_health_status vgdata
+  LV    LSize Data%  Health         
+  thin1 5.00g 10.90                 
+  thin2 5.00g 9.10                  
+  tpool 1.00g 100.00 out_of_data    
+
+-- tpool Data% 100.00, Health out_of_data.
+-- thin1 10.90%(약 558M)
+-- 풀이 차면 그 풀의 모든 thin LV 가 새 블록을 받지 못한다.
+-- thin2 도 같이 멈춘다
+-- 커널은 풀 상태가 바뀔 때마다 기록을 남긴다. 시각(부팅 뒤 초)으로 순서를 읽는다
+[root@ol7a ~]# dmesg | grep -iE 'thin|space|xfs' | tail -8
+[   12.305324] device-mapper: thin: Data device (dm-3) discard unsupported: Disabling discard passdown.
+[   12.745925] device-mapper: thin: Data device (dm-3) discard unsupported: Disabling discard passdown.
+[   12.923822] XFS (dm-6): Mounting V4 Filesystem
+[   12.939691] XFS (dm-6): Ending clean mount
+[   12.939722] xfs filesystem being mounted at /data/t1 supports timestamps until (%ptR?) (0x7fffffff)
+[   15.347176] device-mapper: thin: 252:4: reached low water mark for data device: sending event.
+[   15.348417] device-mapper: thin: 252:4: switching pool to out-of-data-space (queue IO) mode
+[   79.153393] device-mapper: thin: 252:4: switching pool to out-of-data-space (error IO) mode
+-- 원인   : 풀 데이터가 100% 가 되었다. 커널 기록 순서
+--   15.347 : low water mark 도달 → dmeventd 에 이벤트(감시는 했지만 확장 기준 100%)
+--   15.348 : out-of-data-space (queue IO) → 쓰기를 대기열에 잡아 둠
+--   79.153 : out-of-data-space (error IO) → 약 64초 뒤 오류로 바꿈
+-- 대기 시간은 dm-thin-pool 모듈의 no_space_timeout(기본 60초)이 정한다
+-- 앞쪽 discard unsupported 두 줄은 VMware 가상 디스크가 discard 를 받지 않아
+-- 풀 아래로는 전달하지 않는다는 뜻. 풀 안에서의 반환([3])은 그대로 된다
+
+--------------------------------------------------------------------------------
+ [6] 풀을 늘려 쓰기를 되살린다
+--------------------------------------------------------------------------------
+-- 풀을 늘린다. VG 에 9G 가까이 남아 있다. thin 풀은 데이터 LV(_tdata)가 늘어난다.
+[root@ol7a ~]# lvextend -L +2G vgdata/tpool
+  WARNING: Sum of all thin volume sizes (10.00 GiB) exceeds the size of thin pools and the size of whole volume group (<10.00 GiB).
+  WARNING: You have not turned on protection against thin pools running out of space.
+  WARNING: Set activation/thin_pool_autoextend_threshold below 100 to trigger automatic extension of thin pools before they get full.
+  Size of logical volume vgdata/tpool_tdata changed from 1.00 GiB (256 extents) to 3.00 GiB (768 extents).
+  Logical volume vgdata/tpool_tdata successfully resized.
+
+-- 조치   : lvextend -L +2G vgdata/tpool. 실제로 늘어난 것은 tpool_tdata 1G → 3G
+[root@ol7a ~]# lvs -o lv_name,lv_size,data_percent,lv_health_status vgdata
+  LV    LSize Data%  Health         
+  thin1 5.00g 10.90                 
+  thin2 5.00g 9.10                  
+  tpool 3.00g 33.33                 
+
+-- tpool 3.00g, Data% 33.33,
+-- Health 빈칸 → out_of_data 가 풀렸다
+-- 풀을 늘린 뒤 같은 파일 시스템에 새로 쓸 수 있는지 본다
+[root@ol7a ~]# touch /data/t1/after; ls /data/t1; dmesg | tail -3
+after
+fill
+[   79.315428] device-mapper: thin: Data device (dm-3) discard unsupported: Disabling discard passdown.
+[   79.316232] device-mapper: thin: 252:4: switching pool to write mode
+[   79.316234] device-mapper: thin: 252:4: growing the data device from 16384 to 49152 blocks
+-- 재확인 : touch 가 성공해 after 파일이 생겼다
+-- 커널도 "switching pool to write mode" 로 쓰기 모드에 돌아왔다
+-- 16384 → 49152 블록(64KiB 청크) = 1GiB → 3GiB
+-- 실패한 dd 의 fill 파일은 547M 까지만 남아 있다. 오류 이후의 쓰기는 사라졌다
+
+--------------------------------------------------------------------------------
+ [7] 자동 확장 — 감시가 있어도 기본값은 꺼져 있다
+--------------------------------------------------------------------------------
+
+-- [2] 의 lvcreate 경고를 다시 본다. 경고는 "보호 장치가 꺼져 있다"는 것이었다.
+-- thin_pool_autoextend_threshold : 풀 사용률이 이 %를 넘으면 늘린다(100 이면 끔)
+-- thin_pool_autoextend_percent   : 한 번에 늘리는 비율
+[root@ol7a ~]# sed -i 's/^\(\s*thin_pool_autoextend_threshold =\).*/\1 70/; s/^\(\s*thin_pool_autoextend_percent =\).*/\1 50/' /etc/lvm/lvm.conf
+[root@ol7a ~]# diff /root/lvm.conf.orig /etc/lvm/lvm.conf
+1459c1459
+<       thin_pool_autoextend_threshold = 100
+---
+>       thin_pool_autoextend_threshold = 70
+1472c1472
+<       thin_pool_autoextend_percent = 20
+---
+>       thin_pool_autoextend_percent = 50
+-- 고친 줄 두 개(1459·1472 행)만 다르다. 나머지는 원본과 같다
+-- lvm.conf 는 다음 LVM 명령부터 바로 읽는다. 데몬 재시작은 없다
+
+-- 새 풀 tpool2 (400M)를 만들어 thin LV 하나를 얹고 300M(약 75%)를 쓴다.
+[root@ol7a ~]# lvcreate -L 400M -T vgdata/tpool2
+  Thin pool volume with chunk size 64.00 KiB can address at most 15.81 TiB of data.
+  Logical volume "tpool2" created.
+
+-- 새 설정에서 만든 400M 풀이다. 감시가 시작될 때 새 threshold 가 적용된다
+[root@ol7a ~]# lvcreate -V 2G -T vgdata/tpool2 -n thin3; mkfs.xfs -q /dev/vgdata/thin3; mkdir -p /data/t3; mount /dev/vgdata/thin3 /data/t3
+  WARNING: Sum of all thin volume sizes (12.00 GiB) exceeds the size of thin pools and the size of whole volume group (<10.00 GiB).
+  Logical volume "thin3" created.
+
+-- 이번 경고는 한 줄뿐이다. "보호가 꺼져 있다" 는 경고 두 줄이 사라졌다
+-- seg_monitor : dmeventd 감시 여부.
+-- monitored 여야 자동 확장이 동작한다
+[root@ol7a ~]# lvs -o lv_name,lv_size,seg_monitor vgdata/tpool2
+  LV     LSize   Monitor  
+  tpool2 400.00m monitored
+
+-- Monitor monitored : dmeventd 가 이 풀을 감시 중
+[root@ol7a ~]# dd if=/dev/zero of=/data/t3/f300 bs=1M count=300 oflag=direct status=none; lvs -o lv_name,lv_size,data_percent vgdata/tpool2
+  LV     LSize   Data% 
+  tpool2 600.00m 51.78 
+-- dd 직후 이미 400M → 600M.
+-- 300M 를 쓰는 도중 70% 를 넘자 50% 를 늘렸다
+-- 51.78% 는 늘어난 600M 기준의 사용률이다
+
+-- dmeventd 가 10초 간격으로 사용률을 본다. 잠시 기다린다.
+[root@ol7a ~]# sleep 25; lvs -o lv_name,lv_size,data_percent vgdata/tpool2
+  LV     LSize   Data% 
+  tpool2 600.00m 51.78 
+
+-- 25초 뒤에도 그대로. 51.78% 는 threshold 70 아래라 더 늘리지 않는다
+-- 자동 확장은 dmeventd 가 한다. 그 기록은 dm-event 유닛의 저널에 남는다
+[root@ol7a ~]# journalctl -u dm-event --since "-3min" --no-pager | tail -4
+Nov 13 09:09:35 ol7a.example.com lvm[2152]: Monitoring thin pool vgdata-tpool2-tpool.
+Nov 13 09:09:35 ol7a.example.com lvm[2152]: WARNING: Sum of all thin volume sizes (12.00 GiB) exceeds the size of thin pools and the size of whole volume group (<10.00 GiB).
+Nov 13 09:09:35 ol7a.example.com lvm[2152]: Size of logical volume vgdata/tpool2_tdata changed from 400.00 MiB (100 extents) to 600.00 MiB (150 extents).
+Nov 13 09:09:35 ol7a.example.com lvm[2152]: Logical volume vgdata/tpool2_tdata successfully resized.
+-- dmeventd(lvm[2152]) 의 기록
+--   Monitoring thin pool ... : 감시 시작
+--   Size ... changed from 400.00 MiB (100 extents) to 600.00 MiB (150 extents)
+-- 사람이 lvextend 를 친 것과 같은 메시지가 dmeventd 이름으로 남는다
+-- VG 에 빈 공간이 없으면 이 자동 확장도 실패한다. VG 여유는 따로 감시한다
+
+--------------------------------------------------------------------------------
+ [변형] thin 스냅샷 — 크기를 주지 않는다
+--------------------------------------------------------------------------------
+
+-- thin LV 의 스냅샷은 -L 없이 만든다. 같은 풀에서 블록을 공유한다.
+-- 스냅샷 시점을 구분할 내용을 넣는다
+[root@ol7a ~]# echo v1 > /data/t3/app.conf; sync
+[root@ol7a ~]# lvcreate -s -n thin3_snap vgdata/thin3
+  WARNING: Sum of all thin volume sizes (14.00 GiB) exceeds the size of thin pools and the size of whole volume group (<10.00 GiB).
+  Logical volume "thin3_snap" created.
+
+-- -L 을 주지 않았다. 크기를 주면 풀 밖의 COW 스냅샷이 만들어진다
+[root@ol7a ~]# lvs -o lv_name,lv_attr,lv_size,data_percent,origin,pool_lv vgdata
+  LV         Attr       LSize   Data%  Origin Pool  
+  thin1      Vwi-aotz--   5.00g 10.90         tpool 
+  thin2      Vwi-aotz--   5.00g 9.10          tpool 
+  thin3      Vwi-aotz--   2.00g 15.17         tpool2
+-- thin3 Data% 15.17 ≈ 2G 의 15% ≈ 310M.
+-- 300M 파일과 XFS 메타데이터 몫
+  thin3_snap Vwi---tz-k   2.00g        thin3  tpool2
+  tpool      twi-aotz--   3.00g 33.33               
+  tpool2     twi-aotz-- 600.00m 51.78               
+-- thin3_snap 의 Attr Vwi---tz-k
+--   첫 글자 V : thin LV. 스냅샷도 thin LV 로 만들어진다
+--   다섯째 '-' : 비활성
+--   열째 k     : 활성화 건너뛰기(skip activation) 표시
+-- LSize 2.00g 는 원본과 같다. Data% 칸이 빈 것은 비활성이라 읽지 못해서다
+-- Origin thin3, Pool tpool2. 원본과 같은 풀의 블록을 공유한다
+
+-- 속성 열 끝의 k 는 "활성화 건너뛰기" 표시다. 그냥 활성화하면 무시된다. -K 로 덮어쓴다.
+[root@ol7a ~]# lvchange -ay vgdata/thin3_snap; ls /dev/vgdata/ | grep snap
+
+-- 출력이 없다. -ay 를 줬는데도 k 표시 때문에 활성화를 건너뛰었다
+[root@ol7a ~]# lvchange -ay -K vgdata/thin3_snap; ls /dev/vgdata/ | grep snap
+-- -K(--ignoreactivationskip) 를 함께 주자 /dev/vgdata/thin3_snap 이 생겼다
+thin3_snap
+
+-- XFS 라 원본과 UUID 가 같다.
+-- COW 스냅샷 때처럼 nouuid 를 준다(실습 05)
+[root@ol7a ~]# mkdir -p /snap; mount -o ro,nouuid /dev/vgdata/thin3_snap /snap; echo v2 > /data/t3/app.conf; cat /snap/app.conf /data/t3/app.conf
+-- 스냅샷은 v1, 원본은 v2. thin 스냅샷도 만든 시점의 모습을 유지한다
+-- COW 스냅샷과 달리 "스냅샷 크기" 가 없다. 풀이 차지 않는 한 무효화되지 않는다
+v1
+v2
+
+--------------------------------------------------------------------------------
+ [8] 되돌림
+--------------------------------------------------------------------------------
+
+-- 마운트 넷을 내리고 디렉터리를 지운다
+[root@ol7a ~]# umount /snap /data/t1 /data/t2 /data/t3; rm -rf /data /snap
+[root@ol7a ~]# vgremove -y vgdata
+  Logical volume "thin1" successfully removed
+  Logical volume "thin2" successfully removed
+  Logical volume "tpool" successfully removed
+  Logical volume "thin3" successfully removed
+  Logical volume "thin3_snap" successfully removed
+  Logical volume "tpool2" successfully removed
+-- 숨은 LV 까지 모두 지워졌다. VG 는 마지막에 지운다
+  Volume group "vgdata" successfully removed
+
+-- 숨은 LV(_tdata, _tmeta,
+-- pmspare)는 목록에 나오지 않고 함께 지워졌다
+-- LVM2 레이블까지 지운다
+[root@ol7a ~]# pvremove /dev/sdb
+  Labels on physical volume "/dev/sdb" successfully wiped.
+[root@ol7a ~]# cp -p /root/lvm.conf.orig /etc/lvm/lvm.conf; rm -f /root/lvm.conf.orig
+-- 고쳤던 lvm.conf 를 원본으로 되돌린다
+
+--------------------------------------------------------------------------------
+ [9] 시작 전과 비교
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# vgs; lsblk -o NAME,SIZE,TYPE /dev/sdb
+  VG #PV #LV #SN Attr   VSize   VFree
+  ol   1   2   0 wz--n- <39.00g 4.00m
+NAME SIZE TYPE
+sdb   10G disk
+
+-- lvm.conf 를 되돌린 효과를 lvmconfig 로 확인한다
+[root@ol7a ~]# lvmconfig activation/thin_pool_autoextend_threshold activation/thin_pool_autoextend_percent
+thin_pool_autoextend_threshold=100
+thin_pool_autoextend_percent=20
+-- 재확인 : 두 값이 [0] 과 같은 100·20 으로 돌아왔다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                    시작 전   작업 중                               되돌린 뒤
+--  tpool LSize / Data%     -         1G 0% → 30.34% → 46.55% → 100% → 3G 33.33% -
+--  thin LV 합 / 풀 합      -         10G / 1G → 12G·14G / 3.6G             -
+--  thin1 Data% (rm, fstrim)-         6.07 → 6.07 → 0.21                    -
+--  풀 고갈 때 dd           -         64초 대기 후 No space left on device  -
+--  tpool2 (threshold 70)   -         400M → 600M 자동 확장                  -
+--  autoextend threshold    100       70                                    100
+--  autoextend percent      20        50                                    20
+-- 오류 두 가지
+--   rm 뒤에도 사용률 그대로 : fstrim 으로 반환
+--   풀 고갈                 : queue 60초 → error. lvextend 로 풀 확장, threshold 로 예방
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. lvchange --errorwhenfull y vgdata/tpool 로 바꾼 뒤 [5] 를 다시 해 보고 dd 가 기다리지 않고
+--    바로 실패하는지 time 으로 비교한다. 확인: lvs -o +lv_when_full
+-- 2. lvcreate --poolmetadatasize 로 메타데이터를 작게 잡은 풀에 작은 파일을 아주 많이 써서
+--    Meta% 가 먼저 차는 경우를 만들어 본다.
+-- 3. /etc/fstab 의 마운트 옵션에 discard 를 넣었을 때와 fstrim.timer 를 켰을 때를 비교한다.
+--    확인 방법: systemctl status fstrim.timer, 파일 삭제 뒤 thin LV 의 Data% 변화
+-- 4. VG 에 남은 공간보다 큰 자동 확장이 필요할 때 dmeventd 가 남기는 메시지를 찾아본다
+--    확인 방법: VG 를 거의 채운 뒤 [7] 을 반복하고 journalctl -u dm-event
+
+================================================================================
+ 실습 06 종료 — 1G 풀에 5G thin LV 둘, 풀 고갈로 dd 64초 정지 후 오류, 자동 확장 400M→600M
+================================================================================

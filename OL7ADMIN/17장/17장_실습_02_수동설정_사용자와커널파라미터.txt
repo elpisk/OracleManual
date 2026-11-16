@@ -1,0 +1,452 @@
+================================================================================
+ 제17장 실습 02 — 수동 설정: preinstall 없이 사용자·그룹·커널 파라미터 맞추기
+ 대상   : ol7b (작업), ol7a (preinstall 을 설치한 기준 노드)
+ 목표   : ol7b 에서 preinstall 없이 oracle 사용자와 그룹 7개, sysctl·limits 값을
+          손수 만들어 ol7a 와 같게 맞춘다. 공유 메모리 값을 이 노드 메모리로
+          계산해 근거를 남기고, 두 노드의 UID·GID 가 같은지 확인한다
+ 배경   : preinstall 을 쓸 수 없는 서버(사내 표준 이미지, 다른 배포판)에서는
+          설치 가이드 표를 보고 같은 작업을 직접 한다. 사용자·그룹 번호는 노드
+          사이에 같아야 공유 스토리지 권한이 맞는다. shmall 은 바이트가 아니라
+          페이지 단위다(본문 17.2·17.4·17.5)
+ 소요   : 약 30분
+ 선행   : ol7-base, ol7b-base 스냅샷. ol7a 에는 preinstall 을 미리 설치(출력 생략)
+ 계정   : root
+ 주의   : 실행 중인 커널 값은 파일을 지워도 재부팅 전까지 남는다
+ 되돌림 : ol7b 사용자·그룹·설정 파일 삭제, 끝에 두 노드 스냅샷 복귀
+================================================================================
+
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 기준 노드 ol7a. preinstall 을 설치해 둔 상태다
+[root@ol7a ~]# id oracle; rpm -q oracle-database-preinstall-19c
+uid=54321(oracle) gid=54321(oinstall) groups=54321(oinstall),54322(dba),54323(oper),54324(backupdba),54325(dgdba),54326(kmdba),54330(racdba)
+oracle-database-preinstall-19c-1.0-3.el7.x86_64
+-- uid=54321(oracle) gid=54321(oinstall) : 사용자 번호와 기본 그룹
+-- groups= : 보조 그룹 여섯 개와 기본 그룹. 이 줄 전체가 ol7b 에서 만들 목표다
+-- rpm -q 결과 1.0-3.el7 이 ol7_latest 에 있는 판이다(실습 01)
+-- 작업 노드 ol7b. 아직 아무것도 없다
+[root@ol7b ~]# id oracle; getent group oinstall dba; echo "exit=$?"
+id: oracle: no such user
+exit=2
+-- 이 실습의 작업은 모두 ol7b 에서 하고, ol7a 는 비교 대상으로만 읽는다
+-- ol7b 메모리는 2GB 라 HugePages 실습은 하지 않는다
+-- 프롬프트의 호스트 이름(ol7a / ol7b)으로 어느 노드의 출력인지 구분한다
+-- id 는 "no such user", getent 는 아무것도 찍지 않고 종료 코드 2(키를 찾지 못함)
+-- getent 종료 코드: 0 찾음, 2 하나 이상 못 찾음
+[root@ol7b ~]# sysctl kernel.shmmax kernel.shmall kernel.shmmni kernel.sem fs.file-max fs.aio-max-nr
+kernel.shmmax = 18446744073692774399
+kernel.shmall = 18446744073692774399
+kernel.shmmni = 4096
+kernel.sem = 32000      1024000000      500     32000
+fs.file-max = 168778
+fs.aio-max-nr = 65536
+-- 커널 기본값이다. ol7a 의 preinstall 전 값과 같은 줄이 대부분이지만
+-- fs.file-max 는 168778 로 ol7a(368252)보다 작다. 이 값은 커널이 메모리 크기로 정한다
+-- shmmax·shmall 의 18446744073692774399 는 "사실상 무제한"(2^64 - 2^24)
+[root@ol7b ~]# ls /etc/sysctl.d/ /etc/security/limits.d/; tail -3 /etc/group
+/etc/security/limits.d/:
+20-nproc.conf
+
+/etc/sysctl.d/:
+99-sysctl.conf
+stapdev:x:158:
+student:x:1000:student
+fuse:x:993:
+-- limits.d 에는 기본 20-nproc.conf 하나, sysctl.d 에는 99-sysctl.conf 하나
+-- /etc/group 끝 세 줄 : 마지막 일반 그룹은 student(1000)다. 다음 자동 번호를 짐작하는 근거
+
+--------------------------------------------------------------------------------
+ [1] 기준 노드의 번호 확인
+--------------------------------------------------------------------------------
+
+-- 두 노드에 같은 번호로 만들려면 먼저 기준 값을 본다
+[root@ol7a ~]# for g in oinstall dba oper backupdba dgdba kmdba racdba; do getent group $g; done
+oinstall:x:54321:oracle
+dba:x:54322:oracle
+oper:x:54323:oracle
+backupdba:x:54324:oracle
+dgdba:x:54325:oracle
+kmdba:x:54326:oracle
+racdba:x:54330:oracle
+-- 넷째 필드가 그룹 구성원 목록. 보조 그룹으로 넣은 사용자만 나온다
+-- oinstall 에도 oracle 이 보이는 것은 preinstall 이 보조 그룹 목록에 oinstall 을 함께 넣었기 때문이다
+-- 번호가 54327~54329 를 건너뛴다. asmdba·asmoper·asmadmin 몫으로 비워 둔 번호다
+[root@ol7a ~]# getent passwd oracle
+oracle:x:54321:54321::/home/oracle:/bin/bash
+-- getent 는 /etc/passwd 뿐 아니라 nsswitch.conf 에 적힌 모든 출처(LDAP 등)를 함께 본다
+-- 필드: 이름, x(shadow 에 비밀번호), UID, 기본 GID, GECOS(빈 값), 홈, 셸
+-- 셋째·넷째 필드 54321:54321 이 ol7b 에서 맞춰야 할 숫자다. 홈과 셸은 useradd 기본값과 같다
+-- 확인할 번호 정리: oinstall 54321, dba 54322, oper 54323, backupdba 54324,
+--   dgdba 54325, kmdba 54326, racdba 54330, oracle UID 54321
+
+--------------------------------------------------------------------------------
+ [2] 그룹 만들기 — 번호를 빼먹으면
+--------------------------------------------------------------------------------
+
+-- dba 를 먼저 번호 없이 만들고, oinstall 은 -g 로 번호를 준다
+-- groupadd -g GID : 그룹 번호 지정. 생략하면 GID_MIN(1000) 이상에서 가장 큰 번호 + 1
+[root@ol7b ~]# grep -E '^GID_(MIN|MAX)' /etc/login.defs
+GID_MIN                  1000
+GID_MAX                 60000
+-- 일반 그룹 번호 범위 1000~60000. -g 를 빼면 이 범위에서 "현재 가장 큰 번호 + 1" 을 고른다
+[root@ol7b ~]# groupadd dba; groupadd -g 54321 oinstall; getent group oinstall dba
+oinstall:x:54321:
+dba:x:1001:
+-- dba 가 1001 이 됐다. 이때 범위 안의 가장 큰 번호가 student(1000)였다
+-- 순서를 바꿔 oinstall(54321)을 먼저 만들었다면 dba 는 우연히 54322 가 됐을 것이다
+-- 번호를 생성 순서에 맡기면 노드마다 결과가 달라진다. 그래서 모든 그룹에 -g 를 준다
+-- 이미 다른 소프트웨어가 54321 근처 번호를 쓰고 있다면 사내에서 번호 대역을 따로 정해 둔다
+-- 디렉터리를 하나 만들어 dba 그룹을 준다. 번호 문제가 파일에 어떻게 남는지 보려는 것이다
+[root@ol7b ~]# mkdir -p /u01/app/oracle/admin; chgrp dba /u01/app/oracle/admin; ls -ldn /u01/app/oracle/admin
+drwxr-xr-x. 2 0 1001 6 Nov 16 11:00 /u01/app/oracle/admin
+-- ls -n : 소유자·그룹을 이름 대신 번호로. 파일 시스템에는 이 숫자가 저장된다
+
+[root@ol7b ~]# for g in "54323 oper" "54324 backupdba" "54325 dgdba" "54326 kmdba" "54330 racdba"; do groupadd -g $g; done; tail -7 /etc/group
+dba:x:1001:
+oinstall:x:54321:
+oper:x:54323:
+backupdba:x:54324:
+dgdba:x:54325:
+kmdba:x:54326:
+racdba:x:54330:
+-- 나머지 다섯 그룹은 -g 로 번호를 줬다. for 의 "$g" 를 따옴표 없이 펼쳐 "-g 54323 oper" 가 된다
+
+--------------------------------------------------------------------------------
+ [3] 사용자 만들기
+--------------------------------------------------------------------------------
+
+-- useradd -u UID -g 기본그룹 -G 보조그룹목록
+[root@ol7b ~]# useradd -u 54321 -g oinstall -G dba,oper,backupdba,dgdba,kmdba,racdba oracle; id oracle
+uid=54321(oracle) gid=54321(oinstall) groups=54321(oinstall),1001(dba),54323(oper),54324(backupdba),54325(dgdba),54326(kmdba),54330(racdba)
+-- useradd -u 54321 : UID 지정, -g oinstall : 기본 그룹, -G : 보조 그룹(쉼표로, 공백 없이)
+-- groups= 의 둘째 항목이 1001(dba). ol7a 에서는 54322(dba) 였다
+[root@ol7a ~]# id oracle
+uid=54321(oracle) gid=54321(oinstall) groups=54321(oinstall),54322(dba),54323(oper),54324(backupdba),54325(dgdba),54326(kmdba),54330(racdba)
+-- 두 노드의 id 출력을 해시로 비교한다. 같으면 같은 값이 나온다
+[root@ol7a ~]# id oracle | md5sum
+ced02f16cc53f619e7e05e9b6b3726cb  -
+-- md5sum 은 입력이 한 글자만 달라도 다른 값을 낸다. 두 노드의 출력을 눈으로 대조하는 대신 쓴다
+[root@ol7b ~]# id oracle | md5sum
+688bb4b125b74d069050e07b409d2a3c  -
+-- 증상   : 두 노드의 id oracle 해시가 다르다(ced02f16… / 688bb4b1…). 차이는 dba 의 GID 1001 과 54322
+-- 원인   : ol7b 에서 groupadd dba 에 -g 를 빼 자동 번호 1001 이 붙었다. NFS·공유 디스크·
+--          Data Guard 로 파일을 주고받으면 한쪽의 dba 소유 파일이 다른 쪽에서 이름 없는 그룹이 된다
+-- 조치   : groupmod -g 54322 dba 로 번호를 바꾸고, 옛 번호 1001 로 남은 파일을 find 로 고친다
+
+[root@ol7b ~]# groupmod -g 54322 dba; getent group dba; id oracle
+dba:x:54322:oracle
+uid=54321(oracle) gid=54321(oinstall) groups=54321(oinstall),54322(dba),54323(oper),54324(backupdba),54325(dgdba),54326(kmdba),54330(racdba)
+-- groupmod 는 /etc/group 의 셋째 필드만 고친다. 구성원(oracle)은 그대로 남는다
+[root@ol7b ~]# ls -ld /u01/app/oracle/admin; ls -ldn /u01/app/oracle/admin
+drwxr-xr-x. 2 root 1001 6 Nov 16 11:00 /u01/app/oracle/admin
+drwxr-xr-x. 2 0 1001 6 Nov 16 11:00 /u01/app/oracle/admin
+-- 디렉터리의 그룹은 여전히 1001. 이름으로 바꿔 보여 줄 그룹이 없어 숫자로 찍힌다
+-- groupmod 는 파일 시스템을 뒤지지 않는다. 옛 번호로 만든 파일은 사람이 고쳐야 한다
+[root@ol7b ~]# find / -xdev -gid 1001 2>/dev/null
+/u01/app/oracle/admin
+-- find -xdev : 루트 파일 시스템 안에서만(다른 마운트 지점으로 넘어가지 않음). -gid 1001 : 그룹 번호로 찾기
+[root@ol7b ~]# find / -xdev -gid 1001 -exec chgrp dba {} \; ; ls -ld /u01/app/oracle/admin
+drwxr-xr-x. 2 root dba 6 Nov 16 11:00 /u01/app/oracle/admin
+-- -exec chgrp dba {} \; : 찾은 파일마다 chgrp 를 한 번씩. 이제 dba(54322)
+[root@ol7b ~]# id oracle | md5sum
+ced02f16cc53f619e7e05e9b6b3726cb  -
+-- 재확인 : ol7b 의 해시가 ol7a 와 같은 ced02f16cc53f619e7e05e9b6b3726cb 가 됐다
+-- 그룹 번호를 바꾼 뒤에는 그 그룹으로 떠 있던 프로세스도 재시작해야 새 번호를 받는다
+-- 여기서는 oracle 로 떠 있는 프로세스가 없어 바로 끝났다
+[root@ol7b ~]# chown -R oracle:oinstall /u01; chmod -R 775 /u01; ls -ld /u01 /u01/app /u01/app/oracle
+drwxrwxr-x. 3 oracle oinstall 17 Nov 16 11:00 /u01
+drwxrwxr-x. 3 oracle oinstall 20 Nov 16 11:00 /u01/app
+drwxrwxr-x. 3 oracle oinstall 19 Nov 16 11:00 /u01/app/oracle
+-- 설치 가이드 예제의 Oracle Base 경로. 소유자 oracle:oinstall, 775
+-- 운영에서는 /u01 을 별도 파일 시스템으로 잡고 fstab 에 넣은 뒤 이 작업을 한다
+
+--------------------------------------------------------------------------------
+ [4] 공유 메모리 값 계산
+--------------------------------------------------------------------------------
+
+-- 이 노드의 물리 메모리와 페이지 크기
+[root@ol7b ~]# grep MemTotal /proc/meminfo; getconf PAGE_SIZE
+MemTotal:        1720968 kB
+4096
+-- MemTotal 1720968 kB ≈ 1.64GiB. 2GB 를 줬지만 커널·펌웨어 예약분을 뺀 값이 보인다
+-- PAGE_SIZE 4096 : shmall 단위가 되는 페이지 크기
+-- shmmax: 물리 메모리의 절반(바이트). shmall: shmmax 이상을 페이지 수로
+[root@ol7b ~]# M=$(awk '/MemTotal/{print $2*1024}' /proc/meminfo); P=$(getconf PAGE_SIZE); echo "SHMMAX=$((M/2)) SHMALL=$((M/2/P))" | tee /root/shm.calc
+SHMMAX=881135616 SHMALL=215121
+-- shmmax = 1720968 × 1024 / 2 = 881135616 바이트(약 840MiB)
+-- shmall = 881135616 / 4096 = 215121 페이지. 이 값 이상이면 된다
+-- 계산 결과를 파일로 남겨 다음 명령에서 . /root/shm.calc 로 불러 쓴다
+-- 기준 노드가 preinstall 로 받은 값과 비교
+[root@ol7a ~]# grep -E '^kernel\.shm' /etc/sysctl.conf
+kernel.shmmni = 4096
+kernel.shmall = 1073741824
+kernel.shmmax = 4398046511104
+-- preinstall 은 메모리와 상관없이 shmmax 4TiB, shmall 1073741824 페이지(4TiB)를 넣는다
+-- 상한일 뿐 메모리를 미리 잡지 않으니 크게 줘도 손해가 없다. 계산값은 "최소 이만큼" 의 근거다
+-- 손으로 설정할 때 계산값을 쓰는 이유는 점검표에 근거를 남기기 위해서다
+--   "메모리 1720968 kB 의 절반 → shmmax 881135616, ÷ 4096 → shmall 215121"
+-- 메모리를 늘리면 다시 계산해야 하니, 넉넉한 고정값(preinstall 방식)을 쓰는 사이트도 많다
+
+--------------------------------------------------------------------------------
+ [5] sysctl 파일 작성 — shmall 단위를 착각하면
+--------------------------------------------------------------------------------
+
+-- 공유 메모리 합계를 1024MB 로 잡겠다며 shmall 에 1024 를 넣었다(단위를 MB 로 착각)
+-- 파일 이름은 97-. sysctl.d 는 이름 순서로 읽고 같은 키는 뒤 파일이 이긴다
+-- 99-sysctl.conf(→ /etc/sysctl.conf 링크)보다 앞에 두어 사내 표준이 sysctl.conf 에 있으면 그것이 이긴다
+-- heredoc 의 EOF 에 따옴표가 없어 $SHMMAX 가 값으로 바뀌어 기록된다
+[root@ol7b ~]# . /root/shm.calc; cat > /etc/sysctl.d/97-oracle-database-sysctl.conf <<EOF
+fs.file-max = 6815744
+kernel.sem = 250 32000 100 128
+kernel.shmmni = 4096
+kernel.shmall = 1024
+kernel.shmmax = $SHMMAX
+kernel.panic_on_oops = 1
+net.core.rmem_default = 262144
+net.core.rmem_max = 4194304
+net.core.wmem_default = 262144
+net.core.wmem_max = 1048576
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+fs.aio-max-nr = 1048576
+net.ipv4.ip_local_port_range = 9000 65500
+EOF
+-- --system : /etc/sysctl.d, /run/sysctl.d, /usr/lib/sysctl.d, /etc/sysctl.conf 를 순서대로 읽는다
+-- 파일 내용은 preinstall 이 ol7a 의 /etc/sysctl.conf 에 쓴 열네 줄과 같은 키·순서로 맞췄다
+--   fs.file-max·fs.aio-max-nr        : 파일 핸들, 비동기 I/O 요청 수(본문 17.6)
+--   kernel.sem                       : SEMMSL SEMMNS SEMOPM SEMMNI(본문 17.5)
+--   kernel.shmmni·shmall·shmmax      : 세그먼트 수, 합계(페이지), 하나의 최대(바이트)
+--   kernel.panic_on_oops = 1         : 커널 oops 때 그대로 돌지 않고 패닉
+--   net.core.[rw]mem_*               : 소켓 버퍼 기본·최대
+--   rp_filter = 2                    : 느슨한 역방향 경로 검사. NIC 가 여럿인 RAC 에서 필요
+--   ip_local_port_range              : 임시 포트 9000~65500
+-- 다른 점은 shmall(일부러 1024)과 shmmax(계산값) 두 줄뿐이다
+[root@ol7b ~]# sysctl --system 2>&1 | grep -A20 97-oracle
+* Applying /etc/sysctl.d/97-oracle-database-sysctl.conf ...
+fs.file-max = 6815744
+kernel.sem = 250 32000 100 128
+kernel.shmmni = 4096
+kernel.shmall = 1024
+kernel.shmmax = 881135616
+kernel.panic_on_oops = 1
+net.core.rmem_default = 262144
+net.core.rmem_max = 4194304
+net.core.wmem_default = 262144
+net.core.wmem_max = 1048576
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+fs.aio-max-nr = 1048576
+net.ipv4.ip_local_port_range = 9000 65500
+* Applying /etc/sysctl.d/99-sysctl.conf ...
+* Applying /etc/sysctl.conf ...
+-- --system 은 읽는 파일마다 "* Applying" 머리줄을 찍고 그 파일이 적용한 값을 보여 준다
+-- 97-oracle 이 먼저, 99-sysctl.conf 와 /etc/sysctl.conf 가 뒤에 읽혔다(둘 다 비어 있음)
+[root@ol7b ~]# sysctl kernel.shmall kernel.shmmax
+kernel.shmall = 1024
+kernel.shmmax = 881135616
+-- 파일 값이 실행 중인 커널에 그대로 들어갔다. shmall = 1024 도 오류 없이 받아들여졌다
+-- 커널은 1024 를 "1024 페이지 = 4MiB" 로 해석한다. 1024MB 를 뜻했다면 4096 배 작다
+
+-- 100MB 공유 메모리 세그먼트 하나를 만들어 본다. ipcmk -M 바이트
+[root@ol7b ~]# ipcmk -M 104857600; echo "exit=$?"
+ipcmk: create share memory failed: No space left on device
+exit=1
+-- ipcmk -M 104857600 : 100MiB 공유 메모리 세그먼트 하나. shmget 을 부르는 가장 간단한 도구
+-- 증상   : "ipcmk: create share memory failed: No space left on device"
+-- 원인   : 100MiB = 25600 페이지가 shmall(1024 페이지) 을 넘는다. shmget 은 합계가 shmall 을 넘으면 ENOSPC 를 돌려준다
+--          디스크와 무관한 메시지라 처음 보면 엉뚱한 곳을 찾게 된다
+--          Oracle 인스턴스라면 기동 때 같은 shmget 실패가 경고 로그에 남고 인스턴스가 뜨지 않는다
+[root@ol7b ~]# ipcs -mu
+
+------ Shared Memory Status --------
+segments allocated 0
+pages allocated 0
+pages resident  0
+pages swapped   0
+Swap performance: 0 attempts     0 successes
+-- ipcs -mu 의 pages allocated 는 shmall 과 같은 단위(페이지)다. 비교할 때 이 값을 본다
+-- ipcs -mu : 공유 메모리 사용 요약. 세그먼트 0개, 페이지 0 — 합계가 차서가 아니라 요청 하나가 한도보다 컸다
+
+[root@ol7b ~]# . /root/shm.calc; sed -i "s/^kernel.shmall = 1024\$/kernel.shmall = $SHMALL/" /etc/sysctl.d/97-oracle-database-sysctl.conf; grep shm /etc/sysctl.d/97-oracle-database-sysctl.conf
+kernel.shmmni = 4096
+kernel.shmall = 215121
+kernel.shmmax = 881135616
+-- 조치   : shmall 을 계산값 215121 로 고쳤다. sed 의 \$ 는 줄 끝 앵커(셸이 $ 로 넘김)
+[root@ol7b ~]# sysctl -p /etc/sysctl.d/97-oracle-database-sysctl.conf | grep shm
+kernel.shmmni = 4096
+kernel.shmall = 215121
+kernel.shmmax = 881135616
+-- sysctl -p 파일 : 그 파일 하나만 적용. --system 과 달리 다른 파일은 읽지 않는다
+[root@ol7b ~]# ipcmk -M 104857600; ipcs -m | tail -2
+Shared memory id: 0
+0xc5d9cac3 0          root       644        104857600  0                       
+-- 재확인 : 같은 100MiB 세그먼트가 만들어졌다(shmid 0, bytes 104857600, nattch 0 = 붙은 프로세스 없음)
+[root@ol7b ~]# ipcrm --all=shm; ipcs -m | tail -2
+key        shmid      owner      perms      bytes      nattch     status      
+-- ipcrm --all=shm : 모든 공유 메모리 세그먼트 삭제. 머리줄만 남았다
+
+--------------------------------------------------------------------------------
+ [6] 셸 한도 파일
+--------------------------------------------------------------------------------
+
+-- preinstall 파일과 같은 여덟 줄. 형식은 "사용자 종류 항목 값", 종류는 soft·hard
+-- memlock 134217728 KB = 128GiB. 이 노드 메모리보다 크지만 상한일 뿐이다
+[root@ol7b ~]# cat > /etc/security/limits.d/oracle-database-19c.conf <<'EOF'
+oracle   soft   nofile    1024
+oracle   hard   nofile    65536
+oracle   soft   nproc    16384
+oracle   hard   nproc    16384
+oracle   soft   stack    10240
+oracle   hard   stack    32768
+oracle   hard   memlock    134217728
+oracle   soft   memlock    134217728
+EOF
+[root@ol7b ~]# su - oracle -c 'echo "nofile $(ulimit -Sn)/$(ulimit -Hn) nproc $(ulimit -Su)/$(ulimit -Hu) stack $(ulimit -Ss)/$(ulimit -Hs) memlock $(ulimit -Sl)/$(ulimit -Hl)"'
+nofile 1024/65536 nproc 16384/16384 stack 10240/32768 memlock 134217728/134217728
+-- ol7b 에서는 su - oracle -c 로 확인했다. 파일을 만든 즉시 새 세션부터 적용된다
+-- 읽는 순서: nofile soft 1024 / hard 65536, nproc 16384 / 16384, stack 10240 / 32768(KB),
+--   memlock 128GiB / 128GiB. 설치 가이드의 nofile·stack 값과 preinstall 의 nproc 값이다
+-- preinstall 파일에는 data unlimited 두 줄이 더 있다. 기본값도 unlimited 라 결과는 같다
+-- 파일 이름은 preinstall 과 겹치지 않게 oracle-database-19c.conf 로 했다
+[oracle@ol7a ~]$ echo "nofile $(ulimit -Sn)/$(ulimit -Hn) nproc $(ulimit -Su)/$(ulimit -Hu) stack $(ulimit -Ss)/$(ulimit -Hs) memlock $(ulimit -Sl)/$(ulimit -Hl)"
+nofile 1024/65536 nproc 16384/16384 stack 10240/32768 memlock 134217728/134217728
+-- 기준 노드 ol7a 의 oracle. 네 항목 soft/hard 가 한 글자도 다르지 않다
+
+--------------------------------------------------------------------------------
+ [7] 두 노드 비교 — 공유 메모리를 뺀 나머지
+--------------------------------------------------------------------------------
+
+-- shmmax·shmall 은 노드 메모리에 따라 다르게 잡았으니 빼고 비교한다
+[root@ol7a ~]# sysctl fs.file-max kernel.sem kernel.shmmni kernel.panic_on_oops net.core.rmem_default net.core.rmem_max net.core.wmem_default net.core.wmem_max net.ipv4.conf.all.rp_filter fs.aio-max-nr net.ipv4.ip_local_port_range | tee /tmp/k.txt | md5sum
+0048a030f36720ddab861d5f856e2b84  -
+-- tee /tmp/k.txt : 출력을 파일로도 남기고 그대로 md5sum 에 넘긴다
+[root@ol7b ~]# sysctl fs.file-max kernel.sem kernel.shmmni kernel.panic_on_oops net.core.rmem_default net.core.rmem_max net.core.wmem_default net.core.wmem_max net.ipv4.conf.all.rp_filter fs.aio-max-nr net.ipv4.ip_local_port_range | tee /tmp/k.txt | md5sum
+0048a030f36720ddab861d5f856e2b84  -
+-- 두 노드 해시가 0048a030… 로 같다. 열한 항목 값이 한 글자도 다르지 않다
+[root@ol7b ~]# cat /tmp/k.txt
+fs.file-max = 6815744
+kernel.sem = 250        32000   100     128
+kernel.shmmni = 4096
+kernel.panic_on_oops = 1
+net.core.rmem_default = 262144
+net.core.rmem_max = 4194304
+net.core.wmem_default = 262144
+net.core.wmem_max = 1048576
+net.ipv4.conf.all.rp_filter = 2
+fs.aio-max-nr = 1048576
+net.ipv4.ip_local_port_range = 9000     65500
+-- sysctl 은 여러 값을 탭으로 구분해 출력한다. 파일에는 공백으로 썼어도 같은 값이다
+[root@ol7a ~]# sysctl kernel.shmmax kernel.shmall
+kernel.shmmax = 4398046511104
+kernel.shmall = 1073741824
+[root@ol7b ~]# sysctl kernel.shmmax kernel.shmall
+kernel.shmmax = 881135616
+kernel.shmall = 215121
+-- shmmax·shmall 은 일부러 다르게 뒀다. ol7a 는 preinstall 의 고정값, ol7b 는 계산값
+-- 둘 다 각자의 메모리에서 SGA 를 만드는 데 모자라지 않다
+-- RAC 처럼 노드 메모리가 같아야 하는 구성이면 shm 값도 같게 맞추는 편이 점검하기 쉽다
+-- 해시 비교는 값만 본다. 어느 파일에서 왔는지는 sysctl --system 의 Applying 줄로 따로 확인한다
+
+--------------------------------------------------------------------------------
+ [8] 재부팅 뒤에도 남는가
+--------------------------------------------------------------------------------
+
+-- 재부팅(@reboot b). systemd-sysctl 서비스가 부팅 중 sysctl.d 를 다시 읽는다
+[root@ol7b ~]# uptime; sysctl kernel.shmall kernel.sem fs.aio-max-nr
+ 11:00:59 up 0 min,  0 users,  load average: 0.20, 0.05, 0.02
+kernel.shmall = 215121
+kernel.sem = 250        32000   100     128
+fs.aio-max-nr = 1048576
+-- up 0 min : 방금 부팅. 세 값 모두 파일에서 다시 적용됐다
+[root@ol7b ~]# su - oracle -c 'ulimit -Hn; ulimit -Su'
+65536
+16384
+-- 한도 파일도 그대로. 한도는 세션을 열 때마다 파일에서 읽으니 재부팅과 관계가 없다
+-- 부팅 때 sysctl.d 를 읽는 것은 systemd-sysctl.service 다. 실패하면 journalctl -u systemd-sysctl 에 남는다
+-- 손으로 설정한 서버는 이 재부팅 확인을 꼭 한다. sysctl -w 로만 바꾼 값은 여기서 사라진다
+
+--------------------------------------------------------------------------------
+ [변형] limits.conf 와 limits.d 가 겹치면
+--------------------------------------------------------------------------------
+
+-- limits.conf 를 먼저 읽고 limits.d/*.conf 를 이름 순서로 읽는다. 뒤에 읽은 값이 이긴다
+[root@ol7b ~]# echo 'oracle soft nproc 2047' >> /etc/security/limits.conf; tail -1 /etc/security/limits.conf
+oracle soft nproc 2047
+-- limits.conf 끝에 oracle 의 soft nproc 를 2047(설치 가이드 최소값)으로 넣었다
+[root@ol7b ~]# ls /etc/security/limits.d/
+20-nproc.conf
+oracle-database-19c.conf
+-- ls 순서가 곧 pam_limits 가 읽는 순서다. 숫자로 시작하는 이름이 영문자보다 앞에 온다
+[root@ol7b ~]# su - oracle -c 'ulimit -Su'
+16384
+-- limits.conf 를 먼저 읽고 limits.d 를 나중에 읽으니 oracle-database-19c.conf 의 16384 가 이긴다
+-- 99- 로 시작하면 맨 뒤에 읽힐 거라 생각하고 덮어쓰기용 파일을 만들었다
+[root@ol7b ~]# echo 'oracle soft nproc 2047' > /etc/security/limits.d/99-override.conf; su - oracle -c 'ulimit -Su'
+16384
+-- 증상   : 99-override.conf 에 2047 을 넣었는데 ulimit -Su 가 여전히 16384
+-- 원인   : 이름 순서는 문자 코드 순이다. "9"(0x39) 가 "o"(0x6F) 보다 앞이라
+--          99-override.conf 가 먼저, oracle-database-19c.conf 가 나중에 읽혀 16384 가 덮었다
+--          preinstall 파일(oracle-database-preinstall-19c.conf)도 같은 이유로 숫자 이름 파일보다 뒤에 읽힌다
+-- 조치   : 덮어쓰려면 영문자 뒤로 오는 이름(예: zz-override.conf)을 쓰거나 원래 파일의 값을 직접 고친다
+-- 재확인 : 실습 03 [9] 에서 같은 값을 99-test.conf 와 zz-test.conf 로 넣어 비교했다
+[root@ol7b ~]# rm -f /etc/security/limits.d/99-override.conf; sed -i '$d' /etc/security/limits.conf; tail -1 /etc/security/limits.conf; su - oracle -c 'ulimit -Su'
+# End of file
+16384
+-- 시험 줄과 파일을 지웠다. sed '$d' : 마지막 줄 삭제. limits.conf 끝이 원래의 "# End of file"
+-- 정리하면 pam_limits 의 읽기 순서는 limits.conf → limits.d/*.conf(문자 코드 순)이고 뒤의 값이 이긴다
+-- 사내 표준 값을 덧씌우는 파일은 영문 소문자로 시작하는 이름 중에서도 뒤로 오게 정한다
+
+--------------------------------------------------------------------------------
+ [9] 되돌리기
+--------------------------------------------------------------------------------
+
+[root@ol7b ~]# userdel -r oracle; for g in oinstall dba oper backupdba dgdba kmdba racdba; do groupdel $g; done; rm -rf /u01
+[root@ol7b ~]# rm -f /etc/sysctl.d/97-oracle-database-sysctl.conf /etc/security/limits.d/oracle-database-19c.conf
+-- 지우는 순서: 사용자 → 그룹 → 디렉터리 → 설정 파일. userdel -r 은 홈과 메일 스풀까지 지운다
+-- 사용자·그룹을 지우고 /u01 도 지웠다. groupdel 은 그 그룹이 누군가의 기본 그룹이면 거부하므로 userdel 을 먼저 한다
+[root@ol7b ~]# id oracle; ls /etc/sysctl.d/ /etc/security/limits.d/; sysctl kernel.sem
+id: oracle: no such user
+/etc/security/limits.d/:
+20-nproc.conf
+
+/etc/sysctl.d/:
+99-sysctl.conf
+kernel.sem = 250        32000   100     128
+-- 파일은 지웠지만 kernel.sem 은 250 32000 100 128 그대로다. 실행 중인 커널 값은 파일 삭제로 돌아가지 않는다
+-- 재부팅하거나 sysctl -w 로 기본값을 다시 넣어야 [0] 의 32000 1024000000 500 32000 이 된다. 이 실습은 스냅샷 복귀로 끝낸다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+
+--  항목                    ol7a(preinstall)   ol7b 시작 전        ol7b 수동 설정 뒤    되돌린 뒤
+--  id oracle md5           ced02f16…          (사용자 없음)       688bb4b1… → ced02f16…  (없음)
+--  dba GID                 54322              -                   1001 → 54322          -
+--  kernel.shmmax           4398046511104      18446744073692774399 881135616           881135616(실행 중)
+--  kernel.shmall           1073741824         18446744073692774399 1024 → 215121       215121(실행 중)
+--  kernel.sem              250 32000 100 128  32000 1024000000 …  250 32000 100 128    250 32000 100 128
+--  fs.aio-max-nr           1048576            65536               1048576              1048576(실행 중)
+--  나머지 11항목 md5       0048a030…          -                   0048a030…            -
+--  oracle soft nproc       16384              -                   16384                -
+--
+--  · GID 는 -g 로 지정하지 않으면 생성 순서에 따라 달라진다
+--  · shmall = 1024 는 4MiB. 100MiB 세그먼트가 ENOSPC 로 거부됐다
+--  · limits.d 의 숫자 이름 파일은 영문자 이름 파일보다 먼저 읽혀 덮어쓰기에 쓸 수 없다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+
+-- 1. ol7b 에 grid 사용자(54331)와 asmadmin(54329)·asmdba(54327)·asmoper(54328)를 만들고,
+--    oracle 을 asmdba 에 넣어 두 노드의 id grid·id oracle 해시를 비교한다
+--    확인: 두 노드에서 id grid | md5sum
+-- 2. shmall 을 25600 으로 두고 100MiB 세그먼트를 두 개 만들어 본다. 둘째가 거부되는지,
+--    ipcs -mu 의 pages allocated 가 얼마인지 본다
+-- 3. /etc/security/limits.d/zz-override.conf 로 soft nproc 2047 을 넣고 ulimit -Su 를 본다
+
+================================================================================
+ 실습 02 종료 — 수동 설정으로 ol7a 와 같은 사용자·그룹·커널 값을 맞췄고 GID 불일치와 shmall 단위 착각을 고쳤다
+================================================================================

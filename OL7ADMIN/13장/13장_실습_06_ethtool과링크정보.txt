@@ -1,0 +1,487 @@
+================================================================================
+ 제13장 실습 06 — ethtool 과 링크 정보
+ 대상   : ol7a
+ 목표   : ethtool 의 기본 출력(속도·듀플렉스·자동 협상·링크), -i(드라이버),
+          -S(드라이버 통계), -k/-K(오프로드), -g(링 버퍼)를 읽고, 가상 NIC 에서
+          어떤 값이 의미 없는지 구분한다. 런타임 변경과 영구 설정의 차이를 확인한다
+ 배경   : ip 는 L3 이상을, ethtool 은 L1·L2(물리 링크와 드라이버)를 다룬다.
+          ethtool 로 바꾼 값은 런타임 전용이라 재부팅하면 드라이버 기본값으로 돌아간다.
+          영구 설정은 ifcfg 의 ETHTOOL_OPTS 나 NetworkManager 의 ethtool 속성으로 한다.
+          VMware 의 e1000 은 소프트웨어로 흉내 낸 NIC 라 물리 값 일부가 고정돼 있다 (본문 13.5)
+ 소요   : 약 30분 (재부팅 1회)
+ 선행   : ol7-base 스냅샷
+ 계정   : root
+ 주의   : ens32 의 오프로드 설정을 바꾼다. 속도·듀플렉스 강제 설정은 ens33 에서만 한다
+ 되돌림 : ens32 tso on(드라이버 기본값), ifcfg-ens32 원본 → ethtool -k ens32 | grep tcp-segmentation
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 바꿀 대상은 ens32 의 오프로드 설정과 ens33 의 속도 설정이다. 둘 다 끝에서 드라이버 기본값으로 돌린다
+-- ethtool 패키지 판, 링크 상태, 두 ifcfg 의 지문을 남긴다
+
+[root@ol7a ~]# rpm -q ethtool; ip -br link; md5sum /etc/sysconfig/network-scripts/ifcfg-ens32 /etc/sysconfig/network-scripts/ifcfg-ens33
+ethtool-4.8-10.el7.x86_64
+lo               UNKNOWN        00:00:00:00:00:00 <LOOPBACK,UP,LOWER_UP> 
+ens32            UP             00:0c:29:ac:5e:a0 <BROADCAST,MULTICAST,UP,LOWER_UP> 
+ens33            UP             00:0c:29:ac:5e:aa <BROADCAST,MULTICAST,UP,LOWER_UP> 
+f552067d2505b12131aa64d5d47de68c  /etc/sysconfig/network-scripts/ifcfg-ens32
+709a178c513f436914a04106c09e3303  /etc/sysconfig/network-scripts/ifcfg-ens33
+
+-- ethtool-4.8 은 7.9 의 기본 판이다. 두 NIC 모두 UP,LOWER_UP(링크 살아 있음)
+
+-- 두 ifcfg 의 사본을 /root 에 둔다. [변형] 과 [되돌림] 에서 이 사본으로 덮는다
+[root@ol7a ~]# cp -p /etc/sysconfig/network-scripts/ifcfg-ens32 /etc/sysconfig/network-scripts/ifcfg-ens33 /root/
+
+--------------------------------------------------------------------------------
+ [1] 기본 출력 — 링크와 협상
+--------------------------------------------------------------------------------
+
+-- 인자 없이 장치 이름만 주면 링크 설정과 상태를 보인다.
+-- 출력 26줄 전부를 남긴다. 다음 단계부터는 grep 으로 필요한 줄만 본다
+[root@ol7a ~]# ethtool ens32
+Settings for ens32:
+        Supported ports: [ TP ]
+        Supported link modes:   10baseT/Half 10baseT/Full 
+                                100baseT/Half 100baseT/Full 
+                                1000baseT/Full 
+        Supported pause frame use: No
+        Supports auto-negotiation: Yes
+        Supported FEC modes: Not reported
+        Advertised link modes:  10baseT/Half 10baseT/Full 
+                                100baseT/Half 100baseT/Full 
+                                1000baseT/Full 
+        Advertised pause frame use: No
+        Advertised auto-negotiation: Yes
+        Advertised FEC modes: Not reported
+        Speed: 1000Mb/s
+        Duplex: Full
+        Port: Twisted Pair
+        PHYAD: 0
+        Transceiver: internal
+        Auto-negotiation: on
+        MDI-X: off (auto)
+        Supports Wake-on: d
+        Wake-on: d
+        Current message level: 0x00000007 (7)
+                               drv probe link
+        Link detected: yes
+
+-- 줄마다 짚는다
+--   Supported ports: [ TP ]          꼬임쌍선(RJ45) 포트. 광 NIC 면 FIBRE
+--   Supported link modes             NIC 가 낼 수 있는 속도·듀플렉스 조합. 1000baseT 는 Full 만
+--   Advertised link modes            자동 협상 때 상대(스위치)에게 알리는 조합
+--   Speed: 1000Mb/s / Duplex: Full   협상 결과. 이 실습의 핵심 두 줄
+--   Auto-negotiation: on             자동 협상 사용 중
+--   MDI-X: off (auto)                케이블 교차 자동 감지
+--   Wake-on: d                       Wake-on-LAN 꺼짐(d = disabled)
+--   Link detected: yes               반송파가 있다. ip link 의 LOWER_UP 과 같은 정보
+-- 물리 서버라면 Speed: 100Mb/s 나 Duplex: Half 가 보일 때가 장애 신호다. 스위치 포트와 협상이 어긋났다는 뜻이다
+-- e1000 은 VMware 가 흉내 낸 Intel NIC 라 늘 1000Mb/s Full 로 보인다. 실제 처리량과는 관계없다
+-- VMware 의 vmxnet3 NIC 를 쓰면 같은 자리에 10000Mb/s 가 찍힌다. 이 값도 흉내 낸 숫자다
+-- Current message level 은 드라이버 로그를 얼마나 남길지 정하는 비트값이다(drv probe link)
+
+--------------------------------------------------------------------------------
+ [2] 드라이버 — ethtool -i
+--------------------------------------------------------------------------------
+
+-- -i 는 드라이버 이름·버전·펌웨어·PCI 위치를 보인다. 장애 문의 때 가장 먼저 묻는 값이다.
+[root@ol7a ~]# ethtool -i ens32
+driver: e1000
+version: 7.3.21-k8-NAPI
+firmware-version: 
+expansion-rom-version: 
+bus-info: 0000:02:00.0
+supports-statistics: yes
+supports-test: yes
+supports-eeprom-access: yes
+supports-register-dump: yes
+supports-priv-flags: no
+
+-- driver: e1000, version: 7.3.21-k8-NAPI. 커널에 들어 있는 드라이버의 판이다
+-- firmware-version 이 비어 있다. 가상 NIC 에는 펌웨어가 없다. 물리 NIC 면 여기에 판이 찍힌다
+-- bus-info 0000:02:00.0 은 PCI 도메인:버스:장치.기능. 실습 07 에서 이 값과 슬롯 번호를 맞춰 본다
+-- supports-* 다섯 줄은 이 드라이버가 받아 주는 ethtool 기능이다. priv-flags 만 없다
+
+-- bus-info 의 PCI 주소로 lspci 에서 실제 장치 이름을 찾는다.
+[root@ol7a ~]# lspci -s $(ethtool -i ens32 | awk '/bus-info/{print $2}')
+02:00.0 Ethernet controller: Intel Corporation 82545EM Gigabit Ethernet Controller (Copper) (rev 01)
+-- 서버에 있는 이더넷 장치 전체를 본다
+[root@ol7a ~]# lspci | grep -i ether
+02:00.0 Ethernet controller: Intel Corporation 82545EM Gigabit Ethernet Controller (Copper) (rev 01)
+02:01.0 Ethernet controller: Intel Corporation 82545EM Gigabit Ethernet Controller (Copper) (rev 01)
+
+-- 두 NIC 모두 Intel 82545EM 이다. 02:00.0 이 ens32, 02:01.0 이 ens33 이다
+-- VMware 가 e1000 형식으로 만든 가상 NIC 는 이 칩 이름으로 보인다. 실제 칩은 없다
+
+-- 드라이버는 커널 모듈이다. 어느 커널의 어느 파일인지 modinfo 로 본다.
+[root@ol7a ~]# modinfo e1000 | grep -E '^(filename|version|description|license)'
+filename:       /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/net/ethernet/intel/e1000/e1000.ko.xz
+version:        7.3.21-k8-NAPI
+license:        GPL v2
+description:    Intel(R) PRO/1000 Network Driver
+
+-- 드라이버 파일은 실행 중인 UEK 5.4.17-2136.338.4.2 아래에 있다. 커널을 바꾸면 드라이버 판도 바뀐다
+-- modinfo 의 version 과 ethtool -i 의 version 이 같다
+-- license GPL v2. 커널에 들어 있는 오픈 소스 드라이버다. 벤더가 따로 주는 드라이버면 여기가 다르다
+
+--------------------------------------------------------------------------------
+ [3] 링크를 내린 장치에서는 — Link detected
+--------------------------------------------------------------------------------
+
+-- ens33 은 링크는 UP 이지만 주소가 없다. 먼저 그대로 본다.
+-- grep -E 로 네 줄만 고른다. 링크 판단에 쓰는 줄이다
+[root@ol7a ~]# ethtool ens33 | grep -E 'Speed|Duplex|Auto-neg|Link detected'
+        Speed: 1000Mb/s
+        Duplex: Full
+        Auto-negotiation: on
+        Link detected: yes
+
+-- 주소가 없어도 링크는 살아 있다. Speed·Duplex 도 정상으로 협상됐다
+
+-- 링크를 관리상 내리면 무엇이 바뀌는지 본다.
+[root@ol7a ~]# ip link set ens33 down; ethtool ens33 | grep -E 'Speed|Duplex|Auto-neg|Link detected'
+        Speed: 1000Mb/s
+        Duplex: Full
+        Auto-negotiation: on
+        Link detected: no
+
+-- Link detected 만 no 로 바뀌었다. Speed·Duplex 는 마지막 값 1000Mb/s Full 을 그대로 보인다
+-- 이 e1000 드라이버는 링크가 없어도 Unknown! 을 내지 않았다. 드라이버에 따라 Speed: Unknown! 이 나오기도 한다
+-- 판단은 Link detected 로 한다. Speed 줄만 보고 링크가 있다고 믿지 않는다
+-- ip link set down 은 관리상 내림이다. 케이블을 뽑은 것과 달리 ip link 에서 UP 플래그도 빠진다
+-- 케이블을 뽑으면 UP 은 남고 LOWER_UP 만 빠진다(NO-CARRIER). 둘을 구분하면 원인이 사람인지 선로인지 갈린다
+
+-- 다시 올리고 협상이 끝나기를 3초 기다린다
+[root@ol7a ~]# ip link set ens33 up; sleep 3; ethtool ens33 | grep -E 'Speed|Duplex|Link detected'
+        Speed: 1000Mb/s
+        Duplex: Full
+        Link detected: yes
+
+-- 3초 뒤 다시 yes. 링크 재협상에 1~3초가 걸린다
+-- 링크가 빠졌다 붙는 순간은 커널 로그에 e1000: ens33 NIC Link is Up 1000 Mbps Full Duplex 로 남는다
+
+-- 루프백은 물리 링크가 아니다. ethtool 이 보여 줄 것이 거의 없다.
+[root@ol7a ~]# ethtool lo; ethtool -i lo
+Settings for lo:
+        Link detected: yes
+Cannot get driver information: Operation not supported
+
+-- lo 는 드라이버 정보가 없어 -i 가 실패한다. Link detected: yes 만 나온다
+
+--------------------------------------------------------------------------------
+ [4] 오류 ① — 가상 NIC 가 지원하지 않는 질의
+--------------------------------------------------------------------------------
+
+-- -m 은 SFP 모듈의 EEPROM(광 모듈 온도·출력)을 읽는다. 물리 서버의 광 NIC 에서 쓰는 명령이다.
+[root@ol7a ~]# ethtool -m ens32
+Cannot get module EEPROM information: Operation not supported
+
+-- 오류 흐름
+-- 증상   : ethtool -m ens32 → Cannot get module EEPROM information: Operation not supported
+-- 원인   : -m 은 SFP·QSFP 광 모듈의 EEPROM 을 읽는다. 가상 e1000 에는 모듈이 없고 드라이버도 이 기능이 없다
+-- 조치   : 가상 NIC 에서는 확인할 수 없는 항목으로 기록한다. 물리 광 NIC 서버에서 같은 명령으로 온도·수신 전력을 본다
+-- 재확인 : ethtool -i 의 supports-eeprom-access 는 yes 지만, 이것은 NIC 의 EEPROM 이지 광 모듈이 아니다
+
+-- -T 는 하드웨어 타임스탬프 지원(PTP), -l 은 다중 큐(채널) 수다.
+[root@ol7a ~]# ethtool -T ens32 | grep -E 'PTP|Hardware'
+PTP Hardware Clock: none
+Hardware Transmit Timestamp Modes: none
+Hardware Receive Filter Modes: none
+
+-- PTP Hardware Clock: none. 하드웨어 시각 도장이 없어 PTP(18장)는 소프트웨어 방식만 된다
+
+-- -l 은 송수신 큐(채널) 수다. 큐가 여럿이면 CPU 여러 개가 패킷을 나눠 처리한다
+[root@ol7a ~]# ethtool -l ens32
+Cannot get device channel parameters
+: Operation not supported
+Channel parameters for ens32:
+
+-- -l 은 Cannot get device channel parameters 로 실패했다. 출력 순서가 뒤섞인 것은 오류(stderr)와 머리글(stdout)이 따로 나와서다
+-- e1000 은 큐가 하나뿐인 옛 NIC 다. 다중 큐 NIC(vmxnet3, 물리 10G NIC)라면 Combined: 4 같은 값이 나온다
+-- [4] 의 세 질의는 모두 물리 NIC 의 하드웨어 기능을 묻는다. 가상 NIC 에서 결과가 없는 것은 장애가 아니다
+-- 지원 문의 때 이런 출력을 붙이면 "가상 환경이라 확인 불가"로 따로 적는다
+
+--------------------------------------------------------------------------------
+ [5] 통계 — ethtool -S 와 ip -s link
+--------------------------------------------------------------------------------
+
+-- -S 는 드라이버가 세는 카운터다. 항목 이름과 개수는 드라이버마다 다르다.
+[root@ol7a ~]# ethtool -S ens32 | head -12
+NIC statistics:
+     rx_packets: 225
+     tx_packets: 326
+     rx_bytes: 29910
+     tx_bytes: 42300
+     rx_broadcast: 0
+     tx_broadcast: 0
+     rx_multicast: 0
+     tx_multicast: 0
+     rx_errors: 0
+     tx_errors: 0
+     tx_dropped: 0
+
+-- head -12 로 앞 열두 줄만 봤다. rx_/tx_ 접두어가 수신·송신이다
+
+-- 카운터가 모두 몇 줄인지 센다
+[root@ol7a ~]# ethtool -S ens32 | wc -l
+47
+
+-- e1000 은 카운터가 46개다(첫 줄 NIC statistics: 를 빼면). 드라이버가 바뀌면 이름과 개수가 다르다
+
+-- 오류 카운터만 골라 0 이 아닌 것을 찾는다. 장애 때 실제로 쓰는 방식이다.
+[root@ol7a ~]# ethtool -S ens32 | awk -F: '$2+0 != 0' | grep -iE 'err|drop|crc|collision|miss' ; echo "(0 이 아닌 오류 카운터 끝)"
+
+-- awk -F: '$2+0 != 0' 은 콜론 뒤 숫자가 0 이 아닌 줄만 남긴다. 그중 오류 이름이 들어간 줄을 grep 했다
+-- 걸린 줄이 하나도 없다. 오류·드롭·CRC·충돌 카운터가 모두 0 이다
+
+(0 이 아닌 오류 카운터 끝)
+
+-- ip -s link 는 커널이 세는 공통 카운터다. 어느 드라이버든 같은 열이 나온다.
+[root@ol7a ~]# ip -s link show ens32
+2: ens32: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UP mode DEFAULT group default qlen 1000
+    link/ether 00:0c:29:ac:5e:a0 brd ff:ff:ff:ff:ff:ff
+    RX:  bytes packets errors dropped  missed   mcast           
+         33876     263      0       0       0       0 
+    TX:  bytes packets errors dropped carrier collsns           
+         49346     383      0       0       0       0 
+
+-- RX: bytes packets errors dropped missed mcast / TX: bytes packets errors dropped carrier collsns
+-- ethtool -S 의 rx_packets 225 와 여기 RX packets 263 이 다르다. 두 명령 사이에 SSH 패킷이 더 오갔고, 세는 주체도 다르다
+--   ethtool -S   드라이버(NIC)가 센 값
+--   ip -s link   커널 네트워크 계층이 센 값
+-- 오류를 볼 때는 둘 다 본다. CRC 오류는 -S 에만, 커널 드롭은 ip -s 에만 보인다
+-- 카운터는 부팅 뒤 누적값이다. 늘고 있는지는 시간 간격을 두고 두 번 찍어 비교한다([더 해 보기] 3)
+
+--------------------------------------------------------------------------------
+ [6] 링 버퍼 — ethtool -g
+--------------------------------------------------------------------------------
+
+-- 수신·송신 링 버퍼의 최댓값과 현재값이다. 트래픽이 몰릴 때 rx 드롭이 늘면 키우는 값이다.
+[root@ol7a ~]# ethtool -g ens32
+Ring parameters for ens32:
+Pre-set maximums:
+RX:             4096
+RX Mini:        0
+RX Jumbo:       0
+TX:             4096
+Current hardware settings:
+RX:             256
+RX Mini:        0
+RX Jumbo:       0
+TX:             256
+
+-- Pre-set maximums 는 드라이버가 허용하는 최댓값, Current 는 지금 값이다. RX·TX 모두 4096 까지 늘릴 수 있고 지금은 256 이다
+-- Mini·Jumbo 링은 이 NIC 에 없다(0)
+-- 늘릴 때는 ethtool -G ens32 rx 4096. 이것도 런타임 전용이라 [10] 과 같은 방법으로 영구화한다
+-- 링 버퍼를 늘리면 순간적으로 몰리는 패킷을 더 많이 받아 두지만 메모리와 지연이 늘어난다
+-- DB 서버에서는 ip -s link 의 RX dropped 가 꾸준히 늘 때만 손댄다
+
+--------------------------------------------------------------------------------
+ [7] 오프로드 — ethtool -k
+--------------------------------------------------------------------------------
+
+-- 오프로드는 체크섬 계산·TCP 분할 같은 일을 NIC 에 맡기는 기능이다. [fixed] 는 바꿀 수 없다는 뜻이다.
+[root@ol7a ~]# ethtool -k ens32 | head -16
+Features for ens32:
+rx-checksumming: off
+tx-checksumming: on
+        tx-checksum-ipv4: off [fixed]
+        tx-checksum-ip-generic: on
+        tx-checksum-ipv6: off [fixed]
+        tx-checksum-fcoe-crc: off [fixed]
+        tx-checksum-sctp: off [fixed]
+scatter-gather: on
+        tx-scatter-gather: on
+        tx-scatter-gather-fraglist: off [fixed]
+tcp-segmentation-offload: on
+        tx-tcp-segmentation: on
+        tx-tcp-ecn-segmentation: off [fixed]
+        tx-tcp-mangleid-segmentation: off
+        tx-tcp6-segmentation: off [fixed]
+
+-- head -16 으로 앞 열여섯 줄만 봤다. 전체는 60줄 가까이 된다
+-- 들여쓴 줄은 위 줄의 세부 기능이다. tcp-segmentation-offload: on 은 tx-tcp-segmentation: on 의 묶음 표시다
+-- rx-checksumming: off 는 이 가상 NIC 가 수신 체크섬을 커널에 맡긴다는 뜻이다
+-- [fixed] 가 붙은 줄은 드라이버가 바꿀 수 없게 막아 둔 값이다. -K 로 바꿔도 그대로다
+-- 짧은 이름과 긴 이름이 따로 있다. -K 에는 tso·gso·gro 같은 짧은 이름을 쓴다
+--   tso  tcp-segmentation-offload     gso  generic-segmentation-offload
+--   gro  generic-receive-offload      lro  large-receive-offload(여기서는 [fixed] off)
+
+--------------------------------------------------------------------------------
+ [8] 오프로드 런타임 변경 — ethtool -K
+--------------------------------------------------------------------------------
+
+-- 패킷 캡처 분석이나 일부 드라이버 버그 회피 때 TSO 를 끈다.
+-- -K(대문자) 는 바꾸기, -k(소문자) 는 보기다.
+-- SSH 가 붙은 ens32 에서 해도 연결이 끊기지 않는 설정이다. 분할을 NIC 대신 커널이 할 뿐이다
+[root@ol7a ~]# ethtool -K ens32 tso off; ethtool -k ens32 | grep -E 'tcp-segmentation-offload|tx-tcp-segmentation'
+tcp-segmentation-offload: off
+        tx-tcp-segmentation: off
+
+-- 두 줄 모두 off 로 바뀌었다. 즉시 반영됐다
+-- 묶음 표시(tcp-segmentation-offload)와 세부 기능(tx-tcp-segmentation)이 함께 바뀐다
+
+-- 바꾼 값은 어디에도 기록되지 않았다.
+-- ifcfg 와 NetworkManager 프로필 양쪽에 기록이 있는지 본다. 2>&1 로 오류도 함께 본다
+[root@ol7a ~]# grep -i ethtool /etc/sysconfig/network-scripts/ifcfg-ens32; nmcli -f ethtool connection show ens32 2>&1 | head -5
+
+-- 두 명령 모두 아무것도 찍지 않았다. ifcfg 에도, NetworkManager 프로필에도 ethtool 설정이 없다
+-- 지금의 off 는 커널 메모리에만 있다
+-- 같은 셸에서 nmcli device reapply ens32 를 해도 TSO 는 off 그대로다. 프로필에 ethtool 설정이 없으면 NetworkManager 는 건드리지 않는다
+
+--------------------------------------------------------------------------------
+ [9] 오류 ② — 재부팅 후 사라진 설정
+--------------------------------------------------------------------------------
+
+-- 재부팅
+-- 재부팅 직후다. uptime 으로 막 켜졌는지 확인하고 TSO 를 본다
+[root@ol7a ~]# uptime; ethtool -k ens32 | grep -E 'tcp-segmentation-offload'
+ 09:52:15 up 0 min,  0 users,  load average: 0.07, 0.02, 0.00
+tcp-segmentation-offload: on
+
+-- up 0 min. 방금 재부팅했다. TSO 가 드라이버 기본값 on 으로 돌아왔다
+-- 오류 흐름
+-- 증상   : 재부팅 뒤 tcp-segmentation-offload: on. [8] 에서 끈 설정이 없어졌다
+-- 원인   : ethtool -K 는 런타임 전용이다. [8] 의 grep·nmcli 가 보였듯 어디에도 저장되지 않았다
+-- 조치   : [10] 처럼 ifcfg 에 ETHTOOL_OPTS 를 넣거나 [변형] 처럼 nmcli ethtool.feature-tso 속성을 쓴다
+-- 재확인 : 다시 재부팅한 뒤 ethtool -k ens32 의 tcp-segmentation-offload: off
+-- 지원 문서가 "ethtool -K 로 끄라"고만 적혀 있으면 영구화는 운영자의 몫이다. 변경 기록에 영구화 방법까지 남긴다
+
+--------------------------------------------------------------------------------
+ [10] 영구 설정 — ifcfg 의 ETHTOOL_OPTS
+--------------------------------------------------------------------------------
+
+-- ETHTOOL_OPTS 는 연결이 올라올 때 ethtool 에 넘길 인자다. -K 형식은 "-K 장치 기능 값" 으로 쓴다.
+[root@ol7a ~]# echo 'ETHTOOL_OPTS="-K ens32 tso off"' >> /etc/sysconfig/network-scripts/ifcfg-ens32
+-- 파일 끝에 한 줄이 붙었는지 사본과 비교한다
+[root@ol7a ~]# diff /root/ifcfg-ens32 /etc/sysconfig/network-scripts/ifcfg-ens32
+20a21
+> ETHTOOL_OPTS="-K ens32 tso off"
+-- 손으로 고친 ifcfg 를 NetworkManager 가 어떻게 읽는지 본다. reload 를 빼먹지 않는다(실습 03)
+[root@ol7a ~]# nmcli connection reload; nmcli -f ethtool connection show ens32 2>&1 | grep -v ':.*--$' | head -5
+ethtool.feature-tso:                    off
+
+-- reload 하자 NetworkManager 가 ETHTOOL_OPTS 를 읽어 ethtool.feature-tso: off 로 보였다
+-- grep -v ':.*--$' 로 값이 -- 인 수십 개 속성을 걸러 냈다. 남은 것은 tso 하나다
+
+-- 재부팅
+-- 재부팅 뒤 같은 줄을 본다
+[root@ol7a ~]# ethtool -k ens32 | grep -E 'tcp-segmentation-offload'
+tcp-segmentation-offload: off
+
+-- 재부팅 뒤에도 off 다. 연결이 올라올 때 NetworkManager 가 이 설정을 적용했다
+
+--------------------------------------------------------------------------------
+ [11] 속도·듀플렉스 강제 설정 — ens33 에서만
+--------------------------------------------------------------------------------
+
+-- 물리 서버에서 스위치와 협상이 안 맞을 때 속도와 듀플렉스를 고정한다.
+-- autoneg off 로 협상을 끄고 speed·duplex 를 직접 준다. SSH 가 붙은 ens32 에서는 하지 않는다.
+[root@ol7a ~]# ethtool -s ens33 speed 100 duplex full autoneg off; sleep 3; ethtool ens33 | grep -E 'Speed|Duplex|Auto-negotiation|Link detected'
+        Speed: 100Mb/s
+        Duplex: Full
+        Auto-negotiation: off
+        Link detected: yes
+
+-- 100Mb/s Full, 자동 협상 off. 링크는 유지됐다. 상대(VMware 가상 스위치)가 무엇이든 받아 준다
+-- 물리 스위치에서 한쪽만 고정하고 한쪽은 자동 협상이면 듀플렉스가 어긋나 충돌·CRC 오류가 늘어난다. 고정은 양쪽 모두 한다
+-- 이 설정도 런타임 전용이다. 영구화는 ETHTOOL_OPTS="speed 100 duplex full autoneg off" 또는 nmcli 의 802-3-ethernet.speed·duplex
+
+-- 다시 자동 협상으로 돌린다.
+[root@ol7a ~]# ethtool -s ens33 autoneg on; sleep 4; ethtool ens33 | grep -E 'Speed|Duplex|Auto-negotiation|Link detected'
+        Speed: 1000Mb/s
+        Duplex: Full
+        Auto-negotiation: on
+        Link detected: yes
+
+-- 자동 협상으로 돌리자 다시 1000Mb/s 가 됐다
+
+--------------------------------------------------------------------------------
+ [변형] NetworkManager 속성으로 같은 일을 — ethtool.feature-tso
+--------------------------------------------------------------------------------
+
+-- ETHTOOL_OPTS 를 지우고 nmcli 의 ethtool 속성으로 같은 설정을 한다.
+-- 원본 ifcfg 로 덮고 reload 해서 ETHTOOL_OPTS 를 없앤 상태에서 시작한다
+-- 지금 커널의 TSO 는 [10] 의 재부팅 때 걸린 off 그대로다
+[root@ol7a ~]# cp -p /root/ifcfg-ens32 /etc/sysconfig/network-scripts/ifcfg-ens32; nmcli connection reload
+-- ethtool 속성은 NetworkManager 1.14 부터 있다. 7.9 의 1.18 에서 쓸 수 있다
+[root@ol7a ~]# nmcli connection modify ens32 ethtool.feature-tso off; nmcli -g ethtool.feature-tso connection show ens32
+
+-- nmcli 로 넣은 속성값이 off 다
+
+off
+-- NetworkManager 가 이 속성을 파일에 어떻게 썼는지 본다
+[root@ol7a ~]# diff /root/ifcfg-ens32 /etc/sysconfig/network-scripts/ifcfg-ens32
+20a21
+> ETHTOOL_OPTS="-K ens32 tso off"
+
+-- 원본으로 되돌린 뒤 nmcli 로 바꿨는데 [10] 에서 손으로 넣은 것과 똑같은 줄이 생겼다
+-- 7.9 의 ifcfg-rh 플러그인은 ethtool.feature-* 속성을 ETHTOOL_OPTS 키로 저장한다. 두 방법은 같은 설정이다
+
+-- 재부팅 대신 reapply 로 반영한다. 연결이 유지된다
+[root@ol7a ~]# nmcli device reapply ens32; sleep 2; ethtool -k ens32 | grep -E 'tcp-segmentation-offload'
+Connection successfully reapplied to device 'ens32'.
+tcp-segmentation-offload: off
+
+-- reapply 로 재부팅 없이 바로 적용됐다
+-- [10] 에서 이미 off 였으니 눈에 보이는 변화는 없다. 재부팅 뒤 유지되는지는 [10] 과 같은 방법으로 확인한다
+-- [OL8/9] OL 9 의 keyfile 프로필에서는 [ethtool] 묶음의 feature-tso=false 로 저장된다
+
+--------------------------------------------------------------------------------
+ [되돌림]
+--------------------------------------------------------------------------------
+
+-- 되돌림은 세 단계다. 파일을 원본으로, 프로필을 다시 읽기, 커널 값을 기본값으로
+[root@ol7a ~]# cp -p /root/ifcfg-ens32 /etc/sysconfig/network-scripts/ifcfg-ens32; nmcli connection reload; nmcli -g ethtool.feature-tso connection show ens32
+-- 커널에 남은 off 를 직접 on 으로 돌린다
+[root@ol7a ~]# ethtool -K ens32 tso on; ethtool -k ens32 | grep -E 'tcp-segmentation-offload'
+tcp-segmentation-offload: on
+
+-- 원본 ifcfg 로 덮고 reload 하자 ethtool.feature-tso 가 빈 값이 됐다(출력 없음)
+-- 프로필에서 빠져도 커널의 off 는 남는다. 그래서 ethtool -K 로 on 을 직접 돌렸다
+
+-- 두 파일의 지문을 [0] 과 비교하고 사본을 지운다
+[root@ol7a ~]# md5sum /etc/sysconfig/network-scripts/ifcfg-ens32 /etc/sysconfig/network-scripts/ifcfg-ens33; rm -f /root/ifcfg-ens3?
+f552067d2505b12131aa64d5d47de68c  /etc/sysconfig/network-scripts/ifcfg-ens32
+709a178c513f436914a04106c09e3303  /etc/sysconfig/network-scripts/ifcfg-ens33
+
+-- 두 지문이 [0] 과 같다. ens33 의 속도는 [11] 에서 이미 자동 협상으로 돌렸다
+-- TSO 는 on, 두 ifcfg 는 원본, NetworkManager 프로필에 ethtool 속성 없음. 시작 전 상태다
+-- 재부팅하지 않아도 된다. 지금 커널 값과 디스크 값이 모두 기본값이다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                       시작 전        변경 후                       재부팅 뒤        되돌린 뒤
+--  ens32 TSO (ethtool -K)     on             off                           on (사라짐)      on
+--  ens32 TSO (ETHTOOL_OPTS)   on             off                           off (유지)       -
+--  ens32 TSO (ethtool.feature) on            off (reapply 즉시)            -                on
+--  ens33 속도                 1000Mb/s 자동  100Mb/s 고정                  -                1000Mb/s 자동
+--  ifcfg-ens32 md5            f552067d…      ETHTOOL_OPTS 한 줄 추가       -                f552067d…
+--
+--  가상 NIC 에서 의미 없거나 안 되는 것
+--    Speed·Duplex              흉내 낸 값(늘 1000Mb/s Full)
+--    firmware-version          비어 있음
+--    -m 광 모듈 / -l 채널      Operation not supported
+--    -T 하드웨어 시각 도장     none
+--
+--  런타임 변경(ethtool -K·-s·-G)은 재부팅·드라이버 재적재로 사라진다
+--  영구화 두 가지는 같은 ifcfg 줄(ETHTOOL_OPTS)로 저장된다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. ethtool -G ens32 rx 512 로 링 버퍼를 늘리고 재부팅 전후를 비교한다. 영구화는 ETHTOOL_OPTS="-G ens32 rx 512"
+--    확인: ethtool -g ens32 의 Current hardware settings 의 RX
+-- 2. ethtool -p ens33 5 를 물리 서버에서 쳐 본다. 포트 LED 가 깜빡여 케이블 위치를 찾을 때 쓴다(가상 NIC 에서는 결과가 없다)
+-- 3. ethtool -S 를 1초 간격으로 두 번 찍어 rx_packets 차이로 초당 패킷 수를 구한다
+--    확인: 같은 시간 동안 ip -s link 의 RX packets 차이와 비교한다
+-- 4. ETHTOOL_OPTS 에 오타(-K ens32 tos off)를 넣고 reload·reapply 한다
+--    확인: nmcli -f ethtool 과 journalctl -u NetworkManager 에 무엇이 남는가
+
+================================================================================
+ 실습 06 종료
+================================================================================

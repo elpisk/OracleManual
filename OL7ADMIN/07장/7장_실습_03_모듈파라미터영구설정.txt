@@ -1,0 +1,452 @@
+================================================================================
+ 제7장 실습 03 — 모듈 파라미터와 영구 설정
+ 대상   : ol7a
+ 목표   : loop 모듈의 파라미터를 /sys/module/loop/parameters 에서 읽고,
+          modprobe 인자·/etc/modprobe.d 의 options·커널 명령줄 세 곳에서 값을 줘
+          본다. 이미 적재된 모듈에는 conf 가 적용되지 않는 것, 재부팅 뒤에도
+          설정이 남는 것, 세 곳이 겹칠 때 어느 값이 이기는지 확인한다
+ 배경   : 모듈 파라미터는 적재하는 순간 정해진다. modprobe 는 적재 직전에
+          /etc/modprobe.d/*.conf 의 options 줄과 /proc/cmdline 의 모듈이름.파라미터=
+          값을 모아 insmod 에 넘긴다. 적재 뒤에는 파라미터 권한이 쓰기 가능(0644)
+          일 때만 /sys 에서 바꿀 수 있다(본문 7.4.1~7.4.5)
+ 소요   : 약 30분 (재부팅 2회)
+ 선행   : ol7-base 스냅샷. loop 미적재
+ 계정   : root
+ 주의   : loop 를 쓰는 마운트가 없을 때만 해제한다. 커널 명령줄 변경은 끝에서 되돌린다
+ 되돌림 : /etc/modprobe.d/loop.conf 삭제, 커널 인자 loop.max_loop 제거 후 재부팅.
+          lsmod 에 loop 없음, grubby --info=DEFAULT 의 args 가 [0] 과 같음
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# uname -r; lsmod | grep -w loop; echo "rc=$?"
+5.4.17-2136.338.4.2.el7uek.x86_64
+rc=1
+-- 기준 커널은 UEK 5.4.17-2136.338.4.2. grep -w loop 가 rc=1 → loop 는 적재돼 있지 않다
+-- loop 는 이 커널에서 모듈(.ko.xz)이다. 내장이었다면 이 실습의 해제·재적재가 불가능하다
+-- loop 는 루프 장치 드라이버다. 파일 하나를 블록 장치처럼 보이게 해 ISO·이미지 파일을 마운트할 때 쓴다
+-- 파라미터가 단순하고, 쓰는 곳이 없으면 언제든 내릴 수 있어 이 실습의 대상으로 골랐다
+
+-- 루프 장치 노드. 모듈이 없어도 /dev/loop-control 은 미리 만들어져 있을 수 있다.
+-- 열: 형식 c(문자 장치) · 권한 · 링크 · 소유자 root · 그룹 disk · 메이저 10, 마이너 237 · 시각 · 이름
+-- loop 가 없는데도 /dev/loop-control 은 있다. kmod static-nodes 가 부팅 때 미리 만든 노드다
+-- 누군가 이 노드를 열면 커널이 char-major-10-237 별칭으로 loop 를 자동 적재한다
+
+[root@ol7a ~]# ls -l /dev/loop* 2>&1
+crw-rw----. 1 root disk 10, 237 Nov 13 08:53 /dev/loop-control
+-- 설정 디렉터리 두 곳. /etc 쪽이 관리자용, /usr/lib 쪽은 패키지가 넣는 기본값이다.
+[root@ol7a ~]# ls -l /etc/modprobe.d /usr/lib/modprobe.d
+/etc/modprobe.d:
+total 20
+-rw-r--r--. 1 root root 215 Sep 30  2024 dccp-blacklist.conf
+-rw-r--r--. 1 root root 166 Apr 28  2021 firewalld-sysctls.conf
+-rw-r--r--. 1 root root 746 Oct 14  2021 lockd.conf
+-rw-r--r--. 1 root root 355 Dec 24  2024 tcindex-disable.conf
+-rw-r--r--. 1 root root 674 Mar 22  2019 tuned.conf
+/usr/lib/modprobe.d:
+total 8
+-rw-r--r--. 1 root root 382 Jun 10  2019 dist-alsa.conf
+-rw-r--r--. 1 root root 982 Mar 18  2021 dist-blacklist.conf
+-- /etc/modprobe.d 에 기본 다섯 파일, /usr/lib/modprobe.d 에 패키지 파일 둘
+-- loop 에 관한 설정은 어디에도 없다. [6] 에서 /etc/modprobe.d/loop.conf 를 만든다
+-- 같은 이름의 파일이 두 곳에 있으면 /etc 쪽이 이긴다
+-- 파일 크기 열을 보면 모두 1KB 미만이다. 대부분 blacklist·options·install 몇 줄짜리다
+-- tuned.conf·lockd.conf 처럼 패키지가 /etc 에 넣은 파일도 있다. 지우기 전에 rpm -qf 로 주인을 본다
+
+-- 커널 명령줄 기본 항목의 인자. 끝에서 이 값으로 돌아와야 한다.
+[root@ol7a ~]# grubby --info=DEFAULT | grep -E '^(kernel|args)'
+kernel=/boot/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+args="ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync "
+-- args 끝의 console=tty0 console=ttyS0,115200 scsi_mod.scan=sync 는 랩 콘솔 캡처용 설정이다
+-- scsi_mod.scan=sync 자체가 "모듈이름.파라미터=값" 형식이다. scsi_mod 는 내장 모듈이라
+-- 이 방법으로만 값을 줄 수 있다. [9] 에서 같은 형식으로 loop.max_loop=6 을 넣는다
+
+--------------------------------------------------------------------------------
+ [1] 어떤 파라미터가 있나 — modinfo -p
+--------------------------------------------------------------------------------
+-- -p : 파라미터 이름·설명·형식만. 적재하지 않고 파일에서 읽는다
+[root@ol7a ~]# modinfo -p loop
+max_loop:Maximum number of loop devices (int)
+max_part:Maximum number of partitions per loop device (int)
+-- 파라미터 둘. 형식은 이름:설명 (자료형)
+--   max_loop : 적재할 때 미리 만들 루프 장치 수
+--   max_part : 루프 장치 하나에 허용할 파티션 수
+-- 둘 다 int. 적재하지 않은 상태에서 파일만 읽어 얻은 정보다
+-- 어떤 값을 넣어야 하는지(범위·단위)는 설명에 없다. 모듈 문서나 소스가 근거다
+
+--------------------------------------------------------------------------------
+ [2] 기본값으로 적재
+--------------------------------------------------------------------------------
+[root@ol7a ~]# modprobe -v loop
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/block/loop.ko.xz 
+-- -v 출력 한 줄. 의존 모듈이 없어 insmod 한 번으로 끝났다. 뒤에 붙은 인자도 없다
+
+-- 적재된 모듈의 현재 값. 파일 하나에 값 하나.
+[root@ol7a ~]# grep -H . /sys/module/loop/parameters/*
+/sys/module/loop/parameters/max_loop:0
+/sys/module/loop/parameters/max_part:0
+-- grep -H . 는 파일 이름:내용 형식으로 여러 파일을 한 번에 보여 준다
+-- 두 값 모두 0. 소스의 기본값이 0 이다
+-- 파라미터 디렉터리는 적재 순간 생긴다. [0] 에서 /sys/module/loop 자체가 없던 것과 비교
+
+-- max_loop=0 이 "장치 0 개" 는 아니다. 실제로 만들어진 노드를 센다.
+[root@ol7a ~]# ls /dev/loop*; ls -d /sys/block/loop* | wc -l
+/dev/loop-control
+ls: cannot access /sys/block/loop*: No such file or directory
+0
+-- 노드는 /dev/loop-control 뿐이고 /sys/block/loop* 도 0 개
+-- 5.4 의 loop 는 max_loop=0 이면 장치를 미리 만들지 않는다. losetup 이 loop-control 로
+-- 그때그때 하나씩 만든다. 그래서 0 이 "장치를 못 쓴다" 는 뜻은 아니다
+
+--------------------------------------------------------------------------------
+ [3] 실행 중에 바꿀 수 있나 — 파라미터 파일의 권한
+--------------------------------------------------------------------------------
+-- 권한 비트가 파라미터마다 다르다. 소스의 module_param(이름, 형식, 권한) 세 번째 값이다.
+[root@ol7a ~]# ls -l /sys/module/loop/parameters
+total 0
+-r--r--r--. 1 root root 4096 Nov 13 08:53 max_loop
+-r--r--r--. 1 root root 4096 Nov 13 08:53 max_part
+-- 두 파일 모두 -r--r--r-- (0444). 소스가 쓰기 권한을 주지 않았다
+-- 크기 4096 은 sysfs 파일의 고정 표시값이다. 실제 내용 길이와 무관하다
+
+[root@ol7a ~]# echo 4 > /sys/module/loop/parameters/max_loop; echo "rc=$?"; cat /sys/module/loop/parameters/max_loop
+/tmp/_ol7lab_root.sh: line 1: /sys/module/loop/parameters/max_loop: Permission denied
+rc=1
+0
+-- root 로 썼는데도 Permission denied, rc=1. 값은 0 그대로
+-- /tmp/_ol7lab_root.sh 는 실습 러너가 명령을 담아 실행한 임시 스크립트 이름이다
+-- 0444 파라미터는 적재할 때만 정할 수 있다. 바꾸려면 내렸다 다시 올려야 한다
+-- echo 의 오류가 셸 단계에서 났다. 커널까지 가지도 않고 파일 열기에서 거부된 것이다
+
+-- 시스템 전체에서 쓰기 가능한 파라미터가 얼마나 되는지 센다.
+-- -perm -u+w : 소유자 쓰기 비트가 있는 파일
+[root@ol7a ~]# find /sys/module/*/parameters -type f | wc -l; find /sys/module/*/parameters -type f -perm -u+w | wc -l
+353
+258
+-- 지금 적재된 모듈과 내장 모듈을 합쳐 파라미터 파일 353 개, 그중 소유자 쓰기 비트가 있는 것 258 개
+-- 다만 쓰기 비트가 있다고 해서 쓴 값이 동작에 바로 반영되는지는 모듈마다 다르다
+
+[root@ol7a ~]# find /sys/module/*/parameters -type f -perm -u+w | head -8
+/sys/module/8250_core/parameters/nr_uarts
+/sys/module/8250_core/parameters/share_irqs
+/sys/module/8250_core/parameters/skip_txen_test
+/sys/module/8250/parameters/nr_uarts
+/sys/module/8250/parameters/share_irqs
+/sys/module/8250/parameters/skip_txen_test
+/sys/module/acpi/parameters/aml_debug_output
+/sys/module/acpi/parameters/ec_no_wakeup
+-- head -8 로 앞 여덟 개만. 8250(직렬 포트)·acpi 는 모두 내장 모듈이다
+-- 이 목록에 loop 는 없다
+-- find 옵션: -type f 는 일반 파일만, -perm -u+w 는 소유자 쓰기 비트가 켜진 것만
+-- 쓰기 가능 파라미터의 예: 디버그 수준, 타임아웃, 로그 출력 여부처럼 실행 중에 바꿔도 안전한 값
+
+--------------------------------------------------------------------------------
+ [4] modprobe 인자로 값 주기
+--------------------------------------------------------------------------------
+-- 값을 바꾸려면 내렸다 다시 올린다. 루프 장치를 쓰는 곳이 없는지 먼저 본다.
+-- losetup -a : 연결된 루프 장치 전부. 출력이 없어야 한다
+[root@ol7a ~]# losetup -a; modprobe -r -v loop
+rmmod loop
+-- losetup -a 출력 없음 → 연결된 루프 장치 없음. 그래서 rmmod 가 바로 됐다
+
+[root@ol7a ~]# modprobe -v loop max_loop=4 max_part=8
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/block/loop.ko.xz max_loop=4 max_part=8
+-- 명령에 준 두 인자가 insmod 줄 끝에 그대로 붙었다
+-- 여러 파라미터는 공백으로 나눠 이어 쓴다. 배열 파라미터는 쉼표로 값을 나열한다(예: e1000 의 Speed=)
+
+[root@ol7a ~]# grep -H . /sys/module/loop/parameters/*; ls /dev/loop*
+/sys/module/loop/parameters/max_loop:4
+/sys/module/loop/parameters/max_part:15
+/dev/loop0
+/dev/loop1
+/dev/loop2
+/dev/loop3
+/dev/loop-control
+-- max_loop=4 → /dev/loop0~loop3 네 개가 적재와 동시에 생겼다
+-- max_part 는 8 을 줬는데 15 로 읽힌다. 5.4 의 loop 는 max_part 를 (2 의 거듭제곱 - 1)로
+-- 올림한다(8 → 15). 넣은 값과 읽은 값이 다를 수 있으니 반드시 다시 읽어 확인한다
+
+--------------------------------------------------------------------------------
+ [5] 오류 ① — 파라미터 이름 오타와 값 형식 오류
+--------------------------------------------------------------------------------
+[root@ol7a ~]# modprobe -r loop; dmesg -C; modprobe -v loop max_lop=4; echo "rc=$?"; dmesg
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/block/loop.ko.xz max_lop=4
+rc=0
+[   12.647220] loop: unknown parameter 'max_lop' ignored
+[   12.647263] loop: module loaded
+-- 화면에는 insmod 줄만 있고 rc=0. 오류처럼 보이지 않는다
+-- dmesg 첫 줄 원문: loop: unknown parameter 'max_lop' ignored
+-- UEK 5.4 는 모르는 파라미터를 무시하고 모듈을 그대로 올린다
+
+[root@ol7a ~]# lsmod | grep -w loop; cat /sys/module/loop/parameters/max_loop
+loop                   32768  0 
+0
+-- loop 는 올라왔고(Used by 0) max_loop 는 기본값 0
+--
+-- 증상   : modprobe -v loop max_lop=4 가 rc=0 으로 끝났는데 max_loop 가 0, 장치가 생기지 않음
+-- 원인   : 파라미터 이름 오타(max_lop). dmesg 에 'loop: unknown parameter 'max_lop' ignored'.
+--          UEK 5.4 커널은 모르는 파라미터를 경고만 남기고 무시한다
+-- 조치   : modprobe -r loop 후 올바른 이름으로 modprobe -v loop max_loop=4
+-- 재확인 : /sys/module/loop/parameters/max_loop 가 4, /dev/loop0~3 생성 — [4] 에서 확인한 결과와 같음
+-- 같은 7.9 라도 RHCK 3.10 은 이 오타를 거부한다(실습 05 [10]). 커널 버전마다 다르니 dmesg 를 본다
+
+-- 이름은 맞고 값의 형식이 틀린 경우. max_loop 는 int 다.
+[root@ol7a ~]# modprobe -r loop; dmesg -C; modprobe -v loop max_loop=four; echo "rc=$?"; dmesg
+modprobe: ERROR: could not insert 'loop': Invalid argument
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/block/loop.ko.xz max_loop=four
+rc=1
+[   12.780177] loop: `four' invalid for parameter `max_loop'
+-- 이번에는 화면에 ERROR 가 나왔다. Invalid argument 는 커널이 돌려준 EINVAL 이다
+-- 이름은 맞고 값 형식이 틀리면 UEK 도 적재를 거부한다. dmesg 가 어느 값이 문제인지 알려 준다
+-- 화면의 ERROR 줄이 insmod 줄보다 먼저 찍혔다. 오류는 표준 오류로 바로, -v 출력은 버퍼를 거쳐 나와
+-- 순서가 뒤바뀌어 보인다. 실제 순서는 insmod 시도 → 거부다
+
+[root@ol7a ~]# lsmod | grep -w loop; echo "rc=$?"
+rc=1
+-- loop 가 없다. 오타(무시)와 형식 오류(거부)는 결과가 정반대다
+
+--------------------------------------------------------------------------------
+ [6] /etc/modprobe.d 에 영구 설정
+--------------------------------------------------------------------------------
+-- 이름은 아무것이나 되지만 .conf 로 끝나야 읽힌다. 형식: options 모듈 파라미터=값 ...
+[root@ol7a ~]# modprobe loop; grep -H . /sys/module/loop/parameters/max_loop
+/sys/module/loop/parameters/max_loop:0
+-- conf 를 쓰기 전에 기본값으로 먼저 올려 둔다. [7] 의 오류를 만들기 위한 준비다
+
+[root@ol7a ~]# cat > /etc/modprobe.d/loop.conf <<'EOF'
+# 7장 실습 03 - loop 장치 4개, 장치당 파티션 8개까지
+options loop max_loop=4 max_part=8
+EOF
+[root@ol7a ~]# cat /etc/modprobe.d/loop.conf
+# 7장 실습 03 - loop 장치 4개, 장치당 파티션 8개까지
+options loop max_loop=4 max_part=8
+-- cat <<'EOF' 로 두 줄을 썼다. 첫 줄은 주석, 둘째 줄이 options 지시어
+
+-- modprobe -c : 모든 conf 를 합친 최종 설정 출력. 원하는 줄이 들어갔는지 본다
+[root@ol7a ~]# modprobe -c | grep -w loop
+options loop max_loop=4 max_part=8
+alias block_major_7_* loop
+alias char_major_10_237 loop
+alias devname:loop_control loop
+alias symbol:loop_register_transfer loop
+alias symbol:loop_unregister_transfer loop
+-- modprobe -c 는 모든 conf 와 모듈 색인을 합쳐 출력한다. grep -w loop 로 걸렀다
+--   options 줄      : 방금 만든 loop.conf
+--   alias block_major_7_* : 메이저 7 블록 장치를 열면 loop 적재
+--   alias char_major_10_237, devname:loop_control : /dev/loop-control 용 별칭
+--   alias symbol:... : loop 가 내보내는 심벌. 다른 모듈의 의존성 계산에 쓰임
+-- alias 줄들은 modules.alias·modules.symbols 에서 온 것이다(이름의 - 는 _ 로 표시)
+-- 파일을 만든 것만으로는 아무 일도 일어나지 않는다. 지금 적재된 loop 의 값도 그대로다([7])
+
+--------------------------------------------------------------------------------
+ [7] 오류 ② — 이미 적재된 모듈에는 conf 가 적용되지 않는다
+--------------------------------------------------------------------------------
+[root@ol7a ~]# grep -H . /sys/module/loop/parameters/*; ls /dev/loop* | wc -l
+/sys/module/loop/parameters/max_loop:0
+/sys/module/loop/parameters/max_part:0
+1
+-- conf 를 쓴 뒤인데도 값은 0, 0. /dev/loop* 는 loop-control 하나뿐
+
+[root@ol7a ~]# modprobe -v loop; echo "rc=$?"; cat /sys/module/loop/parameters/max_loop
+rc=0
+0
+-- modprobe -v loop 가 아무것도 출력하지 않고 rc=0. 이미 있으니 할 일이 없다고 본 것이다
+-- conf 는 읽히지 않았고 max_loop 는 그대로 0
+--
+-- 증상   : /etc/modprobe.d/loop.conf 에 max_loop=4 를 넣고 modprobe -v loop 를 쳤지만 출력 없이
+--          rc=0, /sys/module/loop/parameters/max_loop 는 0
+-- 원인   : loop 가 이미 적재돼 있었다. options 는 적재하는 순간에만 insmod 인자로 붙는다
+-- 조치   : modprobe -r loop && modprobe -v loop
+-- 재확인 : -v 출력 insmod 줄 끝에 max_loop=4 max_part=8, max_loop 가 4
+
+-- 다시 올려야 conf 가 읽힌다. -v 출력의 insmod 줄에 붙는 인자를 본다.
+[root@ol7a ~]# modprobe -r loop && modprobe -v loop
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/block/loop.ko.xz max_loop=4 max_part=8 
+-- 이번에는 명령에 인자를 주지 않았는데 insmod 줄에 conf 의 두 값이 붙었다
+
+[root@ol7a ~]# grep -H . /sys/module/loop/parameters/*; ls /dev/loop*
+/sys/module/loop/parameters/max_loop:4
+/sys/module/loop/parameters/max_part:15
+/dev/loop0
+/dev/loop1
+/dev/loop2
+/dev/loop3
+/dev/loop-control
+-- [4] 와 같은 결과(4, 15, loop0~3). conf 가 명령 인자와 같은 효과를 냈다
+-- 운영에서는 이 형태로 남긴다. 명령 인자는 그 한 번뿐이고 다음 적재 때 사라진다
+
+--------------------------------------------------------------------------------
+ [8] 세 곳이 겹치면 — 명령 인자 대 conf
+--------------------------------------------------------------------------------
+-- conf 에 max_loop=4 가 있는 상태에서 명령에 max_loop=2 를 준다.
+[root@ol7a ~]# modprobe -r loop && modprobe -v loop max_loop=2; cat /sys/module/loop/parameters/max_loop
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/block/loop.ko.xz max_loop=4 max_part=8 max_loop=2
+2
+-- insmod 줄을 보면 conf 의 max_loop=4 가 먼저, 명령의 max_loop=2 가 나중에 붙었다
+-- 같은 파라미터가 두 번 오면 커널은 뒤의 값을 쓴다 → 2
+-- modprobe 의 순서: conf options → (커널 명령줄) → 명령 인자. 명령 인자가 늘 이긴다
+-- conf 의 max_part=8 은 명령에 없으니 그대로 적용된다. 겹친 파라미터만 덮인다
+
+--------------------------------------------------------------------------------
+ [9] 커널 명령줄에 모듈 파라미터 넣기 — 모듈이름.파라미터=값
+--------------------------------------------------------------------------------
+-- grubby --update-kernel=DEFAULT --args : 기본 항목의 커널 인자에 추가
+-- 같은 파라미터를 conf(4)와 다른 값(6)으로 넣어 우선순위를 본다
+[root@ol7a ~]# grubby --update-kernel=DEFAULT --args="loop.max_loop=6"; grubby --info=DEFAULT | grep ^args
+args="ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync loop.max_loop=6"
+-- grubby 가 기본 항목(UEK 2136)의 args 끝에 loop.max_loop=6 을 붙였다
+-- grubby 는 /boot/grub2/grub.cfg 의 해당 항목을 직접 고친다. grub2-mkconfig 를 돌리면
+-- 이 변경은 사라진다. 모든 커널에 영구로 넣으려면 /etc/default/grub 의 GRUB_CMDLINE_LINUX 에 넣는다
+-- --update-kernel=DEFAULT 는 기본 항목 하나만 바꾼다. 다른 커널 항목의 args 는 그대로다
+
+-- 재부팅해야 /proc/cmdline 에 들어간다. 지금은 아직 없다.
+[root@ol7a ~]# grep -o 'loop[^ ]*' /proc/cmdline; echo "rc=$?"
+rc=1
+-- /proc/cmdline 은 지금 돌고 있는 커널이 받은 명령줄이다. 아직 반영되지 않았다
+
+-- 재부팅
+
+[root@ol7a ~]# uptime; grep -o 'loop[^ ]*' /proc/cmdline
+ 08:53:48 up 0 min,  0 users,  load average: 0.07, 0.02, 0.00
+loop.max_loop=6
+-- up 0 min. 재부팅 직후이고 /proc/cmdline 에 loop.max_loop=6 이 들어왔다
+
+-- 재부팅 뒤 loop 는 저절로 올라오지 않는다(부팅 때 쓰는 곳이 없음).
+[root@ol7a ~]# lsmod | grep -w loop; echo "rc=$?"
+rc=1
+-- 부팅 중 loop 를 부른 쪽이 없어 적재되지 않았다. 커널 명령줄 값은 적재될 때까지 기다린다
+-- 커널은 모르는 모듈 이름의 명령줄 인자(loop.max_loop)를 그냥 넘기고, modprobe 가 나중에 읽어 쓴다
+
+[root@ol7a ~]# modprobe -v loop; grep -H . /sys/module/loop/parameters/*
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/block/loop.ko.xz max_loop=4 max_part=8 max_loop=6 
+/sys/module/loop/parameters/max_loop:6
+/sys/module/loop/parameters/max_part:15
+-- insmod 줄: conf 의 max_loop=4 max_part=8 다음에 명령줄의 max_loop=6
+-- 결과 6. 커널 명령줄 값이 conf 뒤에 붙어 conf 를 이겼다
+-- 명령 인자를 더 주면 그 뒤에 붙는다([8]). 우선순위는 명령 인자 > 커널 명령줄 > conf
+-- /dev/loop* 는 이제 loop0~loop5 와 loop-control([10] 에서 확인)
+
+[root@ol7a ~]# modprobe -c | grep -w loop
+options loop max_loop=4 max_part=8
+options loop max_loop=6
+alias block_major_7_* loop
+alias char_major_10_237 loop
+alias devname:loop_control loop
+alias symbol:loop_register_transfer loop
+alias symbol:loop_unregister_transfer loop
+-- modprobe -c 에 options 줄이 둘. 둘째 줄 options loop max_loop=6 은 /proc/cmdline 에서 온 것이다
+-- modprobe 가 커널 명령줄을 conf 의 한 줄처럼 다룬다는 것을 보여 준다
+
+--------------------------------------------------------------------------------
+ [10] 재부팅 뒤에도 conf 가 남아 있나
+--------------------------------------------------------------------------------
+[root@ol7a ~]# ls -l /etc/modprobe.d/loop.conf; ls /dev/loop*
+-rw-r--r--. 1 root root 103 Nov 13 08:53 /etc/modprobe.d/loop.conf
+/dev/loop0
+/dev/loop1
+/dev/loop2
+/dev/loop3
+/dev/loop4
+/dev/loop5
+/dev/loop-control
+-- loop.conf 는 재부팅 뒤에도 그대로(103 바이트). 장치는 loop0~loop5 여섯 개 = max_loop 6
+-- conf 는 파일이라 재부팅과 무관하게 남는다. 다만 재부팅만으로는 적용되지 않고 적재될 때 적용된다
+-- 부팅 때 바로 올리고 싶으면 /etc/modules-load.d 에 이름을 넣는다(실습 04)
+
+-- 커널 인자를 지운 뒤 conf 만 남은 상태를 보려면 재부팅이 또 필요하다.
+-- 여기서는 [되돌림] 에서 인자를 지우고 재부팅한 뒤 함께 본다.
+
+--------------------------------------------------------------------------------
+ [변형] options 대신 install 로 값 주기
+--------------------------------------------------------------------------------
+-- install 은 "적재 대신 이 셸 명령을 실행" 이다. --ignore-install 로 자기 자신을 다시
+-- 부르면 원래 적재가 일어나고, 거기 인자를 붙일 수 있다.
+[root@ol7a ~]# modprobe -r loop; mv /etc/modprobe.d/loop.conf /root/loop.conf.off
+[root@ol7a ~]# echo 'install loop /sbin/modprobe --ignore-install loop max_loop=3 $CMDLINE_OPTS' > /etc/modprobe.d/loop-install.conf; cat /etc/modprobe.d/loop-install.conf
+install loop /sbin/modprobe --ignore-install loop max_loop=3 $CMDLINE_OPTS
+-- $CMDLINE_OPTS 는 modprobe 가 install 명령을 실행할 때 원래 받은 인자로 바꿔 넣는 변수다
+
+[root@ol7a ~]# modprobe -v loop; cat /sys/module/loop/parameters/max_loop
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/block/loop.ko.xz max_loop=6 max_loop=3 max_loop=6
+install /sbin/modprobe --ignore-install loop max_loop=3 $CMDLINE_OPTS max_loop=6 
+6
+-- 출력 순서가 뒤집혀 보이지만 실제 순서는 install 줄 → 그 안의 modprobe 가 insmod 실행이다
+-- install 줄 끝에 max_loop=6 이 붙었다. 커널 명령줄 값이 $CMDLINE_OPTS 와 별도로 붙은 것이다
+-- 안쪽 insmod 줄은 max_loop=6 max_loop=3 max_loop=6. 마지막 6 이 이겨 결과는 6
+-- install 로 준 3 은 아직 커널 명령줄에 6 이 남아 있어 졌다. 우선순위 규칙은 install 에서도 같다
+-- 마지막 명령은 install 파일을 지우고 loop.conf 를 원래 자리로 돌린다. 출력은 없다
+
+[root@ol7a ~]# modprobe -r loop; rm -f /etc/modprobe.d/loop-install.conf; mv /root/loop.conf.off /etc/modprobe.d/loop.conf
+
+--------------------------------------------------------------------------------
+ [되돌림]
+--------------------------------------------------------------------------------
+[root@ol7a ~]# grubby --update-kernel=DEFAULT --remove-args="loop.max_loop=6"; grubby --info=DEFAULT | grep ^args
+args="ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync"
+-- args 가 [0] 과 같은 문자열로 돌아왔다(끝 공백 하나만 차이)
+
+[root@ol7a ~]# rm -f /etc/modprobe.d/loop.conf; modprobe -r loop; ls /etc/modprobe.d
+dccp-blacklist.conf
+firewalld-sysctls.conf
+lockd.conf
+tcindex-disable.conf
+tuned.conf
+-- loop.conf 가 지워져 /etc/modprobe.d 는 기본 다섯 파일
+-- 커널 인자는 grubby --remove-args 로, conf 는 rm 으로 지웠다. 반영 확인은 재부팅 뒤에 한다
+
+-- 재부팅
+
+[root@ol7a ~]# grep -o 'loop[^ ]*' /proc/cmdline; echo "rc=$?"; lsmod | grep -w loop; echo "rc=$?"; modprobe -c | grep -w loop; echo "rc=$?"
+rc=1
+rc=1
+alias block_major_7_* loop
+alias char_major_10_237 loop
+alias devname:loop_control loop
+alias symbol:loop_register_transfer loop
+alias symbol:loop_unregister_transfer loop
+rc=0
+-- 재부팅 뒤 /proc/cmdline 에 loop 없음(rc=1), loop 미적재(rc=1)
+-- modprobe -c 에는 alias 줄만 남고 options 줄이 사라졌다
+
+-- 깨끗한 상태에서 올리면 기본값으로 돌아오는지.
+[root@ol7a ~]# modprobe -v loop; cat /sys/module/loop/parameters/max_loop; ls /dev/loop* | wc -l; modprobe -r loop
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/block/loop.ko.xz 
+-- 인자 없는 insmod, max_loop 0, 노드는 loop-control 하나 → [2] 와 같은 기본 상태
+0
+1
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                         시작 전     변경 후                      되돌린 뒤
+--  /etc/modprobe.d/loop.conf    없음        options loop max_loop=4 ...  없음
+--  커널 인자 loop.max_loop      없음        6 (grubby)                   없음
+--  max_loop (인자 없이 적재)    0           4(conf) → 6(명령줄)          0
+--  max_part                     0           8 을 줘서 15                 0
+--  /dev/loop* 수                1           5 → 7                        1
+--  /sys 에 echo                 -           Permission denied (0444)     -
+--  max_lop=4 (오타)             -           무시, rc=0, dmesg 경고       -
+--  max_loop=four (형식 오류)    -           Invalid argument, rc=1       -
+--
+-- 확인한 사실
+--   options 는 적재하는 순간에만 읽힌다. 이미 있으면 modprobe 는 말없이 넘어간다
+--   겹치면 conf → 커널 명령줄 → 명령 인자 순으로 붙고 마지막 값이 이긴다
+--   0444 파라미터는 /sys 에서 못 바꾼다. 읽은 값이 넣은 값과 다를 수도 있다(max_part)
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. loop.conf 에 options loop max_lop=4 처럼 오타를 낸 뒤 재적재해 본다
+--    확인: modprobe -v 의 insmod 줄, dmesg | grep loop, /sys/module/loop/parameters/max_loop
+-- 2. max_part 에 1, 3, 16 을 넣어 읽은 값이 어떻게 올림되는지 표로 만든다
+--    확인: grep -H . /sys/module/loop/parameters/*
+-- 3. 쓰기 가능한 파라미터 하나(예: /sys/module/printk/parameters/time)를 찾아 echo 로 바꾸고
+--    재부팅 뒤 값이 남는지 본다. 확인: cat 으로 전후 비교
+-- 4. grubby 대신 /etc/default/grub 의 GRUB_CMDLINE_LINUX 에 loop.max_loop=6 을 넣고
+--    grub2-mkconfig -o /boot/grub2/grub.cfg 를 돌린 뒤 모든 커널 항목에 들어갔는지 본다
+--    확인: grubby --info=ALL | grep loop, 되돌릴 때도 같은 두 단계
+
+================================================================================
+ 실습 03 종료 — conf·커널 명령줄·명령 인자 순으로 붙고 마지막 값이 이김, 오타는 UEK 가 무시
+================================================================================

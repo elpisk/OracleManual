@@ -1,0 +1,463 @@
+================================================================================
+ 제14장 실습 06 — DB 용 NFS 마운트 옵션
+ 대상   : ol7a (NFS 서버), ol7b (DB 서버 역할의 NFS 클라이언트)
+ 목표   : Oracle Database 19c 설치 가이드가 예로 드는 NFS 마운트 옵션을 ol7b 에
+          걸고 nfsstat -m 으로 실제 적용값을 읽는다. 기본 마운트와 무엇이 달라지는지,
+          옵션 오타가 어떻게 처리되는지(거부되는지, 조용히 무시되는지) 확인하고,
+          oracle 사용자 UID·GID 를 두 노드에서 맞추지 않았을 때의 실패를 재현한 뒤
+          RMAN 백업 대상 경로를 준비한다
+ 배경   : DB 파일을 NFS 에 두면 "쓰기가 서버 디스크에 닿았다"는 응답과 속성의 즉시성이
+          중요하다. 그래서 hard(서버가 멈춰도 오류 대신 기다림), tcp, timeo=600,
+          rsize·wsize 32768 이상, 그리고 여러 클라이언트가 같은 파일을 볼 때 속성
+          캐시를 끄는 actimeo=0 을 쓴다. 파일 권한은 UID·GID 숫자로 판단하므로 oracle
+          계정의 번호를 모든 노드에서 같게 만든다 (본문 14.6)
+ 소요   : 약 40분
+ 선행   : ol7-base, ol7b-base 스냅샷
+ 계정   : root, oracle (두 노드에서 만들고 지움)
+ 주의   : 실제 DB 는 설치하지 않는다. 파일 쓰기는 200MiB 이내
+ 되돌림 : 마운트·fstab 줄 제거, oracle·oinstall·dba 삭제, ol7a 의 내보내기·방화벽 원복
+          → findmnt -t nfs,nfs4, id oracle, grep -c nfs /etc/fstab, firewall-cmd --list-services
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# id oracle; getent group oinstall dba; echo "rc=$?"
+id: oracle: no such user
+rc=2
+-- 서버에 oracle·oinstall·dba 가 없다. getent 가 아무것도 못 찾아 rc=2
+[root@ol7b ~]# id oracle; getent group oinstall dba; echo "rc=$?"; grep -c nfs /etc/fstab; findmnt -t nfs,nfs4 | wc -l
+id: oracle: no such user
+rc=2
+0
+0
+-- 클라이언트도 계정 없음, fstab 의 nfs 줄 0, NFS 마운트 0
+
+--------------------------------------------------------------------------------
+ [1] 서버 준비 — oracle 계정과 내보낼 디렉터리
+--------------------------------------------------------------------------------
+-- DB 설치 가이드가 쓰는 번호 그대로 만든다.
+-- oinstall 54321, dba 54322, oracle 54321.
+-- oracle-database-preinstall-19c 패키지도 같은 번호를 쓴다.
+[root@ol7a ~]# groupadd -g 54321 oinstall; groupadd -g 54322 dba; useradd -u 54321 -g oinstall -G dba oracle; id oracle
+uid=54321(oracle) gid=54321(oinstall) groups=54321(oinstall),54322(dba)
+-- id 출력 읽기
+--   uid=54321(oracle)   : 사용자 번호
+--   gid=54321(oinstall) : 기본 그룹. 오라클 인벤토리를 소유하는 그룹
+--   groups=...54322(dba): 보조 그룹. SYSDBA 권한의 OS 그룹
+-- 설치 가이드의 번호를 쓰면 다른 서버에서도 같은 명령 한 줄로 같은 계정이 생긴다
+[root@ol7a ~]# mkdir -p /srv/nfs/oradata /srv/nfs/orabackup; chown oracle:oinstall /srv/nfs/oradata /srv/nfs/orabackup; chmod 775 /srv/nfs/oradata /srv/nfs/orabackup; ls -ld /srv/nfs/*
+drwxrwxr-x. 2 oracle oinstall 6 Nov 16 15:58 /srv/nfs/orabackup
+drwxrwxr-x. 2 oracle oinstall 6 Nov 16 15:58 /srv/nfs/oradata
+-- 두 디렉터리 모두 oracle:oinstall 775. 그룹 oinstall 도 쓸 수 있다
+-- 서버 디스크에는 이름이 아니라 54321:54321 이 기록돼 있다
+[root@ol7a ~]# printf '%s\n' '/srv/nfs/oradata    ol7b.example.com(rw,sync)' '/srv/nfs/orabackup  ol7b.example.com(rw,sync)' > /etc/exports
+[root@ol7a ~]# firewall-cmd -q --permanent --add-service={nfs,mountd,rpc-bind}; firewall-cmd -q --reload; systemctl enable -q --now nfs-server; exportfs -v
+/srv/nfs/oradata
+                ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+/srv/nfs/orabackup
+                ol7b.example.com(sync,wdelay,hide,no_subtree_check,sec=sys,rw,secure,root_squash,no_all_squash)
+-- 경로 이름이 길어(16자 이상)
+-- exportfs -v 가 클라이언트를 다음 줄로 내렸다. 내용은 한 항목이다
+-- 데이터 파일 경로에 root_squash 를 그대로 둔다. DB 파일은 oracle 이 만든다
+
+--------------------------------------------------------------------------------
+ [2] 기준 — 옵션 없이 마운트
+--------------------------------------------------------------------------------
+[root@ol7b ~]# mkdir -p /u02/oradata /u03/orabackup
+[root@ol7b ~]# mount -t nfs ol7a:/srv/nfs/oradata /u02/oradata; nfsstat -m
+/u02/oradata from ol7a:/srv/nfs/oradata
+ Flags: rw,relatime,vers=4.1,rsize=524288,wsize=524288,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none,addr=172.16.225.61
+-- 옵션 없이 붙인 기준값
+--   vers=4.1, rsize·wsize 524288, hard, tcp, timeo=600, retrans=2
+--   ac 관련 값이 없다 → 속성 캐시 기본값(3~60초)
+-- 이미 hard·tcp·timeo=600 은 기본값이다.
+-- 권고 옵션에서 실제로 달라지는 것은 버전·크기·ac 다
+
+--------------------------------------------------------------------------------
+ [3] DB 데이터 파일용 옵션으로 다시 마운트
+--------------------------------------------------------------------------------
+-- 19c 설치 가이드(Linux)의 데이터 파일용 예:
+--   rw,bg,hard,nointr,tcp,nfsvers=3,timeo=600,rsize=32768,wsize=32768,actimeo=0
+[root@ol7b ~]# umount /u02/oradata
+[root@ol7b ~]# mount -t nfs -o rw,bg,hard,nointr,tcp,nfsvers=3,timeo=600,rsize=32768,wsize=32768,actimeo=0 ol7a:/srv/nfs/oradata /u02/oradata
+[root@ol7b ~]# nfsstat -m
+/u02/oradata from ol7a:/srv/nfs/oradata
+ Flags: rw,relatime,vers=3,rsize=32768,wsize=32768,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=172.16.225.61,mountvers=3,mountport=20048,mountproto=tcp,local_lock=none,addr=172.16.225.61
+-- 기준과 비교
+--   vers=4.1 → 3                 : nfsvers=3
+--   rsize·wsize 524288 → 32768   : 적은 값 그대로
+--   acregmin~acdirmax 모두 0     : actimeo=0 이 네 값으로 풀렸다
+--   mountaddr·mountvers·mountport·mountproto : v3 이라 mountd 를 거쳤다
+--   bg, nointr                   : 보이지 않는다
+-- 적용값을 옵션 하나씩 한 줄로 펴서 본다.
+[root@ol7b ~]# findmnt -n -o OPTIONS /u02/oradata | tr ',' '\n'
+-- 한 줄씩 다시 읽는다
+rw
+relatime
+--   relatime   : 접근 시각을 드물게 갱신(커널 기본)
+vers=3
+rsize=32768
+wsize=32768
+namlen=255
+--   namlen=255 : 서버가 알려 준 파일 이름 최대 길이
+acregmin=0
+acregmax=0
+acdirmin=0
+acdirmax=0
+--   acregmin/acregmax : 일반 파일 속성 캐시 최소·최대 초 → 0
+--   acdirmin/acdirmax : 디렉터리 속성 캐시 → 0
+hard
+--   hard       : 서버가 응답할 때까지 재시도
+proto=tcp
+timeo=600
+retrans=2
+--   timeo=600  : 60초 뒤 첫 재시도   retrans=2 : 기본값 그대로
+sec=sys
+--   sec=sys    : UID·GID 숫자 인증. 그래서 [5] 의 문제가 생긴다
+mountaddr=172.16.225.61
+mountvers=3
+mountport=20048
+mountproto=tcp
+--   mountport=20048, mountproto=tcp : 마운트 요청도 tcp 로 보냈다(tcp 옵션 영향)
+--   실습 05 에서 tcp 를 적지 않은 v3 은 mountproto=udp 였다
+local_lock=none
+--   local_lock=none : 잠금은 서버의 NLM 에 맡긴다. 여러 노드의 잠금이 공유된다
+addr=172.16.225.61
+
+--------------------------------------------------------------------------------
+ [4] 옵션 오타 — 거부되나, 무시되나
+--------------------------------------------------------------------------------
+-- actimeo 를 actimo 로 잘못 친다.
+[root@ol7b ~]# mkdir -p /mnt/t; mount -t nfs -o rw,hard,tcp,nfsvers=3,timeo=600,actimo=0 ol7a:/srv/nfs/oradata /mnt/t; echo "rc=$?"
+mount.nfs: an incorrect mount option was specified
+rc=32
+-- 증상   : actimo=0 (actimeo 오타) → "an incorrect mount option was specified", rc=32
+-- 조용히 무시되지 않고 마운트 자체가 실패했다
+[root@ol7b ~]# dmesg | tail -2
+[   14.473954] Key type id_resolver registered
+[   14.473955] Key type id_legacy registered
+-- 커널 로그 끝 두 줄은 부팅 때 것이다.
+-- 이 오타는 커널 로그에 남지 않았다
+-- mount.nfs 가 커널에 넘기기 전에 거부했거나,
+-- 커널이 로그 없이 거부한 것이다
+-- 값의 형식이 틀린 경우. rsize 에 단위 k 를 붙인다.
+[root@ol7b ~]# mount -t nfs -o rw,nfsvers=3,rsize=32k ol7a:/srv/nfs/oradata /mnt/t; echo "rc=$?"
+mount.nfs: an incorrect mount option was specified
+rc=32
+-- 값 형식이 틀린 rsize=32k 도 같은 메시지, rc=32
+[root@ol7b ~]# dmesg | tail -1
+[   15.412206] NFS: bad mount option value specified: rsize=32k
+-- 이쪽은 커널이 "bad mount option value specified: rsize=32k" 를 남겼다
+-- 줄 앞 숫자는 부팅 뒤 초. 실습 시작 직후라 작다
+-- 철자는 맞지만 효과가 없는 옵션.
+-- intr·nointr 는 2.6.25 커널부터 무시된다. 결과에 남지 않는다.
+[root@ol7b ~]# mount -t nfs -o rw,nfsvers=3,intr ol7a:/srv/nfs/oradata /mnt/t; echo "rc=$?"; findmnt -n -o OPTIONS /mnt/t | tr ',' '\n' | grep -c intr; umount /mnt/t
+rc=0
+0
+-- intr : rc=0 으로 붙었고 결과 옵션에 intr 가 0 개. 받기만 하고 버렸다
+-- 원인   : 커널이 모르는 옵션은 거부하지만 intr·nointr 는 "아는데 효과 없는" 옵션이라 통과한다
+-- -s(sloppy) 를 주면 모르는 옵션을 조용히 넘긴다.
+-- autofs 가 마운트할 때 이 방식을 쓴다.
+[root@ol7b ~]# mount -s -t nfs -o rw,nfsvers=3,actimo=0 ol7a:/srv/nfs/oradata /mnt/t; echo "rc=$?"; findmnt -n -o OPTIONS /mnt/t | tr ',' '\n' | grep -E '^ac'; umount /mnt/t
+rc=0
+-- mount -s(sloppy) 에서는 같은 actimo=0 오타가 rc=0 으로 통과했다
+-- grep '^ac' 결과가 비었다. ac 값은 기본값이라 옵션 목록에 나오지 않는다
+-- 즉 오타가 조용히 사라졌고 속성 캐시는 켜져 있다
+-- autofs 는 맵의 옵션을 이 sloppy 방식으로 넘긴다.
+-- autofs 맵의 오타는 이렇게 사라진다
+-- 크기는 서버가 허용하는 최대값으로 깎인다.
+-- 서버 최대값보다 크게 요청해 본다.
+[root@ol7b ~]# mount -t nfs -o rw,nfsvers=3,rsize=4194304,wsize=4194304 ol7a:/srv/nfs/oradata /mnt/t; nfsstat -m | grep -A1 '^/mnt/t' | grep -oE '[rw]size=[0-9]+'; umount /mnt/t
+rsize=524288
+wsize=524288
+-- 4MiB(4194304)를 요청했는데 524288 로 붙었다
+[root@ol7a ~]# cat /proc/fs/nfsd/max_block_size
+524288
+-- 조치   : 크기는 서버 최대값 max_block_size 524288 을 넘지 못한다. 오타는 mount -a·nfsstat -m 으로 확인
+-- 재확인 : 권고 옵션으로 다시 붙인 /u02/oradata 의 Flags 에 rsize=32768·ac 0 이 있다([3])
+
+--------------------------------------------------------------------------------
+ [5] oracle 계정을 맞추지 않은 클라이언트
+--------------------------------------------------------------------------------
+-- ol7b 에서 번호 없이 만든다.
+-- 그 서버에서 비어 있는 다음 번호(student 1000 다음)를 받는다.
+[root@ol7b ~]# groupadd oinstall; groupadd dba; useradd -g oinstall -G dba oracle; id oracle
+uid=1001(oracle) gid=1001(oinstall) groups=1001(oinstall),1002(dba)
+-- 번호 없이 만든 결과: oracle 1001, oinstall 1001, dba 1002
+-- student 가 1000 이라 그다음 번호를 받았다
+[root@ol7b ~]# ls -ld /u02/oradata; ls -lnd /u02/oradata
+drwxrwxr-x. 2 54321 54321 6 Nov 16 15:58 /u02/oradata
+drwxrwxr-x. 2 54321 54321 6 Nov 16 15:58 /u02/oradata
+-- ls -l 인데도 54321 숫자. 클라이언트에 54321 이 없다
+-- oracle 이 데이터 파일 자리에 파일을 만든다(DBCA 가 하는 일을 흉내).
+[oracle@ol7b ~]$ touch /u02/oradata/system01.dbf; echo "rc=$?"
+touch: cannot touch ‘/u02/oradata/system01.dbf’: Permission denied
+rc=1
+-- 증상   : 클라이언트 oracle 의 touch 가 Permission denied
+[oracle@ol7b ~]$ id -u; id -g
+1001
+1001
+-- 원인   : 요청자 UID·GID 1001 은 서버의 54321:54321 775 디렉터리에 대해 "기타" 다
+--          기타에게는 r-x 만 있어 파일을 만들 수 없다
+-- DBCA 였다면 데이터 파일을 만들다 ORA-01119 같은 오류로 멈췄을 것이다
+
+--------------------------------------------------------------------------------
+ [6] 고치기 — UID·GID 를 서버와 같게 다시 만든다
+--------------------------------------------------------------------------------
+-- 이미 DB 를 설치한 뒤라면 usermod·groupmod 뒤에 find 로 소유자를 바꿔야 한다.
+-- 설치 전이라 지우고 다시 만든다.
+[root@ol7b ~]# userdel -r oracle; groupdel dba; groupdel oinstall
+[root@ol7b ~]# groupadd -g 54321 oinstall; groupadd -g 54322 dba; useradd -u 54321 -g oinstall -G dba oracle; id oracle
+uid=54321(oracle) gid=54321(oinstall) groups=54321(oinstall),54322(dba)
+-- 조치   : 계정·그룹을 지우고 54321/54321/54322 로 다시 만들었다
+--   userdel -r : 홈 디렉터리까지 삭제. 그룹은 사용자를 지운 뒤에 지운다
+[oracle@ol7b ~]$ touch /u02/oradata/system01.dbf; echo "rc=$?"; ls -l /u02/oradata
+rc=0
+total 0
+-rw-r--r--. 1 oracle oinstall 0 Nov 16  2026 system01.dbf
+-- 재확인 : rc=0, 소유자 oracle:oinstall 로 보인다
+[root@ol7a ~]# ls -l /srv/nfs/oradata
+total 0
+-rw-r--r--. 1 oracle oinstall 0 Nov 16 15:58 system01.dbf
+-- 서버에서도 oracle:oinstall. 두 노드가 같은 번호를 쓰니 이름까지 맞는다
+
+--------------------------------------------------------------------------------
+ [7] RMAN 백업 대상 경로 — fstab 으로
+--------------------------------------------------------------------------------
+-- 백업 경로는 데이터 파일과 같은 hard·tcp·timeo·rsize·wsize 를 쓰고,
+-- 여러 노드가 같은 파일을 동시에 고치지 않으므로 actimeo=0 은 뺀다.
+--   bg      : 부팅 때 서버가 없으면 백그라운드에서 재시도하고 부팅을 계속한다
+--   _netdev : 네트워크가 올라온 뒤 마운트
+[root@ol7b ~]# cp -p /etc/fstab /root/fstab.orig
+[root@ol7b ~]# echo 'ol7a:/srv/nfs/orabackup  /u03/orabackup  nfs  rw,bg,hard,nointr,tcp,nfsvers=3,timeo=600,rsize=32768,wsize=32768,_netdev  0 0' >> /etc/fstab
+[root@ol7b ~]# diff /root/fstab.orig /etc/fstab
+11a12
+> ol7a:/srv/nfs/orabackup  /u03/orabackup  nfs  rw,bg,hard,nointr,tcp,nfsvers=3,timeo=600,rsize=32768,wsize=32768,_netdev  0 0
+-- 백업 경로 줄. 데이터 파일 옵션에서 actimeo=0 만 빼고 _netdev 를 더했다
+[root@ol7b ~]# mount -a; findmnt -n -o TARGET,SOURCE,FSTYPE /u03/orabackup; nfsstat -m | grep -A1 '^/u03'
+/u03/orabackup ol7a:/srv/nfs/orabackup nfs
+-- mount -a 가 fstab 줄을 읽어 붙였다. FSTYPE nfs(v3)
+/u03/orabackup from ol7a:/srv/nfs/orabackup
+ Flags: rw,relatime,vers=3,rsize=32768,wsize=32768,namlen=255,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=172.16.225.61,mountvers=3,mountport=20048,mountproto=tcp,local_lock=none,addr=172.16.225.61
+-- vers=3, 32768, hard, tcp, timeo=600. ac 값이 없으므로 속성 캐시 기본값
+-- 이 줄이 fstab 에 적은 의도대로인지 확인하는 마지막 근거다
+-- RMAN 이 쓸 하위 디렉터리를 oracle 로 만든다.
+-- FORMAT '/u03/orabackup/ORCL/%U' 같은 경로가 된다.
+[oracle@ol7b ~]$ mkdir -p /u03/orabackup/ORCL; ls -ld /u03/orabackup/ORCL; df -h /u03/orabackup
+drwxr-xr-x. 2 oracle oinstall 6 Nov 16 15:58 /u03/orabackup/ORCL
+Filesystem               Size  Used Avail Use% Mounted on
+ol7a:/srv/nfs/orabackup   36G  4.3G   31G  13% /u03/orabackup
+-- ORCL 디렉터리를 oracle 로 만들었다. RMAN 의 FORMAT '/u03/orabackup/ORCL/%U' 자리
+-- df 는 서버 ol-root 의 값이다. 실제 운영에서는 백업 전용 볼륨을 내보낸다
+
+--------------------------------------------------------------------------------
+ [8] 쓰기 시험 — wsize 32768 과 기본값
+--------------------------------------------------------------------------------
+-- 같은 서버 같은 디렉터리에 wsize 만 다른 마운트로 200MiB 씩 쓴다.
+--   oflag=direct : 클라이언트 캐시를 거치지 않음(RMAN·DB 도 직접 I/O 를 쓴다)
+[oracle@ol7b ~]$ dd if=/dev/zero of=/u03/orabackup/ORCL/t32k.bkp bs=1M count=200 oflag=direct 2>&1 | tail -1
+209715200 bytes (210 MB) copied, 2.26953 s, 92.4 MB/s
+-- wsize 32768 : 200MiB 에 2.27초, 92.4 MB/s
+[root@ol7b ~]# mkdir -p /mnt/big; mount -t nfs -o nfsvers=3 ol7a:/srv/nfs/orabackup /mnt/big; nfsstat -m | grep -A1 '^/mnt/big' | grep -oE 'wsize=[0-9]+'
+wsize=524288
+-- 비교용 마운트는 nfsvers=3 만 적어 wsize 가 524288 로 협상됐다
+[oracle@ol7b ~]$ dd if=/dev/zero of=/mnt/big/ORCL/t1m.bkp bs=1M count=200 oflag=direct 2>&1 | tail -1
+209715200 bytes (210 MB) copied, 4.06423 s, 51.6 MB/s
+-- wsize 524288 : 4.06초, 51.6 MB/s. 이번에는 작은 wsize 쪽이 빨랐다
+-- 같은 시험을 앞서 한 번 돌렸을 때는 32768 이 4.4 MB/s, 524288 이 6.0 MB/s 였다
+-- VM 의 디스크 캐시 상태에 따라 수십 배씩 흔들린다.
+-- 한 번의 dd 로 wsize 를 고르지 않는다
+-- 32768 은 설치 가이드가 정한 최소값이지 권장 상한이 아니다
+[root@ol7b ~]# nfsstat -c -3 | grep -A1 -w write | head -4
+read         write        create       mkdir        symlink      mknod        
+0         0% 6800     93% 4         0% 1         0% 0         0% 0         0% 
+-- 클라이언트 v3 write 6800 회(전체의 93%)
+-- 200MiB 를 32KiB 로 나누면 6400, 512KiB 로 나누면 400. 합이 6800 이다
+[oracle@ol7b ~]$ rm -f /u03/orabackup/ORCL/t32k.bkp /mnt/big/ORCL/t1m.bkp
+
+--------------------------------------------------------------------------------
+ [변형] actimeo=0 이 하는 일 — 속성 캐시
+--------------------------------------------------------------------------------
+-- 같은 파일을 기본 마운트(/mnt/big,
+-- 속성 캐시 3~60초)와 actimeo=0 마운트에서 본다.
+-- 기본 마운트 쪽에 /u02/oradata 의 내보내기를 하나 더 붙인다.
+[root@ol7b ~]# mkdir -p /mnt/ac; mount -t nfs -o nfsvers=3 ol7a:/srv/nfs/oradata /mnt/ac
+[root@ol7a ~]# echo "v1" > /srv/nfs/oradata/ctl.txt; chown oracle:oinstall /srv/nfs/oradata/ctl.txt
+[root@ol7b ~]# stat -c '%n %s' /mnt/ac/ctl.txt /u02/oradata/ctl.txt
+/mnt/ac/ctl.txt 3
+/u02/oradata/ctl.txt 3
+-- 두 마운트 모두 3 바이트("v1\n").
+-- 이 조회로 기본 마운트는 속성을 캐시에 담았다
+-- 서버에서 파일을 늘리고 곧바로 두 마운트에서 크기를 본다.
+[root@ol7a ~]# echo "v2 appended line" >> /srv/nfs/oradata/ctl.txt; stat -c '%n %s' /srv/nfs/oradata/ctl.txt
+/srv/nfs/oradata/ctl.txt 20
+-- 서버에서 20 바이트로 늘었다
+[root@ol7b ~]# stat -c '%n %s' /mnt/ac/ctl.txt /u02/oradata/ctl.txt
+/mnt/ac/ctl.txt 3
+/u02/oradata/ctl.txt 20
+-- 곧바로 본 결과
+--   /mnt/ac (기본 ac)       : 3. 캐시에 있던 옛 크기
+--   /u02/oradata (actimeo=0): 20. 매번 서버에 물었다
+[root@ol7b ~]# stat -c '%n %s' /mnt/ac/ctl.txt /u02/oradata/ctl.txt
+/mnt/ac/ctl.txt 20
+/u02/oradata/ctl.txt 20
+-- 5초 뒤에는 둘 다 20. 기본 acregmin 3초가 지나 캐시가 만료됐다
+-- RAC 에서 다른 노드가 늘린 데이터 파일 크기를 몇 초 늦게 보면 안 되는 이유가 이것이다
+-- 속성 캐시를 끈 대가는 GETATTR 요청 수다.
+[root@ol7b ~]# nfsstat -c -3 | grep -A1 -w getattr | head -2
+null         getattr      setattr      lookup       access       readlink     
+1         0% 43        0% 1         0% 7         0% 17        0% 0         0% 
+-- getattr 43 회. actimeo=0 은 속성을 볼 때마다 GETATTR 을 보낸다.
+-- 읽기가 많은 경로일수록 요청이 늘어난다
+
+--------------------------------------------------------------------------------
+ [9] 같은 옵션을 v4.1 로
+--------------------------------------------------------------------------------
+-- 설치 가이드 예는 v3 이다. 버전만 4.1 로 바꾸면 무엇이 달라지는지 본다.
+[root@ol7b ~]# mkdir -p /mnt/v41; mount -t nfs -o rw,bg,hard,tcp,vers=4.1,timeo=600,rsize=32768,wsize=32768,actimeo=0 ol7a:/srv/nfs/oradata /mnt/v41
+[root@ol7b ~]# nfsstat -m | grep -A1 -E '^/(u02|mnt/v41)' | sed 's/,addr=.*//'
+/u02/oradata from ol7a:/srv/nfs/oradata
+ Flags: rw,relatime,vers=3,rsize=32768,wsize=32768,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,hard,proto=tcp,timeo=600,retrans=2,sec=sys,mountaddr=172.16.225.61,mountvers=3,mountport=20048,mountproto=tcp,local_lock=none
+--
+/mnt/v41 from ol7a:/srv/nfs/oradata
+ Flags: rw,relatime,vers=4.1,rsize=32768,wsize=32768,namlen=255,acregmin=0,acregmax=0,acdirmin=0,acdirmax=0,hard,proto=tcp,timeo=600,retrans=2,sec=sys,clientaddr=172.16.225.62,local_lock=none
+-- 두 줄 비교(addr 이후는 sed 로 잘랐다)
+--   같은 것 : rsize·wsize 32768, ac 네 값 0, hard, tcp, timeo=600, retrans=2
+--   v3 만   : mountaddr·mountvers·mountport=20048·mountproto=tcp
+--   v4.1 만 : clientaddr
+-- v4.1 이면 mountd 가 필요 없어 방화벽에는 nfs 하나면 된다.
+-- NAS 가 v4.1 을 인증하는지가 고를 기준이다
+[root@ol7b ~]# umount /mnt/v41; rmdir /mnt/v41
+
+--------------------------------------------------------------------------------
+ [10] bg — 서버가 없을 때 fstab 마운트
+--------------------------------------------------------------------------------
+-- 서버가 내려간 상태에서 fstab 의 백업 줄(bg)을 마운트한다.
+-- 부팅 때와 같은 상황이다.
+[root@ol7b ~]# umount /u03/orabackup
+[root@ol7a ~]# systemctl stop nfs-server; systemctl is-active nfs-server nfs-mountd
+inactive
+inactive
+-- nfs-server 를 멈추자 nfs-mountd 도 함께 멈췄다(nfs-server 에 묶인 유닛)
+[root@ol7b ~]# time timeout 90 mount /u03/orabackup; echo "rc=$?"
+mount.nfs: backgrounding "ol7a:/srv/nfs/orabackup"
+mount.nfs: mount options: "rw,bg,hard,nointr,tcp,nfsvers=3,timeo=600,rsize=32768,wsize=32768,_netdev"
+
+real    0m0.004s
+user    0m0.001s
+sys     0m0.002s
+rc=0
+-- 첫 시도가 실패하자 "backgrounding" 을 찍고 뒤로 물러났다
+-- 0.004초 만에 rc=0. 부팅이라면 여기서 기다리지 않고 다음으로 넘어간다
+-- 다만 마운트는 아직 안 됐다. rc=0 을 마운트 성공으로 읽으면 안 된다
+[root@ol7b ~]# ps -eo pid,args | grep '[m]ount.nfs'; findmnt /u03/orabackup | wc -l
+11104 /sbin/mount.nfs ol7a:/srv/nfs/orabackup /u03/orabackup -o rw,bg,hard,nointr,tcp,nfsvers=3,timeo=600,rsize=32768,wsize=32768,_netdev
+0
+-- 백그라운드 mount.nfs(PID 11104)가 fstab 옵션 그대로 재시도 중이고 findmnt 는 0 줄
+-- 이 상태에서 RMAN 이 /u03/orabackup 에 쓰면 마운트 지점 아래 로컬 디스크에 쓴다
+-- 백업 스크립트 첫 줄에서 findmnt 로 확인하는 이유다
+-- 서버를 올리고 백그라운드 재시도가 붙이는지 기다린다.
+[root@ol7a ~]# systemctl start nfs-server; systemctl is-active nfs-server
+active
+[root@ol7b ~]# for i in $(seq 1 12); do findmnt -n /u03/orabackup >/dev/null && break; sleep 10; done; date +%T; findmnt -n -o TARGET,SOURCE,FSTYPE /u03/orabackup
+15:58:34
+/u03/orabackup ol7a:/srv/nfs/orabackup nfs
+-- 서버를 올린 뒤 루프가 붙은 것을 보고 빠져나왔다(15:58:34)
+-- bg 의 재시도 간격은 처음 짧고 점점 길어진다
+[root@ol7b ~]# ps -eo pid,args | grep -c '[m]ount.nfs'
+0
+-- 재시도 프로세스는 마운트를 끝내고 사라졌다
+
+--------------------------------------------------------------------------------
+ [11] mountstats — 연산별 시간
+--------------------------------------------------------------------------------
+-- nfsstat 은 횟수만 센다.
+-- mountstats 는 마운트 하나의 연산별 횟수·평균 왕복 시간(RTT)·실행 시간을 보여 준다.
+[root@ol7b ~]# mountstats /u02/oradata | sed -n '/^RPC statistics/,$p' | head -24
+RPC statistics:
+-- mountstats 는 /proc/self/mountstats 를 읽기 좋게 보여 준다. head -24 로 잘랐다
+  7317 RPC requests sent, 7317 RPC replies received (0 XIDs not found)
+  average backlog queue length: 0
+-- 7317 요청에 7317 응답.
+-- 같은 서버·같은 내보내기의 마운트는 통계를 함께 쓴다(/mnt/ac 의 dd 도 포함)
+-- backlog 0 : 보내기를 기다린 요청이 없다
+
+GETATTR:
+        28 ops (0%) 
+        avg bytes sent per op: 121      avg bytes received per op: 112
+        backlog wait: 0.000000  RTT: 0.178571   total execute time: 1.035714 (milliseconds)
+-- 연산마다 세 줄
+--   ops        : 횟수와 전체 대비 비율
+--   avg bytes  : 요청·응답 평균 크기
+--   RTT        : 서버 왕복 시간 평균(ms). total execute time 은 클라이언트 큐까지 포함
+-- GETATTR 의 RTT 0.18ms.
+-- actimeo=0 이 만든 GETATTR 은 개수가 많아도 하나하나는 가볍다
+-- 원격 NAS 가 멀리 있어 RTT 가 수 ms 가 되면 이야기가 달라진다
+ACCESS:
+        11 ops (0%) 
+        avg bytes sent per op: 122      avg bytes received per op: 120
+        backlog wait: 0.000000  RTT: 0.272727   total execute time: 1.000000 (milliseconds)
+LOOKUP:
+        3 ops (0%) 
+        avg bytes sent per op: 133      avg bytes received per op: 160
+        backlog wait: 0.000000  RTT: 0.000000   total execute time: 2.666667 (milliseconds)
+CREATE:
+        2 ops (0%) 
+        avg bytes sent per op: 168      avg bytes received per op: 212
+        backlog wait: 0.000000  RTT: 0.000000   total execute time: 0.500000 (milliseconds)
+FSINFO:
+        2 ops (0%) 
+        avg bytes sent per op: 116      avg bytes received per op: 80
+        backlog wait: 0.000000  RTT: 0.000000   total execute time: 0.500000 (milliseconds)
+
+--------------------------------------------------------------------------------
+ [12] 되돌리기
+--------------------------------------------------------------------------------
+[root@ol7b ~]# pkill -x mount.nfs; umount /mnt/ac /mnt/big /u03/orabackup /u02/oradata; cp -p /root/fstab.orig /etc/fstab; systemctl daemon-reload
+[root@ol7b ~]# rmdir /mnt/ac /mnt/big /mnt/t; rm -rf /u02 /u03; userdel -r oracle; groupdel dba; groupdel oinstall
+[root@ol7b ~]# findmnt -t nfs,nfs4 | wc -l; id oracle; grep -c nfs /etc/fstab
+0
+id: oracle: no such user
+0
+-- 클라이언트: 마운트 0, oracle 없음, fstab nfs 줄 0
+[root@ol7a ~]# exportfs -ua; : > /etc/exports; systemctl disable -q --now nfs-server; firewall-cmd -q --permanent --remove-service={nfs,mountd,rpc-bind}; firewall-cmd -q --reload
+[root@ol7a ~]# rm -rf /srv/nfs; userdel -r oracle; groupdel dba; groupdel oinstall; id oracle; firewall-cmd --list-services
+id: oracle: no such user
+dhcpv6-client ssh
+-- 서버: oracle 없음, 방화벽 기본
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  마운트                      vers  rsize/wsize  ac           비고
+--  옵션 없음                   4.1   524288       기본(3~60초)
+--  DB 데이터 파일 권고 옵션    3     32768        모두 0       bg·nointr 표시 없음
+--  rsize=4194304 요청          3     524288       기본         서버 max_block_size 로 깎임
+--  RMAN 백업(fstab)            3     32768        기본         _netdev, mount -a 로 확인
+--
+--  옵션 실수                   결과
+--  actimo=0                    incorrect mount option, rc=32, 커널 로그 없음
+--  rsize=32k                   incorrect mount option, 커널 "bad mount option value"
+--  intr                        rc=0, 결과에 없음
+--  mount -s 로 actimo=0        rc=0, ac 기본값 그대로(조용히 무시)
+--
+--  oracle 계정        ol7b UID/GID      /u02/oradata 쓰기
+--  번호 없이 생성     1001/1001         Permission denied
+--  54321 로 재생성    54321/54321       rc=0
+--
+--  200MiB direct 쓰기  wsize 32768 92.4 MB/s, 524288 51.6 MB/s (앞선 실행 4.4·6.0, 편차 큼)
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. fstab 의 백업 줄에서 bg 를 빼고 서버 nfs-server 를 멈춘 채 ol7b 를 재부팅한다
+--    확인: 부팅이 얼마나 늦어지는지 systemd-analyze blame 의 u03-orabackup.mount 값
+-- 2. 데이터 파일 옵션에 vers=4.1 을 주고 nfsstat -m 을 [3] 과 비교한다
+--    확인: mountaddr 계열 필드가 사라지고 clientaddr 가 생기는지
+-- 3. RAC 처럼 두 클라이언트가 같은 파일을 본다고 가정하고 ol7a 자신도 그 경로를 마운트한다
+--    확인: actimeo=0 이 없는 쪽에서 [변형] 과 같은 지연이 보이는지
+
+================================================================================
+ 실습 06 종료 — 권고 옵션이 nfsstat -m 에 반영됨, 오타는 거부·sloppy 는 무시, UID 54321 로 해결
+================================================================================

@@ -1,0 +1,473 @@
+================================================================================
+ 제20장 실습 01 — root 암호 분실 복구 (rd.break)
+ 대상   : ol7a (직렬 콘솔 ttyS0 으로 진행)
+ 목표   : root 암호를 모르는 상태를 만들고, GRUB 에서 rd.break 를 붙여 initramfs 셸로
+          들어가 /sysroot 를 쓰기 가능으로 다시 마운트·chroot 해 암호를 바꾼다.
+          .autorelabel 을 빠뜨렸을 때 무엇이 막히는지 보고 다시 고친다
+ 배경   : rd.break 는 dracut 이 실제 루트로 넘어가기(switch_root) 직전에 셸을 준다. 이
+          시점의 실제 루트는 /sysroot 에 읽기 전용으로 붙어 있고 systemd 는 아직 뜨지
+          않았다. 그래서 root 암호를 묻지 않는다. 대신 SELinux 정책도 아직 올라오지
+          않아 이때 새로 쓴 /etc/shadow 에는 보안 레이블이 붙지 않는다. 기본 상태
+          (enforcing)를 그대로 둔 서버라 다음 부팅에서 전체 레이블을 다시 붙이는
+          /.autorelabel 이 필요하다 (본문 20.5)
+ 소요   : 약 30분
+ 선행   : pre-break 스냅샷. 직렬 콘솔 캡처 설정(console=ttyS0,115200)이 기준 상태에 있다
+ 계정   : root
+ 주의   : root 암호를 한 번 임의 값으로 바꾼다(분실 상황 흉내). 끝에서 oracle 로 되돌린다
+ 되돌림 : root 암호 oracle, /.autorelabel 없음 → SSH 로 root/oracle 접속,
+          ls -Z /etc/shadow 의 형식이 [0] 과 같음
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- shadow 의 root 줄에서 해시 앞부분만 본다.
+-- cut -c1-24 로 24자에서 잘랐다.
+-- 해시 전체를 화면에 남기지 않는다.
+[root@ol7a ~]# grep '^root:' /etc/shadow | cut -c1-24; chage -l root | head -1
+root:$6$5Cdlp2/WVWJJT7nO
+-- 필드는 콜론으로 나뉜다.
+-- 이름 : 해시 : 마지막 변경일 …
+-- $6$ 는 SHA-512 해시.
+-- 다음 $ 까지가 솔트(5Cdlp2/WVWJJT7nO).
+Last password change                                    : never
+-- 설치 때 넣은 암호라 변경일 기록이 never 다.
+-- ls -Z 의 네 번째 열이 보안 레이블이다.
+-- 이 실습은 레이블을 다루지 않는다.
+-- 복구가 맞게 됐는지 보는 기준으로만 쓴다.
+[root@ol7a ~]# ls -Z /etc/shadow; getenforce; ls -la /.autorelabel 2>&1
+----------. root root system_u:object_r:shadow_t:s0    /etc/shadow
+Enforcing
+ls: cannot access /.autorelabel: No such file or directory
+-- 권한 열이 모두 - 다.
+-- 누구에게도 권한이 없고 root 만 예외로 읽는다.
+-- 레이블 열은 system_u:object_r:shadow_t:s0.
+-- 끝의 점(.)은 레이블이 붙은 파일 표시.
+-- 기본 상태 그대로 Enforcing,
+-- /.autorelabel 은 없다.
+-- console=tty0 console=ttyS0,115200 은 랩 콘솔 캡처용 설정이다.
+-- 마지막 console= 이 /dev/console 이 되므로 rd.break 셸이 ttyS0 에 뜬다.
+[root@ol7a ~]# cat /proc/cmdline
+BOOT_IMAGE=/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol-root ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync
+-- 볼 것은 root=/dev/mapper/ol-root ro.
+-- 루트는 처음에 읽기 전용으로 붙는다.
+-- rd.lvm.lv 두 개는 initramfs 가 켤 LV 이름이다.
+
+--------------------------------------------------------------------------------
+ [1] 분실 상황 만들기
+--------------------------------------------------------------------------------
+
+-- 분실 상황을 만든다.
+-- 아무도 모르는 무작위 암호로 바꾼다.
+-- chpasswd 는 표준 입력의 "이름:암호" 를 읽는다.
+-- openssl rand -base64 12 는 12바이트 난수를 글자로 바꾼다.
+-- 화면에 찍지 않는다.
+[root@ol7a ~]# echo "root:$(openssl rand -base64 12)" | chpasswd; grep '^root:' /etc/shadow | cut -c1-24
+root:$6$jtEzHFajLp/$EPWL
+-- 솔트가 jtEzHFajLp/ 로 바뀌었다.
+-- 해시가 새로 쓰였다.
+-- 지금 SSH 세션은 이미 로그인한 상태라 끊기지 않는다.
+-- 직렬 콘솔에서 예전 암호(oracle)로 로그인해 본다.
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+root
+
+Password: 
+
+Login incorrect
+-- Login incorrect.
+-- 이제 아무도 root 암호를 모른다.
+
+ol7a login: 
+
+--------------------------------------------------------------------------------
+ [2] 먼저 emergency 로 들어가 볼까
+--------------------------------------------------------------------------------
+
+-- 3장에서 본 systemd.unit=emergency.target 으로 들어가 보면 어떨까.
+-- GRUB 에서 linux16 줄 끝에 붙여 부팅했다.
+-- 편집 화면은 [3] 과 같아 생략했다.
+-- 아래는 콘솔 출력의 마지막 3줄과 암호 입력 결과다.
+try again to boot into default mode.
+Give root password for maintenance
+(or press Control-D to continue):
+
+
+Login incorrect
+
+Give root password for maintenance
+(or press Control-D to continue): 
+-- emergency 셸 앞에 sulogin 이 root 암호를 묻는다.
+-- 예전 암호 oracle 은 Login incorrect.
+-- Control-D 를 누르면 기본 타깃으로 부팅을 계속할 뿐이다.
+-- rescue.target 도 같은 sulogin 을 쓴다.
+-- 암호를 모르면 두 길 다 막힌다.
+-- 첫 줄(try again to boot …)은 앞부분이 잘린 안내문의 끝이다.
+
+--------------------------------------------------------------------------------
+ [3] GRUB 에서 rd.break 붙이기
+--------------------------------------------------------------------------------
+
+-- sulogin 은 암호를 모르면 지나갈 수 없다.
+-- 전원을 강제로 끈다 (vmrun stop hard).
+-- 다시 켜고 메뉴의 기본 항목에서 e 를 누른다.
+-- 끝까지 내려가 두 줄 위가 linux16 줄이다.
+-- 그 끝에 rd.break 를 붙인다.
+-- 화면은 직렬 콘솔 출력을 80x24 로 재구성한 것이다.
+
+
+
+        set root='hd1,msdos1'                                                  ^
+        if [ x$feature_platform_search_hint = xy ]; then
+          search --no-floppy --fs-uuid --set=root --hint-bios=hd1,msdos1 --hin\
+t-efi=hd1,msdos1 --hint-baremetal=ahci1,msdos1  9e9b6650-ec84-4fa9-b7ec-e54159\
+2b4ecc
+        else
+          search --no-floppy --fs-uuid --set=root 9e9b6650-ec84-4fa9-b7ec-e541\
+592b4ecc
+        fi
+        linux16 /vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol\
+-root ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet conso\
+le=tty0 console=ttyS0,115200 scsi_mod.scan=sync  rd.break
+        initrd16 /initramfs-5.4.17-2136.338.4.2.el7uek.x86_64.img
+-- linux16 줄이 화면 폭(80자)에서 세 줄로 접혔다.
+-- 줄 끝 \ 가 접힘 표시다.
+-- 끝에 rd.break 가 붙었다.
+-- 앞의 공백 두 칸은 원래 줄 끝 공백 때문이다.
+-- 편집은 이번 부팅에만 쓰인다.
+-- grub.cfg 는 바뀌지 않는다.
+
+
+      Press Ctrl-x to start, Ctrl-c for a command prompt or Escape to
+      discard edits and return to the menu. Pressing Tab lists
+      possible completions.
+
+--------------------------------------------------------------------------------
+ [4] initramfs 셸 — switch_root 직전
+--------------------------------------------------------------------------------
+
+-- Ctrl-X 로 부팅한다.
+-- dracut 이 셸을 열 때까지의 마지막 6줄.
+Generating "/run/initramfs/rdsosreport.txt"
+Entering emergency mode. Exit the shell to continue.
+Type "journalctl" to view system logs.
+You might want to save "/run/initramfs/rdsosreport.txt" to a USB stick or /boot
+after mounting them and attach it to a bug report.
+switch_root:/#
+-- 프롬프트 switch_root:/# 가 rd.break 셸이다.
+-- dracut 은 이 셸을 emergency mode 라고 부른다.
+-- root 암호를 묻지 않았다.
+-- rdsosreport.txt 는 dracut 의 진단 자료다.
+-- 장애 보고 때 붙인다.
+-- 지금 / 는 initramfs(메모리)다.
+-- 실제 루트는 /sysroot 에 있다.
+cat /proc/cmdline | tr ' ' '\n' | tail -2
+sh: tail: command not found
+-- initramfs 에는 꼭 필요한 명령만 들어 있다.
+-- tail 이 없다.
+-- 이 셸에서는 cat·mount·ls·chroot 정도만 믿는다.
+switch_root:/# 
+mount | grep -E ' /sysroot | / '
+none on / type rootfs (rw)
+/dev/mapper/ol-root on /sysroot type xfs (ro,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota)
+-- / 는 rootfs(메모리),
+-- 실제 루트 ol-root 는 /sysroot 에 ro 로 붙어 있다.
+-- 옵션의 첫 단어 ro 가 [5] 오류의 원인이다.
+switch_root:/# 
+ls /sysroot
+bin   dev  home  lib64	mnt  proc  run	 srv  tmp  var
+boot  etc  lib	 media	opt  root  sbin  sys  usr
+-- 디스크의 루트 디렉터리가 그대로 보인다.
+switch_root:/# 
+
+--------------------------------------------------------------------------------
+ [5] 오류 흐름 — 읽기 전용 /sysroot 에서 passwd
+--------------------------------------------------------------------------------
+
+-- 바로 chroot 해서 암호를 바꿔 본다.
+-- chroot /sysroot 는 /sysroot 를 / 로 삼는 셸을 연다.
+-- 디스크의 passwd 를 쓰려는 것이다.
+-- passwd --stdin 은 표준 입력에서 새 암호를 읽는다(콘솔 자동화용).
+chroot /sysroot
+sh-4.2# 
+echo oracle | passwd --stdin root
+Changing password for user root.
+passwd: Authentication token manipulation error
+-- 메시지만으로는 원인이 보이지 않는다.
+sh-4.2# 
+touch /etc/x; exit
+touch: cannot touch ‘/etc/x’: Read-only file system
+-- touch 로 확인하니 Read-only file system 이다.
+-- passwd 는 /etc/nshadow 를 만든 뒤 바꿔치기하는데 그 쓰기가 막혔다.
+-- 증상   : "passwd: Authentication token manipulation error"
+-- 원인   : /sysroot 가 ro 로 붙어 있어 /etc/shadow 를 새로 쓸 수 없다(touch 가 Read-only file system)
+-- 조치   : chroot 를 나와 mount -o remount,rw /sysroot 뒤 다시 chroot 해서 passwd
+-- 재확인 : passwd 가 all authentication tokens updated successfully, 해시의 솔트가 바뀜
+exit
+switch_root:/# 
+
+--------------------------------------------------------------------------------
+ [6] /sysroot 를 rw 로 다시 마운트하고 암호 변경
+--------------------------------------------------------------------------------
+
+mount -o remount,rw /sysroot; mount | grep ' /sysroot '
+/dev/mapper/ol-root on /sysroot type xfs (rw,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota)
+-- 옵션 첫 단어가 rw 로 바뀌었다.
+-- 즉시 반영된다.
+switch_root:/# 
+chroot /sysroot
+sh-4.2# 
+echo oracle | passwd --stdin root
+Changing password for user root.
+passwd: all authentication tokens updated successfully.
+-- 이번에는 성공.
+-- 같은 명령, 다른 마운트 상태.
+sh-4.2# 
+grep '^root:' /etc/shadow | cut -c1-24; ls -Z /etc/shadow
+root:$6$TZYpVWOS$h.pP4bw
+---------- root root ?                                /etc/shadow
+-- 솔트가 TZYpVWOS 로 바뀌었다.
+-- 레이블 열이 ? 다.
+-- [0] 의 shadow_t 가 사라졌다.
+-- 정책이 아직 올라오지 않은 시점이라 새 파일에 레이블이 붙지 않았다.
+-- 권한 표시 끝의 점(.)도 없다.
+sh-4.2# 
+
+--------------------------------------------------------------------------------
+ [7] 오류 흐름 — .autorelabel 을 빠뜨리고 부팅
+--------------------------------------------------------------------------------
+
+-- 흔한 실수 그대로 chroot 를 나가고 셸을 나가 부팅을 이어 간다.
+-- 셸을 나가면(exit) dracut 이 switch_root 로 실제 루트에 넘어간다.
+exit
+exit
+switch_root:/# 
+exit
+logout
+[   37.549660] piix4_smbus 0000:00:07.3: SMBus Host Controller not enabled!
+[  OK  ] Started Wait for Plymouth Boot Screen to Quit.
+[  OK  ] Started Terminate Plymouth Boot Screen.
+[  OK  ] Started Getty on tty1.
+[  OK  ] Started Serial Getty on ttyS0.
+[  OK  ] Reached target Login Prompts.
+[  OK  ] Started VDO volume services.
+[  OK  ] Started firewalld - dynamic firewall daemon.
+[  OK  ] Reached target Network (Pre).
+         Starting Network Manager...
+[  OK  ] Started Network Manager.
+         Starting Network Manager Wait Online...
+         Starting Hostname Service...
+[  OK  ] Started Hostname Service.
+         Starting Network Manager Script Dispatcher Service...
+[  OK  ] Started Network Manager Script Dispatcher Service.
+[  OK  ] Started Network Manager Wait Online.
+         Starting LSB: Bring up/down networking...
+[  OK  ] Started LSB: Bring up/down networking.
+[  OK  ] Reached target Network.
+         Starting Postfix Mail Transport Agent...
+         Starting OpenSSH server daemon...
+         Starting Dynamic System Tuning Daemon...
+[  OK  ] Reached target Network is Online.
+         Starting NTP client/server...
+         Starting Notify NFS peers of a restart...
+         Starting LSB: Starts the Spacewalk Daemon...
+         Starting System Logging Service...
+         Starting Crash recovery kernel arming...
+[  OK  ] Started Notify NFS peers of a restart.
+[  OK  ] Started System Logging Service.
+[  OK  ] Started OpenSSH server daemon.
+[  OK  ] Started NTP client/server.
+[  OK  ] Started LSB: Starts the Spacewalk Daemon.
+[  OK  ] Started Postfix Mail Transport Agent.
+[  OK  ] Started Dynamic System Tuning Daemon.
+[  OK  ] Started Crash recovery kernel arming.
+[  OK  ] Reached target Multi-User System.
+         Starting Update UTMP about System Runlevel Changes...
+[  OK  ] Started Update UTMP about System Runlevel Changes.
+-- 부팅은 평소처럼 끝났다. sshd 도 올라왔다.
+-- 겉으로는 아무 문제가 없어 보인다.
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+
+-- 방금 oracle 로 바꾼 암호로 로그인한다.
+root
+
+Password: 
+
+Login incorrect
+-- 암호를 맞게 넣었는데 Login incorrect.
+-- 로그인 프로그램이 레이블 없는 /etc/shadow 를 읽지 못했다.
+-- 증상   : 새 암호(oracle)로 콘솔 로그인 → "Login incorrect"
+-- 원인   : rd.break 단계에서 쓴 /etc/shadow 에 레이블이 없다([6] 의 ls -Z 가 ?)
+-- 조치   : 다시 rd.break → remount,rw → chroot → touch /.autorelabel → 재부팅
+-- 재확인 : 레이블 다시 붙인 뒤 SSH 로 root/oracle 접속, ls -Z 가 shadow_t
+
+ol7a login: 
+
+--------------------------------------------------------------------------------
+ [8] 다시 rd.break — 이번에는 .autorelabel 까지
+--------------------------------------------------------------------------------
+
+-- 전원을 강제로 끄고 [3] 과 같은 키로 rd.break 를 붙였다. 화면은 생략.
+-- 셸이 열릴 때까지의 마지막 2줄.
+after mounting them and attach it to a bug report.
+switch_root:/#
+mount -o remount,rw /sysroot
+switch_root:/# 
+chroot /sysroot
+sh-4.2# 
+ls -Z /etc/shadow
+---------- root root ?                                /etc/shadow
+sh-4.2# 
+-- 레이블은 여전히 ?.
+-- 부팅 한 번으로는 저절로 고쳐지지 않는다.
+
+--------------------------------------------------------------------------------
+ [변형] passwd 대신 chpasswd 로 다시 설정
+--------------------------------------------------------------------------------
+
+-- 같은 chroot 안에서 chpasswd 로 한 번 더 바꾼다.
+-- 이름:암호 형식은 [1] 과 같다.
+-- 여러 계정을 한 번에 바꿀 때 쓴다.
+grep '^root:' /etc/shadow | cut -c1-24; echo 'root:oracle' | chpasswd; g 
+rep '^root:' /etc/shadow | cut -c1-24
+-- 명령이 g 와 rep 사이에서 끊겨 보인다.
+-- 콘솔이 80자에서 줄을 바꿔 되돌려 보낸 화면이다.
+-- 실행된 명령은 한 줄이다.
+root:$6$TZYpVWOS$h.pP4bw
+root:$6$AWgmM/HFge5/bU2$
+-- 위가 passwd 의 결과(솔트 8자 TZYpVWOS),
+-- 아래가 chpasswd 결과.
+-- 둘 다 $6$(SHA-512).
+-- chpasswd 쪽 솔트가 16자(AWgmM/HFge5/bU2)로 더 길다.
+-- 형식이 같으니 로그인에는 차이가 없다.
+-- 마지막 값(chpasswd)이 남는다.
+sh-4.2# 
+touch /.autorelabel; ls -la /.autorelabel
+-rw-r--r-- 1 root root 0 Nov 16 18:21 /.autorelabel
+-- 0바이트 빈 파일.
+-- 내용이 아니라 존재가 신호다.
+-- 이 파일도 레이블이 없다(권한 끝에 점이 없다).
+-- 어차피 다음 부팅에 지워진다.
+sh-4.2# 
+exit
+exit
+switch_root:/# 
+exit
+logout
+[   23.254952] piix4_smbus 0000:00:07.3: SMBus Host Controller not enabled!
+[   40.978172] reboot: Restarting system
+-- 셸을 나가자 부팅이 이어지고,
+-- 레이블 작업 뒤 40.98초에 스스로 재부팅했다.
+-- 23초에서 41초 사이,
+-- 약 18초가 걸렸다(파일 수가 적은 랩 VM 이라 짧다).
+-- 콘솔 화면에는 진행 표시가 찍히지 않았다.
+Use the ^ and v keys to change the selection.                       
+-- 다음 긴 줄은 GRUB 메뉴 화면이다.
+-- 직렬 콘솔의 커서 이동 코드를 지우면서 한 줄로 이어졌다.
+-- 5초 카운트다운이 끝나 기본 항목으로 부팅했다(rd.break 없음).
+
+      Press 'e' to edit the selected item, or 'c' for a command prompt.          Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2136.>      Oracle Linux Server 7.9, with Unbreakable Enterprise Kernel 5.4.17-2102.>      Oracle Linux Server 7.9, with Linux 3.10.0-1160.119.1.0.5.el7.x86_64           Oracle Linux Server 7.9, with Linux 3.10.0-1160.el7.x86_64                     Oracle Linux Server 7.9, with Linux 0-rescue-b8658360b45f49fe8174bcd0b61>                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          The selected entry will be started automatically in 5s.                        The selected entry will be started automatically in 4s.                        The selected entry will be started automatically in 3s.                        The selected entry will be started automatically in 2s.                        The selected entry will be started automatically in 1s.                        The selected entry will be started automatically in 0s.                     [    0.538722] integrity: Unable to open file: /etc/keys/x509_ima.der (-2)
+[    1.423738] sd 2:0:1:0: [sdb] Assuming drive cache: write through
+[    1.424653] sd 2:0:0:0: [sda] Assuming drive cache: write through
+[    1.425598] sd 2:0:2:0: [sdc] Assuming drive cache: write through
+[    1.427070] sd 2:0:3:0: [sdd] Assuming drive cache: write through
+[    1.428262] sd 2:0:4:0: [sde] Assuming drive cache: write through
+[    2.433174] piix4_smbus 0000:00:07.3: SMBus Host Controller not enabled!
+-- 재부팅 뒤 두 번째 부팅.
+-- 이번에는 레이블 작업 없이 곧장 로그인 프롬프트까지 왔다.
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+
+--------------------------------------------------------------------------------
+ [9] 레이블 다시 붙이기와 자동 재부팅
+--------------------------------------------------------------------------------
+
+-- 레이블 작업과 자동 재부팅은 위 [변형] 의 마지막 exit 뒤에 이미 지나갔다.
+-- 러너가 그 출력과 로그인 프롬프트를 [변형] 에서 받아서 이 단계에는 새 출력이 없다.
+-- 순서: exit → 부팅 → 전체 레이블 → /.autorelabel 삭제 → reboot → GRUB → 로그인 프롬프트.
+
+
+--------------------------------------------------------------------------------
+ [10] 복구 확인
+--------------------------------------------------------------------------------
+
+-- 러너가 이 SSH 접속을 root/oracle 로 새로 열었다.
+-- 로그인부터 성공이다.
+[root@ol7a ~]# uptime; ls -Z /etc/shadow; ls -la /.autorelabel 2>&1
+ 18:37:29 up 15 min,  0 users,  load average: 0.00, 0.00, 0.00
+----------. root root system_u:object_r:shadow_t:s0    /etc/shadow
+ls: cannot access /.autorelabel: No such file or directory
+-- up 15 min : [3] 의 강제 재시작부터 센 시간이 아니라 마지막 재부팅부터다.
+-- 레이블이 system_u:object_r:shadow_t:s0 으로 돌아왔다.
+-- [0] 과 같다.
+-- /.autorelabel 은 작업이 끝나며 지워졌다.
+[root@ol7a ~]# grep '^root:' /etc/shadow | cut -c1-24; chage -l root | head -1
+root:$6$AWgmM/HFge5/bU2$
+Last password change                                    : Nov 16, 2026
+-- 솔트는 [변형] 의 chpasswd 값 그대로.
+-- 마지막 변경일이 never 에서 오늘로 바뀌었다.
+-- 레이블을 다시 붙인 흔적을 저널에서 찾는다.
+[root@ol7a ~]# journalctl -b -q --no-pager | grep -iE 'relabel' | head -3; ls -la /boot/grub2/grubenv | cut -c1-60
+Nov 16 18:22:25 ol7a.example.com systemd[1]: Relabelled /dev, /run and /sys/fs/cgroup in 5.049ms.
+-rw-r--r--. 1 root root 1024 Nov 11 20:18 /boot/grub2/gruben
+-- 이번 부팅의 저널에는 systemd 가 /dev 등을 다시 레이블한 평소 기록만 있다.
+-- 전체 레이블은 이전 부팅에서 했고,
+-- 7.9 기본 저널은 재부팅하면 지워진다(19장).
+-- grubenv 는 Nov 11 그대로다.
+-- 부팅 항목 선택(saved_entry)은 바뀌지 않았다.
+
+--------------------------------------------------------------------------------
+ [11] 되돌림 확인
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# grep -c . /etc/shadow; getenforce; systemctl is-system-running
+28
+Enforcing
+running
+-- 계정 수 28 그대로,
+-- Enforcing 그대로, 시스템 running.
+-- SELinux 를 끄지 않고 복구를 끝냈다.
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                     시작 전          분실 상태        복구 뒤
+--  root 해시 솔트           5Cdlp2/WVWJ…     jtEzHFajLp/      AWgmM/HFge5/bU2
+--  콘솔 로그인(oracle)      성공             Login incorrect  성공(SSH)
+--  /etc/shadow 레이블       shadow_t         shadow_t         ? → shadow_t
+--  /.autorelabel            없음             -                만듦 → 지워짐
+--  getenforce               Enforcing        Enforcing        Enforcing
+--
+--  시도한 길                결과
+--  systemd.unit=emergency   sulogin 이 root 암호를 물어 막힘
+--  rd.break, ro 상태 passwd  Authentication token manipulation error
+--  rd.break, rw 상태 passwd  성공, 그러나 레이블 ? → 로그인 실패
+--  + /.autorelabel          약 18초 레이블 작업 뒤 자동 재부팅, 로그인 성공
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. rd.break 대신 linux16 줄의 ro 를 rw 로, 끝에 init=/bin/sh 를 붙여 부팅한다.
+--    같은 복구가 되는지, 마지막에 exec /sbin/init 이 왜 필요한지 확인한다.
+-- 2. GRUB 편집 자체를 막으려면 grub2-setpassword 로 GRUB 암호를 건다.
+--    다음 부팅에서 e 를 누르면 무엇을 묻는지 콘솔로 확인한다.
+-- 3. student 계정 암호도 같은 방법으로 바꿔 보고, wheel 그룹의 sudo 로
+--    root 암호를 바꾸는 것과 무엇이 다른지 정리한다.
+
+================================================================================
+ 실습 01 종료 — rd.break 로 root 암호를 바꾸고 .autorelabel 로 로그인까지 복구
+================================================================================

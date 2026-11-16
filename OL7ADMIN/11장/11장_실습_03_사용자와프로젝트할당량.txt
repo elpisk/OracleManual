@@ -1,0 +1,529 @@
+================================================================================
+ 제11장 실습 03 — 사용자와 프로젝트 할당량
+ 대상   : ol7a
+ 목표   : uquota·gquota·pquota 마운트 옵션으로 할당량을 켜고, xfs_quota -x 의
+          limit·report·state 로 사용자·그룹·프로젝트 한도를 건다. /etc/projects 와
+          /etc/projid 로 디렉터리 트리에 프로젝트 할당량을 건다. 루트 파일 시스템은
+          remount 로 켤 수 없어 부트 파라미터 rootflags 가 필요함을 재부팅으로 확인한다
+ 배경   : XFS 할당량은 별도 파일(aquota.user)이 아니라 파일 시스템 메타데이터로
+          관리된다. 켜는 시점은 마운트할 때 하나뿐이다. 사용자·그룹 할당량은
+          소유자 기준이고, 프로젝트 할당량은 소유자와 무관하게 디렉터리 트리 기준이다.
+          quotacheck·quotaon 같은 Ext 용 절차가 없다 (본문 11.6)
+ 소요   : 약 30분 (재부팅 2회 포함)
+ 선행   : storage-clean 스냅샷. student 계정(기준 상태에 있음)
+ 계정   : root, student
+ 주의   : [12] 에서 부트 파라미터를 바꾸고 재부팅한다. 끝에서 원래대로 돌리고
+          한 번 더 재부팅한다. sda(VG ol)는 건드리지 않는다
+ 되돌림 : /etc/fstab·/etc/projects·/etc/projid 원복, 마운트 해제, wipefs,
+          grubby 로 rootflags 제거 후 재부팅. /proc/cmdline 에 rootflags 가 없으면 끝
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+-- 바꿀 파일 세 개(/etc/fstab, /etc/projects, /etc/projid)의 현재 상태를 남긴다.
+-- projects·projid 는 기본으로 없는 파일이다.
+[root@ol7a ~]# cp -p /etc/fstab /root/fstab.orig; grep -v '^#' /etc/fstab | grep -v '^$'; ls -l /etc/projects /etc/projid
+/dev/mapper/ol-root     /                       xfs     defaults        0 0
+UUID=9e9b6650-ec84-4fa9-b7ec-e541592b4ecc /boot                   xfs     defaults        0 0
+/dev/mapper/ol-swap     swap                    swap    defaults        0 0
+ls: cannot access /etc/projects: No such file or directory
+ls: cannot access /etc/projid: No such file or directory
+-- fstab 은 세 줄. 넷째 칸 옵션은 모두 defaults
+-- projects·projid 는 아직 없다
+
+-- 루트 파일 시스템의 마운트 옵션과 할당량 상태.
+-- xfs_quota 의 -x 는 전문가(expert) 모드다. state·limit 같은 관리 명령은 -x 가 있어야 쓴다.
+[root@ol7a ~]# grep ' / ' /proc/mounts; xfs_quota -x -c state /
+/dev/mapper/ol-root / xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+-- 루트 옵션 끝이 noquota
+-- state 출력이 비었다. 켜진 할당량이 없다
+
+-- 부트 파라미터와 할당량 관련 패키지.
+[root@ol7a ~]# cat /proc/cmdline; id student
+BOOT_IMAGE=/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol-root ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync
+uid=1000(student) gid=1000(student) groups=1000(student),10(wheel)
+-- cmdline 에 rootflags 가 없다
+-- student UID 1000, wheel 소속
+[root@ol7a ~]# rpm -q xfsprogs quota || yum -y -q install quota; rpm -q quota
+xfsprogs-5.4.0-1.0.1.el7.x86_64
+quota-4.01-19.el7.x86_64
+-- quota 패키지가 이미 있어 yum 은 돌지 않았다
+-- || 뒤는 실패할 때만 실행된다
+quota-4.01-19.el7.x86_64
+
+--------------------------------------------------------------------------------
+ [1] 옵션 없이 마운트하고 한도 걸기 — 오류 ①
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# mkfs.xfs -q -L xfsq /dev/sdb; mkdir -p /xfsq; mount /dev/sdb /xfsq; grep xfsq /proc/mounts
+/dev/sdb /xfsq xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+
+-- student 에게 블록 한도를 건다.
+--   bsoft / bhard  블록(용량) soft·hard 한도
+[root@ol7a ~]# xfs_quota -x -c 'limit bsoft=40m bhard=50m student' /xfsq; echo "rc=$?"
+xfs_quota: cannot set limits: Function not implemented
+rc=1
+-- 증상   : xfs_quota: cannot set limits: Function not implemented
+-- 원인   : 옵션 없이 마운트해 할당량이 꺼져 있다(noquota)
+-- 조치   : 할당량 옵션을 주고 다시 마운트한다([3])
+-- 재확인 : [6] 의 limit rc=0 과 report
+
+[root@ol7a ~]# xfs_quota -x -c state /xfsq
+-- 꺼진 종류는 state 에 아예 나오지 않는다
+
+--------------------------------------------------------------------------------
+ [2] remount 로 켜 보기
+--------------------------------------------------------------------------------
+
+-- Ext4 는 remount 로 usrquota 를 붙일 수 있다. XFS 에서 같은 방법을 써 본다.
+[root@ol7a ~]# mount -o remount,uquota /xfsq; echo "rc=$?"; grep xfsq /proc/mounts; dmesg | tail -2
+rc=0
+/dev/sdb /xfsq xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+[   12.052627] XFS (sdb): Ending clean mount
+[   12.052644] xfs filesystem being mounted at /xfsq supports timestamps until (%ptR?) (0x7fffffff)
+-- rc=0 이지만 옵션은 여전히 noquota
+-- 오류 없이 무시됐다. rc 만 믿으면 속는다
+-- 2038 년 줄은 v4 형식의 시각 한계 알림
+
+-- 언마운트했다가 옵션을 주고 다시 마운트한다.
+--   uquota  사용자 할당량 계정과 강제(usrquota·quota 와 같은 뜻)
+--   gquota  그룹 할당량(grpquota)
+--   pquota  프로젝트 할당량(prjquota)
+--   uqnoenforce 처럼 noenforce 가 붙으면 사용량만 세고 막지는 않는다
+[root@ol7a ~]# umount /xfsq; mount -o uquota,gquota,pquota /dev/sdb /xfsq; grep xfsq /proc/mounts; dmesg | tail -3
+mount: wrong fs type, bad option, bad superblock on /dev/sdb,
+       missing codepage or helper program, or other error
+
+       In some cases useful info is found in syslog - try
+       dmesg | tail or so.
+[   12.052644] xfs filesystem being mounted at /xfsq supports timestamps until (%ptR?) (0x7fffffff)
+[   12.284914] XFS (sdb): Unmounting Filesystem
+[   12.289987] XFS (sdb): Super block does not support project and group quota together
+-- 증상   : mount 일반 문구 + dmesg 의 Super block does not support
+--          project and group quota together
+-- 원인   : 이 장치는 v4 형식이다([3] 의 V4)
+--          v4 는 그룹·프로젝트가 inode 하나를 나눠 쓴다
+-- 조치   : -m crc=1 로 v5 를 만들어 다시 마운트
+-- 재확인 : /proc/mounts 의 usrquota,prjquota,grpquota
+
+--------------------------------------------------------------------------------
+ [3] v4 형식의 제약과 v5 로 다시 만들기
+--------------------------------------------------------------------------------
+
+-- 이 시스템의 mkfs.xfs 기본값이 어느 형식인지 슈퍼블록으로 본다.
+[root@ol7a ~]# xfs_db -r -c version /dev/sdb
+versionnum [0xb4a4+0x28a] = V4,NLINK,DIRV2,ALIGN,LOGV2,EXTFLG,MOREBITS,ATTR2,LAZYSBCOUNT,PROJID32BIT,FTYPE
+-- 첫 항목 V4. CRC·FINOBT 가 없다
+-- mkfs.xfs 5.4 기본값이 v4 다
+
+-- -m crc=1  v5 형식(메타데이터 체크섬)으로 만든다. 그룹·프로젝트 할당량을 함께 쓸 수 있다.
+[root@ol7a ~]# mkfs.xfs -f -q -m crc=1 -L xfsq /dev/sdb; xfs_db -r -c version /dev/sdb
+versionnum [0xb4a5+0x18a] = V5,NLINK,DIRV2,ALIGN,LOGV2,EXTFLG,MOREBITS,ATTR2,LAZYSBCOUNT,PROJID32BIT,CRC,FTYPE,FINOBT,SPARSE_INODES
+-- V5 로 바뀌고 CRC·FINOBT·SPARSE_INODES 가 붙었다
+[root@ol7a ~]# mount -o uquota,gquota,pquota /dev/sdb /xfsq; echo "rc=$?"; grep xfsq /proc/mounts
+rc=0
+/dev/sdb /xfsq xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota 0 0
+-- uquota 는 usrquota 로 바뀌어 표시된다
+-- 세 종류가 모두 켜졌다
+
+--------------------------------------------------------------------------------
+ [4] xfs_quota state 읽기
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# xfs_quota -x -c state /xfsq
+User quota state on /xfsq (/dev/sdb)
+  Accounting: ON
+  Enforcement: ON
+  Inode: #131 (1 blocks, 1 extents)
+Group quota state on /xfsq (/dev/sdb)
+  Accounting: ON
+  Enforcement: ON
+  Inode: #132 (1 blocks, 1 extents)
+Project quota state on /xfsq (/dev/sdb)
+  Accounting: ON
+  Enforcement: ON
+  Inode: #133 (1 blocks, 1 extents)
+Blocks grace time: [7 days]
+Inodes grace time: [7 days]
+Realtime Blocks grace time: [7 days]
+-- 종류마다 세 줄
+--   Accounting  사용량 기록
+--   Enforcement 한도 강제
+--   Inode #131~133  할당량 정보를 담은 inode
+-- 할당량 정보가 파일 시스템 안에 있다
+--   aquota.user 같은 파일이 없다
+--   quotacheck·quotaon 도 필요 없다
+-- 유예 기간 기본값은 7 days
+
+--------------------------------------------------------------------------------
+ [5] /etc/fstab 에 넣기
+--------------------------------------------------------------------------------
+
+-- 재부팅 뒤에도 할당량이 켜진 채 마운트되도록 fstab 에 옵션을 적는다.
+-- 장치는 레이블로 지정한다. nofail 은 이 장치가 없거나 마운트에 실패해도 부팅을 멈추지 않게 한다.
+[root@ol7a ~]# echo 'LABEL=xfsq  /xfsq  xfs  defaults,nofail,uquota,gquota,pquota  0 0' >> /etc/fstab; diff /root/fstab.orig /etc/fstab
+11a12
+> LABEL=xfsq  /xfsq  xfs  defaults,nofail,uquota,gquota,pquota  0 0
+-- diff: 12번째 줄이 새로 붙었다
+[root@ol7a ~]# umount /xfsq; mount -a; findmnt /xfsq
+TARGET SOURCE   FSTYPE OPTIONS
+/xfsq  /dev/sdb xfs    rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+-- mount -a 가 fstab 의 옵션으로 붙였다
+-- nofail 은 OPTIONS 에 나타나지 않는다
+--   systemd·mount 가 쓰는 옵션이다
+
+--------------------------------------------------------------------------------
+ [6] 사용자 한도
+--------------------------------------------------------------------------------
+
+-- 이번에는 블록과 inode(파일 수) 한도를 모두 건다.
+--   isoft / ihard  inode 개수 soft·hard 한도
+[root@ol7a ~]# xfs_quota -x -c 'limit bsoft=40m bhard=50m isoft=200 ihard=250 student' /xfsq; echo "rc=$?"
+rc=0
+-- 이제 limit 이 성공한다
+--   bsoft 40m · bhard 50m
+--   isoft 200 · ihard 250
+[root@ol7a ~]# mkdir /xfsq/pub; chmod 1777 /xfsq/pub; xfs_quota -x -c 'report -h' /xfsq
+User quota on /xfsq (/dev/sdb)
+                        Blocks              
+User ID      Used   Soft   Hard Warn/Grace   
+---------- --------------------------------- 
+root            0      0      0  00 [------]
+student         0    40M    50M  00 [------]
+
+Group quota on /xfsq (/dev/sdb)
+                        Blocks              
+Group ID     Used   Soft   Hard Warn/Grace   
+---------- --------------------------------- 
+root            0      0      0  00 [------]
+
+Project quota on /xfsq (/dev/sdb)
+                        Blocks              
+Project ID   Used   Soft   Hard Warn/Grace   
+---------- --------------------------------- 
+#0              0      0      0  00 [------]
+-- report -h 는 켜진 종류를 모두 보인다
+-- 열: ID · Used · Soft · Hard · Warn/Grace
+--   Warn 00  경고 횟수
+--   [------] 유예 시계 없음
+-- 한도가 0 이면 제한 없음
+-- 프로젝트 #0 은 프로젝트 밖 파일
+
+-- student 가 파일을 쓴다. 사용량이 바로 잡히는지 본다.
+[student@ol7a ~]$ dd if=/dev/zero of=/xfsq/pub/s1.dat bs=1M count=12 2>&1 | tail -1; touch /xfsq/pub/t{1..9}
+12582912 bytes (13 MB) copied, 0.00527513 s, 2.4 GB/s
+[root@ol7a ~]# xfs_quota -x -c 'report -u -bih' /xfsq
+User quota on /xfsq (/dev/sdb)
+                        Blocks                            Inodes              
+User ID      Used   Soft   Hard Warn/Grace     Used   Soft   Hard Warn/Grace  
+---------- --------------------------------- --------------------------------- 
+root            0      0      0  00 [------]      4      0      0  00 [------]
+student       12M    40M    50M  00 [------]     10    200    250  00 [------]
+-- -b 블록, -i inode 를 나란히 보였다
+-- student: 12M, 파일 10개(dd 1 + touch 9)
+-- root 의 inode 4 는 디렉터리 등
+
+-- student 자신은 -x 없이 자기 사용량만 본다.
+[student@ol7a ~]$ xfs_quota -c 'quota -h' /xfsq; quota -s
+Disk quotas for User student (1000)
+Filesystem   Blocks  Quota  Limit Warn/Time    Mounted on
+/dev/sdb        12M    40M    50M  00 [------] /xfsq
+Disk quotas for user student (uid 1000): 
+     Filesystem   space   quota   limit   grace   files   quota   limit   grace
+       /dev/sdb  12288K  40960K  51200K              10     200     250        
+-- xfs_quota quota: 일반 모드라 자기 줄만
+-- quota -s: Ext 용 도구도 XFS 를 읽는다
+--   space 12288K = 12M, files 10
+
+--------------------------------------------------------------------------------
+ [7] 그룹 한도
+--------------------------------------------------------------------------------
+
+-- 그룹 한도는 limit 에 -g 를 붙인다. 파일의 그룹 소유자 기준으로 센다.
+[root@ol7a ~]# xfs_quota -x -c 'limit -g bhard=100m student' /xfsq; xfs_quota -x -c 'report -g -h' /xfsq
+Group quota on /xfsq (/dev/sdb)
+                        Blocks              
+Group ID     Used   Soft   Hard Warn/Grace   
+---------- --------------------------------- 
+root            0      0      0  00 [------]
+student       12M      0   100M  00 [------]
+-- 그룹 student 도 12M. 파일 그룹이 student
+-- 사용자·그룹이 같은 파일을 각각 센다
+-- 둘 중 먼저 닿는 한도가 막는다
+
+--------------------------------------------------------------------------------
+ [8] 프로젝트 정의 — /etc/projects 와 /etc/projid
+--------------------------------------------------------------------------------
+
+-- 프로젝트는 "ID:디렉터리" 와 "이름:ID" 두 파일로 정의한다.
+--   /etc/projects  프로젝트 ID 와 관리할 디렉터리 트리
+--   /etc/projid    프로젝트 이름과 ID 대응
+[root@ol7a ~]# mkdir -p /xfsq/oradata /xfsq/applog
+[root@ol7a ~]# echo '51:/xfsq/oradata' >> /etc/projects; echo '52:/xfsq/applog' >> /etc/projects
+[root@ol7a ~]# echo 'oradata:51' >> /etc/projid; echo 'applog:52' >> /etc/projid; cat /etc/projects /etc/projid
+-- ID 51·52, 이름 oradata·applog
+51:/xfsq/oradata
+52:/xfsq/applog
+oradata:51
+applog:52
+
+-- project -s 는 디렉터리 트리의 모든 파일과 디렉터리에 프로젝트 ID 를 새기고
+-- 상속 플래그를 켠다. 이 단계를 빼면 디렉터리는 프로젝트에 속하지 않는다.
+[root@ol7a ~]# cp -a /etc/sysconfig /xfsq/applog/; xfs_quota -x -c 'project -s applog' /xfsq; xfs_quota -x -c 'project -s oradata' /xfsq
+xfs_quota: skipping special file /xfsq/applog/sysconfig/network-scripts/ifdown
+xfs_quota: skipping special file /xfsq/applog/sysconfig/network-scripts/ifdown-isdn
+xfs_quota: skipping special file /xfsq/applog/sysconfig/network-scripts/ifup
+xfs_quota: skipping special file /xfsq/applog/sysconfig/network-scripts/ifup-isdn
+xfs_quota: skipping special file /xfsq/applog/sysconfig/grub
+xfs_quota: skipping special file /xfsq/applog/sysconfig/selinux
+Setting up project applog (path /xfsq/applog)...
+Processed 1 (/etc/projects and cmdline) paths for project applog with recursion depth infinite (-1).
+Setting up project oradata (path /xfsq/oradata)...
+Processed 1 (/etc/projects and cmdline) paths for project oradata with recursion depth infinite (-1).
+-- skipping special file: 심볼릭 링크는 건너뛴다
+-- 두 프로젝트 모두 Processed 1 paths
+
+--------------------------------------------------------------------------------
+ [9] 프로젝트 한도와 report
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# xfs_quota -x -c 'limit -p bsoft=800m bhard=1g oradata' /xfsq; xfs_quota -x -c 'limit -p bhard=200m applog' /xfsq
+[root@ol7a ~]# xfs_quota -x -c 'report -p -h' /xfsq
+Project quota on /xfsq (/dev/sdb)
+                        Blocks              
+Project ID   Used   Soft   Hard Warn/Grace   
+---------- --------------------------------- 
+#0            12M      0      0  00 [------]
+oradata         0   800M     1G  00 [------]
+applog       392K      0   200M  00 [------]
+-- 프로젝트 이름으로 보인다(projid 덕분)
+-- applog 는 복사한 sysconfig 392K
+-- #0 12M 은 pub 의 student 파일
+
+-- project -c 는 트리의 모든 항목이 프로젝트 ID 를 제대로 갖고 있는지 검사만 한다.
+[root@ol7a ~]# xfs_quota -x -c 'project -c applog' /xfsq; echo "rc=$?"
+xfs_quota: skipping special file /xfsq/applog/sysconfig/network-scripts/ifdown
+xfs_quota: skipping special file /xfsq/applog/sysconfig/network-scripts/ifdown-isdn
+xfs_quota: skipping special file /xfsq/applog/sysconfig/network-scripts/ifup
+xfs_quota: skipping special file /xfsq/applog/sysconfig/network-scripts/ifup-isdn
+xfs_quota: skipping special file /xfsq/applog/sysconfig/grub
+xfs_quota: skipping special file /xfsq/applog/sysconfig/selinux
+Checking project applog (path /xfsq/applog)...
+Processed 1 (/etc/projects and cmdline) paths for project applog with recursion depth infinite (-1).
+rc=0
+-- 검사만 하고 바꾸지 않는다
+
+-- 파일에 새겨진 프로젝트 ID 는 lsattr 가 아니라 xfs_io 의 stat 이나 lsproj 류로 본다.
+-- 7.9 의 xfs_io 로 디렉터리 속성(fsxattr)을 읽는다.
+[root@ol7a ~]# xfs_io -r -c stat /xfsq/oradata | grep -E 'projid|xflags'; touch /xfsq/oradata/new.dbf; xfs_io -r -c stat /xfsq/oradata/new.dbf | grep projid
+fsxattr.xflags = 0x80000200 [--------P-------X]
+fsxattr.projid = 51
+-- xflags P = 프로젝트 상속(PROJINHERIT)
+-- 새 파일 new.dbf 도 projid 51 을 받았다
+-- X 는 확장 속성 있음 표시
+--   SELinux 레이블이 들어 있다
+fsxattr.projid = 51
+
+--------------------------------------------------------------------------------
+ [10] df 가 프로젝트 한도를 크기로 보인다
+--------------------------------------------------------------------------------
+
+-- 프로젝트 할당량이 강제되는 디렉터리에서 df 를 치면 파일 시스템 전체 크기가 아니라
+-- 프로젝트 hard 한도를 크기로 보여 준다.
+[root@ol7a ~]# df -h /xfsq /xfsq/oradata /xfsq/applog /xfsq/pub
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb         10G   57M   10G   1% /xfsq
+/dev/sdb        800M     0  800M   0% /xfsq
+/dev/sdb        200M  392K  200M   1% /xfsq
+/dev/sdb         10G   57M   10G   1% /xfsq
+-- oradata 는 800M, applog 는 200M 로 보인다
+--   Size 에 soft(있으면) 또는 hard 한도
+-- pub 는 프로젝트 밖이라 10G 전체
+-- Mounted on 은 모두 /xfsq
+
+-- xfs_quota 의 df 명령은 같은 정보를 파일 시스템 단위로 보인다.
+[root@ol7a ~]# xfs_quota -c 'df -h' /xfsq
+Filesystem     Size   Used  Avail Use% Pathname
+/dev/sdb      10.0G  56.2M   9.9G   1% /xfsq
+/dev/sdb       800M      0   800M   0% /xfsq/oradata
+/dev/sdb      10.0G   392K   9.9G   0% /xfsq/applog
+-- 경로별로 한 줄. applog 는 10.0G
+--   xfs_quota df 는 hard 만 반영했다
+--   oradata 는 soft 800M 이 Size
+
+--------------------------------------------------------------------------------
+ [11] 한도 풀기
+--------------------------------------------------------------------------------
+
+-- 한도를 0 으로 주면 제한 없음이다. applog 의 한도를 푼다.
+[root@ol7a ~]# xfs_quota -x -c 'limit -p bsoft=0 bhard=0 applog' /xfsq; xfs_quota -x -c 'report -p -h' /xfsq; df -h /xfsq/applog
+Project quota on /xfsq (/dev/sdb)
+                        Blocks              
+Project ID   Used   Soft   Hard Warn/Grace   
+---------- --------------------------------- 
+#0            12M      0      0  00 [------]
+oradata         0   800M     1G  00 [------]
+applog       392K      0      0  00 [------]
+
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sdb         10G   57M   10G   1% /xfsq
+-- 한도 0 → applog 의 Size 가 10G 로 돌아왔다
+-- 재마운트 없이 바로 반영된다
+-- 한도를 바꿔도 사용량 392K 는 그대로
+
+--------------------------------------------------------------------------------
+ [12] 루트 파일 시스템의 할당량 — 오류 ②
+--------------------------------------------------------------------------------
+
+-- /home 이 따로 없는 이 VM 에서 사용자 할당량을 걸려면 루트(/)에 켜야 한다.
+-- [2] 와 같은 방법을 / 에 써 본다.
+[root@ol7a ~]# mount -o remount,uquota /; echo "rc=$?"; grep ' / ' /proc/mounts; xfs_quota -x -c state / | head -3
+rc=0
+/dev/mapper/ol-root / xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+xfs_quota: cannot find mount point for path `/xfsq/oradata': No such file or directory
+xfs_quota: cannot find mount point for path `/xfsq/applog': No such file or directory
+-- remount 는 rc=0, 옵션은 noquota 그대로
+-- xfs_quota 경고 두 줄은 /etc/projects 탓
+--   / 에 없는 경로를 찾다가 낸 메시지
+-- state 가 / 를 보여 주지 않는다. 꺼져 있다
+
+-- 루트는 initramfs 가 부팅 초기에 마운트한다. 그때 쓸 옵션은 부트 파라미터
+-- rootflags= 로 넘긴다. grubby 로 기본 커널 항목에만 인자를 붙인다.
+[root@ol7a ~]# grubby --default-kernel; grubby --update-kernel=DEFAULT --args="rootflags=uquota"; grubby --info=DEFAULT | grep -E '^kernel|^args'
+-- args 끝에 rootflags=uquota 가 붙었다
+-- 기본 커널(UEK 2136) 한 항목만 바꿨다
+/boot/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+kernel=/boot/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64
+args="ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync rootflags=uquota"
+
+-- 재부팅한다.
+[root@ol7a ~]# cat /proc/cmdline; grep ' / ' /proc/mounts
+BOOT_IMAGE=/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol-root ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync rootflags=uquota
+/dev/mapper/ol-root / xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,usrquota 0 0
+-- cmdline 끝에 rootflags=uquota
+-- 루트 옵션이 noquota → usrquota
+[root@ol7a ~]# xfs_quota -x -c state / | head -6; xfs_quota -x -c 'report -h' / | head -8
+xfs_quota: cannot find mount point for path `/xfsq/oradata': No such file or directory
+xfs_quota: cannot find mount point for path `/xfsq/applog': No such file or directory
+User quota state on / (/dev/mapper/ol-root)
+  Accounting: ON
+  Enforcement: ON
+  Inode: #346 (5 blocks, 5 extents)
+Group quota state on / (/dev/mapper/ol-root)
+  Accounting: OFF
+xfs_quota: cannot find mount point for path `/xfsq/oradata': No such file or directory
+xfs_quota: cannot find mount point for path `/xfsq/applog': No such file or directory
+User quota on / (/dev/mapper/ol-root)
+                        Blocks              
+User ID      Used   Soft   Hard Warn/Grace   
+---------- --------------------------------- 
+root         4.3G      0      0  00 [------]
+rpcuser         0      0      0  00 [------]
+rpc             0      0      0  00 [------]
+tss            8K      0      0  00 [------]
+-- 증상   : remount,uquota / 는 rc=0 인데 noquota 그대로
+-- 원인   : 루트는 initramfs 가 첫 마운트를 한다
+--          그 뒤의 remount 는 할당량 옵션을 무시한다
+-- 조치   : grubby --args="rootflags=uquota" 후 재부팅
+-- 재확인 : /proc/mounts 의 usrquota, state 의 ON
+-- 그룹은 켜지 않아 OFF
+-- report 는 head -8 로 앞 네 사용자만 잘랐다
+
+-- [5] 에서 fstab 에 넣은 /xfsq 도 재부팅 뒤 할당량이 켜진 채 올라왔는지 본다.
+[root@ol7a ~]# findmnt -o TARGET,OPTIONS /xfsq; xfs_quota -x -c 'report -p -h' /xfsq | head -6
+TARGET OPTIONS
+/xfsq  rw,relatime,seclabel,attr2,inode64,logbufs=8,logbsize=32k,usrquota,prjquota,grpquota
+Project quota on /xfsq (/dev/sdb)
+                        Blocks              
+Project ID   Used   Soft   Hard Warn/Grace   
+---------- --------------------------------- 
+#0            12M      0      0  00 [------]
+oradata         0   800M     1G  00 [------]
+-- 재부팅 뒤에도 /xfsq 가 옵션대로 올라왔다
+-- 프로젝트 한도도 그대로 남았다
+
+--------------------------------------------------------------------------------
+ [변형] setquota·repquota 로 같은 일 하기
+--------------------------------------------------------------------------------
+
+-- quota 패키지의 명령도 XFS 를 다룬다. 내부에서 XFS 할당량 인터페이스를 부른다.
+-- setquota -u 사용자 블록soft 블록hard inodesoft inodehard 마운트지점 (블록 단위는 KB)
+[root@ol7a ~]# setquota -u student 20000 30000 0 0 /xfsq; echo "rc=$?"
+rc=0
+-- setquota 숫자는 KB. 20000·30000
+[root@ol7a ~]# repquota -s /xfsq | tail -n +2; xfs_quota -x -c 'report -u -h' /xfsq
+Block grace time: 7days; Inode grace time: 7days
+                        Space limits                File limits
+User            used    soft    hard  grace    used  soft  hard  grace
+----------------------------------------------------------------------
+root      --    392K      0K      0K             92     0     0       
+student   --  12288K  20000K  30000K             10     0     0       
+
+User quota on /xfsq (/dev/sdb)
+                        Blocks              
+User ID      Used   Soft   Hard Warn/Grace   
+---------- --------------------------------- 
+root         392K      0      0  00 [------]
+student       12M  19.5M  29.3M  00 [------]
+-- repquota 의 보고서 제목 줄은 tail -n +2 로 뺐다
+-- repquota: Ext 형식 보고서. 유예 7days
+--   -- 는 블록·inode 모두 한도 안
+-- xfs_quota: 같은 값이 MiB 로 19.5M·29.3M
+-- 두 도구가 같은 한도를 읽는다
+
+--------------------------------------------------------------------------------
+ [13] 되돌림
+--------------------------------------------------------------------------------
+
+-- rootflags 를 빼고 fstab·프로젝트 파일을 원래대로 돌린 뒤 다시 재부팅한다.
+[root@ol7a ~]# grubby --update-kernel=DEFAULT --remove-args="rootflags=uquota"; grubby --info=DEFAULT | grep -E '^args'
+args="ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync"
+-- rootflags 가 빠졌다
+[root@ol7a ~]# umount /xfsq; cp -p /root/fstab.orig /etc/fstab; rm -f /etc/projects /etc/projid /root/fstab.orig; wipefs -a /dev/sdb >/dev/null; rmdir /xfsq
+-- (재부팅)
+[root@ol7a ~]# cat /proc/cmdline; grep ' / ' /proc/mounts; xfs_quota -x -c state / | head -3
+BOOT_IMAGE=/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol-root ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync
+/dev/mapper/ol-root / xfs rw,seclabel,relatime,attr2,inode64,logbufs=8,logbsize=32k,noquota 0 0
+-- cmdline·루트 옵션이 [0] 과 같다
+[root@ol7a ~]# lsblk -f /dev/sdb; ls -l /etc/projects /etc/projid; grep -c xfsq /etc/fstab
+NAME FSTYPE LABEL UUID MOUNTPOINT
+sdb                    
+ls: cannot access /etc/projects: No such file or directory
+ls: cannot access /etc/projid: No such file or directory
+0
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                시작 전   변경 후               되돌린 뒤
+--  /xfsq 형식          -         v4 → v5(crc=1)        -
+--  /xfsq 옵션          -         usr·prj·grpquota      -
+--  student 한도        -         40M/50M → 20M/30M     -
+--  프로젝트            없음      oradata 51, applog 52 없음
+--  / 옵션              noquota   usrquota              noquota
+--  cmdline rootflags   없음      rootflags=uquota      없음
+--  fstab xfsq 줄       0         1                     0
+-- remount 는 두 번 모두 rc=0 이면서 아무것도 켜지 않았다
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 0. 이 실습에서 rc 를 믿을 수 없었던 곳
+--    [2] remount,uquota /xfsq → rc=0, noquota
+--    [12] remount,uquota /    → rc=0, noquota
+--    확인은 언제나 /proc/mounts 와 state 로
+
+-- 1. uqnoenforce 로 마운트하고 한도를 넘게 써 본다. 쓰기는 성공하고 report 에만
+--    초과가 보이는지 확인한다.
+--    확인: report 의 Used 가 Hard 를 넘는지, dd 가 실패하지 않는지
+-- 2. /xfsq/oradata 아래 파일을 mv 로 /xfsq/pub 로 옮겼다가 다시 가져와 본다.
+--    프로젝트 ID 는 어떻게 되는가.
+--    확인: xfs_io -r -c stat 의 fsxattr.projid
+-- 3. rootflags=uquota,pquota 로 루트에 프로젝트 할당량을 켜고 /var/log 를 프로젝트로 묶는다.
+--    확인: df -h /var/log 의 Size 열
+
+================================================================================
+ 실습 03 종료 — v4 는 그룹+프로젝트 불가, 루트는 rootflags 로만
+================================================================================

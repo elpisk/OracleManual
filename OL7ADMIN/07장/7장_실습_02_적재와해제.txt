@@ -1,0 +1,486 @@
+================================================================================
+ 제7장 실습 02 — 모듈 적재와 해제: modprobe·insmod·rmmod·depmod
+ 대상   : ol7a
+ 목표   : modprobe 가 modules.dep 를 따라 의존 모듈까지 함께 적재·해제하는 것을
+          -v 출력으로 확인하고, 의존성을 풀지 않는 insmod 가 어떻게 실패하는지,
+          사용 중인 모듈의 해제가 왜 거부되는지 본다. depmod 를 다시 돌려
+          modules.dep 가 무엇으로 만들어지는지도 확인한다
+ 배경   : vfat 은 fat 이 내보내는 함수(심벌)를 쓰므로 fat 이 먼저 있어야 올라간다.
+          modprobe 는 이 순서를 modules.dep 에서 읽어 알아서 맞추고, insmod 는 파일
+          하나만 커널에 넘긴다. 모듈을 쓰는 것(마운트된 파일 시스템, 다른 모듈)이
+          남아 있으면 참조 수가 0 이 아니라 해제가 거부된다(본문 7.3)
+ 소요   : 약 25분
+ 선행   : ol7-base 스냅샷. vfat·fat 이 적재되지 않은 상태
+ 계정   : root
+ 주의   : 해제 실험은 vfat·fat·isofs 만 쓴다. 디스크·NIC 드라이버(mptspi, e1000)는
+          건드리지 않는다 — 해제되면 SSH 가 끊기고 루트 파일 시스템을 잃는다
+ 되돌림 : vfat·fat 미적재, /root/m07 삭제, /mnt 마운트 없음. lsmod 줄 수가 [0] 과 같음
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+[root@ol7a ~]# uname -r; lsmod | wc -l
+5.4.17-2136.338.4.2.el7uek.x86_64
+73
+
+-- 기준 커널 UEK 5.4.17-2136.338.4.2, lsmod 73 줄(머리글 1 + 모듈 72)
+-- 이 실습은 여러 모듈을 올렸다 내린다. 마지막 [되돌림] 에서 같은 73 이 나와야 한다
+
+-- 실험할 모듈이 적재돼 있지 않은지 본다. grep -w : 단어 단위로만 일치
+[root@ol7a ~]# lsmod | grep -w -E 'vfat|fat|isofs'; echo "rc=$?"
+rc=1
+
+-- grep -w -E 'vfat|fat|isofs' 결과 없음, rc=1. 세 모듈 모두 적재돼 있지 않다
+-- grep 의 종료 코드: 0 = 찾음, 1 = 못 찾음, 2 = 오류. 이 실습 내내 rc 로 있고 없음을 판정한다
+-- -w 가 없으면 vfat 을 찾을 때 fat 도 걸리고, fat 을 찾을 때 vfat 도 걸린다. 이름이 겹치는 모듈은 -w 로 묶는다
+
+-- 마운트 지점 /mnt 가 비어 있는지. findmnt 는 마운트돼 있지 않으면 아무것도 출력하지 않는다.
+[root@ol7a ~]# findmnt /mnt; echo "rc=$?"; ls /mnt
+rc=1
+hgfs
+
+-- findmnt /mnt 출력 없음, rc=1 → /mnt 에 마운트된 것이 없다
+-- ls /mnt 에 보이는 hgfs 는 open-vm-tools 가 만든 빈 디렉터리다. 마운트 지점으로 쓰는 데 지장 없다
+
+--------------------------------------------------------------------------------
+ [1] 적재 전에 의존성 미리 보기
+--------------------------------------------------------------------------------
+-- --show-depends : 적재 없이 modprobe 가 실행할 insmod 순서만 출력
+[root@ol7a ~]# modprobe --show-depends vfat
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/fat.ko.xz 
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/vfat.ko.xz 
+
+-- insmod 두 줄. 위에서 아래 순서가 실제 적재 순서다: fat 먼저, vfat 나중
+-- 경로는 모두 /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/ 아래, 확장자 .ko.xz
+-- --show-depends 는 커널에 아무것도 넣지 않는다. 적재 전에 무엇이 함께 올라갈지 보는 용도다
+-- 줄 끝의 공백은 insmod 뒤에 붙을 인자 자리다. 지금은 options 가 없어 비어 있다
+-- 운영 서버에서 낯선 드라이버를 올리기 전에 이 출력부터 본다. 예상하지 못한 모듈이 딸려 오는지 확인한다
+
+-- 같은 정보의 원본은 modules.dep 의 한 줄이다.
+[root@ol7a ~]# grep 'vfat.ko' /lib/modules/$(uname -r)/modules.dep
+kernel/fs/fat/vfat.ko.xz: kernel/fs/fat/fat.ko.xz
+
+-- modules.dep 한 줄의 형식: "모듈 경로: 의존 모듈 경로 …". 경로는 모듈 디렉터리 기준 상대 경로
+-- vfat 줄 오른쪽에 fat 하나. --show-depends 가 이 줄을 읽어 순서를 정했다
+
+-- modinfo 의 depends 필드도 같은 이름을 준다(경로가 아니라 모듈 이름).
+[root@ol7a ~]# modinfo -F depends vfat; modinfo -F depends fat
+fat
+
+-- 첫 줄 fat 은 vfat 의 depends. fat 의 depends 는 빈 값이라 출력이 없다(둘째 줄 없음)
+-- modinfo 는 모듈 이름을, modules.dep 는 파일 경로를 준다. 담긴 관계는 같다
+-- depends 가 빈 모듈은 혼자 올라간다. fat 을 단독으로 modprobe 하면 insmod 한 줄이 나온다
+
+--------------------------------------------------------------------------------
+ [2] modprobe 로 적재 — 의존 모듈이 함께 올라온다
+--------------------------------------------------------------------------------
+-- -v : 실제로 실행하는 insmod 를 한 줄씩 보여 준다
+[root@ol7a ~]# modprobe -v vfat
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/fat.ko.xz 
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/vfat.ko.xz 
+
+-- -v 출력이 [1] 의 --show-depends 와 같은 두 줄. 이번에는 실제로 실행됐다
+
+[root@ol7a ~]# lsmod | grep -w -E 'vfat|fat'
+vfat                   20480  0 
+fat                    73728  1 vfat
+
+-- 열: Module · Size(바이트) · Used by
+--   vfat  20480  0       → 아무도 vfat 을 쓰지 않는다
+--   fat   73728  1 vfat  → 참조 1, 쓰는 모듈 vfat
+-- Size 는 커널 메모리에 올라간 크기다. 디스크의 .ko.xz 는 압축돼 있어 이보다 훨씬 작다
+-- 줄 순서는 적재 역순이다. 나중에 올라온 vfat 이 위에 있다
+
+-- 커널 쪽 기록. 파일 시스템 모듈은 적재될 때 /proc/filesystems 에 이름을 등록한다.
+[root@ol7a ~]# grep -E 'fat' /proc/filesystems
+        vfat
+
+-- /proc/filesystems 에 vfat 한 줄이 생겼다. 앞의 공백은 nodev 열이 비었다는 뜻(블록 장치가 필요한 파일 시스템)
+-- fat 은 파일 시스템 이름을 등록하지 않는다. fat 은 vfat·msdos 가 함께 쓰는 공통 코드다
+
+-- 이미 올라간 모듈을 다시 modprobe 하면 아무 일도 없다.
+[root@ol7a ~]# modprobe -v vfat; echo "rc=$?"
+rc=0
+
+-- 이미 올라간 모듈에 modprobe -v 를 다시 쳤다. insmod 줄 없이 rc=0. 아무 일도 하지 않았다
+-- 오류가 아니라 정상이다. 스크립트에서 "없으면 올린다" 를 따로 검사할 필요가 없는 이유다
+-- 다만 같은 이유로 파라미터를 바꿔 다시 부르는 것도 무시된다(실습 03 [7])
+
+--------------------------------------------------------------------------------
+ [3] modprobe -r 로 해제 — 역순으로 내려간다
+--------------------------------------------------------------------------------
+-- -r : 해제. 쓰는 곳이 없어진 의존 모듈도 같이 내린다
+[root@ol7a ~]# modprobe -r -v vfat
+rmmod vfat
+rmmod fat
+
+-- rmmod 두 줄. 적재의 역순으로 vfat 이 먼저, fat 이 나중에 내려갔다
+-- fat 은 vfat 때문에 함께 올라왔고 이제 쓰는 곳이 없으니 같이 내렸다
+
+[root@ol7a ~]# lsmod | grep -w -E 'vfat|fat'; echo "rc=$?"; grep -c fat /proc/filesystems
+rc=1
+0
+
+-- 두 모듈 모두 없음(rc=1), /proc/filesystems 에서 fat 이 들어간 줄 0 개
+-- 파일 시스템 등록은 모듈이 내려가면서 함께 해제됐다
+-- modprobe -r 은 다른 모듈이 아직 쓰는 의존 모듈은 남겨 둔다. 그래서 공용 모듈을 실수로 내리지 않는다
+
+--------------------------------------------------------------------------------
+ [4] 오류 ① — insmod 는 의존성을 풀지 않는다
+--------------------------------------------------------------------------------
+-- insmod 에는 모듈 이름이 아니라 파일 경로를 준다. 경로는 modinfo -n 으로 얻는다.
+[root@ol7a ~]# modinfo -n vfat
+/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/vfat.ko.xz
+
+-- insmod 에 넘길 절대 경로. $(modinfo -n vfat) 로 명령 안에 바로 넣는다
+
+[root@ol7a ~]# dmesg -C; insmod $(modinfo -n vfat); echo "rc=$?"
+insmod: ERROR: could not insert module /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/vfat.ko.xz: Unknown symbol in module
+rc=1
+
+-- 셸 원문: insmod: ERROR: could not insert module …/vfat.ko.xz: Unknown symbol in module, rc=1
+-- 셸 메시지만으로는 어떤 심벌이 없는지 모른다. dmesg 를 본다
+
+[root@ol7a ~]# dmesg | head -20
+[   12.590267] vfat: Unknown symbol fat_dir_empty (err -2)
+[   12.590271] vfat: Unknown symbol fat_time_unix2fat (err -2)
+[   12.590274] vfat: Unknown symbol fat_get_dotdot_entry (err -2)
+[   12.590276] vfat: Unknown symbol fat_free_clusters (err -2)
+[   12.590277] vfat: Unknown symbol fat_setattr (err -2)
+[   12.590284] vfat: Unknown symbol __fat_fs_error (err -2)
+[   12.590286] vfat: Unknown symbol fat_scan (err -2)
+[   12.590291] vfat: Unknown symbol fat_search_long (err -2)
+[   12.590295] vfat: Unknown symbol fat_getattr (err -2)
+[   12.590299] vfat: Unknown symbol fat_attach (err -2)
+[   12.590300] vfat: Unknown symbol fat_update_time (err -2)
+[   12.590302] vfat: Unknown symbol fat_build_inode (err -2)
+[   12.590304] vfat: Unknown symbol fat_fill_super (err -2)
+[   12.590305] vfat: Unknown symbol fat_alloc_new_dir (err -2)
+[   12.590307] vfat: Unknown symbol fat_remove_entries (err -2)
+[   12.590309] vfat: Unknown symbol fat_add_entries (err -2)
+[   12.590310] vfat: Unknown symbol fat_sync_inode (err -2)
+[   12.590313] vfat: Unknown symbol fat_truncate_time (err -2)
+[   12.590316] vfat: Unknown symbol fat_detach (err -2)
+
+-- dmesg 19 줄(head -20 이지만 19 줄뿐). 모두 vfat: Unknown symbol fat_… (err -2)
+-- err -2 는 ENOENT. vfat 이 부르려는 fat_dir_empty, fat_fill_super 같은 함수가 커널에 없었다
+-- 이 함수들은 fat 모듈이 내보낸다(EXPORT_SYMBOL). fat 이 없으니 찾을 곳이 없다
+-- 커널은 심벌을 하나라도 못 찾으면 모듈 전체를 거부한다. 일부만 올라가는 일은 없다
+-- 타임스탬프 [   12.59…] 는 부팅 뒤 경과 초다. dmesg -C 로 비운 뒤라 이 실험의 기록만 남았다
+
+[root@ol7a ~]# lsmod | grep -w vfat; echo "rc=$?"
+rc=1
+
+-- vfat 은 올라가지 않았다
+--
+-- 증상   : insmod $(modinfo -n vfat) 가 'could not insert module … Unknown symbol in module', rc=1
+-- 원인   : insmod 는 modules.dep 를 보지 않는다. vfat 이 쓰는 fat 의 심벌이 커널에 없었다
+--          (dmesg: vfat: Unknown symbol fat_dir_empty (err -2) 등 19 줄)
+-- 조치   : 의존 모듈부터 넣는다 — insmod fat → insmod vfat, 또는 처음부터 modprobe vfat
+-- 재확인 : lsmod 에 vfat 20480 0, fat 73728 1 vfat (아래 명령)
+
+-- 순서를 맞춰 fat 을 먼저 넣으면 insmod 로도 올라간다.
+[root@ol7a ~]# insmod $(modinfo -n fat) && insmod $(modinfo -n vfat) && lsmod | grep -w -E 'vfat|fat'
+vfat                   20480  0 
+fat                    73728  1 vfat
+
+-- 순서만 맞추면 insmod 로도 [2] 와 같은 결과가 나온다
+
+-- rmmod 도 의존성을 보지 않는다. 쓰이는 fat 부터 빼려고 하면 거부된다.
+[root@ol7a ~]# rmmod fat; echo "rc=$?"
+rmmod: ERROR: Module fat is in use by: vfat
+rc=1
+
+-- 원문: rmmod: ERROR: Module fat is in use by: vfat. 쓰는 모듈 이름까지 알려 준다
+-- rmmod 는 의존 관계를 따라 내려가지 않는다. 쓰는 쪽(vfat)을 먼저 내려야 한다
+-- rc=1 이고 fat 은 그대로 남아 있다. 거부는 아무것도 바꾸지 않는다
+
+[root@ol7a ~]# rmmod vfat && rmmod fat && lsmod | grep -w -E 'vfat|fat'; echo "rc=$?"
+rc=1
+
+-- vfat → fat 순서로 내리자 둘 다 사라졌다(마지막 grep rc=1)
+
+--------------------------------------------------------------------------------
+ [5] 사용 중으로 만들기 — vfat 이미지 마운트
+--------------------------------------------------------------------------------
+-- 64MB 짜리 빈 파일을 만들어 vfat 으로 포맷하고 루프 장치로 마운트한다.
+-- dd : if=/dev/zero 를 bs=1M 단위로 count=64 번 복사
+[root@ol7a ~]# mkdir -p /root/m07 && dd if=/dev/zero of=/root/m07/fat.img bs=1M count=64 2>&1 | tail -1
+67108864 bytes (67 MB) copied, 0.0681616 s, 985 MB/s
+
+-- dd 의 마지막 줄만 봤다(tail -1). 67108864 바이트 = 64MiB
+
+[root@ol7a ~]# mkfs.vfat -n M07 /root/m07/fat.img
+mkfs.fat 3.0.20 (12 Jun 2013)
+
+-- mkfs.vfat 은 dosfstools 의 mkfs.fat 이다. -n M07 은 볼륨 이름
+-- 파일 시스템을 만드는 일은 사용자 공간 도구가 하므로 vfat 모듈이 필요 없다. 마운트할 때 필요하다
+
+-- 마운트하면 커널이 vfat 을 필요로 하고, 없으면 스스로 modprobe 를 부른다(request_module).
+[root@ol7a ~]# lsmod | grep -w -E 'vfat|fat|loop'; echo "rc=$?"; mount -o loop /root/m07/fat.img /mnt && findmnt /mnt
+rc=1
+TARGET SOURCE     FSTYPE OPTIONS
+/mnt   /dev/loop0 vfat   rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,errors=remount-ro
+
+-- 마운트 전 grep 결과 없음(rc=1): vfat·fat·loop 모두 없던 상태
+-- findmnt 열: TARGET(마운트 지점) · SOURCE(장치) · FSTYPE · OPTIONS
+-- SOURCE 가 /dev/loop0. -o loop 가 이미지 파일을 루프 장치에 연결했다
+-- modprobe 를 치지 않았는데 마운트가 성공했다. 커널이 fs-vfat 을 스스로 요청했다
+-- OPTIONS 의 codepage=437, iocharset=ascii 는 vfat 의 기본 마운트 옵션이다. 한글 파일 이름이 필요하면 iocharset=utf8 을 준다
+-- 커널의 요청은 /proc/sys/kernel/modprobe 에 적힌 경로(/sbin/modprobe)를 실행하는 방식이다
+
+[root@ol7a ~]# lsmod | grep -w -E 'vfat|fat|loop'
+vfat                   20480  1 
+fat                    73728  1 vfat
+loop                   32768  2 
+
+-- 마운트 한 번으로 모듈 셋이 올라왔다
+--   vfat  Used by 1, 이름 없음 → 마운트 하나가 붙들고 있다
+--   fat   Used by 1 vfat      → vfat 이 쓰고 있다
+--   loop  Used by 2, 이름 없음 → /dev/loop0 장치와 연결된 이미지가 참조를 올렸다
+-- 이름 없는 숫자는 모듈이 아닌 쪽(마운트, 열린 장치)이 만든 참조다
+-- loop 도 -o loop 옵션 때문에 자동으로 올라왔다. 마운트가 /dev/loop-control 을 열어 장치를 받아 갔다
+
+-- 마운트를 붙들고 있는 쪽을 /sys 에서도 본다.
+[root@ol7a ~]# cat /sys/module/vfat/refcnt /sys/module/fat/refcnt; ls /sys/module/fat/holders
+1
+1
+vfat
+
+-- refcnt 는 vfat 1, fat 1. lsmod 의 Used by 숫자와 같은 값이다
+-- holders 디렉터리에는 모듈만 나온다(vfat). 마운트는 holders 에 나타나지 않는다
+
+--------------------------------------------------------------------------------
+ [6] 오류 ② — 사용 중인 모듈 해제 시도
+--------------------------------------------------------------------------------
+[root@ol7a ~]# modprobe -r vfat; echo "rc=$?"
+modprobe: FATAL: Module vfat is in use.
+rc=1
+
+[root@ol7a ~]# rmmod vfat; echo "rc=$?"
+rmmod: ERROR: Module vfat is in use
+rc=1
+
+-- modprobe -r 원문: modprobe: FATAL: Module vfat is in use.
+-- rmmod 원문: rmmod: ERROR: Module vfat is in use. 이번에는 by: 뒤 이름이 없다
+-- 이름이 없다는 것이 단서다. 붙든 쪽이 모듈이 아니다
+-- 메시지 형식이 두 도구에서 조금 다르다. modprobe 는 FATAL, rmmod 는 ERROR 로 시작한다
+
+-- 누가 쓰는지 찾는다. 파일 시스템 모듈은 프로세스가 아니라 마운트가 붙든다.
+[root@ol7a ~]# findmnt -t vfat; losetup -a
+TARGET SOURCE     FSTYPE OPTIONS
+/mnt   /dev/loop0 vfat   rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,errors=remount-ro
+/dev/loop0: [64512]:135056699 (/root/m07/fat.img)
+
+-- findmnt -t vfat : 형식이 vfat 인 마운트만. /mnt 에 /dev/loop0
+-- losetup -a 형식: 장치: [백킹 파일 장치 번호]:inode (파일 경로)
+-- [64512] 는 /root 가 있는 장치(ol-root LV)의 번호, 135056699 는 fat.img 의 inode
+-- 디렉터리를 쓰는 프로세스가 있었다면 umount 가 target is busy 로 실패했을 것이다. 그때는 fuser -vm /mnt 로 찾는다
+
+-- 마운트를 풀면 참조 수가 0 으로 떨어진다. 그다음 해제.
+[root@ol7a ~]# umount /mnt && cat /sys/module/vfat/refcnt && modprobe -r -v vfat
+0
+rmmod vfat
+rmmod fat
+
+-- umount 직후 vfat refcnt 0. 이어서 rmmod vfat, rmmod fat 두 줄로 해제
+
+[root@ol7a ~]# lsmod | grep -w -E 'vfat|fat|loop'; echo "rc=$?"
+loop                   32768  0 
+rc=0
+
+-- vfat·fat 은 사라졌고 loop 만 남았다(Used by 0, rc=0)
+-- umount 가 루프 장치를 자동으로 풀어 loop 참조도 0 이다. loop 는 [되돌림] 에서 내린다
+--
+-- 증상   : modprobe -r vfat → 'modprobe: FATAL: Module vfat is in use.', rmmod vfat → 'Module vfat is in use'
+-- 원인   : /mnt 에 vfat 이미지(/dev/loop0)가 마운트돼 vfat 참조 수가 1. 이름이 없는 참조라
+--          모듈이 아닌 마운트를 의심하고 findmnt -t vfat 으로 찾았다
+-- 조치   : umount /mnt 후 modprobe -r -v vfat
+-- 재확인 : /sys/module/vfat/refcnt 0, rmmod vfat·rmmod fat 출력, lsmod 에 vfat·fat 없음
+
+--------------------------------------------------------------------------------
+ [7] 해제가 아예 안 되는 모듈
+--------------------------------------------------------------------------------
+-- 루트 파일 시스템 xfs 와 그것이 쓰는 libcrc32c. -n(--dry-run) 으로 실제 해제는 하지 않는다.
+-- -n 은 rmmod 를 실행하지 않고 할 일만 출력하므로 안전하다
+[root@ol7a ~]# modprobe -r -n -v libcrc32c; echo "rc=$?"
+modprobe: FATAL: Module libcrc32c is in use.
+rc=1
+
+-- -n(--dry-run) 이어도 참조 수 검사는 한다. 원문: modprobe: FATAL: Module libcrc32c is in use.
+
+[root@ol7a ~]# lsmod | grep -w -E '^xfs|^libcrc32c'
+xfs                  1499136  2 
+libcrc32c              16384  3 nf_conntrack,nf_nat,xfs
+
+-- xfs 는 Used by 2(이름 없음) — / 와 /boot 두 마운트가 붙들고 있다
+-- libcrc32c 는 3 — nf_conntrack, nf_nat, xfs 세 모듈이 쓴다
+-- 이런 모듈은 실행 중에 내릴 방법이 없다. 내리는 순간 루트 파일 시스템을 잃는다
+-- rmmod -f(강제 해제)는 커널이 CONFIG_MODULE_FORCE_UNLOAD 를 켰을 때만 동작하며, 운영에서는 쓰지 않는다
+
+--------------------------------------------------------------------------------
+ [8] depmod — modules.dep 를 다시 만들기
+--------------------------------------------------------------------------------
+-- modules.dep 계열 파일의 현재 시각과 크기를 남긴다.
+[root@ol7a ~]# cd /lib/modules/$(uname -r) && ls -l --time-style=+%F_%T modules.dep modules.dep.bin modules.alias.bin modules.symbols.bin
+-rw-r--r--. 1 root root 992246 2026-11-11_20:17:02 modules.alias.bin
+-rw-r--r--. 1 root root 318167 2026-11-11_20:17:02 modules.dep
+-rw-r--r--. 1 root root 446308 2026-11-11_20:17:02 modules.dep.bin
+-rw-r--r--. 1 root root 552080 2026-11-11_20:17:02 modules.symbols.bin
+
+-- --time-style=+%F_%T 로 시각을 초까지 찍었다. 모두 2026-11-11 20:17:02, 커널 설치 때 만들어진 것
+
+-- depmod -a : 실행 중인 커널의 모든 모듈을 다시 훑어 색인을 새로 쓴다
+[root@ol7a ~]# cp -a /lib/modules/$(uname -r)/modules.dep /root/m07/modules.dep.before && time depmod -a
+real    0m6.252s
+user    0m1.639s
+sys     0m4.440s
+
+-- 실행 중인 커널의 모듈 2,895 개를 훑는 데 real 약 6 초
+-- time 은 bash 의 예약어라 출력이 명령 출력 뒤에 붙었다
+
+[root@ol7a ~]# cd /lib/modules/$(uname -r) && ls -l --time-style=+%F_%T modules.dep modules.dep.bin modules.alias.bin modules.symbols.bin
+-rw-r--r--. 1 root root 992246 2026-11-13_19:40:05 modules.alias.bin
+-rw-r--r--. 1 root root 318167 2026-11-13_19:40:05 modules.dep
+-rw-r--r--. 1 root root 446308 2026-11-13_19:40:05 modules.dep.bin
+-rw-r--r--. 1 root root 552080 2026-11-13_19:40:05 modules.symbols.bin
+
+-- 네 파일 모두 시각만 2026-11-13 19:40:05 로 바뀌고 크기는 그대로(992246, 318167, 446308, 552080)
+
+-- 내용은 같아야 한다. 모듈 파일이 바뀌지 않았으니까.
+[root@ol7a ~]# diff /root/m07/modules.dep.before /lib/modules/$(uname -r)/modules.dep && echo same
+
+-- diff 출력 없음 → same. 모듈 파일이 바뀌지 않았으니 결과도 같다
+-- .ko 를 직접 복사해 넣었을 때는 이 결과가 달라진다. 그래서 그때 depmod -a 를 돌린다
+-- depmod 는 파일 시각만 보면 "새로 만들었다" 는 것만 알 수 있다. 내용 비교는 diff 로 해야 한다
+same
+
+-- vfat 이 fat 에 의존한다는 것은 어디서 왔나 — fat 이 내보내는 심벌을 vfat 이 쓴다.
+[root@ol7a ~]# grep -E ' fat$' /lib/modules/$(uname -r)/modules.symbols 2>/dev/null | head -3; grep -c 'fat$' /lib/modules/$(uname -r)/modules.symbols
+alias symbol:fat_build_inode fat
+alias symbol:fat_dir_empty fat
+alias symbol:fat_free_clusters fat
+20
+
+-- modules.symbols 의 형식: alias symbol:심벌이름 모듈이름
+-- 끝이 fat 인 줄 20 개 = fat 이 내보내는 심벌 수(이름이 fat 으로 끝나는 다른 줄이 섞였을 수 있는 대략값)
+-- [4] 의 dmesg 에 나온 fat_dir_empty, fat_build_inode 가 여기 있다. depmod 는 이 짝을 맞춰 의존을 계산한다
+
+--------------------------------------------------------------------------------
+ [9] 모듈 이름의 밑줄과 하이픈
+--------------------------------------------------------------------------------
+-- modprobe 는 이름 속 - 와 _ 를 같게 본다. 파일 이름(dm-mod.ko.xz)과 lsmod 표기(dm_mod)가 다른 예.
+[root@ol7a ~]# modinfo -n dm-mod; modinfo -n dm_mod; lsmod | grep -E '^dm.mod '; modprobe -n -v dm-mod; echo "rc=$?"
+/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/md/dm-mod.ko.xz
+/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/drivers/md/dm-mod.ko.xz
+dm_mod                135168  8 dm_log,dm_mirror
+rc=0
+
+-- modinfo 에 dm-mod 를 주든 dm_mod 를 주든 같은 파일(dm-mod.ko.xz)을 찾았다
+-- lsmod 에는 밑줄 dm_mod 로 표시된다. 커널은 모듈 이름의 - 를 _ 로 바꿔 등록한다
+-- dm_mod 135168 8 dm_log,dm_mirror: LVM 이 쓰는 device-mapper. 참조 8 중 이름 있는 것은 둘
+-- modprobe -n -v dm-mod 는 이미 적재돼 있어 아무 출력 없이 rc=0
+-- 설정 파일(options, blacklist)에 모듈 이름을 쓸 때도 - 와 _ 어느 쪽이든 통한다
+
+--------------------------------------------------------------------------------
+ [10] 다른 파일 시스템 모듈로 한 번 더 — isofs
+--------------------------------------------------------------------------------
+-- 설치 ISO 가 sr0 에 연결돼 있다. 마운트하면 isofs 가 적재되는지 본다.
+[root@ol7a ~]# lsblk -o NAME,SIZE,TYPE,FSTYPE /dev/sr0; lsmod | grep -w isofs; echo "rc=$?"
+NAME  SIZE TYPE FSTYPE
+sr0   4.5G rom  iso9660
+rc=1
+
+-- sr0 은 4.5G iso9660 — 설치 ISO 가 연결돼 있다. isofs 는 아직 없다(rc=1)
+
+[root@ol7a ~]# mount -o ro /dev/sr0 /mnt && findmnt /mnt && lsmod | grep -w -E 'isofs|cdrom|sr_mod'
+TARGET SOURCE   FSTYPE  OPTIONS
+/mnt   /dev/sr0 iso9660 ro,relatime,nojoliet,check=s,map=n,blocksize=2048,iocharset=utf8
+isofs                  49152  1 
+sr_mod                 24576  1 
+cdrom                  69632  1 sr_mod
+
+-- iso9660 형식 마운트가 isofs 를 끌어올렸다(Used by 1)
+-- sr_mod·cdrom 은 기준 상태부터 있던 CD 드라이브 드라이버다. sr_mod 참조 1 은 열린 /dev/sr0
+-- 형식 이름(iso9660)과 모듈 이름(isofs)이 다르다. 연결은 isofs 의 별칭 fs-iso9660 이 해 준다
+
+[root@ol7a ~]# modprobe -r isofs; echo "rc=$?"; umount /mnt && modprobe -r -v isofs; lsmod | grep -w isofs; echo "rc=$?"
+modprobe: FATAL: Module isofs is in use.
+rc=1
+rmmod isofs
+rc=1
+
+-- 마운트된 동안: modprobe: FATAL: Module isofs is in use., rc=1
+-- umount 뒤: rmmod isofs 한 줄로 해제, 마지막 grep rc=1
+-- vfat 과 같은 규칙이 다른 파일 시스템에도 그대로 적용됐다
+-- ISO 를 마운트한 채 isofs 를 내리려는 상황은 실제로 yum 로컬 저장소(5장)를 쓰다가 생긴다
+
+--------------------------------------------------------------------------------
+ [변형] modprobe 대신 insmod·rmmod 만으로 같은 일을
+--------------------------------------------------------------------------------
+-- [2]·[3] 을 insmod·rmmod 로 옮기면 순서를 사람이 맞춰야 한다.
+-- --show-depends 의 출력이 곧 insmod 순서다. 그대로 따라 한다.
+[root@ol7a ~]# modprobe --show-depends vfat | awk '{print $2}'
+/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/fat.ko.xz
+/lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/vfat.ko.xz
+
+-- awk '{print $2}' 로 insmod 다음 칸(경로)만 뽑았다. 이 목록 순서대로 넣으면 된다
+
+[root@ol7a ~]# for f in $(modprobe --show-depends vfat | awk '{print $2}'); do insmod $f && echo "insmod $f"; done; lsmod | grep -w -E 'vfat|fat'
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/fat.ko.xz
+insmod /lib/modules/5.4.17-2136.338.4.2.el7uek.x86_64/kernel/fs/fat/vfat.ko.xz
+vfat                   20480  0 
+fat                    73728  1 vfat
+
+-- [2] 와 같은 결과(vfat 0, fat 1 vfat). modprobe 가 하던 일을 사람이 그대로 한 것이다
+
+[root@ol7a ~]# rmmod vfat fat; echo "rc=$?"; lsmod | grep -w -E 'vfat|fat'; echo "rc=$?"
+rc=0
+rc=1
+
+-- rmmod vfat fat: 인자 순서대로 내린다. vfat 먼저라 성공(rc=0)
+-- 순서를 바꿔 rmmod fat vfat 으로 쳤다면 fat 에서 is in use by: vfat 이 났을 것이다
+-- 의존 관계가 깊어지면 사람이 순서를 맞추기 어렵다. 그래서 modprobe 를 쓴다
+
+--------------------------------------------------------------------------------
+ [되돌림]
+--------------------------------------------------------------------------------
+[root@ol7a ~]# rm -rf /root/m07; modprobe -r loop; findmnt /mnt; lsmod | grep -w -E "vfat|fat|isofs|loop"; echo "rc=$?"; lsmod | wc -l
+rc=1
+73
+
+-- /root/m07 삭제, loop 해제, /mnt 마운트 없음, 실험 모듈 없음(rc=1)
+-- lsmod 73 줄 — [0] 과 같다
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  항목                       시작 전      변경 후                               되돌린 뒤
+--  lsmod 줄 수                73           vfat·fat·loop·isofs 가 오르내림       73
+--  modprobe -v vfat           -            insmod fat → insmod vfat              -
+--  modprobe -r -v vfat        -            rmmod vfat → rmmod fat                -
+--  insmod vfat (fat 없음)     -            Unknown symbol in module, rc=1        -
+--  rmmod fat (vfat 있음)      -            Module fat is in use by: vfat         -
+--  vfat 마운트 중 해제        -            Module vfat is in use (이름 없음)     umount 뒤 해제
+--  depmod -a                  11-11 20:17  11-13 19:40, 내용 같음(diff 없음)     -
+--  /mnt                       비어 있음    /dev/loop0 vfat, /dev/sr0 iso9660     비어 있음
+--
+-- 확인한 사실
+--   modprobe 는 modules.dep 를 따라 적재하고 역순으로 해제한다. insmod·rmmod 는 그 일을 안 한다
+--   Used by 의 이름 없는 숫자는 마운트·열린 장치가 만든 참조다. findmnt·losetup 으로 찾는다
+--   모듈 이름의 - 와 _ 는 같은 것으로 취급된다(dm-mod = dm_mod)
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. msdos 모듈도 fat 을 쓴다. modprobe -v msdos 뒤 modprobe -v vfat 을 하고 fat 의 Used by 를 본다
+--    확인: lsmod | grep -w fat 의 숫자와 이름 두 개, modprobe -r vfat 뒤 fat 이 남는지
+-- 2. vfat 이미지를 마운트한 셸에서 cd /mnt 로 들어간 채 umount 를 시도해 본다
+--    확인: umount 의 target is busy 원문, lsof +D /mnt 또는 fuser -vm /mnt
+-- 3. 아무 .ko 하나를 /lib/modules/$(uname -r)/extra 에 복사하고 depmod 없이 modprobe 해 본다
+--    확인: modinfo -n 결과, depmod -a 뒤 다시 modinfo -n 결과(extra 쪽이 먼저 잡히는지)
+
+================================================================================
+ 실습 02 종료 — modprobe 는 의존 순서대로 올리고 내림, insmod 는 Unknown symbol, 마운트가 붙든 vfat 은 umount 뒤 해제
+================================================================================

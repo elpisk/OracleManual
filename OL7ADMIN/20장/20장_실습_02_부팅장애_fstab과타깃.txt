@@ -1,0 +1,581 @@
+================================================================================
+ 제20장 실습 02 — 부팅 장애: fstab 과 기본 타깃
+ 대상   : ol7a (직렬 콘솔 ttyS0 으로 진행)
+ 목표   : 마운트할 수 없는 fstab 줄, 망가진 기본 타깃 링크, 끝나지 않는 서비스를 하나씩
+          걸고 부팅이 각각 어디서 멈추는지(emergency·rescue·멈춤) 구분한다. GRUB 에서
+          systemd.unit= 으로 들어간 셸에서 읽기 전용 루트를 다시 마운트해 고친다
+ 배경   : local-fs.target 이 실패하면 systemd 는 emergency.target 으로 간다. 기본
+          타깃을 쓸 수 없으면 rescue.target 을 대신 올린다. 둘 다 sulogin 이 root 암호를
+          묻지만 올라와 있는 것이 다르다. emergency 는 루트 하나만(요청해서 들어가면
+          읽기 전용), rescue 는 로컬 파일 시스템 전부를 올린다. 둘 다 네트워크와 sshd 는
+          없다 (본문 20.5, 3장)
+ 소요   : 약 50분
+ 선행   : pre-break 스냅샷(sdb 는 빈 디스크). 직렬 콘솔 캡처 설정이 기준 상태에 있다
+ 계정   : root (콘솔의 sulogin 도 root 암호 oracle)
+ 주의   : SSH 가 끊긴 동안의 작업은 모두 직렬 콘솔에서 한다. 전원을 강제로 끄는 단계가 있다
+ 되돌림 : fstab 원본, 기본 타깃 multi-user.target, license-wait 유닛 제거
+          → systemctl get-default, diff /root/fstab.orig /etc/fstab (출력 없음)
+================================================================================
+
+--------------------------------------------------------------------------------
+ [0] 시작 전 상태 기록
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# systemctl get-default; ls -l /etc/systemd/system/default.target
+multi-user.target
+lrwxrwxrwx. 1 root root 37 Nov 11 19:49 /etc/systemd/system/default.target -> /lib/systemd/system/multi-user.target
+-- 기본 타깃은 multi-user.target.
+-- /etc 의 링크가 /lib 아래 유닛을 가리킨다.
+-- /lib 은 /usr/lib 로 가는 링크라 같은 곳이다.
+-- set-default 는 이 링크를 바꾸는 명령이다.
+[root@ol7a ~]# grep -v '^#' /etc/fstab | grep .; cp -p /etc/fstab /root/fstab.orig
+/dev/mapper/ol-root     /                       xfs     defaults        0 0
+UUID=9e9b6650-ec84-4fa9-b7ec-e541592b4ecc /boot                   xfs     defaults        0 0
+/dev/mapper/ol-swap     swap                    swap    defaults        0 0
+-- 주석·빈 줄을 뺀 fstab 세 줄.
+-- /boot 만 UUID, 나머지는 LV 경로다.
+-- 원본은 /root/fstab.orig 로 떠 둔다.
+-- [12] 에서 diff 로 비교한다.
+[root@ol7a ~]# findmnt -no OPTIONS / | cut -c1-40; lsblk -dno NAME,HCTL,FSTYPE /dev/sda /dev/sdb
+rw,relatime,seclabel,attr2,inode64,logbu
+sda  2:0:0:0    
+sdb  2:0:1:0    
+-- 루트는 rw.
+-- OS 디스크 sda(2:0:0:0), 빈 디스크 sdb(2:0:1:0).
+-- sdb 의 FSTYPE 칸이 비었다.
+-- console= 두 개는 랩 콘솔 캡처용 설정이다.
+-- 마지막 console= 이 /dev/console 이 되어 sulogin 이 직렬 포트에 뜬다.
+[root@ol7a ~]# cat /proc/cmdline
+BOOT_IMAGE=/vmlinuz-5.4.17-2136.338.4.2.el7uek.x86_64 root=/dev/mapper/ol-root ro crashkernel=auto rd.lvm.lv=ol/root rd.lvm.lv=ol/swap rhgb quiet console=tty0 console=ttyS0,115200 scsi_mod.scan=sync
+-- ro 로 시작해 부팅 중 rw 로 바뀌는 것이 정상 흐름이다.
+-- [9] 에서 이 차이를 본다.
+-- 부트 파라미터는 실습 내내 그대로다.
+
+--------------------------------------------------------------------------------
+ [1] 먼저 — 없는 UUID 를 가리키는 fstab 줄
+--------------------------------------------------------------------------------
+
+-- 디스크를 바꿔 UUID 가 달라진 상황이다.
+-- nofail 이 없다.
+-- 9장 실습 04 에서 본 경우를 부팅 장애 관점에서 다시 본다.
+[root@ol7a ~]# mkdir -p /data; echo 'UUID=0e0e0e0e-dead-beef-0000-000000000001 /data xfs defaults 0 0' >> /etc/fstab; diff /root/fstab.orig /etc/fstab
+11a12
+> UUID=0e0e0e0e-dead-beef-0000-000000000001 /data xfs defaults 0 0
+[root@ol7a ~]# systemctl daemon-reload; systemctl show data.mount -p What -p RequiredBy | cut -c1-120
+What=/dev/disk/by-uuid/0e0e0e0e-dead-beef-0000-000000000001
+RequiredBy=remote-fs.target
+-- RequiredBy=remote-fs.target. local-fs 가 아니다.
+-- 7.9 의 systemd-219 는 부팅 초기에 없는 장치를
+-- 가리키는 줄을 원격 쪽(remote-fs)에 건다.
+-- 그러면 이 마운트가 실패해도 emergency 로 가지 않는다.
+-- 9장에서 본 것과 같은 동작이다.
+-- 재부팅. SSH 가 돌아오는지 본다.
+[root@ol7a ~]# uptime; systemctl is-system-running; findmnt /data; echo "findmnt rc=$?"
+ 21:11:11 up 0 min,  0 users,  load average: 0.00, 0.00, 0.00
+starting
+findmnt rc=1
+-- SSH 로 들어왔다.
+-- up 0 min, 상태 starting.
+-- 부팅이 아직 끝나지 않았다.
+-- /data 는 없다(findmnt rc=1).
+[root@ol7a ~]# journalctl -b -q --no-pager | grep -E 'Timed out|Dependency failed' | cut -c17-140
+-- 아직 아무 줄도 없다.
+-- 장치 대기 90초가 다 지나지 않았다.
+[root@ol7a ~]# systemd-analyze | cut -c1-120
+Bootup is not yet finished. Please try again later.
+-- systemd-analyze 도 부팅이 끝나지 않았다고 한다.
+-- sshd 는 이미 떴지만 시스템은 뒤에서 장치를 기다리는 중이다.
+-- 이런 서버는 "접속은 되는데 느리게 뜬다"로 신고된다.
+-- emergency 화면은 없다.
+
+--------------------------------------------------------------------------------
+ [2] 장애 A 심기 — 빈 디스크를 가리키는 fstab 줄
+--------------------------------------------------------------------------------
+
+-- 장애 A. UUID 대신 장치 이름을 썼고,
+-- 그 디스크는 교체돼 비어 있다.
+[root@ol7a ~]# sed -i '/0e0e0e0e/d' /etc/fstab; echo '/dev/sdb /data xfs defaults 0 0' >> /etc/fstab; diff /root/fstab.orig /etc/fstab
+11a12
+> /dev/sdb /data xfs defaults 0 0
+[root@ol7a ~]# systemctl daemon-reload; systemctl show data.mount -p What -p RequiredBy | cut -c1-120; blkid /dev/sdb; echo "blkid rc=$?"
+What=/dev/sdb
+RequiredBy=local-fs.target
+blkid rc=2
+-- 이번에는 RequiredBy=local-fs.target.
+-- /dev/sdb 는 부팅 초기에 이미 있는 장치다.
+-- 커널이 만든 장치 파일이라 udev 를 기다리지 않는다.
+-- blkid rc=2 : sdb 에 파일 시스템이 없다.
+-- 마운트는 실패할 것이다.
+
+--------------------------------------------------------------------------------
+ [3] 장애 A 부팅 — emergency
+--------------------------------------------------------------------------------
+
+-- 재부팅. SSH 가 안 열릴 것이므로 전원을 껐다 켜고 직렬 콘솔을 본다.
+-- 아래는 콘솔 출력의 마지막 10줄이다(전체는 .log).
+[  OK  ] Reached target rpc_pipefs.target.
+[  OK  ] Reached target NFS client services.
+[  OK  ] Reached target Remote File Systems (Pre).
+[  OK  ] Reached target Remote File Systems.
+         Starting Crash recovery kernel arming...
+Welcome to emergency mode! After logging in, type "journalctl -xb" to view
+system logs, "systemctl reboot" to reboot, "systemctl default" or ^D to
+try again to boot into default mode.
+Give root password for maintenance
+(or press Control-D to continue):
+-- Welcome to emergency mode!
+-- 다음 줄에 할 수 있는 일 세 가지가 안내된다.
+-- journalctl -xb, systemctl reboot,
+-- systemctl default(또는 Ctrl-D).
+-- 그 아래 sulogin 이 root 암호를 묻는다.
+-- oracle 을 넣었다.
+-- 입력은 화면에 찍히지 않는다.
+-- 위의 Remote File Systems 줄들은 [1] 의 원격 마운트가 아니라 NFS 클라이언트 타깃이다.
+
+
+[root@ol7a ~]# 
+systemctl list-units -t target --state=active --no-legend
+=
+-- 프롬프트 다음 줄의 = 와 목록 끝의 > 는
+-- systemctl 이 보낸 터미널 제어 문자의 흔적이다.
+cryptsetup.target     loaded active active Local Encrypted Volumes
+emergency.target      loaded active active Emergency Mode
+getty.target          loaded active active Login Prompts
+local-fs-pre.target   loaded active active Local File Systems (Pre)
+network-online.target loaded active active Network is Online
+network-pre.target    loaded active active Network (Pre)
+network.target        loaded active active Network
+nfs-client.target     loaded active active NFS client services
+paths.target          loaded active active Paths
+remote-fs-pre.target  loaded active active Remote File Systems (Pre)
+remote-fs.target      loaded active active Remote File Systems
+rpc_pipefs.target     loaded active active rpc_pipefs.target
+rpcbind.target        loaded active active RPC Port Mapper
+slices.target         loaded active active Slices
+sockets.target        loaded active active Sockets
+swap.target           loaded active active Swap
+timers.target         loaded active active Timers
+-- 활성 타깃 17개.
+-- emergency.target 이 있다.
+-- local-fs.target 이 없다.
+-- 로컬 파일 시스템 단계에서 멈췄다.
+-- network.target 은 active 인데 sshd 는 아래에서 inactive 다.
+
+>[root@ol7a ~]# 
+systemctl --failed --no-legend
+=
+data.mount loaded failed failed /data
+-- 실패한 유닛은 data.mount 하나.
+-- 열: 유닛, 로드, 활성, 하위 상태, 설명.
+
+>[root@ol7a ~]# 
+findmnt -no OPTIONS / | cut -c1-30; findmnt -no TARGET /boot
+rw,relatime,seclabel,attr2,ino
+/boot
+-- 루트는 rw.
+-- /boot 도 붙어 있다.
+-- 부팅이 local-fs 에서 멈춘 경우다.
+-- 루트를 rw 로 바꾸는 systemd-remount-fs 는 이미 돌았다.
+[root@ol7a ~]# 
+systemctl is-active sshd network
+inactive
+inactive
+-- sshd·network 서비스 모두 inactive.
+-- 원격으로는 이 서버에 들어올 수 없다.
+-- 네트워크 타깃이 active 여도 서비스는 안 떴다.
+[root@ol7a ~]# 
+journalctl -b -q | grep -E 'data|Emergency' | cut -c17-100
+ol7a.example.com kernel: BIOS-e820: [mem 0x00000000bfee0000-0x00000000bfefefff] ACPI
+ol7a.example.com kernel: Memory: 2901252K/4193784K available (14340K kernel code, 22
+ol7a.example.com kernel: Write protecting the kernel read-only data: 26624k
+ol7a.example.com kernel: rodata_test: all tests were successful
+ol7a.example.com kernel: sd 2:0:0:0: [sda] Cache data unavailable
+ol7a.example.com kernel: sd 2:0:2:0: [sdc] Cache data unavailable
+ol7a.example.com kernel: sd 2:0:1:0: [sdb] Cache data unavailable
+ol7a.example.com kernel: sd 2:0:3:0: [sdd] Cache data unavailable
+ol7a.example.com kernel: sd 2:0:4:0: [sde] Cache data unavailable
+ol7a.example.com systemd[1]: Started LVM2 metadata daemon.
+ol7a.example.com systemd[1]: Mounting /data...
+ol7a.example.com systemd[1]: data.mount mount process exited, code=exited status=32
+ol7a.example.com systemd[1]: Failed to mount /data.
+ol7a.example.com systemd[1]: Unit data.mount entered failed state.
+ol7a.example.com systemd[1]: Started Emergency Shell.
+ol7a.example.com systemd[1]: Reached target Emergency Mode.
+-- Mounting /data → exit status=32 → Failed to mount /data → Emergency Mode.
+-- status=32 는 mount 의 "마운트 실패" 종료 코드다.
+-- 빈 디스크라 xfs 슈퍼블록을 찾지 못했다.
+ol7a.example.com dracut[1489]:     microcode_ctl: processing data directory  "/usr/s
+-- 앞의 kernel 줄과 뒤의 dracut 줄은 'data' 라는 글자가 들어 있어 함께 걸린 것이다.
+-- dracut 줄은 kdump 가 덤프용 initramfs 를 만들며 남겼다.
+-- 원하는 줄만 보려면 -u 유닛 이름으로 거른다.
+ol7a.example.com dracut[1489]:     microcode_ctl: processing data directory  "/usr/s
+ol7a.example.com dracut[1489]:     microcode_ctl: processing data directory  "/usr/s
+ol7a.example.com dracut[1489]:     microcode_ctl: processing data directory  "/usr/s
+ol7a.example.com dracut[1489]:     microcode_ctl: processing data directory  "/usr/s
+[root@ol7a ~]# 
+
+--------------------------------------------------------------------------------
+ [4] 장애 A 고치기
+--------------------------------------------------------------------------------
+
+-- 줄을 지우지 않고 주석으로 막는다.
+-- 나중에 원래 의도를 확인할 수 있다.
+sed -i '/^\/dev\/sdb/s/^/#/' /etc/fstab; tail -1 /etc/fstab
+#/dev/sdb /data xfs defaults 0 0
+-- 루트가 rw 라 바로 고쳐졌다.
+-- tail -1 로 마지막 줄만 확인했다.
+[root@ol7a ~]# 
+systemctl daemon-reload; systemctl default
+Authorization not available. Check if polkit service is running or see debug message for more information.
+Authorization not available. Check if polkit service is running or see debug message for more information.
+-- polkit 이 아직 없어 경고를 낸 것이다.
+-- root 의 명령은 그대로 실행된다.
+-- systemctl default 는 기본 타깃(multi-user)으로 부팅을 이어 간다.
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+
+[root@ol7a ~]# systemctl is-system-running; findmnt /data; echo "findmnt rc=$?"
+degraded
+findmnt rc=1
+-- 상태 degraded.
+-- data.mount 의 실패 기록이 남아 있어서다.
+-- systemctl reset-failed 로 지우거나 다음 부팅에서 사라진다.
+-- 증상   : "Welcome to emergency mode!" 후 root 암호를 묻고 sshd·network 가 없다
+-- 원인   : local-fs.target 이 요구하는 /data(/dev/sdb)가 "status=32" 로 마운트 실패
+-- 조치   : 콘솔에서 root 로 들어가 fstab 줄을 주석 처리 → daemon-reload → systemctl default
+-- 재확인 : SSH 접속, systemctl is-system-running, findmnt /data 없음
+
+--------------------------------------------------------------------------------
+ [5] 장애 B — 기본 타깃 링크가 없는 타깃을 가리킴
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# systemctl set-default nosuch.target; echo "rc=$?"
+Failed to set default target: No such file or directory
+rc=1
+-- set-default 는 없는 타깃을 거부한다.
+-- 오류 문구는 No such file or directory.
+-- 링크를 직접 만들면 막을 수 없다.
+-- 패키지 제거나 잘못된 스크립트로 생기는 상황이다.
+[root@ol7a ~]# ln -sf /usr/lib/systemd/system/nosuch.target /etc/systemd/system/default.target; systemctl get-default
+Failed to get default target: Link has been severed
+-- get-default 는 링크가 끊겼다고 말한다.
+-- 재부팅. SSH 가 열리는지 본다.
+[root@ol7a ~]# uptime; runlevel; systemctl get-default
+ 21:15:24 up 0 min,  0 users,  load average: 0.29, 0.07, 0.02
+unknown
+Failed to get default target: Link has been severed
+-- SSH 가 열렸다.
+-- runlevel 은 unknown.
+-- 아직 목표 타깃에 닿지 않았다.
+[root@ol7a ~]# systemctl list-units -t target --state=active --no-legend | grep -E 'graphical|multi-user|rescue'
+-- graphical·multi-user·rescue 어느 것도 아직 active 가 아니다. 부팅 중이다.
+[root@ol7a ~]# ls -l /usr/lib/systemd/system/default.target
+lrwxrwxrwx. 1 root root 16 Nov 11 20:15 /usr/lib/systemd/system/default.target -> graphical.target
+-- /etc 의 링크가 끊겨 있으면 systemd 는 /usr/lib 의 default.target 을 읽는다.
+-- 배포판 기본값은 graphical.target 이다.
+-- rescue 로 떨어지지 않고 그쪽으로 부팅이 진행됐다.
+-- GUI 패키지가 없는 서버라 graphical 도 결국 multi-user 와 같은 서비스를 올린다.
+-- 겉보기 증상은 거의 없다.
+-- get-default 가 오류를 내는 것으로만 드러난다.
+
+--------------------------------------------------------------------------------
+ [6] 장애 B' — 기본 타깃이 마스크됨
+--------------------------------------------------------------------------------
+
+-- 장애 B'. 링크를 /dev/null 로 바꾸면 systemd 는 이것을 마스크(masked)로 읽는다.
+[root@ol7a ~]# ln -sf /dev/null /etc/systemd/system/default.target; ls -l /etc/systemd/system/default.target
+lrwxrwxrwx. 1 root root 9 Nov 16 21:15 /etc/systemd/system/default.target -> /dev/null
+-- 전원을 껐다 켜고 콘솔의 마지막 8줄을 본다.
+[    1.555111] sd 2:0:3:0: [sdd] Assuming drive cache: write through
+[    1.558748] sd 2:0:4:0: [sde] Assuming drive cache: write through
+[    3.083182] piix4_smbus 0000:00:07.3: SMBus Host Controller not enabled!
+Welcome to rescue mode! After logging in, type "journalctl -xb" to view
+system logs, "systemctl reboot" to reboot, "systemctl default" or ^D to
+boot into default mode.
+Give root password for maintenance
+(or press Control-D to continue):
+-- Welcome to rescue mode! 이번에는 rescue 다.
+
+
+[root@ol7a ~]# 
+systemctl list-units -t target --state=active --no-legend
+=
+cryptsetup.target   loaded active active Local Encrypted Volumes
+local-fs-pre.target loaded active active Local File Systems (Pre)
+local-fs.target     loaded active active Local File Systems
+rescue.target       loaded active active Rescue Mode
+-- 활성 타깃 6개.
+-- local-fs.target 과 sysinit.target 이 있다.
+-- emergency 의 17개와 비교하면 네트워크·소켓·타이머 타깃이 없다.
+swap.target         loaded active active Swap
+sysinit.target      loaded active active System Initialization
+
+>[root@ol7a ~]# 
+findmnt -no OPTIONS / | cut -c1-30; findmnt -no TARGET /boot
+rw,relatime,seclabel,attr2,ino
+/boot
+-- 루트 rw, /boot 도 붙었다.
+-- 로컬 파일 시스템을 다 올린 상태다.
+[root@ol7a ~]# 
+systemctl is-active sshd network
+inactive
+inactive
+-- rescue 에서도 sshd·network 는 없다.
+-- 원격 접속은 여전히 안 된다.
+[root@ol7a ~]# 
+journalctl -b -q | grep -iE 'default target|rescue' | cut -c17-10 
+-- 콘솔이 80자에서 명령을 접어 보냈다.
+-- 실제 명령은 cut -c17-100 이다.
+0
+ol7a.example.com systemd[1]: Reached target Initrd Default Target.
+ol7a.example.com systemd[1]: Stopped target Initrd Default Target.
+ol7a.example.com systemd[1]: Default target masked.
+ol7a.example.com systemd[1]: Trying to load rescue target...
+ol7a.example.com systemd[1]: Started Rescue Shell.
+ol7a.example.com systemd[1]: Reached target Rescue Mode.
+-- Initrd Default Target 두 줄은 initramfs 단계의 것이다.
+-- Default target masked.
+-- → Trying to load rescue target... 이 핵심 두 줄이다.
+[root@ol7a ~]# 
+
+--------------------------------------------------------------------------------
+ [7] 장애 B' 고치기
+--------------------------------------------------------------------------------
+
+systemctl set-default multi-user.target
+Removed symlink /etc/systemd/system/default.target.
+Created symlink from /etc/systemd/system/default.target to /usr/lib/systemd/system/multi-user.target.
+-- set-default 가 /dev/null 링크를 지우고 multi-user 링크를 새로 만들었다.
+-- rescue 는 루트가 rw 라 바로 바뀌었다.
+Authorization not available. Check if polkit service is running or see debug message for more information.
+[root@ol7a ~]# 
+systemctl default
+Authorization not available. Check if polkit service is running or see debug message for more information.
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+
+[root@ol7a ~]# systemctl is-system-running; systemctl get-default; runlevel
+running
+-- running, multi-user.target.
+-- runlevel "1 3".
+-- 1 3 은 이전 런레벨 1(rescue)에서 지금 3(multi-user)으로 왔다는 뜻이다.
+-- 증상   : "Welcome to rescue mode!" 와 root 암호 요구, sshd 없음
+-- 원인   : default.target 이 /dev/null(마스크) — 저널의 "Default target masked." 와 "Trying to load rescue target..."
+-- 조치   : rescue 셸에서 systemctl set-default multi-user.target → systemctl default
+-- 재확인 : get-default 가 multi-user.target, is-system-running 이 running
+multi-user.target
+1 3
+
+--------------------------------------------------------------------------------
+ [8] 장애 C 심기 — 끝나지 않는 서비스
+--------------------------------------------------------------------------------
+
+-- 장애 C. sshd 보다 먼저 끝나야 하는(Before=sshd.service) oneshot 서비스가 끝나지 않는다.
+-- TimeoutStartSec=0 은 시작 시간 제한을 끈다.
+-- 라이선스 서버를 기다리는 스크립트 같은 것이다.
+[root@ol7a ~]# printf '[Unit]\nDescription=Wait for license server\nBefore=sshd.service\n[Service]\nType=oneshot\nExecStart=/bin/sleep infinity\nTimeoutStartSec=0\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/license-wait.service
+[root@ol7a ~]# systemctl enable license-wait.service; systemctl cat license-wait.service | grep -v '^#'
+Created symlink from /etc/systemd/system/multi-user.target.wants/license-wait.service to /etc/systemd/system/license-wait.service.
+[Unit]
+Description=Wait for license server
+Before=sshd.service
+[Service]
+Type=oneshot
+ExecStart=/bin/sleep infinity
+TimeoutStartSec=0
+[Install]
+WantedBy=multi-user.target
+-- enable 로 multi-user.target.wants 에 링크가 생겼다.
+-- 다음 부팅부터 multi-user 가 이 서비스를 기다린다.
+
+-- 부팅한다. 100초 동안의 콘솔 출력 중 마지막 6줄.
+[    1.550778] sd 2:0:3:0: [sdd] Assuming drive cache: write through
+[    1.556270] sd 2:0:4:0: [sde] Assuming drive cache: write through
+[    3.011607] piix4_smbus 0000:00:07.3: SMBus Host Controller not enabled!
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+ol7a login:
+-- 콘솔에는 로그인 프롬프트가 떴다.
+-- 겉으로는 정상으로 보인다.
+-- 그러나 sshd 는 license-wait 가 끝나야 시작되므로 SSH 로는 들어올 수 없다.
+-- systemd 는 시간 제한이 없는 작업에 대해 아무 경고도 찍지 않았다.
+-- 원격에서는 "부팅이 끝나지 않는다"로만 보인다.
+-- 직렬 콘솔에서 로그인할 수도 있다.
+-- 여기서는 전원을 강제로 끄고 GRUB 에서 들어간다.
+-- 원격 콘솔만 있는 상황을 가정했다.
+
+--------------------------------------------------------------------------------
+ [9] 오류 흐름 — GRUB 에서 emergency 로 들어가 보니 루트가 읽기 전용
+--------------------------------------------------------------------------------
+
+[    1.451811] sd 2:0:3:0: [sdd] Assuming drive cache: write through
+[    1.459905] sd 2:0:4:0: [sde] Assuming drive cache: write through
+Welcome to emergGive root password for maintenance
+-- GRUB 에서 linux16 줄 끝에 systemd.unit=emergency.target 을 붙였다.
+-- 키 입력은 실습 01 의 [3] 과 같다.
+-- Welcome 문구가 콘솔에서 잘렸다.
+(or press Control-D to continue):
+
+
+[root@ol7a ~]# 
+findmnt -no OPTIONS / | cut -c1-30; findmnt -no TARGET /boot
+ro,relatime,seclabel,attr2,ino
+-- 루트가 ro 다.
+-- /boot 는 출력이 없다. 마운트되지 않았다.
+-- 요청해서 들어간 emergency 는 루트 하나만 읽기 전용으로 둔다.
+[root@ol7a ~]# 
+systemctl disable license-wait.service; echo "rc=$?"
+Authorization not available. Check if polkit service is running or see debug message for more information.
+Failed to execute operation: Read-only file system
+rc=1
+-- disable 이 Read-only file system 으로 실패했다.
+-- 증상   : systemctl disable license-wait.service → "Failed to execute operation: Read-only file system"
+-- 원인   : systemd.unit=emergency.target 으로 들어가면 루트를 rw 로 바꾸는 systemd-remount-fs 가 돌지 않는다
+-- 조치   : mount -o remount,rw / 뒤 다시 disable
+-- 재확인 : findmnt 옵션 rw, disable rc=0
+[root@ol7a ~]# 
+
+--------------------------------------------------------------------------------
+ [10] 장애 C 고치기 — remount 후 disable
+--------------------------------------------------------------------------------
+
+mount -o remount,rw /; findmnt -no OPTIONS / | cut -c1-30
+rw,relatime,seclabel,attr2,ino
+-- 즉시 rw 가 됐다.
+-- 재부팅 없이 remount 만으로 바뀐다.
+[root@ol7a ~]# 
+systemctl disable license-wait.service; echo "rc=$?"
+Authorization not available. Check if polkit service is running or see debug message for more information.
+Removed symlink /etc/systemd/system/multi-user.target.wants/license-wait.service.
+rc=0
+-- 이번에는 wants 링크가 지워졌다.
+-- 위의 Authorization 경고는 무시해도 된다.
+[root@ol7a ~]# 
+systemctl default
+Authorization not available. Check if polkit service is running or see debug message for more information.
+[   20.798167] piix4_smbus 0000:00:07.3: SMBus Host Controller not enabled!
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+
+[root@ol7a ~]# systemctl is-system-running; systemctl is-enabled license-wait; systemctl is-active sshd
+running
+disabled
+active
+-- 다시 부팅을 이어 가자 sshd active.
+-- license-wait 는 disabled.
+
+--------------------------------------------------------------------------------
+ [변형] GRUB 에서 rescue.target 으로 — emergency 와 나란히 보기
+--------------------------------------------------------------------------------
+
+[    1.489117] sd 2:0:4:0: [sde] Assuming drive cache: write through
+[    2.931980] piix4_smbus 0000:00:07.3: SMBus Host Controller not enabled!
+Welcome to rescuGive root password for maintenance
+-- 이번에는 systemd.unit=rescue.target 을 붙였다.
+-- 루트와 /boot 부터 본다.
+(or press Control-D to continue):
+
+
+[root@ol7a ~]# 
+findmnt -no OPTIONS / | cut -c1-30; findmnt -no TARGET /boot
+rw,relatime,seclabel,attr2,ino
+/boot
+-- rescue 는 루트 rw, /boot 도 붙었다.
+-- [9] 의 emergency 와 다르다.
+[root@ol7a ~]# 
+systemctl list-units -t target --state=active --no-legend
+=
+cryptsetup.target   loaded active active Local Encrypted Volumes
+local-fs-pre.target loaded active active Local File Systems (Pre)
+local-fs.target     loaded active active Local File Systems
+rescue.target       loaded active active Rescue Mode
+swap.target         loaded active active Swap
+sysinit.target      loaded active active System Initialization
+-- [6] 의 마스크로 떨어진 rescue 와 같은 6개 타깃이다.
+-- 요청한 rescue 와 자동 rescue 가 같은 상태다.
+
+>[root@ol7a ~]# 
+systemctl default
+Authorization not available. Check if polkit service is running or see debug message for more information.
+
+
+Oracle Linux Server 7.9
+Kernel 5.4.17-2136.338.4.2.el7uek.x86_64 on an x86_64
+
+ol7a login: 
+
+
+--------------------------------------------------------------------------------
+ [11] 오류 흐름 — emergency 와 rescue 를 구분하지 못함
+--------------------------------------------------------------------------------
+-- 세 번의 셸을 나란히 놓는다.
+--
+--  항목             장애 A(자동 emergency)  [9](요청 emergency)  B'·[변형](rescue)
+--  화면 첫 줄       Welcome to emergency    Welcome to emerg…    Welcome to rescue
+--  루트             rw                      ro                   rw
+--  /boot            붙음                    안 붙음              붙음
+--  local-fs.target  없음(실패)              없음                 active
+--  sshd·network     inactive                -                    inactive
+--  활성 타깃 수     17                      -                    6
+--
+-- 자동 emergency 는 local-fs 단계에서 실패했다.
+-- 그래서 루트가 이미 rw 였다.
+-- 요청한 emergency 는 루트를 ro 로만 붙인다.
+-- 고치려면 remount 가 먼저다.
+-- 증상   : 콘솔에 "Give root password for maintenance" 가 떴다는 것만 보고 같은 상황으로 판단
+-- 원인   : emergency 와 rescue 는 sulogin 화면이 같아 첫 줄을 놓치면 구분이 안 된다
+-- 조치   : 첫 줄(Welcome to …)과 findmnt -no OPTIONS /, list-units -t target 으로 확인
+-- 재확인 : emergency 는 local-fs.target 이 없고, rescue 는 local-fs.target 이 active
+
+--------------------------------------------------------------------------------
+ [12] 되돌림
+--------------------------------------------------------------------------------
+
+[root@ol7a ~]# rm -f /etc/systemd/system/license-wait.service; cp -p /root/fstab.orig /etc/fstab; rmdir /data; systemctl set-default multi-user.target; systemctl daemon-reload
+[root@ol7a ~]# systemctl get-default; diff /root/fstab.orig /etc/fstab; echo "diff rc=$?"; systemctl is-enabled license-wait 2>&1; systemctl is-system-running
+multi-user.target
+diff rc=0
+Failed to get unit file state for license-wait.service: No such file or directory
+running
+-- 기본 타깃 multi-user.
+-- fstab 원본과 같음(diff rc=0).
+-- license-wait 없음, running.
+
+--------------------------------------------------------------------------------
+ [정리] 관찰 요약
+--------------------------------------------------------------------------------
+--  장애                       어디서 멈췄나                     복구
+--  없는 UUID(nofail 없음)     멈추지 않음, 90초 늦게 부팅        fstab 수정
+--  빈 /dev/sdb(local-fs)      emergency                          콘솔에서 주석 처리
+--  default.target 끊김        /usr/lib 의 graphical 로 진행      set-default
+--  default.target 마스크      rescue                             set-default
+--  끝나지 않는 oneshot        콘솔 login 은 뜨나 sshd 없음       GRUB → emergency → remount → disable
+--
+--  항목             시작 전              장애 중                    되돌린 뒤
+--  get-default      multi-user.target    Link has been severed      multi-user.target
+--  fstab 추가 줄    없음                 /data 한 줄                없음(diff rc=0)
+--  license-wait     없음                 enabled                    없음
+
+--------------------------------------------------------------------------------
+ [더 해 보기]
+--------------------------------------------------------------------------------
+-- 1. 장애 A 의 줄에 nofail 을 붙여 다시 부팅한다. emergency 대신 무엇이 보이는가.
+-- 2. license-wait 에 TimeoutStartSec=30 을 주고 부팅해 콘솔 메시지를 비교한다.
+-- 3. emergency 셸에서 journalctl -xb 를 열어 [3] 의 실패 줄을 찾는다.
+--    -x 가 붙인 설명 줄이 무엇을 알려 주는지 적는다.
+
+================================================================================
+ 실습 02 종료 — emergency·rescue·멈춤을 화면과 활성 타깃으로 가르고 콘솔에서 복구
+================================================================================
